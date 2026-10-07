@@ -62,13 +62,18 @@ findings off the line until the review ends. [S, shipped mods]
 
 | State | Glyph | Colour | Weight |
 | --- | --- | --- | --- |
-| running | `●` | `yellow` | bold |
+| running | `◌` | `yellow` | bold |
 | done | `✓` | `green` | — |
 | failed | `✗` | `red` | — |
-| needs you | `!` | `cyan` | bold |
+| needs you | `⚠` | `cyan` | bold |
+
+All four are `EAW=Neutral` — one column in every locale. See **Glyphs** below;
+an earlier draft used `●` and that was wrong.
 
 If the terminal is monochrome, or the user is colourblind, the glyph still
-reads. This is the terminal's version of WCAG's non-colour channel. [S]
+reads. This is the terminal's version of WCAG's non-colour channel, and Apple
+HIG names the exact failure: users *"have particular difficulty with pairings
+such as red-green"*. [S]
 
 **Palette — the whole set.** Claude Code's `Text` accepts exactly these named
 values (verified in 2.1.292): `red` `green` `yellow` `blue` `magenta` `cyan`
@@ -93,29 +98,50 @@ Rules: [S, mod API]
 
 ## Glyphs
 
-**[I] Choose single-width, ASCII-adjacent glyphs. This is a correctness issue,
-not a taste issue.**
+**[S] Choose `EAW=Neutral` glyphs — one column in every locale.** This is a
+correctness issue, not taste. Width is UAX #11 East Asian Width:
+`Neutral`/`Narrow` = 1 column always; `Wide`/`Fullwidth` = 2; **`Ambiguous`/`A`
+= 1 column in Western terminals but 2 in CJK-locale terminals.** Per UAX #11
+§4.2 the recommended default is to treat ambiguous as narrow — but terminals
+differ, and the failure is silent column drift.
 
-A TUI aligns with spaces. `⏳` and `✅` are emoji: most terminals render them
-**double-width**, which silently breaks every column after them. Both reference
-mods ship this bug — `agent-radar` uses `● ✓ ✗` and aligns; `review-watch`
-uses `⏳ ✅ ✗` and does not. We follow the first.
+Verified against UCD `EastAsianWidth.txt`:
 
-Safe, single-width, near-universally supported:
+| Glyph | EAW | Verdict |
+| --- | --- | --- |
+| `✓` `✗` `✔` `◌` `∙` `⚠` `▸` | **N** | **safe** — 1 column everywhere |
+| `●` `·` `…` `–` `│` `─` `└` | **A** | risky in CJK locales |
+| `⏳` `✅` `❌` | **W** | **never** — 2 columns |
+
+**Correction to the first draft of this file:** `●` was listed as safe. It is
+not — it is Ambiguous. That is exactly why **Claude Code ships a different
+codepoint per platform**: `U+23FA ⏺` on macOS, `U+25CF ●` elsewhere. Even
+Anthropic treats glyph choice as a per-platform negotiation, not solved.
+
+Our set, all `EAW=N`:
 
 ```
-●  ✓  ✗  ·  └  …  ⏵(check before use)
+running    ◌   (U+25CC)   static liveness dot
+done       ✓   (U+2713)
+failed     ✗   (U+2717)
+needs you  ⚠   (U+26A0)
+neutral    ∙   (U+2219)
 ```
 
-Risky — avoid in aligned columns:
+We use **`◌` for running, not `●`** — same meaning, genuinely single-width.
 
-```
-emoji (double-width)   ⏳ ✅ ❌ ⚠️
-box drawing (font-dependent)
-braille spinners       ⠋⠙⠹  (fine only as a whole-cell animation)
-```
+**Both reference mods ship the emoji bug.** `review-watch` uses `⏳ ✅ ✗`: the
+first two are `EAW=Wide`, so every column after them misaligns. `agent-radar`'s
+`● ✓ ✗` is *mostly* fine (only `●` is Ambiguous). We follow neither.
 
-If a box-drawing frame is wanted, verify the user's font first; assume not. [S]
+**If you must ship an emoji-block glyph**, append `U+FE0E` to force text
+presentation — Claude Code's binary contains `"·✔︎·"`, a check mark with VS15
+attached. Belt and braces; the real fix is not using the glyph. [S]
+
+**Never use `String.length` for layout.** It counts UTF-16 units, not columns.
+We sidestep it: **reserve a fixed 2-cell gutter** and truncate from the end, so
+we never compute a column count at runtime. If a subtraction is ever needed,
+guard it and fall back to prefix-only rather than rendering at width zero. [S]
 
 ---
 
@@ -136,6 +162,29 @@ If a box-drawing frame is wanted, verify the user's font first; assume not. [S]
 
 ---
 
+## Layout contract
+
+**[S] The engine hands you the budget. Use it.** `AbovePrompt` arrives with
+`e.props.maxRows`, `bodyColumns`, `isWorking` and `hasSurvey`. `maxRows` is our
+layout contract — the band never exceeds it, and overflow folds rather than
+pushes.
+
+Codex names the failure mode exactly, and it is the same one: *"Keeping these
+pieces on one line avoids **vertical layout churn in the bottom pane**."* Their
+fixes, all of which we adopt: [S]
+
+- **Everything essential on one row.** Optional detail folds to up to 3
+  `└`-prefixed dimmed lines, never displacing controls.
+- **Core affordances stay in a fixed visual location.** Put the ticking field
+  last so nothing after it shifts.
+- **Fixed-width timer format** so digits never reflow: `0s`, `59s`, `1m 00s`,
+  `59m 59s`, `1h 00m 00s`, `2h 03m 09s`.
+- **Clamp counts.** Claude Code's agent footer shows `99+` above 99. Do the same.
+- **Hysteresis on thresholds.** Do not show the band at ≥1 job and hide it at
+  ≥2. A threshold that flips on the boundary flickers.
+
+---
+
 ## Timing
 
 The web skill's loading rules **invert** here. In a browser you delay a spinner
@@ -148,7 +197,7 @@ paint — **the first poll is already warm.** Adding latency is pure loss.
 | Data poll | **3 s** | both reference mods use 3 000 ms; file reads are not free |
 | Draw | **only on change** | never repaint an unchanged band |
 | Finish linger | **30 s** | a result that vanishes instantly is never seen [S, shipped mods] |
-| Row cap | **4**, then `+N more` | a band that grows without bound pushes the prompt off screen [I] |
+| Row cap | **4**, then `+N more` | a band that grows without bound pushes the prompt off screen [S, k9s enforces a *minimum* refresh too, with a warning rather than a 10× CPU bill] |
 
 **The tick must be gated on visibility.** Both reference mods read the clock and
 only redraw when something is shown:
@@ -160,6 +209,12 @@ $.clock.every(1000, () => {
 ```
 
 Idle means idle. A 1 Hz repaint of nothing is a laptop fan. [S, shipped mods]
+
+**Redraw caps are enforced by the engine** — 10/s, or 30/s for the visible pane,
+expanded band and hint line. We stay far below that. If a future animation is
+needed, derive the frame index from **wall-clock elapsed, not an incrementing
+counter**: a counter drifts and speeds up when the event loop is busy. Both
+Claude Code and Codex do the former. [S]
 
 ---
 
@@ -177,6 +232,26 @@ Idle means idle. A 1 Hz repaint of nothing is a laptop fan. [S, shipped mods]
   quantities — show them rather than a percentage you would have to invent.
   The web skill's "never swap indicator shape mid-task" [S, Apple] becomes
   "never change what a column means between renders."
+
+### Five distinct empty/error states, never collapsed [S, HIG]
+
+Each gets its own copy. Collapsing them is how a status UI ends up saying
+"loading" when it should say "no data yet."
+
+| State | Copy | Example |
+| --- | --- | --- |
+| **Loading** | the specific verb, never "loading" | `Reading job state` |
+| **Empty — never had data** | why it's empty, and when it fills | `No jobs yet · run /agy:implement to start one` |
+| **Empty — filtered** | name the filter | `No running jobs · 14 finished` |
+| **Error** | what failed **and what to do** | `.agy-staff unreadable · is the path right?` |
+| **Nothing selected** (pane) | list with no highlighted row | never a fake selection on row 0 |
+
+The pattern to copy is Claude Code's usage panel: *"No attribution data yet ·
+accumulates as you use Claude"* and *"Nothing over 10% in this period — try the
+other window."* Both dimmed, both one line, both tell you what to do. [S]
+
+Apple HIG: *"Avoid vague terms like loading or authenticating because they
+seldom add value."* [S]
 
 ---
 
@@ -204,29 +279,65 @@ Terminal equivalents, and what actually exists:
 | Web | Terminal | Status |
 | --- | --- | --- |
 | colour is never the only channel | glyph + colour | **[S]** required |
-| `prefers-reduced-motion` | use zero animation | **[I]** ours defaults to zero |
+| `prefers-reduced-motion` | Claude Code `prefersReducedMotion` setting | **[S]** exists |
 | `prefers-contrast: more` | `NO_COLOR`, bold instead of colour | **[S]** partly exists |
-| screen-reader semantics | — | **not available.** Do not pretend |
+| screen-reader semantics | `--ax-screen-reader` | **[S]** exists, and it **hides the band entirely** |
 
-Claude Code has an `ax-screen-reader` mode (6 references in the binary) that
-renders a flat text view. It strips decoration, which means **a band that
-communicates only through colour disappears in that mode** — another reason the
-glyph is load-bearing. [S]
+**Three things we now know exist that an earlier draft of this file denied:**
+
+1. **`prefersReducedMotion` is a real Claude Code setting** — *"Reduce or disable
+   animations for accessibility."* Codex goes further and reads the **OS**
+   setting directly (macOS `accessibilityDisplayShouldReduceMotion`, Windows
+   `SPI_GETCLIENTAREAANIMATION`, Linux xdg portal) with an explicit substitute per
+   element: animated spinner → static `◌`, shimmered dot → dimmed `•`. We take
+   the same substitution: **zero animation is our default anyway**, so the
+   setting costs us nothing. [S]
+
+2. **`--ax-screen-reader` renders a flat text view** — no box drawing, no
+   colour-only cues, spinners as static text — and the agent-footer hint is
+   *hidden* in that mode. So a band communicating only through colour does not
+   merely degrade, it **disappears**. The glyph is load-bearing. [S]
+
+3. **`NO_COLOR` semantics are precise and I had them wrong.** [S, no-color.org]
+   - It is **present-and-non-empty** that counts. `NO_COLOR=0` still disables
+     colour. Checking `=== '1'` is a bug.
+   - It covers **colour only** — *"Should the presence of `NO_COLOR` disable
+     other styling such as bold, underline, and italic? **No.**"* So under
+     `NO_COLOR` we keep `dimColor`, `bold` and glyphs; we drop only hue.
+   - CLI flags override the env var.
+   - `FORCE_COLOR` is the counterpart, and Node's is numeric: `1`/`true`/`""` =
+     16-colour, `2` = 256, `3` = truecolor — and it **overrides** `NO_COLOR`.
+   - `CLICOLORS`/`CLICOLOR_FORCE` is [deprecated](https://bixense.com/clicolors/).
+     Don't use it.
+
+**And the reason colour is harder here than on the web**, which is worth knowing
+before adding a fifth colour: the user owns the palette, so your hex is a
+*request*; the background may be un-queryable over SSH or tmux; and ANSI 16 is
+not perceptually uniform — default green `#00aa00` vs yellow `#aa5500` is a ~2×
+lightness difference, not a hue difference. That is why the mod API takes named
+colours only, and why the palette is frozen.
+
+**No screen-reader semantics exist for mod content.** Do not pretend otherwise;
+rely on redundancy instead.
 
 ---
 
 ## Review checklist
 
-1. Does the band change height while the user is mid-prompt?
+1. Does the band change height while the user is mid-prompt? Does it respect
+   `e.props.maxRows`?
 2. Does every line read in its first 40 columns?
 3. Would it survive `--no-color`? Does every state have a glyph?
-4. Any emoji or double-width glyph in an aligned column?
-5. Is the ticking field the last thing on the line?
+4. **Is every glyph `EAW=Neutral`?** Any emoji, or any `● · … – │ ─ └`?
+5. Is the ticking field last, and zero-padded (`1m 05s`, not `1m 5s`)?
 6. Does `wrap="truncate-end"` cover every `<Text>`?
 7. Does it return `next(e)`'s output untouched, and skip when `hasSurvey`?
 8. Does the clock skip work when nothing is shown?
-9. Is more than one thing on the line red?
-10. Is there a colour here that should be `dimColor`?
+9. Is more than one thing on the line red? Is anything `gray` instead of
+   `dimColor`?
+10. Is `NO_COLOR` tested as **present-and-non-empty**, not `=== '1'`?
+11. Does every empty/error state have its own copy, naming what to do?
+12. Are thresholds hysteretic — does a count at the boundary flicker?
 
 ---
 
