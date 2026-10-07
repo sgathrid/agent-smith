@@ -8,7 +8,7 @@ import { validateSpec } from '../../../pipeline/pipeline.ts';
 import { MODES, MODE_PRESETS } from '../../../forge/modes.ts';
 import { getCatalogs, getInstalledProviders } from '../../../providers/catalog.ts';
 import { providerNames } from '../../../providers/registry.ts';
-import { loadModelConfig, resolveRequest, describeAliases } from '../../../providers/aliases.ts';
+import { loadModelConfig, resolveRequest, describeAliases, type ModelConfig } from '../../../providers/aliases.ts';
 import type { ModelCatalog } from '../../../providers/types.ts';
 import type { Effort, PipelineSpec, Stage, StageCheck } from '../../../pipeline/types.ts';
 
@@ -93,14 +93,23 @@ export function defaultProvider(installed: readonly string[]): string {
 export interface MixedSpecInput {
   readonly name: string; readonly task: string; readonly workDir?: string;
   readonly concurrency?: number; readonly models?: Readonly<Partial<Record<string, string>>>;
-  readonly efforts?: Readonly<Partial<Record<string, Effort>>>; readonly stages?: readonly Stage[];
+  readonly efforts?: Readonly<Partial<Record<string, Effort>>>; readonly stages?: readonly Stage[]; readonly modelConfig?: ModelConfig;
 }
 /** Default implement/review/moderate pipeline from installed providers; explicit `stages` pass through unchanged. */
 export async function defaultMixedPipeline(input: MixedSpecInput, catalogs?: CatalogSource): Promise<PipelineSpec> {
-  if (input.stages) return { name: input.name, stages: input.stages, workDir: input.workDir, concurrency: input.concurrency };
+  if (input.stages) {
+    const stages = input.modelConfig
+      ? input.stages.map(st => { const r = resolveRequest({ provider: st.provider, model: st.model, effort: st.effort, mode: st.role ?? st.name }, input.modelConfig!); return { ...st, provider: r.provider ?? st.provider, model: r.model, effort: r.effort as Effort | undefined }; })
+      : input.stages;
+    return { name: input.name, stages, workDir: input.workDir, concurrency: input.concurrency };
+  }
   const cats = await installedCatalogs({ catalogs });
   const assign = assignStageProviders(cats.map(c => c.provider));
   const stage = (name: string, extra: Partial<Stage>): Stage => {
+    const rd = input.modelConfig ? resolveRequest({ mode: name }, input.modelConfig) : undefined;
+    if (rd?.source === 'roleDefault' && rd.provider) {
+      return { name, provider: rd.provider, model: input.models?.[name] ?? rd.model, effort: input.efforts?.[name] ?? rd.effort as Effort | undefined, role: name, routingPinned: true, ...extra } as Stage;
+    }
     const provider = assign[name]!; const cat = cats.find(c => c.provider === provider);
     const cfg = cat?.defaultSource === 'harness-config';
     return { name, provider, model: input.models?.[provider] ?? input.models?.[name] ?? (cfg ? cat?.defaultModel : undefined),
@@ -215,7 +224,8 @@ export async function callTool(ctx: HandlerContext, name: string, rawArgs: unkno
         }
         if (detail.status === 'running') throw new Error('Worker is still running; live steering is not supported by this CLI adapter.');
         if (!detail.conversation) throw new Error('Worker has no resumable conversation handle.');
-        return json(await ctx.service.spawnJob({ mode: detail.mode ?? 'task', prompt: text(args, 'prompt', true)!, provider: detail.provider ?? undefined, model: text(args, 'model') ?? detail.model ?? undefined, effort: allowed(args, 'effort', EFFORTS) ?? detail.effort ?? undefined, name: detail.name, workerId: detail.workerId, task: detail.task ?? undefined, cwd: detail.cwd ?? ctx.service.repo, conversation: detail.conversation, timeoutMs: number(args, 'timeoutMs'), unrestricted: boolean(args, 'unrestricted') ?? detail.unrestricted }));
+        const resumeModel = resolveRequest({ provider: detail.provider ?? undefined, model: text(args, 'model'), effort: allowed(args, 'effort', EFFORTS) }, loadModelConfig({ repo: ctx.service.repo }));
+        return json(await ctx.service.spawnJob({ mode: detail.mode ?? 'task', prompt: text(args, 'prompt', true)!, provider: detail.provider ?? undefined, model: resumeModel.model ?? detail.model ?? undefined, effort: resumeModel.effort ?? detail.effort ?? undefined, name: detail.name, workerId: detail.workerId, task: detail.task ?? undefined, cwd: detail.cwd ?? ctx.service.repo, conversation: detail.conversation, timeoutMs: number(args, 'timeoutMs'), unrestricted: boolean(args, 'unrestricted') ?? detail.unrestricted }));
       }
       case 'list_jobs': return structured(await ctx.service.list({ provider: allowed(args, 'provider', ['agent-smith', 'agy-staff', 'all']), status: allowed(args, 'status', ['running', 'succeeded', 'failed', 'canceled']) as ForgeStatus | undefined, limit: number(args, 'limit', 500) }));
       case 'status': {
@@ -232,7 +242,7 @@ export async function callTool(ctx: HandlerContext, name: string, rawArgs: unkno
       case 'run_pipeline': {
         const raw = record(args.spec, 'spec'); keys(raw, ['name', 'task', 'workDir', 'concurrency', 'unrestricted', 'stages']);
         const stages = parseStages(raw.stages); const task = text(raw, 'task', stages === undefined);
-        const spec = await defaultMixedPipeline({ name: text(raw, 'name', true)!, task: task ?? '', stages, workDir: text(raw, 'workDir') ?? ctx.service.repo, concurrency: number(raw, 'concurrency', 32) }, ctx.catalogs);
+        const spec = await defaultMixedPipeline({ name: text(raw, 'name', true)!, task: task ?? '', stages, workDir: text(raw, 'workDir') ?? ctx.service.repo, concurrency: number(raw, 'concurrency', 32), modelConfig: loadModelConfig({ repo: ctx.service.repo }) }, ctx.catalogs);
         validateSpec(spec);
         const run = startPipeline(ctx.service, spec, { unrestricted: boolean(raw, 'unrestricted') });
         void run.done.catch(err => process.stderr.write(`agent-smith pipeline ${run.runId}: ${String(err)}\n`));

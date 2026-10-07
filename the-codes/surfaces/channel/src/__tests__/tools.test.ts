@@ -75,3 +75,22 @@ test('spawn_job expands a user alias and role defaults from models.json', async 
   const caps = await callTool(ctx, 'list_capabilities', {});
   assert.match((caps.content[0] as { text: string }).text, /sol-high/);
 });
+
+test('pipelines expand aliases in explicit stages and apply roleDefaults to the default pipeline', async () => {
+  const { loadModelConfig } = await import('../../../../providers/aliases.ts');
+  const { writeFileSync, mkdirSync } = await import('node:fs');
+  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-alias-pipe-'));
+  mkdirSync(path.join(repo, '.agent-smith'));
+  writeFileSync(path.join(repo, '.agent-smith', 'models.json'), JSON.stringify({
+    aliases: { 'sol-high': { provider: 'codex', model: 'gpt-6.1-sol', effort: 'high' } },
+    roleDefaults: { review: 'sol-high' },
+  }));
+  const modelConfig = loadModelConfig({ repo });
+  const explicit = await defaultMixedPipeline({ name: 'p', task: 't', modelConfig, stages: [{ name: 'a', provider: 'codex', model: 'sol-high', role: 'implement' } as never] });
+  assert.deepEqual([explicit.stages[0]!.provider, explicit.stages[0]!.model, explicit.stages[0]!.effort], ['codex', 'gpt-6.1-sol', 'high']);
+  const cats = ['agy', 'codex', 'claude'].map(provider => ({ provider, models: [], defaultSource: 'unknown', source: 'live', stale: false, verified: true }) as never);
+  const def = await defaultMixedPipeline({ name: 'p', task: 't', modelConfig }, async () => cats);
+  const review = def.stages.find(s => s.name === 'review')!;
+  assert.deepEqual([review.provider, review.model, review.effort], ['codex', 'gpt-6.1-sol', 'high']);
+  assert.equal(def.stages.find(s => s.name === 'implement')!.model, undefined);
+});
