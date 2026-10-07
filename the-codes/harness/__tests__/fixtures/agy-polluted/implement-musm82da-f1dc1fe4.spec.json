@@ -1,0 +1,17 @@
+{
+  "resolved": {
+    "mode": "implement",
+    "model": "gemini-3.8-flash-high",
+    "profile": "unrestricted",
+    "profileSource": "default",
+    "background": true,
+    "timeout": "120m"
+  },
+  "prompt": "[REDACTED for fixture]",
+  "prompt_source": {
+    "kind": "template",
+    "task": "[REDACTED for fixture]"
+  },
+  "opts": {},
+  "cwd": "/Users/gathrid/Repos/renyi"
+}

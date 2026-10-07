@@ -164,8 +164,7 @@ export interface ToolLoopOptions {
  * produce a false "different input" verdict.
  */
 export function hashToolInput(input: unknown): string {
-  const text =
-    typeof input === 'string' ? input : safeStringify(input);
+  const text = typeof input === 'string' ? input : safeStringify(input);
   let hash = 0x811c9dc5;
   for (let i = 0; i < text.length; i++) {
     hash ^= text.charCodeAt(i);
@@ -175,30 +174,55 @@ export function hashToolInput(input: unknown): string {
   return hash.toString(16).padStart(8, '0');
 }
 
-/** JSON.stringify that cannot throw on a cycle or a BigInt. */
-function safeStringify(value: unknown): string {
-  const seen = new WeakSet<object>();
-  try {
-    return JSON.stringify(value, (_key, val: unknown) => {
-      if (typeof val === 'bigint') return val.toString();
-      if (typeof val === 'object' && val !== null) {
-        if (seen.has(val)) return '[circular]';
-        seen.add(val);
-      }
-      return val;
-    }) ?? String(value);
-  } catch {
-    return String(value);
+/**
+ * Canonical serialization for hashing: keys sorted at every level, cycles and
+ * BigInts handled, and never throws.
+ *
+ * Hand-rolled rather than JSON.stringify-with-a-replacer because the two
+ * requirements fight each other. A replacer that sorts keys runs *before* the
+ * serializer descends, so it cannot see the ancestors that make a cycle; and
+ * the usual `this`-based cycle trick needs the un-sorted traversal order.
+ * Writing it out is ~15 lines and has no hidden interaction to reason about.
+ *
+ * Sorting matters: a provider that builds `{a, b}` one way and `{b, a}` another
+ * would look like two different tool inputs and hide a real loop.
+ */
+function safeStringify(value: unknown, ancestors: Set<object> = new Set()): string {
+  if (value === null) return 'null';
+  if (typeof value === 'bigint') return `"${value.toString()}"`;
+  if (typeof value === 'string') return JSON.stringify(value);
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (typeof value === 'undefined' || typeof value === 'function' || typeof value === 'symbol') {
+    return 'null';
   }
+
+  if (Array.isArray(value)) {
+    // `ancestors` is copied so a repeated (non-cyclic) sibling reference still
+    // serializes as its value rather than as '[circular]'.
+    const next = new Set(ancestors).add(value);
+    return `[${value.map((item) => safeStringify(item, next)).join(',')}]`;
+  }
+
+  const object = value as Record<string, unknown>;
+  if (ancestors.has(object)) return '"[circular]"';
+  const next = new Set(ancestors).add(object);
+
+  const parts: string[] = [];
+  for (const key of Object.keys(object).sort()) {
+    parts.push(`${JSON.stringify(key)}:${safeStringify(object[key], next)}`);
+  }
+  return `{${parts.join(',')}}`;
 }
 
 /**
  * Detect a run of identical consecutive tool calls.
  *
  * "Identical" means same tool name AND same normalized input hash. The rule
- * compares the *tail* of the event list backwards and returns as soon as the run
- * reaches the threshold, so it costs O(threshold) in the common case and never
- * walks the whole history.
+ * walks the *tail* of the event list backwards, counts the run, and stops at the
+ * first event that does not match — so it costs O(run length), never O(history).
+ * A job looping 50 times reports 50, not 2: the count is what tells an operator
+ * whether to interrupt or just look, so it is measured rather than truncated at
+ * the threshold.
  *
  * A call with no `toolInputHash` is only treated as identical to another such
  * call if the tool names match. Guessing equality from messages would produce
@@ -224,11 +248,14 @@ export function detectToolLoop(
   let count = 0;
   let tool: string | null = null;
   let inputHash: string | null = null;
+  let lastAt = '';
 
   for (let i = events.length - 1; i >= 0; i--) {
     const event = events[i];
+    // noUncheckedIndexedAccess: a holey array is a legitimate input, not a bug.
     if (event === undefined) continue;
     if (!kinds.includes(event.kind)) continue;
+    // An event with no tool cannot be a repeated *tool* call.
     if (event.tool === undefined || event.tool === null) continue;
 
     const eventHash = event.toolInputHash ?? null;
@@ -237,19 +264,20 @@ export function detectToolLoop(
       // Seed the run with the newest qualifying event.
       tool = event.tool;
       inputHash = eventHash;
+      lastAt = event.at;
       count = 1;
     } else if (event.tool === tool && eventHash === inputHash) {
       count++;
-      if (count >= threshold) {
-        return { tool, count, inputHash, lastAt: event.at };
-      }
     } else {
-      // The run ended: this event belongs to a different call. We are scanning
-      // backwards from the tail, so nothing older can extend this run.
+      // The run ended: this event belongs to a different call. We scan backwards
+      // from the tail, so nothing older can extend this run.
       break;
     }
   }
 
+  if (count >= threshold && tool !== null) {
+    return { tool, count, inputHash, lastAt };
+  }
   return null;
 }
 
@@ -269,7 +297,10 @@ export function assessJob(
   options: LivenessOptions & ToolLoopOptions = {},
 ): { liveness: Liveness; loop: ToolLoop | null } {
   const liveness = evaluateLiveness(job, now, options);
-  if (liveness === 'alive' || liveness === 'done' || liveness === 'dead') {
+  // 'alive' must NOT short-circuit: a job that is emitting activity *and*
+  // repeating the same call is the most important case there is, and it is
+  // alive by the clock. Only finished and presumed-dead jobs skip the scan.
+  if (liveness === 'done' || liveness === 'dead') {
     return { liveness, loop: null };
   }
   const loop = detectToolLoop(events, options);

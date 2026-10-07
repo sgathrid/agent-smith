@@ -6,7 +6,7 @@
   "type": "module",
   "engines": { "node": ">=22" },
   "scripts": {
-    "test": "node --test --experimental-strip-types 'the-codes/*/__tests__/*.test.ts'",
+    "test": "node --test --experimental-strip-types \"the-codes/**/*.test.ts\"",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

@@ -1,0 +1,668 @@
+/**
+ * providers/claude.ts — Claude Code headless adapter.
+ *
+ * This is agent-smith's PROBER / MODERATOR provider. ARCHITECTURE.md is
+ * emphatic about why: "Claude proposes, another model probes." Generative
+ * agreement between same-family models is correlated (60% agreement when both
+ * err, ICML 2025, 350+ models), so self-consistency is not verification — a
+ * different model family is. This adapter exists to be that different family,
+ * which means it must be as trustworthy about its own failure modes as agy is.
+ *
+ * ============================================================================
+ * VERIFICATION LEVEL: HIGH. Verified by running `claude --help` (2.1.292) and
+ * by executing the exact invocation below against a live model.
+ * ============================================================================
+ *
+ * VERIFIED FLAGS (`claude --help`, 2.1.292):
+ *
+ *   -p, --print                       "Print response and exit (useful for pipes)".
+ *                                     Note the help text itself says the workspace
+ *                                     trust dialog is skipped when stdout is not
+ *                                     a TTY — which is exactly our spawn shape.
+ *   --output-format <text|json|stream-json>   "(only works with --print)"
+ *   --input-format <text|stream-json>
+ *   --verbose                         required for the full stream in print mode
+ *   --forward-subagent-text           "Forward subagent text and thinking blocks as
+ *                                     assistant/user messages with
+ *                                     parent_tool_use_id set (only works with
+ *                                     --print and --output-format=stream-json)"
+ *                                     ^^^ THIS IS THE FLAG THAT MAKES A MODERATOR
+ *                                     USABLE. Without it, a subagent's reasoning
+ *                                     is invisible to us, and a moderator that
+ *                                     cannot see what the prober did is just
+ *                                     another proposer.
+ *   --include-partial-messages        partial chunks as they arrive (stream-json)
+ *   --model <model>                   alias ('fable', 'opus', 'sonnet') or full name
+ *   --permission-mode <acceptEdits|auto|bypassPermissions|manual|dontAsk|plan>
+ *   --permission-prompts <host|none>  who answers permission prompts in print mode
+ *   --dangerously-skip-permissions    bypass all permission checks
+ *   --allow-dangerously-skip-permissions  make it an *option*, not the default
+ *   --add-dir <directories...>        additional directories for tool access
+ *   --session-id <uuid>               use a specific session id
+ *   --allowedTools, --allowed-tools   allowlist tools
+ *   --append-system-prompt <prompt>   append to the default system prompt
+ *   --bare                            minimal mode: skip hooks, LSP, plugin sync,
+ *                                     auto-memory, CLAUDE.md auto-discovery.
+ *                                     STRICTLY auth via ANTHROPIC_API_KEY.
+ *   --setting-sources <user,project,local>   which settings files to load
+ *   --max-turns <n>                   (listed as -n/--name separately; turn cap
+ *                                     is accepted in print mode — see UNVERIFIED)
+ *
+ * VERIFIED EVENT SHAPES (live run of
+ *   claude -p --output-format stream-json --verbose --model haiku "Reply with exactly: OK" < /dev/null):
+ *
+ *   {"type":"system","subtype":"init","cwd":"...","session_id":"fd8a7751-...",
+ *    "tools":["Task","Bash","CronCreate",...],"model":"claude-haiku-4-5-20251001", ...}
+ *   {"type":"system","subtype":"thinking_tokens","estimated_tokens":157,
+ *    "estimated_tokens_delta":107,"session_id":"...","uuid":"..."}
+ *   {"type":"system","subtype":"hook_started","hook_id":"...","hook_name":"SessionStart:startup", ...}
+ *   {"type":"system","subtype":"hook_response","hook_id":"...","output":"{...}", ...}
+ *   {"type":"assistant","message":{"id":"msg_...","role":"assistant",
+ *       "content":[{"type":"thinking","thinking":"...","signature":"..."} |
+                   {"type":"text","text":"OK"} | {"type":"tool_use","id":"toolu_...",
+                   "name":"Bash","input":{...}}],
+ *       "model":"claude-haiku-4-5-20251001","usage":{...}},"session_id":"..."}
+ *   {"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_...",
+ *       "content":"...","is_error":false}]},"session_id":"..."}     (documented; not in my run)
+ *   {"type":"result","subtype":"success","duration_ms":...,"duration_api_ms":1609,
+ *    "is_error":false,"result":"...","session_id":"...","total_cost_usd":0.03089125,
+ *    "num_turns":1,"stop_reason":"end_turn",
+ *    "usage":{"input_tokens":10,"cache_creation_input_tokens":24425,
+ *             "cache_read_input_tokens":0,"output_tokens":70,
+ *             "output_tokens_details":{"thinking_tokens":63}}}
+ *   Exit code 0.
+ *
+ * NOTABLE AND IMPORTANT: hooks fire in headless mode. In my run a
+ * SessionStart hook from this machine's Claude config ran and injected company
+ * knowledge into the run. That means a headless moderator can be steered by
+ * whatever hooks happen to be configured. For the prober/moderator role we
+ * default to --setting-sources user (so personal hooks still apply) but keep the
+ * knob, and `--bare` is available via SpawnSpec.env for callers who need a
+ * hermetic run. Documented in the README — this is a real reproducibility trap.
+ *
+ * TIMEOUT: claude has NO `--print-timeout` equivalent (agy has one, codex does
+ * not). We therefore enforce the budget entirely ourselves, via
+ * spawnWorker's SIGTERM->SIGKILL escalation. If you kill mid-run, there is no
+ * result event and we correctly report 'cancelled'/'timeout', never 'success'.
+ */
+
+import {
+  appendEventLog,
+  binaryOnPath,
+  createEventBus,
+  newJobId,
+  nowIso,
+  num,
+  obj,
+  preview,
+  spawnWorker,
+  stderrTailOf,
+  str,
+  tryParseObject,
+  truncate,
+  writeArgv,
+  writeResultFile,
+  writeStateDir,
+} from './ndjson.js';
+import type {
+  ActivityRef,
+  ActivityStatus,
+  JobResult,
+  JobStatus,
+  Provider,
+  ProviderEvent,
+  SpawnSpec,
+  TokenUsage,
+  WorkerHandle,
+} from './types.js';
+
+export const CLAUDE_BINARY = process.env['AGENT_SMITH_CLAUDE_BIN'] ?? 'claude';
+
+export type ClaudePermissionMode =
+  | 'acceptEdits'
+  | 'auto'
+  | 'bypassPermissions'
+  | 'manual'
+  | 'dontAsk'
+  | 'plan';
+
+/**
+ * Build the exact argv for one claude worker.
+ *
+ * argv layout: `claude -p <flags> <prompt>`.
+ *
+ * The prompt is a TRAILING POSITIONAL (help shows `claude [options] [command] [prompt]`),
+ * so a prompt beginning with "-" is safe. Combined with `-p`, this is the
+ * documented headless invocation.
+ */
+export function buildArgv(spec: SpawnSpec): string[] {
+  const argv: string[] = ['-p'];
+
+  // NDJSON on stdout. `stream-json` is what lets a moderator show its work.
+  argv.push('--output-format', 'stream-json');
+
+  // WHY --verbose IS NOT OPTIONAL HERE: with --print, the full event stream is
+  // only emitted in verbose mode. Without it claude emits a single result
+  // object and we lose every tool call. Verified in my live run, which I
+  // passed --verbose to.
+  argv.push('--verbose');
+
+  // Without this, a subagent's text and thinking are dropped from our stream.
+  // For a prober/moderator that is disqualifying: we would be judging a
+  // subagent's work we cannot see. Documented and verified to exist.
+  argv.push('--forward-subagent-text');
+
+  if (spec.model !== undefined && spec.model !== '') {
+    // Aliases ('sonnet', 'opus', 'fable') or full model names both work.
+    argv.push('--model', spec.model);
+  }
+
+  // effort: claude has no --effort flag. Anthropic exposes reasoning effort per
+  // model via the alias/full-name, so a caller asking for an effort gets the
+  // closest thing (see README). We do NOT invent a flag here.
+
+  const addDirs = spec.addDirs ?? [];
+  if (addDirs.length > 0) {
+    // --add-dir is VARIADIC ("--add-dir <directories...>"). Emitting the flag
+    // once per directory would be wrong: the second occurrence's list would be
+    // taken and the first silently dropped. So: one flag, all dirs after it.
+    argv.push('--add-dir', ...addDirs);
+  }
+
+  if (spec.unrestricted) {
+    // Verified. Same semantics as agy's --dangerously-skip-permissions and
+    // codex's --dangerously-bypass-approvals-and-sandbox: "this worker is
+    // trusted in this directory".
+    argv.push('--dangerously-skip-permissions');
+  } else {
+    // Restricted default.
+    //
+    // WHY 'dontAsk' AND NOT 'manual': in print mode 'manual' means claude would
+    // wait for an approval that can never arrive, so a restricted run would
+    // hang until the timeout. 'dontAsk' means "never prompt; just deny what is
+    // not already allowed", which is the same shape as agy's headless
+    // auto-deny and fails loudly instead of stalling.
+    //
+    // IMPORTANT CONSEQUENCE, documented in the README: a restricted claude
+    // moderator may come back with denied tool calls. We surface those as
+    // 'denied', exactly as agy does. A moderator with no tools cannot moderate.
+    argv.push('--permission-mode', 'dontAsk');
+    // Belt and braces: in print mode the host (us) answers permission prompts,
+    // and we have no prompt handler. 'none' means there is nobody to ask.
+    argv.push('--permission-prompts', 'none');
+  }
+
+  if (spec.conversation !== undefined && spec.conversation !== '') {
+    // Verified: "--session-id <uuid>  Use a specific session ID for the
+    // conversation (must be a valid UUID)". If the caller passes a non-UUID,
+    // claude errors out fast with a clear message — acceptable, and better than
+    // silently starting a fresh conversation.
+    argv.push('--session-id', spec.conversation);
+  }
+
+  // Reproducibility knob. --setting-sources controls which settings files load.
+  // Default here is 'user' so personal skills/hooks work; set
+  // AGENT_SMITH_CLAUDE_SETTING_SOURCES='' to disable the flag entirely, or
+  // AGENT_SMITH_CLAUDE_BARE=1 for --bare (no hooks, no CLAUDE.md, keychain
+  // auth disabled). See the header for why this matters for a moderator.
+  const bare = process.env['AGENT_SMITH_CLAUDE_BARE'] === '1';
+  if (bare) {
+    argv.push('--bare');
+  } else {
+    const sources = process.env['AGENT_SMITH_CLAUDE_SETTING_SOURCES'] ?? 'user';
+    if (sources !== '') argv.push('--setting-sources', sources);
+  }
+
+  // Trailing positional prompt, last.
+  argv.push(spec.prompt);
+  return argv;
+}
+
+// ---------------------------------------------------------------------------
+// Event translation
+// ---------------------------------------------------------------------------
+
+/**
+ * Anthropic usage field names, verified from the live `result` event:
+ *   input_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+ *   output_tokens, output_tokens_details.thinking_tokens
+ *
+ * `cache_creation_input_tokens` maps to our `cacheWriteTokens` so the store can
+ * sum cache writes across agy (which does not report them) and claude (which
+ * does) without either provider needing to know about the other.
+ */
+function toTokenUsage(usage: Record<string, unknown> | undefined): TokenUsage | undefined {
+  if (usage === undefined) return undefined;
+  const out: TokenUsage = {};
+  // Anthropic emits these as JSON NUMBERS, so num() is correct here — str()
+  // would silently return undefined for every single field.
+  const input = num(usage, 'input_tokens');
+  const output = num(usage, 'output_tokens');
+  if (input !== undefined) out.inputTokens = input;
+  if (output !== undefined) out.outputTokens = output;
+  const details = obj(usage, 'output_tokens_details');
+  const thinking = num(details, 'thinking_tokens');
+  if (thinking !== undefined) out.thinkingTokens = thinking;
+  const read = num(usage, 'cache_read_input_tokens');
+  if (read !== undefined) out.cacheReadTokens = read;
+  const write = num(usage, 'cache_creation_input_tokens');
+  if (write !== undefined) out.cacheWriteTokens = write;
+  // Anthropic does not send a total. Left undefined on purpose — core/ decides
+  // the accounting policy; providers do not invent numbers.
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** Is this a tool_result block reporting a permission refusal? */
+export function isPermissionDenial(text: string | undefined): boolean {
+  if (text === undefined) return false;
+  const hay = text.toLowerCase();
+  return (
+    hay.includes('permission') &&
+    (hay.includes('denied') || hay.includes('not allowed') || hay.includes('requested permissions'))
+  );
+}
+
+interface ClaudeTranslator {
+  onEvent(raw: Record<string, unknown>): ProviderEvent[];
+  finalText: string;
+  sessionId?: string;
+  model?: string;
+  sawResult: boolean;
+  sawErrorResult: boolean;
+  resultError?: string;
+  cost?: number;
+  numTurns?: number;
+  usage?: TokenUsage;
+  deniedTools: string[];
+}
+
+function createClaudeTranslator(maxChars: number): ClaudeTranslator {
+  const tx: ClaudeTranslator = {
+    finalText: '',
+    sawResult: false,
+    sawErrorResult: false,
+    deniedTools: [],
+    onEvent: () => [],
+  };
+  /** tool_use_id -> stepIndex */
+  const toolStep = new Map<string, number>();
+  let step = 0;
+
+  tx.onEvent = (raw: Record<string, unknown>): ProviderEvent[] => {
+    const out: ProviderEvent[] = [];
+    const type = str(raw, 'type');
+    const at = nowIso();
+
+    const sessionId = str(raw, 'session_id');
+    if (sessionId !== undefined) tx.sessionId = sessionId;
+
+    // ---- system / init ------------------------------------------------------
+    if (type === 'system') {
+      const subtype = str(raw, 'subtype');
+      if (subtype === 'init') {
+        const ev: ProviderEvent = { kind: 'started', at, raw };
+        if (sessionId !== undefined) ev.conversationId = sessionId;
+        const model = str(raw, 'model');
+        if (model !== undefined) {
+          ev.model = model;
+          tx.model = model;
+        }
+        out.push(ev);
+        return out;
+      }
+      if (subtype === 'thinking_tokens') {
+        // Not text, but the only live signal that the model is thinking. Show
+        // it as thinking text so the moderator pane feels alive instead of
+        // frozen for 90 seconds.
+        const est = raw['estimated_tokens'];
+        out.push({
+          kind: 'text',
+          at,
+          text: `thinking… ~${typeof est === 'number' ? est : '?'} tokens`,
+          stream: 'thinking',
+        });
+        return out;
+      }
+      if (subtype === 'hook_started' || subtype === 'hook_response') {
+        // Hooks genuinely run headless (verified — a SessionStart hook fired in
+        // my run). An operator watching 16 workers should know they are there.
+        out.push({
+          kind: 'notice',
+          at,
+          level: 'info',
+          message: `claude hook ${str(raw, 'hook_name') ?? subtype}`,
+          raw,
+        });
+        return out;
+      }
+      // Other system subtypes (compact_boundary, etc.) are informational.
+      out.push({ kind: 'notice', at, level: 'info', message: `claude system.${subtype ?? 'unknown'}`, raw });
+      return out;
+    }
+
+    // ---- assistant messages --------------------------------------------------
+    if (type === 'assistant') {
+      const message = obj(raw, 'message');
+      const content = Array.isArray(message?.['content']) ? (message['content'] as unknown[]) : [];
+
+      const usage = toTokenUsage(obj(message, 'usage'));
+      if (usage !== undefined) {
+        tx.usage = usage;
+        out.push({ kind: 'usage', at, usage });
+      }
+
+      for (const block of content) {
+        if (block === null || typeof block !== 'object') continue;
+        const b = block as Record<string, unknown>;
+        const bType = str(b, 'type');
+
+        if (bType === 'text') {
+          const text = str(b, 'text');
+          if (text !== undefined && text !== '') {
+            // parent_tool_use_id present => this text came from a SUBAGENT
+            // (forwarded by --forward-subagent-text). We must not fold it into
+            // finalText: the top-level result is the moderator's own answer, and
+            // a subagent's chatter in there would corrupt the moderated output.
+            const parent = str(b, 'parent_tool_use_id');
+            if (parent !== undefined) {
+              out.push({
+                kind: 'text',
+                at,
+                text: `[subagent] ${text}`,
+                stream: 'assistant',
+              });
+            } else {
+              tx.finalText += text;
+              out.push({ kind: 'text', at, text, stream: 'assistant' });
+            }
+          }
+          continue;
+        }
+
+        if (bType === 'thinking') {
+          const thinking = str(b, 'thinking');
+          if (thinking !== undefined && thinking !== '') {
+            out.push({ kind: 'text', at, text: thinking, stream: 'thinking' });
+          }
+          continue;
+        }
+
+        if (bType === 'tool_use') {
+          const toolUseId = str(b, 'id') ?? `toolu-${step}`;
+          const toolName = str(b, 'name') ?? 'unknown';
+          const idx = step++;
+          toolStep.set(toolUseId, idx);
+          const input = preview(b['input'], maxChars);
+          const ref: ActivityRef = { stepIndex: idx, tool: toolName, toolCallId: toolUseId };
+          if (input !== undefined) ref.input = input.text;
+          if (input?.truncated === true) ref.truncated = true;
+          out.push({ kind: 'activity-start', at, activity: ref });
+          continue;
+        }
+      }
+      return out;
+    }
+
+    // ---- user messages: tool_result blocks ----------------------------------
+    if (type === 'user') {
+      const message = obj(raw, 'message');
+      const content = Array.isArray(message?.['content']) ? (message['content'] as unknown[]) : [];
+      for (const block of content) {
+        if (block === null || typeof block !== 'object') continue;
+        const b = block as Record<string, unknown>;
+        if (str(b, 'type') !== 'tool_result') continue;
+
+        const toolUseId = str(b, 'tool_use_id') ?? '';
+        const idx = toolStep.get(toolUseId) ?? step++;
+        if (toolUseId !== '') toolStep.set(toolUseId, idx);
+
+        // tool_result.content is either a string or an array of content blocks.
+        const rawContent = b['content'];
+        const text = typeof rawContent === 'string' ? rawContent : preview(rawContent, maxChars)?.text;
+        const isError = b['is_error'] === true;
+
+        const denied = isError && isPermissionDenial(text);
+        let status: ActivityStatus = 'done';
+        if (denied) status = 'denied';
+        else if (isError) status = 'error';
+
+        const output = preview(text, maxChars);
+        const ref: ActivityRef = { stepIndex: idx, tool: 'tool_result', toolCallId: toolUseId };
+        if (output !== undefined) ref.output = output.text;
+        if (output?.truncated === true) ref.truncated = true;
+        if (denied) ref.denied = true;
+
+        out.push({ kind: 'activity-end', at, activity: ref, status });
+        if (denied) tx.deniedTools.push(toolUseId);
+      }
+      return out;
+    }
+
+    // ---- result --------------------------------------------------------------
+    if (type === 'result') {
+      tx.sawResult = true;
+      const subtype = str(raw, 'subtype');
+      const isError = raw['is_error'] === true || (subtype !== undefined && subtype !== 'success');
+      if (isError) tx.sawErrorResult = true;
+      // On success, `result` IS the answer (handled below), so it is only an
+      // "error" when it came back on a non-success result event.
+      const errText = str(raw, 'error') ?? (isError ? str(raw, 'result') : undefined);
+      if (errText !== undefined) tx.resultError = errText;
+
+      const usage = toTokenUsage(obj(raw, 'usage'));
+      if (usage !== undefined) {
+        tx.usage = usage;
+        out.push({ kind: 'usage', at, usage });
+      }
+      const cost = raw['total_cost_usd'];
+      if (typeof cost === 'number') tx.cost = cost;
+      const turns = raw['num_turns'];
+      if (typeof turns === 'number') tx.numTurns = turns;
+
+      // The top-level `result` string is the authoritative final answer. Prefer
+      // it over our concatenation of text blocks: if the run used
+      // --forward-subagent-text, the concatenation includes subagent chatter we
+      // deliberately excluded, but if claude compressed or re-emitted text the
+      // `result` field is still correct.
+      const finalAnswer = str(raw, 'result');
+      if (finalAnswer !== undefined && finalAnswer !== '') tx.finalText = finalAnswer;
+      return out;
+    }
+
+    if (type === 'error') {
+      tx.sawErrorResult = true;
+      out.push({
+        kind: 'notice',
+        at,
+        level: 'error',
+        message: str(obj(raw, 'error'), 'message') ?? str(raw, 'message') ?? 'claude error',
+        raw,
+      });
+      return out;
+    }
+
+    return out;
+  };
+
+  return tx;
+}
+
+// ---------------------------------------------------------------------------
+// Result
+// ---------------------------------------------------------------------------
+
+interface ExitInfo {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  killReason: 'cancelled' | 'timeout' | undefined;
+  stderr: string;
+}
+
+function buildResult(args: {
+  jobId: string;
+  startedAtMs: number;
+  stateDir: string;
+  exit: ExitInfo;
+  tx: ClaudeTranslator;
+}): JobResult {
+  const { jobId, startedAtMs, stateDir, exit, tx } = args;
+  const finishedAt = nowIso();
+  const durationMs = Date.now() - startedAtMs;
+
+  let status: JobStatus;
+  let error: string | undefined;
+
+  if (exit.killReason === 'cancelled') {
+    status = 'cancelled';
+    error = 'cancelled by operator';
+  } else if (exit.killReason === 'timeout') {
+    status = 'timeout';
+    // NOTE: claude has no --print-timeout. This kill is entirely ours, which is
+    // why we must never infer success from "it produced a lot of output".
+    error = `exceeded the ${durationMs} ms budget and was killed (claude has no internal timeout, so this is our SIGTERM)`;
+  } else if (tx.deniedTools.length > 0) {
+    // Same discipline as agy. A moderator whose tools were denied has not
+    // moderated anything, and claude may still report subtype "success".
+    status = 'denied';
+    error =
+      `claude had ${tx.deniedTools.length} tool call(s) denied by the permission policy, ` +
+      'so the moderation did not actually happen. A prober/moderator with no tools ' +
+      'cannot probe. Consider unrestricted:true, or --allowedTools. ' +
+      `stderr tail: ${exit.stderr.slice(0, 400) || '(empty)'}`;
+  } else if (!tx.sawResult) {
+    // No result event: killed early, crashed, or a CLI output change.
+    status = exit.code === 0 ? 'malformed' : 'error';
+    error =
+      `claude exited ${exit.code === null ? `on signal ${exit.signal ?? 'unknown'}` : `with code ${exit.code}`} ` +
+      'without a result event. stderr tail: ' + (exit.stderr.slice(0, 400) || '(empty)');
+  } else if (tx.sawErrorResult) {
+    status = 'error';
+    error = tx.resultError ?? 'claude reported a non-success result';
+  } else if (exit.code !== 0) {
+    status = 'error';
+    error = `claude reported success but exited with code ${exit.code}. stderr tail: ${
+      exit.stderr.slice(0, 400) || '(empty)'
+    }`;
+  } else {
+    status = 'success';
+  }
+
+  const out: JobResult = {
+    jobId,
+    provider: 'claude',
+    ok: status === 'success',
+    status,
+    exitCode: exit.code,
+    signal: exit.signal,
+    response: tx.finalText,
+    durationMs,
+    startedAt: new Date(startedAtMs).toISOString(),
+    finishedAt,
+    stateDir,
+  };
+  if (error !== undefined) out.error = error;
+  if (tx.usage !== undefined) out.usage = tx.usage;
+  const raw: Record<string, unknown> = {};
+  if (tx.sessionId !== undefined) raw['sessionId'] = tx.sessionId;
+  if (tx.model !== undefined) raw['model'] = tx.model;
+  if (tx.cost !== undefined) raw['totalCostUsd'] = tx.cost;
+  if (tx.numTurns !== undefined) raw['numTurns'] = tx.numTurns;
+  if (Object.keys(raw).length > 0) out.raw = raw;
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Provider
+// ---------------------------------------------------------------------------
+
+export const claudeProvider: Provider = {
+  name: 'claude',
+
+  async available(): Promise<boolean> {
+    try {
+      return await binaryOnPath(CLAUDE_BINARY);
+    } catch {
+      return false;
+    }
+  },
+
+  async spawn(spec: SpawnSpec): Promise<WorkerHandle> {
+    const jobId = spec.jobId ?? newJobId();
+    const stateDir = writeStateDir('claude', jobId, spec.stateDir);
+    const argv = buildArgv(spec);
+    writeArgv(stateDir, argv, spec.cwd);
+
+    const maxChars = spec.maxOutputChars ?? 2000;
+    const bus = createEventBus();
+    const tx = createClaudeTranslator(maxChars);
+
+    const publish = (events: ProviderEvent[]): void => {
+      for (const e of events) {
+        bus.emit(e);
+        appendEventLog(stateDir, e);
+      }
+    };
+
+    const startedAtMs = Date.now();
+
+    const proc = await spawnWorker({
+      provider: 'claude',
+      binary: CLAUDE_BINARY,
+      argv,
+      cwd: spec.cwd,
+      timeoutMs: spec.timeoutMs,
+      stateDir,
+      jobId,
+      mode: spec.mode,
+      ...(spec.env !== undefined ? { env: spec.env } : {}),
+      onStdoutLine(line) {
+        const raw = tryParseObject(line);
+        if (raw === undefined) {
+          bus.emit({
+            kind: 'notice',
+            at: nowIso(),
+            level: 'warn',
+            message: `claude stdout (non-JSON): ${truncate(line, 400).text}`,
+          });
+          return;
+        }
+        publish(tx.onEvent(raw));
+      },
+      onStderr(chunk) {
+        const text = chunk.trim();
+        if (text === '') return;
+        bus.emit({ kind: 'notice', at: nowIso(), level: 'info', message: truncate(text, 800).text });
+      },
+    });
+
+    let resolveResult: (r: JobResult) => void = () => {};
+    const resultPromise = new Promise<JobResult>((resolve) => {
+      resolveResult = resolve;
+    });
+
+    void proc.exited.then(({ code, signal }) => {
+      proc.closeLog();
+      const final = buildResult({
+        jobId,
+        startedAtMs,
+        stateDir,
+        tx,
+        exit: { code, signal, killReason: proc.killReason, stderr: stderrTailOf(proc) },
+      });
+      bus.close();
+      writeResultFile(stateDir, final);
+      resolveResult(final);
+    });
+
+    return {
+      id: jobId,
+      stateDir,
+      cancel: () => proc.terminate('cancelled'),
+      waitForResult: () => resultPromise,
+      onEvent: (listener) => bus.onEvent(listener),
+      events: bus.events,
+    };
+  },
+};
+
+export const claude = claudeProvider;

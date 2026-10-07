@@ -1,0 +1,16 @@
+{
+  "resolved": {
+    "mode": "implement",
+    "model": "gemini-3.8-flash-high",
+    "profile": "unrestricted",
+    "background": true,
+    "timeout": "120m"
+  },
+  "prompt": "[REDACTED for fixture]",
+  "prompt_source": {
+    "kind": "template",
+    "task": "[REDACTED for fixture]"
+  },
+  "opts": {},
+  "cwd": "/tmp/fixture-repo"
+}
