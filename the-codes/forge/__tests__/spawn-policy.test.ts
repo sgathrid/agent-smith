@@ -201,10 +201,12 @@ test('stale, empty, errored, unverified or throwing catalogs warn instead of rej
 
 test('agy preflight warns when a command-running mode is restricted', async () => {
   const { service } = svc(fakeProvider('agy'));
-  const warn = await service.spawnJob({ mode: 'implement', prompt: 'x' });
+  const warn = await service.spawnJob({ mode: 'implement', prompt: 'x', unrestricted: false });
   assert.ok(warn.warnings?.some((w) => /agy cannot prompt for permission headless/.test(w)));
   const quiet = await service.spawnJob({ mode: 'implement', name: 'q', prompt: 'x', unrestricted: true });
   assert.equal(quiet.warnings, undefined);
+  const dflt = await service.spawnJob({ mode: 'implement', name: 'd', prompt: 'x' });
+  assert.equal(dflt.unrestricted, true, 'agy defaults to unrestricted');
   const review = await service.spawnJob({ mode: 'review', name: 'r', prompt: 'x' });
   assert.equal(review.warnings, undefined);
 });

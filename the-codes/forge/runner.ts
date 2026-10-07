@@ -327,7 +327,7 @@ export function createForgeRunner(deps: RunnerDeps): StageRunner {
       // A stage timeout is ALSO enforced by the DAG via ctx.signal, so this is a
       // second, independent line of defence rather than the only one.
       timeoutMs: stage.timeoutMs ?? 0,
-      unrestricted: deps.unrestricted === true,
+      unrestricted: deps.unrestricted,
       pipeline: ctx.pipeline,
       stage: stage.name,
       attempt: ctx.attempt,

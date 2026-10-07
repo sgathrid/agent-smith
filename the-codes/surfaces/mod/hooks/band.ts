@@ -123,7 +123,7 @@ export function noColor(env: {
  * reason this section is short: the row used to be built here, separately, with
  * its own field order and its own head/tail split, and the two surfaces drifted.
  *
- *   running : ` ◌ the output gate core              running tests  28m03s`
+ *   running : ` ⏺ the output gate core              running tests  28m03s`
  *   needs   : ` ⚠ close the registration leaks       needs you  14m48s`
  *   done    : ` ✓ show the doctor each column        finished    1m15s`
  *   failed  : ` ✗ registration uses the column       failed ∙ tool error  4m36s`

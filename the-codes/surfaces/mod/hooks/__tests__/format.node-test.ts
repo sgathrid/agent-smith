@@ -194,8 +194,8 @@ test('every status has a single-width glyph, and the glyph alone is unambiguous'
   assert.equal(new Set(glyphs).size, statuses.length, 'two states share a glyph');
 });
 
-test('running is ◌, succeeded is ✓, failed is ✗ — the current row set', () => {
-  assert.equal(pickGlyph('running'), '◌');
+test('running is ⏺, succeeded is ✓, failed is ✗ — the current row set', () => {
+  assert.equal(pickGlyph('running'), '⏺');
   assert.equal(pickGlyph('succeeded'), '✓');
   assert.equal(pickGlyph('failed'), '✗');
 });
@@ -216,7 +216,7 @@ test('colour never carries meaning alone — every coloured status also has a gl
   }
   // Terminal-UI.md §Colour: yellow=running, green=done, red=failed. Do not invent a
   // local convention — git, cargo, pytest and CI all agree on this one.
-  assert.equal(pickColor('running'), 'yellow');
+  assert.equal(pickColor('running'), 'blue');
   assert.equal(pickColor('succeeded'), 'green');
   assert.equal(pickColor('failed'), 'red');
 });
@@ -307,7 +307,7 @@ test('a job line reads as glyph, identity, activity, then elapsed', () => {
     }),
     { label: 18, detail: 30, now: 724_000 },
   );
-  assert.ok(line.startsWith(' ◌ implement-musm82da'));
+  assert.ok(line.startsWith(' ⏺ implement-musm82da'));
   assert.ok(line.includes('cargo test --workspace'));
   assert.ok(line.endsWith('12m04s'));
 });
@@ -322,9 +322,9 @@ test('the three design lines, and their columns line up', () => {
   ].map((j) => formatJobLine(j, { label: 18, detail: 30, now: j.endedAt ?? 724_000 }));
 
   // Content, in the current design's order: identity, liveness, then clock.
-  assert.ok(lines[0]!.startsWith(' ◌ implement-musm82da'));
+  assert.ok(lines[0]!.startsWith(' ⏺ implement-musm82da'));
   assert.ok(lines[0]!.endsWith('12m04s'));
-  assert.ok(lines[1]!.startsWith(' ◌ review-muroviej'));
+  assert.ok(lines[1]!.startsWith(' ⏺ review-muroviej'));
   assert.ok(lines[1]!.endsWith('2m18s'));
   assert.ok(lines[1]!.includes('reading decoded_view.rs'));
   assert.ok(lines[2]!.startsWith(' ✓ research-muroabc'));

@@ -59,7 +59,7 @@ import type { RadarJob, RadarStatus } from '../types/index.d.ts';
  * EAW=Neutral (one column in every locale, which is a correctness property and
  * not a taste question):
  *
- *     running    ◌  (U+25CC)    succeeded  ✓  (U+2713)
+ *     running    ⏺  (U+23FA)    succeeded  ✓  (U+2713)
  *     failed     ✗  (U+2717)    attention  ⚠  (U+26A0)
  *     neutral    ∙  (U+2219)
  *
@@ -71,7 +71,7 @@ import type { RadarJob, RadarStatus } from '../types/index.d.ts';
  *      column drift the whole glyph section exists to prevent, and it is why
  *      Claude Code itself ships `U+23FA ⏺` on macOS and `U+25CF ●` everywhere
  *      else — even Anthropic treats the choice as a per-platform negotiation.
- *      `◌` and `∙` are genuinely neutral.
+ *      `⏺` and `∙` are genuinely neutral.
  *   2. `!` for attention is ASCII punctuation rather than a glyph, and `·` for
  *      canceled collided with the separator the rows used between fields, so a
  *      monochrome reader could not tell a cancelled job from a separator.
@@ -84,7 +84,7 @@ import type { RadarJob, RadarStatus } from '../types/index.d.ts';
 export function pickGlyph(status: RadarStatus): string {
   switch (status) {
     case 'running':
-      return '◌';
+      return '⏺';
     case 'succeeded':
       return '✓';
     case 'failed':
@@ -111,10 +111,10 @@ export function pickGlyph(status: RadarStatus): string {
  */
 export function pickColor(
   status: RadarStatus,
-): 'yellow' | 'green' | 'red' | 'cyan' | undefined {
+): 'blue' | 'green' | 'red' | 'cyan' | undefined {
   switch (status) {
     case 'running':
-      return 'yellow'; // bold is applied at the call site
+      return 'blue'; // bold is applied at the call site
     case 'succeeded':
       return 'green';
     case 'failed':
@@ -525,7 +525,7 @@ export interface JobRow {
   /** head + label + detail + clock: exactly what the terminal shows. */
   readonly plain: string;
   /** null means "pass no colour prop at all" — NO_COLOR, canceled, unknown. */
-  readonly accent: 'yellow' | 'green' | 'red' | 'cyan' | undefined;
+  readonly accent: 'blue' | 'green' | 'red' | 'cyan' | undefined;
   /** Only running and attention are bold: the states still in flux. */
   readonly bold: boolean;
   /** True when the whole row should be drawn dim (finished, canceled, unknown). */

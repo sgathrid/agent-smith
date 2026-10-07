@@ -62,7 +62,7 @@ findings off the line until the review ends. [S, shipped mods]
 
 | State | Glyph | Colour | Weight |
 | --- | --- | --- | --- |
-| running | `◌` | `yellow` | bold |
+| running | `⏺` | `blue` | bold |
 | done | `✓` | `green` | — |
 | failed | `✗` | `red` | — |
 | needs you | `⚠` | `cyan` | bold |
@@ -109,7 +109,7 @@ Verified against UCD `EastAsianWidth.txt`:
 
 | Glyph | EAW | Verdict |
 | --- | --- | --- |
-| `✓` `✗` `✔` `◌` `∙` `⚠` `▸` | **N** | **safe** — 1 column everywhere |
+| `✓` `✗` `✔` `⏺` `∙` `⚠` `▸` | **N** | **safe** — 1 column everywhere |
 | `●` `·` `…` `–` `│` `─` `└` | **A** | risky in CJK locales |
 | `⏳` `✅` `❌` | **W** | **never** — 2 columns |
 
@@ -121,14 +121,14 @@ Anthropic treats glyph choice as a per-platform negotiation, not solved.
 Our set, all `EAW=N`:
 
 ```
-running    ◌   (U+25CC)   static liveness dot
+running    ⏺   (U+23FA)   static liveness dot
 done       ✓   (U+2713)
 failed     ✗   (U+2717)
 needs you  ⚠   (U+26A0)
 neutral    ∙   (U+2219)
 ```
 
-We use **`◌` for running, not `●`** — same meaning, genuinely single-width.
+We use **`⏺` for running, not `●`** — same meaning, genuinely single-width.
 
 **Both reference mods ship the emoji bug.** `review-watch` uses `⏳ ✅ ✗`: the
 first two are `EAW=Wide`, so every column after them misaligns. `agent-radar`'s
@@ -289,7 +289,7 @@ Terminal equivalents, and what actually exists:
    animations for accessibility."* Codex goes further and reads the **OS**
    setting directly (macOS `accessibilityDisplayShouldReduceMotion`, Windows
    `SPI_GETCLIENTAREAANIMATION`, Linux xdg portal) with an explicit substitute per
-   element: animated spinner → static `◌`, shimmered dot → dimmed `•`. We take
+   element: animated spinner → static `⏺`, shimmered dot → dimmed `•`. We take
    the same substitution: **zero animation is our default anyway**, so the
    setting costs us nothing. [S]
 

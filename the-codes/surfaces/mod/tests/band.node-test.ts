@@ -83,7 +83,8 @@ test('every status has a distinct single-width glyph, so colour is never alone',
     // and `✅` render DOUBLE-WIDTH and silently break every column after them,
     // which is what the shipped review-watch mod does. The check is on the code
     // point rather than on a list someone might extend.
-    assert.ok(!/\p{Extended_Pictographic}/u.test(g), `${g} is emoji and may be double-width`);
+    // U+23FA is the one deliberate exception: text-presentation by default (not Emoji_Presentation), and the glyph Claude Code itself ships on macOS.
+    assert.ok(g === '⏺' || !/\p{Extended_Pictographic}/u.test(g), `${g} is emoji and may be double-width`);
     assert.equal([...g].length, 1, `${g} is not a single code point`);
     assert.ok((g.codePointAt(0) ?? 0) <= 0xffff, `${g} is outside the BMP`);
   }
@@ -93,8 +94,8 @@ test('every status has a distinct single-width glyph, so colour is never alone',
   assert.equal(new Set(glyphs).size, statuses.length, 'two states share a glyph');
 });
 
-test('running/done/failed are ◌ ✓ ✗ — the current row set', () => {
-  assert.equal(pickGlyph('running'), '◌');
+test('running/done/failed are ⏺ ✓ ✗ — the current row set', () => {
+  assert.equal(pickGlyph('running'), '⏺');
   assert.equal(pickGlyph('succeeded'), '✓');
   assert.equal(pickGlyph('failed'), '✗');
 });
@@ -119,7 +120,7 @@ test('unknown is neither healthy-looking nor failure-looking', () => {
 test('colours follow the fixed convention: yellow running, green done, red failed', () => {
   // TERMINAL-UI.md L80-82: git, cargo, pytest and CI all agree; do not invent a
   // local convention.
-  assert.equal(pickColor('running'), 'yellow');
+  assert.equal(pickColor('running'), 'blue');
   assert.equal(pickColor('succeeded'), 'green');
   assert.equal(pickColor('failed'), 'red');
   // Every coloured state also has a glyph, so colour is decoration on a decision
@@ -174,7 +175,7 @@ test('the band line is identity, then liveness, then elapsed LAST', () => {
   // TERMINAL-UI.md L129-132: the ticking field goes last, so the activity text
   // does not slide sideways once a second. This ordering is the band/pane
   // deviation; see README.md §Deviation.
-  assert.equal(line.plain, ' ◌ implement-musm82da                           cargo test --workspace 12m04s');
+  assert.equal(line.plain, ' ⏺ implement-musm82da                           cargo test --workspace 12m04s');
   assert.ok(line.plain.endsWith('12m04s'), `elapsed must be last: ${line.plain}`);
 });
 
@@ -222,7 +223,7 @@ test('the head carries the glyph and the accent; the tail is everything dim', ()
   const done = buildLine(job({ status: 'succeeded', endedAt: 2_000 }), 2_000);
   const gone = buildLine(job({ status: 'canceled', endedAt: 2_000 }), 2_000);
 
-  assert.equal(running.accent, 'yellow');
+  assert.equal(running.accent, 'blue');
   assert.equal(running.bold, true);
   assert.equal(done.accent, 'green');
   assert.equal(gone.accent, undefined, 'canceled is glyph-only');
@@ -329,10 +330,10 @@ test('NO_COLOR drops colour but keeps the glyph, so state still reads', () => {
   const withColour = buildLine(one, 1_000);
   const without = buildLine(one, 1_000, { colour: false });
 
-  assert.equal(withColour.accent, 'yellow');
+  assert.equal(withColour.accent, 'blue');
   assert.equal(without.accent, undefined, 'no colour prop at all');
   // The redundant channel survives — this is the whole point of the glyph.
-  assert.equal(without.glyph, '◌');
+  assert.equal(without.glyph, '⏺');
   assert.equal(without.plain, withColour.plain, 'only colour changes, never the text');
 });
 

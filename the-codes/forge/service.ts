@@ -27,7 +27,7 @@
  * concurrency of 3; a spawn path that holds the caller is that failure again.
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * SAFETY: --dangerously-skip-permissions IS OFF BY DEFAULT
+ * SAFETY: --dangerously-skip-permissions IS OFF BY DEFAULT (EXCEPT FOR agy)
  * ─────────────────────────────────────────────────────────────────────────────
  *
  * `SpawnSpec.unrestricted` is a required field and this module defaults it to
@@ -36,7 +36,9 @@
  * returns an empty response and exits 0 (verified live — see providers/agy.ts,
  * THE TRAP). Passing the flag by default would be "safe" for the job and
  * dangerous for the user, and the whole point of this repo is that we never
- * quietly choose for them. It is opt-in, per call, and it is recorded in
+ * quietly choose for them. The one exception is agy, where restricted mode just
+ * fails silently, so it defaults to unrestricted (pass unrestricted:false or set
+ * AGENT_SMITH_AGY_RESTRICTED=1 to opt out). Everything else is opt-in, per call. It is recorded in
  * job.json as `unrestricted: true` so nobody has to guess later.
  *
  * ─────────────────────────────────────────────────────────────────────────────
@@ -451,7 +453,8 @@ export class ForgeService {
     }
     const timeoutMs = clampTimeout(request.timeoutMs);
     const cwd = request.cwd ?? this.repo;
-    const unrestricted = request.unrestricted === true;
+    // agy cannot prompt headless, so restricted means silent denial: default it on. Explicit false (or AGENT_SMITH_AGY_RESTRICTED=1) opts out.
+    const unrestricted = request.unrestricted ?? (provider.name === 'agy' && process.env['AGENT_SMITH_AGY_RESTRICTED'] !== '1');
     const warnings: string[] = [];
     if (request.model !== undefined || request.effort !== undefined) {
       warnings.push(

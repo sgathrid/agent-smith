@@ -199,8 +199,11 @@ capped at 1,800,000 ms; re-arm on expiry), or call `status` with `wait_ms`, or
 
 Workers start with their harness's restricted configuration, not the parent
 Claude session's permission rules: Codex workspace-write, Claude noninteractive
-permission denial, agy auto-denying unapproved tools, OpenCode its configured
-permissions. `unrestricted: true` requests the provider's bypass mode. Workers
+permission denial, OpenCode its configured permissions. `unrestricted: true`
+requests the provider's bypass mode. **agy is the exception:** headless agy cannot
+prompt and silently auto-denies tools, so it defaults to
+`--dangerously-skip-permissions`. Pass `unrestricted: false` (or set
+`AGENT_SMITH_AGY_RESTRICTED=1`) to keep agy restricted. Workers
 edit the requested working tree; use a stage `workDir` (for example a separate git
 worktree) to isolate parallel editors. Default job budget is 45 minutes.
 

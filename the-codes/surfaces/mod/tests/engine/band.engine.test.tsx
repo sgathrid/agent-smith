@@ -200,14 +200,14 @@ describe('the band', () => {
     } as never);
 
     // The exact line from the design brief, produced from real corpus files.
-    const line = await band.find({ type: 'Text', text: /◌ open an agent-built dashboard/ });
+    const line = await band.find({ type: 'Text', text: /⏺ open an agent-built dashboard/ });
     expect(line).toBeDefined();
     // …and the clock, which is 12m04s from the real log's worker-started line.
     expect(await band.find({ type: 'Text', text: '12m04s' })).toBeDefined();
 
     // The accent, and only the accent, is coloured; the rest is dim.
     const head = (line as { children?: { props?: Record<string, unknown> }[] }).children?.[0];
-    expect(head?.props?.color).toBe('yellow');
+    expect(head?.props?.color).toBe('blue');
     expect(head?.props?.bold).toBe(true);
   });
 
@@ -249,7 +249,7 @@ describe('the band', () => {
     await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
     const band = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', ...BAND } as never);
 
-    const line = await band.find({ type: 'Text', text: /◌ open an agent-built dashboard/ });
+    const line = await band.find({ type: 'Text', text: /⏺ open an agent-built dashboard/ });
     expect(line).toBeDefined();
     const head = (line as { children?: { props?: Record<string, unknown> }[] }).children?.[0];
     // The redundant channel survives: the glyph still says "running".
@@ -303,7 +303,7 @@ describe('HAZARD A, as drawn', () => {
     // No tool count, because there is genuinely none on disk — omitted, not 0.
     expect(await band.find({ type: 'Text', text: /0 tools/ })).toBeUndefined();
     // And it does NOT read as still running.
-    expect(await band.find({ type: 'Text', text: /◌ open an agent-built dashboard/ })).toBeUndefined();
+    expect(await band.find({ type: 'Text', text: /⏺ open an agent-built dashboard/ })).toBeUndefined();
   });
 
   test('empty output + warnings:true draws FAILED, not a green check', async ($, on) => {
@@ -428,8 +428,8 @@ describe('the render path uses the tested helpers', () => {
     };
     const line: BandLine = buildLine(job, RUNNING_NOW);
     expect(line.plain).toContain('12m04s');
-    expect(line.glyph).toBe('◌');
-    expect(line.accent).toBe('yellow');
+    expect(line.glyph).toBe('⏺');
+    expect(line.accent).toBe('blue');
 
     const budget: BandBudget = rowBudget([job], 10);
     expect(budget.rows).toHaveLength(1);
