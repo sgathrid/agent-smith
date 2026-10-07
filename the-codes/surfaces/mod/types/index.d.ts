@@ -160,6 +160,10 @@ declare module 'claude-code' {
       now: number;
       /** Job ids dismissed with `c`; filtered against on read, never deleted. */
       cleared: string[];
+      /** Follow mode (`f`): bounded live tail in the detail view. Resets on `/forge`. */
+      follow: boolean;
+      /** `p`: show the prompt as sent, with the mode preamble. Resets on `/forge`. */
+      showPreamble: boolean;
       /**
        * The band's own snapshot of the jobs directory, from the 3 s poll.
        *
