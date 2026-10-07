@@ -1,17 +1,17 @@
 # agent-smith — the band
 
 A Claude Code mod that draws **one live line per running agy / Codex / OpenCode
-job** in the `AbovePrompt` band, and opens a browsable pane on `/radar`.
+job** in the `AbovePrompt` band, and opens a browsable pane on `/forge`.
 
 ```
  ● implement-musm82da-f1dc1fe4 cargo test --workspace · 341 tools ·     12m04s
  ● implement-muroviej-a23df195 reading decoded_view.rs ·  22 tools ·     02m18s
  ! implement-musm82da-f1dc1fe4 stalled ·  341 tools · 1h02m03s
  ✓ research-muroabc-f1dc1fe4 finished, warnings ·  8 tools ·      48s
-   +2 more · /radar
+   +2 more · /forge
 ```
 
-**This file covers the band.** The pane (`/radar`) is a separate surface with
+**This file covers the band.** The pane (`/forge`) is a separate surface with
 a separate owner; see [§ Scope boundary](#scope-boundary).
 
 ---
@@ -182,7 +182,7 @@ return.
 
 **`hooks/jobs.ts` is the only file in the mod that reads `.agy-staff/jobs/`, and
 `resolve()` is the only function that decides a job's status.** § BAND and § PANE
-both call it, so the band above the prompt and the list inside `/radar` cannot
+both call it, so the band above the prompt and the list inside `/forge` cannot
 report different states for the same job. Two readers would mean two answers to
 "is this job still running", which is the drift this project exists to eliminate.
 

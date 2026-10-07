@@ -180,7 +180,6 @@ declare module 'claude-code' {
     Text(props: TextProps): JSX.Element;
     Button(props: ButtonProps): JSX.Element;
     Markdown(props: MarkdownProps): JSX.Element;
-    Code(props: CodeProps): JSX.Element;
   }
 
   /**
@@ -324,13 +323,20 @@ declare module 'claude-code' {
   }
 
   export interface MarkdownProps {
-    source: string;
+    /**
+     * The markdown body.
+     *
+     * `text`, NOT `source` — a vendored declaration guessed `source` and the
+     * engine refused it at render time:
+     *   "JSX element <Markdown> needs text, a string (the markdown)"
+     * When the two disagree, the runtime error IS the specification.
+     */
+    text: string;
   }
 
-  export interface CodeProps {
-    source: string;
-    language?: string;
-  }
+  // CodeProps deliberately NOT declared. It was a guess (`source`), and the
+  // Markdown guess was wrong the same way. The engine is the spec: find out by
+  // using it once and reading the thrown HooksError, not by inventing a shape.
 }
 
 // ── JSX ────────────────────────────────────────────────────────────────────

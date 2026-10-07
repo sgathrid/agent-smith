@@ -412,11 +412,11 @@ export const register: Register = (on) => {
   on('session.start', async ($, e, next) => {
     const rest = await next(e);
     // Band first, and it never throws: a slow or failing band config must not
-    // delay `/agent-smith` appearing or take the session's start with it.
+    // delay `/forge` appearing or take the session's start with it.
     await startBand($, typeof e.cwd === 'string' ? e.cwd : undefined);
     await $.command
       .register({
-        name: 'radar',
+        name: 'forge',
         description: 'Browse worker jobs: tool history, warnings, and the final report',
       })
       .catch(() => {});
@@ -430,7 +430,7 @@ export const register: Register = (on) => {
   // The matcher must equal the name registered above — 'radar', not the plugin
   // name. A matcher that matches nothing is a pane nobody can open, and it fails
   // SILENTLY, so the two strings are deliberately the same string.
-  on('command.run', { command: 'radar' }, async ($, _e, _next) => {
+  on('command.run', { command: 'forge' }, async ($, _e, _next) => {
     // Reset the selection so the pane always opens on the list. Opening directly
     // into a stale detail view would be disorienting: the user asked for a
     // browser, not for wherever they happened to be last time.
@@ -460,7 +460,7 @@ export const register: Register = (on) => {
   // band, where other mods and Claude Code draw above the prompt; it does not
   // apply here, and calling next(e) would be cargo-culting.
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e, _next) => {
-    const { Box, Text, Button, Markdown, Code } = $.ui.resolve(e);
+    const { Box, Text, Button, Markdown } = $.ui.resolve(e);
 
     // Subscribe to the clock. This read is what repaints the pane as elapsed cells
     // tick; without it the pane would redraw only when something else changed.
@@ -485,7 +485,7 @@ export const register: Register = (on) => {
         // Promise, and a Promise is not a renderable element. Reading in the hook
         // also means exactly one read per render.
         const history = await readToolHistory(fs, repo, pick);
-        return renderDetail($, e, job, t, history, hidden, { Box, Text, Button, Markdown, Code });
+        return renderDetail($, e, job, t, history, hidden, { Box, Text, Button, Markdown });
       }
       // The selected job vanished — agy-staff cleaned the directory, or the id
       // came from a stale list. Fall back to the list rather than rendering a
@@ -616,7 +616,7 @@ function renderDetail(
   hidden: readonly string[],
   W: Widgets,
 ): JSX.Element {
-  const { Box, Text, Button, Markdown, Code } = W;
+  const { Box, Text, Button, Markdown } = W;
 
   return (
     <Box flexDirection="column">
@@ -666,7 +666,7 @@ function renderDetail(
           rendering it as a monospace blob would make it harder to skim than the
           one-line summary above it already did. */}
       {job.report !== null && job.report.trim().length > 0 ? (
-        <Markdown source={job.report} />
+        <Markdown text={job.report} />
       ) : (
         // No report. On a terminal status this is the headline rule from
         // normalize.ts: empty output + warnings is a suspicious success, not a
