@@ -104,7 +104,7 @@ import {
   writeArgv,
   writeResultFile,
   writeStateDir,
-} from './ndjson.js';
+} from './ndjson.ts';
 import type {
   ActivityRef,
   ActivityStatus,
@@ -116,7 +116,10 @@ import type {
   SpawnSpec,
   TokenUsage,
   WorkerHandle,
-} from './types.js';
+} from './types.ts';
+import type { ListModelsOptions, ModelCatalog, ModelInfo, SandboxInfo } from './types.ts';
+import { DEFAULT_DISCOVERY_TIMEOUT_MS, errMessage, runCapture } from './discovery.ts';
+import type { RunFn } from './discovery.ts';
 
 export const AGY_BINARY = process.env['AGENT_SMITH_AGY_BIN'] ?? 'agy';
 
@@ -203,6 +206,48 @@ export function modelCarriesEffort(model: string): boolean {
   return /-(low|medium|high|xhigh|max)$/i.test(model);
 }
 
+const COMPOSABLE_EFFORTS = ['low', 'medium', 'high'];
+
+/**
+ * Decide the --model / --effort pair. `agy models` lists effort-SUFFIXED ids and
+ * discovery (listModels) exposes BASE ids, so a base id + low|medium|high effort
+ * composes to `<base>-<effort>` (the form agy actually knows) and no --effort is
+ * passed. Other efforts (xhigh/max) keep the separate --effort flag. An id that
+ * already carries a suffix is used as-is; a conflicting effort throws.
+ */
+export function resolveModelAndEffort(spec: Pick<SpawnSpec, 'model' | 'effort'>): {
+  model?: string;
+  effortFlag?: string;
+} {
+  const model = spec.model !== undefined && spec.model !== '' ? spec.model : undefined;
+  const effort = spec.effort !== undefined && spec.effort !== '' ? spec.effort : undefined;
+  if (effort === undefined) return model === undefined ? {} : { model };
+  if (model === undefined) return { effortFlag: effort };
+  const encoded = model.match(/-(low|medium|high|xhigh|max)$/i)?.[1]?.toLowerCase();
+  if (encoded !== undefined) {
+    if (encoded !== effort) throw new Error(`model ${model} encodes effort ${encoded}, conflicting with ${effort}`);
+    return { model };
+  }
+  if (COMPOSABLE_EFFORTS.includes(effort)) return { model: `${model}-${effort}` };
+  return { model, effortFlag: effort };
+}
+
+/** Sandbox flags agy gets for a spawn. Shared by buildArgv and describeSandbox. */
+export function sandboxPlan(spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly'>): SandboxInfo {
+  if (spec.unrestricted) {
+    return {
+      sandbox: 'agy --dangerously-skip-permissions (unrestricted)',
+      flags: ['--dangerously-skip-permissions'],
+      readOnlyEnforced: false,
+    };
+  }
+  return {
+    sandbox: 'agy proceed-in-sandbox (cannot prompt; unapproved tools are auto-denied)',
+    flags: [],
+    readOnlyEnforced: false,
+  };
+}
+
 /**
  * Build the exact argv for one agy worker.
  *
@@ -236,15 +281,9 @@ export function buildArgv(spec: SpawnSpec): string[] {
     'stream-json',
   ];
 
-  if (spec.model !== undefined && spec.model !== '') {
-    argv.push('--model', spec.model);
-  }
-  if (spec.effort !== undefined && spec.effort !== '') {
-    // Only when the model id does not already carry the effort suffix.
-    if (spec.model === undefined || spec.model === '' || !modelCarriesEffort(spec.model)) {
-      argv.push('--effort', spec.effort);
-    }
-  }
+  const { model, effortFlag } = resolveModelAndEffort(spec);
+  if (model !== undefined) argv.push('--model', model);
+  if (effortFlag !== undefined) argv.push('--effort', effortFlag);
 
   if (spec.timeoutMs > 0) {
     argv.push('--print-timeout', toGoDuration(spec.timeoutMs));
@@ -255,12 +294,9 @@ export function buildArgv(spec: SpawnSpec): string[] {
     argv.push('--add-dir', dir);
   }
 
-  if (spec.unrestricted) {
-    // Without this, headless agy auto-denies every tool that needs approval and
-    // reports SUCCESS. See THE TRAP. This flag is the whole reason
-    // SpawnSpec.unrestricted exists as a required field.
-    argv.push('--dangerously-skip-permissions');
-  }
+  // Without --dangerously-skip-permissions, headless agy auto-denies every tool
+  // that needs approval and reports SUCCESS. See THE TRAP.
+  argv.push(...sandboxPlan(spec).flags);
 
   if (spec.conversation !== undefined && spec.conversation !== '') {
     // Resume a conversation thread (UUID from result.conversation_id).
@@ -598,6 +634,58 @@ function buildResult(args: {
 // ---------------------------------------------------------------------------
 // The Provider
 // ---------------------------------------------------------------------------
+/**
+ * Parse `agy models` stdout (`<id>\t<label>` lines after a "Fetching..." line)
+ * into BASE models: the -low/-medium/-high suffix is stripped and collected as efforts.
+ */
+export function parseAgyModels(stdout: string): ModelInfo[] {
+  const order: string[] = [];
+  const byBase = new Map<string, ModelInfo>();
+  for (const raw of stdout.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (line === '' || !line.includes('\t')) continue;
+    const [id = '', label = ''] = line.split('\t');
+    const m = id.trim().match(/^(.+)-(low|medium|high)$/);
+    const base = m ? m[1]! : id.trim();
+    const effort = m ? m[2]! : undefined;
+    if (base === '') continue;
+    let info = byBase.get(base);
+    if (info === undefined) {
+      info = { id: base, label: label.replace(/\s*\((low|medium|high)\)\s*$/i, '').trim() || base, efforts: [] };
+      byBase.set(base, info);
+      order.push(base);
+    }
+    if (effort !== undefined && !info.efforts.includes(effort)) info.efforts.push(effort);
+  }
+  const rank = (e: string): number => COMPOSABLE_EFFORTS.indexOf(e);
+  return order.map((b) => {
+    const i = byBase.get(b)!;
+    i.efforts.sort((a, c) => rank(a) - rank(c));
+    return i;
+  });
+}
+
+/** Lazy, never throws. `run` is injectable for tests. */
+export async function listAgyModels(run: RunFn, options?: ListModelsOptions): Promise<ModelCatalog> {
+  const base: ModelCatalog = {
+    provider: 'agy',
+    models: [],
+    defaultSource: 'unknown',
+    source: 'live',
+    stale: false,
+    verified: true,
+  };
+  try {
+    const r = await run(AGY_BINARY, ['models'], options?.timeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS);
+    const models = parseAgyModels(r.stdout);
+    if (r.error !== undefined && models.length === 0) return { ...base, error: r.error };
+    if (models.length === 0) return { ...base, error: '`agy models` printed no models' };
+    return { ...base, models };
+  } catch (e) {
+    return { ...base, error: errMessage(e) };
+  }
+}
+
 export const agyProvider: Provider = {
   name: 'agy',
 
@@ -614,6 +702,10 @@ export const agyProvider: Provider = {
       return false;
     }
   },
+
+  describeSandbox: (spec) => sandboxPlan(spec),
+
+  listModels: (options) => listAgyModels(runCapture, options),
 
   async spawn(spec: SpawnSpec): Promise<WorkerHandle> {
     const jobId = spec.jobId ?? newJobId();

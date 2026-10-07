@@ -1,6 +1,6 @@
 {
-  "name": "agy-watch-channel",
-  "version": "0.1.0",
+  "name": "agent-smith-channel",
+  "version": "0.2.0",
   "private": true,
   "description": "Claude Code channel that pushes agy job state CHANGES into Claude's context.",
   "license": "MIT",
@@ -13,7 +13,7 @@
     "start": "node --experimental-strip-types src/server.ts",
     "test": "node --test --experimental-strip-types \"src/**/*.test.ts\"",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "build": "tsc -p tsconfig.build.json; node scripts/stamp-entrypoint.mjs"
+    "build": "tsc -p tsconfig.build.json && node scripts/stamp-entrypoint.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1"

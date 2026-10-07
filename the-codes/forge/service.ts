@@ -1,0 +1,937 @@
+/**
+ * service.ts — the composition root that can START a worker.
+ *
+ * This is the file the repo was missing. Until now:
+ *   - providers/ (3,643 lines) was never imported by anything
+ *   - pipeline/ had no StageRunner
+ *   - core/store.ts was unused
+ *   - surfaces/mod read somebody else's state and could not create any
+ *
+ * This module wires those together and answers four questions: spawn a job, list
+ * them, describe one, cancel one. `surfaces/channel` exposes exactly these as
+ * MCP tools; nothing else in the repo may call a provider directly.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * WHY spawn_job RETURNS IN UNDER A MILLISECOND
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * A reference job in the corpus took 28 minutes. A tool call that waits for it
+ * would time out, and a tool call that blocks the MCP server would stop the
+ * channel from pushing anything at all for the duration — so a 28-minute job
+ * would also blind the surface that exists to report it.
+ *
+ * So `spawnJob` does exactly three things synchronously: validate the request,
+ * write the anchor (forge/writer.ts `start`), and hand the rest to a detached
+ * async pump. The job id comes back and the job exists on disk before the caller
+ * has finished reading the response. The 20 real jobs took 16.3 hours at a
+ * concurrency of 3; a spawn path that holds the caller is that failure again.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * SAFETY: --dangerously-skip-permissions IS OFF BY DEFAULT
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * `SpawnSpec.unrestricted` is a required field and this module defaults it to
+ * `false`. It has to: agy runs headless and CANNOT prompt for tool permission, so
+ * in the default mode a denied tool is auto-denied, agy reports status "SUCCESS",
+ * returns an empty response and exits 0 (verified live — see providers/agy.ts,
+ * THE TRAP). Passing the flag by default would be "safe" for the job and
+ * dangerous for the user, and the whole point of this repo is that we never
+ * quietly choose for them. It is opt-in, per call, and it is recorded in
+ * job.json as `unrestricted: true` so nobody has to guess later.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * WHY THIS IS NOT A CLI
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * It was going to be. The arguments against, which are the only ones that matter
+ * here: this product is driven FROM WITHIN a harness, not from a terminal. A
+ * `agent-smith run` binary would be a second way to do the same job as the MCP
+ * tool, and a user driving agent-smith from Claude Code has a shell already —
+ * it has Claude. Everything below is a plain function so it can be called from a
+ * tool handler, a test, or a future entrypoint, and there is exactly one
+ * implementation.
+ */
+
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import path from 'node:path';
+
+import { AgentSmithReader, SMITH_PAYLOAD } from '../harness/agent-smith.ts';
+import { AgyStaffReader } from '../harness/agy-staff.ts';
+import { readObservedJob } from '../harness/registry.ts';
+import type { JobStateReader, ObservedJob } from '../harness/types.ts';
+import { findProvider, getProvider, providerNames } from '../providers/registry.ts';
+import { getCatalogs, getHarnessDefaults } from '../providers/catalog.ts';
+import type {
+  JobResult,
+  ModelCatalog,
+  Provider,
+  SandboxInfo,
+  SpawnSpec,
+  WorkerHandle,
+} from '../providers/types.js';
+import { isMode, MODE_PRESETS, MODES, type ModePreset } from './modes.ts';
+import {
+  DEFAULT_TIMEOUT_MS,
+  FILES,
+  isForgeJobId,
+  jobDir,
+  jobFile,
+  jobsDir,
+  newJobId,
+  type ForgeActivity,
+  type ForgeManifest,
+  type ForgeStatus,
+} from './format.ts';
+import { JobWriter, pipeEvents, reportFor } from './writer.ts';
+import { writeJsonAtomic } from './atomic.ts';
+
+/**
+ * Default wall-clock budget for one job.
+ *
+ * 45 minutes, not 30, because the longest job in the real corpus took 28 and a
+ * timeout that fires at minute 29 destroys an hour of work. Not 120, because a
+ * run with no budget at all is indistinguishable from a hang and the caller has
+ * no other lever — `cancel` is the operator's, and an operator who is not there
+ * to press it should not be the reason a job runs for six hours.
+ */
+export { DEFAULT_TIMEOUT_MS };
+
+/** Floor and ceiling on a caller-supplied timeout. */
+export const MIN_TIMEOUT_MS = 1_000;
+export const MAX_TIMEOUT_MS = 6 * 60 * 60_000;
+
+export interface SpawnRequest {
+  readonly name?: string;
+  readonly task?: string;
+  readonly workerId?: string;
+  /** Stage/role name. Becomes part of the job id and the pane's task context. */
+  readonly mode: string;
+  readonly prompt: string;
+  /** Defaults to 'agy': the cheapest verified adapter, and the one we tested. */
+  readonly provider?: string | undefined;
+  readonly model?: string | undefined;
+  readonly effort?: string | undefined;
+  readonly timeoutMs?: number | undefined;
+  /**
+   * Opt in to bypassing tool-approval prompts. FALSE unless you say otherwise.
+   * See the header: in headless agy the denied path is a silent no-op, so this is
+   * the difference between a job that works and a job that reports success and
+   * did nothing.
+   */
+  readonly unrestricted?: boolean | undefined;
+  /** Resume a prior conversation. Providers that cannot resume ignore this. */
+  readonly conversation?: string | undefined;
+  /** Overrides the repo root. Only pipeline stages set this. */
+  readonly cwd?: string | undefined;
+  readonly pipeline?: string | undefined;
+  readonly stage?: string | undefined;
+  readonly attempt?: number | undefined;
+}
+
+/** What spawn_job returns. Immediate, and always truthful. */
+export interface SpawnAck {
+  readonly jobId: string;
+  readonly name: string;
+  readonly workerId: string;
+  readonly role: string;
+  readonly provider: string;
+  /** Always 'running' at ack time; read `status` later. */
+  readonly status: ForgeStatus;
+  /** Absolute path of the job directory. The anchor is already on disk. */
+  readonly dir: string;
+  readonly repo: string;
+  /** The budget the job actually got, after clamping. */
+  readonly timeoutMs: number;
+  /** True only when the caller asked for it AND we passed it. */
+  readonly unrestricted: boolean;
+  /** One sentence an operator can act on. */
+  readonly note: string;
+  /** Effective sandbox posture reported by the provider ('unknown' when it cannot say). */
+  readonly sandbox: string;
+  readonly sandboxFlags: readonly string[];
+  /** Whether the mode asked for read-only (false when unrestricted). */
+  readonly readOnlyRequested: boolean;
+  /** Whether the provider's CLI actually enforces that request. */
+  readonly readOnlyEnforced: boolean;
+  readonly modelRequested: string | null;
+  readonly modelResolved: string | null;
+  readonly modelSource: 'requested' | 'harness-config' | 'reported' | 'unknown';
+  readonly preambleApplied: boolean;
+  /** Non-fatal problems the caller should read. Omitted when none. */
+  readonly warnings?: readonly string[];
+}
+
+/** A spawn plus the promise of its terminal manifest. Used by the pipeline runner. */
+export interface TrackedSpawn {
+  readonly ack: SpawnAck;
+  readonly done: Promise<ForgeManifest>;
+}
+
+export interface ListFilter {
+  /** 'agent-smith' (ours, default), 'agy-staff' (interop history), or 'all'. */
+  readonly provider?: string | undefined;
+  /** Only jobs in this state. */
+  readonly status?: ForgeStatus | undefined;
+  readonly limit?: number | undefined;
+}
+
+export interface JobSummary {
+  readonly jobId: string;
+  readonly name: string;
+  readonly workerId: string;
+  readonly role: string | null;
+  readonly latestSummary: string | null;
+  readonly summarySource: 'worker' | null;
+  readonly source: 'agent-smith' | 'agy-staff';
+  readonly status: ObservedJob['status'];
+  readonly provider: string | null;
+  readonly mode: string | null;
+  readonly model: string | null;
+  readonly task: string | null;
+  readonly toolCalls: number | null;
+  readonly currentActivity: ForgeActivity | null;
+  readonly startedAt: string | null;
+  readonly updatedAt: string | null;
+  readonly finishedAt: string | null;
+  readonly warnings: readonly { code: string; message: string }[];
+}
+
+export interface JobDetail extends JobSummary {
+  readonly report: string | null;
+  readonly error: string | null;
+  readonly exitCode: number | null;
+  readonly unrestricted: boolean;
+  readonly pipeline: string | null;
+  readonly stage: string | null;
+  readonly usage: Readonly<Record<string, number>> | null;
+  readonly conversation: string | null;
+  readonly effort: string | null;
+  readonly cwd: string | null;
+  readonly modelRequested?: string | null;
+  readonly modelResolved?: string | null;
+  readonly modelSource?: 'requested' | 'harness-config' | 'reported' | 'unknown';
+  readonly preambleApplied?: boolean;
+  readonly sandbox?: string;
+  readonly sandboxFlags?: readonly string[];
+  readonly readOnlyRequested?: boolean;
+  readonly readOnlyEnforced?: boolean;
+  /** False when a cancel was requested but this process holds no live handle. */
+  readonly cancellable: boolean;
+}
+
+export interface CancelResult {
+  readonly jobId: string;
+  readonly requested: boolean;
+  /** True when a live worker in THIS process was actually signalled. */
+  readonly signalled: boolean;
+  readonly note: string;
+}
+
+/**
+ * Clamp a timeout into the range we are willing to enforce. Pure; unit-tested.
+ *
+ * ZERO IS "UNSET", NOT "NO TIMEOUT", and that is a deliberate reading of an
+ * otherwise ambiguous value. `SpawnSpec.timeoutMs: 0` means "do not arm the timer"
+ * to providers/ndjson.ts, so a caller passing 0 would otherwise get an unbounded
+ * job whose only kill path is an operator who happens to be watching. And a
+ * pipeline stage that does not name a timeout — which is every stage in
+ * ARCHITECTURE.md's own example — would have no budget at all.
+ *
+ * So 0 resolves to the default, exactly like an absent value. Anyone who genuinely
+ * wants a very long job passes MAX_TIMEOUT_MS and says so out loud.
+ */
+export function clampTimeout(ms: number | undefined): number {
+  if (ms === undefined || !Number.isFinite(ms) || ms <= 0) return DEFAULT_TIMEOUT_MS;
+  return Math.min(MAX_TIMEOUT_MS, Math.max(MIN_TIMEOUT_MS, Math.floor(ms)));
+}
+
+/**
+ * The word to put in a SpawnSpec for a provider that is not installed.
+ *
+ * Throwing rather than defaulting: `getProvider` on an unknown name is a typo in
+ * a stage config, and a typo that silently runs zero workers and reports green is
+ * the exact failure class this codebase is organised against. A KNOWN provider
+ * whose binary is missing is different — that becomes a `failed` job with the
+ * ENOENT in it, which is a report an operator can act on.
+ */
+export function requireProvider(name: string): Provider {
+  if (findProvider(name) === undefined) {
+    throw new Error(
+      `unknown provider "${name}". Known providers: ${providerNames().join(', ')}.`,
+    );
+  }
+  return getProvider(name);
+}
+
+interface LiveJob {
+  readonly writer: JobWriter;
+  readonly handle: WorkerHandle;
+}
+
+export interface ForgeOptions {
+  /** Repo whose `.agent-smith/jobs/` this service owns. */
+  readonly repo: string;
+  /** Write the agy-staff-shaped compat mirror. Default true. */
+  readonly mirror?: boolean | undefined;
+  /** Progress coalescing window, ms. Overridable so tests need not sleep. */
+  readonly flushMs?: number | undefined;
+  /** Model catalog source. Default: providers/catalog.ts getCatalogs. Injectable for tests. */
+  readonly catalogSource?: ((providers: string[]) => Promise<ModelCatalog[]>) | undefined;
+  /** Provider config-file defaults (sync, no CLI). Default: providers/catalog.ts getHarnessDefaults. Injectable for tests. */
+  readonly harnessDefaults?: ((provider: string) => { model?: string; effort?: string }) | undefined;
+  /** Provider lookup. Default: requireProvider. Injectable for tests. */
+  readonly providerSource?: ((name: string) => Provider) | undefined;
+  /** Sandbox describer. Default: provider.describeSandbox. Injectable for tests. */
+  readonly describeSandbox?:
+    | ((provider: Provider, spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly'>) => SandboxInfo | undefined)
+    | undefined;
+}
+
+/** The teaching error for a mode outside the closed set. */
+export function modeError(mode: string): Error {
+  const lines = MODES.map((m) => `  ${m}: ${MODE_PRESETS[m].description}`).join('\n');
+  return new Error(
+    `${mode === '' ? 'mode is required' : `unknown mode "${mode}"`}. Valid modes:\n${lines}`,
+  );
+}
+
+const AGY_EFFORT_SUFFIX = /-(low|medium|high)$/;
+const CATALOG_WAIT_MS = 2_000;
+
+/**
+ * Check model/effort against a catalog. Pure. Throws only when the catalog is
+ * fresh and nonempty AND positively says the value is wrong; otherwise warns.
+ */
+export function checkAgainstCatalog(
+  provider: string,
+  model: string | undefined,
+  effort: string | undefined,
+  catalog: ModelCatalog | undefined,
+): string[] {
+  const warnings: string[] = [];
+  if (model === undefined && effort === undefined) return warnings;
+  const fresh =
+    catalog !== undefined &&
+    !catalog.stale &&
+    catalog.error === undefined &&
+    catalog.verified !== false &&
+    catalog.source !== 'static' &&
+    catalog.models.length > 0;
+  if (!fresh) {
+    const why =
+      catalog === undefined
+        ? 'no catalog available'
+        : catalog.error !== undefined
+          ? `catalog error: ${catalog.error}`
+          : catalog.stale
+            ? 'catalog is stale'
+            : catalog.models.length === 0
+              ? 'catalog is empty'
+              : catalog.source === 'static'
+                ? 'catalog is a static alias list; full model names are also valid'
+                : 'catalog is unverified';
+    warnings.push(
+      `could not verify ${[model === undefined ? '' : `model "${model}"`, effort === undefined ? '' : `effort "${effort}"`].filter(Boolean).join(' / ')} for ${provider} (${why}); passing it through unchecked.`,
+    );
+    return warnings;
+  }
+  const ids = catalog.models.map((m) => m.id);
+  let match = model === undefined ? undefined : catalog.models.find((m) => m.id === model);
+  if (model !== undefined && match === undefined && provider === 'agy') {
+    const base = model.replace(AGY_EFFORT_SUFFIX, '');
+    if (base !== model) match = catalog.models.find((m) => m.id === base);
+  }
+  if (model !== undefined && match === undefined) {
+    throw new Error(`unknown model "${model}" for ${provider}. Valid model ids: ${ids.join(', ')}.`);
+  }
+  if (effort !== undefined) {
+    const target = match ?? (catalog.defaultModel === undefined ? undefined : catalog.models.find((m) => m.id === catalog.defaultModel));
+    if (target !== undefined && target.efforts.length > 0 && !target.efforts.includes(effort)) {
+      throw new Error(
+        `effort "${effort}" is not valid for ${provider} model "${target.id}". Valid efforts: ${target.efforts.join(', ')}.`,
+      );
+    }
+  }
+  return warnings;
+}
+
+/**
+ * The forge. One instance per process; the live-handle map is per instance.
+ *
+ * The map is bounded by the number of jobs this process started, and it is
+ * deliberately NOT the source of truth — job.json is. A restart of this server
+ * loses the ability to `kill()` an in-flight worker, and that is stated in the
+ * cancel result rather than papered over: an honest "I marked it cancelled but
+ * there is no handle here to signal" beats a `signalled: true` that never
+ * happened. We currently have no cross-process owner lease or PID-safe recovery:
+ * if the owner dies, the child may hit its timeout but its final result cannot be
+ * written here, so job.json can remain running until an owner recovers it.
+ */
+export class ForgeService {
+  readonly repo: string;
+  private readonly live = new Map<string, LiveJob>();
+  private readonly mirrorOn: boolean;
+  private readonly flushMs: number | undefined;
+  private readonly catalogSource: (providers: string[]) => Promise<ModelCatalog[]>;
+  private readonly harnessDefaults: (provider: string) => { model?: string; effort?: string };
+  private readonly providerSource: (name: string) => Provider;
+  private readonly describeSandbox: NonNullable<ForgeOptions['describeSandbox']>;
+
+  constructor(options: ForgeOptions) {
+    this.repo = options.repo;
+    this.mirrorOn = options.mirror ?? true;
+    this.flushMs = options.flushMs;
+    this.providerSource = options.providerSource ?? requireProvider;
+    this.catalogSource = options.catalogSource ?? ((providers) => getCatalogs({ providers }));
+    this.harnessDefaults = options.harnessDefaults ?? getHarnessDefaults;
+    this.describeSandbox = options.describeSandbox ?? ((p, spec) => p.describeSandbox?.(spec));
+  }
+
+  /** Never throws, never waits long: a catalog is advice, not a gate on starting. */
+  private async catalogFor(provider: string): Promise<ModelCatalog | undefined> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      const timeout = new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), CATALOG_WAIT_MS);
+        timer.unref?.();
+      });
+      const all = await Promise.race([this.catalogSource([provider]), timeout]);
+      return all?.find((c) => c.provider === provider) ?? all?.[0];
+    } catch {
+      return undefined;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Start one job. Returns as soon as the anchor is on disk.
+   *
+   * Rejects only for a bad REQUEST (unknown provider, empty prompt). Everything
+   * that can go wrong afterwards — binary missing, auth expired, tool denied,
+   * killed by the OS — arrives as a `failed` job, because a rejected promise has
+   * no job id and therefore nothing a pane can ever draw.
+   */
+  async spawnJob(request: SpawnRequest): Promise<SpawnAck> {
+    const { ack } = await this.spawnTracked(request);
+    return ack;
+  }
+
+  /**
+   * spawnJob, plus the terminal manifest promise.
+   *
+   * Split out for exactly one caller — forge/runner.ts, which runs a pipeline
+   * stage and must wait for it. Everything else wants the ack and the channel.
+   */
+  async spawnTracked(request: SpawnRequest): Promise<TrackedSpawn> {
+    const provider = this.providerSource(request.provider ?? 'agy');
+    const rawMode = request.mode.trim();
+    const resuming = request.conversation !== undefined && request.conversation !== null;
+    // Closed set for fresh, non-pipeline spawns. Pipeline stages keep arbitrary
+    // roles; a resume may carry a legacy mode from an older job.
+    if (request.pipeline == null && !resuming && !isMode(rawMode)) throw modeError(rawMode);
+    const mode = rawMode === '' ? 'task' : rawMode;
+    const preset: ModePreset | undefined = isMode(mode) ? MODE_PRESETS[mode] : undefined;
+    const prompt = request.prompt;
+    if (prompt.trim() === '') {
+      throw new Error('prompt is empty; there is nothing to hand the worker.');
+    }
+    const timeoutMs = clampTimeout(request.timeoutMs);
+    const cwd = request.cwd ?? this.repo;
+    const unrestricted = request.unrestricted === true;
+    const warnings: string[] = [];
+    if (request.model !== undefined || request.effort !== undefined) {
+      warnings.push(
+        ...checkAgainstCatalog(provider.name, request.model, request.effort, await this.catalogFor(provider.name)),
+      );
+    }
+    let modelResolved: string | null = request.model ?? null;
+    let modelSource: SpawnAck['modelSource'] = request.model === undefined ? 'unknown' : 'requested';
+    if (request.model === undefined) {
+      // Config-file read only: no CLI, so spawn stays instant (see server.ts no-long-call rule).
+      const configured = this.harnessDefaults(provider.name).model;
+      if (configured) {
+        modelResolved = configured;
+        modelSource = 'harness-config';
+      }
+    }
+    const readOnlyRequested = preset?.readOnly === true && !unrestricted;
+    const sandboxInfo = this.describeSandbox(provider, { unrestricted, readOnly: readOnlyRequested });
+    const sandbox = sandboxInfo?.sandbox ?? 'unknown';
+    const sandboxFlags = sandboxInfo?.flags ?? [];
+    const readOnlyEnforced = sandboxInfo?.readOnlyEnforced ?? false;
+    if (provider.name === 'agy' && preset?.runsCommands === true && !unrestricted) {
+      warnings.push(
+        'agy cannot prompt for permission headless; commands will be denied and the job will return an empty result. Retry with unrestricted:true if this job needs shell access.',
+      );
+    }
+    const preambleApplied = preset !== undefined;
+    const sentPrompt =
+      preset === undefined || prompt.startsWith(preset.preamble)
+        ? prompt
+        : `${preset.preamble}\n\n${prompt}`;
+    const jobId = newJobId(mode);
+    const name = request.name?.trim() || `${mode}-${jobId.slice(-8)}`;
+    if (name.length > 80) throw new Error('worker name must be at most 80 characters');
+    const workerId = request.workerId ?? jobId;
+    const canonicalConflict = findActiveIdentity(this.repo, name, workerId);
+    if (canonicalConflict !== null) {
+      throw new Error(`worker identity already has an active job (${canonicalConflict.jobId})`);
+    }
+    for (const { writer } of this.live.values()) {
+      const active = writer.snapshot();
+      if (active?.workerId === workerId) {
+        throw new Error(`worker "${workerId}" already has an active job (${active.jobId})`);
+      }
+      if (active?.name === name) {
+        throw new Error(`worker name "${name}" already has an active job (${active.jobId})`);
+      }
+    }
+
+    const writer = new JobWriter({
+      repo: this.repo,
+      jobId,
+      mirror: this.mirrorOn,
+      ...(this.flushMs === undefined ? {} : { flushMs: this.flushMs }),
+    });
+
+    // Anchor first. Everything after this point can fail loudly; nothing after
+    // this point can make the job invisible.
+    writer.start({
+      name,
+      workerId,
+      task: request.task,
+      provider: provider.name,
+      mode,
+      model: request.model ?? null,
+      effort: request.effort ?? null,
+      cwd,
+      prompt,
+      unrestricted,
+      conversation: request.conversation ?? null,
+      timeoutMs,
+      pipeline: request.pipeline ?? null,
+      stage: request.stage ?? null,
+      attempt: request.attempt ?? null,
+      modelRequested: request.model ?? null,
+      modelResolved,
+      modelSource,
+      preambleApplied,
+      sandbox,
+      sandboxFlags: [...sandboxFlags],
+      readOnlyRequested,
+      readOnlyEnforced,
+    });
+
+    const ack: SpawnAck = {
+      jobId,
+      name,
+      workerId,
+      role: mode,
+      provider: provider.name,
+      status: 'running',
+      dir: jobDir(this.repo, jobId),
+      repo: this.repo,
+      timeoutMs,
+      unrestricted,
+      note:
+        `queued ${provider.name}/${mode}` +
+        (request.model === undefined ? '' : ` model=${request.model}`) +
+        ` budget=${Math.round(timeoutMs / 1000)}s` +
+        (unrestricted
+          ? ' — UNRESTRICTED: tool approvals bypassed'
+          : ' — approvals enforced; a tool that needs one will be denied'),
+      sandbox,
+      sandboxFlags,
+      readOnlyRequested,
+      readOnlyEnforced,
+      modelRequested: request.model ?? null,
+      modelResolved,
+      modelSource,
+      preambleApplied,
+      ...(warnings.length === 0 ? {} : { warnings }),
+    };
+
+    const done = this.pump(writer, provider, {
+      jobId,
+      prompt: sentPrompt,
+      readOnly: readOnlyRequested,
+      cwd,
+      model: request.model,
+      effort: request.effort,
+      timeoutMs,
+      unrestricted,
+      conversation: request.conversation,
+    });
+
+    return { ack, done };
+  }
+
+  /**
+   * The detached pump: spawn, stream, record, resolve.
+   *
+   * Never rejects. Every exit path lands on writer.finish() or writer.abort(),
+   * because a job that stops being `running` is the only promise this function
+   * makes to every reader on the other side of the filesystem.
+   */
+  private async pump(
+    writer: JobWriter,
+    provider: Provider,
+    spec: {
+      jobId: string;
+      prompt: string;
+      readOnly: boolean;
+      cwd: string;
+      model: string | undefined;
+      effort: string | undefined;
+      timeoutMs: number;
+      unrestricted: boolean;
+      conversation: string | undefined;
+    },
+  ): Promise<ForgeManifest> {
+    let handle: WorkerHandle;
+    try {
+      handle = await provider.spawn({
+        mode: spec.jobId,
+        prompt: spec.prompt,
+        cwd: spec.cwd,
+        timeoutMs: spec.timeoutMs,
+        unrestricted: spec.unrestricted,
+        ...(spec.readOnly ? { readOnly: true } : {}),
+        ...(spec.model === undefined ? {} : { model: spec.model }),
+        ...(spec.effort === undefined ? {} : { effort: spec.effort }),
+        ...(spec.conversation === undefined ? {} : { conversation: spec.conversation }),
+        // THE KEY LINE. Handing the provider adapter OUR job directory as its
+        // stateDir means events.jsonl / argv.json / stderr.log / result.json are
+        // written by the already-verified plumbing in providers/ndjson.ts, for
+        // all four providers, instead of being copied across afterwards by us.
+        stateDir: writerDir(this.repo, spec.jobId),
+        jobId: spec.jobId,
+      });
+    } catch (err) {
+      // ENOENT, a bad cwd, a provider that refuses to spawn. The job exists and
+      // is now `failed`, which is a fact the pane can draw — as opposed to a
+      // rejected promise, which is a fact nothing can draw.
+      return (
+        writer.abort('failed', `could not start ${provider.name}: ${describe(err)}`) ??
+        writer.snapshot() ??
+        ({ jobId: spec.jobId } as unknown as ForgeManifest)
+      );
+    }
+
+    this.live.set(spec.jobId, { writer, handle });
+    const unsubscribe = pipeEvents(writer, handle);
+    // The cancel marker is written by `cancel()`; if it arrived while we were
+    // spawning, apply it now or the worker runs to completion for nothing.
+    if (existsSync(jobFile(this.repo, spec.jobId, FILES.cancel))) {
+      writer.requestCancel();
+      handle.cancel();
+    }
+
+    // A different ForgeService instance can request cancellation by creating the
+    // shared marker. The process that owns the handle must acknowledge it and
+    // signal the worker; a marker alone cannot stop a child process.
+    let observedCancel = existsSync(jobFile(this.repo, spec.jobId, FILES.cancel));
+    const cancelPoll = setInterval(() => {
+      if (!observedCancel && existsSync(jobFile(this.repo, spec.jobId, FILES.cancel))) {
+        observedCancel = true;
+        writer.requestCancel();
+        handle.cancel();
+      }
+    }, 200);
+    cancelPoll.unref?.();
+
+    try {
+      const result: JobResult = await handle.waitForResult();
+      const report = reportFor(result);
+      const manifest = writer.finish(result, report === '' ? null : report);
+      return manifest;
+    } catch (err) {
+      return (
+        writer.abort('failed', `worker ended without a result: ${describe(err)}`) ??
+        writer.snapshot() ??
+        ({ jobId: spec.jobId } as unknown as ForgeManifest)
+      );
+    } finally {
+      clearInterval(cancelPoll);
+      unsubscribe();
+      this.live.delete(spec.jobId);
+    }
+  }
+
+  /**
+   * Cancel a job.
+   *
+   * TWO STAGES, and the split is the honest answer rather than a hedge:
+   *   - Marker written, live handle signalled. The worker is actually stopped and
+   *     the state file says `canceled` within one poll interval.
+   *   - Marker written, NO live handle. This process did not start the job (the
+   *     server restarted, or the job belongs to another session). We record the
+   * *intent* so every reader agrees the job was asked to stop, and we say so.
+   *     We do NOT claim it was stopped, because we have no pid to signal and
+   *     `WorkerHandle` does not expose one — inventing that field in four
+   *     verified adapters for one cosmetic gain is not worth it.
+   */
+  cancel(jobId: string): CancelResult {
+    const live = this.live.get(jobId);
+    const writer =
+      live?.writer ??
+      new JobWriter({
+        repo: this.repo,
+        jobId,
+        mirror: this.mirrorOn,
+        ...(this.flushMs === undefined ? {} : { flushMs: this.flushMs }),
+      });
+
+    const known = live !== undefined || existsSync(jobDir(this.repo, jobId));
+    if (!known) {
+      throw new Error(`no job "${jobId}" in ${jobsDir(this.repo)}`);
+    }
+
+    writer.requestCancel();
+
+    if (live === undefined) {
+      return {
+        jobId,
+        requested: true,
+        signalled: false,
+        note:
+          'cancel recorded, but this process has no live worker handle (the server ' +
+          'restarted, or another process owns it). Only the running owner can signal ' +
+          'the worker; without that owner, the job may remain marked running.',
+      };
+    }
+
+    live.handle.cancel();
+    return {
+      jobId,
+      requested: true,
+      signalled: true,
+      note: 'cancel recorded and the worker process was signalled.',
+    };
+  }
+
+  /** Jobs the pane would draw. Ours by default; interop history on request. */
+  async list(filter: ListFilter = {}): Promise<JobSummary[]> {
+    const source = filter.provider ?? 'agent-smith';
+    const out: JobSummary[] = [];
+
+    if (source === 'agent-smith' || source === 'all') {
+      out.push(...(await this.readSource('agent-smith', new AgentSmithReader())));
+    }
+    if (source === 'agy-staff' || source === 'all') {
+      // The interop source. Our own ids are filtered out because the compat
+      // mirror makes them visible there too, and one job must have one verdict —
+      // see harness/registry.ts for the same rule applied to the registry sweep.
+      out.push(...(await this.readSource('agy-staff', new AgyStaffReader(), isForgeJobId)));
+    }
+
+    const filtered = out.filter((j) => filter.status === undefined || j.status === filter.status);
+    // Live first, then newest — the same ordering the band draws, so the list a
+    // model reads and the list a human sees put the same job on top.
+    filtered.sort((a, b) => {
+      const rank = (s: ObservedJob['status']): number => (s === 'running' ? 0 : 1);
+      const r = rank(a.status) - rank(b.status);
+      if (r !== 0) return r;
+      return (b.finishedAt ?? b.updatedAt ?? '').localeCompare(a.finishedAt ?? a.updatedAt ?? '');
+    });
+    const limit = filter.limit ?? 50;
+    return filtered.slice(0, Math.max(1, limit));
+  }
+
+  /**
+   * One job in full.
+   *
+   * Reads from DISK, not from the in-memory map, so `status` works for a job this
+   * process did not start. The in-memory manifest is only consulted to answer
+   * `cancellable`.
+   */
+  async detail(jobId: string): Promise<JobDetail> {
+    const observed = await readObservedJob('agent-smith', this.repo, jobId);
+    if (observed === null) {
+      const interop = await readObservedJob('agy-staff', this.repo, jobId);
+      if (interop === null) {
+        throw new Error(`no job "${jobId}" in ${jobsDir(this.repo)}`);
+      }
+      return { ...toSummary(interop, 'agy-staff'), report: interop.output, error: null, exitCode: null, unrestricted: false, pipeline: null, stage: null, usage: null, conversation: null, effort: null, cwd: null, cancellable: false };
+    }
+
+    const reportPath = jobFile(this.repo, jobId, FILES.report);
+    let report: string | null = null;
+    try {
+      report = readFileSync(reportPath, 'utf8');
+    } catch {
+      report = null;
+    }
+
+    const raw = observed.raw;
+    let manifest: ForgeManifest | null = null;
+    try { manifest = JSON.parse(readFileSync(jobFile(this.repo, jobId, FILES.job), 'utf8')) as ForgeManifest; } catch { /* partial state */ }
+    return {
+      ...toSummary(observed, 'agent-smith'),
+      report,
+      error: typeof raw['error'] === 'string' ? raw['error'] : null,
+      exitCode: typeof raw['exit_code'] === 'number' ? raw['exit_code'] : null,
+      unrestricted: raw['unrestricted'] === true,
+      pipeline: typeof raw['pipeline'] === 'string' ? raw['pipeline'] : null,
+      stage: typeof raw['stage'] === 'string' ? raw['stage'] : null,
+      usage: typeof raw['usage'] === 'object' && raw['usage'] !== null ? (raw['usage'] as Record<string, number>) : null,
+      conversation: typeof raw['conversation'] === 'string' ? raw['conversation'] : null,
+      effort: typeof raw['effort'] === 'string' ? raw['effort'] : null,
+      cwd: manifest?.cwd ?? null,
+      ...(manifest === null
+        ? {}
+        : {
+            ...(manifest.modelRequested === undefined ? {} : { modelRequested: manifest.modelRequested }),
+            ...(manifest.modelResolved === undefined ? {} : { modelResolved: manifest.modelResolved }),
+            ...(manifest.modelSource === undefined ? {} : { modelSource: manifest.modelSource }),
+            ...(manifest.preambleApplied === undefined ? {} : { preambleApplied: manifest.preambleApplied }),
+            ...(manifest.sandbox === undefined ? {} : { sandbox: manifest.sandbox }),
+            ...(manifest.sandboxFlags === undefined ? {} : { sandboxFlags: manifest.sandboxFlags }),
+            ...(manifest.readOnlyRequested === undefined ? {} : { readOnlyRequested: manifest.readOnlyRequested }),
+            ...(manifest.readOnlyEnforced === undefined ? {} : { readOnlyEnforced: manifest.readOnlyEnforced }),
+          }),
+      cancellable: this.live.has(jobId),
+    };
+  }
+
+  /**
+   * The job's recent tool rows, for the pipeline runner's observation tap.
+   *
+   * LIVE FIRST, disk second. While the job runs this process holds the writer,
+   * and asking the writer is exact. Once it is over (or if it was started by
+   * another process) we fall back to reading progress.json back through the
+   * reader — which is the same file the pane draws from, so the observations
+   * routing.ts escalates on are literally the tool calls a human would see.
+   */
+  async activities(jobId: string): Promise<readonly ForgeActivity[]> {
+    const live = this.live.get(jobId);
+    if (live !== undefined) return live.writer.activities();
+    try {
+      const raw = await new AgentSmithReader().read(this.repo, jobId);
+      const rows = raw?.payload[SMITH_PAYLOAD.recentActivities];
+      return Array.isArray(rows) ? (rows as ForgeActivity[]) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * The job's current state, terminal or not.
+   *
+   * `unknown` is returned AS `unknown`, never coerced to `running`. The runner's
+   * poll loop depends on being able to tell "still going" from "cannot tell",
+   * and collapsing the second into the first is how an observation series gets
+   * silently truncated.
+   */
+  async state(jobId: string): Promise<ForgeStatus | 'unknown'> {
+    const live = this.live.get(jobId)?.writer.snapshot();
+    if (live !== null && live !== undefined) return live.status;
+    try {
+      const raw = await new AgentSmithReader().read(this.repo, jobId);
+      const s = raw?.payload[SMITH_PAYLOAD.status];
+      return s === 'running' || s === 'succeeded' || s === 'failed' || s === 'canceled' ? s : 'unknown';
+    } catch {
+      return 'unknown';
+    }
+  }
+
+  private async readSource(
+    provider: string,
+    reader: JobStateReader,
+    skip: (jobId: string) => boolean = () => false,
+  ): Promise<JobSummary[]> {
+    const ids = await reader.discover(this.repo);
+    const out: JobSummary[] = [];
+    for (const id of ids) {
+      if (skip(id)) continue;
+      const observed = await readObservedJob(provider, this.repo, id);
+      if (observed === null) continue;
+      out.push(toSummary(observed, provider === 'agent-smith' ? 'agent-smith' : 'agy-staff'));
+    }
+    return out;
+  }
+}
+
+/* ── pure helpers ───────────────────────────────────────────────────────── */
+
+/** Project an ObservedJob onto what a list actually needs. */
+export function toSummary(observed: ObservedJob, source: 'agent-smith' | 'agy-staff'): JobSummary {
+  const raw = observed.raw;
+  const toolCalls = typeof raw['tool_calls'] === 'number' ? raw['tool_calls'] : null;
+  const task = typeof raw['task'] === 'string' && raw['task'] !== '' ? raw['task'] : null;
+  const activities = Array.isArray(raw['recent_activities']) ? raw['recent_activities'] : [];
+  const currentActivity = observed.status === 'running'
+    ? [...activities].reverse().find(isActiveForgeActivity) ?? null
+    : null;
+  return {
+    jobId: observed.jobId,
+    name: typeof raw['name'] === 'string' && raw['name'] ? raw['name'] : observed.jobId,
+    workerId: typeof raw['workerId'] === 'string' ? raw['workerId'] : observed.jobId,
+    role: typeof raw['role'] === 'string' ? raw['role'] : observed.mode,
+    latestSummary: raw['summarySource'] === 'worker' && typeof raw['latestSummary'] === 'string' ? raw['latestSummary'] : null,
+    summarySource: raw['summarySource'] === 'worker' ? 'worker' : null,
+    source,
+    status: observed.status,
+    // `raw.provider` for OUR jobs, `label` for interop ones (which carry no
+    // provider field — they are agy-staff's, and agy-staff's `profile` is the
+    // closest thing it has to a provider name).
+    provider: typeof raw['provider'] === 'string' ? raw['provider'] : observed.label,
+    mode: observed.mode,
+    model: observed.model,
+    task,
+    toolCalls,
+    currentActivity,
+    startedAt: observed.startedAt,
+    updatedAt: observed.updatedAt,
+    finishedAt: observed.finishedAt,
+    warnings: observed.warnings.map((w) => ({ code: w.code, message: w.message })),
+  };
+}
+
+function isActiveForgeActivity(value: unknown): value is ForgeActivity {
+  if (typeof value !== 'object' || value === null) return false;
+  const activity = value as Record<string, unknown>;
+  return typeof activity['stepIndex'] === 'number' && typeof activity['tool'] === 'string' && activity['status'] === 'active';
+}
+
+function findActiveIdentity(repo: string, name: string, workerId: string): ForgeManifest | null {
+  let entries: string[];
+  try { entries = readdirSync(jobsDir(repo)); } catch { return null; }
+  for (const id of entries) {
+    let manifest: ForgeManifest;
+    try { manifest = JSON.parse(readFileSync(jobFile(repo, id, FILES.job), 'utf8')) as ForgeManifest; } catch { continue; }
+    if (manifest.status !== 'running') continue;
+    if (manifest.workerId === workerId || manifest.name === name) return manifest;
+  }
+  return null;
+}
+
+/** The job directory, as the provider adapters are told to use it. */
+function writerDir(repo: string, jobId: string): string {
+  return jobDir(repo, jobId);
+}
+
+function describe(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  return String(err);
+}
+
+/* ── pipeline run records ────────────────────────────────────────────────── */
+
+/**
+ * Where a finished PipelineRun is written.
+ *
+ * A pipeline outlives the MCP call that started it and usually outlives the
+ * process too, so the run summary has to be a file. It sits beside the jobs,
+ * not inside one: a run is not a job, and pretending otherwise would put a second
+ * verdict for the same work into the pane.
+ */
+export function pipelineRecordPath(repo: string, name: string): string {
+  const safe = name.replace(/[^A-Za-z0-9._-]+/g, '-').slice(0, 80) || 'pipeline';
+  return path.join(repo, '.agent-smith', 'pipelines', `${safe}.json`);
+}
+
+export function writePipelineRecord(repo: string, name: string, value: unknown): void {
+  writeJsonAtomic(pipelineRecordPath(repo, name), value);
+}

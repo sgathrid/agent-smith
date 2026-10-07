@@ -18,11 +18,11 @@
  *     cannot staff before burning a job slot on it.
  */
 
-import { agyProvider, AGY_BINARY } from './agy.js';
-import { claudeProvider, CLAUDE_BINARY } from './claude.js';
-import { codexProvider, CODEX_BINARY } from './codex.js';
-import { opencodeProvider, OPENCODE_BINARY } from './opencode.js';
-import type { Provider } from './types.js';
+import { agyProvider, AGY_BINARY } from './agy.ts';
+import { claudeProvider, CLAUDE_BINARY } from './claude.ts';
+import { codexProvider, CODEX_BINARY } from './codex.ts';
+import { opencodeProvider, OPENCODE_BINARY } from './opencode.ts';
+import type { Provider } from './types.ts';
 
 // ---------------------------------------------------------------------------
 // The provider set

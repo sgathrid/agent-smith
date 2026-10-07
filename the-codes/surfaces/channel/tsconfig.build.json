@@ -4,6 +4,7 @@
     // The build config is the only place that emits — `npm run typecheck` uses the
     // base, which sets noEmit.
     "noEmit": false,
+    "noEmitOnError": true,
     "outDir": "./dist",
     "declaration": true,
     "sourceMap": true

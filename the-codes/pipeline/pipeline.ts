@@ -45,6 +45,7 @@ import type {
   StageRunner,
   StageStatus,
 } from './types.ts';
+import path from 'node:path';
 
 /**
  * Default ceiling on simultaneous stages.
@@ -102,10 +103,26 @@ export class PipelineSpecError extends Error {
  * offending edge.
  */
 export function validateSpec(spec: PipelineSpec): void {
+  if (!spec.name.trim() || spec.stages.length === 0) {
+    throw new PipelineSpecError('a pipeline needs a name and at least one stage');
+  }
+  if (spec.concurrency !== undefined && (!Number.isSafeInteger(spec.concurrency) || spec.concurrency < 1 || spec.concurrency > 32)) {
+    throw new PipelineSpecError('concurrency must be an integer from 1 to 32');
+  }
   const seen = new Set<string>();
   for (const stage of spec.stages) {
-    if (stage.name.length === 0) {
+    if (!stage.name.trim() || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(stage.name)) {
       throw new PipelineSpecError('every stage needs a name');
+    }
+    if (!stage.provider.trim()) throw new PipelineSpecError(`stage '${stage.name}' needs a provider`);
+    if (stage.timeoutMs !== undefined && (!Number.isSafeInteger(stage.timeoutMs) || stage.timeoutMs <= 0)) {
+      throw new PipelineSpecError(`stage '${stage.name}' timeoutMs must be a positive integer`);
+    }
+    for (const check of stage.checks ?? []) {
+      if (!check.name.trim() || !check.command.trim()) throw new PipelineSpecError(`stage '${stage.name}' has an empty check`);
+      if (check.timeoutMs !== undefined && (!Number.isSafeInteger(check.timeoutMs) || check.timeoutMs <= 0)) {
+        throw new PipelineSpecError(`stage '${stage.name}' check timeoutMs must be a positive integer`);
+      }
     }
     if (seen.has(stage.name)) {
       throw new PipelineSpecError(`duplicate stage name '${stage.name}'`);
@@ -462,7 +479,7 @@ export async function runPipeline(
         pipeline: spec.name,
         stage,
         attempt,
-        workDir: stage.workDir ? `${workDir}/${stage.workDir}` : workDir,
+        workDir: stage.workDir ? path.resolve(workDir, stage.workDir) : workDir,
         inputs: inputsFor(stage),
         routing,
         ...(continuation ? { continuation } : {}),
@@ -579,6 +596,7 @@ export async function runPipeline(
         attempt,
         priorStatus: result.status,
         transcriptRef: result.transcriptRef,
+        transcriptProvider: routing.provider,
         appendedContext: escalation.appendedContext ?? '',
         priorEscalations: escalations,
       };

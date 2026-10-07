@@ -49,8 +49,29 @@ export async function binaryOnPath(bin: string): Promise<boolean> {
   const cached = pathProbeCache.get(cacheKey);
   if (cached !== undefined) return cached;
 
-  const sep = path.sep;
-  const dirs = pathEnv.split(sep).filter((d) => d !== '');
+  // A name containing a path separator is a PATH, not a name. This is what makes
+  // the documented AGENT_SMITH_<NAME>_BIN overrides work at all: without this,
+  // path.join(dir, '/opt/bin/agy') yields '/usr/local/bin/opt/bin/agy' and an
+  // absolute override can never resolve. Same rule as execvp.
+  if (bin.includes('/') || bin.includes(path.sep)) {
+    let direct = false;
+    try {
+      await access(bin, constants.X_OK);
+      direct = true;
+    } catch {
+      /* not executable */
+    }
+    pathProbeCache.set(cacheKey, direct);
+    return direct;
+  }
+
+  // `path.delimiter`, NOT `path.sep`. The PATH *list* separator is ':' on POSIX
+  // and ';' on Windows; `path.sep` is '/' and '\' — the separator BETWEEN
+  // components of a single path. Splitting PATH by path.sep walks garbage
+  // fragments like 'sers/gathrid/.local/bin' and never finds anything, so
+  // binaryOnPath returned false for every binary on a machine where all four
+  // were installed. Caught by `agent-smith doctor` reporting zero providers.
+  const dirs = pathEnv.split(path.delimiter).filter((d) => d !== '');
   let found = false;
   for (const dir of dirs) {
     const full = path.join(dir, bin);
@@ -264,6 +285,8 @@ export interface SpawnWorkerOptions extends WorkerPumps {
   argv: string[];
   cwd: string;
   timeoutMs: number;
+  /** SIGTERM-to-SIGKILL grace period. Defaults to 5 seconds. */
+  killGraceMs?: number;
   env?: NodeJS.ProcessEnv;
   stateDir: string;
   jobId: string;
@@ -302,6 +325,9 @@ const STDERR_LOG_LIMIT = 4 * 1024 * 1024; // 4 MB retained on disk
  */
 export function spawnWorker(opts: SpawnWorkerOptions): Promise<WorkerProcess> {
   const logStream: WriteStream = createWriteStream(path.join(opts.stateDir, 'stderr.log'), { flags: 'w' });
+  // A full disk or removed state directory must not turn a worker into an
+  // unhandled stream error. stderr is still retained in memory for its result.
+  logStream.on('error', () => {});
   const state = {
     captured: '',
     logged: 0,
@@ -313,16 +339,28 @@ export function spawnWorker(opts: SpawnWorkerOptions): Promise<WorkerProcess> {
     // for a pipe (codex) do not block on it.
     stdio: ['ignore', 'pipe', 'pipe'],
     env: { ...process.env, ...opts.env },
-    // Stay in OUR process group. `detached: true` would put the worker in its own
-    // group, which then requires killing the negated PID and reaps nothing on
-    // macOS without a subreaper — not worth it, and every CLI we drive flushes
-    // its own state on SIGTERM.
-    detached: false,
+    // Give each worker its own process group so cancellation reaches shell/tool
+    // descendants too. We only wait for the CLI process itself; the group is
+    // signalled as a unit on timeout or cancellation.
+    detached: process.platform !== 'win32',
   });
 
   let killReason: 'cancelled' | 'timeout' | undefined;
   let killTimer: NodeJS.Timeout | undefined;
   let timeoutTimer: NodeJS.Timeout | undefined;
+  const killGraceMs = Math.max(0, opts.killGraceMs ?? 5_000);
+
+  function signalTree(signal: NodeJS.Signals): void {
+    const pid = handle.pid;
+    if (pid === undefined) return;
+    try {
+      if (process.platform === 'win32') process.kill(pid, signal);
+      else process.kill(-pid, signal);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== 'ESRCH' && code !== 'EPERM') throw err;
+    }
+  }
 
   // RULE 4: polite first, then escalate. SIGTERM gives the CLI a chance to flush
   // its result file, which matters for the agy-staff readers in harness/.
@@ -335,20 +373,13 @@ export function spawnWorker(opts: SpawnWorkerOptions): Promise<WorkerProcess> {
       clearTimeout(timeoutTimer);
       timeoutTimer = undefined;
     }
-    try {
-      handle.kill('SIGTERM');
-    } catch {
-      /* already dead */
-    }
+    signalTree('SIGTERM');
     killTimer = setTimeout(() => {
       killTimer = undefined;
-      try {
-        handle.kill('SIGKILL');
-      } catch {
-        /* already dead */
-      }
-    }, 5_000);
-    killTimer.unref?.();
+      signalTree('SIGKILL');
+    }, killGraceMs);
+    // Cleanup must keep the supervisor alive even when only detached-stdio
+    // descendants remain. An unref'ed timer would silently abandon SIGKILL.
   }
 
   const proc: WorkerProcess = {
@@ -374,7 +405,13 @@ export function spawnWorker(opts: SpawnWorkerOptions): Promise<WorkerProcess> {
       if (settled) return;
       settled = true;
       if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
-      if (killTimer !== undefined) clearTimeout(killTimer);
+      if (killTimer !== undefined) {
+        clearTimeout(killTimer);
+        killTimer = undefined;
+        // Once the leader is gone there is nothing left to flush. Stop any
+        // surviving tools before acknowledging the terminal cancellation.
+        if (killReason !== undefined) signalTree('SIGKILL');
+      }
       resolve({ code, signal });
     };
     handle.on('error', (err: NodeJS.ErrnoException) => {

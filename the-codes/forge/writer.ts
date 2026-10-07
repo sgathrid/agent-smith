@@ -1,0 +1,548 @@
+/**
+ * writer.ts — one job, from `spawn()` to the terminal anchor.
+ *
+ * This is the module that makes the two halves of this repo one system. It takes
+ * a `WorkerHandle` from providers/, translates its event stream into OUR state
+ * format (format.ts), computes the verdict (format.deriveStatus), writes the
+ * anchor, and projects the result into the compat mirror (mirror.ts) so an
+ * unmodified mod can draw it.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * WHY THE WRITER, AND NOT THE SURFACE, OWNS THE FILES
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * Because a job outlives the tool call that started it. `spawn_job` returns a
+ * job id in under a millisecond; the job then runs for 28 minutes across an MCP
+ * server restart, a session close, and a pane that was never opened. If the
+ * surface owned the state, a Claude Code restart would lose every running job.
+ *
+ * The filesystem is the only thing in this system that survives all three.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * WRITE AMOUNT, BECAUSE THIS RUNS 484 TIMES ON A GOOD JOB
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * The reference job made 484 tool calls. Naively, that is 484 progress.json
+ * rewrites and 484 mirror progress rewrites. Both are invisible — the band polls
+ * at 3 s, the channel at 5 s — so we coalesce: at most one progress flush every
+ * PROGRESS_FLUSH_MS, with a trailing flush on every terminal transition so the
+ * last state is never lost.
+ *
+ * What is NOT throttled: the terminal writes, the cancel marker, and the
+ * append-only event log. Those are the ones a reader is waiting on.
+ */
+
+import { readFileSync } from 'node:fs';
+
+import { appendLine, createMarker, writeAtomic, writeJsonAtomic } from './atomic.ts';
+import {
+  FILES,
+  PROGRESS_FLUSH_MS,
+  SCHEMA_VERSION,
+  deriveStatus,
+  jobFile,
+  looksEmpty,
+  shouldFlush,
+  taskTitle,
+  type ForgeActivity,
+  type ForgeManifest,
+  type ForgeProgress,
+  type ForgeStatus,
+} from './format.ts';
+import { MirrorWriter } from './mirror.ts';
+import type { JobResult, ProviderEvent, WorkerHandle } from '../providers/types.ts';
+
+/** How many recent activities we keep. Matches the pane's rendering cap. */
+const RECENT_ACTIVITIES = 5;
+
+/** How much assistant text we keep as the "reasoning" cell. */
+const LATEST_TEXT_CHARS = 4_000;
+
+export interface JobWriterOptions {
+  readonly repo: string;
+  readonly jobId: string;
+  /** Project into the agy-staff-shaped compat mirror. Default true. */
+  readonly mirror?: boolean;
+  /** Progress coalescing window, ms. Overridable so tests need not sleep. */
+  readonly flushMs?: number;
+}
+
+export interface StartInput {
+  readonly name?: string;
+  readonly workerId?: string;
+  readonly task?: string;
+  readonly provider: string;
+  readonly mode: string;
+  readonly model: string | null;
+  readonly effort: string | null;
+  readonly cwd: string;
+  readonly prompt: string;
+  readonly unrestricted: boolean;
+  readonly conversation: string | null;
+  readonly timeoutMs: number;
+  readonly pipeline: string | null;
+  readonly stage: string | null;
+  readonly attempt: number | null;
+  readonly modelRequested?: string | null;
+  readonly modelResolved?: string | null;
+  readonly modelSource?: 'requested' | 'harness-config' | 'reported' | 'unknown';
+  readonly preambleApplied?: boolean;
+  readonly sandbox?: string;
+  readonly sandboxFlags?: readonly string[];
+  readonly readOnlyRequested?: boolean;
+  readonly readOnlyEnforced?: boolean;
+}
+
+/**
+ * Owns the on-disk state of exactly one job.
+ *
+ * Not thread-safe and does not need to be: one job has one owner (the coroutine
+ * that spawned it), and `forge/service.ts` keeps that ownership in a map.
+ */
+export class JobWriter {
+  readonly jobId: string;
+  private readonly repo: string;
+  private readonly flushMs: number;
+  private readonly mirror: MirrorWriter;
+  private readonly mirrorOn: boolean;
+
+  private manifest: ForgeManifest | null = null;
+  private progress: ForgeProgress | null = null;
+  private recent: ForgeActivity[] = [];
+  private lastFlushMs = 0;
+  private toolCalls = 0;
+  private latestText: string | null = null;
+  private conversation: string | null = null;
+  private finished = false;
+  private cancelRequestedAt: string | null = null;
+
+  constructor(options: JobWriterOptions) {
+    this.repo = options.repo;
+    this.jobId = options.jobId;
+    this.flushMs = options.flushMs ?? PROGRESS_FLUSH_MS;
+    this.mirrorOn = options.mirror ?? true;
+    this.mirror = new MirrorWriter(options.repo, { enabled: options.mirror ?? true });
+  }
+
+  /**
+   * Write the initial snapshot, BEFORE the process is spawned.
+   *
+   * The ordering is the whole point. A reader that finds nothing has to answer
+   * "does this job exist?" with "no", and then the job's whole life is invisible
+   * until its first event — which for a slow provider is seconds, and for a
+   * spawn failure is forever. Writing first means the job exists from the
+   * instant it was accepted, and a spawn that throws turns an existing job from
+   * `running` into `failed` instead of leaving a hole.
+   *
+   * `claim()` runs first: if the id belongs to somebody else's job we refuse
+   * before writing a single byte.
+   */
+  start(input: StartInput): ForgeManifest {
+    const now = new Date().toISOString();
+    this.conversation = input.conversation;
+    const manifest: ForgeManifest = {
+      schema: SCHEMA_VERSION,
+      jobId: this.jobId,
+      name: input.name ?? this.jobId,
+      workerId: input.workerId ?? this.jobId,
+      role: input.mode,
+      latestSummary: null,
+      summarySource: null,
+      provider: input.provider,
+      mode: input.mode,
+      model: input.model,
+      effort: input.effort,
+      cwd: input.cwd,
+      task: input.task === undefined ? taskTitle(input.prompt) : taskTitle(input.task),
+      promptChars: input.prompt.length,
+      unrestricted: input.unrestricted,
+      conversation: input.conversation,
+      ownerPid: process.pid,
+      status: 'running',
+      createdAt: now,
+      updatedAt: now,
+      startedAt: null,
+      finishedAt: null,
+      exitCode: null,
+      jobStatus: null,
+      error: null,
+      deniedActions: [],
+      usage: null,
+      toolCalls: 0,
+      pipeline: input.pipeline,
+      stage: input.stage,
+      attempt: input.attempt,
+      ...(input.modelRequested === undefined ? {} : { modelRequested: input.modelRequested }),
+      ...(input.modelResolved === undefined ? {} : { modelResolved: input.modelResolved }),
+      ...(input.modelSource === undefined ? {} : { modelSource: input.modelSource }),
+      ...(input.preambleApplied === undefined ? {} : { preambleApplied: input.preambleApplied }),
+      ...(input.sandbox === undefined ? {} : { sandbox: input.sandbox }),
+      ...(input.sandboxFlags === undefined ? {} : { sandboxFlags: input.sandboxFlags }),
+      ...(input.readOnlyRequested === undefined ? {} : { readOnlyRequested: input.readOnlyRequested }),
+      ...(input.readOnlyEnforced === undefined ? {} : { readOnlyEnforced: input.readOnlyEnforced }),
+    };
+    this.manifest = manifest;
+    this.progress = {
+      jobId: this.jobId,
+      lastEventAt: now,
+      recentActivities: [],
+      latestText: null,
+      toolCalls: 0,
+      warnings: [],
+    };
+
+    this.mirror.claim(this.jobId);
+    this.writeManifest();
+    this.mirror.writeSpec(manifest);
+    this.flushProgress(this.manifest.createdAt);
+    return manifest;
+  }
+
+  /** Feed one normalized provider event into the snapshot. */
+  onEvent(event: ProviderEvent): void {
+    if (this.finished || this.manifest === null) return;
+    const at = event.at;
+
+    if (event.kind === 'started') {
+      if (typeof event.conversationId === 'string') this.conversation = event.conversationId;
+      if (typeof event.model === 'string' && this.manifest.model === null) {
+        // Provider-reported (structured event, never worker text) beats "unknown"/harness-config guesses.
+        this.manifest = {
+          ...this.manifest,
+          model: event.model,
+          modelResolved: event.model,
+          modelSource: 'reported',
+        };
+      }
+      this.touch(at);
+      return;
+    }
+
+    if (event.kind === 'activity-start' || event.kind === 'activity-end') {
+      const ref = event.activity;
+      const status =
+        event.kind === 'activity-start'
+          ? ('active' as const)
+          : event.status === 'denied'
+            ? ('denied' as const)
+            : event.status === 'error'
+              ? ('error' as const)
+              : ('done' as const);
+
+      if (event.kind === 'activity-start') {
+        this.toolCalls = Math.max(this.toolCalls, ref.stepIndex + 1);
+      }
+
+      // A tool's DONE record frequently carries no `input` (the provider split
+      // ACTIVE and DONE for the same step_index, and only ACTIVE had the
+      // parameters — 14,900 archived records confirm it). So the DONE row
+      // INHERITS the input from the ACTIVE row rather than dropping it, which is
+      // what keeps the pane's activity phrase readable on a finished job.
+      const idx = this.recent.findIndex((a) => a.stepIndex === ref.stepIndex);
+      const input = ref.input ?? (idx >= 0 ? this.recent[idx]?.input : undefined);
+      const row: ForgeActivity = {
+        stepIndex: ref.stepIndex,
+        tool: ref.tool,
+        status,
+        ...(input === undefined ? {} : { input }),
+      };
+      if (idx >= 0) this.recent[idx] = row;
+      else this.recent.push(row);
+      // The pane picks the HIGHEST step_index, not the last entry, because a
+      // rewritten array mid-poll is not guaranteed sorted. Keeping the array
+      // short is what stops that from mattering.
+      if (this.recent.length > RECENT_ACTIVITIES) this.recent = this.recent.slice(-RECENT_ACTIVITIES);
+
+      this.mirror.appendEvent(this.jobId, event as unknown as Record<string, unknown>);
+      this.touch(at);
+      return;
+    }
+
+    if (event.kind === 'text') {
+      if (event.stream !== 'assistant') return;
+      this.latestText = appendBounded(this.latestText ?? '', event.text, LATEST_TEXT_CHARS);
+      this.manifest = { ...this.manifest, latestSummary: this.latestText.trim().slice(-1_000) || this.manifest.latestSummary || null, summarySource: 'worker' };
+      this.touch(at);
+      return;
+    }
+
+    if (event.kind === 'notice') {
+      if (event.level === 'warn' || event.level === 'error') {
+        this.addWarning(event.message.slice(0, 400));
+        this.touch(at);
+      }
+      return;
+    }
+
+    if (event.kind === 'usage') {
+      this.touch(at);
+      return;
+    }
+  }
+
+  /**
+   * Write the terminal state.
+   *
+   * Every path out of a job goes through here, including the ones where the
+   * process died without producing a JobResult — a cancel that raced the exit,
+   * a throw from the adapter. A job that never gets a terminal write stays
+   * `running` forever, which is a lie with a very long fuse.
+   */
+  finish(result: JobResult, report: string | null): ForgeManifest {
+    if (this.finished || this.manifest === null) {
+      // A second terminal write is a bug in the caller, but returning the
+      // manifest we already have is strictly better than rewriting history.
+      return this.manifest ?? emptyManifest(this.jobId);
+    }
+    this.finished = true;
+
+    const finishedAt = result.finishedAt;
+    // A marker records a request, not proof that the worker stopped. Only the
+    // adapter's terminal cancellation verdict can make the job canceled.
+    const alreadyTerminal: ForgeStatus | null = result.status === 'cancelled' ? 'canceled' : null;
+
+    const verdict = deriveStatus({
+      alreadyTerminal,
+      ok: result.ok,
+      jobStatus: result.status,
+      deniedActions: result.deniedActions ?? [],
+      report,
+    });
+
+    const usage =
+      result.usage === undefined
+        ? null
+        : (Object.fromEntries(
+            Object.entries(result.usage).filter((e): e is [string, number] => typeof e[1] === 'number'),
+          ) as Record<string, number>);
+
+    const manifest: ForgeManifest = {
+      ...this.manifest,
+      status: verdict.status,
+      updatedAt: finishedAt,
+      finishedAt,
+      startedAt: this.manifest.startedAt ?? result.startedAt,
+      exitCode: result.exitCode,
+      jobStatus: result.status,
+      // BOTH strings, verdict first. The verdict leads because it is this repo's
+      // own vocabulary and reads identically for every provider. The adapter's
+      // message follows because it is the SPECIFIC one — `agy exited without
+      // emitting a result event` on its own does not say ENOENT, and dropping it
+      // would turn a diagnosable spawn failure into an unexplained `error`.
+      error:
+        verdict.reason === null
+          ? (result.error ?? null)
+          : appendBounded(`${verdict.reason} — `, result.error ?? '', 1_200),
+      deniedActions: (result.deniedActions ?? []).map((d) => ({
+        ...(d.action === undefined ? {} : { action: d.action }),
+        ...(d.displayName === undefined ? {} : { displayName: d.displayName }),
+      })),
+      usage,
+      toolCalls: this.toolCalls,
+      conversation: this.conversation,
+      latestSummary: result.response.trim().slice(0, 1_000) || this.manifest.latestSummary || null,
+      summarySource: result.response.trim() || this.manifest.latestSummary ? 'worker' : null,
+    };
+    this.manifest = manifest;
+
+    const body = report ?? '';
+    writeAtomic(jobFile(this.repo, this.jobId, FILES.report), body);
+    this.writeManifest();
+    this.flushProgress(finishedAt);
+    this.mirror.finish(manifest, body, verdict.suspicious);
+
+    if (verdict.suspicious) this.addWarning(verdict.reason ?? 'suspicious success');
+    return manifest;
+  }
+
+  /**
+   * Record a terminal state with no JobResult at all.
+   *
+   * Used when the adapter throws or never resolves. Same guarantee as `finish`:
+   * the job stops claiming to be `running`.
+   */
+  abort(status: Exclude<ForgeStatus, 'running'>, reason: string): ForgeManifest | null {
+    if (this.finished || this.manifest === null) return this.manifest;
+    this.finished = true;
+    const now = new Date().toISOString();
+    const manifest: ForgeManifest = {
+      ...this.manifest,
+      status,
+      updatedAt: now,
+      finishedAt: now,
+      error: reason,
+      jobStatus: status === 'canceled' ? 'cancelled' : 'malformed',
+    };
+    this.manifest = manifest;
+    this.addWarning(reason);
+    this.writeManifest();
+    this.flushProgress(now);
+    this.mirror.finish(manifest, reportText(this.repo, this.jobId), false);
+    return manifest;
+  }
+
+  /**
+   * Request cancellation. Writes the marker FIRST, then the caller kills.
+   *
+   * Marker before kill because the kill is asynchronous and a reader polling in
+   * between must already see the intent. This is agy-staff's HAZARD B, kept for
+   * the same reason it exists there: a cancellation caught mid-flight is still a
+   * cancellation, and the worker may never get to write its own terminal state.
+   */
+  requestCancel(at: string = new Date().toISOString()): void {
+    if (this.finished) return;
+    if (this.cancelRequestedAt === null) {
+      this.cancelRequestedAt = at;
+      createMarker(jobFile(this.repo, this.jobId, FILES.cancel), at);
+      // Legacy readers treat a marker as already stopped. Keep the request
+      // canonical until finish() publishes an acknowledged terminal state.
+    }
+  }
+
+  /** Did this job get cancelled? True once a marker exists, terminal or not. */
+  get cancelled(): boolean {
+    return this.cancelRequestedAt !== null;
+  }
+
+  /**
+   * The recent tool rows, in step order.
+   *
+   * Exposed so the pipeline runner can build `Observation[]` for routing.ts
+   * without opening a second subscription to the provider's event stream — this
+   * process already owns that stream.
+   */
+  activities(): readonly ForgeActivity[] {
+    return [...this.recent].sort((a, b) => a.stepIndex - b.stepIndex);
+  }
+
+  /** The current manifest, for a status() read that does not re-parse the file. */
+  snapshot(): ForgeManifest | null {
+    return this.manifest;
+  }
+
+  /* ── internals ─────────────────────────────────────────────────────────── */
+
+  private touch(at: string): void {
+    if (this.manifest === null) return;
+    this.manifest = { ...this.manifest, updatedAt: at };
+    this.progress = {
+      jobId: this.jobId,
+      name: this.manifest.name,
+      workerId: this.manifest.workerId,
+      role: this.manifest.role,
+      latestSummary: this.manifest.latestSummary,
+      summarySource: this.manifest.summarySource,
+      lastEventAt: at,
+      recentActivities: this.recent,
+      latestText: this.latestText,
+      toolCalls: this.toolCalls,
+      warnings: this.progress?.warnings ?? [],
+    };
+    const nowMs = Date.parse(at);
+    const clock = Number.isNaN(nowMs) ? Date.now() : nowMs;
+    if (shouldFlush(this.lastFlushMs, clock, this.flushMs)) this.flushProgress(at);
+  }
+
+  private addWarning(message: string): void {
+    if (this.progress === null) return;
+    if (this.progress.warnings.includes(message)) return;
+    this.progress = { ...this.progress, warnings: [...this.progress.warnings, message] };
+  }
+
+  /** Persist the anchor. Always whole, always atomic. */
+  private writeManifest(): void {
+    if (this.manifest === null) return;
+    writeJsonAtomic(jobFile(this.repo, this.jobId, FILES.job), this.manifest);
+  }
+
+  private flushProgress(at: string): void {
+    if (this.progress === null) return;
+    const progress: ForgeProgress = { ...this.progress, lastEventAt: at,
+      name: this.manifest?.name, workerId: this.manifest?.workerId, role: this.manifest?.role,
+      latestSummary: this.manifest?.latestSummary ?? null, summarySource: this.manifest?.summarySource ?? null };
+    this.progress = progress;
+    this.writeManifest();
+    writeJsonAtomic(jobFile(this.repo, this.jobId, FILES.progress), progress);
+    this.mirror.writeProgress(this.manifest ?? emptyManifest(this.jobId), progress);
+    const ms = Date.parse(at);
+    this.lastFlushMs = Number.isNaN(ms) ? Date.now() : ms;
+  }
+}
+
+/** Append `add` to `base`, bounded. Pure, so the bounding rule is testable. */
+export function appendBounded(base: string, add: string, max: number): string {
+  const joined = base === '' ? add : `${base}${add}`;
+  if (joined.length <= max) return joined;
+  // Cut from the FRONT: the newest text is what the pane shows, and a stale
+  // opening paragraph is worth less than the sentence the worker just wrote.
+  return joined.slice(joined.length - max);
+}
+
+/** Read back a report we wrote. Used by abort(), where we never had one. */
+function reportText(repo: string, jobId: string): string {
+  try {
+    return readFileSync(jobFile(repo, jobId, FILES.report), 'utf8');
+  } catch {
+    return '';
+  }
+}
+
+function emptyManifest(jobId: string): ForgeManifest {
+  const now = new Date().toISOString();
+  return {
+    schema: SCHEMA_VERSION,
+    jobId,
+    provider: 'unknown',
+    mode: 'unknown',
+    model: null,
+    effort: null,
+    cwd: '',
+    task: '',
+    promptChars: 0,
+    unrestricted: false,
+    conversation: null,
+    status: 'running',
+    createdAt: now,
+    updatedAt: now,
+    startedAt: null,
+    finishedAt: null,
+    exitCode: null,
+    jobStatus: null,
+    error: null,
+    deniedActions: [],
+    usage: null,
+    toolCalls: 0,
+    pipeline: null,
+    stage: null,
+    attempt: null,
+  };
+}
+
+/**
+ * Subscribe to a handle's events and drive this writer from them.
+ *
+ * Returns an unsubscribe. Event listeners run synchronously in stream order, so
+ * this does no async work — the only awaits are in `onEvent`, and there are none.
+ */
+export function pipeEvents(writer: JobWriter, handle: WorkerHandle): () => void {
+  return handle.onEvent((event) => {
+    try {
+      writer.onEvent(event);
+    } catch {
+      // A state write must never kill a worker that is otherwise fine. Losing
+      // one progress snapshot costs one stale poll tick; killing the job costs
+      // the user 28 minutes.
+    }
+  });
+}
+
+/** The report text a JobResult implies, under the headline rule. Exported for tests. */
+export function reportFor(result: JobResult): string {
+  if (typeof result.response === 'string' && !looksEmpty(result.response)) return result.response;
+  return '';
+}
+
+/** Append one normalized event straight to our own event log. Used by tests. */
+export function appendOwnEvent(repo: string, jobId: string, event: ProviderEvent): void {
+  appendLine(jobFile(repo, jobId, FILES.events), event);
+}

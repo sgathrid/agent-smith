@@ -13,13 +13,40 @@
  * So every call here is wrapped, and a failure becomes an empty contribution.
  */
 
+import { AgentSmithReader } from "./agent-smith.ts";
 import { AgyStaffReader } from "./agy-staff.ts";
 import { ClaudeCodeReader } from "./claude-code.ts";
 import { normalize } from "./normalize.ts";
+import { isForgeJobId } from "../forge/format.ts";
 import type { JobStateReader, ObservedJob } from "./types.ts";
 
-/** All readers, keyed by provider name. Constructed once and reused. */
+/**
+ * All readers, keyed by provider name. Constructed once and reused.
+ *
+ * THE ORDER IS THE PRIORITY ORDER, AND THAT IS A DECISION, NOT ALPHABETICAL:
+ *
+ *   "agent-smith"  PRIMARY.   Every job this repo spawned. Authoritative.
+ *   "agy-staff"    INTEROP.   Somebody else's layout, read-only. Kept so the 20
+ *                             real jobs under renyi/.agy-staff/jobs stay visible
+ *                             and so any future worker that writes that shape is
+ *                             picked up for free.
+ *   "claude-code"  TRANSCRIPT. Claude Code subagent transcripts.
+ *
+ * WHY agent-smith COMES FIRST — and why that matters beyond tidiness:
+ * forge/mirror.ts projects our jobs into `.agy-staff/jobs/` so an UNMODIFIED mod
+ * plugin can render them (see that file's header for why the projection is the
+ * only route to the acceptance criterion). The consequence is that the
+ * interop reader's `discover()` also returns our job ids.
+ *
+ * If both readers contributed a verdict for the same id, every spawned job would
+ * be reported twice in a single sweep, from two independently computed states.
+ * The channel's dedupe would hide that; nothing else would. So
+ * `readAllObservedJobs` below resolves the collision explicitly in favour of the
+ * primary reader, and this insertion order is what makes the resolution
+ * expressible.
+ */
 const READERS: ReadonlyMap<string, JobStateReader> = new Map<string, JobStateReader>([
+  ["agent-smith", new AgentSmithReader()],
   ["agy-staff", new AgyStaffReader()],
   ["claude-code", new ClaudeCodeReader()],
 ]);
@@ -102,18 +129,45 @@ export async function readObservedJob(
 
 /**
  * Read + normalize every job for a cwd, across every provider.
- * Unknown/errored entries are dropped (the provider-level `error` already
- * carries the diagnostic from discoverAll).
+ *
+ * UNKNOWN/ERRORED ENTRIES ARE DROPPED (the provider-level `error` from
+ * discoverAll carries the diagnostic).
+ *
+ * COLLISION RULE — one verdict per job id, primary reader wins:
+ * the compat mirror in `.agy-staff/jobs/` means the interop reader discovers our
+ * own job ids too. Left alone, every job we spawn would be counted twice. So a
+ * job id that the PRIMARY reader can read is never also read from a lower-priority
+ * reader, and the returned list has at most one entry per id.
+ *
+ * This is the mechanism behind the architecture's claim that two surfaces cannot
+ * disagree about a job's state. Without it they would disagree inside a single
+ * sweep, which is strictly worse than disagreeing across two surfaces: there is
+ * no second opinion to notice.
  */
 export async function readAllObservedJobs(cwd: string): Promise<ObservedJob[]> {
   const sweeps = await discoverAll(cwd);
-  const reads = await Promise.all(
-    sweeps.flatMap((s) => s.jobIds.map(async (jobId): Promise<ObservedJob | null> => {
-      return readObservedJob(s.provider, cwd, jobId);
-    })),
-  );
-  return reads.filter((j): j is ObservedJob => j !== null);
+  const claimed = new Set<string>();
+  const reads: Array<Promise<ObservedJob | null>> = [];
+  for (const sweep of sweeps) {
+    for (const jobId of sweep.jobIds) {
+      if (claimed.has(jobId)) continue;
+      claimed.add(jobId);
+      reads.push(readObservedJob(sweep.provider, cwd, jobId));
+    }
+  }
+  const settled = await Promise.all(reads);
+  return settled.filter((j): j is ObservedJob => j !== null);
 }
+
+/**
+ * Is this job id one agent-smith owns?
+ *
+ * Re-exported from forge/format.ts rather than duplicated, because the id shape
+ * is part of the on-disk contract: the `-smith-` segment is what makes a mirrored
+ * id distinguishable from a real agy-staff one, in the band, in a job list, and
+ * in the channel's `meta`. Two definitions of it would eventually disagree.
+ */
+export { isForgeJobId };
 
 /** A defensive `unknown` ObservedJob used when a read/normalize fails. */
 function unknownJob(provider: string, jobId: string, detail: string): ObservedJob {

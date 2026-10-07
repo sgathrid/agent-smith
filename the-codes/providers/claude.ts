@@ -103,7 +103,7 @@ import {
   writeArgv,
   writeResultFile,
   writeStateDir,
-} from './ndjson.js';
+} from './ndjson.ts';
 import type {
   ActivityRef,
   ActivityStatus,
@@ -114,7 +114,11 @@ import type {
   SpawnSpec,
   TokenUsage,
   WorkerHandle,
-} from './types.js';
+} from './types.ts';
+import type { ListModelsOptions, ModelCatalog, ModelInfo, SandboxInfo } from './types.ts';
+import { DEFAULT_DISCOVERY_TIMEOUT_MS, configDir, errMessage, readTextSafe, runCapture } from './discovery.ts';
+import type { RunFn } from './discovery.ts';
+import path from 'node:path';
 
 export const CLAUDE_BINARY = process.env['AGENT_SMITH_CLAUDE_BIN'] ?? 'claude';
 
@@ -135,6 +139,33 @@ export type ClaudePermissionMode =
  * so a prompt beginning with "-" is safe. Combined with `-p`, this is the
  * documented headless invocation.
  */
+/**
+ * Sandbox/permission flags for claude. Shared by buildArgv and describeSandbox.
+ *
+ * unrestricted -> --dangerously-skip-permissions ("trusted in this directory").
+ * restricted   -> --permission-mode dontAsk + --permission-prompts none. Claude
+ *   cannot prompt in print mode, so anything not already allowed (by the user's
+ *   settings allow rules or built-in read-only tools) is DENIED, not stalled.
+ *   Denials are surfaced as status 'denied' in the JobResult (detected from
+ *   tool_result text), so a restricted worker does not silently pass; but
+ *   read-only is NOT enforced: user allow rules may still permit writes.
+ */
+export function sandboxPlan(spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly'>): SandboxInfo {
+  if (spec.unrestricted) {
+    return {
+      sandbox: 'claude --dangerously-skip-permissions (unrestricted)',
+      flags: ['--dangerously-skip-permissions'],
+      readOnlyEnforced: false,
+    };
+  }
+  const flags = ['--permission-mode', 'dontAsk', '--permission-prompts', 'none'];
+  return {
+    sandbox: 'claude dontAsk (cannot prompt; non-allowed tools are denied and reported as denied)',
+    flags,
+    readOnlyEnforced: false,
+  };
+}
+
 export function buildArgv(spec: SpawnSpec): string[] {
   const argv: string[] = ['-p'];
 
@@ -157,9 +188,13 @@ export function buildArgv(spec: SpawnSpec): string[] {
     argv.push('--model', spec.model);
   }
 
-  // effort: claude has no --effort flag. Anthropic exposes reasoning effort per
-  // model via the alias/full-name, so a caller asking for an effort gets the
-  // closest thing (see README). We do NOT invent a flag here.
+  if (spec.effort !== undefined && spec.effort !== '') {
+    const supported = ['low', 'medium', 'high', 'xhigh', 'max'];
+    if (!supported.includes(spec.effort)) {
+      throw new RangeError(`claude does not support effort '${spec.effort}'; expected one of ${supported.join(', ')}`);
+    }
+    argv.push('--effort', spec.effort);
+  }
 
   const addDirs = spec.addDirs ?? [];
   if (addDirs.length > 0) {
@@ -169,35 +204,13 @@ export function buildArgv(spec: SpawnSpec): string[] {
     argv.push('--add-dir', ...addDirs);
   }
 
-  if (spec.unrestricted) {
-    // Verified. Same semantics as agy's --dangerously-skip-permissions and
-    // codex's --dangerously-bypass-approvals-and-sandbox: "this worker is
-    // trusted in this directory".
-    argv.push('--dangerously-skip-permissions');
-  } else {
-    // Restricted default.
-    //
-    // WHY 'dontAsk' AND NOT 'manual': in print mode 'manual' means claude would
-    // wait for an approval that can never arrive, so a restricted run would
-    // hang until the timeout. 'dontAsk' means "never prompt; just deny what is
-    // not already allowed", which is the same shape as agy's headless
-    // auto-deny and fails loudly instead of stalling.
-    //
-    // IMPORTANT CONSEQUENCE, documented in the README: a restricted claude
-    // moderator may come back with denied tool calls. We surface those as
-    // 'denied', exactly as agy does. A moderator with no tools cannot moderate.
-    argv.push('--permission-mode', 'dontAsk');
-    // Belt and braces: in print mode the host (us) answers permission prompts,
-    // and we have no prompt handler. 'none' means there is nobody to ask.
-    argv.push('--permission-prompts', 'none');
-  }
+  // See sandboxPlan for the unrestricted / restricted (dontAsk) rationale.
+  argv.push(...sandboxPlan(spec).flags);
 
   if (spec.conversation !== undefined && spec.conversation !== '') {
-    // Verified: "--session-id <uuid>  Use a specific session ID for the
-    // conversation (must be a valid UUID)". If the caller passes a non-UUID,
-    // claude errors out fast with a clear message — acceptable, and better than
-    // silently starting a fresh conversation.
-    argv.push('--session-id', spec.conversation);
+    // --session-id starts a new session with a chosen id. --resume is the CLI's
+    // continuation path and preserves the prior conversation.
+    argv.push('--resume', spec.conversation);
   }
 
   // Reproducibility knob. --setting-sources controls which settings files load.
@@ -575,7 +588,58 @@ function buildResult(args: {
 // Provider
 // ---------------------------------------------------------------------------
 
+/** Aliases documented by `claude --help`. */
+export const CLAUDE_ALIASES: ReadonlyArray<{ id: string; label: string }> = [
+  { id: 'fable', label: 'Fable' },
+  { id: 'opus', label: 'Opus' },
+  { id: 'sonnet', label: 'Sonnet' },
+  { id: 'haiku', label: 'Haiku' },
+];
+export const CLAUDE_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+
+/** Claude config dir: AGENT_SMITH_CLAUDE_HOME, CLAUDE_CONFIG_DIR, then ~/.claude. */
+export function claudeHome(): string {
+  return configDir(['AGENT_SMITH_CLAUDE_HOME', 'CLAUDE_CONFIG_DIR'], '.claude');
+}
+
+/** Static alias catalog; default model from <home>/settings.json top-level `model`. Never throws. */
+export async function listClaudeModels(_options?: ListModelsOptions, home: string = claudeHome()): Promise<ModelCatalog> {
+  const cat: ModelCatalog = {
+    provider: 'claude',
+    models: CLAUDE_ALIASES.map((a) => ({ id: a.id, label: a.label, efforts: [...CLAUDE_EFFORTS] })),
+    defaultSource: 'unknown',
+    source: 'static',
+    stale: false,
+    verified: true,
+  };
+  try {
+    const text = readTextSafe(path.join(home, 'settings.json'));
+    if (text !== undefined) {
+      const model = (JSON.parse(text) as { model?: unknown } | null)?.model;
+      if (typeof model === 'string' && model !== '') {
+        cat.defaultModel = model;
+        cat.defaultSource = 'harness-config';
+      }
+    }
+  } catch (e) {
+    cat.error = `could not parse settings.json: ${errMessage(e)}`;
+  }
+  return cat;
+}
+
+/** Default model from <home>/settings.json. Sync file read only; never throws. */
+export function claudeHarnessDefaults(home: string = claudeHome()): { model?: string; effort?: string } {
+  try {
+    const text = readTextSafe(path.join(home, 'settings.json'));
+    const model = text === undefined ? undefined : (JSON.parse(text) as { model?: unknown } | null)?.model;
+    return typeof model === 'string' && model !== '' ? { model } : {};
+  } catch {
+    return {};
+  }
+}
+
 export const claudeProvider: Provider = {
+  harnessDefaults: () => claudeHarnessDefaults(),
   name: 'claude',
 
   async available(): Promise<boolean> {
@@ -585,6 +649,10 @@ export const claudeProvider: Provider = {
       return false;
     }
   },
+
+  describeSandbox: (spec) => sandboxPlan(spec),
+
+  listModels: (options) => listClaudeModels(options),
 
   async spawn(spec: SpawnSpec): Promise<WorkerHandle> {
     const jobId = spec.jobId ?? newJobId();

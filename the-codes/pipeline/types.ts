@@ -31,7 +31,16 @@ export type ModelId = string;
  * in-band task. That is why `low` is the default everywhere in this codebase
  * and why escalation — not the default — is what buys effort.
  */
-export type Effort = 'low' | 'medium' | 'high';
+export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+
+/** An explicit executable acceptance check, resolved against the worker's cwd. */
+export interface StageCheck {
+  readonly name: string;
+  readonly command: string;
+  readonly cwd?: string;
+  readonly timeoutMs?: number;
+  readonly blocking?: boolean;
+}
 
 /**
  * What a stage is for. Open-ended on purpose: a spec may use a custom role and
@@ -85,6 +94,24 @@ export interface Stage {
   readonly role?: StageRole | undefined;
   /** The instruction handed to the worker. */
   readonly prompt?: string | undefined;
+  /**
+   * Human-facing one-liner for surfaces — the mod's `task` column, the store's
+   * `title`.
+   *
+   * ADDITIVE, and it exists because deriving it from `prompt` is wrong whenever
+   * the prompt is not the task. A `review` stage's prompt is role framing plus
+   * the task, so "the first line of the prompt" is the framing, and every row in
+   * the band reads `You are reviewing the work of…` instead of what the worker is
+   * actually being asked to do. Omit it and the first non-empty line of `prompt`
+   * is used, which is right for a spec whose prompt IS the task.
+   */
+  readonly title?: string | undefined;
+  /** Human-readable worker name, independent of the DAG node key. */
+  readonly agentName?: string;
+  /** Stable worker identity retained across follow-up invocations. */
+  readonly workerId?: string;
+  /** Provider-native conversation handle for an explicit follow-up. */
+  readonly conversation?: string;
   /** Working directory for the worker. Relative to the pipeline work dir. */
   readonly workDir?: string | undefined;
   /**
@@ -96,6 +123,8 @@ export interface Stage {
   readonly consumes?: readonly ArtifactRef[] | undefined;
   /** Per-stage timeout. The pipeline aborts the runner via `StageContext.signal`. */
   readonly timeoutMs?: number | undefined;
+  /** Checks run after the harness completes; no checks means execution only. */
+  readonly checks?: readonly StageCheck[];
   /**
    * Opt out of routing's default-cheapest pass. Set true when a spec author has
    * deliberately pinned model/effort and does not want them rewritten.
@@ -222,6 +251,7 @@ export interface StageContinuation {
   readonly priorStatus: StageStatus;
   /** Where the worker left its conversation. Read by the runner, never by us. */
   readonly transcriptRef?: string | undefined;
+  readonly transcriptProvider?: string | undefined;
   /** Text appended to the worker's context (failing check output, stall shape). */
   readonly appendedContext: string;
   /** Escalations already applied, so the runner can label the resume. */
@@ -329,6 +359,11 @@ export interface Escalation {
  */
 export interface StageResult {
   readonly stage: string;
+  /** External worker invocation ID; distinct from the pipeline run ID. */
+  readonly jobId?: string;
+  /** Acceptance is separate from successful harness execution. */
+  readonly acceptance?: 'unchecked' | 'passed' | 'failed';
+  readonly verification?: import('../verify/types.ts').CheckReport;
   readonly provider: ProviderId;
   readonly model?: ModelId | undefined;
   readonly status: StageStatus;

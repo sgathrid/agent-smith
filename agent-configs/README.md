@@ -2,6 +2,14 @@
 
 Per-harness configuration for **developing and using** Agent Smith.
 
+The nested `.claude/settings.json` is an example enablement key; Claude does not
+read it when launched from the repository root. For an active repo-only setup,
+run `npm run setup:claude` from the root. That builds a complete plugin and writes
+the root `.claude/settings.local.json`, preserving your existing local settings.
+The local file declares this checkout as a directory marketplace and enables its
+plugin only here. Claude maintains its own marketplace registry and plugin data
+under `~/.claude/plugins`; setup does not change global enablement or user settings.
+
 > **Not part of the application.** Nothing in `the-codes/` reads these files.
 > They exist so a human (or an agent) can install Agent Smith into each harness,
 > and so each harness's agent is told how to behave when it is a worker or a

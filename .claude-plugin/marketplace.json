@@ -1,0 +1,13 @@
+{
+  "name": "agent-smith-dev",
+  "owner": {
+    "name": "Agent Smith"
+  },
+  "description": "Local Agent Smith development plugin",
+  "plugins": [
+    {
+      "name": "agent-smith",
+      "source": "./builds/local-plugin/agent-smith"
+    }
+  ]
+}

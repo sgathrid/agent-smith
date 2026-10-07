@@ -1,108 +1,170 @@
 # Agent Smith
 
-**Forge for coding agents.** One task, many workers, one place to watch them.
+Delegate coding work from Claude Code to the **actual Codex, OpenCode, agy, or
+Claude harness**, then observe and follow up with the worker. Agent Smith replaces
+agy-staff execution; the agy-staff reader and state mirror support existing history
+and the terminal plugin. No agy-staff installation is required to run workers.
 
----
+## Start a Claude session
 
-## The problem
+Use Node 22.18+ (or a current Node 24/26 release) and an authenticated worker CLI.
+The Claude mod API also requires a compatible Claude Code release; this repository
+is verified against 2.1.292.
 
-You can already hire a cheap agent — [agy](https://antigravity.google) (Gemini),
-Codex, OpenCode. What you cannot do is **watch them work**.
+For development in **this repository**, enable a self-contained local plugin:
 
-The proof is in real data. `agy-staff` runs a background job that streams a
-complete, typed event log to disk, republished every 100 milliseconds. It then
-instructs the host model *not to look at it*:
-
-> While a job is running, do not proactively call `observe`/`status`, read logs
-> or inspect intermediate artifacts.
-
-Measured across 20 real jobs:
-
-| | |
-|---|---|
-| Jobs | 20 (16 with full telemetry) |
-| Compute time | 9.0 h |
-| Wall clock | **16.3 h** |
-| Max concurrent | **3** |
-| Median job | 28 m |
-| Tokens that were cache reads | **90.4 %** |
-
-Nine hours of work, spread over sixteen, capped at three in flight, with no live
-visibility. The bottleneck was never model capability. **It was observability.**
-
-## What this is
-
-Two surfaces, because they do different jobs:
-
-| Surface | Reaches | Cost | Always on |
-|---|---|---|---|
-| **mod** | your eyes | zero tokens | yes, no flags |
-| **channel** | Claude's cognition | ~50 tokens / event | needs `--channels` |
-
-A **mod** draws live progress in your terminal — a band above the prompt, a
-browsable pane — while you watch. It costs no tokens and works every session.
-
-A **channel** pushes state changes into Claude's context so the model *reacts*
-without being asked. That is the one thing a mod cannot do.
-
-Neither replaces the other. They read from the same store.
-
-## The screen
-
-```
- ● implement-musm82da  12m04s · 341 tools · cargo test --workspace
- ● review-muroviej      2m18s ·  22 tools · reading decoded_view.rs
- ✓ research-muroabc finished (48s · 8 tools)
-   +2 more · /agy-radar
+```sh
+npm install
+npm --prefix the-codes/surfaces/channel install
+npm run setup:claude
+claude
 ```
 
-## Mixed pipelines
+Run these commands from the repository root. Setup builds the UI, MCP runtime,
+dependencies, delegation skill, and background monitor into
+`builds/local-plugin/agent-smith`, then declares this checkout's directory
+marketplace in `.claude/settings.local.json`. Existing local settings are
+preserved. Setup writes no user settings or global enablement. Claude itself
+maintains its marketplace registry and plugin data under `~/.claude/plugins`;
+the plugin is enabled only for this checkout and its files load in place. Re-run
+setup if you move the checkout; run `npm run build:plugin` after source changes
+and restart Claude to load the new monitor.
 
-Name a different worker per stage:
+Project/local settings cannot set `CLAUDE_CODE_PLUGIN_DIRS`. Putting the plugin
+in the project's `.claude/skills/` would suppress its background monitor; the
+local marketplace avoids both limitations.
 
-```yaml
-name: dashboard-rework
-stages:
-  - implement: { provider: gemini }
-  - review:    { provider: codex }
-  - moderate:  { provider: claude, model: sonnet }
+The monitor delivers completion, attention, and pipeline acceptance changes;
+it stays silent for ordinary progress and old history. It starts only in
+interactive sessions on providers where Claude's Monitor tool is available.
+It is unavailable with `DISABLE_TELEMETRY` or
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`; use `status` and `pipeline_status`
+when notifications are unavailable. `/forge` opens the right-third job pane.
+
+The `.claude` under `agent-configs/` is a configuration example, not an active
+root configuration. Claude does not read it when launched from this repo root.
+The setup above uses the root `.claude` without relocating that example.
+
+For a session in **another project**, use the session-scoped launcher:
+
+```sh
+npm install
+npm --prefix the-codes/surfaces/channel install
+npm run build
+/path/to/agent-smith/dev.sh --repo /path/to/your/project
 ```
 
-The `moderate` stage is not decoration. Models across families make **correlated**
-errors — 60 % agreement when both are wrong, across 350+ models (ICML 2025).
-Self-consistency is therefore *not* verification. A different family is.
+This loads the MCP control tools and the `/forge` pane for this session. It does
+not install a global plugin or modify your Claude settings. Add `--channels` to
+opt into the development channel for completion and attention notifications:
 
-**Deliberately not built:** debate, voting, consensus. Four budget-matched
-replications show multi-agent debate underperforms plain self-consistency, and
-gets *worse* with more compute budget ([2406.06461](https://arxiv.org/abs/2406.06461)).
-More tokens are cheap here. Correctness is not.
-
-## Layout
-
-```
-agent-smith/
-├── the-codes/
-│   ├── core/        provider-agnostic job model, store, liveness
-│   ├── harness/     readers for state workers already write
-│   ├── providers/   agy · codex · opencode · claude
-│   ├── pipeline/    multi-stage DAG, dynamic routing
-│   ├── verify/      executable gates — the highest-value piece
-│   └── surfaces/    mod (band + pane) · channel
-├── agent-configs/   per-harness config for developers, not the app
-├── builds/          packaged artifacts
-└── docs/            ARCHITECTURE.md and friends
+```sh
+/path/to/agent-smith/dev.sh --repo /path/to/your/project --channels
 ```
 
-**The one insight that shapes this:** workers already write their own job state
-to disk. `harness/` reads those files. We do not instrument the workers at all.
-That is why this is cheap, and why it works retroactively — you can point it at
-16 jobs you already ran and see them.
+Channels are a Claude research preview and may be unavailable under organization
+policy. The MCP tools still work without notifications: use `status` or
+`pipeline_status`. The terminal UI continues to show progress.
 
-## Status
+Ask Claude to delegate, specifying the worker name, harness, model, and task:
 
-Under construction. See `docs/ARCHITECTURE.md` for the design and the reasoning
-behind each rejected alternative.
+> Use Agent Smith to start a Codex worker named Ada, with my available Codex model,
+> to review the authentication changes. Keep it restricted. Follow up with Ada
+> after reading its findings.
 
-## License
+## Tools and worker identity
 
-MIT
+- `spawn_job`: start a named external worker and return immediately.
+- `list_jobs`, `status`: inspect its task, role, activity, latest summary, report,
+  conversation handle, and lifecycle.
+- `resume_job`: address a completed worker by job ID or unambiguous name. A new
+  invocation retains the worker identity and resumes its harness conversation.
+- `cancel`: request cancellation of a job or pipeline run.
+- `run_pipeline`, `pipeline_status`: run and inspect a mixed-harness DAG.
+
+A worker has a human name and stable `workerId`; each invocation has a separate
+`jobId`. Pipeline runs have their own unique `runId`. Names are labels, not native
+Claude agent addresses. Follow-up to an active CLI invocation is rejected: live
+steering is not implemented by these subprocess adapters.
+
+Live summaries are bounded excerpts of actual worker assistant output, labeled
+with `summarySource: "worker"`. They are not an orchestrator's clinical or technical
+conclusions. Routine output stays in the UI; completion and attention notifications
+include a bounded excerpt. Full reports and original event logs remain on disk.
+
+## Permissions and acceptance
+
+Workers use their harness's restricted configuration by default. This is not
+inheritance of the parent Claude session's permission rules. Codex uses its
+workspace-write sandbox; Claude uses noninteractive permission denial; agy and
+OpenCode have their own configured permissions. `unrestricted: true` explicitly
+requests the provider's bypass mode. A denied, malformed, empty, timed-out, or
+cancelled run is not successful execution.
+
+Successful execution alone does not prove the task is correct. Configure stage
+`checks` to gate acceptance with executable commands. A stage without checks has
+`acceptance: "unchecked"`. Review prose is evidence for the supervising agent;
+Agent Smith does not infer an approval verdict from it.
+
+Workers operate in the requested working tree. Parallel editing stages share it;
+use separate worktrees via stage `workDir` when edits must be isolated. Artifacts
+are separate from the source tree, under a unique run directory. A worker-written
+artifact is preserved; its final chat summary is only a fallback when no artifact
+was produced.
+
+## Optional CLI
+
+The CLI is a thin adapter over the same forge service and state as MCP:
+
+```sh
+node scripts/agent-smith.mjs doctor
+node scripts/agent-smith.mjs run implement --name Ada --provider codex \
+  --model YOUR_AVAILABLE_MODEL --effort high --prompt 'Implement the requested fix' \
+  --check 'npm test' --foreground
+node scripts/agent-smith.mjs ls
+node scripts/agent-smith.mjs status RUN_ID_OR_JOB_ID
+node scripts/agent-smith.mjs resume Ada --prompt 'Address the failing edge case' --foreground
+node scripts/agent-smith.mjs cancel RUN_ID_OR_JOB_ID
+node scripts/agent-smith.mjs run the-codes/cli/pipeline.example.yaml --foreground
+```
+
+Without `--foreground`, the CLI starts a detached supervisor. Run `--help` for the
+current flags. `doctor` reports installed binaries, not authentication or model
+availability. Model IDs come from the user's provider configuration; this project
+never promises that a particular account can run a particular model.
+
+## State and boundaries
+
+`.agent-smith/jobs/<jobId>/` holds the canonical manifest, progress, events, result,
+report, and cancel request. `.agent-smith/pipelines/` holds run records and isolated
+artifacts. A compatibility projection lives in `.agy-staff/jobs/` for the terminal
+plugin. Both directories are local and ignored by git.
+
+Job cancellation reaches the owning supervisor through a persistent request and
+signals the worker process group on Unix. If its supervisor dies, records can
+remain running; the monitor flags prolonged silence as needing attention.
+Cancellation needs a live supervisor. Crash reconciliation and automatic replay
+are not implemented.
+
+The plugin can project external workers into Claude's native task list where the
+host supports those tools. External harness conversations remain external; they
+are not Claude Agent loops, native teammates, or targets for native SendMessage.
+Use Agent Smith's resume tool for follow-ups.
+
+OpenCode's successful event stream remains provisional until qualified against a
+working configured account. Automated verification uses fake CLIs through the
+real process and MCP boundaries; it does not consume model quota.
+
+## Development
+
+```sh
+npm run verify
+npm run test:plugin
+npm run build
+```
+
+Luna agents may implement separate seams, but the primary developer owns final
+integration and protocol verification. See [PROGRESS.md](PROGRESS.md) for delivery
+status and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for runtime ownership.
+
+MIT licensed.

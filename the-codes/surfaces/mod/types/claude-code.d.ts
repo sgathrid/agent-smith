@@ -61,6 +61,8 @@ declare module 'claude-code' {
     readonly ui: UiApi;
     readonly command: CommandApi;
     readonly clock: ClockApi;
+    /** Host-built tools such as TaskCreate and TaskUpdate. */
+    readonly tool: ToolApi;
     /**
      * Host-provided filesystem access.
      *
@@ -109,7 +111,35 @@ declare module 'claude-code' {
   }
 
   export interface UiApi {
-    open(opts: { id: string; title: string; focus?: boolean }): Promise<unknown>;
+    /**
+     * Open a pane.
+     *
+     * `columns` and `rows` are SIZE REQUESTS, verified against the 2.1.292
+     * binary rather than guessed. The schema describes them as "The body columns
+     * its content asked for while docked; a request the person's own sizing
+     * overrides", and the terminal surface resolves the column request as
+     *
+     *     min(terminalColumns - 24, max(24, requested))
+     *
+     * with the width the person dragged the dock to (`pluginPanes.dockColumns`)
+     * taking precedence over the request. With NO request at all the default is
+     *
+     *     min(floor(terminalColumns * 0.45), 90, terminalColumns - 70)
+     *
+     * which is 85 columns on a 190-column terminal — a right-hand third, with
+     * rows wrapping at 90 while 190 sat unused. Passing `columns` is therefore the
+     * difference between a pane that wastes two thirds of the screen and one that
+     * uses it, and it costs one property.
+     *
+     * Only what this mod passes is declared, per this file's rule.
+     */
+    open(opts: {
+      id: string;
+      title: string;
+      focus?: boolean;
+      /** Requested pane width in columns; the surface clamps it. */
+      columns?: number;
+    }): Promise<unknown>;
     close(opts: { id: string }): Promise<unknown>;
     /** Resolve the render components for this render site. */
     resolve(e: UiRenderEvent): UiComponents;
@@ -143,14 +173,42 @@ declare module 'claude-code' {
     now(): Promise<number>;
   }
 
+  export interface ToolApi {
+    call(input:
+      | {
+          tool: 'TaskCreate';
+          subject: string;
+          description: string;
+          activeForm?: string;
+          metadata?: Record<string, unknown>;
+        }
+      | {
+          tool: 'TaskUpdate';
+          taskId: string;
+          subject?: string;
+          description?: string;
+          activeForm?: string;
+          status?: 'pending' | 'in_progress' | 'completed' | 'deleted';
+        }
+    ): Promise<{ result?: unknown; isError?: boolean; deny?: string; text?: string }>;
+  }
+
   // ── render sites ───────────────────────────────────────────────────────────
 
   export interface UiRenderEvent {
+    /** Whole window measurement; bodyColumns remains the pane's own budget. */
+    readonly viewport?: { readonly columns: number; readonly rows: number; readonly isFullscreen?: boolean };
     /** 'AbovePrompt' | 'Pane' | 'Spinner' — where the host is drawing. */
     readonly component: string;
     /** For panes: the id passed to ui.open. Matched by `requestId`. */
     readonly requestId?: string;
     readonly props: {
+      /**
+       * The width available to this component's body, in columns. THE ENGINE
+       * HANDS YOU THE BUDGET AND YOU MUST USE IT (TERMINAL-UI.md §Layout
+       * contract): sizing a row's columns against the width of its own content
+       * instead is what made the pane's rows wrap to two lines.
+       */
       readonly bodyColumns: number;
       readonly hasSurvey?: boolean;
       readonly isWorking?: boolean;
@@ -258,7 +316,7 @@ declare module 'claude-code' {
  * module ("on(\"session.start\") is registered twice without a matcher").
  *
  * Both halves need session.start (the band to read `AGY_RADAR_REPO` and honour
- * `NO_COLOR`; the pane to register `/agent-smith`), so the band half parks its handler
+ * `NO_COLOR`; the pane to register `/forge`), so the band half parks its handler
  * in a module-level variable and the pane half — which owns the single registration
  * — awaits it. That is the whole band↔pane coupling: two calls.
  */

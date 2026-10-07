@@ -1,0 +1,133 @@
+# pipeline.example.yaml — the mixed-provider path.
+#
+#   agent-smith run ./the-codes/cli/pipeline.example.yaml
+#
+# THE THING THIS FILE DEMONSTRATES
+# ================================
+# One task, three workers from three DIFFERENT MODEL FAMILIES, with the DAG
+# doing real work:
+#
+#   implement → agy    (Google)     no deps → starts immediately
+#   review    → codex   (OpenAI)     dependsOn: [implement]
+#   moderate  → claude  (Anthropic)  dependsOn: [implement, review]
+#   acceptance → claude (Anthropic)  dependsOn: [review]   ─┐
+#   security   → codex   (OpenAI)     dependsOn: [review]   ─┴─ concurrent fan-out
+#
+# Two properties worth noticing, because they are what ARCHITECTURE.md is about:
+#
+#   1. `moderate` is NOT a second opinion from the same family. routing.ts
+#      (RULE 5) enforces this: same-family agreement is correlated (60% when
+#      both models err, ICML 2025), so a moderator that shares the implementer's
+#      family manufactures agreement and calls it verification. The pipeline
+#      will refuse to let you do that — assertCrossFamily throws.
+#
+#   2. `acceptance` and `security` BOTH depend only on `review`, so they run
+#      CONCURRENTLY. That is the measurable claim: 16 jobs across 16.3 hours at a
+#      concurrency ceiling of 3 was the pathology this DAG exists to remove.
+#      `peakConcurrency` is reported on every run, so the claim is checked rather
+#      than asserted.
+#
+# WHY THE FAN-OUT IS NOT SIMULATED VOTE-TAKING
+# =============================================
+# Deliberately two review axes rather than a vote. Four budget-matched
+# replications found debate underperforms plain self-consistency and gets WORSE
+# with more budget (2406.06461). Agreement-counting proves less the more it
+# costs. One cross-family probe applied to a written artifact is the honest
+# version, and these two stages are probes with different questions, not voters
+# for the same one.
+#
+# SAFETY — READ BEFORE RUNNING
+# ===========================
+# By default every worker here is RESTRICTED. A headless worker cannot prompt
+# for tool approval, so anything needing it comes back `denied` and the stage
+# FAILS (that is the point — see the header of runner.ts). To let them actually
+# do the work, run with `--unrestricted`, and understand what that means:
+#
+#   agent-smith run ./the-codes/cli/pipeline.example.yaml --unrestricted
+#
+# That flag hands each worker its provider's bypass-approvals equivalent
+# (`agy --dangerously-skip-permissions`, `codex
+# --dangerously-bypass-approvals-and-sandbox`, `claude
+# --dangerously-skip-permissions`). The worker may run any command it decides to
+# run, in whatever directory it is pointed at. Only use it on a repo you would
+# let a stranger's agent rewrite.
+
+name: dashboard-rework
+concurrency: 4
+
+stages:
+  # ── the cheap tier, doing the work ──────────────────────────────────────────
+  # No `dependsOn`: this dispatches immediately, and with concurrency 4 it runs
+  # alongside nothing else here because the others all need ITS output.
+  - name: implement
+    provider: agy
+    model: gemini-3.8-flash-low
+    # RULE 1: 'low'. Measured on this user's own jobs, 'high' cost +50% wall
+    # clock and 1.9x thinking tokens for zero accuracy gain. Do not raise this
+    # to feel safer; routing escalates on a measured stall shape instead.
+    effort: low
+    role: implement
+    timeout: 45m
+    prompt: |
+      Implement the dashboard rework described in the repo's docs/ directory.
+
+      Work in the working tree. When you are done, describe what you changed
+      and where, in prose a reviewer can check against the diff.
+
+  # ── a different family reviews it ───────────────────────────────────────────
+  # Codex is OpenAI; implement was Google. Their errors are not correlated, so
+  # agreement between them is information.
+  - name: review
+    provider: codex
+    dependsOn: [implement]
+    role: review
+    timeout: 20m
+    prompt: |
+      Review the implement stage's work.
+
+      Read the result artifact it produced AND read the diff in the working
+      tree — the prose is a claim, not evidence. Report defects, missed cases,
+      and claims the code does not support. Do not rewrite anything.
+
+  # ── the cross-family probe ──────────────────────────────────────────────────
+  # Anthropic probing Google-written work. `routingPinned: true` so routing
+  # leaves the model alone: escalation here would be spending more to agree
+  # with itself.
+  - name: moderate
+    provider: claude
+    model: sonnet
+    dependsOn: [implement, review]
+    role: moderate
+    routingPinned: true
+    timeout: 20m
+    prompt: |
+      Read the implement and review artifacts. Find what BOTH of them missed:
+      unstated assumptions, edge cases nobody checked, and any place the review
+      agrees with the implementation for the wrong reason.
+
+      Report findings only. Do not rewrite the work.
+
+  # ── two concurrent probes off the same node ────────────────────────────────
+  # Both depend on `review` and not on each other, so the DAG dispatches them
+  # together. `peakConcurrency` on the run report should be 2 here.
+  - name: acceptance
+    provider: claude
+    model: sonnet
+    dependsOn: [review]
+    role: verify
+    timeout: 15m
+    prompt: |
+      Read the review's findings and check whether the working tree actually
+      satisfies them. Run the project's own tests and typecheck if they exist.
+      Report what the commands actually printed — not an assessment of them.
+
+  - name: security
+    provider: codex
+    dependsOn: [review]
+    role: review
+    timeout: 15m
+    prompt: |
+      Read the review's findings and look specifically for security
+      regressions introduced by the implement stage: unvalidated input, path
+      traversal, secrets in source or logs, and anything newly reachable from
+      untrusted input. Report findings only.

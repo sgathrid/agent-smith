@@ -408,7 +408,7 @@ test('activity comes from the newest step, not the last array position', async (
     'implement-a-00000000.log': '[agy-staff] worker started implement-a-00000000 pid=1 at 2026-10-03T16:50:00.000Z\n',
   });
   const job = await resolve(fs, jobsDir('/repo'), 'implement-a-00000000', Date.parse('2026-10-03T17:00:10.000Z'));
-  assert.equal(job?.activity, 'writing new.rs');
+  assert.equal(job?.activity, 'editing new.rs');
 });
 
 test('activity reads a REAL progress.json input_preview', () => {

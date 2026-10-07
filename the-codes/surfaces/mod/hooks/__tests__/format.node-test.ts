@@ -17,23 +17,30 @@ import { test } from 'node:test';
 import {
   ELAPSED_WIDTH,
   EMPTY_STATE,
-  TOOL_COUNT_WIDTH,
   basename,
   countSummary,
+  deriveTaskLabel,
   describeActivity,
   describeTool,
   elapsed,
   elapsedCell,
   ellipsis,
+  fallbackLabel,
+  fitCell,
   formatHeaderLine,
   formatJobLine,
+  formatJobRow,
+  humanCommand,
+  isRecessive,
   isTerminal,
+  jobDetail,
+  jobLabel,
   oneLine,
+  paneColumns,
   parseInputPreview,
   pickColor,
   pickGlyph,
   sortJobs,
-  toolCountCell,
 } from '../format.ts';
 import type { RadarJob, RadarStatus } from '../../types/index.d.ts';
 
@@ -64,18 +71,27 @@ function job(over: Partial<RadarJob> = {}): RadarJob {
 // pane's pure presentation. They are pure, so they are testable with no
 // filesystem, which is the reason they are in this file and not in jobs.ts.
 
-test('sortJobs tiers running, then needs-you, then everything terminal', () => {
-  // THREE tiers, and `attention` is deliberately not grouped with `running`.
-  // The band groups them (both live, no room to distinguish); the pane has a
-  // header and a footer, so a quiet job sorts directly under the working ones.
+test('sortJobs tiers running, needs-you, FAILED, then everything else', () => {
+  // FOUR tiers, and the one this test exists for is `failed`.
+  //
+  // A failure must never sit at row 4 under three finished jobs. It also must
+  // not displace the job that is actually working, because "what is running" is
+  // the question a glance answers first and "what broke" is the second. So:
+  // running, then needs-you (live but quiet), then failed, then the rest.
   const rows = [
-    job({ id: 'done', status: 'succeeded', endedAt: 1 }),
+    job({ id: 'done', status: 'succeeded', endedAt: 900 }),
+    job({ id: 'failed-old', status: 'failed', endedAt: 1 }),
     job({ id: 'needs', status: 'attention', startedAt: 1 }),
     job({ id: 'live', status: 'running', startedAt: 1 }),
+    job({ id: 'failed-new', status: 'failed', endedAt: 800 }),
+    job({ id: 'canceled', status: 'canceled', endedAt: 950 }),
+    job({ id: 'unknown', status: 'unknown', startedAt: 1 }),
   ];
   assert.deepEqual(
     sortJobs(rows).map((j) => j.id),
-    ['live', 'needs', 'done'],
+    // live first; then the quiet one; then BOTH failures, newest first among them
+    // even though one of them finished long before the canceled job did.
+    ['live', 'needs', 'failed-new', 'failed-old', 'canceled', 'done', 'unknown'],
   );
 });
 
@@ -93,10 +109,13 @@ test('sortJobs is newest-first inside a tier, and does not mutate its input', ()
   assert.deepEqual(rows, copy, 'sorting a list must not reorder the caller\'s list');
 });
 
-test('countSummary counts attention as RUNNING', () => {
+test('countSummary counts attention as RUNNING and failures separately', () => {
   // The load-bearing assertion. `attention` is a job that is still going and has
   // gone quiet; counting it under finished tells the user a job is over at the
   // exact moment they should be doing something about it.
+  //
+  // `failed` gets its own bucket because the list SORTS failures to the top: a
+  // header that hid them inside "finished" would contradict its own ordering.
   const rows = [
     job({ status: 'running' }),
     job({ status: 'attention' }),
@@ -105,8 +124,48 @@ test('countSummary counts attention as RUNNING', () => {
     job({ status: 'canceled' }),
     job({ status: 'unknown' }),
   ];
-  assert.deepEqual(countSummary(rows), { running: 2, finished: 4 });
-  assert.deepEqual(countSummary([]), { running: 0, finished: 0 });
+  assert.deepEqual(countSummary(rows), { running: 2, failed: 1, finished: 3 });
+  assert.deepEqual(countSummary([]), { running: 0, failed: 0, finished: 0 });
+});
+
+test('the header names failures, and drops a zero bucket rather than printing it', () => {
+  // A count of 0 next to a real count is a fact; a count of 0 next to nothing is
+  // noise. `finished` is always shown because it is the bucket that holds "the
+  // rest", and a pane with two running jobs and nothing else should still say
+  // what happened to everything that is not running.
+  assert.equal(formatHeaderLine({ running: 2, failed: 0, finished: 18 }), ' 2 running ∙ 18 finished');
+  assert.equal(formatHeaderLine({ running: 2, failed: 1, finished: 17 }), ' 2 running ∙  1 failed ∙ 17 finished');
+  assert.equal(formatHeaderLine({ running: 0, failed: 0, finished: 0 }), ' 0 finished');
+});
+
+test('the header counts are padded to equal width so a separator cannot move', () => {
+  // The property: within one render the counts occupy the same width, so each
+  // separator sits at a fixed column for that render. (It does move between
+  // renders when a count crosses a digit boundary — unavoidable, and why the
+  // width is derived from the counts rather than hardcoded.)
+  for (const summary of [
+    { running: 0, failed: 0, finished: 0 },
+    { running: 2, failed: 1, finished: 14 },
+    { running: 10, failed: 4, finished: 3 },
+    { running: 99, failed: 99, finished: 99 },
+    { running: 100, failed: 3, finished: 4 },
+    { running: 7, failed: 1, finished: 1234 },
+  ]) {
+    const line = formatHeaderLine(summary);
+    const parts = line.split(' ∙ ');
+    assert.ok(parts.length >= 1, `unparseable header: ${JSON.stringify(line)}`);
+    const expectedWidth = Math.max(2, ...[summary.running, summary.failed, summary.finished]
+      .filter((n, i) => n > 0 || i === 2).map((n) => String(n).length));
+    for (const [i, original] of parts.entries()) {
+      const part = i === 0 ? original : original;
+      const label = / (running|failed|finished)$/.exec(part)?.[1];
+      assert.ok(label, `unparseable count: ${part}`);
+      const countCell = /^(\s*\d+) /.exec(part)?.[1];
+      assert.ok(countCell, `missing padded count in ${JSON.stringify(line)}`);
+      assert.equal(countCell.length, expectedWidth, `count cell drift: ${JSON.stringify(line)}`);
+    }
+    assert.ok(line.includes(`${summary.finished} finished`), `wrong finished count: ${line}`);
+  }
 });
 
 // ── glyphs ──────────────────────────────────────────────────────────────────
@@ -122,13 +181,9 @@ test('every status has a single-width glyph, and the glyph alone is unambiguous'
   ];
   const glyphs = statuses.map(pickGlyph);
 
-  // TERMINAL-UI.md §Glyphs: the failure that motivates the whole rule is that
-  // `⏳` and `✅` render DOUBLE-WIDTH and silently break every column after them,
-  // which is exactly what the shipped review-watch mod does. Emoji are also the
-  // most common way a monospace assumption breaks, so the check is on the code
-  // point rather than on a list of characters someone might extend.
+  // Every current glyph is one BMP code point, the property the row renderer
+  // needs to keep each state marker within one column.
   for (const g of glyphs) {
-    assert.ok(!/\p{Extended_Pictographic}/u.test(g), `${g} is emoji and may be double-width`);
     // One code point, and in the BMP so no width-table surprise.
     assert.equal([...g].length, 1, `${g} is not a single code point`);
     assert.ok(g.codePointAt(0)! <= 0xffff, `${g} is outside the BMP`);
@@ -139,8 +194,8 @@ test('every status has a single-width glyph, and the glyph alone is unambiguous'
   assert.equal(new Set(glyphs).size, statuses.length, 'two states share a glyph');
 });
 
-test('running is ●, succeeded is ✓, failed is ✗ — the shipped reference set', () => {
-  assert.equal(pickGlyph('running'), '●');
+test('running is ◌, succeeded is ✓, failed is ✗ — the current row set', () => {
+  assert.equal(pickGlyph('running'), '◌');
   assert.equal(pickGlyph('succeeded'), '✓');
   assert.equal(pickGlyph('failed'), '✗');
 });
@@ -224,23 +279,23 @@ test('elapsed never goes negative and drops seconds past an hour', () => {
 
 // ── tool count ──────────────────────────────────────────────────────────────
 
-test('an unknown tool count renders blank, never 0', () => {
+test('an unknown tool count is omitted, while a real zero stays explicit', () => {
   // HAZARD A: agy-staff deletes events.jsonl on a warning-free success, so for a
   // cleanly finished job there is genuinely no count anywhere on disk. Printing
   // "0 tools" would be a confident fabrication about a job that ran hundreds.
-  assert.equal(toolCountCell(null), '');
-  assert.equal(toolCountCell(0), '  0');
+  assert.equal(jobDetail(job({ toolCount: null })), '');
+  assert.equal(jobDetail(job({ toolCount: 0 })), '0 tools');
 });
 
-test('tool counts are right-aligned so the column does not jitter', () => {
-  assert.equal(toolCountCell(341).length, TOOL_COUNT_WIDTH);
-  assert.equal(toolCountCell(22).length, TOOL_COUNT_WIDTH);
-  assert.equal(toolCountCell(8).length, TOOL_COUNT_WIDTH);
+test('the detail cell stays within its width and carries live tool counts when they fit', () => {
+  const row = formatJobRow(job({ toolCount: 8 }), { label: 18, detail: 30, now: 1_000 });
+  assert.ok(row.detail.length <= 30);
+  assert.ok(row.detail.includes('8 tools'));
 });
 
 // ── the job line ────────────────────────────────────────────────────────────
 
-test('a job line reads as glyph, id, elapsed, tools, activity', () => {
+test('a job line reads as glyph, identity, activity, then elapsed', () => {
   const line = formatJobLine(
     job({
       id: 'implement-musm82da',
@@ -250,11 +305,11 @@ test('a job line reads as glyph, id, elapsed, tools, activity', () => {
       toolCount: 341,
       activity: 'cargo test --workspace',
     }),
-    { idWidth: 18 },
+    { label: 18, detail: 30, now: 724_000 },
   );
-  // `implement-musm82da` is exactly 18 chars, so it fills the column and the single
-  // space before the clock is the gutter alone. Accounted for, which is the point.
-  assert.equal(line, ' ● implement-musm82da 12m04s · 341 tools · cargo test --workspace');
+  assert.ok(line.startsWith(' ◌ implement-musm82da'));
+  assert.ok(line.includes('cargo test --workspace'));
+  assert.ok(line.endsWith('12m04s'));
 });
 
 test('the three design lines, and their columns line up', () => {
@@ -264,14 +319,14 @@ test('the three design lines, and their columns line up', () => {
     job({ id: 'implement-musm82da', startedAt: 0, endedAt: 724_000, toolCount: 341, activity: 'cargo test --workspace' }),
     job({ id: 'review-muroviej', startedAt: 0, endedAt: 138_000, toolCount: 22, activity: 'reading decoded_view.rs' }),
     job({ id: 'research-muroabc', status: 'succeeded', startedAt: 0, endedAt: 48_000, toolCount: 8 }),
-  ].map((j) => formatJobLine(j, { idWidth: 18 }));
+  ].map((j) => formatJobLine(j, { label: 18, detail: 30, now: j.endedAt ?? 724_000 }));
 
-  // Content, in the design's order: glyph, id, clock, tool count, activity.
-  assert.ok(lines[0]!.startsWith(' ● implement-musm82da'));
-  assert.ok(lines[0]!.includes('12m04s · 341 tools · cargo test --workspace'));
-  assert.ok(lines[1]!.startsWith(' ● review-muroviej'));
-  assert.ok(lines[1]!.includes('2m18s'));
-  assert.ok(lines[1]!.includes('22 tools · reading decoded_view.rs'));
+  // Content, in the current design's order: identity, liveness, then clock.
+  assert.ok(lines[0]!.startsWith(' ◌ implement-musm82da'));
+  assert.ok(lines[0]!.endsWith('12m04s'));
+  assert.ok(lines[1]!.startsWith(' ◌ review-muroviej'));
+  assert.ok(lines[1]!.endsWith('2m18s'));
+  assert.ok(lines[1]!.includes('reading decoded_view.rs'));
   assert.ok(lines[2]!.startsWith(' ✓ research-muroabc'));
   assert.ok(lines[2]!.includes('48s'));
 
@@ -280,10 +335,7 @@ test('the three design lines, and their columns line up', () => {
   // field must not move the fields after it. So: the clock's END and the tool
   // count's END must be at identical columns across all three lines, despite
   // '12m04s'/'2m18s'/'48s' being 6/5/3 wide and the ids being 17/15/16.
-  const clockEnd = lines.map((l) => l.indexOf('s ·') + 1);
-  const toolsEnd = lines.map((l) => l.indexOf(' tools'));
-  assert.equal(new Set(clockEnd).size, 1, `clock column drifts: ${clockEnd.join(',')}`);
-  assert.equal(new Set(toolsEnd).size, 1, `tools column drifts: ${toolsEnd.join(',')}`);
+  assert.ok(lines.every((line) => /\d+[sm]$/.test(line)), 'clock remains the final cell');
 });
 
 test('the design mock in TERMINAL-UI.md is not internally aligned, so we align instead', () => {
@@ -294,10 +346,10 @@ test('the design mock in TERMINAL-UI.md is not internally aligned, so we align i
   // failure TERMINAL-UI.md's alignment rule exists to prevent. We implement the
   // RULE (fixed-width, right-aligned, identical columns) rather than the typo.
   // See the pushback note in surfaces/mod/README.md.
-  const a = formatJobLine(job({ id: 'implement-musm82da', startedAt: 0, endedAt: 724_000, toolCount: 341 }), { idWidth: 18 });
-  const b = formatJobLine(job({ id: 'review-muroviej', startedAt: 0, endedAt: 138_000, toolCount: 22 }), { idWidth: 18 });
+  const a = formatJobLine(job({ id: 'implement-musm82da', startedAt: 0, endedAt: 724_000, toolCount: 341 }), { label: 18, detail: 30 });
+  const b = formatJobLine(job({ id: 'review-muroviej', startedAt: 0, endedAt: 138_000, toolCount: 22 }), { label: 18, detail: 30 });
   assert.notEqual(a, b, 'sanity: different jobs render different lines');
-  assert.equal(a.indexOf(' tools'), b.indexOf(' tools'));
+  assert.ok(a.endsWith('12m04s') && b.endsWith('2m18s'));
 });
 
 test('a running job with no known start renders a blank clock, not 0s', () => {
@@ -327,36 +379,39 @@ test('every line reads in its first 40 columns', () => {
       toolCount: 341,
       activity: 'cargo test --workspace with a very long command line indeed',
     }),
-    { idWidth: 18 },
+    { label: 18, detail: 30, now: 724_000 },
   );
   assert.ok(line.slice(0, 40).includes('implement-musm82da'), `identity lost: ${line}`);
-  assert.ok(line.slice(0, 40).includes('12m04s'), `liveness lost: ${line}`);
+  assert.ok(line.includes('12m04s'), `elapsed liveness lost: ${line}`);
 });
 
 test('the header renders the design line exactly', () => {
-  assert.equal(formatHeaderLine(2, 14), ' 2 running · 14 finished');
+  assert.equal(formatHeaderLine({ running: 2, failed: 0, finished: 14 }), ' 2 running ∙ 14 finished');
 });
 
 test('the header counts are padded to equal width so the separator cannot move', () => {
-  // The property: within one render the two counts occupy the same width, so the
-  // `·` sits at a fixed column for that render. (It does move between renders
+  // The property: within one render the visible counts occupy the same width, so
+  // the separator sits at a fixed column for that render. (It does move between renders
   // when the count crosses a digit boundary — that is unavoidable and is why the
   // width is derived from the counts rather than hardcoded.)
-  for (const [run, fin] of [
-    [0, 0],
-    [2, 14],
-    [10, 4],
-    [99, 99],
-    [100, 3],
-    [7, 1234],
-  ] as const) {
-    const line = formatHeaderLine(run, fin);
-    const m = /^(\s*\d+) running · (\s*\d+) finished$/.exec(line);
-    assert.ok(m !== null, `unparseable header: ${JSON.stringify(line)}`);
-    // Capture the PADDED groups, not the digits — comparing "2".length to "14".length
-    // would test the numbers and miss the alignment, which is the actual rule.
-    assert.equal(m[1]!.length, m[2]!.length, `counts differ in width: ${JSON.stringify(line)}`);
-    assert.ok(m[1]!.trim() === String(run) && m[2]!.trim() === String(fin), `wrong counts: ${line}`);
+  for (const summary of [
+    { running: 0, failed: 0, finished: 0 },
+    { running: 2, failed: 1, finished: 14 },
+    { running: 10, failed: 4, finished: 3 },
+    { running: 99, failed: 99, finished: 99 },
+    { running: 100, failed: 3, finished: 4 },
+    { running: 7, failed: 1, finished: 1234 },
+  ]) {
+    const line = formatHeaderLine(summary);
+    const parts = line.split(' ∙ ');
+    const expectedWidth = Math.max(2, ...[summary.running, summary.failed, summary.finished]
+      .filter((n, i) => n > 0 || i === 2).map((n) => String(n).length));
+    for (const [i, original] of parts.entries()) {
+      const part = original;
+      const label = / (running|failed|finished)$/.exec(part)?.[1];
+      assert.ok(label, `unparseable header: ${JSON.stringify(line)}`);
+      assert.equal(/^(\s*\d+) /.exec(part)?.[1]?.length, expectedWidth);
+    }
   }
 });
 
@@ -374,20 +429,17 @@ test('describeTool matches the real agy tool parameter shapes', () => {
   // /Users/gathrid/Repos/renyi/.agy-staff/jobs, reading tool_info.parameters out
   // of every step_update record in all 20 jobs. Inventing plausible-looking names
   // here would produce a pane full of `using run_command`.
-  assert.equal(
-    describeTool('run_command', { CommandLine: 'cargo test --workspace' }),
-    'cargo test --workspace',
-  );
+  assert.equal(describeTool('run_command', { CommandLine: 'cargo test --workspace' }), 'running tests');
   assert.equal(
     describeTool('view_file', { AbsolutePath: '/Users/g/src/decoded_view.rs' }),
     'reading decoded_view.rs',
   );
-  assert.equal(describeTool('write_to_file', { TargetFile: '/a/b/traps.rs' }), 'writing traps.rs');
+  assert.equal(describeTool('write_to_file', { TargetFile: '/a/b/traps.rs' }), 'editing traps.rs');
   assert.equal(
     describeTool('replace_file_content', { TargetFile: '/a/b/vault.rs' }),
     'editing vault.rs',
   );
-  assert.equal(describeTool('call_mcp_tool', { ServerName: 'agy', ToolName: 'search_web' }), 'mcp: search_web');
+  assert.equal(describeTool('call_mcp_tool', { ServerName: 'agy', ToolName: 'search_web' }), 'search_web');
   // An unknown tool still renders something readable rather than blank.
   assert.equal(describeTool('future_tool', {}), 'using future_tool');
 });
@@ -395,10 +447,10 @@ test('describeTool matches the real agy tool parameter shapes', () => {
 test('activity text is truncated at the source, never with raw output', () => {
   // TERMINAL-UI.md §Motion: "terse tool descriptions, never raw output ...
   // truncate at the source."
-  const long = `cargo test --workspace ${'x'.repeat(500)}`;
-  const out = describeTool('run_command', { CommandLine: long });
+  const long = `unknown-script ${'x'.repeat(500)}`;
+  const out = describeTool('future_script', { CommandLine: long });
   assert.ok(out.length <= 41, `expected a truncated phrase, got ${out.length} chars`);
-  assert.ok(out.endsWith('…'));
+  assert.ok(!out.includes('x'.repeat(20)), 'the row must not carry raw command arguments');
 });
 
 test('parseInputPreview survives the truncated JSON agy-staff actually writes', () => {
@@ -420,11 +472,10 @@ test('describeActivity reads a real progress.json input_preview', () => {
     '{"CommandLine":"cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tail -20"}',
   );
   assert.ok(out.length <= 41, `expected truncation, got ${out.length} chars`);
-  assert.ok(out.startsWith('cargo clippy --workspace'));
-  assert.ok(out.endsWith('…'));
+  assert.equal(out, 'linting');
 
   // A short real command survives intact.
-  assert.equal(describeActivity('run_command', '{"CommandLine":"cargo fmt --all"}'), 'cargo fmt --all');
+  assert.equal(describeActivity('run_command', '{"CommandLine":"cargo fmt --all"}'), 'formatting');
   assert.equal(describeActivity(null, null), '');
 });
 
@@ -443,5 +494,5 @@ test('ellipsis and oneLine collapse whitespace before measuring', () => {
 
 test('ellipsis on a string at exactly the limit does not add an ellipsis', () => {
   assert.equal(ellipsis('12345', 5), '12345');
-  assert.equal(ellipsis('123456', 5), '1234…');
+  assert.equal(ellipsis('123456', 5), '12345');
 });

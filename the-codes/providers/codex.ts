@@ -99,7 +99,7 @@ import {
   writeArgv,
   writeResultFile,
   writeStateDir,
-} from './ndjson.js';
+} from './ndjson.ts';
 import type {
   ActivityRef,
   ActivityStatus,
@@ -110,7 +110,11 @@ import type {
   SpawnSpec,
   TokenUsage,
   WorkerHandle,
-} from './types.js';
+} from './types.ts';
+import type { ListModelsOptions, ModelCatalog, ModelInfo, SandboxInfo } from './types.ts';
+import { DEFAULT_DISCOVERY_TIMEOUT_MS, configDir, errMessage, readTextSafe, runCapture } from './discovery.ts';
+import type { RunFn } from './discovery.ts';
+import path from 'node:path';
 
 export const CODEX_BINARY = process.env['AGENT_SMITH_CODEX_BIN'] ?? 'codex';
 
@@ -156,6 +160,38 @@ export function sandboxFor(unrestricted: boolean): { argv: string[]; note: strin
   return { argv: ['-s', 'workspace-write'], note: 'restricted -> sandbox workspace-write' };
 }
 
+/** Valid AGENT_SMITH_CODEX_SANDBOX value, if any. */
+function envSandbox(): CodexSandbox | undefined {
+  const v = process.env['AGENT_SMITH_CODEX_SANDBOX'];
+  return v === 'read-only' || v === 'workspace-write' || v === 'danger-full-access' ? v : undefined;
+}
+
+/**
+ * The single source of truth for codex sandbox flags, used by buildArgv AND
+ * describeSandbox. Precedence: AGENT_SMITH_CODEX_SANDBOX env > unrestricted
+ * (bypass) > readOnly (`-s read-only`) > workspace-write. On resume `-s` is not
+ * exposed, so the same mode goes through `-c sandbox_mode="..."`.
+ */
+export function sandboxPlan(
+  spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly'>,
+  resuming = false,
+): SandboxInfo {
+  const mode = (m: CodexSandbox): SandboxInfo => {
+    const flags = resuming ? ['-c', `sandbox_mode=${JSON.stringify(m)}`] : ['-s', m];
+    return { sandbox: `codex ${flags.join(' ')}`, flags, readOnlyEnforced: m === 'read-only' };
+  };
+  const forced = envSandbox();
+  if (forced !== undefined) {
+    const info = mode(forced);
+    return { ...info, sandbox: `${info.sandbox} (AGENT_SMITH_CODEX_SANDBOX)` };
+  }
+  if (spec.unrestricted) {
+    const flags = sandboxFor(true).argv;
+    return { sandbox: `codex ${flags[0]} (unrestricted)`, flags, readOnlyEnforced: false };
+  }
+  return mode(spec.readOnly === true ? 'read-only' : 'workspace-write');
+}
+
 /**
  * SpawnSpec has no field for arbitrary CLI config overrides, and inventing one
  * here would fork the shared interface while core/types.ts is still in flight.
@@ -168,10 +204,6 @@ function configOverrides(): string[] {
   // -c model="x" — note the value is TOML-parsed, so a bare number would become
   // a TOML integer. Model ids are never numeric, so a plain string is safe.
   if (model !== undefined && model !== '') argv.push('-c', `model="${model}"`);
-  const sandbox = process.env['AGENT_SMITH_CODEX_SANDBOX'];
-  if (sandbox === 'read-only' || sandbox === 'workspace-write' || sandbox === 'danger-full-access') {
-    argv.push('-s', sandbox);
-  }
   return argv;
 }
 
@@ -187,7 +219,10 @@ function configOverrides(): string[] {
  * does not. Verified live with a multi-word prompt.
  */
 export function buildArgv(spec: SpawnSpec): string[] {
-  const argv: string[] = ['exec'];
+  const resuming = spec.conversation !== undefined && spec.conversation !== '';
+  const argv: string[] = resuming
+    ? ['exec', 'resume', spec.conversation!]
+    : ['exec'];
 
   // Verified: "--json  Print events to stdout as JSONL". Without it codex prints
   // human-formatted prose and we would have nothing to parse.
@@ -196,21 +231,34 @@ export function buildArgv(spec: SpawnSpec): string[] {
   // Verified necessary outside a git repo; see header note 2.
   argv.push('--skip-git-repo-check');
 
-  // Belt and braces: we already spawn with cwd=spec.cwd, but passing -C makes
-  // the working root explicit to codex itself, so it survives any wrapper that
-  // forgets to set our spawn cwd.
-  argv.push('-C', spec.cwd);
+  // `exec resume --help` does not expose -C; resumed sessions retain their
+  // original working directory. New sessions get an explicit root.
+  if (!resuming) argv.push('-C', spec.cwd);
 
   if (spec.model !== undefined && spec.model !== '') argv.push('--model', spec.model);
+
+  if (spec.effort !== undefined && spec.effort !== '') {
+    const supported = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+    if (!supported.includes(spec.effort)) {
+      throw new RangeError(`codex does not support effort '${spec.effort}'; expected one of ${supported.join(', ')}`);
+    }
+    // Codex exposes reasoning effort as config, not a dedicated exec flag.
+    // `-c` applies to both exec and exec resume (verified with installed CLI help).
+    argv.push('-c', `model_reasoning_effort=${JSON.stringify(spec.effort)}`);
+  }
 
   // The prompt goes LAST so a prompt that begins with "-" cannot be mistaken
   // for a flag. (`--` would be the other fix; trailing positional is what the
   // help text documents and what I verified.)
-  for (const dir of spec.addDirs ?? []) {
+  if (resuming && (spec.addDirs?.length ?? 0) > 0) {
+    throw new RangeError('codex exec resume does not support --add-dir; remove addDirs or start a new session');
+  }
+  for (const dir of resuming ? [] : spec.addDirs ?? []) {
     argv.push('--add-dir', dir);
   }
 
-  argv.push(...sandboxFor(spec.unrestricted).argv);
+  // Resume omits -s from its help but accepts generic -c; sandboxPlan handles both.
+  argv.push(...sandboxPlan(spec, resuming).flags);
   argv.push(...configOverrides());
 
   argv.push(spec.prompt);
@@ -562,8 +610,123 @@ function buildResult(args: {
 // Provider
 // ---------------------------------------------------------------------------
 
+/** Codex home: AGENT_SMITH_CODEX_HOME, then CODEX_HOME, then ~/.codex. */
+export function codexHome(): string {
+  return configDir(['AGENT_SMITH_CODEX_HOME', 'CODEX_HOME'], '.codex');
+}
+
+/**
+ * Extract ONLY the `models` array from either `codex debug models` output or
+ * models_cache.json. Nothing else (notably `identity`) is passed through.
+ */
+export function parseCodexModels(text: string): ModelInfo[] | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  const list = (parsed as { models?: unknown } | null)?.models;
+  if (!Array.isArray(list)) return undefined;
+  const out: ModelInfo[] = [];
+  for (const m of list) {
+    if (m === null || typeof m !== 'object') continue;
+    const r = m as Record<string, unknown>;
+    if (typeof r['slug'] !== 'string' || r['slug'] === '') continue;
+    const levels = Array.isArray(r['supported_reasoning_levels']) ? r['supported_reasoning_levels'] : [];
+    const efforts: string[] = [];
+    for (const l of levels) {
+      const e = typeof l === 'string' ? l : (l as { effort?: unknown } | null)?.effort;
+      if (typeof e === 'string' && e !== '' && !efforts.includes(e)) efforts.push(e);
+    }
+    const info: ModelInfo = {
+      id: r['slug'],
+      label: typeof r['display_name'] === 'string' && r['display_name'] !== '' ? r['display_name'] : r['slug'],
+      efforts,
+    };
+    if (typeof r['default_reasoning_level'] === 'string' && r['default_reasoning_level'] !== '') {
+      info.defaultEffort = r['default_reasoning_level'];
+    }
+    out.push(info);
+  }
+  return out;
+}
+
+/** Top-level `key = "value"` pairs of a config.toml (stops at the first [table]). */
+export function parseTomlTopLevel(text: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (line.startsWith('[')) break;
+    const m = line.match(/^([A-Za-z0-9_.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s#]+))/);
+    if (m) out[m[1]!] = m[2] ?? m[3] ?? m[4] ?? '';
+  }
+  return out;
+}
+
+/** Lazy, never throws. `run` and `home` are injectable for tests. */
+export async function listCodexModels(
+  run: RunFn,
+  options?: ListModelsOptions,
+  home: string = codexHome(),
+): Promise<ModelCatalog> {
+  const cat: ModelCatalog = {
+    provider: 'codex',
+    models: [],
+    defaultSource: 'unknown',
+    source: 'live',
+    stale: false,
+    verified: true,
+  };
+  try {
+    let error: string | undefined;
+    let models: ModelInfo[] | undefined;
+    const r = await run(CODEX_BINARY, ['debug', 'models'], options?.timeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS);
+    if (r.error === undefined) models = parseCodexModels(r.stdout);
+    if (models === undefined || models.length === 0) {
+      error = r.error ?? '`codex debug models` returned no models';
+      const cached = readTextSafe(path.join(home, 'models_cache.json'));
+      const fromCache = cached === undefined ? undefined : parseCodexModels(cached);
+      if (fromCache !== undefined && fromCache.length > 0) {
+        models = fromCache;
+        cat.source = 'cache';
+        // The live listing failed, so this is last-known data: callers must not
+        // reject unknown ids against it.
+        cat.stale = true;
+        cat.error = `live listing failed (${error}); using ~/.codex/models_cache.json`;
+      } else {
+        models = [];
+      }
+    }
+    cat.models = models;
+    if (models.length === 0) cat.error = error;
+    const cfgText = readTextSafe(path.join(home, 'config.toml'));
+    if (cfgText !== undefined) {
+      const cfg = parseTomlTopLevel(cfgText);
+      if (cfg['model']) cat.defaultModel = cfg['model'];
+      if (cfg['model_reasoning_effort']) cat.defaultEffort = cfg['model_reasoning_effort'];
+      if (cat.defaultModel !== undefined || cat.defaultEffort !== undefined) cat.defaultSource = 'harness-config';
+    }
+  } catch (e) {
+    cat.error = errMessage(e);
+  }
+  return cat;
+}
+
+/** Default model/effort from <home>/config.toml. Sync file read only. */
+export function codexHarnessDefaults(home: string = codexHome()): { model?: string; effort?: string } {
+  const cfgText = readTextSafe(path.join(home, 'config.toml'));
+  if (cfgText === undefined) return {};
+  const cfg = parseTomlTopLevel(cfgText);
+  const out: { model?: string; effort?: string } = {};
+  if (cfg['model']) out.model = cfg['model'];
+  if (cfg['model_reasoning_effort']) out.effort = cfg['model_reasoning_effort'];
+  return out;
+}
+
 export const codexProvider: Provider = {
   name: 'codex',
+  harnessDefaults: () => codexHarnessDefaults(),
 
   async available(): Promise<boolean> {
     try {
@@ -572,6 +735,10 @@ export const codexProvider: Provider = {
       return false;
     }
   },
+
+  describeSandbox: (spec) => sandboxPlan(spec),
+
+  listModels: (options) => listCodexModels(runCapture, options),
 
   async spawn(spec: SpawnSpec): Promise<WorkerHandle> {
     const jobId = spec.jobId ?? newJobId();

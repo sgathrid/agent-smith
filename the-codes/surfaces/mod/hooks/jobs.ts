@@ -112,6 +112,14 @@ export function jobsDir(repo: string): string {
   return [repo.replace(/\/+$/, ''), ...JOBS_SUFFIX].join('/');
 }
 
+/** Mirrors forge/format.ts ORPHAN_REASON (the mod may not import outside its folder). */
+const ORPHAN_REASON = 'supervisor process exited before the job finished (orphaned)';
+
+/** `<repo>/.agent-smith/jobs/<id>/orphaned`, from `<repo>/.agy-staff/jobs`. */
+export function orphanMarker(dir: string, id: string): string {
+  return `${dir.replace(/\/\.agy-staff\/jobs$/, '/.agent-smith/jobs')}/${id}/orphaned`;
+}
+
 function at(dir: string, id: string, suffix: string): string {
   return `${dir}/${id}${suffix}`;
 }
@@ -156,8 +164,18 @@ async function readJsonSafe<T>(fs: FsLike, path: string): Promise<T | null> {
  */
 
 interface Spec {
-  resolved?: { mode?: string; model?: string; profile?: string };
-  prompt_source?: { task?: string };
+  name?: string | null;
+  workerId?: string | null;
+  role?: string | null;
+  resolved?: {
+    mode?: string;
+    model?: string;
+    profile?: string;
+    name?: string | null;
+    workerId?: string | null;
+    role?: string | null;
+  };
+  prompt_source?: { kind?: string; task?: string };
 }
 
 interface Activity {
@@ -168,6 +186,11 @@ interface Activity {
 
 interface Progress {
   job_id?: string;
+  name?: string | null;
+  workerId?: string | null;
+  role?: string | null;
+  latestSummary?: string | null;
+  summarySource?: 'worker' | null;
   last_event_at?: string;
   recent_activities?: Activity[];
   latest_text?: { text?: string };
@@ -325,12 +348,22 @@ function activityPhrase(activities: readonly Activity[] | undefined): string {
   return describeActivity(tool, preview);
 }
 
-/** The task title. First non-empty line of prompt_source.task, never the prompt. */
+/**
+ * The task's first line, verbatim. NOT a display label.
+ *
+ * Formatting a title is presentation, so it happens in ./format.ts
+ * (`deriveTaskLabel`) rather than here — one place decides what a task title
+ * looks like, and the band and the pane both call it. This function's whole job
+ * is to find the line: the real tasks are 60+ lines long and the pane has room
+ * for one, and the leading `#` is left ON because stripping markdown is one of
+ * the cuts `deriveTaskLabel` makes deliberately (see its comment on the two
+ * cuts) and doing half of it here would leave that function unable to reason
+ * about what it was given.
+ */
 function taskTitle(spec: Spec | null): string {
   const raw = spec?.prompt_source?.task;
   if (typeof raw !== 'string') return '';
-  const first = raw.split('\n').find((l) => l.trim().length > 0) ?? '';
-  return first.replace(/^#\s*/, '').slice(0, 200);
+  return raw.split('\n').find((l) => l.trim().length > 0)?.trim().slice(0, 400) ?? '';
 }
 
 /**
@@ -455,11 +488,45 @@ export async function resolve(
       ? progress.latest_text.text
       : null;
 
+  const firstText = (...values: unknown[]): string | null => {
+    for (const value of values) {
+      if (typeof value === 'string' && value.trim() !== '') return value.trim();
+    }
+    return null;
+  };
+  const name = firstText(spec?.name, spec?.resolved?.name, progress?.name);
+  const workerId = firstText(spec?.workerId, spec?.resolved?.workerId, progress?.workerId) ?? id;
+  const role = firstText(spec?.role, spec?.resolved?.role, progress?.role, spec?.resolved?.mode);
+  const latestSummary = firstText(progress?.latestSummary);
+  const summarySource: 'worker' | null = progress?.summarySource === 'worker' && latestSummary !== null ? 'worker' : null;
+
   const terminalStatus = status?.status;
   // The report body is computed from bytes already in hand, so keeping it costs a
   // reference, not a read. See `withReport` above for why the band declines it.
   const report = withReport ? reportBody(result) : null;
-  const base = { id, startedAt, toolCount, activity, task: taskTitle(spec), warnings, report, reasoning, raw: {} };
+  const raw = {
+    ...(name === null ? {} : { name }),
+    workerId,
+    ...(role === null ? {} : { role }),
+    ...(latestSummary === null ? {} : { latestSummary }),
+    summarySource,
+  };
+  const base = {
+    id,
+    name,
+    workerId,
+    role,
+    latestSummary,
+    summarySource,
+    startedAt,
+    toolCount,
+    activity,
+    task: taskTitle(spec),
+    warnings,
+    report,
+    reasoning,
+    raw,
+  };
 
   // --- rows 1 & 2: canceled --------------------------------------------------
   if (canceled || terminalStatus === 'canceled') {
@@ -511,6 +578,19 @@ export async function resolve(
     // result with a warnings flag stays succeeded, and TERMINAL-UI.md L85-87
     // reserves red for real failures.
     return { ...base, status: 'succeeded', endedAt: endedAt ?? now };
+  }
+
+  // --- row 4b: supervisor died ------------------------------------------------
+  // The node-side reader (harness/agent-smith.ts) proves the owner pid is dead and
+  // leaves `.agent-smith/jobs/<id>/orphaned`; this module cannot probe a pid, so it
+  // honours the marker. Same verdict, same words as forge/format.ts ORPHAN_REASON.
+  if (await fs.exists(orphanMarker(dir, id)).catch(() => false)) {
+    return {
+      ...base,
+      status: 'failed',
+      endedAt: toEpoch(progress?.last_event_at) ?? now,
+      warnings: [{ code: 'tool_error', message: ORPHAN_REASON }, ...warnings],
+    };
   }
 
   // --- row 5: died before writing status.json ---------------------------------
@@ -677,17 +757,18 @@ export function toolHistoryFromEvents(text: string): ToolEntry[] {
 }
 
 /**
- * The order the band draws: live first, then terminal, newest first.
+ * The order the BAND draws: live first, then terminal, newest first.
  *
- * PURE and therefore testable with no filesystem. Ordering is where a job list
+ * It used to live here, next to the reader, and the pane's order lived in
+ * format.ts. Two implementations of one rule is the drift this project's whole
+ * "one reader, one resolver" structure exists to prevent — so the band's ordering
+ * moved up to format.ts beside the pane's, where both are pure, both are tested
+ * in the same place, and both are visible in the same file as the rows they
+ * order. Re-exported here because ./band.ts used to import it from this module
+ * and the mod's import graph should not have to care where a sort lives.
+ *
+ * PURE, and therefore testable with no filesystem. Ordering is where a job list
  * usually goes wrong, and an unstable order is TERMINAL-UI.md's one rule arriving
  * as a reshuffle rather than as a row count change.
  */
-export function sortForBand(jobs: readonly RadarJob[]): RadarJob[] {
-  return [...jobs].sort((a, b) => {
-    const rank = (s: RadarStatus): number => (s === 'running' || s === 'attention' ? 0 : 1);
-    const r = rank(a.status) - rank(b.status);
-    if (r !== 0) return r;
-    return (b.endedAt ?? b.startedAt ?? 0) - (a.endedAt ?? a.startedAt ?? 0);
-  });
-}
+export { sortForBand } from './format.ts';

@@ -27,11 +27,31 @@
  * remaining class, which is "the band draws the wrong THING".
  */
 
-import { describe, expect, test } from 'claude-code/testing';
+import { describe, expect, mock, test } from 'claude-code/testing';
 
 import type { BandLine, BandBudget } from '../../hooks/band.ts';
 import { BAND_ROWS, buildLine, isShown, noColor, rowBudget } from '../../hooks/band.ts';
 import type { RadarJob } from '../../../types/index.d.ts';
+
+test('Forge list and detail request one third of the measured terminal', async ($, on) => {
+  engine(on);
+  const widths: number[] = [];
+  on('ui.open', (_$, e) => { widths.push(e.columns); return { value: { isPlaced: true } }; });
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
+  const band = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', ...BAND,
+    viewport: { columns: 180, rows: 40, isFullscreen: true } } as never);
+  await $.command.run({ command: 'forge', args: '' });
+  expect(widths[widths.length - 1]).toBe(60);
+  await band.unmount();
+  const pane = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', component: 'Pane', requestId: 'agent-smith',
+    viewport: { columns: 240, rows: 40, isFullscreen: true },
+    props: { title: 'Agent Smith', isFocused: true, bodyColumns: 80, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} } } as never);
+  expect(widths[widths.length - 1]).toBe(80);
+  await pane.press({ key: `job-${ID}` });
+  expect(await pane.find({ key: 'back' })).toBeDefined();
+  expect(widths[widths.length - 1]).toBe(80);
+  await pane.unmount();
+});
 
 // ── fixtures, verbatim from the corpus ──────────────────────────────────────
 
@@ -86,6 +106,8 @@ function engine(
     noColorEnv?: string;
     files?: Record<string, string>;
     entries?: { name: string; kind: 'file' | 'dir'; size: number }[];
+    nativeTask?: boolean;
+    nativeTaskCalls?: { tool: string; input: Record<string, unknown> }[];
   } = {},
 ) {
   const files: Record<string, string> = {
@@ -111,28 +133,42 @@ function engine(
     cwd: (e as { cwd?: string }).cwd,
   }));
   on('command.register', () => ({ value: undefined }));
-  on('clock.every', () => ({ value: { cancel: () => {} } }));
-  on('clock.now', () => ({ value: options.now ?? RUNNING_NOW }));
+  mock.clock(on as never, { now: options.now ?? RUNNING_NOW });
   on('env.get', (_$: unknown, e: unknown) => {
     const name = (e as { name: string }).name;
-    if (name === 'AGY_RADAR_REPO') return { value: '/corpus' };
+    if (name === 'AGY_RADAR_REPO') return { value: options.nativeTask ? '/work' : '/corpus' };
     if (name === 'NO_COLOR') return { value: options.noColorEnv };
     return { value: undefined };
   });
-  on('fs.list', () => ({ value: entries }));
+  on('fs.list', (_$: unknown, e: unknown) => {
+    const path = (e as { path: string }).path;
+    if (options.nativeTask && path === '/work/.agent-smith/jobs') {
+      return { value: [{ name: 'job-native-1', kind: 'dir', size: 0 }] };
+    }
+    return { value: entries };
+  });
   on('fs.read', (_$: unknown, e: unknown) => {
     const path = (e as { path: string }).path;
     const name = path.slice(path.lastIndexOf('/') + 1);
     const body = files[name];
     if (body === undefined) {
       // The real `$.fs.read` rejects with the OS errno; the band must survive it.
-      throw new Error(`ENOENT: no such file or directory, open '${path}'`);
+      return { deny: `ENOENT: no such file or directory, open '${path}'` };
     }
     return { value: body };
   });
   on('fs.exists', (_$: unknown, e: unknown) => ({
     value: Object.hasOwn(files, (e as { path: string }).path.slice((e as { path: string }).path.lastIndexOf('/') + 1)),
   }));
+  if (options.nativeTaskCalls) {
+    on('tool.call', (_$: unknown, e: unknown) => {
+      const call = e as { tool: string; [key: string]: unknown };
+      options.nativeTaskCalls!.push({ tool: call.tool, input: { ...call } });
+      if (call.tool === 'TaskCreate') return { result: { task: { id: 'native-task-1', subject: call.subject } } };
+      if (call.tool === 'TaskUpdate') return { result: { success: true, taskId: call.taskId } };
+      return { deny: `unexpected tool ${call.tool}` };
+    });
+  }
   on('ui.render', ($: any, e: any) => $.ui.resolve(e).Text({ children: 'REST-OF-BAND' }));
 }
 
@@ -164,10 +200,7 @@ describe('the band', () => {
     } as never);
 
     // The exact line from the design brief, produced from real corpus files.
-    const line = await band.find({
-      type: 'Text',
-      text: `● ${ID} cargo test --workspace · 341 tools`,
-    });
+    const line = await band.find({ type: 'Text', text: /◌ open an agent-built dashboard/ });
     expect(line).toBeDefined();
     // …and the clock, which is 12m04s from the real log's worker-started line.
     expect(await band.find({ type: 'Text', text: '12m04s' })).toBeDefined();
@@ -207,7 +240,7 @@ describe('the band', () => {
     engine(on, { entries: [], files: {} });
     await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
     const band = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', ...BAND } as never);
-    expect(await band.find({ type: 'Text', text: /agent-smith/ })).toBeUndefined();
+    expect(await band.find({ type: 'Text', text: /\/forge/ })).toBeUndefined();
     expect(await band.find({ type: 'Text', text: 'REST-OF-BAND' })).toBeDefined();
   });
 
@@ -216,7 +249,7 @@ describe('the band', () => {
     await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
     const band = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', ...BAND } as never);
 
-    const line = await band.find({ type: 'Text', text: `● ${ID}` });
+    const line = await band.find({ type: 'Text', text: /◌ open an agent-built dashboard/ });
     expect(line).toBeDefined();
     const head = (line as { children?: { props?: Record<string, unknown> }[] }).children?.[0];
     // The redundant channel survives: the glyph still says "running".
@@ -266,11 +299,11 @@ describe('HAZARD A, as drawn', () => {
     await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
     const band = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', ...BAND } as never);
 
-    expect(await band.find({ type: 'Text', text: `✓ ${ID} finished` })).toBeDefined();
+    expect(await band.find({ type: 'Text', text: /✓ open an agent-built dashboard.*finished/ })).toBeDefined();
     // No tool count, because there is genuinely none on disk — omitted, not 0.
     expect(await band.find({ type: 'Text', text: /0 tools/ })).toBeUndefined();
     // And it does NOT read as still running.
-    expect(await band.find({ type: 'Text', text: new RegExp(`● ${ID}`) })).toBeUndefined();
+    expect(await band.find({ type: 'Text', text: /◌ open an agent-built dashboard/ })).toBeUndefined();
   });
 
   test('empty output + warnings:true draws FAILED, not a green check', async ($, on) => {
@@ -292,10 +325,10 @@ describe('HAZARD A, as drawn', () => {
     await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
     const band = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', ...BAND } as never);
 
-    expect(await band.find({ type: 'Text', text: new RegExp(`✗ ${ID} failed`) })).toBeDefined();
-    expect(await band.find({ type: 'Text', text: new RegExp(`✓ ${ID}`) })).toBeUndefined();
+    expect(await band.find({ type: 'Text', text: /✗ open an agent-built dashboard.*failed/ })).toBeDefined();
+    expect(await band.find({ type: 'Text', text: /✓ open an agent-built dashboard/ })).toBeUndefined();
     // And the reason reaches the line as a stable code.
-    expect(await band.find({ type: 'Text', text: 'suspicious success' })).toBeDefined();
+    expect(await band.find({ type: 'Text', text: /no output/ })).toBeDefined();
   });
 
   test('a finished job older than the linger is not drawn at all', async ($, on) => {
@@ -343,7 +376,7 @@ describe('HAZARD A, as drawn', () => {
 
     const overflow = await band.find({ type: 'Text', text: '+2 more' });
     expect(overflow).toBeDefined();
-    expect((overflow as { text?: string }).text).toContain('/agent-smith');
+    expect((overflow as { text?: string }).text).toContain('/forge');
   });
 
   test("the engine's own maxRows is respected", async ($, on) => {
@@ -395,12 +428,57 @@ describe('the render path uses the tested helpers', () => {
     };
     const line: BandLine = buildLine(job, RUNNING_NOW);
     expect(line.plain).toContain('12m04s');
-    expect(line.glyph).toBe('●');
+    expect(line.glyph).toBe('◌');
     expect(line.accent).toBe('yellow');
 
     const budget: BandBudget = rowBudget([job], 10);
     expect(budget.rows).toHaveLength(1);
     expect(budget.hidden).toBe(0);
     expect(isShown(job, RUNNING_NOW)).toBe(true);
+  });
+});
+
+describe('native task-list projection', () => {
+  test('uses host TaskCreate/TaskUpdate and preserves truthful worker metadata', async ($, on) => {
+    const calls: { tool: string; input: Record<string, unknown> }[] = [];
+    engine(on, {
+      nativeTask: true,
+      nativeTaskCalls: calls,
+      files: {
+        'job.json': JSON.stringify({
+          schema: 1,
+          jobId: 'job-native-1',
+          status: 'running',
+          name: 'Codex reviewer',
+          workerId: 'worker-codex-7',
+          role: 'reviewer',
+          task: 'Review provider recovery',
+          provider: 'codex',
+          model: 'gpt-6-sol',
+        }),
+        'progress.json': JSON.stringify({
+          latestSummary: 'Found a retry loop that can duplicate a request.',
+          summarySource: 'worker',
+        }),
+      },
+    });
+
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
+
+    const create = calls.find((call) => call.tool === 'TaskCreate');
+    const update = calls.find((call) => call.tool === 'TaskUpdate');
+    expect(create).toBeDefined();
+    expect(create?.input.subject).toBe('Codex reviewer: Review provider recovery');
+    expect(create?.input.metadata).toEqual({
+      source: 'agent-smith',
+      jobId: 'job-native-1',
+      workerId: 'worker-codex-7',
+      role: 'reviewer',
+    });
+    expect(update).toBeDefined();
+    expect(update?.input.taskId).toBe('native-task-1');
+    expect(update?.input.status).toBe('in_progress');
+    expect(update?.input.description).toContain('Outcome: running');
+    expect(update?.input.description).toContain('Latest worker output:\nFound a retry loop');
   });
 });

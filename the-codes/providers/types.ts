@@ -96,6 +96,13 @@ export interface SpawnSpec {
   /** Stable id for this job. Generated (randomUUID) if omitted. */
   jobId?: string;
 
+  /**
+   * Run read-only where the provider can enforce it (codex: `-s read-only`).
+   * Providers that cannot enforce it ignore this; the ack reports that via
+   * `readOnlyEnforced`. Ignored when `unrestricted` is true.
+   */
+  readOnly?: boolean;
+
   /** Extra directories to widen the worker's sandbox to (agy --add-dir / codex --add-dir). */
   addDirs?: string[];
 
@@ -299,4 +306,64 @@ export interface Provider {
    * the returned handle's waitForResult() — never as a rejection.
    */
   spawn(spec: SpawnSpec): Promise<WorkerHandle>;
+
+  /**
+   * Report the sandbox/permission posture `spawn(spec)` WILL apply, derived from
+   * the same code path that builds argv (not a parallel guess). Pure, no I/O.
+   */
+  describeSandbox?(spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly'>): SandboxInfo;
+
+  /**
+   * The provider's own configured default model/effort, read from its config
+   * file only. Sync, no CLI, no network: safe on the spawn hot path.
+   */
+  harnessDefaults?(): { model?: string; effort?: string };
+
+  /** Discover models. Optional; never throws. Must be lazy (never called at startup). */
+  listModels?(options?: ListModelsOptions): Promise<ModelCatalog>;
+}
+
+// ---------------------------------------------------------------------------
+// Model discovery
+// ---------------------------------------------------------------------------
+
+/** One discoverable model, normalized across providers. */
+export interface ModelInfo {
+  /** Provider-native id to pass as `--model`. For agy this is a BASE id (effort suffix stripped). */
+  id: string;
+  label: string;
+  /** Efforts this model accepts, provider-native strings (codex includes e.g. "ultra"). */
+  efforts: string[];
+  defaultEffort?: string;
+}
+
+/** What `listModels()` returns. Never throws; failures land in `error`. */
+export interface ModelCatalog {
+  provider: string;
+  models: ModelInfo[];
+  /** Provider default read from the harness's own config, when it exists. */
+  defaultModel?: string;
+  defaultEffort?: string;
+  defaultSource: 'harness-config' | 'unknown';
+  /** Where this listing came from. */
+  source: 'live' | 'cache' | 'static';
+  /** True when served from an expired cache because a refresh failed. */
+  stale: boolean;
+  /** False when the discovery path has not been verified against a real install (opencode). */
+  verified: boolean;
+  error?: string;
+}
+
+export interface ListModelsOptions {
+  timeoutMs?: number;
+}
+
+/** Effective sandbox posture for a spawn, echoed in the spawn ack. */
+export interface SandboxInfo {
+  /** Human-readable, e.g. "codex -s read-only" or "agy proceed-in-sandbox (cannot prompt)". */
+  sandbox: string;
+  /** Flags that will be passed for sandbox/permissions, verbatim. */
+  flags: string[];
+  /** True only if a requested readOnly is actually enforced by the CLI. */
+  readOnlyEnforced: boolean;
 }

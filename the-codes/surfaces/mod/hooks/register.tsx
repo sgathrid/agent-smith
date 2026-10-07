@@ -1,11 +1,11 @@
 // =============================================================================
-// register.tsx — the /agent-smith pane, in an AbovePrompt-style mod.
+// register.tsx — the /forge pane, in an AbovePrompt-style mod.
 //
 // ─────────────────────────────────────────────────────────────────────────────
 // ⚠ MERGE NOTE — READ THIS BEFORE EDITING. ⚠
 // ─────────────────────────────────────────────────────────────────────────────
 // Another engineer may be writing the BAND half of this file concurrently. The
-// band is the 1–4 line strip above the prompt; the pane is what /agent-smith opens.
+// band is the 1–4 line strip above the prompt; the pane is what /forge opens.
 //
 // The split is structural, not advisory:
 //
@@ -47,12 +47,15 @@ import {
   elapsedCell,
   formatHeaderLine,
   formatJobLine,
+  isRecessive,
   isTerminal,
+  jobLabel,
   oneLine,
+  paneColumns,
   pickColor,
   pickGlyph,
+  SEP,
   sortJobs,
-  toolCountCell,
 } from './format.ts';
 // ── BAND IMPORTS (band author) ────────────────────────────────────────────────
 // § PANE reads through this module too, and for the same reason the band does: it
@@ -73,13 +76,55 @@ import {
   readAllJobs,
   readJob,
   readToolHistory,
-  sortForBand,
   type FsLike,
 } from './jobs.ts';
+import { sortForBand } from './format.ts';
 import type { ToolEntry } from '../types/index.d.ts';
+import {
+  readNativeJobs,
+  syncNativeTasks,
+  type NativeTaskClient,
+  type NativeTaskLinks,
+} from './native.ts';
 
 /** Pane id. Must match the `requestId` in the ui.render matcher below. */
 const PANE = 'agent-smith';
+
+/** Before the host measures the terminal, ask for a compact pane width. */
+const PANE_FALLBACK_COLUMNS = 60;
+const PANE_MIN_COLUMNS = 24;
+
+/** Last measured whole-terminal width, supplied by the host render event. */
+let lastViewportColumns: number | null = null;
+/** Width last requested from ui.open, avoiding render-triggered reopen loops. */
+let lastPaneRequest: number | null = null;
+
+/** A pane request for the rightmost third, respecting the host's 24-column floor. */
+export function paneWidthRequest(viewportColumns: number | null): number {
+  if (viewportColumns === null || !Number.isFinite(viewportColumns) || viewportColumns <= 0) {
+    return PANE_FALLBACK_COLUMNS;
+  }
+  return Math.max(PANE_MIN_COLUMNS, Math.floor(viewportColumns / 3));
+}
+
+function noteViewport(columns: number | undefined): void {
+  if (typeof columns === 'number' && Number.isFinite(columns) && columns > 0) {
+    lastViewportColumns = Math.floor(columns);
+  }
+}
+
+async function requestPane($: EngineInterface, force = false): Promise<void> {
+  const columns = paneWidthRequest(lastViewportColumns);
+  if (!force && lastPaneRequest === columns) return;
+  // Set before awaiting: a Pane render can arrive while ui.open is still pending.
+  lastPaneRequest = columns;
+  await $.ui.open({
+    id: PANE,
+    title: 'Agent Smith',
+    ...(force ? { focus: true } : {}),
+    columns,
+  });
+}
 
 // ── state ───────────────────────────────────────────────────────────────────
 //
@@ -107,6 +152,10 @@ const now = atom({ plugin: 'agent-smith', key: 'now' } as const, 0);
  * state, and an array survives that where a Set does not.
  */
 const cleared = atom({ plugin: 'agent-smith', key: 'cleared' } as const, [] as string[]);
+const nativeTaskLinks = atom(
+  { plugin: 'agent-smith', key: 'nativeTaskLinks' } as const,
+  {} as NativeTaskLinks,
+);
 
 // ── BAND STATE (band author) ──────────────────────────────────────────────────
 // `jobs` is the band's own snapshot of the jobs directory. It is NOT shared with
@@ -289,6 +338,39 @@ export async function startBand($: EngineInterface, cwd?: string): Promise<void>
   });
 }
 
+// Clock ticks can arrive while the host's TaskCreate/TaskUpdate call is still
+// resolving. The durable map lives in plugin state; this is only an overlap
+// guard for the mod's current engine session.
+let nativeSyncing = false;
+
+async function pollNativeTasks($: EngineInterface, repo: string): Promise<void> {
+  if (nativeSyncing) return;
+  nativeSyncing = true;
+  try {
+    const jobs = await readNativeJobs(fsOf($), repo);
+    const previous = await read($, nativeTaskLinks);
+    const client: NativeTaskClient = {
+      create: (input) => $.tool.call({ tool: 'TaskCreate', ...input }),
+      update: (input) => $.tool.call({ tool: 'TaskUpdate', ...input }),
+    };
+    const next = await syncNativeTasks(jobs, previous, client);
+    if (JSON.stringify(previous) !== JSON.stringify(next)) {
+      await update($, nativeTaskLinks, () => next);
+    }
+  } catch {
+    // The native task list is an optional view. Its failure cannot interrupt
+    // worker execution, the pane, or the existing progress band.
+  } finally {
+    nativeSyncing = false;
+  }
+}
+
+/** Start a live-only projection into Claude's TaskList, using host-assigned ids. */
+async function startNativeTasks($: EngineInterface, repo: string): Promise<void> {
+  await pollNativeTasks($, repo);
+  $.clock.every(POLL_MS, () => pollNativeTasks($, repo));
+}
+
 // ── the band's remaining registrations ─────────────────────────────────────
 //
 // Its session-start half is `startBand` above, because the engine refuses two
@@ -299,7 +381,7 @@ export async function startBand($: EngineInterface, cwd?: string): Promise<void>
  * Register the band. Called from the pane's `register`.
  *
  * The band deliberately registers NO `command.run` handler and opens NO pane:
- * `/agent-smith` belongs to the pane half, and two handlers for one command is a
+ * `/forge` belongs to the pane half, and two handlers for one command is a
  * coin toss over which one the engine picks.
  */
 export function registerBand(on: Parameters<Register>[0]): void {
@@ -318,6 +400,7 @@ export function registerBand(on: Parameters<Register>[0]): void {
   });
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    noteViewport(e.viewport?.columns);
     // Yield FIRST. Everything Claude Code and every other mod draw in this band
     // comes back in `rest`, and we return it as our LAST child, untouched.
     // TERMINAL-UI.md L170-173.
@@ -351,21 +434,28 @@ export function registerBand(on: Parameters<Register>[0]): void {
         {budget.rows.map((job) => {
           const line = buildLine(job, at, { colour: cfg.colour });
           return (
-            <Text key={job.id} wrap="truncate-end">
-              {/* Segment 1: identity + outcome, in the accent. `accent` is
-                  undefined under NO_COLOR and for canceled/unknown, and
-                  `color={undefined}` draws in the terminal's default — the
-                  glyph still carries the state, which is the whole point. */}
+            <Text key={job.id} dimColor={line.recessive} wrap="truncate-end">
+              {/* Segment 1: the GLYPH ALONE, in the accent and bold while live.
+                  `accent` is undefined under NO_COLOR and for canceled/unknown,
+                  and `color={undefined}` draws in the terminal's default — the
+                  glyph still carries the state, which is the whole point.
+
+                  It is the glyph alone rather than "glyph + identity" because a
+                  44-column task title painted yellow is not an accent, it is a
+                  highlighted sentence. One accent per line, spent on the one
+                  character that means something. */}
               <Text color={line.accent} bold={line.bold} wrap="truncate-end">
-                {line.head}
+                {line.glyph}
               </Text>
-              {/* Segment 2: everything secondary, `dimColor`. NEVER `gray`: it is
-                  a fixed colour that disappears on one of light/dark terminals
-                  (TERMINAL-UI.md L84-85). `wrap` here too — TERMINAL-UI.md
-                  L124-126 says EVERY Text, not just the outermost one, and the
-                  engine tests the rule per element. */}
-              <Text dimColor wrap="truncate-end">
-                {line.tail}
+              {/* Segment 2: the task and the state, default foreground — this is
+                  level-1 identity and it must be as readable as anything else on
+                  the line. Segment 3 is the detail; segment 4 is the clock, LAST
+                  and dim. `wrap` on every one of them: TERMINAL-UI.md L124-126
+                  says EVERY Text, not just the outermost, and the engine tests
+                  the rule per element. */}
+              <Text wrap="truncate-end">{` ${line.label}`}</Text>
+              <Text dimColor={!line.recessive} wrap="truncate-end">
+                {` ${line.detail} ${line.clock}`.replace(/\s+$/, '')}
               </Text>
             </Text>
           );
@@ -384,7 +474,7 @@ export function registerBand(on: Parameters<Register>[0]): void {
 }
 
 // =============================================================================
-// § PANE — everything below this line belongs to the /agent-smith pane.
+// § PANE — everything below this line belongs to the /forge pane.
 // =============================================================================
 
 /** `register(on, options)` is the mod entry point. hooks.json names this file. */
@@ -407,13 +497,15 @@ export const register: Register = (on) => {
   // ── the command ───────────────────────────────────────────────────────────
   //
   // `.catch(() => {})` because Claude Code refuses a command name it already owns,
-  // and refusing to start would take the band down with it. Losing `/agent-smith` to
+  // and refusing to start would take the band down with it. Losing `/forge` to
   // a name collision is acceptable; losing the whole mod is not.
   on('session.start', async ($, e, next) => {
     const rest = await next(e);
     // Band first, and it never throws: a slow or failing band config must not
     // delay `/forge` appearing or take the session's start with it.
     await startBand($, typeof e.cwd === 'string' ? e.cwd : undefined);
+    const cfg = await read($, bandConfig);
+    await startNativeTasks($, cfg.repo);
     await $.command
       .register({
         name: 'forge',
@@ -435,7 +527,12 @@ export const register: Register = (on) => {
     // into a stale detail view would be disorienting: the user asked for a
     // browser, not for wherever they happened to be last time.
     await update($, selected, () => null);
-    await $.ui.open({ id: PANE, title: 'Agent Smith', focus: true });
+
+    // Claude accepts a width REQUEST and lets the user resize/relocate the pane.
+    // Ask for one third of the measured terminal so `/forge` occupies the right
+    // third by default, with 60 columns before measurement and the host's 24
+    // column floor on very narrow terminals. The host may still override it.
+    await requestPane($, true);
 
     // Read once here so the command's own return value is honest about what is
     // running. The pane re-reads on every render; this is just for the command's
@@ -448,8 +545,7 @@ export const register: Register = (on) => {
     // also means the band and the pane cannot end up pointed at different repos.
     const cfg = await read($, bandConfig);
     const jobs = await readAllJobs(fsOf($), cfg.repo, await $.clock.now());
-    const { running, finished } = countSummary(jobs);
-    return { text: formatHeaderLine(running, finished) };
+    return { text: formatHeaderLine(countSummary(jobs)) };
   });
 
   // ── the pane itself ───────────────────────────────────────────────────────
@@ -460,6 +556,12 @@ export const register: Register = (on) => {
   // band, where other mods and Claude Code draw above the prompt; it does not
   // apply here, and calling next(e) would be cargo-culting.
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e, _next) => {
+    noteViewport(e.viewport?.columns);
+    // Terminal resizes may change the desired third. Reissue exactly once per
+    // changed request; the guard prevents a render/open feedback loop.
+    if (lastPaneRequest !== null && lastPaneRequest !== paneWidthRequest(lastViewportColumns)) {
+      await requestPane($).catch(() => {});
+    }
     const { Box, Text, Button, Markdown } = $.ui.resolve(e);
 
     // Subscribe to the clock. This read is what repaints the pane as elapsed cells
@@ -539,7 +641,6 @@ function renderList(
   // `c` filters locally rather than deleting anything: agy-staff owns this
   // directory and a UI preference must not destroy another process's state.
   const sorted = sortJobs(all.filter((j) => !hidden.includes(j.id) || !isTerminal(j.status)));
-  const { running, finished } = countSummary(sorted);
 
   // Empty state: one literal line. NOT a box, NOT a spinner, NOT "0 jobs".
   // A pane whose whole content is a border and the word "empty" is louder than a
@@ -553,41 +654,47 @@ function renderList(
     );
   }
 
-  // Left-align the id column to the widest id actually on screen, capped so one
-  // pathological id cannot push every row's clock off the pane.
-  const idWidth = Math.min(
-    28,
-    Math.max(...sorted.slice(0, LIST_ROWS).map((j) => j.id.length)),
-  );
-
   const shown = sorted.slice(0, LIST_ROWS);
+
+  // The two variable column widths come from the width the ENGINE reports, not
+  // from the width of the content. That is the fix for the pane's worst visible
+  // flaw: the rows used to be laid out against the longest job id (30 columns of
+  // `implement-musm82da-f1dc1fe4`) and then truncated at 90 by a pane that was
+  // only 85 wide, so every row wrapped to two lines. `bodyColumns` is the real
+  // budget, and `paneColumns` guarantees label + detail + overhead fits inside
+  // it — so a row cannot wrap at ANY terminal width, including 60.
+  const cols = paneColumns(e.props.bodyColumns);
 
   return (
     <Box flexDirection="column">
       {/* Counts, not a spinner. `wrap="truncate-end"` on every Text: a wrapped
           status line becomes two rows and the pane's height changes under the
           user's cursor. */}
-      <Text bold wrap="truncate-end">{formatHeaderLine(running, finished)}</Text>
+      <Text bold wrap="truncate-end">{formatHeaderLine(countSummary(sorted))}</Text>
 
       {shown.map((job, i) => (
         <Button
           key={`job-${job.id}`}
           plain
           hotkey={String(i + 1)}
-          // dimColor only for jobs that are over. The BAND owns this decision for
-          // running rows; here it is a secondary signal, so it is dimColor and
-          // never `gray` (TERMINAL-UI.md §Colour).
-          dimColor={isTerminal(job.status)}
-          label={formatJobLine(job, { idWidth, now: t })}
+          // Recessive for finished/canceled/unknown, NOT for failed. A failed job
+          // is the one terminal state the user has to act on, and dimming it is
+          // how a failure becomes the thing nobody reads. `dimColor`, never
+          // `gray` — a fixed colour that vanishes on one of light/dark.
+          dimColor={isRecessive(job.status)}
+          label={formatJobLine(job, { ...cols, tools: true, now: t })}
           // `void`: Button.onPress is Promise<void> and update() resolves to the new
           // value, which is not assignable. The value is discarded by design.
           onPress={() => void update($, selected, () => job.id)}
         />
       ))}
 
-      {/* Row cap. A list that grows without bound pushes the footer off screen. */}
+      {/* Row cap. A list that grows without bound pushes the footer off screen.
+          `+N older` rather than an ellipsis: `…` is EAW=Ambiguous, and this row
+          is dim text at the left edge where a one-column drift is invisible but
+          a two-column one is not. */}
       {sorted.length > LIST_ROWS && (
-        <Text dimColor wrap="truncate-end">{`  … ${sorted.length - LIST_ROWS} older`}</Text>
+        <Text dimColor wrap="truncate-end">{`  +${sorted.length - LIST_ROWS} older`}</Text>
       )}
 
       {footer($, W, false, hidden)}
@@ -617,16 +724,29 @@ function renderDetail(
   W: Widgets,
 ): JSX.Element {
   const { Box, Text, Button, Markdown } = W;
+  const rule = '─'.repeat(Math.max(10, Math.min(e.props.bodyColumns - 2, 200)));
 
   return (
     <Box flexDirection="column">
-      {/* Header: identity, then liveness. Same order as the list row so the two
-          levels look like the same product. */}
+      {/* Header: the TASK as the title, the elapsed beside it, and the job id
+          demoted to a dim line of its own.
+
+          THE ID IS HERE AND NOT ON THE LIST ROW, which is the whole point of the
+          split: on a list row, `implement-musm82da-f1dc1fe4` is 30 columns of
+          which the mode is constant and the suffix is a UUID fragment; on a
+          detail page, where there are four things to read and rows are not being
+          scanned against each other, the id is exactly what a person needs in
+          order to say "show me job f1dc1fe4". Keeping it here costs nothing and
+          removing it from the row is what buys the row its width. */}
       <Text wrap="truncate-end">
         <Text color={pickColor(job.status)} bold>
-          {`${pickGlyph(job.status)} ${job.id}`}
+          {`${pickGlyph(job.status)} ${jobLabel(job)}`}
         </Text>
-        <Text dimColor>{`  ${detailSummary(job, t)}`}</Text>
+        <Text dimColor>{`  ${elapsedCell(job.startedAt === null ? 0 : (job.endedAt ?? t) - job.startedAt)}`}</Text>
+      </Text>
+
+      <Text dimColor wrap="truncate-end">
+        {`${job.id}${job.workerId ? `  worker ${job.workerId}` : ''}${job.role ? `  ${job.role}` : ''}  ${detailSummary(job, t)}`}
       </Text>
 
       {/* The task. prompt_source.task's first line only — the real tasks run to
@@ -638,11 +758,18 @@ function renderDetail(
 
       {/* Current reasoning. Only for a live job: a finished job's last thought is
           not news, and its report says the same thing better. */}
-      {job.status === 'running' && job.reasoning !== null && (
+      {job.status === 'running' && job.reasoning !== null && job.summarySource !== 'worker' && (
         <Text dimColor wrap="truncate-end">{oneLine(job.reasoning, 300)}</Text>
       )}
 
-      <Text dimColor>{'─'.repeat(Math.max(10, e.props.bodyColumns - 2))}</Text>
+      {job.summarySource === 'worker' && typeof job.latestSummary === 'string' && job.latestSummary.trim() !== '' && (
+        <Box flexDirection="column">
+          <Text bold wrap="truncate-end">Latest worker output</Text>
+          <Markdown text={job.latestSummary} />
+        </Box>
+      )}
+
+      <Text dimColor>{rule}</Text>
 
       {/* Tool history, newest last so it reads forward in time. Empty is stated in
           words: for a cleanly finished job there IS no history on disk, and a
@@ -655,10 +782,10 @@ function renderDetail(
           <Text bold wrap="truncate-end">{`Warnings (${job.warnings.length})`}</Text>
           {job.warnings.map((w) => (
             <Text key={`w-${w.code}`} color="yellow" wrap="truncate-end">
-              {`! ${oneLine(w.message, 300)}`}
+              {`⚠ ${oneLine(w.message, 300)}`}
             </Text>
           ))}
-          <Text dimColor>{'─'.repeat(Math.max(10, e.props.bodyColumns - 2))}</Text>
+          <Text dimColor>{rule}</Text>
         </>
       )}
 
@@ -682,24 +809,25 @@ function renderDetail(
 }
 
 /**
- * The one-line liveness summary for the detail header: `running · 12m04s · 341 tools`.
+ * The detail page's one-line summary: `running ∙ running tests ∙ 341 tools`.
  *
  * A separate helper rather than slicing the output of formatJobLine: slicing a
  * formatted line back into parts means the header silently breaks the day
  * formatJobLine's layout changes. Both call the same primitives instead, so they
  * cannot drift, and neither depends on the other's string layout.
+ *
+ * The tool count IS shown here, on every status, unlike on a list row. On a row
+ * it competes with nine neighbours for one glance and 504-versus-36 means
+ * nothing; on a detail page it is one number in one line and it answers "how much
+ * work was this", which is a fair question to ask a job you have opened on purpose.
  */
-function detailSummary(job: RadarJob, t: number): string {
+function detailSummary(job: RadarJob, _t: number): string {
   // Annotated as string[] because the first element is a RadarStatus and TS would
   // otherwise infer the array as RadarStatus[] and reject the strings pushed after.
   const bits: string[] = [job.status];
-  const span = job.startedAt === null ? null : (job.endedAt ?? t) - job.startedAt;
-  // A blank clock when the start is unknown, matching the list row's rule.
-  const clock = span === null ? '' : elapsedCell(span);
-  if (clock !== '') bits.push(clock);
-  const tools = toolCountCell(job.toolCount);
-  if (tools !== '') bits.push(`${tools} tools`);
-  return bits.join(' · ');
+  if (job.activity !== '' && !isTerminal(job.status)) bits.push(job.activity);
+  if (job.toolCount !== null) bits.push(`${job.toolCount} tools`);
+  return bits.join(` ${SEP} `);
 }
 
 /**
@@ -736,12 +864,12 @@ function ToolHistory({ entries, W }: { entries: readonly ToolEntry[]; W: Widgets
               §Colour): the tool name is coloured, its output never is. */}
           <Text color={entry.state === 'error' ? 'red' : 'cyan'}>{`${entry.tool} `}</Text>
           <Text dimColor wrap="truncate-end">
-            {entry.output.length > 0 ? `${entry.label} → ${oneLine(entry.output, 120)}` : entry.label}
+            {entry.output.length > 0 ? `${entry.label} ${SEP} ${oneLine(entry.output, 120)}` : entry.label}
           </Text>
         </Text>
       ))}
       {entries.length > HISTORY_ROWS && (
-        <Text dimColor wrap="truncate-end">{`  … ${entries.length - HISTORY_ROWS} earlier`}</Text>
+        <Text dimColor wrap="truncate-end">{`  +${entries.length - HISTORY_ROWS} earlier`}</Text>
       )}
     </Box>
   );
@@ -822,6 +950,7 @@ export {
   oneLine,
   pickColor,
   pickGlyph,
+  SEP,
 } from './format.ts';
 
 export type { RadarJob, RadarStatus } from '../types/index.d.ts';

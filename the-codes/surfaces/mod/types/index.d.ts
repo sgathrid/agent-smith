@@ -53,6 +53,21 @@ export interface RadarJob {
   /** agy-staff's job id, e.g. `implement-musm82da-f1dc1fe4`. */
   readonly id: string;
 
+  /** Optional human label for the worker; absent labels fall back to task text. */
+  readonly name?: string | null;
+
+  /** Stable worker identity supplied by Agent Smith, or the job id as fallback. */
+  readonly workerId?: string;
+
+  /** Worker role/stage, when the source records one. */
+  readonly role?: string | null;
+
+  /** Latest actual assistant output, kept separate from reasoning/tool activity. */
+  readonly latestSummary?: string | null;
+
+  /** `worker` only when the latest summary came from worker output. */
+  readonly summarySource?: 'worker' | null;
+
   /** Lifecycle state as the pane draws it. See RadarStatus. */
   readonly status: RadarStatus;
 
@@ -149,6 +164,12 @@ declare module 'claude-code' {
        * about the truth, only about when they looked.
        */
       bandJobs: RadarJob[];
+      /** Host-created task IDs for live Agent Smith jobs; keys are Agent Smith job IDs. */
+      nativeTaskLinks: Record<string, {
+        taskId: string;
+        status: 'in_progress' | 'completed';
+        fingerprint: string;
+      }>;
       /**
        * Resolved once at session start: which repo to watch, and whether colour
        * is allowed (NO_COLOR / FORCE_COLOR / TERM=dumb). Re-reading env per frame

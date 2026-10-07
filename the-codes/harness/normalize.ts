@@ -18,7 +18,9 @@
  *   └──────────────────────────────────────────────────────────────────┘
  */
 
+import { SCHEMA_VERSION } from "../forge/format.ts";
 import { AGY_PAYLOAD } from "./agy-staff.ts";
+import { SMITH_PAYLOAD } from "./agent-smith.ts";
 import { CLAUDE_PAYLOAD } from "./claude-code.ts";
 import {
   type JobNormalizer,
@@ -323,9 +325,188 @@ const claudeNormalizer: JobNormalizer = (raw: RawJobState): ObservedJob => {
   };
 };
 
+// ── agent-smith normalizer ──────────────────────────────────────────────────
+
+/**
+ * Map an agent-smith payload onto ObservedJob.
+ *
+ * THIS IS THE PRIMARY NORMALIZER, and it is far shorter than the two above
+ * because we own the format (see forge/format.ts). Three rows, in order:
+ *
+ *   1. cancel marker exists                    ⇒ canceled   (outranks job.json:
+ *      the marker is written the instant cancel is requested, and the worker may
+ *      never get to write its own terminal state)
+ *   2. job.json.status is a terminal state      ⇒ that state, VERBATIM
+ *   3. otherwise                               ⇒ running, or unknown if the
+ *      anchor was unreadable
+ *
+ * ROW 2 HAS NO JUDGEMENT IN IT, and that is deliberate. The suspicious-success
+ * downgrade — the headline rule of this whole codebase — is applied ONCE, at the
+ * moment of writing, by `forge/format.ts`'s `deriveStatus`. It is not applied
+ * again here. A normalizer that re-derived the verdict from the output would be a
+ * second, subtly different implementation of the same rule, and the day the two
+ * disagree the mod would draw one state while the channel announced another.
+ *
+ * The reader's job is to report what is on disk. The writer's job is to decide
+ * what it means. One decision, one place.
+ */
+const smithNormalizer: JobNormalizer = (raw: RawJobState): ObservedJob => {
+  const p = raw.payload;
+  const warnings: ObservedWarning[] = [];
+
+  const canceled = asBool(p[SMITH_PAYLOAD.canceled]) === true;
+  const status = asString(p[SMITH_PAYLOAD.status]);
+  const output = asString(p[SMITH_PAYLOAD.output]);
+  const denied = p[SMITH_PAYLOAD.deniedActions];
+  const deniedCount = Array.isArray(denied) ? denied.length : 0;
+  const errorText = asString(p[SMITH_PAYLOAD.error]);
+  const progressWarnings = asStringArray(p[SMITH_PAYLOAD.progressWarnings]);
+
+  // A newer on-disk schema is not a job we understand. `unknown` is the honest
+  // answer and it must survive to the surface: core/types.ts is explicit that
+  // `unknown` is load-bearing and must never be collapsed.
+  const schema = asNumber(p[SMITH_PAYLOAD.schema]);
+
+  if (deniedCount > 0) {
+    warnings.push({
+      code: "suspicious_success",
+      message:
+        `${deniedCount} tool action(s) were soft-denied. The worker exited 0 and reported ` +
+        "success while doing nothing; the job was recorded FAILED.",
+    });
+  }
+
+  if (errorText !== null) {
+    warnings.push({ code: "tool_error", message: errorText });
+  }
+
+  for (const w of progressWarnings) {
+    warnings.push({ code: "tool_error", message: w });
+  }
+
+  let resolved: ObservedStatus;
+  if (canceled) {
+    resolved = "canceled";
+    warnings.push({ code: "canceled", message: "Cancelled by the operator." });
+  } else if (schema !== null && schema > SCHEMA_VERSION) {
+    // A newer writer's file. `unknown`, and NOT `running`: "we cannot read this"
+    // is a different claim from "it is working", and drawing one as the other is
+    // the specific failure `unknown` exists to prevent.
+    resolved = "unknown";
+    warnings.push({
+      code: "incomplete_state",
+      message: `on-disk schema v${schema} is newer than this reader (v${SCHEMA_VERSION}); state unknown.`,
+    });
+  } else if (status === "succeeded") {
+    resolved = "succeeded";
+    if (output === null || looksEmpty(output)) {
+      // Defensive only. deriveStatus cannot produce `succeeded` with an empty
+      // report, so reaching here means job.json was written by something other
+      // than forge/writer.ts. Believe the file, flag the contradiction, and do
+      // not silently upgrade a job with no output to a success.
+      warnings.push({
+        code: "empty_output",
+        message: "Status says succeeded but no usable output is on disk; verify before trusting.",
+      });
+    }
+  } else if (status === "failed") {
+    resolved = "failed";
+  } else if (status === "canceled") {
+    resolved = "canceled";
+  } else if (status === "running") {
+    resolved = "running";
+  } else if (raw.partial === true) {
+    // The anchor is missing. NOT `running`: "we cannot tell" and "it is working"
+    // are different claims and a band that draws one as the other is lying.
+    resolved = "unknown";
+    warnings.push({
+      code: "incomplete_state",
+      message: "job.json is missing or unreadable; state is unknown, not running.",
+    });
+  } else {
+    resolved = "unknown";
+    warnings.push({
+      code: "incomplete_state",
+      message: "No status in the anchor and no cancel marker.",
+    });
+  }
+
+  // A cancelled job's empty output is expected, not a defect.
+  const kept = resolved === "canceled" ? warnings.filter((w) => w.code !== "empty_output") : warnings;
+
+  return buildSmith(raw, resolved, kept);
+};
+
+/** Assemble the ObservedJob for the agent-smith normalizer. */
+function buildSmith(
+  raw: RawJobState,
+  status: ObservedStatus,
+  warnings: ObservedWarning[],
+): ObservedJob {
+  const p = raw.payload;
+  const usage = asUsage(p[SMITH_PAYLOAD.usage]);
+  const toolCalls = asNumber(p[SMITH_PAYLOAD.toolCalls]);
+  const usageFull: ObservedUsage | null =
+    usage === null
+      ? toolCalls === null || toolCalls === 0
+        ? null
+        : { turns: toolCalls }
+      : toolCalls === null
+        ? usage
+        : { ...usage, turns: toolCalls };
+  return {
+    provider: "agent-smith",
+    jobId: raw.jobId,
+    status,
+    warnings,
+    output: asString(p[SMITH_PAYLOAD.output]),
+    startedAt: asString(p[SMITH_PAYLOAD.startedAt]) ?? asString(p[SMITH_PAYLOAD.createdAt]),
+    updatedAt: asString(p[SMITH_PAYLOAD.updatedAt]) ?? asString(p[SMITH_PAYLOAD.lastEventAt]),
+    finishedAt: asString(p[SMITH_PAYLOAD.finishedAt]),
+    mode: asString(p[SMITH_PAYLOAD.mode]),
+    model: asString(p[SMITH_PAYLOAD.model]),
+    // `label` is the pane's provider/permission word. Ours is honest about the
+    // one field an operator must never have to guess: did this run with the
+    // tool-approval prompt bypassed.
+    label:
+      asBool(p[SMITH_PAYLOAD.unrestricted]) === true
+        ? "unrestricted"
+        : asString(p[SMITH_PAYLOAD.provider]),
+    outputTruncated: false,
+    usage: usageFull,
+    partial: raw.partial === true,
+    raw: p,
+  };
+}
+
+/**
+ * Coerce a usage bag into the nullable ObservedUsage shape.
+ *
+ * Absent is absent. A provider that reports no token counts gets `null`, not a
+ * bag of zeroes, because a confident `0` drawn on the pane is a measurement
+ * nobody took.
+ */
+function asUsage(v: unknown): ObservedUsage | null {
+  if (v === null || typeof v !== "object") return null;
+  const src = v as Record<string, unknown>;
+  const out: { -readonly [K in keyof ObservedUsage]: ObservedUsage[K] } = {};
+  const map: ReadonlyArray<[string, keyof ObservedUsage]> = [
+    ["inputTokens", "inputTokens"],
+    ["outputTokens", "outputTokens"],
+    ["thinkingTokens", "thinkingTokens"],
+    ["cacheReadTokens", "cacheTokens"],
+  ];
+  for (const [from, to] of map) {
+    const n = asNumber(src[from]);
+    if (n !== null) out[to] = n;
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
 // ── registry of normalizers ─────────────────────────────────────────────────
 
 const NORMALIZERS: ReadonlyMap<string, JobNormalizer> = new Map<string, JobNormalizer>([
+  ["agent-smith", smithNormalizer],
   ["agy-staff", agyNormalizer],
   ["claude-code", claudeNormalizer],
 ]);
@@ -369,4 +550,4 @@ function fallbackNormalizer(raw: RawJobState): ObservedJob {
 }
 
 // Register the agy normalizer under the reader's provider key.
-export { agyNormalizer, claudeNormalizer };
+export { agyNormalizer, claudeNormalizer, smithNormalizer };

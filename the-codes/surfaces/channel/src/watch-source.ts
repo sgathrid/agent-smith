@@ -1,27 +1,54 @@
 /**
- * watch-source.ts — the channel's read of agy-staff job state.
+ * watch-source.ts — what the channel reads.
  *
- * Deliberately a thin adapter over the same harness reader the mod pane uses, so
- * the two surfaces CANNOT disagree about a job's state. That is the whole claim
- * in docs/ARCHITECTURE.md: "two surfaces cost one implementation". If this file
- * had its own status rules, the channel could announce a failure the pane draws
- * as a success, and there would be no way for a user to tell which one is lying.
+ * Deliberately a thin adapter over the same harness readers the mod pane is built
+ * on, so the two surfaces CANNOT disagree about a job's state. That is the whole
+ * claim in docs/ARCHITECTURE.md: "two surfaces cost one implementation". If this
+ * file had its own status rules, the channel could announce a failure the pane
+ * draws as a success, and there would be no way for a user to tell which one is
+ * lying.
  *
- * COUPLING NOTE: imports harness/, does not modify it. Same three imports as the
- * mod's job-source.ts:
- *   AgyStaffReader, normalize, stripSystemNotifications.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * TWO READERS, ONE VERDICT PER JOB
+ * ─────────────────────────────────────────────────────────────────────────────
  *
- * Unlike the mod, this surface may use third-party packages (it has the MCP SDK).
- * It still does not need anything else: harness is Node-builtins-only, and that is
- * the entire dependency graph of a reader.
+ *   agent-smith   PRIMARY.  Everything this repo spawned via spawn_job. Our own
+ *                            format, our own normalizer, our own status rules.
+ *   agy-staff     INTEROP.  Somebody else's on-disk layout, read-only. Kept so
+ *                            the 20 real jobs under renyi/.agy-staff/jobs stay
+ *                            visible and so a future worker that writes that shape
+ *                            is picked up for free.
  *
- * WHY THE HAZARDS ARE HANDLED BY DELEGATING RATHER THAN REPEATED:
- *   A. progress.json deleted on clean success → harness anchors on
- *      result.md.status.json, and we never read progress for terminal state.
- *   B. .spec.json.cancel marker → harness folds it into ObservedStatus before
- *      status.json is even consulted.
- *   C. polluted result.md → harness's reader strips <system_notification> blocks
- *      before the payload is built.
+ * BEFORE THIS EXISTED, this file read agy-staff only. That was correct when
+ * nothing in the repo could spawn anything: the only jobs that existed were
+ * agy-staff's. It stopped being correct the moment `spawn_job` landed, and a
+ * channel that never mentioned the jobs it had just started would be a surface
+ * that watches somebody else's work and ignores its own.
+ *
+ * WHY THE DEDUPE IS EXPLICIT RATHER THAN INHERITED FROM registry.ts:
+ * forge/mirror.ts projects our jobs into `.agy-staff/jobs/` so the UNMODIFIED mod
+ * plugin can render them. So the interop reader discovers our job ids too, and a
+ * naive concatenation would report every job we spawn TWICE — two independently
+ * computed verdicts for one id, inside a single poll. The channel's dedupe map
+ * would mask the duplicate for notifications and for nothing else. So the primary
+ * reader wins the id, here and in harness/registry.ts, by the same rule.
+ *
+ * WHY WE DO NOT IMPORT `claude-code`'s reader HERE: this surface is a channel
+ * about WORKERS WE SPAWN. Folding in every Claude Code subagent transcript would
+ * turn a 4-event vocabulary into a firehose of the user's own internal reasoning,
+ * and it would spend tokens on events nobody asked to hear.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * WHY THE HAZARDS ARE HANDLED BY DELEGATING RATHER THAN REPEATED
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ *   A. a deleted live-progress file means FINISHED, never "missing". Our writer
+ *      never deletes the anchor (forge/format.ts), so the format we own has no
+ *      such hazard; the interop reader still has to survive agy-staff's, and it
+ *      does by anchoring on result.md.status.json.
+ *   B. a cancel marker outranks the terminal status file, because a job we killed
+ *      has no trustworthy terminal state of its own.
+ *   C. a polluted result is stripped by the reader before we ever see the text.
  *
  * Re-implementing any of these here would create a second source of truth for the
  * exact failures that are hardest to debug. One place, one answer.
@@ -29,10 +56,13 @@
 
 import path from 'node:path';
 
+import { AgentSmithReader } from '../../../harness/agent-smith.ts';
 import { AgyStaffReader } from '../../../harness/agy-staff.ts';
 import { normalize } from '../../../harness/normalize.ts';
-import { existsSafe } from '../../../harness/safe-fs.ts';
-import type { ObservedJob } from '../../../harness/types.ts';
+import { existsSafe, readdirSafe, readJsonSafe } from '../../../harness/safe-fs.ts';
+import type { PipelineRecord } from '../../../forge/execute.ts';
+import type { JobStateReader, ObservedJob } from '../../../harness/types.ts';
+import { isForgeJobId } from '../../../forge/format.ts';
 // Cross-surface import, and deliberately so. The mod ships as a STANDALONE plugin
 // directory — it cannot reach outside its own folder — so it has to own any
 // constant the channel also needs. One owner, two importers, no drift. The same
@@ -41,32 +71,77 @@ import type { ObservedJob } from '../../../harness/types.ts';
 import { STALL_GRACE_MS } from '../../mod/hooks/stale.ts';
 import type { WatchableJob, WatchStatus } from './policy.ts';
 
-const READER = new AgyStaffReader();
+/** Our own jobs directory. Read first, so it claims ids before interop sees them. */
+const OWN_JOBS_DIR = ['.agent-smith', 'jobs'];
 
-/** Jobs live at `<repo>/.agy-staff/jobs/`. */
-const JOBS_DIR = ['.agy-staff', 'jobs'];
+/** agy-staff's jobs directory, read second, for history. */
+const INTEROP_JOBS_DIR = ['.agy-staff', 'jobs'];
 
 /** One read of every job. Never throws; an unreadable directory yields []. */
 export async function readAll(cwd: string, now: number = Date.now()): Promise<WatchableJob[]> {
-  if (!(await existsSafe(path.join(cwd, ...JOBS_DIR)))) return [];
+  const claimed = new Set<string>();
+  const out: WatchableJob[] = [];
+
+  // Primary first. `discover` returns [] for a repo that has never spawned, which
+  // is the ordinary case and not an error — that is why the existsSafe pre-check
+  // below is a cost we only pay when we are going to read anyway.
+  await collect(new AgentSmithReader(), 'agent-smith', cwd, now, claimed, out, () => false);
+  await collect(new AgyStaffReader(), 'agy-staff', cwd, now, claimed, out, isForgeJobId);
+
+  // Pipeline acceptance happens after harness execution. Announce its own
+  // terminal transition so a failing check cannot be hidden by a green job.
+  const runs = path.join(cwd, '.agent-smith', 'pipelines');
+  for (const file of await readdirSafe(runs)) {
+    if (!file.endsWith('.json')) continue;
+    const run = await readJsonSafe<PipelineRecord>(path.join(runs, file));
+    if (!run || typeof run.runId !== 'string' || typeof run.pipeline !== 'string' ||
+        !Number.isFinite(run.startedAt) || (run.finishedAt !== null && !Number.isFinite(run.finishedAt)) ||
+        !['running', 'passed', 'partial', 'failed'].includes(run.status) ||
+        run.stageResults === null || typeof run.stageResults !== 'object') continue;
+    out.push({
+      id: run.runId, name: run.pipeline, role: 'pipeline',
+      status: run.status === 'running' ? 'running' : run.status === 'passed' ? 'succeeded' : 'failed',
+      lastEventAt: new Date(run.startedAt).toISOString(),
+      finishedAt: run.finishedAt === null ? null : new Date(run.finishedAt).toISOString(),
+      warned: run.status !== 'passed' && run.status !== 'running',
+      outcome: run.status === 'running' ? undefined : `Pipeline ${run.status}; ${Object.values(run.stageResults).filter(s => s && typeof s.stage === 'string').map(s => `${s.stage}: execution ${s.status}, acceptance ${s.acceptance ?? 'unchecked'}`).join('; ')}.`,
+    });
+  }
+
+  return out;
+}
+
+/** Read one source's jobs, skipping ids another source already claimed. */
+async function collect(
+  reader: JobStateReader,
+  source: string,
+  cwd: string,
+  now: number,
+  claimed: Set<string>,
+  out: WatchableJob[],
+  skip: (jobId: string) => boolean,
+): Promise<void> {
+  const dir = source === 'agent-smith' ? OWN_JOBS_DIR : INTEROP_JOBS_DIR;
+  if (!(await existsSafe(path.join(cwd, ...dir)))) return;
 
   let ids: string[];
   try {
-    ids = await READER.discover(cwd);
+    ids = await reader.discover(cwd);
   } catch {
-    return [];
+    return;
   }
 
-  const out: WatchableJob[] = [];
-  // Sequential, for the same reason the pane reads serially: agy-staff is
-  // rewriting these files right now, and a burst of parallel readers maximises
-  // the chance of catching one mid-write. safe-fs tolerates it either way, but
+  // Sequential, for the same reason the pane reads serially: these files are
+  // being rewritten right now, and a burst of parallel readers maximises the
+  // chance of catching one mid-write. safe-fs tolerates it either way, but
   // tolerating is not the same as not happening.
   for (const id of ids) {
-    const job = await readOne(cwd, id, now);
+    if (claimed.has(id)) continue;
+    if (skip(id)) continue;
+    claimed.add(id);
+    const job = await readOne(reader, cwd, id, now);
     if (job !== null) out.push(job);
   }
-  return out;
 }
 
 /**
@@ -76,25 +151,32 @@ export async function readAll(cwd: string, now: number = Date.now()): Promise<Wa
  * the provider payload, so it CANNOT accidentally start depending on it, and a
  * reader change cannot silently alter what gets pushed into someone's context.
  */
-async function readOne(cwd: string, jobId: string, now: number): Promise<WatchableJob | null> {
+async function readOne(
+  reader: JobStateReader,
+  cwd: string,
+  jobId: string,
+  now: number,
+): Promise<WatchableJob | null> {
   let observed: ObservedJob;
   try {
-    const raw = await READER.read(cwd, jobId);
+    const raw = await reader.read(cwd, jobId);
     if (raw === null) return null;
     observed = normalize(raw);
   } catch {
     return null;
   }
 
-  // `warned` covers both sources harness tracks: the status.json warnings flag
-  // and the progress.json warning strings. We only need the boolean, because the
-  // message we push says "with warnings" and nothing more.
-  const warned =
-    observed.warnings.some((w) => w.code === 'suspicious_success' || w.code === 'tool_error') ||
-    observed.warnings.length > 0;
+  // `warned` covers both sources harness tracks: a recorded failure reason and
+  // any warning strings the provider reported. We only need the boolean, because
+  // the message we push says "with warnings" and nothing more.
+  const warned = observed.warnings.length > 0;
 
   return {
     id: observed.jobId,
+    name: typeof observed.raw['name'] === 'string' ? observed.raw['name'] : undefined,
+    role: typeof observed.raw['role'] === 'string' ? observed.raw['role'] : observed.mode ?? undefined,
+    latestSummary: typeof observed.raw['latestSummary'] === 'string' ? observed.raw['latestSummary'] : null,
+    summarySource: observed.raw['summarySource'] === 'worker' ? 'worker' : null,
     status: toWatchStatus(observed, now),
     lastEventAt: observed.updatedAt,
     finishedAt: observed.finishedAt,

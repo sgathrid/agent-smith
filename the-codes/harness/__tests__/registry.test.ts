@@ -16,8 +16,9 @@ import {
   readObservedJob,
 } from "../registry.ts";
 
-test("both readers are registered under their provider names", () => {
-  assert.deepEqual(providerNames(), ["agy-staff", "claude-code"]);
+test("canonical and interoperability readers are registered", () => {
+  assert.deepEqual(providerNames(), ["agent-smith", "agy-staff", "claude-code"]);
+  assert.equal(getReader("agent-smith")?.provider, "agent-smith");
   assert.equal(getReader("agy-staff")?.provider, "agy-staff");
   assert.equal(getReader("claude-code")?.provider, "claude-code");
 });

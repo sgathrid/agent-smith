@@ -95,3 +95,26 @@ budget while degrading as budget grows ([2406.06461](https://arxiv.org/abs/2406.
 3. **Empty output plus warnings is not success.** Distinguish *finished*,
    *finished with warnings*, and *could not act*.
 4. **Stop at ambiguity.** Flag it in `## Notes`; do not invent scope.
+## Permissions
+
+Workers run restricted by default in both the CLI and MCP. Reviewers may run
+commands and checks where their harness policy allows them. Role instructions
+alone do not enforce permissions.
+
+The caller must explicitly set `--unrestricted` (CLI) or `unrestricted: true`
+(MCP) to request bypassing harness approvals. This does not inherit Claude's
+permission policy; each external harness owns its own sandbox and permissions.
+
+Headless harnesses can deny actions they cannot ask a human to approve. Record
+those denials as failures and explain the blocked action in the report.
+
+---
+
+## The deny-detection rule
+
+agy soft-denies a tool call in headless mode and still exits **0**, with an
+empty `response` and a `denied_actions` list. A job in that state did nothing.
+
+**Record it as FAILED, never as clean success.** Absence of output is not
+evidence of completion. This matters most during agent-driven testing, where
+restricted mode is the default and every job can hit it.

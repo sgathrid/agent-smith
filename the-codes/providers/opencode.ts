@@ -96,7 +96,7 @@ import {
   writeArgv,
   writeResultFile,
   writeStateDir,
-} from './ndjson.js';
+} from './ndjson.ts';
 import type {
   ActivityRef,
   ActivityStatus,
@@ -107,9 +107,25 @@ import type {
   SpawnSpec,
   TokenUsage,
   WorkerHandle,
-} from './types.js';
+} from './types.ts';
+import type { ListModelsOptions, ModelCatalog, ModelInfo, SandboxInfo } from './types.ts';
+import { DEFAULT_DISCOVERY_TIMEOUT_MS, errMessage, runCapture } from './discovery.ts';
+import type { RunFn } from './discovery.ts';
+
 
 export const OPENCODE_BINARY = process.env['AGENT_SMITH_OPENCODE_BIN'] ?? 'opencode';
+
+/** Sandbox flags for opencode. Shared by buildArgv and describeSandbox. */
+export function sandboxPlan(spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly'>): SandboxInfo {
+  if (spec.unrestricted) {
+    return { sandbox: 'opencode --auto (approve all non-denied permissions)', flags: ['--auto'], readOnlyEnforced: false };
+  }
+  return {
+    sandbox: "opencode default permissions (agent's configured rules; no CLI flag to restrict or enforce read-only)",
+    flags: [],
+    readOnlyEnforced: false,
+  };
+}
 
 /**
  * Build the exact argv for one opencode worker.
@@ -138,14 +154,10 @@ export function buildArgv(spec: SpawnSpec): string[] {
   if (spec.model !== undefined && spec.model !== '') {
     argv.push('--model', withEffortVariant(spec.model, spec.effort));
   } else if (spec.effort !== undefined && spec.effort !== '') {
-    // No model to hang the variant off. There is no --variant-only mode we
-    // verified, so we drop the effort rather than emit a malformed flag.
-    // Surfaced in the README as an unsupported combination.
+    throw new Error('opencode effort requires an explicit provider/model so its variant can be applied');
   }
 
-  if (spec.unrestricted) {
-    argv.push('--auto');
-  }
+  argv.push(...sandboxPlan(spec).flags);
 
   // --session both continues an existing session and creates it if absent,
   // which is exactly the semantics SpawnSpec.conversation needs.
@@ -561,6 +573,43 @@ function buildResult(args: {
 // Provider
 // ---------------------------------------------------------------------------
 
+/** Parse `opencode models` lines (`provider/model`, optionally `#variant` is not expected). */
+export function parseOpencodeModels(stdout: string): ModelInfo[] {
+  const seen = new Set<string>();
+  const out: ModelInfo[] = [];
+  for (const raw of stdout.split(/\r?\n/)) {
+    const id = raw.trim().split(/\s+/)[0] ?? '';
+    // Accept only provider/model-looking tokens; skip banners and noise.
+    if (!/^[A-Za-z0-9_.-]+\/[^\s]+$/.test(id) || seen.has(id)) continue;
+    seen.add(id);
+    out.push({ id, label: id, efforts: [] });
+  }
+  return out;
+}
+
+/** Lazy, never throws. verified:false — the output format is unconfirmed. */
+export async function listOpencodeModels(run: RunFn, options?: ListModelsOptions): Promise<ModelCatalog> {
+  const base: ModelCatalog = {
+    provider: 'opencode',
+    models: [],
+    defaultSource: 'unknown',
+    source: 'live',
+    stale: false,
+    verified: false,
+  };
+  try {
+    const r = await run(OPENCODE_BINARY, ['models'], options?.timeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS);
+    const models = parseOpencodeModels(r.stdout);
+    if (models.length > 0) return { ...base, models };
+    return {
+      ...base,
+      error: r.error ?? '`opencode models` printed no recognizable models (output format unverified; pass an explicit provider/model)',
+    };
+  } catch (e) {
+    return { ...base, error: errMessage(e) };
+  }
+}
+
 export const opencodeProvider: Provider = {
   name: 'opencode',
 
@@ -571,6 +620,10 @@ export const opencodeProvider: Provider = {
       return false;
     }
   },
+
+  describeSandbox: (spec) => sandboxPlan(spec),
+
+  listModels: (options) => listOpencodeModels(runCapture, options),
 
   async spawn(spec: SpawnSpec): Promise<WorkerHandle> {
     const jobId = spec.jobId ?? newJobId();

@@ -14,13 +14,15 @@
  * WHAT IS HERE AND WHAT IS NOT
  * ────────────────────────────
  * NOT here, because ./format.ts already owns it and both surfaces must agree:
- *   pickGlyph · pickColor · isTerminal · elapsed · elapsedCell · toolCountCell
- *   · ellipsis · oneLine · describeTool · describeActivity · formatJobLine
- * Those are re-exported from the bottom of this file so the band's render code
- * has ONE import site for "how a job looks" and cannot drift from the pane's.
+ *   pickGlyph · pickColor · isTerminal · isRecessive · elapsed · elapsedCell
+ *   · fitCell · jobLabel · jobDetail · describeTool · describeActivity
+ *   · formatJobLine · formatJobRow
+ * formatJobRow is the band AND the pane's row, from one function with one set of
+ * cells. That is deliberate: two formatters for the same visual object is how
+ * the band and the pane stop agreeing about what a job looks like.
  *
  * HERE, because they are band-specific and the pane has no use for them:
- *   noColor · isShown · rowBudget · reconcile · buildLine · LINGER_MS
+ *   noColor · isShown · rowBudget · reconcile · LINGER_MS
  *
  * THE RULES THIS FILE ENCODES (agent-configs/shared/TERMINAL-UI.md)
  * ───────────────────────────────────────────────────────────────────
@@ -35,17 +37,18 @@
  */
 
 import {
-  ELAPSED_WIDTH,
+  bandColumns,
   elapsedCell,
-  ellipsis,
+  formatJobRow,
   isTerminal,
   pickColor,
   pickGlyph,
+  type RowOptions,
 } from './format.ts';
-import type { RadarJob, RadarStatus } from '../types/index.d.ts';
+import type { RadarJob } from '../types/index.d.ts';
 
-export { elapsedCell, isTerminal, pickColor, pickGlyph, ellipsis } from './format.ts';
-export { formatJobLine } from './format.ts';
+export { elapsedCell, isTerminal, pickColor, pickGlyph } from './format.ts';
+export { fitCell, formatJobLine, formatJobRow, paneColumns } from './format.ts';
 
 /* ────────────────────────────────────────────────────────────────────────────
  * TIMING (TERMINAL-UI.md L147-162)
@@ -115,86 +118,40 @@ export function noColor(env: {
 /* ────────────────────────────────────────────────────────────────────────────
  * THE LINE
  * ────────────────────────────────────────────────────────────────────────────
- * Shape, in TERMINAL-UI.md's own hierarchy order (L41-46):
+ * The band row is the PANE row with the tool count switched off and a fixed
+ * budget, and both come out of format.ts's `formatJobRow`. That is the whole
+ * reason this section is short: the row used to be built here, separately, with
+ * its own field order and its own head/tail split, and the two surfaces drifted.
  *
- *   identity → liveness (clock, tools) → activity, with elapsed LAST.
+ *   running : ` ◌ the output gate core              running tests  28m03s`
+ *   needs   : ` ⚠ close the registration leaks       needs you  14m48s`
+ *   done    : ` ✓ show the doctor each column        finished    1m15s`
+ *   failed  : ` ✗ registration uses the column       failed ∙ tool error  4m36s`
  *
- *   running : ` ● implement-musm82da  341 tools · cargo test --workspace 12m04s`
- *   done    : ` ✓ research-muroabc finished · 8 tools 48s`
- *   failed  : ` ✗ implement-mursjrt2 failed · agy_error 43m48s`
- *   canceled: ` · implement-musledug canceled 01m15s`
- *   unknown : ` ? implement-foo no state yet 02m04s`
+ * WHAT THE BAND DOES NOT SHOW, and why each is right:
  *
- * THE ONE PLACE THE BAND AND THE PANE DISAGREE, ON PURPOSE
- * ────────────────────────────────────────────────────────
- * format.ts's `formatJobLine` puts the clock SECOND and relies on
- * `ELAPSED_WIDTH` right-alignment to keep the columns steady. That is correct
- * for a pane, whose rows are compared against each other in a list.
+ *   the job id      30 columns of which 9 are a constant mode and 9 a UUID
+ *                   fragment. The task is the identity; the id is in the pane.
+ *   the mode        `implement` is 100% of a 20-job corpus. A column whose every
+ *                   value is the same value is not a column.
+ *   the tool count  TERMINAL-UI.md §Hierarchy puts counts outside a glance row,
+ *                   and this is the glance surface. It survives in the PANE,
+ *                   where it is a liveness signal on a running job.
+ *   the raw command `cargo tree -p renyi-mcp -e features -i` is precise and
+ *                   unreadable. The band says `running tests`.
  *
- * The band puts it LAST, and the reason is that TERMINAL-UI.md L129-132 is
- * about a property the band has and the pane does not: the band's clock is the
- * ONLY thing that changes between two renders of an otherwise identical line, so
- * a ticking field in the middle of it drags the activity text sideways every
- * second. In a pane that never happens (nothing redraws a pane row just because
- * time passed) and the fixed-width cell is the better answer there.
+ * WHAT THE BAND STILL SHOWS: task, state, elapsed. That is the whole contract,
+ * and the budget is chosen so a band row reads completely at 80 columns.
  *
- * Both are 6 columns wide, so the two surfaces still agree on how much room the
- * clock takes. They differ in ORDER only. See README.md §Deviation.
+ * THE BAND/PANE ORDERING DEVIATION IS GONE. It used to be that the band put the
+ * clock last and the pane put it second. Both now put it last, because
+ * TERMINAL-UI.md's rule is about a property the band has — the ticking field
+ * drags whatever follows it sideways — and the pane has no reason to violate a
+ * rule that costs it nothing. See format.ts's header comment.
  */
 
-/** One assembled line: the two Text segments plus the exact plain string. */
-export interface BandLine {
-  /** First segment, drawn in the accent and (for running) bold. */
-  readonly head: string;
-  /** Second segment, drawn `dimColor`. Ends with the elapsed time. */
-  readonly tail: string;
-  /** `head + tail`: exactly what the terminal shows, for tests and width work. */
-  readonly plain: string;
-  readonly glyph: string;
-  /** null means "pass no colour prop at all" — NO_COLOR, canceled, unknown. */
-  readonly accent: 'yellow' | 'green' | 'red' | 'cyan' | undefined;
-  readonly bold: boolean;
-}
-
-/** ` · ` — one column each. Part of the tail's budget. */
-const SEP = ' · ';
-
-/** Only running and attention are bold: the states that are still in flux. */
-function bold(status: RadarStatus): boolean {
-  return status === 'running' || status === 'attention';
-}
-
-/**
- * The outcome word. Null when the job is live and there is nothing to report.
- *
- * `warnings: true` on a `succeeded` job becomes words ("finished, warnings"),
- * not a different glyph or a different colour. Two reasons. harness/normalize.ts
- * is explicit that a non-empty result with a warnings flag stays `succeeded`, so
- * a colour change would contradict the type contract; and TERMINAL-UI.md L85-87
- * reserves red for real failures, and a job that produced a full report is not
- * one.
- */
-function verdict(job: RadarJob): string | null {
-  switch (job.status) {
-    case 'running':
-    case 'attention':
-      return null;
-    case 'succeeded':
-      return job.warnings.length > 0 ? 'finished, warnings' : 'finished';
-    case 'failed': {
-      // The first warning code is the useful one and it is a stable string,
-      // chosen by harness/normalize.ts (suspicious_success, empty_output,
-      // tool_error, ...). Its MESSAGE is prose and is deliberately not used
-      // here: TERMINAL-UI.md L52-54 keeps sentences off a band line.
-      const code = job.warnings[0]?.code;
-      return code === undefined || code === '' ? 'failed' : `failed · ${code.replace(/_/g, ' ')}`;
-    }
-    case 'canceled':
-      return 'canceled';
-    case 'unknown':
-      return 'no state yet';
-  }
-}
+/** One assembled line: the Text segments plus the exact plain string. */
+export type BandLine = import('./format.ts').JobRow;
 
 /**
  * Assemble one band line.
@@ -211,41 +168,12 @@ export function buildLine(
   now: number,
   options: { readonly colour?: boolean } = {},
 ): BandLine {
+  const row = formatJobRow(job, { now, ...bandColumns() } satisfies RowOptions);
   const colour = options.colour !== false;
-  const glyph = pickGlyph(job.status);
-  const accent = colour ? pickColor(job.status) : undefined;
-  const isBold = bold(job.status);
-
-  // L48-55: identity first, and it must survive the first 40 columns. Nothing
-  // precedes the id, because the id is the one field that cannot be dropped.
-  const head = ` ${glyph} ${job.id} `;
-
-  const parts: string[] = [];
-  const say = verdict(job);
-  if (say !== null) parts.push(say);
-
-  // Terse activity, truncated at the source (TERMINAL-UI.md L195-196). Only for
-  // live jobs: what a finished job was last doing is not news. It goes BEFORE the
-  // tool count so the quantity the eye scans for sits next to the clock.
-  if (!isTerminal(job.status) && job.activity !== '') {
-    parts.push(ellipsis(job.activity, 40));
-  }
-
-  // Tool count is a real quantity counted from events.jsonl, and it is OMITTED
-  // entirely when null: agy-staff deletes events.jsonl on a warning-free success
-  // (HAZARD A), so for a cleanly finished job there is genuinely no count on disk.
-  // Printing `0 tools` is a fabrication and `? tools` implies we looked and failed.
-  if (job.toolCount !== null) parts.push(`${job.toolCount} tools`);
-
-  // Elapsed LAST (L129-132), always present, always ELAPSED_WIDTH columns. A job
-  // with no known start gets a BLANK cell rather than `0s`: harness/normalize.ts
-  // refuses to invent a start time and neither do we, and a confident `0s` about
-  // a job that has been working for half an hour is a lie.
-  const span = job.startedAt === null ? null : (job.endedAt ?? now) - job.startedAt;
-  const clock = span === null ? '' : elapsedCell(span);
-
-  const tail = parts.length > 0 ? `${parts.join(SEP)}${SEP}${clock}` : clock;
-  return { head, tail, plain: `${head}${tail}`, glyph, accent, bold: isBold };
+  return {
+    ...row,
+    accent: colour ? row.accent : undefined,
+  };
 }
 
 /* ────────────────────────────────────────────────────────────────────────────
@@ -299,7 +227,7 @@ export function rowBudget(shown: readonly RadarJob[], maxRows?: number): BandBud
 
 /** The overflow line. Dim, and it names the command that opens the rest. */
 export function overflowLine(hidden: number): string {
-  return `   +${hidden} more · /agent-smith`;
+  return `   +${hidden} more ∙ /forge`;
 }
 
 /**
@@ -330,6 +258,15 @@ export function overflowLine(hidden: number): string {
  */
 export function reconcile(previous: RadarJob | undefined, next: RadarJob): RadarJob {
   if (previous === undefined) return next;
+
+  if (
+    isTerminal(previous.status) && previous.status === next.status &&
+    previous.endedAt !== null && next.endedAt !== null && next.endedAt > previous.endedAt
+  ) {
+    // A terminal row whose end was inferred ("now") on each read would otherwise
+    // linger forever; the first instant we saw it finish is the end.
+    return { ...next, endedAt: previous.endedAt };
+  }
 
   if (isTerminal(previous.status) && !isTerminal(next.status)) {
     // Rule (b): a terminal row never un-finishes on weaker evidence.

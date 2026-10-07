@@ -46,6 +46,12 @@ export type WatchStatus = 'running' | 'succeeded' | 'failed' | 'canceled' | 'att
 /** Everything the policy needs to know about one job. No I/O, no types from core. */
 export interface WatchableJob {
   readonly id: string;
+  readonly name?: string;
+  readonly role?: string;
+  readonly latestSummary?: string | null;
+  readonly summarySource?: 'worker' | null;
+  /** Runtime-owned outcome, separate from worker-authored prose. */
+  readonly outcome?: string;
   readonly status: WatchStatus;
   /** ISO-8601 of the last evidence of real work. Null ⇒ we have no evidence. */
   readonly lastEventAt: string | null;
@@ -249,12 +255,16 @@ export function buildBatch(candidates: readonly Candidate[], now: number): Batch
   // Failures are named even in a batch. "4 failed" does not tell Claude which
   // four, and the whole value of the channel is that Claude can act without the
   // user retyping a job id. Names cost ~4 tokens each; four of them is worth it.
-  const named = (byKind.get('failed') ?? []).map((j) => j.id).join(', ');
+  const named = (byKind.get('failed') ?? []).map((j) => j.name ? `${j.name} (${j.id})` : j.id).join(', ');
 
   const content =
     `agy: ${clauses.join(', ')}` +
     (failedCount > 0 ? ` (${named})` : '') +
-    '. /agy-radar to inspect.';
+    (pushable.some(c => c.job.name) ? '. /forge to inspect.' : '. /agy-radar to inspect.') + pushable.filter(c => c.job.name).slice(0, 3).map(c => {
+      const job = c.job;
+      const evidence = job.outcome ?? (job.summarySource === 'worker' ? job.latestSummary : null);
+      return evidence ? ` ${job.name}: ${job.outcome ? 'Runtime outcome' : 'Worker output'}: ${evidence.replace(/\s+/g, ' ').slice(0, 250)}` : '';
+    }).join('');
 
   return { content, meta: metaFor('failed', metaJobs), keys };
 }
@@ -281,6 +291,12 @@ const PLURAL: Record<PushKind, string> = {
  * channel's job is to make Claude aware, not to make Claude do the work.
  */
 function renderOne(kind: PushKind, job: WatchableJob): string {
+  if (job.name) {
+    const state = kind === 'finished' ? 'completed execution' : kind === 'attention' ? 'needs attention' : kind;
+    const summary = job.summarySource === 'worker' && job.latestSummary
+      ? ` Worker output: ${job.latestSummary.replace(/\s+/g, ' ').slice(0, 600)}` : '';
+    return `${job.name}${job.role ? ` (${job.role})` : ''} ${state}. ID ${job.id}.${job.outcome ? ` Runtime outcome: ${job.outcome.slice(0, 600)}` : ''}${summary} /forge or status to inspect.`;
+  }
   const id = job.id;
   const dur = durationWords(job.finishedAt, job.lastEventAt);
 

@@ -1,7 +1,7 @@
 {
   "name": "agent-smith",
   "version": "0.1.0",
-  "description": "One live line above the prompt per agy/Codex/OpenCode job: status, elapsed, tool count, what it is doing. The /radar command opens a browsable pane.",
+  "description": "Native Claude Code task-list projection and a live progress band for Agent Smith workers. The /forge command opens the job pane.",
   "author": {
     "name": "Agent Smith"
   },

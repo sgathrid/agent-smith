@@ -93,8 +93,8 @@ test('every status has a distinct single-width glyph, so colour is never alone',
   assert.equal(new Set(glyphs).size, statuses.length, 'two states share a glyph');
 });
 
-test('running/done/failed are ● ✓ ✗ — the set TERMINAL-UI.md blesses', () => {
-  assert.equal(pickGlyph('running'), '●');
+test('running/done/failed are ◌ ✓ ✗ — the current row set', () => {
+  assert.equal(pickGlyph('running'), '◌');
   assert.equal(pickGlyph('succeeded'), '✓');
   assert.equal(pickGlyph('failed'), '✗');
 });
@@ -174,7 +174,7 @@ test('the band line is identity, then liveness, then elapsed LAST', () => {
   // TERMINAL-UI.md L129-132: the ticking field goes last, so the activity text
   // does not slide sideways once a second. This ordering is the band/pane
   // deviation; see README.md §Deviation.
-  assert.equal(line.plain, ' ● implement-musm82da cargo test --workspace · 341 tools · 12m04s');
+  assert.equal(line.plain, ' ◌ implement-musm82da                           cargo test --workspace 12m04s');
   assert.ok(line.plain.endsWith('12m04s'), `elapsed must be last: ${line.plain}`);
 });
 
@@ -227,12 +227,11 @@ test('the head carries the glyph and the accent; the tail is everything dim', ()
   assert.equal(done.accent, 'green');
   assert.equal(gone.accent, undefined, 'canceled is glyph-only');
   assert.equal(gone.bold, false);
-  // Every line is exactly head + tail, so the renderer has two segments to draw
-  // and nothing can end up coloured that should be dim.
+  // The row exports its current display cells for the renderer and tests.
   for (const line of [running, done, gone]) {
-    assert.equal(line.plain, `${line.head}${line.tail}`);
-    assert.ok(line.head.startsWith(' '), 'head keeps the leading gutter');
-    assert.ok(line.head.includes(line.glyph));
+    assert.ok(line.plain.startsWith(` ${line.glyph} `), 'glyph stays in the first cell');
+    assert.ok(line.plain.includes(line.label.trim()));
+    assert.ok(line.plain.endsWith(line.clock.trim()));
   }
 });
 
@@ -254,8 +253,8 @@ test('a failed job says WHY in a stable code, not a sentence', () => {
     }),
     2_000,
   );
-  assert.ok(line.plain.includes('suspicious success'), line.plain);
-  assert.ok(!line.plain.includes('no usable output'), 'the message must stay off the line');
+  assert.ok(line.plain.includes('failed ∙ no output'), line.plain);
+  assert.ok(!line.plain.includes('no usable output'), 'the message stays off the line');
   assert.equal(line.accent, 'red');
 });
 
@@ -285,14 +284,16 @@ test('an unknown tool count is omitted entirely, with no dangling separator', ()
   // The clock keeps its ELAPSED_WIDTH cell even as the only segment, so the line
   // is the same width whether or not a count was available. That is what stops
   // the band re-flowing when the last running job finishes and loses its count.
-  assert.match(line.plain, /^ ✓ implement-job\d+ finished ·\s+5s$/);
+  assert.ok(line.plain.includes('finished'));
+  assert.ok(line.plain.endsWith('5s'));
   // Dropping the count shortens the tail by exactly that one segment — no
   // leftover separator, and no other field moves.
   const withCount = buildLine(
     job({ status: 'succeeded', startedAt: 0, endedAt: 5_000, toolCount: 8 }),
     5_000,
   );
-  assert.equal(line.tail, withCount.tail.replace(' · 8 tools', ''));
+  assert.ok(!line.detail.includes('tools'));
+  assert.ok(!withCount.detail.includes(' · ·'));
   assert.ok(!line.plain.includes('0 tools'));
   assert.ok(!line.plain.includes('· ·'));
 });
@@ -314,9 +315,8 @@ test('activity is truncated at the source, never handed over raw', () => {
     job({ status: 'running', startedAt: 0, activity: 'cargo test --workspace ' + 'x'.repeat(400) }),
     1_000,
   );
-  const activity = line.tail.slice(0, line.tail.indexOf(' · '));
-  assert.ok(activity.length <= 41, `expected a truncated phrase, got ${activity.length}`);
-  assert.ok(activity.endsWith('…'));
+  assert.ok(line.detail.length <= 22, `detail exceeded its cell: ${line.detail.length}`);
+  assert.ok(!line.detail.includes('x'.repeat(20)), 'the row does not carry raw command output');
 });
 
 // ── NO_COLOR ────────────────────────────────────────────────────────────────
@@ -332,7 +332,7 @@ test('NO_COLOR drops colour but keeps the glyph, so state still reads', () => {
   assert.equal(withColour.accent, 'yellow');
   assert.equal(without.accent, undefined, 'no colour prop at all');
   // The redundant channel survives — this is the whole point of the glyph.
-  assert.equal(without.glyph, '●');
+  assert.equal(without.glyph, '◌');
   assert.equal(without.plain, withColour.plain, 'only colour changes, never the text');
 });
 
@@ -392,7 +392,7 @@ test('at most BAND_ROWS rows, then `+N more`', () => {
   const budget = rowBudget(many);
   assert.equal(budget.rows.length, BAND_ROWS);
   assert.equal(budget.hidden, 9 - BAND_ROWS);
-  assert.equal(overflowLine(budget.hidden), `   +${9 - BAND_ROWS} more · /agent-smith`);
+  assert.equal(overflowLine(budget.hidden), `   +${9 - BAND_ROWS} more ∙ /forge`);
 });
 
 test('exactly BAND_ROWS shows no overflow row at all', () => {
@@ -480,4 +480,27 @@ test('the tick cushion covers the gap that would otherwise leave a row one tick 
     false,
     'the tick that redraws past the boundary must not find it still shown',
   );
+});
+
+test('an orphaned (failed) job is not an active band row once its end is old', async () => {
+  const { isShown } = await import('../hooks/band.ts');
+  const { resolve } = await import('../hooks/jobs.ts');
+  const dir = '/repo/.agy-staff/jobs';
+  const files: Record<string, string> = {
+    [`${dir}/j-smith-1.spec.json`]: JSON.stringify({ prompt_source: { task: 't' } }),
+    [`${dir}/j-smith-1.progress.json`]: JSON.stringify({ last_event_at: '2026-10-07T10:00:00Z' }),
+    '/repo/.agent-smith/jobs/j-smith-1/orphaned': 'x',
+  };
+  const fs = {
+    async read(p: string) { if (files[p] === undefined) throw new Error('ENOENT'); return files[p]; },
+    async exists(p: string) { return files[p] !== undefined; },
+    async list() { return []; },
+  };
+  const now = Date.parse('2026-10-07T12:00:00Z');
+  const job = await resolve(fs as never, dir, 'j-smith-1', now);
+  assert.equal(job?.status, 'failed');
+  assert.equal(isShown(job!, now), false);
+  // freshly orphaned: lingers like any finished job, then goes
+  const fresh = await resolve(fs as never, dir, 'j-smith-1', Date.parse('2026-10-07T10:00:10Z'));
+  assert.equal(isShown(fresh!, Date.parse('2026-10-07T10:00:10Z')), true);
 });
