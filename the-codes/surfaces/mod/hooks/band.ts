@@ -59,8 +59,12 @@ export { fitCell, formatJobLine, formatJobRow, paneColumns } from './format.ts';
  * 1 Hz is exact rather than merely frequent.
  */
 
-/** How long a finished job stays in the band. TERMINAL-UI.md L150, both mods. */
-export const LINGER_MS = 30_000;
+/**
+ * How long a finished job stays in the band (and in the host task list). Shorter
+ * than TERMINAL-UI.md's 30 s on purpose: the completion hook and `/forge` already
+ * carry the result, so a lingering row only clutters the prompt.
+ */
+export const LINGER_MS = 10_000;
 
 /** Rows the band draws before `+N more`. TERMINAL-UI.md L151. */
 export const BAND_ROWS = 4;
@@ -192,7 +196,7 @@ export function buildLine(
  * NOT from when we first noticed. That distinction is load-bearing against the
  * real corpus: `/Users/gathrid/Repos/renyi/.agy-staff/jobs` holds 20 jobs
  * finished hours ago, and a band that showed four of them at session start would
- * be asserting that work is in flight when it is not. The 30 s therefore also
+ * be asserting that work is in flight when it is not. The linger therefore also
  * serves as the honest bound on "I missed the finish, and that is fine".
  */
 export function isShown(job: RadarJob, now: number): boolean {

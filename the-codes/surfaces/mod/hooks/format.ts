@@ -386,7 +386,7 @@ function reason(code: string): string {
       return 'no output';
     // agy reported ERROR or a non-zero exit.
     case 'tool_error':
-      return 'agy error';
+      return 'worker error';
     case 'canceled':
       return 'cancelled';
     case 'timeout':

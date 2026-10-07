@@ -502,6 +502,6 @@ test('an orphaned (failed) job is not an active band row once its end is old', a
   assert.equal(job?.status, 'failed');
   assert.equal(isShown(job!, now), false);
   // freshly orphaned: lingers like any finished job, then goes
-  const fresh = await resolve(fs as never, dir, 'j-smith-1', Date.parse('2026-10-07T10:00:10Z'));
-  assert.equal(isShown(fresh!, Date.parse('2026-10-07T10:00:10Z')), true);
+  const fresh = await resolve(fs as never, dir, 'j-smith-1', Date.parse('2026-10-07T10:00:05Z'));
+  assert.equal(isShown(fresh!, Date.parse('2026-10-07T10:00:05Z')), true);
 });

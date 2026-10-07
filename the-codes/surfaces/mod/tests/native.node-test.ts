@@ -75,6 +75,31 @@ test('native completion records real outcome and latest worker output without cr
   assert.deepEqual(calls, [], 'finished jobs without an existing native link must not flood TaskList');
 });
 
+test('a finished job native task is deleted after the close delay, once', async () => {
+  const calls: Array<Record<string, unknown>> = [];
+  const client: NativeTaskClient = {
+    async create() { return { result: { task: { id: 't1' } } }; },
+    async update(input) { calls.push(input); return { result: { success: true } }; },
+  };
+  const job = {
+    id: 'job-d', status: 'succeeded' as const, task: 'x', name: 'w', workerId: 'w', role: 'implement',
+    provider: 'codex', model: null, latestSummary: null, summarySource: null,
+  };
+  const linked = { 'job-d': { taskId: 't1', status: 'in_progress' as const, fingerprint: '' } };
+  const t0 = 1_000_000;
+  const done = await syncNativeTasks([job], linked, client, t0);
+  assert.equal(done['job-d']?.status, 'completed');
+  assert.equal(done['job-d']?.doneAt, t0);
+  const early = await syncNativeTasks([job], done, client, t0 + 9_999);
+  assert.equal(early['job-d']?.status, 'completed', 'still shown inside the delay');
+  const closed = await syncNativeTasks([job], early, client, t0 + 10_000);
+  assert.equal(closed['job-d']?.status, 'deleted');
+  assert.equal(calls.at(-1)?.status, 'deleted');
+  const n = calls.length;
+  await syncNativeTasks([job], closed, client, t0 + 60_000);
+  assert.equal(calls.length, n, 'a deleted task is never touched again');
+});
+
 test('an orphaned running job is projected as failed, not live', async () => {
   const base = '/repo/.agent-smith/jobs/job-o';
   const jobs = await readNativeJobs(fsFrom({

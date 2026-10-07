@@ -369,7 +369,7 @@ async function pollNativeTasks($: EngineInterface, repo: string): Promise<void> 
       create: (input) => $.tool.call({ tool: 'TaskCreate', ...input }),
       update: (input) => $.tool.call({ tool: 'TaskUpdate', ...input }),
     };
-    const next = await syncNativeTasks(jobs, previous, client);
+    const next = await syncNativeTasks(jobs, previous, client, await $.clock.now());
     if (JSON.stringify(previous) !== JSON.stringify(next)) {
       await update($, nativeTaskLinks, () => next);
     }

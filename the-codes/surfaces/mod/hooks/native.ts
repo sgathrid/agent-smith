@@ -25,7 +25,9 @@ export interface NativeJob {
 
 export interface NativeTaskLink {
   readonly taskId: string;
-  readonly status: 'in_progress' | 'completed';
+  readonly status: 'in_progress' | 'completed' | 'deleted';
+  /** When this job was first seen finished (epoch ms); starts the close delay. */
+  readonly doneAt?: number;
   /** Last description/status sent successfully; lets the poll avoid no-op writes. */
   readonly fingerprint: string;
 }
@@ -44,7 +46,7 @@ export interface NativeTaskClient {
     subject: string;
     description: string;
     activeForm?: string;
-    status: 'in_progress' | 'completed';
+    status: 'in_progress' | 'completed' | 'deleted';
   }): Promise<unknown>;
 }
 
@@ -172,7 +174,10 @@ function updateSucceeded(result: unknown): boolean {
   return output?.success === true;
 }
 
-function taskStatus(job: NativeJob): NativeTaskLink['status'] {
+/** How long a finished job's task stays in the host list before it is closed. */
+export const CLOSE_DELAY_MS = 10_000;
+
+function taskStatus(job: NativeJob): 'in_progress' | 'completed' {
   return job.status === 'running' || job.status === 'attention' ? 'in_progress' : 'completed';
 }
 
@@ -194,10 +199,12 @@ export async function syncNativeTasks(
   jobs: readonly NativeJob[],
   previous: NativeTaskLinks,
   client: NativeTaskClient,
+  now: number = Date.now(),
 ): Promise<NativeTaskLinks> {
   const next: NativeTaskLinks = { ...previous };
   for (const job of jobs) {
     const old = next[job.id];
+    if (old?.status === 'deleted') continue;
     const live = job.status === 'running' || job.status === 'attention';
     if (old === undefined && !live) continue;
 
@@ -229,6 +236,21 @@ export async function syncNativeTasks(
     }
 
     const link = next[job.id]!;
+    // A finished job's task is closed (deleted from the host list) CLOSE_DELAY_MS
+    // after we first see it finished, so the list does not fill with done work.
+    if (!live) {
+      const doneAt = link.doneAt ?? now;
+      if (now - doneAt >= CLOSE_DELAY_MS && link.status === 'completed') {
+        try {
+          const closed = await client.update({ taskId, subject, description, status: 'deleted' });
+          if (updateSucceeded(closed)) next[job.id] = { taskId, status: 'deleted', fingerprint: '', doneAt };
+        } catch {
+          // Retried on the next poll.
+        }
+        continue;
+      }
+      if (link.doneAt === undefined) next[job.id] = { ...link, doneAt };
+    }
     if (link.fingerprint === currentFingerprint) continue;
     try {
       const updated = await client.update({
@@ -238,7 +260,10 @@ export async function syncNativeTasks(
         ...(live ? { activeForm: activeForm(job) } : {}),
         status,
       });
-      if (updateSucceeded(updated)) next[job.id] = { taskId, status, fingerprint: currentFingerprint };
+      if (updateSucceeded(updated)) {
+        const prior = next[job.id];
+        next[job.id] = { taskId, status, fingerprint: currentFingerprint, ...(prior?.doneAt === undefined ? {} : { doneAt: prior.doneAt }) };
+      }
     } catch {
       // Retain the old fingerprint so a later poll retries the update.
     }
