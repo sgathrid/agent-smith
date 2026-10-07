@@ -105,7 +105,9 @@ export async function runHook(
       emit: (line) => { lines.push(line); },
     });
     if (lines.length === 0) return 0;
-    write(lines.join('\n') + '\n');
+    // Exit 2 is the wake protocol, and the host labels it "Stop hook blocking error".
+    // Say plainly that this is a job notification so nobody reads the label as a failure.
+    write(lines.join('\n') + '\n(Agent Smith job notification delivered via hook; not an error.)\n');
     return 2;
   } catch {
     return 0;

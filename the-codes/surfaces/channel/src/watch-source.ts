@@ -63,6 +63,7 @@ import { existsSafe, readdirSafe, readJsonSafe } from '../../../harness/safe-fs.
 import type { PipelineRecord } from '../../../forge/execute.ts';
 import type { JobStateReader, ObservedJob } from '../../../harness/types.ts';
 import { isForgeJobId } from '../../../forge/format.ts';
+import { readAcceptance } from '../../../forge/checks.ts';
 // Cross-surface import, and deliberately so. The mod ships as a STANDALONE plugin
 // directory — it cannot reach outside its own folder — so it has to own any
 // constant the channel also needs. One owner, two importers, no drift. The same
@@ -87,6 +88,22 @@ const terminalCache = new Map<string, WatchableJob>();
 /** Testing hook. */
 export function clearReadCache(): void {
   terminalCache.clear();
+}
+
+/**
+ * Acceptance checks run AFTER the job goes terminal, so for a moment a finished job
+ * carries a pending acceptance placeholder. Announcing it then reports `unchecked`
+ * and the real verdict lands unannounced. Hold the announcement while the
+ * placeholder is pending, but never longer than this: a crashed checker must not
+ * silence a finished job forever.
+ */
+export const ACCEPTANCE_HOLD_MS = 5 * 60_000;
+
+function acceptancePending(cwd: string, job: WatchableJob, now: number): boolean {
+  if (job.finishedAt === null) return false;
+  const finished = Date.parse(job.finishedAt);
+  if (Number.isFinite(finished) && now - finished > ACCEPTANCE_HOLD_MS) return false;
+  return (readAcceptance(cwd, job.id) as { pending?: boolean }).pending === true;
 }
 
 const isTerminal = (job: WatchableJob): boolean =>
@@ -186,6 +203,11 @@ async function collect(
     if (cached) { out.push(cached); continue; }
     const job = await readOne(reader, cwd, id, now);
     if (job === null) continue;
+    if (isTerminal(job) && acceptancePending(cwd, job, now)) {
+      // Not cached and not emitted: re-read next poll, once the verdict is written.
+      claimed.delete(id);
+      continue;
+    }
     if (isTerminal(job)) terminalCache.set(cacheKey(cwd, id), job);
     out.push(job);
   }

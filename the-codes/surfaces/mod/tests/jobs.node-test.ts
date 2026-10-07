@@ -439,8 +439,11 @@ test('the real corpus resolves: 20 jobs, none running, none unknown', async (t) 
   assert.ok(ids.length >= 20, `expected the real corpus, found ${ids.length} jobs`);
 
   const at = Date.parse('2026-10-03T18:00:00.000Z');
-  const jobs = await readAllJobs(fs, '/corpus', at);
-  assert.equal(jobs.length, ids.length, 'every discovered job must resolve');
+  // The corpus directory is shared with agent-smith's own mirrored jobs (`-smith-`
+  // ids), which have no agy worker-started line. This test is about the frozen
+  // agy-staff corpus only.
+  const jobs = (await readAllJobs(fs, '/corpus', at)).filter((j) => !j.id.includes('-smith-'));
+  assert.equal(jobs.length, ids.filter((id) => !id.includes('-smith-')).length, 'every discovered job must resolve');
 
   for (const job of jobs) {
     // Every real job in the corpus finished before `at`, so none may read as
@@ -467,7 +470,7 @@ test('the real corpus exercises the tool count and the activity clause', async (
     t.skip(`corpus not present at ${CORPUS}`);
     return;
   }
-  const jobs = await readAllJobs(fsFromCorpus(CORPUS, '/corpus'), '/corpus', Date.now());
+  const jobs = (await readAllJobs(fsFromCorpus(CORPUS, '/corpus'), '/corpus', Date.now())).filter((j) => !j.id.includes('-smith-'));
 
   // All 20 real jobs have events.jsonl (they all warned, so none were cleaned),
   // so all 20 must produce a real count and none may be null.
@@ -583,7 +586,7 @@ test('the tool history keeps DONE records only, and the newest N', async () => {
   assert.equal(history[1]?.output, 'passed');
 });
 
-test('tool history is capped at 20 and read from a real events.jsonl', async (t) => {
+test('tool history is capped at 200 and read from a real events.jsonl', async (t) => {
   const fs = fsFromCorpus(CORPUS, '/corpus');
   const id = 'implement-muro9n3j-56a13226';
   if (!fs.files.has(`${jobsDir('/corpus')}/${id}.events.jsonl`)) {
@@ -592,7 +595,7 @@ test('tool history is capped at 20 and read from a real events.jsonl', async (t)
   }
   const history = await readToolHistory(fs, '/corpus', id);
   assert.ok(history.length > 0, 'a real job has a real history');
-  assert.ok(history.length <= 20, `capped, got ${history.length}`);
+  assert.ok(history.length <= 200, `capped, got ${history.length}`);
   // And the count on the row agrees with the file, because both read the same
   // bytes now instead of one of them reading harness and the other reading disk.
   const job = await resolve(fs, jobsDir('/corpus'), id, Date.now());

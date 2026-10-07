@@ -151,12 +151,13 @@ test('codex sandbox: readOnly, unrestricted, default, resume, env override', () 
   }
 });
 
-test('agy/opencode/claude describeSandbox matches argv and never claims read-only', () => {
+test('agy/opencode/claude describeSandbox matches argv and only claims read-only when it enforces it', () => {
   for (const [p, build] of [[agyProvider, agyArgv], [opencodeProvider, opencodeArgv], [claudeProvider, claudeArgv]] as const) {
     for (const unrestricted of [false, true]) {
       const s = { unrestricted, readOnly: true };
       const info = p.describeSandbox!(s);
-      assert.equal(info.readOnlyEnforced, false);
+      // Only claude can enforce read-only (allowlist + write-tool denylist), and only when restricted.
+      assert.equal(info.readOnlyEnforced, p === claudeProvider && !unrestricted);
       const argv = build(spec(s));
       const at = info.flags.length === 0 ? 0 : argv.indexOf(info.flags[0]!);
       assert.ok(at >= 0, `${p.name} flags in argv`);

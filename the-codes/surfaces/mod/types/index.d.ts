@@ -98,6 +98,9 @@ export interface RadarJob {
   /** The task description, first line only. Never the whole prompt. */
   readonly task: string;
 
+  /** The full prompt sent to the worker. Detail view only; null elsewhere or on older jobs. */
+  readonly prompt?: string | null;
+
   /** Non-fatal signals, provider codes preserved. Empty means "nothing flagged". */
   readonly warnings: readonly { code: string; message: string }[];
 

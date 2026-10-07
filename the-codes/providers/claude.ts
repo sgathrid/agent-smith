@@ -150,6 +150,15 @@ export type ClaudePermissionMode =
  *   tool_result text), so a restricted worker does not silently pass; but
  *   read-only is NOT enforced: user allow rules may still permit writes.
  */
+/** Tools a read-only worker may use. Shell is limited to inspection commands. */
+export const READ_ONLY_ALLOWED: readonly string[] = [
+  'Read', 'Grep', 'Glob',
+  ...['cat', 'head', 'tail', 'wc', 'xxd', 'od', 'ls', 'file', 'stat', 'rg', 'grep', 'diff',
+    'git diff', 'git show', 'git log', 'git status', 'git blame'].map((c) => `Bash(${c}:*)`),
+];
+/** Tools a read-only worker may never use, even if user settings would allow them. */
+export const READ_ONLY_DENIED: readonly string[] = ['Edit', 'Write', 'NotebookEdit'];
+
 export function sandboxPlan(spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly'>): SandboxInfo {
   if (spec.unrestricted) {
     return {
@@ -159,6 +168,17 @@ export function sandboxPlan(spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly'>):
     };
   }
   const flags = ['--permission-mode', 'dontAsk', '--permission-prompts', 'none'];
+  if (spec.readOnly) {
+    // Read-only modes get an explicit allowlist (so a reviewer can inspect bytes
+    // and history instead of being denied) and an explicit write-tool denylist,
+    // which is what makes read-only enforced rather than merely requested.
+    flags.push('--allowedTools', ...READ_ONLY_ALLOWED, '--disallowedTools', ...READ_ONLY_DENIED);
+    return {
+      sandbox: 'claude dontAsk + read-only allowlist (writes disallowed; shell limited to inspection commands)',
+      flags,
+      readOnlyEnforced: true,
+    };
+  }
   return {
     sandbox: 'claude dontAsk (cannot prompt; non-allowed tools are denied and reported as denied)',
     flags,
@@ -533,7 +553,7 @@ function buildResult(args: {
     // NOTE: claude has no --print-timeout. This kill is entirely ours, which is
     // why we must never infer success from "it produced a lot of output".
     error = `exceeded the ${durationMs} ms budget and was killed (claude has no internal timeout, so this is our SIGTERM)`;
-  } else if (tx.deniedTools.length > 0) {
+  } else if (tx.deniedTools.length > 0 && !(tx.sawResult && !tx.sawErrorResult && exit.code === 0 && tx.finalText.trim() !== '')) {
     // Same discipline as agy. A moderator whose tools were denied has not
     // moderated anything, and claude may still report subtype "success".
     status = 'denied';
@@ -574,6 +594,12 @@ function buildResult(args: {
     stateDir,
   };
   if (error !== undefined) out.error = error;
+  // A report was delivered despite denied calls: the job succeeded, but the
+  // orchestrator must know some checks did not run (normalize.ts turns this
+  // into a warning).
+  if (status === 'success' && tx.deniedTools.length > 0) {
+    out.deniedActions = tx.deniedTools.map((id) => ({ action: 'tool', displayName: id }));
+  }
   if (tx.usage !== undefined) out.usage = tx.usage;
   const raw: Record<string, unknown> = {};
   if (tx.sessionId !== undefined) raw['sessionId'] = tx.sessionId;

@@ -236,11 +236,36 @@ export interface ForgeManifest {
    */
   readonly changedFiles?: readonly string[];
   readonly changedFilesTruncated?: boolean;
+  /**
+   * Paths that changed while this job ran but that none of this job's own tool
+   * calls mention: another job's or the operator's edits (or shell side effects).
+   * Present only when the job's tool inputs were captured.
+   */
+  readonly unattributedFiles?: readonly string[];
 }
 
 export interface GitBaseline {
   readonly head: string | null;
   readonly dirty: readonly string[];
+}
+
+/**
+ * Pure: split changed paths into those this job's own tool inputs mention (by full
+ * path or basename) and those it never touched. With no captured input there is
+ * nothing to attribute against, so everything stays attributed.
+ */
+export function attributeChanged(
+  files: readonly string[],
+  toolInputs: string,
+): { mine: string[]; other: string[] } {
+  if (toolInputs === '') return { mine: [...files], other: [] };
+  const mine: string[] = [];
+  const other: string[] = [];
+  for (const p of files) {
+    const base = p.slice(p.lastIndexOf('/') + 1);
+    (toolInputs.includes(p) || (base !== '' && toolInputs.includes(base)) ? mine : other).push(p);
+  }
+  return { mine, other };
 }
 
 /** Max entries kept in `changedFiles`. */
@@ -383,6 +408,8 @@ export interface StatusVerdict {
    */
   readonly suspicious: boolean;
   readonly reason: string | null;
+  /** A non-fatal caveat on a success (e.g. some tool calls were denied); surfaced as a warning. */
+  readonly note?: string | null;
 }
 
 /**
@@ -424,6 +451,17 @@ export function deriveStatus(d: StatusDerivation): StatusVerdict {
   }
 
   const denials = d.deniedActions ?? [];
+  // Denials the provider itself marked non-fatal (action 'tool': a delivered report
+  // plus denied calls, e.g. a read-only reviewer that wanted a shell) do not fail
+  // the job. agy's soft-denials carry other actions and keep failing below.
+  if (denials.length > 0 && d.ok === true && !looksEmpty(d.report) && denials.every((x) => x.action === 'tool')) {
+    return {
+      status: 'succeeded',
+      suspicious: false,
+      reason: null,
+      note: `${denials.length} tool call(s) were denied by the permission policy; the report was delivered but some checks may not have run.`,
+    };
+  }
   if (denials.length > 0) {
     const names = denials
       .map((x) => x.displayName ?? x.action)
@@ -470,6 +508,7 @@ export function deriveStatus(d: StatusDerivation): StatusVerdict {
 export function warningsFor(v: StatusVerdict, progress: ForgeProgress | null): string[] {
   const out: string[] = [];
   if (v.suspicious) out.push(v.reason ?? 'suspicious success');
+  if (v.note) out.push(v.note);
   for (const w of progress?.warnings ?? []) out.push(w);
   return out;
 }

@@ -40,6 +40,7 @@ import { appendLine, createMarker, writeAtomic, writeJsonAtomic } from './atomic
 import {
   FILES,
   PROGRESS_FLUSH_MS,
+  attributeChanged,
   diffChangedFiles,
   isForgeStatePath,
   SCHEMA_VERSION,
@@ -125,6 +126,9 @@ export class JobWriter {
   /** In-memory size:mtime signatures of baseline-dirty files, to detect further edits. */
   private baselineSigs = new Map<string, string>();
   private changed: { files: string[]; truncated: boolean } | null = null;
+  private unattributed: string[] = [];
+  /** Concatenated tool inputs of this job, used to attribute changed files to it. */
+  private toolInputs = '';
 
   constructor(options: JobWriterOptions) {
     this.repo = options.repo;
@@ -203,7 +207,7 @@ export class JobWriter {
 
     this.mirror.claim(this.jobId);
     this.writeManifest();
-    this.mirror.writeSpec(manifest);
+    this.mirror.writeSpec(manifest, input.prompt);
     this.flushProgress(this.manifest.createdAt);
     // Fire and forget: spawn never waits on git. Merged into the manifest when it lands.
     this.cwd = input.cwd;
@@ -238,7 +242,10 @@ export class JobWriter {
       const committed = base.head !== null && now.head !== null && base.head !== now.head
         ? await gitCommittedPaths(this.cwd, base.head, now.head)
         : [];
-      this.changed = diffChangedFiles(base, now.dirty, modified, committed);
+      const diff = diffChangedFiles(base, now.dirty, modified, committed);
+      const split = attributeChanged(diff.files, this.toolInputs);
+      this.changed = { files: split.mine, truncated: diff.truncated };
+      this.unattributed = split.other;
     } catch { /* best effort */ }
   }
 
@@ -284,6 +291,9 @@ export class JobWriter {
       // what keeps the pane's activity phrase readable on a finished job.
       const idx = this.recent.findIndex((a) => a.stepIndex === ref.stepIndex);
       const input = ref.input ?? (idx >= 0 ? this.recent[idx]?.input : undefined);
+      if (event.kind === 'activity-start' && ref.input !== undefined && this.toolInputs.length < TOOL_INPUTS_CAP) {
+        this.toolInputs += ref.input + '\n';
+      }
       const row: ForgeActivity = {
         stepIndex: ref.stepIndex,
         tool: ref.tool,
@@ -389,6 +399,7 @@ export class JobWriter {
       ...(this.changed === null
         ? {}
         : { changedFiles: this.changed.files, changedFilesTruncated: this.changed.truncated }),
+      ...(this.unattributed.length === 0 ? {} : { unattributedFiles: this.unattributed }),
     };
     this.manifest = manifest;
 
@@ -519,6 +530,7 @@ export class JobWriter {
 /* ── git baseline helpers ─────────────────────────────────────────────────── */
 
 const GIT_CAP_MS = 2_000;
+const TOOL_INPUTS_CAP = 200_000;
 const CHANGED_FILES_SIG_CAP = 500;
 
 function git(cwd: string, args: string[]): Promise<string> {

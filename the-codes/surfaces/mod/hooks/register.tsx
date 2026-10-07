@@ -179,7 +179,7 @@ const bandConfig = atom({ plugin: 'agent-smith', key: 'bandConfig' } as const, {
 const LIST_ROWS = 9;
 
 /** Tool calls shown in the detail pane's history. */
-const HISTORY_ROWS = 12;
+const HISTORY_ROWS = 60;
 
 // =============================================================================
 // § BAND — band author. See MERGE NOTE above.
@@ -748,15 +748,19 @@ function renderDetail(
         <Text dimColor>{`  ${elapsedCell(job.startedAt === null ? 0 : (job.endedAt ?? t) - job.startedAt)}`}</Text>
       </Text>
 
-      <Text dimColor wrap="truncate-end">
+      <Text dimColor wrap="wrap">
         {`${job.id}${job.workerId ? `  worker ${job.workerId}` : ''}${job.role ? `  ${job.role}` : ''}  ${detailSummary(job, t)}`}
       </Text>
 
-      {/* The task. prompt_source.task's first line only — the real tasks run to
-          60+ lines and the pane has no room, and the whole body is available in
-          the spec file if anyone needs it. */}
-      {job.task.length > 0 && (
-        <Text wrap="truncate-end">{oneLine(job.task, e.props.bodyColumns - 2)}</Text>
+      {/* The prompt, in full, like a native subagent's view. Older jobs carry
+          only the one-line title, so fall back to that rather than show nothing. */}
+      {job.prompt != null && job.prompt.trim() !== '' ? (
+        <Box flexDirection="column">
+          <Text bold wrap="truncate-end">Prompt</Text>
+          <Markdown text={job.prompt} />
+        </Box>
+      ) : (
+        job.task.length > 0 && <Text wrap="wrap">{job.task}</Text>
       )}
 
       {/* Current reasoning. Only for a live job: a finished job's last thought is
@@ -872,12 +876,12 @@ function ToolHistory({ entries, W }: { entries: readonly ToolEntry[]; W: Widgets
     <Box flexDirection="column">
       <Text bold wrap="truncate-end">{`Tools (last ${shown.length})`}</Text>
       {shown.map((entry, i) => (
-        <Text key={`t-${i}-${entry.tool}`} wrap="truncate-end">
+        <Text key={`t-${i}-${entry.tool}`} wrap="wrap">
           {/* One accent per line maximum, and red is reserved (TERMINAL-UI.md
               §Colour): the tool name is coloured, its output never is. */}
           <Text color={entry.state === 'error' ? 'red' : entry.state === 'active' ? 'blue' : 'cyan'} bold={entry.state === 'active'}>{`${entry.state === 'active' ? '▸ ' : entry.state === 'error' ? '✗ ' : ''}${oneLine(entry.tool, 60)} `}</Text>
-          <Text dimColor wrap="truncate-end">
-            {entry.output.length > 0 ? `${entry.label} ${SEP} ${oneLine(entry.output, 120)}` : entry.label}
+          <Text dimColor wrap="wrap">
+            {entry.output.length > 0 ? `${entry.label} ${SEP} ${oneLine(entry.output, 600)}` : entry.label}
           </Text>
         </Text>
       ))}

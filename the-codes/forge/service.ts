@@ -232,6 +232,7 @@ export interface JobDetail extends JobSummary {
    */
   readonly changedFiles?: readonly string[];
   readonly changedFilesTruncated?: boolean;
+  readonly unattributedFiles?: readonly string[];
 }
 
 export interface CancelResult {
@@ -810,6 +811,7 @@ export class ForgeService {
             ...(manifest.gitBaseline === undefined ? {} : { gitBaseline: manifest.gitBaseline }),
             ...(manifest.changedFiles === undefined ? {} : { changedFiles: manifest.changedFiles }),
             ...(manifest.changedFilesTruncated === undefined ? {} : { changedFilesTruncated: manifest.changedFilesTruncated }),
+            ...(manifest.unattributedFiles === undefined ? {} : { unattributedFiles: manifest.unattributedFiles }),
           }),
       cancellable: this.live.has(jobId),
     };

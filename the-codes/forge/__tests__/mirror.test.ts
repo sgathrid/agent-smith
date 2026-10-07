@@ -109,6 +109,14 @@ test('the spec is agy-staff-shaped and carries the ownership marker', () => {
   assert.equal(resolved.model, 'gemini-3.8-flash-high');
 });
 
+test('the spec carries the full prompt when given one, capped', () => {
+  const ps = (mirrorSpec(manifest(), 'line one\nline two') ['prompt_source']) as { prompt?: string };
+  assert.equal(ps.prompt, 'line one\nline two');
+  const big = (mirrorSpec(manifest(), 'x'.repeat(100_000))['prompt_source']) as { prompt: string };
+  assert.equal(big.prompt.length, 64_000);
+  assert.equal('prompt' in (mirrorSpec(manifest())['prompt_source'] as object), false);
+});
+
 test('the permission profile says out loud whether approvals were bypassed', () => {
   // This is the field an operator must never have to guess at. agy headless
   // soft-denies and reports success, so "was this job allowed to touch the

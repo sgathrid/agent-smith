@@ -175,7 +175,7 @@ interface Spec {
     workerId?: string | null;
     role?: string | null;
   };
-  prompt_source?: { kind?: string; task?: string };
+  prompt_source?: { kind?: string; task?: string; prompt?: string };
 }
 
 interface Activity {
@@ -522,6 +522,8 @@ export async function resolve(
     toolCount,
     activity,
     task: taskTitle(spec),
+    // The whole prompt is detail-view only, like the report: the band polls every job.
+    prompt: withReport && typeof spec?.prompt_source?.prompt === 'string' ? spec.prompt_source.prompt : null,
     warnings,
     report,
     reasoning,
@@ -721,7 +723,7 @@ export async function readToolHistory(fs: FsLike, repo: string, id: string): Pro
 }
 
 /** How many tool entries the history keeps. The pane's own cap is lower. */
-const HISTORY_KEEP = 20;
+const HISTORY_KEEP = 200;
 
 /** PURE: an events.jsonl body → the newest tool entries, oldest first. */
 export function toolHistoryFromEvents(text: string): ToolEntry[] {
@@ -759,7 +761,7 @@ export function toolHistoryFromEvents(text: string): ToolEntry[] {
       at: null,
       tool,
       label: Object.keys(params).length > 0 ? describeTool(tool, params) : (input !== '' ? (input === tool ? '' : input) : (prev?.label ?? describeTool(tool, params))),
-      output: output.slice(0, 400),
+      output: output.slice(0, 2_000),
       state: st === 'ERROR' ? 'error' : st === 'ACTIVE' ? 'active' : 'done',
     });
   }
@@ -767,7 +769,7 @@ export function toolHistoryFromEvents(text: string): ToolEntry[] {
 }
 
 /** PURE: an events.jsonl body → the newest assistant prose chunks, oldest first. */
-export function transcriptFromEvents(text: string, keep = 6): string[] {
+export function transcriptFromEvents(text: string, keep = 200): string[] {
   const out: string[] = [];
   for (const line of text.split('\n')) {
     if (!line.includes('"agent_text"')) continue;

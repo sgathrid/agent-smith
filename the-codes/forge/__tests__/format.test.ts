@@ -15,6 +15,7 @@ import {
   FILES,
   MIN_USEFUL_CHARS,
   SCHEMA_VERSION,
+  attributeChanged,
   deriveStatus,
   isForgeJobId,
   isForgeStatus,
@@ -129,6 +130,20 @@ test('THE TRAP: exit 0, SUCCESS, denied_actions, empty response ⇒ FAILED', () 
   assert.equal(v.suspicious, true);
   assert.match(v.reason ?? '', /RunCommand/);
   assert.match(v.reason ?? '', /NOT a clean success/);
+});
+
+test('a delivered report with non-fatal tool denials succeeds with a warning', () => {
+  const v = deriveStatus({
+    ok: true,
+    jobStatus: 'success',
+    deniedActions: [{ action: 'tool', displayName: 'toolu_1' }],
+    report: 'No defects found; could not check exact bytes.',
+  });
+  assert.equal(v.status, 'succeeded');
+  assert.equal(v.suspicious, false);
+  assert.match(v.note ?? '', /1 tool call\(s\) were denied/);
+  // Same denial with no report is still a failure.
+  assert.equal(deriveStatus({ ok: true, jobStatus: 'success', deniedActions: [{ action: 'tool' }], report: '' }).status, 'failed');
 });
 
 test('the paranoid net: SUCCESS, no denials reported, empty response ⇒ FAILED', () => {
@@ -279,4 +294,12 @@ test('isForgeStatus accepts exactly the four states and nothing else', () => {
 
 test('the on-disk schema is 1', () => {
   assert.equal(SCHEMA_VERSION, 1);
+});
+
+test('changed files are attributed to the job whose tool inputs mention them', () => {
+  const r = attributeChanged(['smoketest/a.txt', 'smoketest/b.txt'], '{"TargetFile":"/repo/smoketest/a.txt"}\n');
+  assert.deepEqual(r.mine, ['smoketest/a.txt']);
+  assert.deepEqual(r.other, ['smoketest/b.txt']);
+  // No captured input: nothing to attribute against, so nothing is disowned.
+  assert.deepEqual(attributeChanged(['x'], ''), { mine: ['x'], other: [] });
 });
