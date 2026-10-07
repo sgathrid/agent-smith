@@ -29,7 +29,7 @@ The mechanics worked. Both writers produced correct files, and the executable ch
 
 ## Status
 
-Items 1-6 below are implemented in this change. Item 7 (live-tail follow mode, scroll persistence, raw-versus-preamble toggle) is left as follow-up work.
+Items 1-7 below are implemented.
 
 | # | Fix |
 |---|-----|
@@ -38,6 +38,7 @@ Items 1-6 below are implemented in this change. Item 7 (live-tail follow mode, s
 | 3 | The watcher holds a terminal announcement while `acceptance.json` is `pending`, for at most 5 minutes. |
 | 4 | claude reports `readOnlyEnforced: true` when it applies the allowlist and denylist. Other providers still report `false`. |
 | 5 | Hook output ends with a line saying it is a job notification, not an error. The host's "Stop hook blocking error" label is the host's own and can't be changed from here. |
+| 7 | Pane: `f` toggles follow mode (a bounded live tail: newest 3 transcript chunks, 12 tool rows, prompt collapsed to 8 lines while running) against show-all. `p` shows the prompt as sent, with the mode preamble. The preamble is stored apart from the prompt, so the plain view is exactly what you wrote. The host has no scroll API for panes, so scroll position cannot be persisted. Bounding the content in follow mode keeps the newest output on screen instead. Both toggles reset when `/forge` is opened. |
 | 6 | The corpus tests now ignore agent-smith's own mirrored `-smith-` jobs, which had polluted the shared fixture directory. |
 
 ## Plan for the rest

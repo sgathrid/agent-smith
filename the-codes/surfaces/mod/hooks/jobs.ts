@@ -175,7 +175,7 @@ interface Spec {
     workerId?: string | null;
     role?: string | null;
   };
-  prompt_source?: { kind?: string; task?: string; prompt?: string };
+  prompt_source?: { kind?: string; task?: string; prompt?: string; preamble?: string };
 }
 
 interface Activity {
@@ -524,6 +524,7 @@ export async function resolve(
     task: taskTitle(spec),
     // The whole prompt is detail-view only, like the report: the band polls every job.
     prompt: withReport && typeof spec?.prompt_source?.prompt === 'string' ? spec.prompt_source.prompt : null,
+    preamble: withReport && typeof spec?.prompt_source?.preamble === 'string' ? spec.prompt_source.preamble : null,
     warnings,
     report,
     reasoning,

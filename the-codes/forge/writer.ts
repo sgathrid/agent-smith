@@ -83,6 +83,8 @@ export interface StartInput {
   readonly effort: string | null;
   readonly cwd: string;
   readonly prompt: string;
+  /** The mode preamble the service prepends before the provider sees the prompt. */
+  readonly preamble?: string;
   readonly unrestricted: boolean;
   readonly conversation: string | null;
   readonly timeoutMs: number;
@@ -207,7 +209,7 @@ export class JobWriter {
 
     this.mirror.claim(this.jobId);
     this.writeManifest();
-    this.mirror.writeSpec(manifest, input.prompt);
+    this.mirror.writeSpec(manifest, input.prompt, input.preamble);
     this.flushProgress(this.manifest.createdAt);
     // Fire and forget: spawn never waits on git. Merged into the manifest when it lands.
     this.cwd = input.cwd;

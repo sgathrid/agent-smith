@@ -117,6 +117,13 @@ test('the spec carries the full prompt when given one, capped', () => {
   assert.equal('prompt' in (mirrorSpec(manifest())['prompt_source'] as object), false);
 });
 
+test('the spec keeps the mode preamble apart from the prompt', () => {
+  const ps = mirrorSpec(manifest(), 'do it', 'Do the work.')['prompt_source'] as { prompt: string; preamble?: string };
+  assert.equal(ps.prompt, 'do it');
+  assert.equal(ps.preamble, 'Do the work.');
+  assert.equal('preamble' in (mirrorSpec(manifest(), 'do it')['prompt_source'] as object), false);
+});
+
 test('the permission profile says out loud whether approvals were bypassed', () => {
   // This is the field an operator must never have to guess at. agy headless
   // soft-denies and reports success, so "was this job allowed to touch the

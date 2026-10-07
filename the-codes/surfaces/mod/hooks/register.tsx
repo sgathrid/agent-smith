@@ -153,6 +153,16 @@ const now = atom({ plugin: 'agent-smith', key: 'now' } as const, 0);
  * state, and an array survives that where a Set does not.
  */
 const cleared = atom({ plugin: 'agent-smith', key: 'cleared' } as const, [] as string[]);
+/**
+ * Follow mode (`f`). On, the detail view is a bounded live tail: the newest few
+ * transcript chunks and tool rows, and a collapsed prompt, so the pane keeps the
+ * latest activity in view without needing a scroll position. Off, it shows
+ * everything. The host exposes no scroll API to a pane, so bounding the content
+ * is how the newest output stays visible as a job streams.
+ */
+const follow = atom({ plugin: 'agent-smith', key: 'follow' } as const, true as boolean);
+/** `p`: show the mode preamble Agent Smith prepended to the prompt the worker received. */
+const showPreamble = atom({ plugin: 'agent-smith', key: 'showPreamble' } as const, false as boolean);
 const nativeTaskLinks = atom(
   { plugin: 'agent-smith', key: 'nativeTaskLinks' } as const,
   {} as NativeTaskLinks,
@@ -180,6 +190,11 @@ const LIST_ROWS = 9;
 
 /** Tool calls shown in the detail pane's history. */
 const HISTORY_ROWS = 60;
+
+/** What follow mode keeps: transcript chunks, tool rows and prompt lines. */
+const TAIL_TRANSCRIPT = 3;
+const TAIL_TOOLS = 12;
+const TAIL_PROMPT_LINES = 8;
 
 // =============================================================================
 // § BAND — band author. See MERGE NOTE above.
@@ -528,6 +543,8 @@ export const register: Register = (on) => {
     // into a stale detail view would be disorienting: the user asked for a
     // browser, not for wherever they happened to be last time.
     await update($, selected, () => null);
+    await update($, follow, () => true);
+    await update($, showPreamble, () => false);
 
     // Claude accepts a width REQUEST and lets the user resize/relocate the pane.
     // Ask for one third of the measured terminal so `/forge` occupies the right
@@ -572,6 +589,8 @@ export const register: Register = (on) => {
 
     const pick: string | null = await read($, selected);
     const hidden: string[] = await read($, cleared);
+    const tail: boolean = await read($, follow);
+    const preambleOn: boolean = await read($, showPreamble);
     // Same `bandConfig.repo` the band reads: one repo, resolved once. See the note
     // on the `command.run` handler above for why this is not `$.cwd`.
     const repo = (await read($, bandConfig)).repo;
@@ -589,7 +608,7 @@ export const register: Register = (on) => {
         // also means exactly one read per render.
         const history = await readToolHistory(fs, repo, pick);
         const transcript = await readTranscript(fs, repo, pick);
-        return renderDetail($, e, job, t, history, transcript, hidden, { Box, Text, Button, Markdown });
+        return renderDetail($, e, job, t, history, transcript, hidden, { Box, Text, Button, Markdown }, tail, preambleOn);
       }
       // The selected job vanished — agy-staff cleaned the directory, or the id
       // came from a stale list. Fall back to the list rather than rendering a
@@ -725,6 +744,8 @@ function renderDetail(
   transcript: readonly string[],
   hidden: readonly string[],
   W: Widgets,
+  tail: boolean,
+  preambleOn: boolean,
 ): JSX.Element {
   const { Box, Text, Button, Markdown } = W;
   const rule = '─'.repeat(Math.max(10, Math.min(e.props.bodyColumns - 2, 200)));
@@ -756,8 +777,8 @@ function renderDetail(
           only the one-line title, so fall back to that rather than show nothing. */}
       {job.prompt != null && job.prompt.trim() !== '' ? (
         <Box flexDirection="column">
-          <Text bold wrap="truncate-end">Prompt</Text>
-          <Markdown text={job.prompt} />
+          <Text bold wrap="truncate-end">{preambleOn && job.preamble ? 'Prompt (as sent, with preamble)' : 'Prompt'}</Text>
+          <Markdown text={preambleOn && job.preamble ? `${job.preamble}\n\n${job.prompt}` : tailPrompt(job.prompt, tail && job.status === 'running')} />
         </Box>
       ) : (
         job.task.length > 0 && <Text wrap="wrap">{job.task}</Text>
@@ -775,7 +796,10 @@ function renderDetail(
       {transcript.length > 0 && (
         <Box flexDirection="column">
           <Text bold wrap="truncate-end">{job.status === 'running' ? 'Live output' : 'Worker output'}</Text>
-          <Markdown text={transcript.join('\n\n')} />
+          {tail && transcript.length > TAIL_TRANSCRIPT && (
+            <Text dimColor wrap="truncate-end">{`  +${transcript.length - TAIL_TRANSCRIPT} earlier — f for all`}</Text>
+          )}
+          <Markdown text={(tail ? transcript.slice(-TAIL_TRANSCRIPT) : transcript).join('\n\n')} />
         </Box>
       )}
 
@@ -791,7 +815,7 @@ function renderDetail(
       {/* Tool history, newest last so it reads forward in time. Empty is stated in
           words: for a cleanly finished job there IS no history on disk, and a
           silent section would look like a rendering failure. */}
-      <ToolHistory entries={history} W={W} />
+      <ToolHistory entries={history} W={W} rows={tail ? TAIL_TOOLS : HISTORY_ROWS} />
 
       {/* Warnings, above the report on purpose. See the order note above. */}
       {job.warnings.length > 0 && (
@@ -820,7 +844,7 @@ function renderDetail(
         </Text>
       )}
 
-      {footer($, W, true, hidden)}
+      {footer($, W, true, hidden, { tail, hasPreamble: Boolean(job.preamble) })}
     </Box>
   );
 }
@@ -838,6 +862,15 @@ function renderDetail(
  * nothing; on a detail page it is one number in one line and it answers "how much
  * work was this", which is a fair question to ask a job you have opened on purpose.
  */
+/** In follow mode a running job's prompt collapses to its first lines. */
+function tailPrompt(prompt: string, collapse: boolean): string {
+  if (!collapse) return prompt;
+  const lines = prompt.split('\n');
+  return lines.length <= TAIL_PROMPT_LINES
+    ? prompt
+    : `${lines.slice(0, TAIL_PROMPT_LINES).join('\n')}\n\n_… +${lines.length - TAIL_PROMPT_LINES} more lines — f for all_`;
+}
+
 function detailSummary(job: RadarJob, _t: number): string {
   // Annotated as string[] because the first element is a RadarStatus and TS would
   // otherwise infer the array as RadarStatus[] and reject the strings pushed after.
@@ -860,7 +893,7 @@ function detailSummary(job: RadarJob, _t: number): string {
  * a pane that read half a megabyte per job per render would be unusable, and would
  * pay that cost for a section most users never open.
  */
-function ToolHistory({ entries, W }: { entries: readonly ToolEntry[]; W: Widgets }): JSX.Element {
+function ToolHistory({ entries, W, rows }: { entries: readonly ToolEntry[]; W: Widgets; rows: number }): JSX.Element {
   const { Box, Text } = W;
 
   if (entries.length === 0) {
@@ -871,7 +904,7 @@ function ToolHistory({ entries, W }: { entries: readonly ToolEntry[]; W: Widgets
     );
   }
 
-  const shown = entries.slice(-HISTORY_ROWS);
+  const shown = entries.slice(-rows);
   return (
     <Box flexDirection="column">
       <Text bold wrap="truncate-end">{`Tools (last ${shown.length})`}</Text>
@@ -885,8 +918,8 @@ function ToolHistory({ entries, W }: { entries: readonly ToolEntry[]; W: Widgets
           </Text>
         </Text>
       ))}
-      {entries.length > HISTORY_ROWS && (
-        <Text dimColor wrap="truncate-end">{`  +${entries.length - HISTORY_ROWS} earlier`}</Text>
+      {entries.length > rows && (
+        <Text dimColor wrap="truncate-end">{`  +${entries.length - rows} earlier`}</Text>
       )}
     </Box>
   );
@@ -907,6 +940,7 @@ function footer(
   W: ListWidgets,
   inDetail: boolean,
   hiddenFinished: readonly string[],
+  detail?: { tail: boolean; hasPreamble: boolean },
 ): JSX.Element {
   const { Box, Button } = W;
   return (
@@ -925,6 +959,22 @@ function footer(
           // assignable. The value is discarded by design — this is a command, not a
           // query.
           onPress={() => void update($, selected, () => null)}
+        />
+      )}
+      {inDetail && detail !== undefined && (
+        <Button
+          key="follow"
+          label={detail.tail ? 'Show all' : 'Follow'}
+          hotkey="f"
+          onPress={() => void update($, follow, (v) => !v)}
+        />
+      )}
+      {inDetail && detail?.hasPreamble === true && (
+        <Button
+          key="preamble"
+          label="Preamble"
+          hotkey="p"
+          onPress={() => void update($, showPreamble, (v) => !v)}
         />
       )}
       {!inDetail && (

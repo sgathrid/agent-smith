@@ -103,7 +103,7 @@ export function mirrorAt(repo: string, jobId: string, suffix: string): string {
 /** Cap on the prompt copy kept in the spec; the pane shows it, nothing else reads it. */
 export const MIRROR_PROMPT_CAP = 64_000;
 
-export function mirrorSpec(m: ForgeManifest, prompt?: string): Record<string, unknown> {
+export function mirrorSpec(m: ForgeManifest, prompt?: string, preamble?: string): Record<string, unknown> {
   return {
     [MIRROR_MARKER]: true,
     job_id: m.jobId,
@@ -115,6 +115,7 @@ export function mirrorSpec(m: ForgeManifest, prompt?: string): Record<string, un
       kind: MIRROR_MARKER,
       task: m.task,
       ...(prompt === undefined ? {} : { prompt: prompt.slice(0, MIRROR_PROMPT_CAP) }),
+      ...(preamble === undefined || preamble === '' ? {} : { preamble }),
     },
     resolved: {
       name: m.name,
@@ -375,9 +376,9 @@ export class MirrorWriter {
     throw new MirrorClaimError(specPath);
   }
 
-  writeSpec(m: ForgeManifest, prompt?: string): void {
+  writeSpec(m: ForgeManifest, prompt?: string, preamble?: string): void {
     if (!this.enabled) return;
-    writeJsonAtomic(mirrorAt(this.repo, m.jobId, SPEC), mirrorSpec(m, prompt));
+    writeJsonAtomic(mirrorAt(this.repo, m.jobId, SPEC), mirrorSpec(m, prompt, preamble));
     appendLine(mirrorAt(this.repo, m.jobId, LOG), mirrorDispatchLine(m).trimEnd());
   }
 

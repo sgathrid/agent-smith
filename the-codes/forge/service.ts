@@ -524,6 +524,7 @@ export class ForgeService {
       effort: request.effort ?? null,
       cwd,
       prompt,
+      ...(preset === undefined || prompt.startsWith(preset.preamble) ? {} : { preamble: preset.preamble }),
       unrestricted,
       conversation: request.conversation ?? null,
       timeoutMs,
