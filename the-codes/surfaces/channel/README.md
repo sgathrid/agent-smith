@@ -28,8 +28,8 @@ For manual MCP configuration:
 }
 ```
 
-Tools: `spawn_job`, `resume_job`, `list_jobs`, `status`, `cancel`, `run_pipeline`,
-`pipeline_status`. All launch tools return immediately. Errors use MCP `isError`.
+Tools: `list_capabilities`, `spawn_job`, `resume_job`, `list_jobs`, `status`, `cancel`,
+`run_pipeline`, `pipeline_status`. All launch tools return immediately. Errors use MCP `isError`.
 Schema validation rejects malformed settings before execution.
 
 Custom development channels require

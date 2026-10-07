@@ -94,7 +94,7 @@ export function buildPlugin({ repoRoot = DEFAULT_ROOT, outputRoot = path.join(re
             type: 'command',
             command: 'node "${CLAUDE_PLUGIN_ROOT}/runtime/dist/watch-hook.js"',
             asyncRewake: true,
-            timeout: 2760,
+            timeout: 21_900,
           }],
         }],
       },

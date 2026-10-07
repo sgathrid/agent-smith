@@ -17,30 +17,34 @@ under `~/.claude/plugins`; setup does not change global enablement or user setti
 
 ## Why this directory exists
 
-Agent Smith is provider-agnostic. That only holds if each provider's quirks live
-in one place rather than scattered through the code. This is that place.
+Agent Smith is provider-agnostic. Provider quirks live in `the-codes/providers/`;
+this directory holds the provider-neutral contract (`shared/`) that every worker is
+held to, plus an example plugin enablement key.
 
 ## Layout
 
 ```
 agent-configs/
-├── claude-code/     mod + channel manifests (the two surfaces)
-├── codex/           AGENTS.md instructions for Codex as worker/moderator
-├── opencode/        opencode.json skill paths
-├── agy/             agy persona prompts per stage role
-└── shared/          the role contract every provider must honour
+├── .claude/settings.json   example plugin enablement key (inactive; see above)
+└── shared/                 the role contract and terminal-UI rules every provider honours
 ```
+
+Per-provider adapter files (Codex `AGENTS.md`, OpenCode config, agy personas) are not
+checked in. Provider behavior is configured in the provider adapters and, for models, in
+`models.json` (see [docs/CONFIGURATION.md](../docs/CONFIGURATION.md)).
 
 ## The role contract
 
-Every provider, whatever its harness, is asked to do the same three jobs. The
-per-provider files are thin adapters onto these roles.
+Every provider, whatever its harness, is asked to do the same jobs, selected by the
+closed job `mode` (`implement`, `review`, `moderate`, `verify`; presets in
+`the-codes/forge/modes.ts`). `verify` runs the given checks and reports what happened.
 
 | Role | Does | Does **not** |
 |---|---|---|
 | `implement` | Make the change. Minimal diff. | Commit, push, open PRs unless told |
 | `review` | Find defects. Severity-ranked evidence. | Fix anything. Soften nothing |
 | `moderate` | Probe the previous stage's work for a *named* failure class | Argue until agreement. Vote |
+| `verify` | Run the checks and report exact results | Claim a pass it did not run |
 
 ### Why `moderate` is not `debate`
 
@@ -65,5 +69,5 @@ Correctness is not.
 agent-smith doctor
 ```
 
-Reports which providers are on this machine, which harness configs are
-installed, and whether the surfaces can see worker state.
+Reports which providers are on this machine (binary found on `PATH`) and where job
+state is read from. It does not inspect harness configs or surface health.

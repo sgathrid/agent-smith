@@ -12,10 +12,15 @@ import { fileURLToPath } from 'node:url';
 
 import { type JobWatchOptions, runJobWatch } from './monitor.ts';
 
+/** Longest job a spawn may request (forge MAX_TIMEOUT_MS = 6h). */
+const MAX_WATCH_JOB_MS = 6 * 60 * 60_000;
+
 export interface WatchTarget {
   readonly kind: 'job' | 'run';
   readonly id: string;
   readonly cwd: string;
+  /** Watch budget: the job's own timeout (from the ack) plus a minute; pipelines get the 6h job cap. */
+  readonly timeoutMs: number;
 }
 
 const TOOLS: Record<string, 'job' | 'run'> = { spawn_job: 'job', resume_job: 'job', run_pipeline: 'run' };
@@ -74,7 +79,9 @@ export function parseHookInput(input: unknown, env: NodeJS.ProcessEnv = process.
   }
   if (cwd === null && typeof input['cwd'] === 'string' && input['cwd'].length > 0) cwd = input['cwd'];
   if (cwd === null) cwd = env['AGY_WATCH_CWD'] || process.cwd();
-  return { kind, id, cwd: path.resolve(cwd) };
+  const ackTimeout = payload['timeoutMs'];
+  const timeoutMs = (typeof ackTimeout === 'number' && Number.isFinite(ackTimeout) && ackTimeout > 0 ? ackTimeout : MAX_WATCH_JOB_MS) + 60_000;
+  return { kind, id, cwd: path.resolve(cwd), timeoutMs };
 }
 
 /** Run the hook. Resolves to the process exit code (2 = wake Claude). */
@@ -89,6 +96,7 @@ export async function runHook(
     if (target === null) return 0;
     const lines: string[] = [];
     await runJobWatch({
+      timeoutMs: target.timeoutMs,
       ...options,
       cwd: target.cwd,
       jobIds: target.kind === 'job' ? [target.id] : [],

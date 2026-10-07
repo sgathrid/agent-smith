@@ -85,11 +85,11 @@ test('hook input parsing handles each response shape', () => {
   ];
   for (const s of shapes) {
     const t = parseHookInput(wrap('mcp__plugin_agent-smith_agent-smith__spawn_job', s));
-    assert.deepEqual(t, { kind: 'job', id: 'j1', cwd: '/some/repo' });
+    assert.deepEqual({ kind: t?.kind, id: t?.id, cwd: t?.cwd }, { kind: 'job', id: 'j1', cwd: '/some/repo' });
   }
   assert.equal(parseHookInput(wrap('resume_job', ack))?.kind, 'job');
   const run = parseHookInput(wrap('mcp__x__run_pipeline', { runId: 'r1', recordPath: '/p/.agent-smith/pipelines/r1.json' }));
-  assert.deepEqual(run, { kind: 'run', id: 'r1', cwd: '/p' });
+  assert.deepEqual({ kind: run?.kind, id: run?.id, cwd: run?.cwd }, { kind: 'run', id: 'r1', cwd: '/p' });
 });
 
 test('repo falls back to dir then input.cwd', () => {
@@ -131,4 +131,12 @@ test('full scan caches terminal jobs instead of re-reading them', async () => {
   clearReadCache();
   assert.equal((await readAll(repo))[0]!.status, 'failed');
   fs.rmSync(repo, { recursive: true, force: true });
+});
+
+test('hook watch budget follows the ack timeout, with a 6h cap fallback for pipelines', async () => {
+  const { parseHookInput } = await import('../watch-hook.ts');
+  const job = parseHookInput({ tool_name: 'mcp__x__spawn_job', tool_response: { jobId: 'j1', repo: '/tmp/r', timeoutMs: 120_000 } });
+  assert.equal(job?.timeoutMs, 180_000);
+  const run = parseHookInput({ tool_name: 'mcp__x__run_pipeline', tool_response: { runId: 'r1', repo: '/tmp/r' } });
+  assert.equal(run?.timeoutMs, 6 * 60 * 60_000 + 60_000);
 });
