@@ -5,6 +5,11 @@
     "module": "nodenext",
     "moduleResolution": "nodenext",
     "allowImportingTsExtensions": true,
+    // "preserve" rather than "react-jsx": Claude Code's mod API resolves JSX
+    // components at runtime via `$.ui.resolve(e)`. There is no React runtime
+    // in a mod, so pointing at react/jsx-runtime would be a lie that hides real
+    // type errors. The mod's own tsconfig overrides this per-package.
+    "jsx": "preserve",
     "rewriteRelativeImportExtensions": true,
     "verbatimModuleSyntax": true,
     "noEmit": true,

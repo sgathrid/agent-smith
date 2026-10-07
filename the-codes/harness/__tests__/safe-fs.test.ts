@@ -84,7 +84,7 @@ test("readPrefixSafe spans multiple lines and tolerates a cut mid-record", async
     assert.ok(prefix);
     assert.ok(prefix.length > 0);
     // The first record must still be intact and parseable.
-    const firstLine = prefix.split("\n")[0];
+    const firstLine = prefix.split("\n")[0] ?? "";
     assert.deepEqual(JSON.parse(firstLine), { n: 1 });
     // A line that was cut mid-record simply fails to parse — it must not throw.
     for (const line of prefix.split("\n")) {

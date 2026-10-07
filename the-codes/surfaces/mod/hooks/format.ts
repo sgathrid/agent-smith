@@ -173,7 +173,8 @@ export function formatJobLine(job: RadarJob, options: FormatJobLineOptions = {})
   const span = job.startedAt === null ? null : (job.endedAt ?? now) - job.startedAt;
 
   // Level 1 identity, always: glyph + short label. Readable in the first 40 cols.
-  const parts = [` ${pickGlyph(job.status)} ${job.id.padEnd(idWidth)}`];
+  // The trailing space is the gutter between the id column and the clock column.
+  const parts = [` ${pickGlyph(job.status)} ${job.id.padEnd(idWidth)} `];
 
   // Level 2 liveness. The clock is a fixed-width cell whether or not it has a
   // value, so a job with no known start does not shift the columns after it.
@@ -199,7 +200,12 @@ export function formatJobLine(job: RadarJob, options: FormatJobLineOptions = {})
  * without it the `·` jumps sideways every time a job finishes.
  */
 export function formatHeaderLine(running: number, finished: number): string {
-  return `${String(running).padStart(2)} running · ${String(finished).padStart(2)} finished`;
+  // Width is derived from the counts themselves, not fixed at 2. A fixed width of 2
+  // aligns `2` against `14` perfectly and then falls apart the moment a project
+  // has 100 jobs — the separator jumps right and the header visibly tears. Deriving
+  // it costs one Math.max and is correct at every scale.
+  const width = Math.max(2, String(running).length, String(finished).length);
+  return `${String(running).padStart(width)} running · ${String(finished).padStart(width)} finished`;
 }
 
 /** The literal empty state. No box, no spinner, no second line. */

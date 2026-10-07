@@ -130,8 +130,26 @@ declare module 'claude-code' {
       selected: string | null;
       /** Scratch: 'list' | 'detail'. Redundant with `selected`, kept for clarity. */
       view: 'list' | 'detail';
-      /** Clock the pane subscribes to so elapsed cells tick. */
+      /** Clock the pane subscribes to so elapsed cells tick. The BAND writes it. */
       now: number;
+      /** Job ids dismissed with `c`; filtered against on read, never deleted. */
+      cleared: string[];
+      /**
+       * The band's own snapshot of the jobs directory, from the 3 s poll.
+       *
+       * SEPARATE FROM THE PANE'S READ ON PURPOSE. The pane re-reads on demand —
+       * a keypress is a deliberate act and deserves fresh data — while the band
+       * is driven by a poll and must never block a redraw on 20 file reads. Both
+       * are read-only projections of the same files, so they cannot disagree
+       * about the truth, only about when they looked.
+       */
+      bandJobs: RadarJob[];
+      /**
+       * Resolved once at session start: which repo to watch, and whether colour
+       * is allowed (NO_COLOR / FORCE_COLOR / TERM=dumb). Re-reading env per frame
+       * would be a pointless syscall per redraw.
+       */
+      bandConfig: { repo: string; colour: boolean };
     };
   }
 }

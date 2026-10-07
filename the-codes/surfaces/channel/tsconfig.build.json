@@ -1,0 +1,13 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // The build config is the only place that emits — `npm run typecheck` uses the
+    // base, which sets noEmit.
+    "noEmit": false,
+    "outDir": "./dist",
+    "declaration": true,
+    "sourceMap": true
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["src/**/*.test.ts", "src/__tests__/**"]
+}

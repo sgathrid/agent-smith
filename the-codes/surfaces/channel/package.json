@@ -7,12 +7,13 @@
   "type": "module",
   "engines": { "node": ">=22" },
   "bin": { "agy-watch": "./dist/server.js" },
-  "main": "./src/server.ts",
+  "main": "./dist/server.js",
+  "files": ["dist", "src", "README.md"],
   "scripts": {
     "start": "node --experimental-strip-types src/server.ts",
     "test": "node --test --experimental-strip-types \"src/**/*.test.ts\"",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "build": "tsc -p tsconfig.build.json"
+    "build": "tsc -p tsconfig.build.json; node scripts/stamp-entrypoint.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1"

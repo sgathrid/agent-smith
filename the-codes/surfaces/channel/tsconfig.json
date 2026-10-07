@@ -1,0 +1,13 @@
+{
+  "extends": "../../../tsconfig.json",
+  "compilerOptions": {
+    // The channel is the one package that emits JavaScript — it is launched as an
+    // MCP server from `dist/`, not type-stripped from source. `allowImportingTsExtensions`
+    // from the root config is incompatible with emit, hence the two-line override
+    // below: we import `./policy.ts` (matching the rest of the repo's convention)
+    // and let `rewriteRelativeImportExtensions` turn it into `./policy.js`.
+    "noEmit": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts"]
+}

@@ -74,7 +74,7 @@ function looksEmpty(text: string | null): boolean {
  */
 const agyNormalizer: JobNormalizer = (raw: RawJobState): ObservedJob => {
   const p = raw.payload;
-  const warnings: ObservedWarning[] = [];
+  let warnings: ObservedWarning[] = [];
 
   const canceled = asBool(p[AGY_PAYLOAD.canceled]) === true;
   const terminalStatus = asString(p[AGY_PAYLOAD.status]);
@@ -181,7 +181,10 @@ const agyNormalizer: JobNormalizer = (raw: RawJobState): ObservedJob => {
 
   // -- usage ------------------------------------------------------------------
   let usage: ObservedUsage | null = null;
-  const usageParts: ObservedUsage = {};
+  // Built field-by-field as telemetry is parsed, so the accumulator itself is
+  // mutable even though the published `ObservedUsage` shape is readonly.
+  type UsageAccumulator = { -readonly [K in keyof ObservedUsage]: ObservedUsage[K] };
+  const usageParts: UsageAccumulator = {};
   const tin = asNumber(telemetry["tokens_in"]);
   const tout = asNumber(telemetry["tokens_out"]);
   const tthink = asNumber(telemetry["tokens_think"]);

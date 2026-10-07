@@ -41,6 +41,7 @@ import { existsSafe, readTextSafe, statSafe } from '../../../harness/safe-fs.ts'
 import type { ObservedJob } from '../../../harness/types.ts';
 import type { RadarJob, RadarStatus, ToolEntry } from '../types/index.d.ts';
 import { describeActivity, describeTool } from './format.ts';
+import { STALL_GRACE_MS } from './stale.ts';
 
 /** One reader, reused. Constructing a reader is cheap but the map is not per-call. */
 const READER = new AgyStaffReader();
@@ -299,7 +300,10 @@ export function projectRadarJob(
   events: { count: number | null; tail: ToolEntry[] },
   now: number = Date.now(),
 ): RadarJob {
-  const startedAt = spec.startedAt ?? observed.startedAt;
+  // spec.startedAt is epoch ms (from the log or the spec mtime). ObservedJob's own
+  // startedAt is an ISO STRING and is null for agy-staff anyway (normalize.ts
+  // refuses to invent one), so it is only a parsed fallback.
+  const startedAt = spec.startedAt ?? toEpoch(observed.startedAt ?? '');
   const endedAt = observed.finishedAt === null ? null : toEpoch(observed.finishedAt);
 
   // How long the job has been quiet. `updatedAt` is lastEventAt when progress
@@ -341,16 +345,6 @@ export function toRadarStatus(observed: ObservedJob, silenceMs = 0): RadarStatus
   if (observed.status !== 'running') return observed.status;
   return silenceMs > STALL_GRACE_MS ? 'attention' : 'running';
 }
-
-/**
- * Grace before a silent running job is escalated to `attention`.
- *
- * 15 minutes, matching core/liveness.ts's DEFAULT_GRACE_MS. Re-declared rather
- * than imported: the mod is a standalone plugin and cannot resolve a bare
- * specifier for core/. If core changes this number, change it here too — the two
- * files are the only places it appears.
- */
-export const STALL_GRACE_MS = 15 * 60 * 1000;
 
 /**
  * The terse activity phrase, from the most recent activity record.

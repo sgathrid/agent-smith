@@ -1,0 +1,14 @@
+{
+  "extends": "../../../tsconfig.json",
+  "compilerOptions": {
+    // The repo root tsconfig cannot set `jsx` because nothing else in the repo uses
+    // JSX; only the mod does. Setting it here means the surface's JSX is typechecked
+    // without loosening every other package in the repo.
+    //
+    // "preserve" rather than "react-jsx": the mod API's components are resolved at
+    // runtime from `$.ui.resolve(e)`, not imported from a JSX runtime, so we only
+    // need tsc to PARSE and check the tree, never to emit.
+    "jsx": "preserve"
+  },
+  "include": ["hooks/**/*.ts", "hooks/**/*.tsx", "types/**/*.d.ts"]
+}

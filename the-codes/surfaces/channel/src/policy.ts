@@ -164,7 +164,15 @@ export function shouldPush(candidate: Candidate, now: number): boolean {
   // directory which already contains stalled jobs says nothing about them: it did
   // not observe them stall, so it has no news, only a backlog. Announcing the
   // backlog would be the channel's first impression being 16 lines of alarm.
-  if (kind === 'attention' && !candidate.knownBefore) return false;
+  if (kind === 'attention') {
+    if (!candidate.knownBefore) return false;
+    // A stall with no last_event_at is not a stall we can describe. We know the job
+    // exists and that it is not reporting; we do not know that it went quiet, and
+    // a reader that just started will produce exactly this state for every job.
+    // Saying "has stopped making progress" about a job whose progress we have
+    // never observed would be a confident sentence about nothing.
+    if (job.lastEventAt === null) return false;
+  }
 
   return true;
 }

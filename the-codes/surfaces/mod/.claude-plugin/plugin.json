@@ -1,0 +1,10 @@
+{
+  "name": "agy-radar",
+  "version": "0.1.0",
+  "description": "One live line above the prompt per agy/Codex/OpenCode job: status, elapsed, tool count, what it is doing. /agy-radar opens the pane.",
+  "author": {
+    "name": "Agent Smith"
+  },
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}
