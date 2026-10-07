@@ -1,0 +1,9 @@
+node_modules/
+*.log
+.DS_Store
+
+# Worker state written into consuming repos, not ours.
+.agy-staff/
+
+# Local scratch for the mod/channel dev loop.
+builds/tmp/

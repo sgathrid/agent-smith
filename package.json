@@ -1,0 +1,16 @@
+{
+  "name": "agent-smith",
+  "version": "0.1.0",
+  "description": "Forge for coding agents: one task, many workers, one place to watch them.",
+  "license": "MIT",
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node --test --experimental-strip-types 'the-codes/*/__tests__/*.test.ts'",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "@types/node": "^22.10.0"
+  }
+}
