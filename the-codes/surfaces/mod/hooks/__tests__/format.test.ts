@@ -19,6 +19,7 @@ import {
   EMPTY_STATE,
   TOOL_COUNT_WIDTH,
   basename,
+  countSummary,
   describeActivity,
   describeTool,
   elapsed,
@@ -31,6 +32,7 @@ import {
   parseInputPreview,
   pickColor,
   pickGlyph,
+  sortJobs,
   toolCountCell,
 } from '../format.ts';
 import type { RadarJob, RadarStatus } from '../../types/index.d.ts';
@@ -55,6 +57,57 @@ function job(over: Partial<RadarJob> = {}): RadarJob {
     ...over,
   };
 }
+
+// ── list ordering and the header counts ─────────────────────────────────────
+//
+// These two moved here from the deleted ./job-source.ts with the rest of the
+// pane's pure presentation. They are pure, so they are testable with no
+// filesystem, which is the reason they are in this file and not in jobs.ts.
+
+test('sortJobs tiers running, then needs-you, then everything terminal', () => {
+  // THREE tiers, and `attention` is deliberately not grouped with `running`.
+  // The band groups them (both live, no room to distinguish); the pane has a
+  // header and a footer, so a quiet job sorts directly under the working ones.
+  const rows = [
+    job({ id: 'done', status: 'succeeded', endedAt: 1 }),
+    job({ id: 'needs', status: 'attention', startedAt: 1 }),
+    job({ id: 'live', status: 'running', startedAt: 1 }),
+  ];
+  assert.deepEqual(
+    sortJobs(rows).map((j) => j.id),
+    ['live', 'needs', 'done'],
+  );
+});
+
+test('sortJobs is newest-first inside a tier, and does not mutate its input', () => {
+  const rows = [
+    job({ id: 'old', status: 'succeeded', endedAt: 100 }),
+    job({ id: 'new', status: 'succeeded', endedAt: 300 }),
+    job({ id: 'mid', status: 'succeeded', endedAt: 200 }),
+  ];
+  const copy = [...rows];
+  assert.deepEqual(
+    sortJobs(rows).map((j) => j.id),
+    ['new', 'mid', 'old'],
+  );
+  assert.deepEqual(rows, copy, 'sorting a list must not reorder the caller\'s list');
+});
+
+test('countSummary counts attention as RUNNING', () => {
+  // The load-bearing assertion. `attention` is a job that is still going and has
+  // gone quiet; counting it under finished tells the user a job is over at the
+  // exact moment they should be doing something about it.
+  const rows = [
+    job({ status: 'running' }),
+    job({ status: 'attention' }),
+    job({ status: 'succeeded' }),
+    job({ status: 'failed' }),
+    job({ status: 'canceled' }),
+    job({ status: 'unknown' }),
+  ];
+  assert.deepEqual(countSummary(rows), { running: 2, finished: 4 });
+  assert.deepEqual(countSummary([]), { running: 0, finished: 0 });
+});
 
 // ── glyphs ──────────────────────────────────────────────────────────────────
 

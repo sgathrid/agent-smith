@@ -66,31 +66,44 @@ claude --plugin-dir the-codes/surfaces/mod       # or install it
 Then, in the repo you want to watch:
 
 ```bash
-export AGY_RADAR_REPO=/path/to/repo              # defaults to /Users/gathrid/Repos/renyi
-claude
+claude          # launched IN the repo; .agy-staff/jobs is found there
 ```
 
 The band needs no flags, no channels, and no model tokens. It reads
 `<repo>/.agy-staff/jobs/` and nothing else.
 
+To watch a *different* repo from the one you launched in:
+
+```bash
+export AGY_RADAR_REPO=/path/to/repo
+claude
+```
+
 ### Configuration
 
 | variable | default | meaning |
 |---|---|---|
-| `AGY_RADAR_REPO` | `/Users/gathrid/Repos/renyi` | the repo whose `.agy-staff/jobs/` to read |
+| `AGY_RADAR_REPO` | the session's cwd | the repo whose `.agy-staff/jobs/` to read |
 | `NO_COLOR` | unset | any non-empty value drops all colour (glyphs remain) |
 | `FORCE_COLOR` | unset | `0` or `false` treated as `NO_COLOR` |
 | `TERM` | unset | `dumb` treated as `NO_COLOR` |
+
+`.agy-staff/` is per-repo state, so the repo you launched Claude in *is* the right
+default and there is no third fallback: `$.fs.ancestors` turned out not to be
+directory ancestry (see [§ Resolved](#resolved-the-pane-s-reader-used-not-to-load)),
+so "search upward for a jobs directory" is not available, and inventing a default
+path would make the mod report another machine's jobs.
 
 `$.env.get` requires each name as a string literal (VERIFIED — a computed name
 is refused at compile time), which is why they are spelled out rather than
 looped over.
 
-**The default repo is a per-developer absolute path.** That is not a thing a
-shipped plugin should contain; it is here because the band was developed against
-a real 20-job corpus and a band that has only seen a fixture meets HAZARD A for
-the first time in production. Change `DEFAULT_REPO` in `hooks/jobs.ts`, or set
-`AGY_RADAR_REPO`, before releasing this.
+**`DEFAULT_REPO` in `hooks/jobs.ts` is now the empty string.** It used to be
+`/Users/gathrid/Repos/renyi`, which is not a thing a shipped plugin should
+contain: on another machine that path is either absent or — worse — someone
+else's repo, and the band would confidently draw their jobs. It is empty now, and
+`session.start`'s `e.cwd` fills it in; `register.tsx` reads the result from the
+`bandConfig` atom so both surfaces use it.
 
 ## What it reads
 
@@ -101,10 +114,12 @@ every job; the band reads it. Verified against 20 real jobs in
 ```
 <id>.spec.json              mode, model, profile, task title
 <id>.progress.json          recent_activities[≤5], last_event_at, warnings   (~100ms)
-<id>.events.jsonl           tool counts, from the highest step_index
+<id>.events.jsonl           tool counts from the highest step_index; tool history
+                            (pane's detail view only, DONE records only)
 <id>.log                    the ONLY start time: "worker started … at ISO"
 <id>.result.md.status.json  status, warnings, finished_at      <- the terminal anchor
-<id>.result.md              only its EMPTINESS, never its contents
+<id>.result.md              EMPTINESS decides status, always; the CONTENTS are
+                            read only when the pane's detail view asks
 <id>.spec.json.cancel       the cancellation instant
 ```
 
@@ -114,7 +129,7 @@ every job; the band reads it. Verified against 20 real jobs in
 |---|---|---|
 | **A** | on a warning-free success agy-staff **deletes** `progress.json` and `events.jsonl`. A missing progress file means FINISHED, never "missing". | `jobs.ts resolve()` — no status row reads terminal state out of an absent file; `band.ts reconcile()` — a terminal row never un-finishes on weaker evidence |
 | **B** | a `.spec.json.cancel` marker can be written *before* `status.json` is finalised | `jobs.ts resolve()` row 1, outranking `status.json` |
-| **C** | some `result.md` carry leading `<system_notification>` blocks (12 in one real job) | `jobs.ts looksEmpty()` strips before judging emptiness |
+| **C** | some `result.md` carry leading `<system_notification>` blocks (12 in one real job) | `jobs.ts stripSystemNotifications()` — called by both `looksEmpty()` (status) and `reportBody()` (the pane's rendered report), so the two cannot disagree |
 
 ### The headline rule
 
@@ -139,7 +154,7 @@ contradict `harness/normalize.ts`, and red is reserved for real failures.
 hooks/hooks.json            { "modules": ["./register.tsx"] }   — exactly, max 1
 hooks/register.tsx          § BAND (band author) + § PANE (pane author)
 hooks/band.ts               the band's pure rules
-hooks/jobs.ts               the reader, over an injected filesystem
+hooks/jobs.ts               THE READER — one, over an injected filesystem
 hooks/format.ts             pure formatting, shared by band and pane
 hooks/stale.ts              the stall threshold, shared by band and channel
 types/index.d.ts            RadarJob + the PluginState declaration
@@ -163,12 +178,66 @@ which defeats the point of making it pure. So:
 `register.tsx` then does nothing but register hooks and lay out what those
 return.
 
+## One reader
+
+**`hooks/jobs.ts` is the only file in the mod that reads `.agy-staff/jobs/`, and
+`resolve()` is the only function that decides a job's status.** § BAND and § PANE
+both call it, so the band above the prompt and the list inside `/radar` cannot
+report different states for the same job. Two readers would mean two answers to
+"is this job still running", which is the drift this project exists to eliminate.
+
+This was not free. The pane used to have its own reader, `hooks/job-source.ts`,
+and it could not load — it imported `node:path`, `node:fs/promises` and
+`../../../harness/`, all of which the mod loader refuses:
+
+```
+agy-radar: hooks module did not load: cannot import "node:path" (from hooks/job-source.ts):
+  a hooks module imports its own files by relative path and "claude-code", nothing else
+```
+
+It was deleted rather than repaired, and its capability came here instead:
+
+| capability | where it lives now | note |
+|---|---|---|
+| status, elapsed, tool count, activity, task, warnings | `jobs.ts resolve()` | was already here — **this was the drift** |
+| `result.md` contents for the detail view | `jobs.ts`, behind `withReport` | `reportBody()` strips hazard C first |
+| tool history for the detail view | `jobs.ts readToolHistory()` | reads `DONE` records only |
+| `stripSystemNotifications` | `jobs.ts`, exported | one de-polluter, not two |
+| `sortJobs`, `countSummary` | `format.ts` | pure presentation, never touched the disk |
+
+### Why it was not vendored instead
+
+The alternative was copying `harness/agy-staff.ts`'s reader and
+`harness/normalize.ts`'s rules into the plugin folder. That would have made the
+mod *load* while leaving two readers with two precedence tables and two answers
+to the same question — a slower, better-documented version of the problem. Vendoring
+the one genuinely-shared pure helper (`stripSystemNotifications`, 10 lines) is
+where the boundary belongs.
+
+### The cost of the merge, stated plainly
+
+`readToolHistory` used to tail-read the last 256 KB of `events.jsonl` with
+`node:fs`'s `open()`. `$.fs` has no partial read, so it now reads the whole file:
+**803 KB worst case in the real corpus, against a verified 4 MiB `$.fs` limit.**
+A file over the cap rejects, is caught, and yields no history. That is fine today
+and is the thing to revisit if jobs ever get long enough to matter.
+
+Two smaller notes, both verified against the 2.1.292 loader rather than assumed:
+
+- **`$.cwd` is refused**: "`$.cwd` is used as a value … `$` is always spelled
+  `$.noun.event(...)`". The repo comes from `session.start`'s `e.cwd`, folded into
+  the `bandConfig` atom once at start, and **§ PANE reads it from that same atom**
+  so the two halves cannot be pointed at different repos.
+- **`$.fs.ancestors` is not directory ancestry.** It resolves names for the host's
+  own `.md` files and rejects anything else. `AGY_RADAR_REPO` → session cwd is the
+  whole resolution chain, and there is no third fallback to reach for.
+
 ## Tests
 
 **Two runners, two questions. Both are needed.**
 
 ```bash
-# the RULES — 57 tests
+# the RULES — 63 tests
 npm test                                  # from the repo root
 node --test --experimental-strip-types "the-codes/surfaces/mod/tests/*.test.ts"
 
@@ -249,44 +318,51 @@ tool-count cell (`TOOL_COUNT_WIDTH = 3`). The band does not pad the tool count,
 because the band never compares rows to each other the way a list does — the
 activity clause is the varying field and it is truncated at the source anyway.
 
-## Known blocker: the pane's reader cannot load
+## Resolved: the pane's reader used not to load
 
-`hooks/job-source.ts` (pane author) imports `node:path` and reaches into
-`../../../harness/`. **VERIFIED against the 2.1.292 loader**, both are refused:
+**CLOSED.** `hooks/job-source.ts` imported `node:path` and reached into
+`../../../harness/`, and the 2.1.292 loader refuses both:
 
 ```
-cannot import "node:fs/promises" (from hooks/register.tsx): a hooks module
+cannot import "node:path" (from hooks/job-source.ts): a hooks module
   imports its own files by relative path and "claude-code", nothing else
 cannot import "../../../harness/agy-staff.ts": it is outside the plugin's folder
 ```
 
-So `claude plugin validate the-codes/surfaces/mod` currently fails on the **pane's**
-file, not on the band's. The band's own code validates: stub `job-source.ts` and
-the manifest, the hooks, the atoms and every `$.fs` / `$.env` / `$.clock` /
-`$.state` call pass.
+So the mod did not load at all, and nothing in it worked. It is now one reader
+with one status function — see [§ One reader](#one-reader) for what happened to
+its capability and why vendoring was the wrong fix.
 
-Two ways to close it, and the second is better:
+The acceptance test is a real run, not `plugin validate`, because the failure
+mode is a load-time refusal that a typechecker cannot see:
 
-1. Port `job-source.ts` to take an `FsLike` like `jobs.ts` does, dropping the
-   `node:*` imports and inlining the three harness helpers it uses.
-2. **Delete `hooks/jobs.ts` and have the band call `job-source.ts`.** Two readers
-   means two answers to "is this job still running", which is the drift this
-   project exists to eliminate. `jobs.ts` is a stopgap, not a second opinion.
-
-`register.tsx` also uses `$.cwd` and `process.cwd()` in the pane's half, and
-`$.cwd` is refused the same way ("`$` is always spelled `$.noun.event(...)` at
-the call site").
+```bash
+claude --plugin-dir ./the-codes/surfaces/mod -p "ok"
+# must print no "hooks module did not load" line
+```
 
 ### Other engine constraints this code was written against
 
-All VERIFIED with `claude plugin validate` / `claude plugin test`, not assumed:
+All VERIFIED against the 2.1.292 binary by running it, not assumed:
 
 - `$.fs` is the **only** file access. `node:fs`, `node:path` and friends are
   refused in a hooks module, and so is any import escaping the plugin folder.
+  Relative imports *within* the plugin are fine.
+- **`$.cwd` is refused** — `$` is only ever spelled `$.noun.event(...)`. The
+  session's cwd arrives as `session.start`'s `e.cwd`.
+- **`$.fs.ancestors` is not directory ancestry.** It resolves names for the
+  host's own `.md` files and rejects anything else.
+- `$.fs` reads and writes text, capped at 4 MiB (VERIFIED: writing 6 MiB is
+  refused by byte count). 803 KB is the largest `events.jsonl` in the corpus.
+- **`process` is undefined** in a hooks module. No `process.stdout`, no
+  `process.cwd()`.
 - **One matcher-less registration per event per module.** Registering
   `session.start` twice is refused outright, which is why the band's session
   start is an exported `startBand($)` the pane awaits inside the handler it
   already has, rather than a second `on('session.start')`.
+- **A `command.run` matcher must equal the registered command name.** They were
+  `'agent-smith'` and `'radar'` for one commit, which fails silently: the pane
+  simply never opens.
 - **`$` may only be passed to a top-level function declaration**, and a
   registration callback may not return a value the caller keeps. Hence
   `fsOf($)` builds an object of arrow functions rather than passing `$`.
@@ -298,17 +374,20 @@ All VERIFIED with `claude plugin validate` / `claude plugin test`, not assumed:
 
 The band owns `hooks/band.ts`, `hooks/jobs.ts`, and § BAND of `hooks/register.tsx`
 (plus the four `PluginState` atoms it adds). It does **not** touch
-`hooks/format.ts`, `hooks/job-source.ts`, `hooks/stale.ts`,
-`hooks/__tests__/format.test.ts`, or § PANE. The band↔pane coupling is two
-statements in `register`:
+`hooks/format.ts`, `hooks/stale.ts`, `hooks/__tests__/format.test.ts`, or
+§ PANE. The band↔pane coupling is three statements in `register`:
 
 ```ts
 registerBand(on);   // registers the band's render hook + dispatch poll
 // …inside the pane's own session.start:
-await startBand($); // the band's config, first poll, and two clocks
+await startBand($, e.cwd); // the band's config, first poll, and two clocks
 ```
 
-Deleting both leaves the pane working unchanged.
+…and one shared atom. § PANE reads `bandConfig.repo` rather than `$.cwd`, because
+`$.cwd` is refused and the session cwd has to be captured somewhere; sharing the
+atom is what stops the band and the pane watching different repos.
+
+Deleting the band leaves the pane working unchanged.
 
 ## Coupling to the rest of the repo
 

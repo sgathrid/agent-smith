@@ -39,7 +39,6 @@
 import { atom, read, update } from 'claude-code';
 import type { EngineInterface, Register, UiComponents, UiRenderEvent } from 'claude-code';
 
-import { stripSystemNotifications as stripProbe } from './jobs.ts';
 import type { RadarJob } from '../types/index.d.ts';
 import {
   EMPTY_STATE,
@@ -288,24 +287,6 @@ export async function startBand($: EngineInterface, cwd?: string): Promise<void>
   $.clock.every(POLL_MS, () => {
     void pollBand($).catch(() => {});
   });
-  const _probe = async () => {
-    await pollBand($).catch(() => {});
-    const cfg = await read($, bandConfig);
-    const jobs = await readAllJobs(fsOf($), cfg.repo, await $.clock.now());
-    const detail = await readJob(fsOf($), cfg.repo, jobs[0]?.id ?? '', await $.clock.now());
-    const hist = await readToolHistory(fsOf($), cfg.repo, jobs[0]?.id ?? '');
-    const lines = [
-      'repo=' + cfg.repo, 'jobCount=' + jobs.length,
-      'first=' + (jobs[0]?.id ?? 'none') + ' status=' + (jobs[0]?.status ?? '?') + ' tools=' + String(jobs[0]?.toolCount),
-      'reportLen=' + String(detail?.report?.length ?? null),
-      'historyLen=' + String(hist.length) + ' firstTool=' + (hist[0]?.tool ?? 'none') + ' label=' + (hist[0]?.label ?? ''),
-      'summary=' + JSON.stringify(countSummary(jobs)),
-      'sortHead=' + sortJobs(jobs).slice(0, 4).map((j) => j.id + ':' + j.status).join(' '),
-      'stripped=' + JSON.stringify(stripProbe(detail?.report ?? null)),
-    ];
-    await $.fs.write('/private/var/folders/k7/0rzr3dqs285dr7xdltk5w6340000gn/T/opencode/modran.txt', lines.join('\n')).catch(() => {});
-  };
-  await _probe().catch(() => {});
 }
 
 // ── the band's remaining registrations ─────────────────────────────────────
@@ -430,7 +411,6 @@ export const register: Register = (on) => {
   // a name collision is acceptable; losing the whole mod is not.
   on('session.start', async ($, e, next) => {
     const rest = await next(e);
-    await $.fs.write('/private/var/folders/k7/0rzr3dqs285dr7xdltk5w6340000gn/T/opencode/modran.txt', 'REACHED session.start cwd=' + String(e.cwd) + '\n').catch(() => {});
     // Band first, and it never throws: a slow or failing band config must not
     // delay `/agent-smith` appearing or take the session's start with it.
     await startBand($, typeof e.cwd === 'string' ? e.cwd : undefined);

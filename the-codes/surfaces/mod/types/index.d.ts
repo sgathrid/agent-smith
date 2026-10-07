@@ -16,10 +16,10 @@
  *   - activity, one terse phrase for the most recent tool
  *   - a start time, derived from the worker-started line in .log
  *
- * So `projectRadarJob()` (job-source.ts) is the single place that turns one
- * observed job plus its events file into one drawable row. Keeping the mapping
- * in one function is what makes the band and the pane incapable of disagreeing
- * about what a job looks like.
+ * So `resolve()` (hooks/jobs.ts) is the single place that turns one job on disk
+ * into one drawable row. Keeping the mapping in one function is what makes the
+ * band and the pane incapable of disagreeing about what a job looks like — and
+ * `resolve()` is the ONLY function that decides status, for either surface.
  */
 
 // ── the pane's row shape ────────────────────────────────────────────────────
@@ -88,7 +88,12 @@ export interface RadarJob {
 
   /**
    * The de-polluted final report, or null.
-   * Already run through harness's stripSystemNotifications() (hazard C).
+   *
+   * Run through `stripSystemNotifications()` (hazard C). Populated only when the
+   * reader is asked for it — the pane's detail view asks, the band does not,
+   * because the band would otherwise re-read 256 KB of markdown every 3 s to
+   * draw a six-character line. `null` therefore means "not requested" as well as
+   * "nothing there", and the band must never read it.
    */
   readonly report: string | null;
 
@@ -148,6 +153,11 @@ declare module 'claude-code' {
        * Resolved once at session start: which repo to watch, and whether colour
        * is allowed (NO_COLOR / FORCE_COLOR / TERM=dumb). Re-reading env per frame
        * would be a pointless syscall per redraw.
+       *
+       * THE PANE READS `repo` FROM HERE TOO, and that is the point. `$.cwd` is
+       * refused by the mod loader, so the session cwd has to be captured once and
+       * folded in here; the pane reading the result means the band and the pane
+       * cannot end up pointed at different repos.
        */
       bandConfig: { repo: string; colour: boolean };
     };

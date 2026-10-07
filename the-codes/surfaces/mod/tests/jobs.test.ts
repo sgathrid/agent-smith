@@ -39,10 +39,15 @@ import {
   looksEmpty,
   parseLog,
   readAllJobs,
+  readJob,
+  readToolHistory,
+  reportBody,
   resolve,
   sortForBand,
+  stripSystemNotifications,
   toEpoch,
   toolCountFromEvents,
+  toolHistoryFromEvents,
   type FsLike,
 } from '../hooks/jobs.ts';
 
@@ -67,7 +72,10 @@ class FakeFs implements FsLike {
   // strips types without transforming syntax, and a parameter property is a
   // syntax feature, not a type. VERIFIED: "TypeScript parameter property is not
   // supported in strip-only mode".
-  private readonly files: Map<string, string>;
+  //
+  // Readable rather than private so a test can ask "does this corpus job exist
+  // here?" instead of try/catching around a read to find out.
+  readonly files: Map<string, string>;
 
   constructor(files: Map<string, string>) {
     this.files = files;
@@ -497,6 +505,113 @@ test('sortForBand puts live jobs first, newest first within each group', () => {
     sorted.map((j) => j.id),
     ['live-b', 'live-a', 'done-new', 'done-old'],
   );
+});
+
+// ── the pane's capability, absorbed from the deleted ./job-source.ts ─────────
+//
+// These four tests exist because that file used to be a SECOND READER and is now
+// part of this one. They are the regression guard on the merge: the report, the
+// tool history and the status agreement between the two surfaces all have to
+// still hold, and they have to hold for the SAME job.
+
+test('the report is available to the pane, and the band declines it', async () => {
+  // The capability that made job-source.ts worth keeping: the detail view renders
+  // result.md. Note the flag — the band reads the SAME job and gets null, because
+  // it would otherwise re-read 256 KB of markdown on a 3 s poll forever. Status
+  // must be identical either way; that is the invariant, and it is asserted here.
+  //
+  // A TERMINAL fixture, because a still-running job has no result.md to show. The
+  // empty-report case is the one where `done` is a lie, and it is covered below.
+  const fs = fsFromDir(path.join(FIXTURES, 'agy-clean-success'));
+  const id = 'implement-clean01-aaaaaaaa';
+  const now = Date.now();
+
+  const withReport = await readJob(fs, '/repo', id, now);
+  const without = await resolve(fs, jobsDir('/repo'), id, now);
+  const band = await resolve(fs, jobsDir('/repo'), id, now, false);
+
+  assert.ok(withReport !== null, 'the job exists');
+  assert.ok(withReport.report !== null && withReport.report.length > 0, 'the pane gets the body');
+  assert.equal(without?.report, null, 'the band gets none');
+  assert.equal(without?.status, withReport.status, 'and the two agree on status');
+  assert.equal(band?.status, withReport.status, 'the flag does not move the status');
+});
+
+test('a report that is only system_notifications is no report at all', () => {
+  // HAZARD C against the pane rather than against emptiness. The detail view would
+  // otherwise open on twelve notification blocks and call them the deliverable.
+  const polluted = '<system_notification>noise</system_notification>\n<system_notification>more</system_notification>\n';
+  assert.equal(reportBody(polluted), null);
+  assert.equal(reportBody('   \n\n'), null);
+  assert.equal(reportBody(null), null);
+  // And a real body with pollution in front of it survives the strip.
+  assert.equal(reportBody('<system_notification>x</system_notification>\n\n## Real\n'), '## Real');
+});
+
+test('stripSystemNotifications is exported, and the pane does not carry its own copy', () => {
+  // There is exactly one de-polluter in the mod. The pane used to reach
+  // job-source.ts for its re-export; that path is gone, so if this ever needs a
+  // second copy it has to be written here on purpose.
+  assert.equal(stripSystemNotifications('<system_notification>x</system_notification>hi'), 'hi');
+  assert.equal(stripSystemNotifications('<system_notification>unclosed'), '<system_notification>unclosed');
+});
+
+test('the tool history keeps DONE records only, and the newest N', async () => {
+  // agy-staff emits an ACTIVE and a DONE record per step with identical tool and
+  // parameters. Rendering both reads as the tool having run twice, which is the
+  // single easiest way for a history pane to lie.
+  const fs = fsFrom({
+    'h-00000000.spec.json': '{"resolved":{"mode":"implement"}}',
+    'h-00000000.events.jsonl':
+      [
+        '{"event":"init"}',
+        '{"step_update":{"step_index":1,"state":"ACTIVE","step_type":"tool","tool_name":"view_file","tool_info":{"parameters":{"AbsolutePath":"/r/a.rs"}}}}',
+        '{"step_update":{"step_index":1,"state":"DONE","step_type":"tool","tool_name":"view_file","tool_info":{"parameters":{"AbsolutePath":"/r/a.rs"},"output":"ok"}}}',
+        '{"step_update":{"step_index":2,"state":"DONE","step_type":"tool","tool_name":"run_command","tool_info":{"parameters":{"CommandLine":"cargo test"},"output":"passed"}}}',
+        '{"step_update":{"step_index":3,"state":"DONE","step_type":"text","tool_name":"nope"}}',
+        '{"step_upda',
+      ].join('\n'),
+  });
+  const history = await readToolHistory(fs, '/repo', 'h-00000000');
+
+  assert.deepEqual(
+    history.map((h) => h.tool),
+    ['view_file', 'run_command'],
+    'ACTIVE dropped, non-tool steps dropped, half-written line survived',
+  );
+  assert.equal(history[0]?.label, 'reading a.rs', 'phrased by format.ts, like the band');
+  assert.equal(history[1]?.output, 'passed');
+});
+
+test('tool history is capped at 20 and read from a real events.jsonl', async (t) => {
+  const fs = fsFromCorpus(CORPUS, '/corpus');
+  const id = 'implement-muro9n3j-56a13226';
+  if (!fs.files.has(`${jobsDir('/corpus')}/${id}.events.jsonl`)) {
+    t.skip(`corpus job ${id} not present`);
+    return;
+  }
+  const history = await readToolHistory(fs, '/corpus', id);
+  assert.ok(history.length > 0, 'a real job has a real history');
+  assert.ok(history.length <= 20, `capped, got ${history.length}`);
+  // And the count on the row agrees with the file, because both read the same
+  // bytes now instead of one of them reading harness and the other reading disk.
+  const job = await resolve(fs, jobsDir('/corpus'), id, Date.now());
+  assert.ok(job !== null && job.toolCount !== null && job.toolCount > 0);
+});
+
+test('toolHistoryFromEvents is PURE and returns oldest-first', () => {
+  // The pane draws the history newest-last, so ordering is a rendering contract,
+  // and this asserts it without a filesystem at all.
+  const body = [
+    '{"step_update":{"step_index":1,"state":"DONE","step_type":"tool","tool_name":"list_dir","tool_info":{"parameters":{"AbsolutePath":"/r"}}}}',
+    '{"step_update":{"step_index":2,"state":"DONE","step_type":"tool","tool_name":"grep_search","tool_info":{"parameters":{"Query":"fn main"}}}}',
+  ].join('\n');
+  assert.deepEqual(
+    toolHistoryFromEvents(body).map((h) => h.tool),
+    ['list_dir', 'grep_search'],
+  );
+  assert.deepEqual(toolHistoryFromEvents(''), []);
+  assert.deepEqual(toolHistoryFromEvents('not json at all'), []);
 });
 
 // ── resilience ─────────────────────────────────────────────────────────────
