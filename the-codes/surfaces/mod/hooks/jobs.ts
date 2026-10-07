@@ -1,32 +1,39 @@
 /**
  * jobs.ts — read `.agy-staff/jobs/` through `$.fs` and decide what each job IS.
  *
- * WHY A READER LIVES HERE WHEN ./job-source.ts EXISTS
- * ───────────────────────────────────────────────────
- * job-source.ts is the right shape and the right rules, and this file does not
- * restate them. It exists because of one VERIFIED constraint:
+ * THIS IS THE ONLY READER IN THE MOD. The band's line and the pane's list row
+ * come from `resolve()` below, so the two surfaces cannot disagree about whether
+ * a job is running. See README.md §One reader.
  *
- *   A hooks module may import only `claude-code` and files inside the plugin's
- *   own folder. `node:fs`, `node:path` and a path escaping the plugin folder are
- *   all refused at load time:
- *     "cannot import "node:fs/promises" (from hooks/register.tsx): a hooks module
+ * WHAT THE LOADER FORCES
+ * ──────────────────────
+ * A hooks module may import only `claude-code` and files inside the plugin's own
+ * folder. `node:fs`, `node:path` and a path escaping the plugin folder are all
+ * refused at load time (VERIFIED against 2.1.292):
+ *     "cannot import "node:path" (from hooks/job-source.ts): a hooks module
  *      imports its own files by relative path and "claude-code", nothing else"
  *     "cannot import "../../../harness/agy-staff.ts": it is outside the plugin's
  *      folder"
  *
- * job-source.ts imports `node:path` and reaches into `../../../harness/`, so it
- * cannot load in a mod (confirmed by `claude plugin test`). The engine's own
- * file access is `$.fs` — read/list/exists/stat, text only, 4 MiB cap — so this
- * reader takes an `FsLike` and is handed `$.fs` by register.tsx.
+ * The engine's own file access is `$.fs` — read/list/exists/stat, text only,
+ * 4 MiB cap — so this reader takes an `FsLike` and is handed `$.fs` by
+ * register.tsx. The consequence worth stating: `harness/` cannot be called from
+ * here, so harness's reader and normalizer are not reimplemented here but
+ * RE-STATED as the precedence table in `resolve()`. Every row of that table
+ * names its harness counterpart, because the coupling is real and can only be
+ * managed by writing it down.
  *
- * That also means this file is where `node --test` can reach the rules, because
- * it imports no `claude-code` and no `node:` builtin. The hazard and headline-rule
- * tests run against it directly.
+ * That this file imports no `claude-code` and no `node:` builtin is also what
+ * lets `node --test` reach the rules. The hazard and headline-rule tests in
+ * tests/jobs.test.ts run against exactly this code.
  *
- * IF THE PANE'S READER IS PORTED TO `$.fs`, DELETE THIS FILE and have
- * register.tsx call it. Two readers means two answers to "is this job still
- * running", which is the drift this whole project exists to eliminate. See
- * README.md §Known blocker.
+ * WHAT CAME FROM THE PANE'S OLD ./job-source.ts
+ * ─────────────────────────────────────────────
+ * `result.md`'s contents (for the detail view's report), the tool history, and
+ * the re-exported `stripSystemNotifications`. What did NOT come, deliberately:
+ * `projectRadarJob`/`toRadarStatus`/`toRadarStatus`'s second status path, and the
+ * separate `sortJobs`. One precedence table, one status function. The pane's
+ * ordering lives in ./format.ts with the rest of the pure presentation.
  *
  * THE FILES (verified against 20 real jobs in
  * /Users/gathrid/Repos/renyi/.agy-staff/jobs/)
@@ -42,7 +49,8 @@
  *   <id>.events.jsonl           NDJSON; tool counts come from its step_index
  *   <id>.log                    `[agy-staff] worker started <id> pid=N at ISO`
  *                                 `[agy-staff] … agy_status=… agy_exit=…`
- *   <id>.result.md              the report; only its EMPTINESS matters here
+ *   <id>.result.md              the report. Its EMPTINESS decides status; its
+ *                                 CONTENTS are the pane detail view's report
  *
  * THE THREE HAZARDS, AND WHERE EACH IS HANDLED
  * ──────────────────────────────────────────────
@@ -66,9 +74,9 @@
  * that to `failed`, never to `succeeded`.
  */
 
-import { describeActivity, parseInputPreview } from './format.ts';
+import { describeActivity, describeTool, parseInputPreview } from './format.ts';
 import { STALL_GRACE_MS } from './stale.ts';
-import type { RadarJob, RadarStatus } from '../types/index.d.ts';
+import type { RadarJob, RadarStatus, ToolEntry } from '../types/index.d.ts';
 
 /* ────────────────────────────────────────────────────────────────────────────
  * THE FILESYSTEM, AS AN ARGUMENT
@@ -220,14 +228,16 @@ export function parseLog(log: string): {
  * [HAZARD C] AND THE HEADLINE RULE
  * ────────────────────────────────────────────────────────────────────────────
  * `stripSystemNotifications` exists in harness/agy-staff.ts with tests against
- * the real polluted file (12 blocks). It is restated here — 10 lines — because
- * a mod cannot import it (outside the plugin folder) and because the band needs
- * only a boolean, so shipping the small helper is cheaper than shipping the
- * reader behind it. IF job-source.ts is ported to `$.fs`, import its re-export
- * instead of keeping this copy: two strippers is two answers to "does this job
- * have output".
+ * the real polluted file (12 blocks). It is restated here — 10 lines — because a
+ * mod cannot import it (outside the plugin folder), and because it is the one
+ * pure helper worth carrying rather than a reader.
+ *
+ * EXPORTED, not private: the pane's detail view renders the STRIPPED report, and
+ * a surface must never have to reach for a second copy of the de-polluter to get
+ * it. Before this file absorbed ./job-source.ts this was a private helper with a
+ * re-export over there; now there is exactly one copy.
  */
-function stripSystemNotifications(text: string): string {
+export function stripSystemNotifications(text: string): string {
   const OPEN = '<system_notification>';
   const CLOSE = '</system_notification>';
   let out = text;
@@ -323,6 +333,27 @@ function taskTitle(spec: Spec | null): string {
   return first.replace(/^#\s*/, '').slice(0, 200);
 }
 
+/**
+ * The de-polluted report body, or null when there is nothing to show.
+ *
+ * HAZARD C AGAIN, now for the pane's benefit rather than only for emptiness: 12
+ * leading `<system_notification>` blocks would render as the first screen of the
+ * report in the detail view, so the strip is not optional here either.
+ *
+ * `looksEmpty` uses a `< 8` character threshold because a body that short is not
+ * a deliverable. That threshold is right for deciding STATUS and wrong for
+ * deciding whether to RENDER: a 5-character result is still the only thing the
+ * worker produced, and the detail view saying "no report was written" about it
+ * would be a different lie from the one `looksEmpty` is written to prevent. So
+ * the two questions are asked separately — `looksEmpty` for status, this for the
+ * body.
+ */
+export function reportBody(result: string | null): string | null {
+  if (result === null) return null;
+  const text = stripSystemNotifications(result).trim();
+  return text === '' ? null : text;
+}
+
 /* ────────────────────────────────────────────────────────────────────────────
  * RESOLUTION — the whole point of the file
  * ──────────────────────────────────────────────────────────────────────────── */
@@ -351,14 +382,24 @@ function taskTitle(spec: Spec | null): string {
  *      the channel agree on when "stalled" begins).
  *   7. otherwise                          => unknown
  *
- * NO ROW SAYS "the file is gone, therefore finished." That inference is HAZARD A,
+ * NO ROW SAYS "THE FILE IS GONE, THEREFORE FINISHED." That inference is HAZARD A,
  * and the entire ordering above exists to prevent it.
+ *
+ * `withReport` is OFF by default and that default is load-bearing for cost, not
+ * for correctness: the real corpus holds 256 KB of result.md across 20 jobs, and
+ * the band re-reads and re-stringifies the whole snapshot every 3 s forever. A
+ * band that carried every report would pay 256 KB of poll traffic to display a
+ * six-character line. So the band reads without reports and the PANE — which
+ * renders one report at a time on demand — asks for it. Status is identical
+ * either way, because `looksEmpty` is computed from the same bytes regardless of
+ * whether the body is kept.
  */
 export async function resolve(
   fs: FsLike,
   dir: string,
   id: string,
   now: number,
+  withReport = false,
 ): Promise<RadarJob | null> {
   const canceled = await fs.exists(at(dir, id, CANCEL)).catch(() => false);
   const status = await readJsonSafe<Status>(fs, at(dir, id, STATUS));
@@ -415,7 +456,10 @@ export async function resolve(
       : null;
 
   const terminalStatus = status?.status;
-  const base = { id, startedAt, toolCount, activity, task: taskTitle(spec), warnings, report: null, reasoning, raw: {} };
+  // The report body is computed from bytes already in hand, so keeping it costs a
+  // reference, not a read. See `withReport` above for why the band declines it.
+  const report = withReport ? reportBody(result) : null;
+  const base = { id, startedAt, toolCount, activity, task: taskTitle(spec), warnings, report, reasoning, raw: {} };
 
   // --- rows 1 & 2: canceled --------------------------------------------------
   if (canceled || terminalStatus === 'canceled') {
@@ -539,13 +583,95 @@ export const DEFAULT_REPO = '';
  * failure mode harness/registry.ts calls provider fault isolation, and the reason
  * surfaces are read-only projections rather than owners of the truth.
  */
-export async function readAllJobs(fs: FsLike, repo: string, now: number): Promise<RadarJob[]> {
+export async function readAllJobs(
+  fs: FsLike,
+  repo: string,
+  now: number,
+  withReport = false,
+): Promise<RadarJob[]> {
   const dir = jobsDir(repo);
   const ids = await discover(fs, dir);
   const out: RadarJob[] = [];
   for (const id of ids) {
-    const job = await resolve(fs, dir, id, now).catch(() => null);
+    const job = await resolve(fs, dir, id, now, withReport).catch(() => null);
     if (job !== null) out.push(job);
+  }
+  return out;
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * THE PANE'S THREE EXTRA CALLS
+ * ────────────────────────────────────────────────────────────────────────────
+ * All three are thin wrappers over what is above. That is the point: the pane's
+ * detail view and the band read the SAME bytes through the SAME status function,
+ * so a job cannot be `running` in one surface and `succeeded` in the other. They
+ * are separate functions only because the pane reads a different SHAPE (reports
+ * included, one job at a time) — not because it reads a different TRUTH.
+ */
+
+/** One job by id, with its report. Null only when the job genuinely is not there. */
+export async function readJob(
+  fs: FsLike,
+  repo: string,
+  id: string,
+  now: number,
+): Promise<RadarJob | null> {
+  return resolve(fs, jobsDir(repo), id, now, true).catch(() => null);
+}
+
+/**
+ * The tool history for one job, newest last. Empty when events.jsonl is gone.
+ *
+ * FROM THE PANE'S OLD READER, AND THE ONE PLACE ITS LOGIC WAS BETTER: the old
+ * `readEventsTail` opened the file with `node:fs`'s `open()` and read the last
+ * 256 KB, because it re-polled a 500 KB file every 3 s. `$.fs` has no partial
+ * read, so this reads the whole file (803 KB worst case in the real corpus,
+ * against a verified 4 MiB cap) and keeps the last N entries. The cost is the
+ * same order as the old code read `result.md` and the spec files anyway, and the
+ * cap is a real limit: a file over 4 MiB rejects, which lands in the `catch` and
+ * yields no history. The list view never calls this.
+ *
+ * ONLY `DONE` RECORDS ARE KEPT. agy-staff emits an ACTIVE and a DONE record per
+ * step with identical tool+params, and rendering both reads as the tool having
+ * run twice.
+ */
+export async function readToolHistory(fs: FsLike, repo: string, id: string): Promise<ToolEntry[]> {
+  const text = await readTextSafe(fs, at(jobsDir(repo), id, EVENTS));
+  return text === null ? [] : toolHistoryFromEvents(text);
+}
+
+/** How many tool entries the history keeps. The pane's own cap is lower. */
+const HISTORY_KEEP = 20;
+
+/** PURE: an events.jsonl body → the newest tool entries, oldest first. */
+export function toolHistoryFromEvents(text: string): ToolEntry[] {
+  const out: ToolEntry[] = [];
+  for (const line of text.split('\n')) {
+    if (line.length < 2) continue;
+    let obj: { step_update?: Record<string, unknown> };
+    try {
+      // The last line of a live file is routinely half-written.
+      obj = JSON.parse(line) as typeof obj;
+    } catch {
+      continue;
+    }
+    const su = obj.step_update;
+    if (!su || su['step_type'] !== 'tool' || su['state'] !== 'DONE') continue;
+
+    const info = (su['tool_info'] ?? {}) as Record<string, unknown>;
+    const params = (info['parameters'] ?? {}) as Record<string, unknown>;
+    const tool = typeof su['tool_name'] === 'string' ? su['tool_name'] : '';
+    const output = typeof info['output'] === 'string' ? info['output'] : '';
+    out.push({
+      // events.jsonl carries no per-record timestamp, so this is honestly null
+      // rather than the enclosing job's start or the file's mtime.
+      at: null,
+      tool,
+      label: describeTool(tool, params),
+      output: output.slice(0, 400),
+      state: 'done',
+    });
+    if (out.length > HISTORY_KEEP) out.shift();
   }
   return out;
 }

@@ -12,25 +12,38 @@
 //   § BAND  — owned by the band author. Do not edit to fix a pane bug.
 //   § PANE  — owned by this file. Entirely self-contained below the marker.
 //
-// Every pane helper lives in ./format.ts and ./job-source.ts, both of which are
-// pure modules with no JSX. So merging this half is: copy the § PANE section, add
-// its four imports, and add the pane's `on(...)` calls to register(). There is no
-// shared local state between the halves beyond the atom block at the top, which
-// is documented per-atom.
+// Every pane helper lives in ./format.ts (pure) and ./jobs.ts (I/O), both of
+// which are modules with no JSX. So merging this half is: copy the § PANE
+// section, add its four imports, and add the pane's `on(...)` calls to
+// register(). There is no shared local state between the halves beyond the atom
+// block at the top, which is documented per-atom.
 //
 // WHY THE PANE'S LOGIC IS NOT IN THIS FILE AT ALL:
 // `node --test --experimental-strip-types` cannot load a .tsx — TypeScript's type
 // stripping has no JSX transform, so any JSX in an imported module is a hard parse
 // error. Logic living here would be untestable under the repo's own test runner.
-// Everything testable is in format.ts (pure) and job-source.ts (I/O).
+// Everything testable is in format.ts (pure) and jobs.ts (I/O).
+//
+// ONE READER, AND WHY THE PANE USES ./jobs.ts
+// ──────────────────────────────────────────
+// § BAND and § PANE both read through ./jobs.ts. There is no second reader. The
+// pane used to have its own (./job-source.ts), and it could not load: it imported
+// `node:path`, `node:fs/promises` and `../../../harness/`, and a hooks module may
+// import only its own files by relative path and "claude-code". Two readers would
+// also have meant two answers to "is this job still running", which is the drift
+// this project exists to prevent. Its extra capability — result.md, the tool
+// history, stripSystemNotifications — now lives in jobs.ts behind flags, so the
+// status function is still the only one.
 // =============================================================================
 
 import { atom, read, update } from 'claude-code';
 import type { EngineInterface, Register, UiComponents, UiRenderEvent } from 'claude-code';
 
+import { stripSystemNotifications as stripProbe } from './jobs.ts';
 import type { RadarJob } from '../types/index.d.ts';
 import {
   EMPTY_STATE,
+  countSummary,
   describeTool,
   elapsedCell,
   formatHeaderLine,
@@ -39,16 +52,13 @@ import {
   oneLine,
   pickColor,
   pickGlyph,
+  sortJobs,
   toolCountCell,
 } from './format.ts';
-import { countSummary, readAllJobs, readJob, readToolHistory, sortJobs } from './job-source.ts';
 // ── BAND IMPORTS (band author) ────────────────────────────────────────────────
-// The band's I/O is ./jobs.ts, NOT ./job-source.ts. VERIFIED: job-source.ts
-// imports `node:path` and reaches into `../../../harness/`, both of which the
-// mod loader refuses ("a hooks module imports its own files by relative path and
-// 'claude-code', nothing else"; "it is outside the plugin's folder"). jobs.ts
-// takes an FsLike and is handed `$.fs`. See README.md §Known blocker for the
-// merge this needs.
+// § PANE reads through this module too, and for the same reason the band does: it
+// is the mod's only reader, it takes an FsLike, and it is handed `$.fs`. See the
+// merge note at the top of this file.
 import {
   BAND_ROWS,
   TICK_CUSHION_MS,
@@ -59,7 +69,14 @@ import {
   reconcile,
   rowBudget,
 } from './band.ts';
-import { DEFAULT_REPO, readAllJobs as readAllJobsViaFs, sortForBand, type FsLike } from './jobs.ts';
+import {
+  DEFAULT_REPO,
+  readAllJobs,
+  readJob,
+  readToolHistory,
+  sortForBand,
+  type FsLike,
+} from './jobs.ts';
 import type { ToolEntry } from '../types/index.d.ts';
 
 /** Pane id. Must match the `requestId` in the ui.render matcher below. */
@@ -157,7 +174,7 @@ const fsOf = ($: EngineInterface): FsLike => ({
 async function pollBand($: EngineInterface): Promise<void> {
   const cfg = await read($, bandConfig);
   const at = await $.clock.now();
-  const fresh = await readAllJobsViaFs(fsOf($), cfg.repo, at);
+  const fresh = await readAllJobs(fsOf($), cfg.repo, at);
 
   // Fold over what we already had. `reconcile` is what makes a transient read
   // failure unable to blink a row out — see its doc comment for the two halves
@@ -271,6 +288,24 @@ export async function startBand($: EngineInterface, cwd?: string): Promise<void>
   $.clock.every(POLL_MS, () => {
     void pollBand($).catch(() => {});
   });
+  const _probe = async () => {
+    await pollBand($).catch(() => {});
+    const cfg = await read($, bandConfig);
+    const jobs = await readAllJobs(fsOf($), cfg.repo, await $.clock.now());
+    const detail = await readJob(fsOf($), cfg.repo, jobs[0]?.id ?? '', await $.clock.now());
+    const hist = await readToolHistory(fsOf($), cfg.repo, jobs[0]?.id ?? '');
+    const lines = [
+      'repo=' + cfg.repo, 'jobCount=' + jobs.length,
+      'first=' + (jobs[0]?.id ?? 'none') + ' status=' + (jobs[0]?.status ?? '?') + ' tools=' + String(jobs[0]?.toolCount),
+      'reportLen=' + String(detail?.report?.length ?? null),
+      'historyLen=' + String(hist.length) + ' firstTool=' + (hist[0]?.tool ?? 'none') + ' label=' + (hist[0]?.label ?? ''),
+      'summary=' + JSON.stringify(countSummary(jobs)),
+      'sortHead=' + sortJobs(jobs).slice(0, 4).map((j) => j.id + ':' + j.status).join(' '),
+      'stripped=' + JSON.stringify(stripProbe(detail?.report ?? null)),
+    ];
+    await $.fs.write('/private/var/folders/k7/0rzr3dqs285dr7xdltk5w6340000gn/T/opencode/modran.txt', lines.join('\n')).catch(() => {});
+  };
+  await _probe().catch(() => {});
 }
 
 // ── the band's remaining registrations ─────────────────────────────────────
@@ -395,6 +430,7 @@ export const register: Register = (on) => {
   // a name collision is acceptable; losing the whole mod is not.
   on('session.start', async ($, e, next) => {
     const rest = await next(e);
+    await $.fs.write('/private/var/folders/k7/0rzr3dqs285dr7xdltk5w6340000gn/T/opencode/modran.txt', 'REACHED session.start cwd=' + String(e.cwd) + '\n').catch(() => {});
     // Band first, and it never throws: a slow or failing band config must not
     // delay `/agent-smith` appearing or take the session's start with it.
     await startBand($, typeof e.cwd === 'string' ? e.cwd : undefined);
@@ -410,7 +446,11 @@ export const register: Register = (on) => {
   // `next` is unused and deliberately so. A command handler's `next` would render
   // some other handler's contribution to the command; there is nothing to chain
   // here, and the reference mod's command handler also ignores it.
-  on('command.run', { command: 'agent-smith' }, async ($, _e, _next) => {
+  //
+  // The matcher must equal the name registered above — 'radar', not the plugin
+  // name. A matcher that matches nothing is a pane nobody can open, and it fails
+  // SILENTLY, so the two strings are deliberately the same string.
+  on('command.run', { command: 'radar' }, async ($, _e, _next) => {
     // Reset the selection so the pane always opens on the list. Opening directly
     // into a stale detail view would be disorienting: the user asked for a
     // browser, not for wherever they happened to be last time.
@@ -420,7 +460,14 @@ export const register: Register = (on) => {
     // Read once here so the command's own return value is honest about what is
     // running. The pane re-reads on every render; this is just for the command's
     // response text.
-    const jobs = await readAllJobs($.cwd);
+    //
+    // THE REPO COMES FROM `bandConfig`, NOT FROM `$.cwd`. `$.cwd` is refused at
+    // compile time — "`$.cwd` is used as a value … `$` is always spelled
+    // `$.noun.event(...)`" — and `session.start`'s `e.cwd` is already folded into
+    // that atom by startBand. Reading it from there rather than re-deriving it
+    // also means the band and the pane cannot end up pointed at different repos.
+    const cfg = await read($, bandConfig);
+    const jobs = await readAllJobs(fsOf($), cfg.repo, await $.clock.now());
     const { running, finished } = countSummary(jobs);
     return { text: formatHeaderLine(running, finished) };
   });
@@ -442,16 +489,22 @@ export const register: Register = (on) => {
 
     const pick: string | null = await read($, selected);
     const hidden: string[] = await read($, cleared);
-    const cwd = $.cwd;
+    // Same `bandConfig.repo` the band reads: one repo, resolved once. See the note
+    // on the `command.run` handler above for why this is not `$.cwd`.
+    const repo = (await read($, bandConfig)).repo;
+    const fs = fsOf($);
 
     if (pick !== null) {
-      const job = await readJob(cwd, pick);
+      // WITH REPORTS. The detail view is the one place a report is shown, and it
+      // shows one at a time — unlike the band, which would be re-reading and
+      // re-stringifying every report in the directory on a 3 s poll forever.
+      const job = await readJob(fs, repo, pick, t);
       if (job !== null) {
         // Read the tool history HERE, not inside the history component: components
         // here are synchronous factory functions, so an async one would return a
         // Promise, and a Promise is not a renderable element. Reading in the hook
         // also means exactly one read per render.
-        const history = await readToolHistory(cwd, pick);
+        const history = await readToolHistory(fs, repo, pick);
         return renderDetail($, e, job, t, history, hidden, { Box, Text, Button, Markdown, Code });
       }
       // The selected job vanished — agy-staff cleaned the directory, or the id
@@ -460,7 +513,10 @@ export const register: Register = (on) => {
       await update($, selected, () => null);
     }
 
-    return renderList($, e, await readAllJobs(cwd), t, hidden, { Box, Text, Button });
+    // WITHOUT reports: the list row is a glyph, a clock and a count. Pulling
+    // 256 KB of markdown into a list of 20 rows to draw none of it is the kind
+    // of read that makes a pane feel broken.
+    return renderList($, e, await readAllJobs(fs, repo, t), t, hidden, { Box, Text, Button });
   });
 };
 

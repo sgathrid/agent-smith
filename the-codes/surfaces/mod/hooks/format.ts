@@ -211,6 +211,54 @@ export function formatHeaderLine(running: number, finished: number): string {
 /** The literal empty state. No box, no spinner, no second line. */
 export const EMPTY_STATE = 'No jobs yet';
 
+// ── list ordering, and the header counts ─────────────────────────────────────
+//
+// Both of these were the pane reader's job, and both are PURE: they take a list
+// of rows and return a list of rows. They live here rather than in ./jobs.ts
+// because jobs.ts is the I/O boundary and this file is the presentation boundary,
+// and a sort that needed to read a file to order rows would be a bug worth
+// hearing about.
+
+/**
+ * The order the PANE draws its list: running, then needs-you, then everything
+ * terminal, newest first in every group.
+ *
+ * THREE TIERS, NOT TWO, and `attention` is deliberately its own tier rather than
+ * grouped with `running`. The band groups them (both are live, and a band has no
+ * room to make a distinction it cannot then act on); the pane is a browser with
+ * a header and a footer, so a job that has gone quiet sorts directly under the
+ * ones still working — the second thing you read, which is where "you might want
+ * to look at this" belongs. The two surfaces differ in ORDER only, never in the
+ * status a row carries.
+ */
+export function sortJobs(jobs: readonly RadarJob[]): RadarJob[] {
+  const rank = (s: RadarStatus): number =>
+    s === 'running' ? 0 : s === 'attention' ? 1 : 2;
+  return [...jobs].sort((a, b) => {
+    const r = rank(a.status) - rank(b.status);
+    if (r !== 0) return r;
+    return (b.endedAt ?? b.startedAt ?? 0) - (a.endedAt ?? a.startedAt ?? 0);
+  });
+}
+
+/**
+ * The header's two numbers. `finished` is the remainder, so it includes canceled,
+ * failed and unknown.
+ *
+ * `attention` counts as RUNNING, not finished: it is still going, it has just
+ * gone quiet. Counting it under finished would tell the user a job is over at the
+ * exact moment they should be doing something about it.
+ */
+export function countSummary(jobs: readonly RadarJob[]): {
+  running: number;
+  finished: number;
+} {
+  const running = jobs.filter(
+    (j) => j.status === 'running' || j.status === 'attention',
+  ).length;
+  return { running, finished: jobs.length - running };
+}
+
 // ── activity, from real agy tool shapes ─────────────────────────────────────
 
 /**
