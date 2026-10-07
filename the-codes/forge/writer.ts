@@ -32,12 +32,16 @@
  * append-only event log. Those are the ones a reader is waiting on.
  */
 
-import { readFileSync } from 'node:fs';
+import { execFile } from 'node:child_process';
+import { readFileSync, statSync } from 'node:fs';
+import path from 'node:path';
 
 import { appendLine, createMarker, writeAtomic, writeJsonAtomic } from './atomic.ts';
 import {
   FILES,
   PROGRESS_FLUSH_MS,
+  diffChangedFiles,
+  isForgeStatePath,
   SCHEMA_VERSION,
   deriveStatus,
   jobFile,
@@ -45,6 +49,7 @@ import {
   shouldFlush,
   taskTitle,
   type ForgeActivity,
+  type GitBaseline,
   type ForgeManifest,
   type ForgeProgress,
   type ForgeStatus,
@@ -115,6 +120,11 @@ export class JobWriter {
   private conversation: string | null = null;
   private finished = false;
   private cancelRequestedAt: string | null = null;
+  private cwd = '';
+  private baselinePending: Promise<void> | null = null;
+  /** In-memory size:mtime signatures of baseline-dirty files, to detect further edits. */
+  private baselineSigs = new Map<string, string>();
+  private changed: { files: string[]; truncated: boolean } | null = null;
 
   constructor(options: JobWriterOptions) {
     this.repo = options.repo;
@@ -195,7 +205,41 @@ export class JobWriter {
     this.writeManifest();
     this.mirror.writeSpec(manifest);
     this.flushProgress(this.manifest.createdAt);
+    // Fire and forget: spawn never waits on git. Merged into the manifest when it lands.
+    this.cwd = input.cwd;
+    this.baselinePending = this.captureBaseline(input.cwd);
     return manifest;
+  }
+
+  private async captureBaseline(cwd: string): Promise<void> {
+    try {
+      const snap = await gitSnapshot(cwd);
+      if (snap === null || this.finished || this.manifest === null) return;
+      for (const p of snap.dirty.slice(0, CHANGED_FILES_SIG_CAP)) this.baselineSigs.set(p, fileSig(cwd, p));
+      this.manifest = { ...this.manifest, gitBaseline: { head: snap.head, dirty: snap.dirty } };
+      this.writeManifest();
+    } catch { /* best effort */ }
+  }
+
+  /**
+   * Compute `changedFiles` against the baseline. Call (awaited) just before
+   * `finish()`; finish stays synchronous. Bounded by the git ~2s cap, never throws.
+   */
+  async prepareFinish(): Promise<void> {
+    try {
+      if (this.baselinePending !== null) await this.baselinePending;
+      const base = this.manifest?.gitBaseline;
+      if (base === undefined || this.manifest === null) return;
+      const now = await gitSnapshot(this.cwd);
+      if (now === null) return;
+      const modified = base.dirty.filter(
+        (p) => now.dirty.includes(p) && this.baselineSigs.has(p) && this.baselineSigs.get(p) !== fileSig(this.cwd, p),
+      );
+      const committed = base.head !== null && now.head !== null && base.head !== now.head
+        ? await gitCommittedPaths(this.cwd, base.head, now.head)
+        : [];
+      this.changed = diffChangedFiles(base, now.dirty, modified, committed);
+    } catch { /* best effort */ }
   }
 
   /** Feed one normalized provider event into the snapshot. */
@@ -342,6 +386,9 @@ export class JobWriter {
       conversation: this.conversation,
       latestSummary: result.response.trim().slice(0, 1_000) || this.manifest.latestSummary || null,
       summarySource: result.response.trim() || this.manifest.latestSummary ? 'worker' : null,
+      ...(this.changed === null
+        ? {}
+        : { changedFiles: this.changed.files, changedFilesTruncated: this.changed.truncated }),
     };
     this.manifest = manifest;
 
@@ -466,6 +513,69 @@ export class JobWriter {
     this.mirror.writeProgress(this.manifest ?? emptyManifest(this.jobId), progress);
     const ms = Date.parse(at);
     this.lastFlushMs = Number.isNaN(ms) ? Date.now() : ms;
+  }
+}
+
+/* ── git baseline helpers ─────────────────────────────────────────────────── */
+
+const GIT_CAP_MS = 2_000;
+const CHANGED_FILES_SIG_CAP = 500;
+
+function git(cwd: string, args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      'git',
+      args,
+      { cwd, timeout: GIT_CAP_MS, maxBuffer: 8 * 1024 * 1024, env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' } },
+      (err, stdout) => (err ? reject(err) : resolve(stdout)),
+    );
+  });
+}
+
+/** HEAD + dirty paths, or null when cwd is not a git repo / git fails / is slow. */
+async function gitSnapshot(cwd: string): Promise<GitBaseline | null> {
+  try {
+    const [status, head] = await Promise.all([
+      git(cwd, ['status', '--porcelain=v1', '-z', '--untracked-files=all']),
+      git(cwd, ['rev-parse', '--verify', '-q', 'HEAD']).catch(() => ''),
+    ]);
+    return { head: head.trim() === '' ? null : head.trim(), dirty: parsePorcelainZ(status) };
+  } catch {
+    return null;
+  }
+}
+
+/** Parse `status --porcelain=v1 -z`: `XY path\0`, renames/copies add `orig\0`. Exported for tests. */
+export function parsePorcelainZ(out: string): string[] {
+  const parts = out.split('\0');
+  const paths = new Set<string>();
+  for (let i = 0; i < parts.length; i++) {
+    const e = parts[i] ?? '';
+    if (e.length < 4) continue;
+    const xy = e.slice(0, 2);
+    paths.add(e.slice(3));
+    if (xy.includes('R') || xy.includes('C')) {
+      const orig = parts[++i];
+      if (orig) paths.add(orig);
+    }
+  }
+  return [...paths].filter((p) => !isForgeStatePath(p)).sort();
+}
+
+async function gitCommittedPaths(cwd: string, from: string, to: string): Promise<string[]> {
+  try {
+    return (await git(cwd, ['diff', '--name-only', '-z', `${from}`, `${to}`])).split('\0').filter((p) => p !== '');
+  } catch {
+    return [];
+  }
+}
+
+function fileSig(cwd: string, rel: string): string {
+  try {
+    const st = statSync(path.join(cwd, rel));
+    return `${st.size}:${st.mtimeMs}`;
+  } catch {
+    return 'gone';
   }
 }
 

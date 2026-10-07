@@ -1,3 +1,6 @@
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { TOOL_DEFS, callTool, defaultMixedPipeline, type HandlerContext } from '../tools.ts';
@@ -7,7 +10,7 @@ const cat = (provider: string, extra: Partial<ModelCatalog> = {}): ModelCatalog 
   provider, models: [{ id: `${provider}-m`, label: provider, efforts: ['low', 'high'], defaultEffort: 'low' }],
   defaultModel: `${provider}-m`, defaultEffort: 'high', defaultSource: 'harness-config', source: 'static', stale: false, verified: true, ...extra,
 });
-const ctxWith = (cats: ModelCatalog[]) => ({ service: {} as never, catalogs: async () => cats }) as HandlerContext;
+const ctxWith = (cats: ModelCatalog[]) => ({ service: { repo: mkdtempSync(path.join(tmpdir(), 'agent-smith-tools-')) } as never, catalogs: async () => cats }) as HandlerContext;
 const body = (r: { content: unknown }) => JSON.parse(((r.content as { text: string }[])[0]!).text);
 
 test('mode enum rejects unknown modes', async () => {
@@ -24,7 +27,7 @@ test('list_capabilities reports catalogs, errors and modes without throwing', as
   assert.equal(r.providers.find((p: any) => p.name === 'agy').available, false);
   assert.deepEqual(r.modes.map((m: any) => m.name), ['implement', 'review', 'moderate', 'verify']);
   assert.equal(typeof r.efforts, 'string');
-  const failing = { service: {} as never, catalogs: async () => { throw new Error('x'); } } as HandlerContext;
+  const failing = { service: { repo: mkdtempSync(path.join(tmpdir(), 'agent-smith-tools-')) } as never, catalogs: async () => { throw new Error('x'); } } as HandlerContext;
   assert.equal((await callTool(failing, 'list_capabilities', {})).isError, undefined);
 });
 
@@ -49,4 +52,26 @@ test('explicit stages are unchanged', async () => {
   const stages = [{ name: 'a', provider: 'opencode', prompt: 'x' }];
   const spec = await defaultMixedPipeline({ name: 'p', task: '', stages }, async () => { throw new Error('should not be called'); });
   assert.equal(spec.stages, stages);
+});
+
+test('spawn_job expands a user alias and role defaults from models.json', async () => {
+  const { writeFileSync, mkdirSync } = await import('node:fs');
+  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-alias-'));
+  mkdirSync(path.join(repo, '.agent-smith'));
+  writeFileSync(path.join(repo, '.agent-smith', 'models.json'), JSON.stringify({
+    aliases: { 'sol-high': { provider: 'codex', model: 'gpt-6.1-sol', effort: 'high' } },
+    roleDefaults: { review: 'sol-high' },
+  }));
+  const seen: Array<Record<string, unknown>> = [];
+  const service = { repo, spawnJob: async (r: Record<string, unknown>) => { seen.push(r); return { jobId: 'j', warnings: ['w'] }; } } as never;
+  const ctx = { service, catalogs: async () => [] } as HandlerContext;
+  const viaAlias = await callTool(ctx, 'spawn_job', { mode: 'implement', prompt: 'x', model: 'sol-high' });
+  assert.equal(viaAlias.isError, undefined);
+  assert.deepEqual([seen[0]!.provider, seen[0]!.model, seen[0]!.effort], ['codex', 'gpt-6.1-sol', 'high']);
+  await callTool(ctx, 'spawn_job', { mode: 'review', prompt: 'x' });
+  assert.deepEqual([seen[1]!.provider, seen[1]!.model, seen[1]!.effort], ['codex', 'gpt-6.1-sol', 'high']);
+  const conflict = await callTool(ctx, 'spawn_job', { mode: 'implement', prompt: 'x', model: 'sol-high', provider: 'agy' });
+  assert.equal(conflict.isError, true);
+  const caps = await callTool(ctx, 'list_capabilities', {});
+  assert.match((caps.content[0] as { text: string }).text, /sol-high/);
 });

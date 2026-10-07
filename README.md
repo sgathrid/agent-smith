@@ -167,4 +167,14 @@ Luna agents may implement separate seams, but the primary developer owns final
 integration and protocol verification. See [PROGRESS.md](PROGRESS.md) for delivery
 status and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for runtime ownership.
 
+## Model aliases
+
+Optional; no presets ship. Define aliases in `<repo>/.agent-smith/models.json` or
+`~/.agent-smith/models.json` (`AGENT_SMITH_HOME` overrides home):
+`{"aliases":{"sol-high":{"provider":"codex","model":"gpt-6.1-sol","effort":"high"}},"roleDefaults":{"review":"sol-high"}}`.
+Pass an alias as `model`. Precedence: explicit call args > project file > user file.
+A project alias replaces a same-named user alias wholesale. `roleDefaults` (implement,
+review, moderate, verify) apply only when a call names no provider or model. An explicit
+provider that conflicts with the alias's provider is an error.
+
 MIT licensed.

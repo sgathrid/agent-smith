@@ -70,6 +70,7 @@ import type { ForgeService, SpawnRequest } from './service.ts';
 import type { ForgeActivity, ForgeManifest } from './format.ts';
 import { appendBounded } from './writer.ts';
 import { runChecks } from '../verify/runner.ts';
+import { toVerifyChecks } from './checks.ts';
 import type { Check } from '../verify/types.ts';
 
 /**
@@ -372,13 +373,7 @@ export function createForgeRunner(deps: RunnerDeps): StageRunner {
       if (manifest.status !== 'succeeded') return result;
       if (!stage.checks?.length) return { ...result, acceptance: 'unchecked' };
 
-      const checks: Check[] = stage.checks.map((check) => ({
-        name: check.name,
-        command: check.command,
-        cwd: path.resolve(ctx.workDir, check.cwd ?? '.'),
-        timeoutMs: check.timeoutMs ?? 60_000,
-        ...(check.blocking === undefined ? {} : { blocking: check.blocking }),
-      }));
+      const checks: Check[] = toVerifyChecks(stage.checks, ctx.workDir);
       const report = await runChecks(checks, { signal: ctx.signal });
       const checkEvidence = report.verdicts.map((verdict) =>
         `${verdict.passed ? 'PASS' : 'FAIL'} ${verdict.check.name}: ${verdict.reason}`,

@@ -81,6 +81,7 @@ import {
   type ForgeActivity,
   type ForgeManifest,
   type ForgeStatus,
+  nextActionFor,
 } from './format.ts';
 import { JobWriter, pipeEvents, reportFor } from './writer.ts';
 import { writeJsonAtomic } from './atomic.ts';
@@ -194,6 +195,10 @@ export interface JobSummary {
   readonly updatedAt: string | null;
   readonly finishedAt: string | null;
   readonly warnings: readonly { code: string; message: string }[];
+  /** Derived (never stored) imperative for the orchestrator on failed/canceled jobs; null otherwise. */
+  readonly nextAction: string | null;
+  /** True when the job ran with the approval prompt bypassed. */
+  readonly unrestricted?: boolean;
 }
 
 export interface JobDetail extends JobSummary {
@@ -217,6 +222,14 @@ export interface JobDetail extends JobSummary {
   readonly readOnlyEnforced?: boolean;
   /** False when a cancel was requested but this process holds no live handle. */
   readonly cancellable: boolean;
+  /** Git reference at spawn (only when cwd was a git repo). */
+  readonly gitBaseline?: { readonly head: string | null; readonly dirty: readonly string[] };
+  /**
+   * Paths changed since the baseline (set at finish). A worktree diff, so
+   * concurrent jobs in one worktree can attribute each other's edits.
+   */
+  readonly changedFiles?: readonly string[];
+  readonly changedFilesTruncated?: boolean;
 }
 
 export interface CancelResult {
@@ -643,6 +656,7 @@ export class ForgeService {
 
     try {
       const result: JobResult = await handle.waitForResult();
+      await writer.prepareFinish();
       const report = reportFor(result);
       const manifest = writer.finish(result, report === '' ? null : report);
       return manifest;
@@ -753,7 +767,7 @@ export class ForgeService {
       if (interop === null) {
         throw new Error(`no job "${jobId}" in ${jobsDir(this.repo)}`);
       }
-      return { ...toSummary(interop, 'agy-staff'), report: interop.output, error: null, exitCode: null, unrestricted: false, pipeline: null, stage: null, usage: null, conversation: null, effort: null, cwd: null, cancellable: false };
+      return { ...toSummary(interop, 'agy-staff'), report: interop.output, error: null, exitCode: null, unrestricted: interop.label === 'unrestricted', pipeline: null, stage: null, usage: null, conversation: null, effort: null, cwd: null, cancellable: false };
     }
 
     const reportPath = jobFile(this.repo, jobId, FILES.report);
@@ -790,6 +804,9 @@ export class ForgeService {
             ...(manifest.sandboxFlags === undefined ? {} : { sandboxFlags: manifest.sandboxFlags }),
             ...(manifest.readOnlyRequested === undefined ? {} : { readOnlyRequested: manifest.readOnlyRequested }),
             ...(manifest.readOnlyEnforced === undefined ? {} : { readOnlyEnforced: manifest.readOnlyEnforced }),
+            ...(manifest.gitBaseline === undefined ? {} : { gitBaseline: manifest.gitBaseline }),
+            ...(manifest.changedFiles === undefined ? {} : { changedFiles: manifest.changedFiles }),
+            ...(manifest.changedFilesTruncated === undefined ? {} : { changedFilesTruncated: manifest.changedFilesTruncated }),
           }),
       cancellable: this.live.has(jobId),
     };
@@ -873,10 +890,20 @@ export function toSummary(observed: ObservedJob, source: 'agent-smith' | 'agy-st
     summarySource: raw['summarySource'] === 'worker' ? 'worker' : null,
     source,
     status: observed.status,
-    // `raw.provider` for OUR jobs, `label` for interop ones (which carry no
-    // provider field — they are agy-staff's, and agy-staff's `profile` is the
-    // closest thing it has to a provider name).
-    provider: typeof raw['provider'] === 'string' ? raw['provider'] : observed.label,
+    // `raw.provider` for OUR jobs. Interop jobs carry no provider field: they are
+    // agy-staff's, i.e. agy. Their `profile` ("unrestricted") is a permission
+    // word, not a provider, so it goes to the unrestricted flag.
+    provider: typeof raw['provider'] === 'string' ? raw['provider'] : source === 'agy-staff' ? 'agy' : observed.label,
+    unrestricted: raw['unrestricted'] === true || (source === 'agy-staff' && observed.label === 'unrestricted'),
+    nextAction: nextActionFor({
+      status: observed.status,
+      jobStatus: typeof raw['job_status'] === 'string' ? raw['job_status'] : null,
+      error: [typeof raw['error'] === 'string' ? raw['error'] : '', ...observed.warnings.map((w) => w.message)].join(' — '),
+      report: observed.output,
+      exitCode: typeof raw['exit_code'] === 'number' ? raw['exit_code'] : null,
+      deniedCount: Array.isArray(raw['denied_actions']) ? raw['denied_actions'].length : 0,
+      unrestricted: raw['unrestricted'] === true,
+    }),
     mode: observed.mode,
     model: observed.model,
     task,

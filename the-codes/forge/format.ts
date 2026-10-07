@@ -219,6 +219,61 @@ export interface ForgeManifest {
   readonly pipeline: string | null;
   readonly stage: string | null;
   readonly attempt: number | null;
+
+  /**
+   * Cheap git reference taken at spawn when `cwd` is a git repo (absent
+   * otherwise). `dirty` = paths from `git status --porcelain` at that instant.
+   */
+  readonly gitBaseline?: GitBaseline;
+  /**
+   * Paths that differ from the baseline at finish: new/modified/deleted since
+   * start, excluding paths that were already dirty and are unchanged. Present
+   * only when a baseline was captured. Capped at CHANGED_FILES_CAP.
+   *
+   * LIMITATION: it is a worktree diff, not an attribution. Concurrent jobs (or
+   * the operator) editing the same worktree are indistinguishable, so one job's
+   * changedFiles can include another's edits. Read-only modes normally yield [].
+   */
+  readonly changedFiles?: readonly string[];
+  readonly changedFilesTruncated?: boolean;
+}
+
+export interface GitBaseline {
+  readonly head: string | null;
+  readonly dirty: readonly string[];
+}
+
+/** Max entries kept in `changedFiles`. */
+export const CHANGED_FILES_CAP = 200;
+
+/** Paths that are our own bookkeeping, never a worker's change. */
+export function isForgeStatePath(p: string): boolean {
+  return p === '.agent-smith' || p.startsWith('.agent-smith/') || p === '.agy-staff' || p.startsWith('.agy-staff/');
+}
+
+/**
+ * Pure: which paths changed since the baseline.
+ *
+ * `nowDirty` is the worktree's dirty set at finish; `modifiedBaseline` is the
+ * subset of baseline-dirty paths whose content signature moved (writer-computed);
+ * `committed` are paths touched by commits made since the baseline HEAD.
+ */
+export function diffChangedFiles(
+  baseline: GitBaseline,
+  nowDirty: readonly string[],
+  modifiedBaseline: readonly string[] = [],
+  committed: readonly string[] = [],
+): { files: string[]; truncated: boolean } {
+  const was = new Set(baseline.dirty);
+  const out = new Set<string>();
+  for (const p of nowDirty) if (!was.has(p)) out.add(p);
+  // Dirty at start and clean now: the worker reverted/committed it.
+  const now = new Set(nowDirty);
+  for (const p of baseline.dirty) if (!now.has(p)) out.add(p);
+  for (const p of modifiedBaseline) out.add(p);
+  for (const p of committed) out.add(p);
+  const all = [...out].filter((p) => !isForgeStatePath(p)).sort();
+  return { files: all.slice(0, CHANGED_FILES_CAP), truncated: all.length > CHANGED_FILES_CAP };
 }
 
 /** progress.json. Advisory liveness evidence. */
@@ -476,4 +531,51 @@ export function deriveOrphan(
   if (times.length === 0) return null;
   const ref = Math.max(...times);
   return nowMs - ref > LEGACY_ORPHAN_AFTER_MS ? verdict : null;
+}
+
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * nextAction — what the orchestrating agent should do about a bad terminal state
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+/** The facts nextActionFor reads. Every reader can supply these from what it already has. */
+export interface NextActionInput {
+  readonly status: string | null | undefined;
+  readonly jobStatus?: string | null | undefined;
+  readonly error?: string | null | undefined;
+  readonly report?: string | null | undefined;
+  readonly exitCode?: number | null | undefined;
+  readonly deniedCount?: number | undefined;
+  readonly unrestricted?: boolean | undefined;
+}
+
+const NETWORK_RE = /network issue|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|fetch failed|connection (?:reset|refused|closed|error)|temporarily unavailable|overloaded/i;
+const TIMEOUT_RE = /timed? ?out|exceeded the .*budget|\btimeout\b/i;
+
+/**
+ * THE one place a next step is derived. Derived on read, never stored in
+ * job.json. Null for running/succeeded jobs. A short imperative for the
+ * orchestrating agent, not for a human.
+ */
+export function nextActionFor(i: NextActionInput): string | null {
+  const status = i.status ?? null;
+  if (status === 'canceled') return 'Canceled by operator; nothing to do.';
+  if (status !== 'failed') return null;
+  const err = i.error ?? '';
+  if (err.includes('orphaned') || err.includes(ORPHAN_REASON)) {
+    return 'Supervisor exited; resume_job if it has a conversation handle, else rerun.';
+  }
+  if ((i.deniedCount ?? 0) > 0 || /soft-denied/i.test(err)) {
+    return i.unrestricted === true
+      ? 'Worker was denied actions even with unrestricted:true; give it an approved path or narrow the task.'
+      : 'Retry with unrestricted:true, or give the worker an approved path.';
+  }
+  if (i.jobStatus === 'timeout' || TIMEOUT_RE.test(err)) {
+    return 'Raise timeoutMs or split the task; resume_job keeps the conversation.';
+  }
+  if (NETWORK_RE.test(err)) return 'Transient: retry the same job once; resume_job or spawn again.';
+  if (/no usable output/i.test(err) || (i.exitCode === 0 && looksEmpty(i.report))) {
+    return 'Worker returned no usable output; ask for a longer answer via resume_job or rerun.';
+  }
+  return 'Worker failed; read status.error and warnings before retrying.';
 }
