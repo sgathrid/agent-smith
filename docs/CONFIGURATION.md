@@ -83,9 +83,10 @@ never a CLI call on the spawn path.
 | `opencode` | `opencode models` (`verified: false`; use `provider/model` ids) | none |
 | `claude` | static `fable`, `opus`, `sonnet`, `haiku` (efforts low/medium/high/xhigh/max) | `<claudeHome>/settings.json` top-level `model` (no effort) |
 
-Sandbox posture per provider (echoed in the ack): agy default = no flag, cannot prompt,
-unapproved tools auto-denied, read-only not enforceable; `unrestricted` =
-`--dangerously-skip-permissions`. codex default = `-s workspace-write`, `-s read-only` for
+Sandbox posture per provider (echoed in the ack): agy default = `--dangerously-skip-permissions`
+(headless agy cannot prompt, so restricted means silent denial; opt out with `unrestricted:false`
+or `AGENT_SMITH_AGY_RESTRICTED=1`, which gives no flag and auto-denies unapproved tools;
+read-only is not enforceable). codex default = `-s workspace-write`, `-s read-only` for
 read-only modes, bypass flag when unrestricted (resume uses `-c sandbox_mode=...`). claude
 default = `--permission-mode dontAsk --permission-prompts none` (no read-only enforcement),
 `--dangerously-skip-permissions` when unrestricted. opencode default = the agent's own rules

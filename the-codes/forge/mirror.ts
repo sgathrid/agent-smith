@@ -255,6 +255,13 @@ export function tokenWords(usage: Readonly<Record<string, number>> | null): stri
  */
 export function mirrorEventLine(event: Record<string, unknown>): Record<string, unknown> | null {
   const kind = event['kind'];
+  // Assistant prose, for the pane's live transcript. A separate top-level key so
+  // tool-count/tool-history readers (which only look at `step_update`) ignore it.
+  if (kind === 'text') {
+    const text = event['text'];
+    if (event['stream'] !== 'assistant' || typeof text !== 'string' || text.trim() === '') return null;
+    return { agent_text: { at: event['at'] ?? null, text: text.slice(0, 4_000) } };
+  }
   if (kind !== 'activity-start' && kind !== 'activity-end') return null;
   const activity = event['activity'] as Record<string, unknown> | undefined;
   if (activity === undefined) return null;

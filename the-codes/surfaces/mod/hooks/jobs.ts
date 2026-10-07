@@ -725,7 +725,11 @@ const HISTORY_KEEP = 20;
 
 /** PURE: an events.jsonl body → the newest tool entries, oldest first. */
 export function toolHistoryFromEvents(text: string): ToolEntry[] {
-  const out: ToolEntry[] = [];
+  // One entry per step_index: an ACTIVE record is replaced by its DONE/ERROR
+  // record, and an ACTIVE with no terminal record yet is the tool running NOW.
+  const bySteps = new Map<number, ToolEntry>();
+  const order: number[] = [];
+  let seq = -1;
   for (const line of text.split('\n')) {
     if (line.length < 2) continue;
     let obj: { step_update?: Record<string, unknown> };
@@ -736,24 +740,50 @@ export function toolHistoryFromEvents(text: string): ToolEntry[] {
       continue;
     }
     const su = obj.step_update;
-    if (!su || su['step_type'] !== 'tool' || su['state'] !== 'DONE') continue;
+    if (!su || su['step_type'] !== 'tool') continue;
+    const st = su['state'];
+    if (st !== 'DONE' && st !== 'ERROR' && st !== 'ACTIVE') continue;
 
     const info = (su['tool_info'] ?? {}) as Record<string, unknown>;
+    // agy writes `parameters` (an object); the forge mirror writes `input` (a string).
     const params = (info['parameters'] ?? {}) as Record<string, unknown>;
     const tool = typeof su['tool_name'] === 'string' ? su['tool_name'] : '';
+    const input = typeof info['input'] === 'string' ? info['input'] : '';
     const output = typeof info['output'] === 'string' ? info['output'] : '';
-    out.push({
+    const idx = typeof su['step_index'] === 'number' ? su['step_index'] : seq--;
+    if (!bySteps.has(idx)) order.push(idx);
+    const prev = bySteps.get(idx);
+    bySteps.set(idx, {
       // events.jsonl carries no per-record timestamp, so this is honestly null
       // rather than the enclosing job's start or the file's mtime.
       at: null,
       tool,
-      label: describeTool(tool, params),
+      label: Object.keys(params).length > 0 ? describeTool(tool, params) : (input !== '' ? (input === tool ? '' : input) : (prev?.label ?? describeTool(tool, params))),
       output: output.slice(0, 400),
-      state: 'done',
+      state: st === 'ERROR' ? 'error' : st === 'ACTIVE' ? 'active' : 'done',
     });
-    if (out.length > HISTORY_KEEP) out.shift();
   }
-  return out;
+  return order.map((i) => bySteps.get(i)!).slice(-HISTORY_KEEP);
+}
+
+/** PURE: an events.jsonl body → the newest assistant prose chunks, oldest first. */
+export function transcriptFromEvents(text: string, keep = 6): string[] {
+  const out: string[] = [];
+  for (const line of text.split('\n')) {
+    if (!line.includes('"agent_text"')) continue;
+    try {
+      const t = (JSON.parse(line) as { agent_text?: { text?: unknown } }).agent_text?.text;
+      if (typeof t === 'string' && t.trim() !== '') out.push(t.trim());
+    } catch {
+      continue;
+    }
+  }
+  return out.slice(-keep);
+}
+
+export async function readTranscript(fs: FsLike, repo: string, id: string): Promise<string[]> {
+  const text = await readTextSafe(fs, at(jobsDir(repo), id, EVENTS));
+  return text === null ? [] : transcriptFromEvents(text);
 }
 
 /**

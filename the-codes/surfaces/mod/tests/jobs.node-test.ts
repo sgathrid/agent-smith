@@ -644,3 +644,17 @@ test('a half-written progress.json costs one field, not the job', async () => {
   const job = await resolve(fs, jobsDir('/repo'), 'half-00000000', Date.now());
   assert.equal(job?.status, 'succeeded', 'terminal state is anchored elsewhere');
 });
+
+test('forge-mirror events: ERROR rows kept, ACTIVE row is the live tool, transcript parsed', async () => {
+  const { toolHistoryFromEvents, transcriptFromEvents } = await import('../hooks/jobs.ts');
+  const ev = [
+    { step_update: { step_index: 0, state: 'ACTIVE', step_type: 'tool', tool_name: 'sh -c ls', tool_info: { input: 'sh -c ls' } } },
+    { step_update: { step_index: 0, state: 'ERROR', step_type: 'tool', tool_name: 'sh -c ls', tool_info: { input: 'sh -c ls', output: 'boom' } } },
+    { step_update: { step_index: 1, state: 'ACTIVE', step_type: 'tool', tool_name: 'sh -c pwd', tool_info: { input: 'sh -c pwd' } } },
+    { agent_text: { text: 'thinking out loud' } },
+  ].map((o) => JSON.stringify(o)).join('\n') + '\n{"step_upd';
+  const h = toolHistoryFromEvents(ev);
+  assert.deepEqual(h.map((e) => e.state), ['error', 'active']);
+  assert.equal(h[0]!.output, 'boom');
+  assert.deepEqual(transcriptFromEvents(ev), ['thinking out loud']);
+});

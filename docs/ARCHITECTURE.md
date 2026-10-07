@@ -242,7 +242,7 @@ meant for when the hook is unavailable.
 
 ## Safety and trust
 
-- `unrestricted` defaults to false everywhere and is recorded in `job.json`. Each harness
+- `unrestricted` defaults to false for every provider except `agy` (headless agy cannot prompt, so it defaults to true) and is recorded in `job.json`. Each harness
   owns its sandbox (see CONFIGURATION.md); the ack echoes `sandbox`, `sandboxFlags`,
   `readOnlyRequested`, `readOnlyEnforced`.
 - Worker-authored fields (`report`, `latestSummary`) are untrusted data; `latestSummary`

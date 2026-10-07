@@ -76,6 +76,7 @@ import {
   readAllJobs,
   readJob,
   readToolHistory,
+  readTranscript,
   type FsLike,
 } from './jobs.ts';
 import { sortForBand } from './format.ts';
@@ -587,7 +588,8 @@ export const register: Register = (on) => {
         // Promise, and a Promise is not a renderable element. Reading in the hook
         // also means exactly one read per render.
         const history = await readToolHistory(fs, repo, pick);
-        return renderDetail($, e, job, t, history, hidden, { Box, Text, Button, Markdown });
+        const transcript = await readTranscript(fs, repo, pick);
+        return renderDetail($, e, job, t, history, transcript, hidden, { Box, Text, Button, Markdown });
       }
       // The selected job vanished — agy-staff cleaned the directory, or the id
       // came from a stale list. Fall back to the list rather than rendering a
@@ -720,6 +722,7 @@ function renderDetail(
   job: RadarJob,
   t: number,
   history: readonly ToolEntry[],
+  transcript: readonly string[],
   hidden: readonly string[],
   W: Widgets,
 ): JSX.Element {
@@ -762,7 +765,17 @@ function renderDetail(
         <Text dimColor wrap="truncate-end">{oneLine(job.reasoning, 300)}</Text>
       )}
 
-      {job.summarySource === 'worker' && typeof job.latestSummary === 'string' && job.latestSummary.trim() !== '' && (
+      {/* Live transcript: the worker's own prose, newest last, like a native
+          subagent's stream. Falls back to the one-line summary below when the
+          job predates transcript mirroring. */}
+      {transcript.length > 0 && (
+        <Box flexDirection="column">
+          <Text bold wrap="truncate-end">{job.status === 'running' ? 'Live output' : 'Worker output'}</Text>
+          <Markdown text={transcript.join('\n\n')} />
+        </Box>
+      )}
+
+      {transcript.length === 0 && job.summarySource === 'worker' && typeof job.latestSummary === 'string' && job.latestSummary.trim() !== '' && (
         <Box flexDirection="column">
           <Text bold wrap="truncate-end">Latest worker output</Text>
           <Markdown text={job.latestSummary} />
@@ -862,7 +875,7 @@ function ToolHistory({ entries, W }: { entries: readonly ToolEntry[]; W: Widgets
         <Text key={`t-${i}-${entry.tool}`} wrap="truncate-end">
           {/* One accent per line maximum, and red is reserved (TERMINAL-UI.md
               §Colour): the tool name is coloured, its output never is. */}
-          <Text color={entry.state === 'error' ? 'red' : 'cyan'}>{`${entry.tool} `}</Text>
+          <Text color={entry.state === 'error' ? 'red' : entry.state === 'active' ? 'blue' : 'cyan'} bold={entry.state === 'active'}>{`${entry.state === 'active' ? '▸ ' : entry.state === 'error' ? '✗ ' : ''}${oneLine(entry.tool, 60)} `}</Text>
           <Text dimColor wrap="truncate-end">
             {entry.output.length > 0 ? `${entry.label} ${SEP} ${oneLine(entry.output, 120)}` : entry.label}
           </Text>
