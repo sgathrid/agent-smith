@@ -299,7 +299,7 @@ export function rowBudget(shown: readonly RadarJob[], maxRows?: number): BandBud
 
 /** The overflow line. Dim, and it names the command that opens the rest. */
 export function overflowLine(hidden: number): string {
-  return `   +${hidden} more · /agy-radar`;
+  return `   +${hidden} more · /agent-smith`;
 }
 
 /**

@@ -158,7 +158,7 @@ describe('the band', () => {
     engine(on);
     await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
     const band = await $.ui.mount({
-      plugin: 'agy-radar',
+      plugin: 'agent-smith',
       surface: 'terminal',
       ...BAND,
     } as never);
@@ -183,7 +183,7 @@ describe('the band', () => {
     // drew above the prompt.
     engine(on);
     await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
-    const band = await $.ui.mount({ plugin: 'agy-radar', surface: 'terminal', ...BAND } as never);
+    const band = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', ...BAND } as never);
     expect(await band.find({ type: 'Text', text: 'REST-OF-BAND' })).toBeDefined();
   });
 
@@ -191,7 +191,7 @@ describe('the band', () => {
     engine(on);
     await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
     const band = await $.ui.mount({
-      plugin: 'agy-radar',
+      plugin: 'agent-smith',
       surface: 'terminal',
       component: 'AbovePrompt',
       props: { hasSurvey: true, isWorking: true, maxRows: 10, bodyColumns: 120 },
@@ -206,15 +206,15 @@ describe('the band', () => {
     // the row count must drop to zero rather than holding reserved space.
     engine(on, { entries: [], files: {} });
     await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
-    const band = await $.ui.mount({ plugin: 'agy-radar', surface: 'terminal', ...BAND } as never);
-    expect(await band.find({ type: 'Text', text: /agy-radar/ })).toBeUndefined();
+    const band = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', ...BAND } as never);
+    expect(await band.find({ type: 'Text', text: /agent-smith/ })).toBeUndefined();
     expect(await band.find({ type: 'Text', text: 'REST-OF-BAND' })).toBeDefined();
   });
 
   test('NO_COLOR drops the colour prop and keeps the glyph and the bold', async ($, on) => {
     engine(on, { noColorEnv: '1' });
     await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
-    const band = await $.ui.mount({ plugin: 'agy-radar', surface: 'terminal', ...BAND } as never);
+    const band = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', ...BAND } as never);
 
     const line = await band.find({ type: 'Text', text: `● ${ID}` });
     expect(line).toBeDefined();
@@ -233,7 +233,7 @@ describe('the band', () => {
     // return it untouched. Checking it would be checking someone else's code.
     engine(on);
     await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
-    const band = await $.ui.mount({ plugin: 'agy-radar', surface: 'terminal', ...BAND } as never);
+    const band = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', ...BAND } as never);
     const texts = await band.findAll({ type: 'Text' });
     const ours = texts.filter((t) => (t as { text?: string }).text !== 'REST-OF-BAND');
     expect(ours.length).toBeGreaterThan(0);
@@ -264,7 +264,7 @@ describe('HAZARD A, as drawn', () => {
       },
     });
     await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
-    const band = await $.ui.mount({ plugin: 'agy-radar', surface: 'terminal', ...BAND } as never);
+    const band = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', ...BAND } as never);
 
     expect(await band.find({ type: 'Text', text: `✓ ${ID} finished` })).toBeDefined();
     // No tool count, because there is genuinely none on disk — omitted, not 0.
@@ -290,7 +290,7 @@ describe('HAZARD A, as drawn', () => {
       },
     });
     await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
-    const band = await $.ui.mount({ plugin: 'agy-radar', surface: 'terminal', ...BAND } as never);
+    const band = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', ...BAND } as never);
 
     expect(await band.find({ type: 'Text', text: new RegExp(`✗ ${ID} failed`) })).toBeDefined();
     expect(await band.find({ type: 'Text', text: new RegExp(`✓ ${ID}`) })).toBeUndefined();
@@ -315,7 +315,7 @@ describe('HAZARD A, as drawn', () => {
       },
     });
     await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
-    const band = await $.ui.mount({ plugin: 'agy-radar', surface: 'terminal', ...BAND } as never);
+    const band = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', ...BAND } as never);
     expect(await band.find({ type: 'Text', text: new RegExp(ID) })).toBeUndefined();
   });
 
@@ -339,11 +339,11 @@ describe('HAZARD A, as drawn', () => {
       ),
     });
     await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
-    const band = await $.ui.mount({ plugin: 'agy-radar', surface: 'terminal', ...BAND } as never);
+    const band = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', ...BAND } as never);
 
     const overflow = await band.find({ type: 'Text', text: '+2 more' });
     expect(overflow).toBeDefined();
-    expect((overflow as { text?: string }).text).toContain('/agy-radar');
+    expect((overflow as { text?: string }).text).toContain('/agent-smith');
   });
 
   test("the engine's own maxRows is respected", async ($, on) => {
@@ -364,7 +364,7 @@ describe('HAZARD A, as drawn', () => {
     });
     await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
     const band = await $.ui.mount({
-      plugin: 'agy-radar',
+      plugin: 'agent-smith',
       surface: 'terminal',
       component: 'AbovePrompt',
       props: { hasSurvey: false, isWorking: true, maxRows: 3, bodyColumns: 80 },

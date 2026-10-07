@@ -179,7 +179,7 @@ test('the band line is identity, then liveness, then elapsed LAST', () => {
 });
 
 test('the required layout renders: one line per job, readable in its first 40 columns', () => {
-  // The /agy-radar design, through the band's own formatter.
+  // The /agent-smith design, through the band's own formatter.
   const running = buildLine(
     job({
       id: 'implement-musm82da',
@@ -392,7 +392,7 @@ test('at most BAND_ROWS rows, then `+N more`', () => {
   const budget = rowBudget(many);
   assert.equal(budget.rows.length, BAND_ROWS);
   assert.equal(budget.hidden, 9 - BAND_ROWS);
-  assert.equal(overflowLine(budget.hidden), `   +${9 - BAND_ROWS} more · /agy-radar`);
+  assert.equal(overflowLine(budget.hidden), `   +${9 - BAND_ROWS} more · /agent-smith`);
 });
 
 test('exactly BAND_ROWS shows no overflow row at all', () => {

@@ -259,7 +259,7 @@ declare module 'claude-code' {
  * module ("on(\"session.start\") is registered twice without a matcher").
  *
  * Both halves need session.start (the band to read `AGY_RADAR_REPO` and honour
- * `NO_COLOR`; the pane to register `/agy-radar`), so the band half parks its handler
+ * `NO_COLOR`; the pane to register `/agent-smith`), so the band half parks its handler
  * in a module-level variable and the pane half — which owns the single registration
  * — awaits it. That is the whole band↔pane coupling: two calls.
  */

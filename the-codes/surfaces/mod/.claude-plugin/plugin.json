@@ -1,7 +1,7 @@
 {
-  "name": "agy-radar",
+  "name": "agent-smith",
   "version": "0.1.0",
-  "description": "One live line above the prompt per agy/Codex/OpenCode job: status, elapsed, tool count, what it is doing. /agy-radar opens the pane.",
+  "description": "One live line above the prompt per agy/Codex/OpenCode job: status, elapsed, tool count, what it is doing. The /radar command opens a browsable pane.",
   "author": {
     "name": "Agent Smith"
   },

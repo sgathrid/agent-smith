@@ -1,11 +1,11 @@
 // =============================================================================
-// register.tsx — the /agy-radar pane, in an AbovePrompt-style mod.
+// register.tsx — the /agent-smith pane, in an AbovePrompt-style mod.
 //
 // ─────────────────────────────────────────────────────────────────────────────
 // ⚠ MERGE NOTE — READ THIS BEFORE EDITING. ⚠
 // ─────────────────────────────────────────────────────────────────────────────
 // Another engineer may be writing the BAND half of this file concurrently. The
-// band is the 1–4 line strip above the prompt; the pane is what /agy-radar opens.
+// band is the 1–4 line strip above the prompt; the pane is what /agent-smith opens.
 //
 // The split is structural, not advisory:
 //
@@ -63,7 +63,7 @@ import { DEFAULT_REPO, readAllJobs as readAllJobsViaFs, sortForBand, type FsLike
 import type { ToolEntry } from '../types/index.d.ts';
 
 /** Pane id. Must match the `requestId` in the ui.render matcher below. */
-const PANE = 'agy-radar';
+const PANE = 'agent-smith';
 
 // ── state ───────────────────────────────────────────────────────────────────
 //
@@ -76,8 +76,8 @@ const PANE = 'agy-radar';
 // SAME one, or the band would tick and the pane would not, and the two would show
 // elapsed times that disagree by up to a second.
 
-const selected = atom({ plugin: 'agy-radar', key: 'selected' } as const, null as string | null);
-const now = atom({ plugin: 'agy-radar', key: 'now' } as const, 0);
+const selected = atom({ plugin: 'agent-smith', key: 'selected' } as const, null as string | null);
+const now = atom({ plugin: 'agent-smith', key: 'now' } as const, 0);
 
 /**
  * Job ids the user has dismissed with `c`.
@@ -90,7 +90,7 @@ const now = atom({ plugin: 'agy-radar', key: 'now' } as const, 0);
  * Kept as a list rather than a Set because it round-trips through JSON in host
  * state, and an array survives that where a Set does not.
  */
-const cleared = atom({ plugin: 'agy-radar', key: 'cleared' } as const, [] as string[]);
+const cleared = atom({ plugin: 'agent-smith', key: 'cleared' } as const, [] as string[]);
 
 // ── BAND STATE (band author) ──────────────────────────────────────────────────
 // `jobs` is the band's own snapshot of the jobs directory. It is NOT shared with
@@ -103,8 +103,8 @@ const cleared = atom({ plugin: 'agy-radar', key: 'cleared' } as const, [] as str
 // watch, and whether colour is allowed. Re-reading env on every render would be
 // a filesystem-free but pointless syscall per frame.
 
-const bandJobs = atom({ plugin: 'agy-radar', key: 'bandJobs' } as const, [] as RadarJob[]);
-const bandConfig = atom({ plugin: 'agy-radar', key: 'bandConfig' } as const, {
+const bandJobs = atom({ plugin: 'agent-smith', key: 'bandJobs' } as const, [] as RadarJob[]);
+const bandConfig = atom({ plugin: 'agent-smith', key: 'bandConfig' } as const, {
   repo: DEFAULT_REPO,
   colour: true,
 });
@@ -283,7 +283,7 @@ export async function startBand($: EngineInterface, cwd?: string): Promise<void>
  * Register the band. Called from the pane's `register`.
  *
  * The band deliberately registers NO `command.run` handler and opens NO pane:
- * `/agy-radar` belongs to the pane half, and two handlers for one command is a
+ * `/agent-smith` belongs to the pane half, and two handlers for one command is a
  * coin toss over which one the engine picks.
  */
 export function registerBand(on: Parameters<Register>[0]): void {
@@ -368,7 +368,7 @@ export function registerBand(on: Parameters<Register>[0]): void {
 }
 
 // =============================================================================
-// § PANE — everything below this line belongs to the /agy-radar pane.
+// § PANE — everything below this line belongs to the /agent-smith pane.
 // =============================================================================
 
 /** `register(on, options)` is the mod entry point. hooks.json names this file. */
@@ -391,17 +391,17 @@ export const register: Register = (on) => {
   // ── the command ───────────────────────────────────────────────────────────
   //
   // `.catch(() => {})` because Claude Code refuses a command name it already owns,
-  // and refusing to start would take the band down with it. Losing `/agy-radar` to
+  // and refusing to start would take the band down with it. Losing `/agent-smith` to
   // a name collision is acceptable; losing the whole mod is not.
   on('session.start', async ($, e, next) => {
     const rest = await next(e);
     // Band first, and it never throws: a slow or failing band config must not
-    // delay `/agy-radar` appearing or take the session's start with it.
+    // delay `/agent-smith` appearing or take the session's start with it.
     await startBand($, typeof e.cwd === 'string' ? e.cwd : undefined);
     await $.command
       .register({
-        name: 'agy-radar',
-        description: 'Browse agy-staff jobs: tool history, warnings, and the final report',
+        name: 'radar',
+        description: 'Browse worker jobs: tool history, warnings, and the final report',
       })
       .catch(() => {});
     return rest;
@@ -410,7 +410,7 @@ export const register: Register = (on) => {
   // `next` is unused and deliberately so. A command handler's `next` would render
   // some other handler's contribution to the command; there is nothing to chain
   // here, and the reference mod's command handler also ignores it.
-  on('command.run', { command: 'agy-radar' }, async ($, _e, _next) => {
+  on('command.run', { command: 'agent-smith' }, async ($, _e, _next) => {
     // Reset the selection so the pane always opens on the list. Opening directly
     // into a stale detail view would be disorienting: the user asked for a
     // browser, not for wherever they happened to be last time.

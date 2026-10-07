@@ -125,7 +125,7 @@ declare module 'claude-code' {
    * state the pane had accumulated.
    */
   interface PluginState {
-    'agy-radar': {
+    'agent-smith': {
       /** Job id the user has opened in the detail pane, or null for the list. */
       selected: string | null;
       /** Scratch: 'list' | 'detail'. Redundant with `selected`, kept for clarity. */

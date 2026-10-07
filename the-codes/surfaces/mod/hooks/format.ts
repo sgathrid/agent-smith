@@ -1,5 +1,5 @@
 /**
- * format.ts — PURE presentation logic for the /agy-radar pane.
+ * format.ts — PURE presentation logic for the /agent-smith pane.
  *
  * WHY THIS FILE IS NOT `register.tsx`:
  * `node --test --experimental-strip-types` CANNOT load a .tsx file — TypeScript's
@@ -116,7 +116,7 @@ export function elapsed(ms: number): string {
  * WIDTH IS A CORRECTNESS PROPERTY HERE, NOT COSMETICS. TERMINAL-UI.md §Width says
  * "put the volatile field last — elapsed time ticks every second; if it sits
  * mid-line, everything after it shifts horizontally each tick". The required
- * /agy-radar design puts elapsed BEFORE the activity text, which appears to
+ * /agent-smith design puts elapsed BEFORE the activity text, which appears to
  * violate that rule. It does not, once the field is a fixed width: with
  * right-alignment, the second that changes is the last character of a
  * constant-width cell, so nothing to its right moves. `48s`, `12m04s` and

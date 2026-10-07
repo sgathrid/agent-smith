@@ -205,7 +205,7 @@ test('a job line reads as glyph, id, elapsed, tools, activity', () => {
 });
 
 test('the three design lines, and their columns line up', () => {
-  // The three lines from the /agy-radar design spec, with ids 17, 15 and 16 chars
+  // The three lines from the /agent-smith design spec, with ids 17, 15 and 16 chars
   // wide so that a naive join WOULD misalign them.
   const lines = [
     job({ id: 'implement-musm82da', startedAt: 0, endedAt: 724_000, toolCount: 341, activity: 'cargo test --workspace' }),

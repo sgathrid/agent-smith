@@ -1,17 +1,17 @@
-# agy-radar — the band
+# agent-smith — the band
 
 A Claude Code mod that draws **one live line per running agy / Codex / OpenCode
-job** in the `AbovePrompt` band, and opens a browsable pane on `/agy-radar`.
+job** in the `AbovePrompt` band, and opens a browsable pane on `/radar`.
 
 ```
  ● implement-musm82da-f1dc1fe4 cargo test --workspace · 341 tools ·     12m04s
  ● implement-muroviej-a23df195 reading decoded_view.rs ·  22 tools ·     02m18s
  ! implement-musm82da-f1dc1fe4 stalled ·  341 tools · 1h02m03s
  ✓ research-muroabc-f1dc1fe4 finished, warnings ·  8 tools ·      48s
-   +2 more · /agy-radar
+   +2 more · /radar
 ```
 
-**This file covers the band.** The pane (`/agy-radar`) is a separate surface with
+**This file covers the band.** The pane (`/radar`) is a separate surface with
 a separate owner; see [§ Scope boundary](#scope-boundary).
 
 ---
