@@ -94,3 +94,25 @@ test('pipelines expand aliases in explicit stages and apply roleDefaults to the 
   assert.deepEqual([review.provider, review.model, review.effort], ['codex', 'gpt-6.1-sol', 'high']);
   assert.equal(def.stages.find(s => s.name === 'implement')!.model, undefined);
 });
+
+test('notifyHint: hook note always, monitorCommand only when the built monitor path is known, timeout capped', async () => {
+  const { notifyHint } = await import('../tools.ts');
+  const none = notifyHint({ job: 'j1' }, '/repo', 60_000, undefined);
+  assert.equal(none.mode, 'hook');
+  assert.match(none.note, /announced automatically by the plugin hook/);
+  assert.equal('monitorCommand' in none, false);
+  const job = notifyHint({ job: 'j1' }, '/repo', 2_700_000, '/rt/dist/monitor.js') as { monitorCommand: string; monitorTimeoutMs: number };
+  assert.equal(job.monitorCommand, 'node "/rt/dist/monitor.js" --job j1 --cwd "/repo"');
+  assert.equal(job.monitorTimeoutMs, 1_800_000);
+  const run = notifyHint({ run: 'r1' }, '/repo', 120_000, '/rt/dist/monitor.js') as { monitorCommand: string; monitorTimeoutMs: number };
+  assert.match(run.monitorCommand, /--run r1 /);
+  assert.equal(run.monitorTimeoutMs, 120_000);
+});
+
+test('spawn_job ack carries a notify hint', async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-notify-'));
+  const service = { repo, spawnJob: async () => ({ jobId: 'j9', timeoutMs: 1000 }) } as never;
+  const r = await callTool({ service, catalogs: async () => [cat('agy')] } as HandlerContext, 'spawn_job', { mode: 'implement', prompt: 'x', provider: 'agy' });
+  assert.equal(r.isError, undefined);
+  assert.equal(body(r).notify.mode, 'hook');
+});

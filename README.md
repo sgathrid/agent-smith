@@ -21,25 +21,32 @@ claude
 ```
 
 Run these commands from the repository root. Setup builds the UI, MCP runtime,
-dependencies, delegation skill, and background monitor into
+dependencies, delegation skill, and completion hook into
 `builds/local-plugin/agent-smith`, then declares this checkout's directory
 marketplace in `.claude/settings.local.json`. Existing local settings are
 preserved. Setup writes no user settings or global enablement. Claude itself
 maintains its marketplace registry and plugin data under `~/.claude/plugins`;
 the plugin is enabled only for this checkout and its files load in place. Re-run
 setup if you move the checkout; run `npm run build:plugin` after source changes
-and restart Claude to load the new monitor.
+and restart Claude to load the new hook.
 
 Project/local settings cannot set `CLAUDE_CODE_PLUGIN_DIRS`. Putting the plugin
-in the project's `.claude/skills/` would suppress its background monitor; the
+in the project's `.claude/skills/` would suppress its completion hook; the
 local marketplace avoids both limitations.
 
-The monitor delivers completion, attention, and pipeline acceptance changes;
-it stays silent for ordinary progress and old history. It starts only in
-interactive sessions on providers where Claude's Monitor tool is available.
-It is unavailable with `DISABLE_TELEMETRY` or
-`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`; use `status` and `pipeline_status`
-when notifications are unavailable. `/forge` opens the right-third job pane.
+Completion is announced by a job-scoped `PostToolUse` command hook
+(`asyncRewake`, declared in `hooks/watch-hooks.json`) that runs
+`runtime/dist/watch-hook.js` after `spawn_job`, `run_pipeline` or `resume_job`.
+It watches only that job or run, exits 2 when it finishes or needs attention to
+wake Claude, and nothing runs while idle. This replaces the former always-on
+plugin monitor, which appeared in Claude's exit dialog and polled forever.
+Fallbacks when hooks are unavailable (headless `-p`, other clients): run the
+ack's `notify.monitorCommand` (`node runtime/dist/monitor.js --job <id> --cwd
+<repo>`, or `--run <id>`) under the Monitor tool with a timeout of at most
+1,800,000 ms and re-arm on expiry, or use `status` with `wait_ms` /
+`pipeline_status`. Unverified: whether a running async hook shows in the exit
+dialog, whether the hook timeout cap accommodates 45-minute jobs (set to 2760 s),
+and waking while Claude is mid-turn. `/forge` opens the right-third job pane. `/forge` opens the right-third job pane.
 
 The `.claude` under `agent-configs/` is a configuration example, not an active
 root configuration. Claude does not read it when launched from this repo root.
@@ -142,7 +149,7 @@ plugin. Both directories are local and ignored by git.
 
 Job cancellation reaches the owning supervisor through a persistent request and
 signals the worker process group on Unix. If its supervisor dies, records can
-remain running; the monitor flags prolonged silence as needing attention.
+remain running; the watcher flags prolonged silence as needing attention.
 Cancellation needs a live supervisor. Crash reconciliation and automatic replay
 are not implemented.
 

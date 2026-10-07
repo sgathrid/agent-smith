@@ -37,6 +37,7 @@ export function buildPlugin({ repoRoot = DEFAULT_ROOT, outputRoot = path.join(re
   const skillsSource = path.join(modRoot, 'skills');
   const serverSource = path.join(channelRoot, 'dist', 'server.js');
   const monitorSource = path.join(channelRoot, 'dist', 'monitor.js');
+  const watchHookSource = path.join(channelRoot, 'dist', 'watch-hook.js');
   const modulesSource = path.join(channelRoot, 'node_modules');
   const channelPackagePath = path.join(channelRoot, 'package.json');
 
@@ -46,6 +47,7 @@ export function buildPlugin({ repoRoot = DEFAULT_ROOT, outputRoot = path.join(re
   required(typesSource, 'plugin types');
   required(serverSource, 'built MCP server');
   required(monitorSource, 'built monitor entrypoint');
+  required(watchHookSource, 'built watch hook entrypoint (run the channel build; src/watch-hook.ts must exist)');
   required(modulesSource, 'channel runtime node_modules');
   required(channelPackagePath, 'channel package metadata');
 
@@ -83,6 +85,21 @@ export function buildPlugin({ repoRoot = DEFAULT_ROOT, outputRoot = path.join(re
       dependencies: { '@modelcontextprotocol/sdk': runtimePackage.dependencies['@modelcontextprotocol/sdk'] },
     });
 
+    const toolPrefix = 'mcp__plugin_agent-smith_agent-smith__';
+    writeJson(path.join(staging, 'hooks', 'watch-hooks.json'), {
+      hooks: {
+        PostToolUse: [{
+          matcher: ['spawn_job', 'run_pipeline', 'resume_job'].map((n) => `${toolPrefix}${n}`).join('|'),
+          hooks: [{
+            type: 'command',
+            command: 'node "${CLAUDE_PLUGIN_ROOT}/runtime/dist/watch-hook.js"',
+            asyncRewake: true,
+            timeout: 2760,
+          }],
+        }],
+      },
+    });
+
     const pluginManifest = {
       ...manifest,
       mcpServers: {
@@ -93,21 +110,17 @@ export function buildPlugin({ repoRoot = DEFAULT_ROOT, outputRoot = path.join(re
           env: { AGENT_SMITH_CHANNEL: '0' },
         },
       },
-      experimental: {
-        ...(manifest.experimental ?? {}),
-        monitors: [{
-          name: 'milestones',
-          command: 'node "${CLAUDE_PLUGIN_ROOT}/runtime/dist/monitor.js"',
-          description: 'Agent Smith milestone notifications',
-          when: 'always',
-        }],
-      },
+      // The always-on monitor is gone: a running monitor shows in Claude's exit
+      // dialog and polls forever. A job-scoped asyncRewake hook replaces it.
+      hooks: './hooks/watch-hooks.json',
     };
     writeJson(path.join(staging, '.claude-plugin', 'plugin.json'), pluginManifest);
 
     // Ensure the staging output is complete before replacing the last good build.
     required(path.join(staging, 'runtime', 'dist', 'server.js'), 'staged MCP server');
     required(path.join(staging, 'runtime', 'dist', 'monitor.js'), 'staged monitor entrypoint');
+    required(path.join(staging, 'runtime', 'dist', 'watch-hook.js'), 'staged watch hook entrypoint');
+    required(path.join(staging, 'hooks', 'watch-hooks.json'), 'staged watch hooks');
     required(path.join(staging, 'runtime', 'node_modules', '@modelcontextprotocol', 'sdk'), 'staged MCP SDK');
 
     if (existsSync(target)) renameSync(target, backup);

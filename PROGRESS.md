@@ -41,10 +41,16 @@ No successful live paid-model execution is claimed by these automated checks.
 - The nested `agent-configs/.claude` remains an inactive example. Project/local
   settings cannot set `CLAUDE_CODE_PLUGIN_DIRS`, so the active setup uses a local
   marketplace with a relative plugin source instead.
-- The plugin includes Forge, MCP tools, delegation instructions, and a quiet
-  monitor sharing the channel's reader and deduplication policy. Its MCP server
-  runs without the channel poller so notifications have one owner.
-- Live plain `claude` 2.1.292 startup confirmed one monitor, connected
+- The plugin includes Forge, MCP tools, delegation instructions, and a
+  job-scoped `PostToolUse` `asyncRewake` hook (`hooks/watch-hooks.json`, running
+  `runtime/dist/watch-hook.js`) that watches only the job just spawned and exits 2
+  to wake Claude; nothing runs while idle. The always-on `experimental.monitors`
+  entry was removed because a running monitor shows in Claude's exit dialog and
+  polls forever. monitor.js stays staged as a manual fallback (`--job`/`--run`,
+  under Monitor); acks carry a `notify` hint. Its MCP server runs without the
+  channel poller. Unverified: exit-dialog behavior of async hooks, hook timeout
+  cap for 45-minute jobs (set 2760 s), and wake while mid-turn.
+- Earlier live plain `claude` 2.1.292 startup (with the old monitor) confirmed one monitor, connected
   `plugin:agent-smith:agent-smith` with seven tools, and working `/forge`.
   Claude's normal registry/data writes under `~/.claude/plugins` were authorized;
   sandbox-only startup could load the UI/monitor but blocked the MCP data folder.

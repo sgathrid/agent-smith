@@ -77,6 +77,56 @@ const OWN_JOBS_DIR = ['.agent-smith', 'jobs'];
 /** agy-staff's jobs directory, read second, for history. */
 const INTEROP_JOBS_DIR = ['.agy-staff', 'jobs'];
 
+/**
+ * Terminal jobs/pipelines already read, keyed by `cwd\0id`. A terminal verdict is
+ * final for the purposes of this reader, so the full scan skips re-reading them.
+ * Only the cheap directory listing is repeated each poll.
+ */
+const terminalCache = new Map<string, WatchableJob>();
+
+/** Testing hook. */
+export function clearReadCache(): void {
+  terminalCache.clear();
+}
+
+const isTerminal = (job: WatchableJob): boolean =>
+  (job.status === 'succeeded' || job.status === 'failed' || job.status === 'canceled') && job.finishedAt !== null;
+
+function cacheKey(cwd: string, id: string): string {
+  return `${cwd}\0${id}`;
+}
+
+/** Project a pipeline record onto the watchable shape; null for a malformed record. */
+export function pipelineToWatchable(run: PipelineRecord | null): WatchableJob | null {
+  if (!run || typeof run.runId !== 'string' || typeof run.pipeline !== 'string' ||
+      !Number.isFinite(run.startedAt) || (run.finishedAt !== null && !Number.isFinite(run.finishedAt)) ||
+      !['running', 'passed', 'partial', 'failed'].includes(run.status) ||
+      run.stageResults === null || typeof run.stageResults !== 'object') return null;
+  return {
+    id: run.runId, name: run.pipeline, role: 'pipeline',
+    status: run.status === 'running' ? 'running' : run.status === 'passed' ? 'succeeded' : 'failed',
+    lastEventAt: new Date(run.startedAt).toISOString(),
+    finishedAt: run.finishedAt === null ? null : new Date(run.finishedAt).toISOString(),
+    warned: run.status !== 'passed' && run.status !== 'running',
+    outcome: run.status === 'running' ? undefined : `Pipeline ${run.status}; ${Object.values(run.stageResults).filter(s => s && typeof s.stage === 'string').map(s => `${s.stage}: execution ${s.status}, acceptance ${s.acceptance ?? 'unchecked'}`).join('; ')}.`,
+  };
+}
+
+/** Read one pipeline record by run id (file name is the sanitized id). */
+export async function readPipelineRecord(cwd: string, runId: string): Promise<{ job: WatchableJob; stageJobIds: string[] } | null> {
+  const file = path.join(cwd, '.agent-smith', 'pipelines', `${runId.replace(/[^A-Za-z0-9._-]+/g, '-').slice(0, 100) || 'pipeline'}.json`);
+  const run = await readJsonSafe<PipelineRecord>(file);
+  const job = pipelineToWatchable(run);
+  if (job === null || run === null) return null;
+  const stageJobIds = Object.values(run.stageResults).flatMap(s => (s && typeof s.jobId === 'string' ? [s.jobId] : []));
+  return { job, stageJobIds };
+}
+
+/** Read exactly one job by id from either source (primary first). Never throws. */
+export async function readJob(cwd: string, jobId: string, now: number = Date.now()): Promise<WatchableJob | null> {
+  return (await readOne(new AgentSmithReader(), cwd, jobId, now)) ?? (await readOne(new AgyStaffReader(), cwd, jobId, now));
+}
+
 /** One read of every job. Never throws; an unreadable directory yields []. */
 export async function readAll(cwd: string, now: number = Date.now()): Promise<WatchableJob[]> {
   const claimed = new Set<string>();
@@ -93,19 +143,12 @@ export async function readAll(cwd: string, now: number = Date.now()): Promise<Wa
   const runs = path.join(cwd, '.agent-smith', 'pipelines');
   for (const file of await readdirSafe(runs)) {
     if (!file.endsWith('.json')) continue;
-    const run = await readJsonSafe<PipelineRecord>(path.join(runs, file));
-    if (!run || typeof run.runId !== 'string' || typeof run.pipeline !== 'string' ||
-        !Number.isFinite(run.startedAt) || (run.finishedAt !== null && !Number.isFinite(run.finishedAt)) ||
-        !['running', 'passed', 'partial', 'failed'].includes(run.status) ||
-        run.stageResults === null || typeof run.stageResults !== 'object') continue;
-    out.push({
-      id: run.runId, name: run.pipeline, role: 'pipeline',
-      status: run.status === 'running' ? 'running' : run.status === 'passed' ? 'succeeded' : 'failed',
-      lastEventAt: new Date(run.startedAt).toISOString(),
-      finishedAt: run.finishedAt === null ? null : new Date(run.finishedAt).toISOString(),
-      warned: run.status !== 'passed' && run.status !== 'running',
-      outcome: run.status === 'running' ? undefined : `Pipeline ${run.status}; ${Object.values(run.stageResults).filter(s => s && typeof s.stage === 'string').map(s => `${s.stage}: execution ${s.status}, acceptance ${s.acceptance ?? 'unchecked'}`).join('; ')}.`,
-    });
+    const cached = terminalCache.get(cacheKey(cwd, `pipeline:${file}`));
+    if (cached) { out.push(cached); continue; }
+    const job = pipelineToWatchable(await readJsonSafe<PipelineRecord>(path.join(runs, file)));
+    if (job === null) continue;
+    if (isTerminal(job)) terminalCache.set(cacheKey(cwd, `pipeline:${file}`), job);
+    out.push(job);
   }
 
   return out;
@@ -139,8 +182,12 @@ async function collect(
     if (claimed.has(id)) continue;
     if (skip(id)) continue;
     claimed.add(id);
+    const cached = terminalCache.get(cacheKey(cwd, id));
+    if (cached) { out.push(cached); continue; }
     const job = await readOne(reader, cwd, id, now);
-    if (job !== null) out.push(job);
+    if (job === null) continue;
+    if (isTerminal(job)) terminalCache.set(cacheKey(cwd, id), job);
+    out.push(job);
   }
 }
 
