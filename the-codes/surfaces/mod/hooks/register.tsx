@@ -214,7 +214,7 @@ async function pollBand($: EngineInterface): Promise<void> {
  * NEVER THROWS. A band that fails to configure itself must not take the
  * session's start — or the pane — down with it.
  */
-export async function startBand($: EngineInterface): Promise<void> {
+export async function startBand($: EngineInterface, cwd?: string): Promise<void> {
 
   // NO_COLOR first, because it decides every colour prop from here on.
   // `$.env.get` requires a string LITERAL name (VERIFIED: a computed name is
@@ -228,7 +228,11 @@ export async function startBand($: EngineInterface): Promise<void> {
     $.env.get('AGY_RADAR_REPO').catch(() => undefined),
   ]);
   await update($, bandConfig, () => ({
-    repo: repo !== undefined && repo.trim() !== '' ? repo.trim() : DEFAULT_REPO,
+    // Precedence: explicit AGY_RADAR_REPO, else the session cwd, else
+    // DEFAULT_REPO (empty by design). A hardcoded developer path here would
+    // make the plugin show another machine's jobs.
+    repo: repo !== undefined && repo.trim() !== '' ? repo.trim()
+      : (cwd !== undefined && cwd !== '' ? cwd : DEFAULT_REPO),
     colour: !noColor({ NO_COLOR: nc, FORCE_COLOR: force, TERM: term }),
   }));
 
@@ -336,13 +340,17 @@ export function registerBand(on: Parameters<Register>[0]): void {
                   undefined under NO_COLOR and for canceled/unknown, and
                   `color={undefined}` draws in the terminal's default — the
                   glyph still carries the state, which is the whole point. */}
-              <Text color={line.accent} bold={line.bold}>
+              <Text color={line.accent} bold={line.bold} wrap="truncate-end">
                 {line.head}
               </Text>
               {/* Segment 2: everything secondary, `dimColor`. NEVER `gray`: it is
                   a fixed colour that disappears on one of light/dark terminals
-                  (TERMINAL-UI.md L84-85). */}
-              <Text dimColor>{line.tail}</Text>
+                  (TERMINAL-UI.md L84-85). `wrap` here too — TERMINAL-UI.md
+                  L124-126 says EVERY Text, not just the outermost one, and the
+                  engine tests the rule per element. */}
+              <Text dimColor wrap="truncate-end">
+                {line.tail}
+              </Text>
             </Text>
           );
         })}
@@ -389,7 +397,7 @@ export const register: Register = (on) => {
     const rest = await next(e);
     // Band first, and it never throws: a slow or failing band config must not
     // delay `/agy-radar` appearing or take the session's start with it.
-    await startBand($);
+    await startBand($, typeof e.cwd === 'string' ? e.cwd : undefined);
     await $.command
       .register({
         name: 'agy-radar',

@@ -517,8 +517,15 @@ export async function discover(fs: FsLike, dir: string): Promise<string[]> {
   return [...ids].sort();
 }
 
-/** The repo the band watches when `AGY_RADAR_REPO` is unset. See README. */
-export const DEFAULT_REPO = '/Users/gathrid/Repos/renyi';
+/**
+ * The repo the band watches when `AGY_RADAR_REPO` is unset.
+ *
+ * Empty, not a hardcoded path. `.agy-staff/` is per-repo state, so the repo you
+ * launched Claude in IS the right answer; a developer's absolute path would
+ * make the plugin report someone else's jobs on another machine. register.tsx
+ * substitutes the session cwd when this is empty.
+ */
+export const DEFAULT_REPO = '';
 
 /**
  * Read every job in a repo.

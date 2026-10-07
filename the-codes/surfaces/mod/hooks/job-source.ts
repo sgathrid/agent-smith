@@ -34,6 +34,12 @@
  */
 
 import path from 'node:path';
+// Static, not dynamic: Claude Code's hooks-module sandbox REFUSES a hooks module
+// that calls `await import(...)` — it loads the module by walking static import
+// declarations, so a dynamic import fails the whole module with
+// "hooks module did not load". Node's `open` is a static import for exactly
+// that reason; keep it that way.
+import { open } from 'node:fs/promises';
 
 import { AgyStaffReader, stripSystemNotifications } from '../../../harness/agy-staff.ts';
 import { normalize } from '../../../harness/normalize.ts';
@@ -256,7 +262,6 @@ async function readEventsTail(dir: string, jobId: string): Promise<string | null
   const full = path.join(dir, `${jobId}.events.jsonl`);
   if (!(await existsSafe(full))) return null;
 
-  const { open } = await import('node:fs/promises');
   let handle;
   try {
     handle = await open(full, 'r');

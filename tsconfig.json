@@ -20,5 +20,10 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["the-codes/**/*.ts", "the-codes/**/*.tsx"]
+  "include": ["the-codes/**/*.ts", "the-codes/**/*.tsx"],
+  // Host-testkit tests import `claude-code/testing`, whose types ship inside
+  // Claude Code rather than npm. `claude plugin test` supplies them; a bare
+  // `tsc` cannot, so excluding the dir keeps `typecheck` meaningful instead of
+  // permanently red for a reason we cannot fix here.
+  "exclude": ["**/node_modules", "the-codes/surfaces/mod/tests/engine"]
 }
