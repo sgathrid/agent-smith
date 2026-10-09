@@ -54,6 +54,8 @@ import {
   type ForgeManifest,
   type ForgeProgress,
   type ForgeStatus,
+  type ForgeView,
+  type ForgeViewEvent,
 } from './format.ts';
 import { MirrorWriter } from './mirror.ts';
 import type { JobResult, ProviderEvent, WorkerHandle } from '../providers/types.ts';
@@ -119,7 +121,11 @@ export class JobWriter {
   private recent: ForgeActivity[] = [];
   private lastFlushMs = 0;
   private toolCalls = 0;
+  private toolSteps = new Set<number>();
   private latestText: string | null = null;
+  private view: ForgeView = { schema: 1, prompt: '', preamble: null, transcript: [], tools: [], timeline: [], truncated: false };
+  private deltaOpen = false;
+  private viewSequence = 0;
   private conversation: string | null = null;
   private finished = false;
   private cancelRequestedAt: string | null = null;
@@ -155,6 +161,8 @@ export class JobWriter {
    */
   start(input: StartInput): ForgeManifest {
     const now = new Date().toISOString();
+    this.view = { ...this.view, prompt: input.prompt.slice(0, 64_000), preamble: input.preamble?.slice(0, 4_000) ?? null,
+      truncated: input.prompt.length > 64_000 || (input.preamble?.length ?? 0) > 4_000 };
     this.conversation = input.conversation;
     const manifest: ForgeManifest = {
       schema: SCHEMA_VERSION,
@@ -272,6 +280,7 @@ export class JobWriter {
     }
 
     if (event.kind === 'activity-start' || event.kind === 'activity-end') {
+      this.deltaOpen = false;
       const ref = event.activity;
       const status =
         event.kind === 'activity-start'
@@ -282,8 +291,9 @@ export class JobWriter {
               ? ('error' as const)
               : ('done' as const);
 
-      if (event.kind === 'activity-start') {
-        this.toolCalls = Math.max(this.toolCalls, ref.stepIndex + 1);
+      if (!this.toolSteps.has(ref.stepIndex)) {
+        this.toolSteps.add(ref.stepIndex);
+        this.toolCalls += 1;
       }
 
       // A tool's DONE record frequently carries no `input` (the provider split
@@ -298,7 +308,7 @@ export class JobWriter {
       }
       const row: ForgeActivity = {
         stepIndex: ref.stepIndex,
-        tool: ref.tool,
+        tool: ref.tool === 'tool_result' ? this.recent[idx]?.tool ?? ref.tool : ref.tool,
         status,
         ...(input === undefined ? {} : { input }),
       };
@@ -309,6 +319,28 @@ export class JobWriter {
       // short is what stops that from mattering.
       if (this.recent.length > RECENT_ACTIVITIES) this.recent = this.recent.slice(-RECENT_ACTIVITIES);
 
+      const tools = [...this.view.tools];
+      const toolIndex = tools.findIndex(t => t.stepIndex === ref.stepIndex);
+      const previous = tools[toolIndex];
+      const detail = { stepIndex: ref.stepIndex, at, tool: (ref.tool === 'tool_result' ? previous?.tool ?? ref.tool : ref.tool).slice(0, 120),
+        input: (ref.input ?? previous?.input ?? '').slice(0, 1_000),
+        output: (ref.output ?? previous?.output ?? '').slice(0, 2_000),
+        state: status === 'active' ? 'active' as const : status === 'done' ? 'done' as const : 'error' as const };
+      if (toolIndex >= 0) tools[toolIndex] = detail;
+      else tools.push(detail);
+      this.view = { ...this.view, tools: tools.slice(-60), truncated: this.view.truncated || tools.length > 60 ||
+        (ref.input?.length ?? 0) > 1_000 || (ref.output?.length ?? 0) > 2_000 || ref.tool.length > 120 };
+
+      const timeline = [...this.view.timeline ?? []];
+      const eventIndex = timeline.findIndex(e => e.kind === 'tool' && e.stepIndex === ref.stepIndex);
+      const oldEvent = timeline[eventIndex];
+      const item: ForgeViewEvent = { ...detail, kind: 'tool', sequence: oldEvent?.sequence ?? this.viewSequence++,
+        at: oldEvent?.at ?? at };
+      if (eventIndex >= 0) timeline[eventIndex] = item;
+      else timeline.push(item);
+      const bounded = boundTimeline(timeline);
+      this.view = { ...this.view, timeline: bounded.events, truncated: this.view.truncated || bounded.truncated };
+
       this.mirror.appendEvent(this.jobId, event as unknown as Record<string, unknown>);
       this.touch(at);
       return;
@@ -316,6 +348,26 @@ export class JobWriter {
 
     if (event.kind === 'text') {
       if (event.stream !== 'assistant') return;
+      this.mirror.appendEvent(this.jobId, event as unknown as Record<string, unknown>);
+      const joinDelta = event.delta === true && this.deltaOpen;
+      const transcript = [...this.view.transcript];
+      if (event.delta && this.deltaOpen && transcript.length > 0) transcript[transcript.length - 1] += event.text;
+      else transcript.push(event.text);
+      this.deltaOpen = event.delta === true;
+      let truncated = this.view.truncated;
+      let chars = transcript.reduce((n, t) => n + t.length, 0);
+      while (transcript.length > 1 && (chars > 64_000 || transcript.length > 200)) {
+        chars -= transcript.shift()!.length;
+        truncated = true;
+      }
+      if (chars > 64_000) { transcript[0] = transcript[0]!.slice(-64_000); truncated = true; }
+      this.view = { ...this.view, transcript, truncated };
+      const timeline = [...this.view.timeline ?? []];
+      const last = timeline.at(-1);
+      if (joinDelta && last?.kind === 'assistant') timeline[timeline.length - 1] = { ...last, text: last.text + event.text };
+      else timeline.push({ kind: 'assistant', sequence: this.viewSequence++, at, text: event.text });
+      const bounded = boundTimeline(timeline);
+      this.view = { ...this.view, timeline: bounded.events, truncated: this.view.truncated || bounded.truncated };
       this.latestText = appendBounded(this.latestText ?? '', event.text, LATEST_TEXT_CHARS);
       this.manifest = { ...this.manifest, latestSummary: this.latestText.trim().slice(-1_000) || this.manifest.latestSummary || null, summarySource: 'worker' };
       this.touch(at);
@@ -523,6 +575,7 @@ export class JobWriter {
     this.progress = progress;
     this.writeManifest();
     writeJsonAtomic(jobFile(this.repo, this.jobId, FILES.progress), progress);
+    writeJsonAtomic(jobFile(this.repo, this.jobId, FILES.view), this.view);
     this.mirror.writeProgress(this.manifest ?? emptyManifest(this.jobId), progress);
     const ms = Date.parse(at);
     this.lastFlushMs = Number.isNaN(ms) ? Date.now() : ms;
@@ -669,4 +722,24 @@ export function reportFor(result: JobResult): string {
 /** Append one normalized event straight to our own event log. Used by tests. */
 export function appendOwnEvent(repo: string, jobId: string, event: ProviderEvent): void {
   appendLine(jobFile(repo, jobId, FILES.events), event);
+}
+
+/** Ordered previews use the same bounded budget as the other detail fields. */
+function boundTimeline(input: ForgeViewEvent[]): { events: ForgeViewEvent[]; truncated: boolean } {
+  const events = [...input];
+  let truncated = false;
+  let chars = events.reduce((n,e) => n + (e.kind === 'assistant' ? e.text.length : 0),0);
+  let tools = events.filter(e => e.kind === 'tool').length;
+  while (events.length > 1 && (events.length > 100 || chars > 64_000 || tools > 60)) {
+    const removed = events.shift()!;
+    if (removed.kind === 'assistant') chars -= removed.text.length;
+    else tools--;
+    truncated = true;
+  }
+  const first = events[0];
+  if (first?.kind === 'assistant' && first.text.length > 64_000) {
+    events[0] = { ...first, text: first.text.slice(-64_000) };
+    truncated = true;
+  }
+  return { events, truncated };
 }

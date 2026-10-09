@@ -61,6 +61,13 @@ export interface RadarJob {
 
   /** Worker role/stage, when the source records one. */
   readonly role?: string | null;
+  readonly provider?: string | null;
+  readonly model?: string | null;
+  readonly acceptance?: RadarAcceptance;
+  readonly lastEventAt?: number | null;
+  readonly pipeline?: string | null;
+  readonly stage?: string | null;
+  readonly attempt?: number | null;
 
   /** Latest actual assistant output, kept separate from reasoning/tool activity. */
   readonly latestSummary?: string | null;
@@ -125,6 +132,17 @@ export interface RadarJob {
   readonly raw: Record<string, unknown>;
 }
 
+export type ActivityEvent =
+  | { sequence: number; kind: 'assistant'; at: string; text: string }
+  | { sequence: number; kind: 'tool'; at: string; stepIndex: number; tool: string; input: string; output: string; state: string };
+export type DetailTab = 'activity' | 'task' | 'result' | 'checks';
+
+export interface RadarAcceptance {
+  readonly state: 'accepted' | 'rejected' | 'unchecked';
+  readonly pending?: boolean;
+  readonly checks: readonly { name: string; ok: boolean; outputTail: string }[];
+}
+
 /** One tool call, for the detail pane's history. */
 export interface ToolEntry {
   /** Epoch ms, or null if the event carried no usable time. */
@@ -164,6 +182,14 @@ declare module 'claude-code' {
       follow: boolean;
       /** `p`: show the prompt as sent, with the mode preamble. Resets on `/forge`. */
       showPreamble: boolean;
+      listPage: number;
+      paneOpen: boolean;
+      expanded: boolean;
+      rosterTab: 'active' | 'history';
+      detailTab: DetailTab;
+      expandedTools: string[];
+      expandedChecks: number[];
+      readError: string | null;
       /**
        * The band's own snapshot of the jobs directory, from the 3 s poll.
        *
@@ -177,8 +203,9 @@ declare module 'claude-code' {
       /** Host-created task IDs for live Agent Smith jobs; keys are Agent Smith job IDs. */
       nativeTaskLinks: Record<string, {
         taskId: string;
-        status: 'in_progress' | 'completed';
+        status: 'in_progress' | 'completed' | 'deleted';
         fingerprint: string;
+        doneAt?: number;
       }>;
       /**
        * Resolved once at session start: which repo to watch, and whether colour
@@ -190,7 +217,7 @@ declare module 'claude-code' {
        * folded in here; the pane reading the result means the band and the pane
        * cannot end up pointed at different repos.
        */
-      bandConfig: { repo: string; colour: boolean };
+      bandConfig: { repo: string; colour: boolean; legacy: boolean };
     };
   }
 }

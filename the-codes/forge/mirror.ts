@@ -267,8 +267,8 @@ export function mirrorEventLine(event: Record<string, unknown>): Record<string, 
   // tool-count/tool-history readers (which only look at `step_update`) ignore it.
   if (kind === 'text') {
     const text = event['text'];
-    if (event['stream'] !== 'assistant' || typeof text !== 'string' || text.trim() === '') return null;
-    return { agent_text: { at: event['at'] ?? null, text: text.slice(0, 16_000) } };
+    if (event['stream'] !== 'assistant' || typeof text !== 'string' || text === '' || (event['delta'] !== true && text.trim() === '')) return null;
+    return { agent_text: { at: event['at'] ?? null, text: text.slice(0, 16_000), delta: event['delta'] === true } };
   }
   if (kind !== 'activity-start' && kind !== 'activity-end') return null;
   const activity = event['activity'] as Record<string, unknown> | undefined;

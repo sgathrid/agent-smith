@@ -159,7 +159,7 @@ export type ProviderEvent =
   | { kind: 'started'; at: string; conversationId?: string; model?: string; raw?: unknown }
 
   /** Assistant prose. `stream` distinguishes user-visible text from thinking. */
-  | { kind: 'text'; at: string; text: string; stream: 'assistant' | 'thinking' }
+  | { kind: 'text'; at: string; text: string; stream: 'assistant' | 'thinking'; delta?: boolean }
 
   /** A tool call began. Emit once per step_index, on the ACTIVE transition. */
   | { kind: 'activity-start'; at: string; activity: ActivityRef }

@@ -772,16 +772,19 @@ export function toolHistoryFromEvents(text: string): ToolEntry[] {
 /** PURE: an events.jsonl body → the newest assistant prose chunks, oldest first. */
 export function transcriptFromEvents(text: string, keep = 200): string[] {
   const out: string[] = [];
+  let deltaOpen = false;
   for (const line of text.split('\n')) {
-    if (!line.includes('"agent_text"')) continue;
     try {
-      const t = (JSON.parse(line) as { agent_text?: { text?: unknown } }).agent_text?.text;
-      if (typeof t === 'string' && t.trim() !== '') out.push(t.trim());
-    } catch {
-      continue;
-    }
+      const event = JSON.parse(line) as { agent_text?: { text?: unknown; delta?: boolean }; step_update?: unknown };
+      if (event.step_update) deltaOpen = false;
+      const t = event.agent_text?.text;
+      if (typeof t !== 'string' || t === '') continue;
+      if (event.agent_text?.delta && deltaOpen && out.length > 0) out[out.length - 1] += t;
+      else out.push(t);
+      deltaOpen = event.agent_text?.delta === true;
+    } catch { /* The final line can be incomplete while the worker appends. */ }
   }
-  return out.slice(-keep);
+  return out.slice(-keep).filter(t => t.trim() !== '');
 }
 
 export async function readTranscript(fs: FsLike, repo: string, id: string): Promise<string[]> {

@@ -405,7 +405,7 @@ export function createAgyTranslator(maxChars: number) {
           // agy streams prose as many small text_delta slices. We forward each
           // one rather than buffering: the mod surface renders incrementally and
           // a long answer would otherwise be invisible for minutes.
-          out.push({ kind: 'text', at, text: delta, stream: 'assistant' });
+          out.push({ kind: 'text', at, text: delta, stream: 'assistant', delta: true });
         }
         return out;
       }

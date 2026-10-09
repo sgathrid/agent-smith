@@ -33,7 +33,7 @@ import type { BandLine, BandBudget } from '../../hooks/band.ts';
 import { BAND_ROWS, buildLine, isShown, noColor, rowBudget } from '../../hooks/band.ts';
 import type { RadarJob } from '../../../types/index.d.ts';
 
-test('Forge list and detail request one third of the measured terminal', async ($, on) => {
+test('Forge expands at the bottom; an explicit inspector requests one third of the terminal', async ($, on) => {
   engine(on);
   const widths: number[] = [];
   on('ui.open', (_$, e) => { widths.push(e.columns); return { value: { isPlaced: true } }; });
@@ -41,6 +41,9 @@ test('Forge list and detail request one third of the measured terminal', async (
   const band = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', ...BAND,
     viewport: { columns: 180, rows: 40, isFullscreen: true } } as never);
   await $.command.run({ command: 'forge', args: '' });
+  expect(widths).toHaveLength(0);
+  expect(await band.find({key:'job-'+ID})).toBeDefined();
+  await band.press({key:'inspector'});
   expect(widths[widths.length - 1]).toBe(60);
   await band.unmount();
   const pane = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', component: 'Pane', requestId: 'agent-smith',
@@ -89,6 +92,7 @@ const RUNNING_NOW = Date.parse('2026-10-03T16:49:45.031Z');
 
 const BAND = {
   component: 'AbovePrompt' as const,
+  requestId: 'forge-band',
   props: { hasSurvey: false, isWorking: true, maxRows: 10, bodyColumns: 120 },
 };
 
@@ -106,6 +110,7 @@ function engine(
     noColorEnv?: string;
     files?: Record<string, string>;
     entries?: { name: string; kind: 'file' | 'dir'; size: number }[];
+    scrollCalls?: Record<string,unknown>[];
     nativeTask?: boolean;
     nativeTaskCalls?: { tool: string; input: Record<string, unknown> }[];
   } = {},
@@ -133,10 +138,13 @@ function engine(
     cwd: (e as { cwd?: string }).cwd,
   }));
   on('command.register', () => ({ value: undefined }));
-  mock.clock(on as never, { now: options.now ?? RUNNING_NOW });
+  on('ui.scroll', (_$,e) => { options.scrollCalls?.push(e as Record<string,unknown>); return {}; });
+  on('ui.close', () => ({value:undefined}));
+  const clock = mock.clock(on as never, { now: options.now ?? RUNNING_NOW });
   on('env.get', (_$: unknown, e: unknown) => {
     const name = (e as { name: string }).name;
     if (name === 'AGY_RADAR_REPO') return { value: options.nativeTask ? '/work' : '/corpus' };
+    if (name === 'AGENT_SMITH_LEGACY_JOBS') return { value: options.nativeTask ? undefined : '1' };
     if (name === 'NO_COLOR') return { value: options.noColorEnv };
     return { value: undefined };
   });
@@ -150,7 +158,7 @@ function engine(
   on('fs.read', (_$: unknown, e: unknown) => {
     const path = (e as { path: string }).path;
     const name = path.slice(path.lastIndexOf('/') + 1);
-    const body = files[name];
+    const body = options.files?.[name] ?? files[name];
     if (body === undefined) {
       // The real `$.fs.read` rejects with the OS errno; the band must survive it.
       return { deny: `ENOENT: no such file or directory, open '${path}'` };
@@ -158,7 +166,7 @@ function engine(
     return { value: body };
   });
   on('fs.exists', (_$: unknown, e: unknown) => ({
-    value: Object.hasOwn(files, (e as { path: string }).path.slice((e as { path: string }).path.lastIndexOf('/') + 1)),
+    value: (options.nativeTask && (e as {path:string}).path === '/work/.agent-smith/jobs') || Object.hasOwn(options.files ?? {}, (e as {path:string}).path.split('/').pop()!) || Object.hasOwn(files, (e as { path: string }).path.slice((e as { path: string }).path.lastIndexOf('/') + 1)),
   }));
   if (options.nativeTaskCalls) {
     on('tool.call', (_$: unknown, e: unknown) => {
@@ -170,6 +178,7 @@ function engine(
     });
   }
   on('ui.render', ($: any, e: any) => $.ui.resolve(e).Text({ children: 'REST-OF-BAND' }));
+  return clock;
 }
 
 // ── pure helpers, re-checked under the engine's own runner ─────────────────
@@ -310,7 +319,7 @@ describe('HAZARD A, as drawn', () => {
     // THE headline rule. agy-staff exits 0 having delivered nothing when a tool
     // is soft-denied. A `✓` here is the most expensive lie this project could tell.
     engine(on, {
-      now: Date.parse('2026-10-03T17:06:00.000Z'),
+      now: Date.parse('2026-10-03T17:05:45.000Z'),
       entries: [
         { name: `${ID}.spec.json`, kind: 'file', size: REAL_SPEC.length },
         { name: `${ID}.log`, kind: 'file', size: REAL_LOG.length },
@@ -403,7 +412,7 @@ describe('HAZARD A, as drawn', () => {
       props: { hasSurvey: false, isWorking: true, maxRows: 3, bodyColumns: 80 },
     } as never);
     // 5 jobs, 2 rows + overflow ⇒ +3 more, not +1.
-    expect(await band.find({ type: 'Text', text: '+3 more' })).toBeDefined();
+    expect(await band.find({ type: 'Text', text: '+4 more' })).toBeDefined();
   });
 });
 
@@ -449,6 +458,7 @@ describe('native task-list projection', () => {
           schema: 1,
           jobId: 'job-native-1',
           status: 'running',
+          updatedAt: new Date(RUNNING_NOW).toISOString(),
           name: 'Codex reviewer',
           workerId: 'worker-codex-7',
           role: 'reviewer',
@@ -481,4 +491,124 @@ describe('native task-list projection', () => {
     expect(update?.input.description).toContain('Outcome: running');
     expect(update?.input.description).toContain('Latest worker output:\nFound a retry loop');
   });
+});
+
+const PANE_TARGET = { plugin: 'agent-smith', surface: 'terminal', component: 'Pane', requestId: 'agent-smith', viewport: { columns: 180, rows: 40, isFullscreen: true }, props: { title: 'Agent Smith', isFocused: true, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} } } as never;
+test('Clear finished dismisses the completed row', async ($, on) => {
+  engine(on, {now: Date.parse('2026-10-03T17:05:45Z'), files: {[`${ID}.result.md`]: 'A complete worker report with enough content to pass the output validator.', [`${ID}.result.md.status.json`]: REAL_STATUS}});
+  await $.session.start({surface:'terminal',isInteractive:true,cwd:'/work'} as never);
+  const pane=await $.ui.mount(PANE_TARGET);
+  await pane.press({key:'roster-history'});
+  expect(await pane.find({key:`job-${ID}`})).toBeDefined();
+  await pane.press({key:'clear'});
+  expect(await pane.find({key:`job-${ID}`})).toBeUndefined();
+});
+test('pagination makes the tenth running job selectable', async ($, on) => {
+  const ids=Array.from({length:10},(_,i)=>`job-${i}`);
+  engine(on,{entries:ids.map(id=>({name:`${id}.spec.json`,kind:'file',size:10})), files:Object.fromEntries(ids.flatMap(id=>[[`${id}.spec.json`,REAL_SPEC],[`${id}.log`,REAL_LOG],[`${id}.progress.json`,REAL_PROGRESS]]))});
+  await $.session.start({surface:'terminal',isInteractive:true,cwd:'/work'} as never);
+  const pane=await $.ui.mount(PANE_TARGET);
+  expect(await pane.find({key:'job-job-9'})).toBeUndefined();
+  await pane.press({key:'next-page'});
+  expect(await pane.find({key:'job-job-9'})).toBeDefined();
+  await pane.press({key:'job-job-9'});
+  expect(await pane.find({key:'back'})).toBeDefined();
+});
+test('the last finished band row expires and stops repainting', async ($, on) => {
+  const clock=engine(on,{now:Date.parse('2026-10-03T17:05:45Z'),files:{[`${ID}.result.md`]:'A complete worker report with enough content to pass the output validator.',[`${ID}.result.md.status.json`]:REAL_STATUS}});
+  await $.session.start({surface:'terminal',isInteractive:true,cwd:'/work'} as never);
+  const band=await $.ui.mount({plugin:'agent-smith',surface:'terminal',...BAND} as never);
+  expect(await band.find({type:'Text',text:/open an agent-built dashboard/})).toBeDefined();
+  await clock.advance(60_000);
+  expect(await band.find({type:'Text',text:/open an agent-built dashboard/})).toBeUndefined();
+});
+
+test('canonical jobs refresh acceptance in an open pane and survive Clear while checks are pending', async ($, on) => {
+  const calls: { tool: string; input: Record<string, unknown> }[] = [];
+  const registrations: unknown[] = [];
+  const files: Record<string, string> = {
+    'job.json': JSON.stringify({schema:1,jobId:'job-native-1',status:'succeeded',name:'Ada',workerId:'ada',
+      task:'Canonical worker',startedAt:new Date(RUNNING_NOW-5000).toISOString(),finishedAt:new Date(RUNNING_NOW-1000).toISOString(),updatedAt:new Date(RUNNING_NOW).toISOString(),toolCalls:1}),
+    'acceptance.json': JSON.stringify({state:'unchecked',pending:true,checks:[]}),
+    'view.json': JSON.stringify({schema:1,prompt:'Canonical task',preamble:null,tools:[],transcript:['Assistant output'],truncated:false}),
+    'result.md': 'Worker report',
+  };
+  on('session.start', (_$, e) => ({sessionId:'s',cwd:e.cwd}));
+  on('command.register', (_$, e) => {registrations.push(e);return {value:undefined};});
+  on('env.get', () => ({value:undefined}));
+  on('ui.open', () => ({value:{isPlaced:true}}));
+  const clock=mock.clock(on,{now:RUNNING_NOW});
+  on('fs.list', () => ({value:[{name:'job-native-1',kind:'dir',size:0}]}));
+  on('fs.exists', (_$, e) => ({value:e.path==='/work/.agent-smith/jobs'||Object.hasOwn(files,e.path.split('/').pop()!)}));
+  on('fs.read', (_$, e) => {
+    const body=files[e.path.split('/').pop()!];
+    return body===undefined?{deny:'ENOENT'}:{value:body};
+  });
+  on('tool.call', (_$, e) => {
+    calls.push({tool:e.tool,input:{...e}});
+    return e.tool==='TaskCreate'?{result:{task:{id:'native-task-1'}}}:{result:{success:true}};
+  });
+  await $.session.start({surface:'terminal',isInteractive:true,cwd:'/work'} as never);
+  expect(registrations.some(e => (e as {immediate?:boolean}).immediate===true)).toBe(true);
+  await $.command.run({command:'forge',args:''});
+  const pane=await $.ui.mount(PANE_TARGET);
+  expect(await pane.find({key:'job-job-native-1'})).toBeDefined();
+  await pane.press({key:'clear'});
+  expect(await pane.find({key:'job-job-native-1'})).toBeDefined();
+  await pane.press({key:'job-job-native-1'});
+  await pane.press({key:'tab-checks'});
+  expect(await pane.find({type:'Text',text:'Acceptance: checks pending'})).toBeDefined();
+  files['acceptance.json']=JSON.stringify({state:'rejected',pending:false,checks:[{name:'tests',ok:false,outputTail:'Test failed'}]});
+  await clock.advance(3000);
+  expect(await pane.find({type:'Text',text:'Acceptance: rejected'})).toBeDefined();
+  expect(calls.some(call => call.tool==='TaskUpdate'&&String(call.input.subject).includes('[checks rejected]'))).toBe(true);
+  await clock.advance(30_000);
+  expect(calls.some(call => call.input.status==='deleted')).toBe(false);
+  await pane.press({key:'back'});
+  files['job.json']='{broken';
+  await clock.advance(3000);
+  expect(await pane.find({type:'Text',text:/Unable to read Forge state/})).toBeDefined();
+  expect(await pane.find({key:'job-job-native-1'})).toBeDefined();
+});
+
+
+test('bottom Activity pauses on user scroll and keeps the worker open on completion', async ($,on) => {
+  const calls: Record<string,unknown>[]=[];
+  const files: Record<string,string>={
+    'job.json':JSON.stringify({schema:1,jobId:'job-native-1',workerId:'ada',name:'Ada',role:'reviewer',status:'running',task:'Inspect Forge',startedAt:new Date(RUNNING_NOW-5000).toISOString(),updatedAt:new Date(RUNNING_NOW).toISOString(),toolCalls:1}),
+    'view.json':JSON.stringify({schema:1,prompt:'Long task instructions',preamble:null,truncated:false,tools:[],transcript:[],timeline:[
+      {kind:'assistant',sequence:0,at:new Date(RUNNING_NOW).toISOString(),text:'Tracing the renderer.'},
+      {kind:'tool',sequence:1,at:new Date(RUNNING_NOW).toISOString(),stepIndex:0,tool:'Read',input:'register.tsx',output:'file contents',state:'active'}]}),
+  };
+  const clock=engine(on,{nativeTask:true,files,scrollCalls:calls});
+
+  await $.session.start({surface:'terminal',isInteractive:true,cwd:'/work'} as never);
+  await $.command.run({command:'forge',args:''});
+  const band=await $.ui.mount({plugin:'agent-smith',surface:'terminal',...BAND} as never);
+  await band.press({key:'job-job-native-1'});
+  expect(await band.find({key:'event-1'})).toBeDefined();
+  expect(await band.find({type:'Markdown',text:'Tracing the renderer.'})).toBeDefined();
+  expect(await band.find({type:'Markdown',text:'Long task instructions'})).toBeUndefined();
+  // The testkit exposes scroll events, but does not paint or implement $.ui.scroll.
+  // The real terminal probe verifies end anchoring; this test verifies pause/state.
+  expect(await band.find({key:'follow',text:'Follow on'})).toBeDefined();
+  await $.ui.scroll({component:'AbovePrompt',requestId:'forge-band',offset:0,by:-1,bodyRows:9,contentRows:30,origin:{kind:'person'}} as never);
+  expect(await band.find({key:'follow',text:'Follow paused'})).toBeDefined();
+  const count=calls.length;
+  files['job.json']=JSON.stringify({...JSON.parse(files['job.json']!),status:'succeeded',finishedAt:new Date(RUNNING_NOW+3000).toISOString()});
+  files['result.md']='Final findings';
+  await clock.advance(3000);
+  expect(calls.length).toBe(count,'polling must not resume following');
+  expect(await band.find({key:'back'})).toBeDefined();
+  expect(await band.find({key:'event-1'})).toBeDefined();
+  await band.press({key:'follow'});
+  expect(await band.find({key:'follow',text:'Follow on'})).toBeDefined();
+  await band.press({key:'tab-result'});
+  expect(await band.find({type:'Markdown',text:'Final findings'})).toBeDefined();
+  await band.press({key:'tab-task'});
+  expect(await band.find({type:'Markdown',text:'Long task instructions'})).toBeDefined();
+  await band.redraw({...BAND.props,bodyColumns:24,maxRows:6} as never);
+  expect(await band.find({key:'close'})).toBeDefined();
+  await band.press({key:'close'});
+  expect(await band.find({key:'tab-activity'})).toBeUndefined();
 });

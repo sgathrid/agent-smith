@@ -69,18 +69,6 @@ export const LINGER_MS = 10_000;
 /** Rows the band draws before `+N more`. TERMINAL-UI.md L151. */
 export const BAND_ROWS = 4;
 
-/**
- * How far past the linger the tick keeps drawing.
- *
- * A finished job's row has to disappear ~30s after it finished, and the band
- * clock is what redraws it. Without this cushion the row survives one extra
- * tick — `isShown` is true at 29_999ms and false at 30_001ms — and the row you
- * were reading blinks out for one frame. Both reference mods add 3s for exactly
- * this reason. This is rule #1 of TERMINAL-UI.md (nothing moves unless the user
- * caused it) arriving as a flicker rather than as a row count change.
- */
-export const TICK_CUSHION_MS = 3000;
-
 /* ────────────────────────────────────────────────────────────────────────────
  * NO_COLOR (TERMINAL-UI.md L88-89, https://no-color.org/)
  * ────────────────────────────────────────────────────────────────────────────
@@ -200,7 +188,7 @@ export function buildLine(
  * serves as the honest bound on "I missed the finish, and that is fine".
  */
 export function isShown(job: RadarJob, now: number): boolean {
-  if (!isTerminal(job.status)) return true;
+  if (!isTerminal(job.status) || job.acceptance?.pending) return true;
   if (job.endedAt === null) return false;
   return now - job.endedAt < LINGER_MS;
 }

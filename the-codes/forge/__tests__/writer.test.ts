@@ -176,7 +176,7 @@ test('a tool call is counted and the newest step wins the activity cell', () => 
     toolCalls: number;
     recentActivities: { stepIndex: number; tool: string }[];
   };
-  assert.equal(p.toolCalls, 5, 'step_index 4 means five steps consumed');
+  assert.equal(p.toolCalls, 3, 'count observed calls rather than gaps in provider step indices');
   // Highest step_index, not last-in-array: a rewritten array mid-poll is not
   // guaranteed sorted, and the pane picks by index for exactly that reason.
   assert.equal(p.recentActivities[p.recentActivities.length - 1]?.tool, 'tool_4');
@@ -531,3 +531,66 @@ function require$fs(): typeof import('node:fs') {
   return fsModule;
 }
 import * as fsModule from 'node:fs';
+
+test('bounded canonical detail round-trips text fragments, tool identity and actual tool count', async () => {
+  const { readForgeDetail } = await import('../../surfaces/mod/hooks/canonical.ts');
+  const r = repo(); const id = 'implement-smith-abcd1234'; const w = start(r);
+  const at = now();
+  w.onEvent({ kind: 'activity-start', at, activity: { stepIndex: 40, tool: 'Read', input: 'source.ts' } });
+  w.onEvent({ kind: 'activity-end', at, activity: { stepIndex: 40, tool: 'tool_result', output: 'file content' }, status: 'done' });
+  w.onEvent({ kind: 'text', at, stream: 'assistant', text: 'Found the', delta: true });
+  w.onEvent({ kind: 'text', at, stream: 'assistant', text: ' ', delta: true });
+  w.onEvent({ kind: 'text', at, stream: 'assistant', text: 'edge case.', delta: true });
+  w.onEvent({ kind: 'text', at, stream: 'thinking', text: 'PRIVATE THINKING' });
+  w.finish(result(), 'Final findings from the worker.');
+  const fs = {
+    async read(p: string) { return readFileSync(p, 'utf8'); },
+    async exists(p: string) { return existsSync(p); },
+    async list(p: string) { return readdirSync(p, { withFileTypes: true }).map(e => ({ name: e.name, kind: e.isDirectory() ? 'dir' : 'file', size: 0 })); },
+  };
+  const detail = await readForgeDetail(fs, r, id, Date.now());
+  assert.equal(detail?.job.toolCount, 1, 'a high provider step index is not a tool count');
+  assert.deepEqual(detail?.transcript, ['Found the edge case.']);
+  assert.deepEqual(detail?.timeline?.map(e=>e.kind), ['tool','assistant']);
+  assert.deepEqual(detail?.timeline?.map(e=>e.sequence), [0,1]);
+  assert.equal(detail?.timeline?.[0]?.kind==='tool' ? detail.timeline[0].state : null, 'done');
+  assert.equal(detail?.timeline?.[1]?.kind==='assistant' ? detail.timeline[1].text : null, 'Found the edge case.');
+  assert.equal(JSON.parse(readFileSync(jobFile(r,id,FILES.progress),'utf8')).recentActivities[0].tool, 'Read');
+  assert.equal(detail?.history[0]?.tool, 'Read', 'completion must retain the original tool name');
+  assert.equal(detail?.history[0]?.label, 'source.ts');
+  assert.equal(detail?.history[0]?.state, 'done');
+  assert.match(detail?.job.prompt ?? '', /Dashboard rework/);
+  const mirror = readFileSync(path.join(r, '.agy-staff/jobs', `${id}.events.jsonl`), 'utf8');
+  const { transcriptFromEvents } = await import('../../surfaces/mod/hooks/jobs.ts');
+  assert.deepEqual(transcriptFromEvents(mirror), ['Found the edge case.']);
+  assert.doesNotMatch(mirror, /PRIVATE THINKING/);
+});
+
+test('detail snapshot stays under the mod file limit and marks truncation', () => {
+  const r = repo(); const id = 'implement-smith-abcd1234'; const w = start(r);
+  for (let i = 0; i < 70; i++) {
+    w.onEvent({ kind: 'activity-start', at: now(), activity: { stepIndex: i, tool: 'Read', input: '\\'.repeat(4000) } });
+    w.onEvent({ kind: 'text', at: now(), stream: 'assistant', text: '\\'.repeat(80_000), delta: true });
+  }
+  w.finish(result(), 'Report');
+  const snapshot = readFileSync(path.join(r, '.agent-smith/jobs', id, 'view.json'), 'utf8');
+  assert.ok(Buffer.byteLength(snapshot) < 4 * 1024 * 1024);
+  const parsed = JSON.parse(snapshot);
+  assert.equal(parsed.truncated, true);
+  assert.equal(parsed.tools.length, 60);
+  assert.ok(parsed.transcript.join('').length <= 64_000);
+});
+
+test('ordered activity preserves assistant/tool interleaving while a completed tool updates in place', () => {
+  const r=repo();const w=start(r);const at=now();
+  w.onEvent({kind:'activity-start',at,activity:{stepIndex:0,tool:'Read',input:'one.ts'}});
+  w.onEvent({kind:'text',at,stream:'assistant',text:'Explaining the first finding.'});
+  w.onEvent({kind:'activity-end',at,activity:{stepIndex:0,tool:'tool_result',output:'source'},status:'done'});
+  w.onEvent({kind:'activity-start',at,activity:{stepIndex:1,tool:'Bash',input:'npm test'}});
+  w.onEvent({kind:'text',at,stream:'assistant',text:'Tests are running.'});
+  w.finish(result(),'Report');
+  const view=JSON.parse(readFileSync(jobFile(r,w.jobId,FILES.view),'utf8'));
+  assert.deepEqual(view.timeline.map((e:{kind:string})=>e.kind),['tool','assistant','tool','assistant']);
+  assert.deepEqual(view.timeline.map((e:{sequence:number})=>e.sequence),[0,1,2,3]);
+  assert.equal(view.timeline[0].tool,'Read');assert.equal(view.timeline[0].state,'done');
+});

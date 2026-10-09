@@ -11,7 +11,7 @@ function fsFrom(files: Record<string, string>, names: readonly { name: string; k
       if (value === undefined) throw new Error(`ENOENT ${path}`);
       return value;
     },
-    async exists(path) { return Object.hasOwn(files, path); },
+    async exists(path) { return Object.hasOwn(files, path) || Object.keys(files).some(file => file.startsWith(path + '/')); },
     async list() { return names.map(entry => ({ ...entry, size: 0 })); },
   };
 }
@@ -107,4 +107,29 @@ test('an orphaned running job is projected as failed, not live', async () => {
     [`${base}/orphaned`]: 'x',
   }, [{ name: 'job-o', kind: 'dir' }] as never), '/repo');
   assert.equal(jobs[0]?.status, 'failed');
+});
+
+test('acceptance settlement starts the native close delay, while failed outcomes remain inspectable', async () => {
+  const calls: Array<Record<string, unknown>> = [];
+  const client: NativeTaskClient = {
+    async create() { return {result:{task:{id:'t1'}}}; },
+    async update(input) { calls.push(input);return {result:{success:true}}; },
+  };
+  const job = {id:'j',status:'succeeded' as const,task:'Review',name:'Ada',workerId:'ada',role:'review',
+    provider:'codex',model:null,latestSummary:null,summarySource:null,
+    acceptance:{state:'unchecked' as const,pending:true,checks:[]}};
+  const pending=await syncNativeTasks([job],{},client,1000);
+  assert.equal(pending.j?.status,'in_progress');
+  assert.equal(pending.j?.doneAt,undefined);
+  const accepted={...job,acceptance:{state:'accepted' as const,pending:false,checks:[]}};
+  const settled=await syncNativeTasks([accepted],pending,client,60_000);
+  assert.equal(settled.j?.status,'completed');
+  assert.equal(settled.j?.doneAt,60_000);
+  assert.equal((await syncNativeTasks([accepted],settled,client,69_999)).j?.status,'completed');
+  assert.equal((await syncNativeTasks([accepted],settled,client,70_000)).j?.status,'deleted');
+  const failed={...accepted,status:'failed' as const};
+  const failure=await syncNativeTasks([failed],pending,client,60_000);
+  const later=await syncNativeTasks([failed],failure,client,100_000);
+  assert.equal(later.j?.status,'completed');
+  assert.match(String(calls.at(-1)?.subject),/\[failed\]/);
 });

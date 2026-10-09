@@ -29,7 +29,6 @@ import { test } from 'node:test';
 import { ELAPSED_WIDTH } from '../hooks/format.ts';
 import {
   BAND_ROWS,
-  TICK_CUSHION_MS,
   LINGER_MS,
   buildLine,
   elapsedCell,
@@ -465,22 +464,6 @@ test('a tool count never walks backwards', () => {
 test('with no previous reading, the fresh one is taken as-is', () => {
   const fresh = job({ status: 'running' });
   assert.equal(reconcile(undefined, fresh), fresh);
-});
-
-test('the tick cushion covers the gap that would otherwise leave a row one tick late', () => {
-  // isShown flips false between 29_999ms and 30_001ms after the finish, and the
-  // tick that notices arrives up to a second later. Without a cushion the row
-  // survives one extra tick — a visible blink, which is rule #1 of TERMINAL-UI.md
-  // arriving through visibility instead of through row count.
-  assert.ok(TICK_CUSHION_MS >= 1000, 'the cushion must cover one clock period');
-  const done = job({ status: 'succeeded', startedAt: 0, endedAt: 0 });
-  const tickAt = LINGER_MS - 1; // just before the boundary
-  assert.equal(isShown(done, tickAt), true);
-  assert.equal(
-    isShown(done, tickAt + TICK_CUSHION_MS),
-    false,
-    'the tick that redraws past the boundary must not find it still shown',
-  );
 });
 
 test('an orphaned (failed) job is not an active band row once its end is old', async () => {

@@ -1,7 +1,8 @@
 # agent-smith — the band
 
 A Claude Code mod that draws **one live line per running agy / Codex / OpenCode
-job** in the `AbovePrompt` band, and opens a browsable pane on `/forge`.
+job** in the `AbovePrompt` band. `/forge` expands the roster and worker detail
+above the prompt; `/forge pane` requests the optional inspector.
 
 ```
  ● implement-musm82da-f1dc1fe4 cargo test --workspace · 341 tools ·     12m04s
@@ -11,8 +12,8 @@ job** in the `AbovePrompt` band, and opens a browsable pane on `/forge`.
    +2 more · /forge
 ```
 
-**This file covers the band.** The pane (`/forge`) is a separate surface with
-a separate owner; see [§ Scope boundary](#scope-boundary).
+This file covers tracking and the band. Legacy adapter notes follow the current
+canonical contract below.
 
 ---
 
@@ -45,8 +46,8 @@ number:
   wrapped status line becomes two rows, the band grows, and the prompt moves.
 - **At most 4 rows, then `+N more`.** And never more than the engine's own
   `maxRows` allows, minus the row the engine reserves for its overflow line.
-- **Finished jobs linger 30 s, then leave.** Measured from when agy-staff wrote
-  the terminal file — *not* from when we first noticed — so a corpus of 20
+- **Finished jobs linger 10 s, then leave.** Pending acceptance stays visible.
+  Linger is measured from the execution finish time — *not* from when we first noticed — so a corpus of 20
   jobs finished hours ago draws nothing instead of claiming four are in flight.
 - **Nothing renders when there is nothing to say.** Not "0 jobs", not an empty
   box. The host's own output comes back untouched, as our last child.
@@ -66,11 +67,12 @@ claude --plugin-dir the-codes/surfaces/mod       # or install it
 Then, in the repo you want to watch:
 
 ```bash
-claude          # launched IN the repo; .agy-staff/jobs is found there
+claude          # launched IN the repo; .agent-smith/jobs is found there
 ```
 
 The band needs no flags, no channels, and no model tokens. It reads
-`<repo>/.agy-staff/jobs/` and nothing else.
+`<repo>/.agent-smith/jobs/` by default. To view legacy jobs, set
+`AGENT_SMITH_LEGACY_JOBS=1` before launching Claude.
 
 To watch a *different* repo from the one you launched in:
 
@@ -83,12 +85,13 @@ claude
 
 | variable | default | meaning |
 |---|---|---|
-| `AGY_RADAR_REPO` | the session's cwd | the repo whose `.agy-staff/jobs/` to read |
+| `AGY_RADAR_REPO` | the session's cwd | the repo whose `.agent-smith/jobs/` to read |
+| `AGENT_SMITH_LEGACY_JOBS` | unset | `1` selects the legacy `.agy-staff/jobs/` reader |
 | `NO_COLOR` | unset | any non-empty value drops all colour (glyphs remain) |
 | `FORCE_COLOR` | unset | `0` or `false` treated as `NO_COLOR` |
 | `TERM` | unset | `dumb` treated as `NO_COLOR` |
 
-`.agy-staff/` is per-repo state, so the repo you launched Claude in *is* the right
+`.agent-smith/` is per-repo state, so the repo you launched Claude in *is* the right
 default and there is no third fallback: `$.fs.ancestors` turned out not to be
 directory ancestry (see [§ Resolved](#resolved-the-pane-s-reader-used-not-to-load)),
 so "search upward for a jobs directory" is not available, and inventing a default
@@ -104,6 +107,60 @@ contain: on another machine that path is either absent or — worse — someone
 else's repo, and the band would confidently draw their jobs. It is empty now, and
 `session.start`'s `e.cwd` fills it in; `register.tsx` reads the result from the
 `bandConfig` atom so both surfaces use it.
+
+## Canonical tracking
+
+`hooks/canonical.ts` supplies the same job projection to the band, pane and
+native task bridge. Lists read `job.json`, optional `progress.json` and
+`acceptance.json`, plus an orphan marker; they never scan event logs or reports.
+An unreadable snapshot shows an error while retaining the last observed rows.
+
+Detail reads the selected job's report and bounded `view.json`: up to 60 tool
+previews, 200 assistant messages / 64,000 characters, 64,000 prompt characters
+and 4,000 preamble characters. Truncation is explicit. Older jobs without a view
+show a warning, summary and report; the UI does not backfill by scanning logs.
+
+`/forge` opens during a turn and expands in the bottom band, whose height and
+scroll window the host controls. It preserves the host's band content and yields
+while a survey is displayed. It never opens a sidebar automatically.
+
+| Control | Action |
+|---|---|
+| Ctrl+X then Tab | Focus the band or inspector using the host's focus controls |
+| `a` / `h` in roster | Active / History |
+| `1`–`9` | Open a visible worker |
+| `n` / `p` in roster | Next / previous page |
+| `a` / `t` / `r` / `k` in detail | Activity / Task / Result / Checks |
+| `b` | Back to the roster |
+| `f` in Activity | Toggle following; manual scrolling pauses it |
+| `p` in Task | Show or hide the prompt preamble |
+| `c` / `u` in roster | Dismiss settled rows / restore dismissed rows |
+| `e` | Open the larger inspector |
+| `x` | Collapse the bottom view or close the inspector |
+| Escape | Return keyboard focus to the prompt |
+
+The inspector uses the same views. The host chooses its placement: docked on a
+wide fullscreen terminal, otherwise inline. Arrow keys, page keys and the wheel
+use the host's scrolling behavior; the mod does not bind those keys itself.
+
+New writer snapshots add an ordered `timeline` alongside the older fields, with
+up to 100 activity rows, 60 tools and 64,000 assistant characters. Tool completion
+updates its original row. Missing timelines show an explicit old-snapshot fallback.
+Activity defaults for live/checking jobs; Result defaults for settled jobs. Checks
+show execution-independent acceptance and expandable results. Errors expand by
+default. Recorded worker IDs group invocations; Task links to earlier runs.
+Detail reads are cached for the three-second data cadence. Selection persists
+through completion, and scrolling the output pauses automatic following.
+
+Native tasks use real host TaskCreate/TaskUpdate IDs. They are a task projection,
+not Claude Agent/subagent sessions. Pending acceptance keeps them in progress.
+Successful settled tasks close after ten seconds; failed, canceled or rejected
+tasks remain completed with an explicit outcome in their subject.
+
+## Legacy adapter evidence
+
+The remaining sections document the opt-in `.agy-staff` adapter and its original
+corpus investigation. They do not describe the default canonical reader.
 
 ## What it reads
 

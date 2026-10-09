@@ -113,6 +113,7 @@ export const PROGRESS_FLUSH_MS = 250;
 export const FILES = {
   job: 'job.json',
   progress: 'progress.json',
+  view: 'view.json',
   events: 'events.jsonl',
   argv: 'argv.json',
   stderr: 'stderr.log',
@@ -314,6 +315,25 @@ export interface ForgeProgress {
   readonly latestText: string | null;
   readonly toolCalls: number;
   readonly warnings: readonly string[];
+}
+
+export type ForgeViewEvent =
+  | { sequence: number; kind: 'assistant'; at: string; text: string }
+  | { sequence: number; kind: 'tool'; at: string; stepIndex: number; tool: string; input: string; output: string; state: 'active' | 'done' | 'error' };
+
+/** Bounded detail projection. Lists use job/progress/acceptance, never this file. */
+export interface ForgeView {
+  readonly schema: 1;
+  readonly prompt: string;
+  readonly preamble: string | null;
+  readonly truncated: boolean;
+  readonly transcript: readonly string[];
+  /** Missing on snapshots written before ordered activity was supported. */
+  readonly timeline?: readonly ForgeViewEvent[];
+  readonly tools: readonly {
+    stepIndex: number; at: string; tool: string; input: string; output: string;
+    state: 'active' | 'done' | 'error';
+  }[];
 }
 
 /* ────────────────────────────────────────────────────────────────────────────

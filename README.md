@@ -248,12 +248,28 @@ resume_job { "worker": "Rae", "prompt": "Explain finding 2 with a failing input.
 
 ## The /forge pane
 
-`/forge` opens a right-third pane listing worker jobs; selecting one opens a
-detail view with its task, tool history, current activity, warnings and final
-report (the report is shown only there). A one-to-four line band above the prompt
-shows one live line per running job (activity, tool count, elapsed time), with
-glyphs for running, stalled, finished, failed and canceled. It renders nothing
-when there is nothing to show. See `the-codes/surfaces/mod/README.md` for the band.
+`/forge` expands Forge above the prompt, like a bottom worker panel. The compact
+band remains a glance at live jobs when collapsed. Active and History views
+separate ongoing work from settled results. Choose a worker with `1`–`9`, then
+inspect Activity, Task, Result or Checks. Focus the band with Ctrl+X then Tab;
+Escape returns focus to the prompt. `x` collapses it.
+
+Activity interleaves assistant messages and tool calls for new jobs. Tool output
+is expandable; errors and failed check output are visible immediately. Follow
+tracks new output using host scrolling; manually scrolling pauses it, and `f`
+resumes. Older snapshots explicitly show separate output and tools. Previews
+remain bounded, with truncation stated. The detail stays open on completion.
+
+`e` opens the larger inspector; `/forge pane` opens it directly. Claude chooses
+whether that pane docks on the right or sits above the prompt. Both surfaces
+share canonical `.agent-smith/jobs/` state, including separate execution and
+acceptance outcomes. Pending checks remain active. Clear finished dismisses
+settled rows locally; Restore dismissed brings them back without changing files.
+Recorded worker IDs group runs; earlier runs are available in Task. Lists never
+scan event logs. Detail snapshots refresh at the three-second data cadence,
+rather than being reread on every clock or control redraw.
+
+See [the mod README](the-codes/surfaces/mod/README.md) for controls and limits.
 
 ## Repo layout
 
@@ -274,7 +290,8 @@ agent-configs/            shared configuration examples (not an active config)
 
 State is local and gitignored: `.agent-smith/jobs/<jobId>/` (manifest, events,
 result, report) and `.agent-smith/pipelines/`, plus a compatibility projection in
-`.agy-staff/jobs/` for the terminal plugin.
+`.agy-staff/jobs/` for older integrations. The terminal plugin reads this mirror
+only with `AGENT_SMITH_LEGACY_JOBS=1`.
 
 An optional CLI over the same service is `node scripts/agent-smith.mjs`
 (`doctor`, `run`, `ls`, `status`, `resume`, `cancel`; `--help` lists flags).

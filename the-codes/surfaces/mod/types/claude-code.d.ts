@@ -141,6 +141,7 @@ declare module 'claude-code' {
       columns?: number;
     }): Promise<unknown>;
     close(opts: { id: string }): Promise<unknown>;
+    scroll(opts: { to: 'start' | 'end' | { key: string }; in?: string; block?: 'start' | 'end' | 'nearest' }): Promise<{ deny?: string }>;
     /** Resolve the render components for this render site. */
     resolve(e: UiRenderEvent): UiComponents;
     toast(text: string): void;
@@ -152,7 +153,7 @@ declare module 'claude-code' {
      * is why every call site `.catch(() => {})`es it: refusing to start would take
      * the whole mod down over a name collision.
      */
-    register(opts: { name: string; description: string }): Promise<unknown>;
+    register(opts: { name: string; description: string; immediate?: true }): Promise<unknown>;
   }
 
   export interface ClockApi {
@@ -220,6 +221,7 @@ declare module 'claude-code' {
        * (TERMINAL-UI.md §Timing: cap at 4, then `+N more`).
        */
       readonly maxRows?: number;
+      readonly scroll?: { readonly offset: number; readonly bodyRows: number };
     };
   }
 
@@ -296,6 +298,8 @@ declare module 'claude-code' {
     (event: 'command.run', matcher: { command: string }, handler: CommandHandler): void;
     (event: 'tool.call', matcher: ToolCallMatcher, handler: Handler<ToolCallEvent>): void;
     (event: 'session.start', handler: Handler): void;
+    (event: 'ui.close', handler: Handler<{ id: string }>): void;
+    (event: 'ui.scroll', handler: Handler<{ component: string; requestId: string; origin: { kind: 'person' | 'plugin' }; offset: number; by: number; bodyRows: number; contentRows: number }>): void;
   }
 
   /** A tool invocation. Only the fields this mod reads are declared. */
@@ -390,6 +394,7 @@ declare module 'claude-code' {
      * When the two disagree, the runtime error IS the specification.
      */
     text: string;
+    key?: string;
   }
 
   // CodeProps deliberately NOT declared. It was a guess (`source`), and the
