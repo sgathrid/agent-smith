@@ -164,18 +164,23 @@ spawn_job { "mode": "implement", "name": "Ada", "provider": "codex",
             "checks": [{ "name": "tests", "command": "npm test" }] }
 ```
 
-One agent builds, another reviews:
+One agent builds, another reviews, and the first fixes what the review found:
 
 ```
 run_pipeline { "spec": { "name": "session-expiry",
   "stages": [
     { "name": "build",  "provider": "agy",   "role": "implement",
-      "prompt": "Expire idle sessions after 30 minutes.",
-      "checks": [{ "name": "tests", "command": "npm test" }] },
+      "prompt": "Expire idle sessions after 30 minutes." },
     { "name": "review", "provider": "codex", "role": "review",
-      "dependsOn": ["build"], "prompt": "Review the change." }
+      "dependsOn": ["build"], "prompt": "Review the change." },
+    { "name": "fix", "continues": "build", "role": "implement",
+      "dependsOn": ["review"], "prompt": "Fix what the review found.",
+      "checks": [{ "name": "tests", "command": "npm test" }] }
   ] } }
 ```
+
+`continues` resumes the builder's own conversation, so it fixes code it already
+knows, with the review in front of it.
 
 A Sonnet worker for a second opinion, then a follow-up:
 
