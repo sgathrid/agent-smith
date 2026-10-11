@@ -210,11 +210,9 @@ stages use the same rules (`StageResult.acceptance` `passed|failed|unchecked`, r
 `pipeline_status`).
 
 Completion notices lead with execution status and truncate worker prose at a sentence
-or word boundary. They include provider, elapsed time and changed-file count only when
-recorded evidence exists. The idle wake still uses exit code 2: Claude Code's
-[asyncRewake protocol](https://code.claude.com/docs/en/hooks#run-hooks-in-the-background)
-requires it. Exit 0 would queue feedback until another conversation turn, so the host's
-error-style wake label remains a host limitation rather than a worker failure.
+or word boundary. They include provider, elapsed time, changed-file count and the
+check tally only when recorded evidence exists. One renderer, `mod/hooks/notice.ts`,
+writes them for both announcers (see Notifications).
 
 ## Changed files
 
@@ -242,17 +240,33 @@ Claude                MCP server (dist/server.js)      Claude Code hooks        
   |   (asyncRewake: Claude keeps working)                             runJobWatch: read job every 2 s,
   |                                                                   no baseline, buildBatch/dedupe
   |                                                                   (job done before start is reported)
-  | <==== exit 2 + one stderr line "Agent Smith: <finished|failed|...>" ===== terminal state seen
+  | <==== exit 2 + stderr "Agent Smith · ✓ Ada (codex review) succeeded…" == terminal state seen
   |   Claude wakes -> status(jobId) / pipeline_status -> acts on report + acceptance
 ```
 
-- **Hook watcher** (`watch-hook.ts`): `build-plugin.mjs` generates `hooks/watch-hooks.json`
+- **Mod announcer** (`mod/hooks/register.tsx` `claimLaunch`/`announce`, rules in
+  `notice.ts`): when the mod is loaded it hooks `classic.PostToolUse` for the three
+  launch tools, claims the job or run in session state (`notices` atom) and answers
+  without `next`. Modules sit above settings and plugin command hooks in that chain,
+  so the hook watcher below never starts for a claimed launch: one announcer per job
+  (the documented hook order; not yet confirmed in a live session).
+  It declines (calls `next`) in legacy mode, after a read error, or when the ack's
+  repo is not the one it polls. Each 3 s poll announces claimed jobs that ended (or
+  stalled, once), holding a pending acceptance verdict up to 5 min: one `$.ui.log`
+  line per job for the user, and one `$.prompt.submit` turn that Claude reads as
+  sent by the plugin. Only claimed ids are announced, so two sessions on one repo
+  never wake each other. A claimed run is announced with its stage jobs when the
+  run ends. `/clear` resets session state, so a job claimed before it goes
+  unannounced (the band still shows it).
+- **Hook watcher** (`watch-hook.ts`), the fallback when no mod claims the launch: `build-plugin.mjs` generates `hooks/watch-hooks.json`
   (`PostToolUse`, `asyncRewake: true`, `timeout: 21900` s) running
   `runtime/dist/watch-hook.js`. `parseHookInput` strips the MCP prefix, unwraps the result
   (`structuredContent` or JSON text), takes `jobId` or `runId`, and resolves the repo from
   `payload.repo`, else `dir`/`recordPath`, else hook `cwd`, else `AGY_WATCH_CWD`, else
   `process.cwd()`. It watches that one job/run (a run also its stage jobs) in-process,
-  prints the milestone line to stderr and exits 2. Any error or non-matching tool exits 0
+  prints the notice to stderr and exits 2 (Claude Code labels that wake "Stop hook
+  feedback" and the label can't be changed, so the notice ends by saying it is not an
+  error). Any error or non-matching tool exits 0
   silently: a hook must never break the session. The hook passes `runJobWatch` a timeout of
   the job's own `timeoutMs` + 60 s (from the ack; pipelines get the 6 h cap + 60 s); standalone
   `monitor.js` defaults to `DEFAULT_WATCH_TIMEOUT_MS` = 46 min. On timeout it emits "still

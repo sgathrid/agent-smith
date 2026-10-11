@@ -64,6 +64,8 @@ export interface RadarJob {
   readonly provider?: string | null;
   readonly model?: string | null;
   readonly acceptance?: RadarAcceptance;
+  /** Files the job changed (job.json changedFiles), when recorded and not truncated. */
+  readonly changedFileCount?: number | null;
   /** Canonical failure detail from the manifest, when available. */
   readonly failureReason?: string | null;
   readonly lastEventAt?: number | null;
@@ -214,6 +216,12 @@ declare module 'claude-code' {
        * cannot end up pointed at different repos.
        */
       bandConfig: { repo: string; colour: boolean; legacy: boolean };
+      /**
+       * Launches this session claimed at `classic.PostToolUse`, until announced.
+       * Session state on purpose: another session's jobs are never in it.
+       * The shape is hooks/notice.ts `Owned`, spelled out for the validator.
+       */
+      notices: { kind: 'job' | 'run'; id: string; at: number; until: number; saidAttention?: boolean }[];
     };
   }
 }

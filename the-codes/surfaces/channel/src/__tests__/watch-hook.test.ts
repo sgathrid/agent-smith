@@ -36,7 +36,7 @@ test('already-terminal job is reported once and watch exits', async () => {
   const { p, lines } = watch({ a: [job('a', 'succeeded')] }, { jobIds: ['a'] });
   assert.equal(await p, 'done');
   assert.equal(lines.length, 1);
-  assert.match(lines[0]!, /^Agent Smith: ✓ .*succeeded/);
+  assert.match(lines[0]!, /^Agent Smith · ✓ .*succeeded/);
 });
 
 test('running then succeeded', async () => {
@@ -114,7 +114,8 @@ test('runHook exits 2 with the line for a finished job', async () => {
     readJob: async () => job('j1', 'succeeded'), intervalMs: 50,
   });
   assert.equal(code, 2);
-  assert.match(out, /^Agent Smith: /);
+  assert.match(out, /^Agent Smith · ✓ W-j1 \(implementer\) succeeded\. Job ID j1\.\n/);
+  assert.match(out, /not an error\.\)\n$/);
 });
 
 test('full scan caches terminal jobs instead of re-reading them', async () => {

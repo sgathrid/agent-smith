@@ -34,8 +34,10 @@ test('named completion notices lead with status and truncate worker prose at a w
   const batch = buildBatch([cand(job({ name: 'smoke-codex', role: 'review', provider: 'codex',
     status: 'succeeded', startedAt: '2026-10-03T16:39:17Z', finishedAt: '2026-10-03T16:40:00Z',
     changedFileCount: 0, summarySource: 'worker', latestSummary: 'Complete sentence. ' + 'preserved '.repeat(80) }))], NOW);
-  assert.match(batch.content!, /^✓ smoke-codex \(codex review\) succeeded · 43s · 0 files changed/);
-  assert.match(batch.content!, /Worker output:.*… \/forge or status to inspect\.$/);
+  assert.match(batch.content!, /^Agent Smith · ✓ smoke-codex \(codex review\) succeeded in 43s\. Job ID /);
+  assert.doesNotMatch(batch.content!, /0 files changed/, 'no change is not a fact worth a clause');
+  assert.match(batch.content!, /Worker summary \(unverified claim\): Complete sentence\..*…\n/);
+  assert.match(batch.content!, /\/forge shows it to the user\.$/);
   assert.doesNotMatch(batch.content!, /preser…/);
 });
 
@@ -172,15 +174,15 @@ test('five simultaneous failures become ONE notification', () => {
   const batch = buildBatch([failed(1), failed(2), failed(3), failed(4), failed(5)], NOW);
 
   assert.ok(batch.content !== null);
-  assert.equal((batch.content!.match(/failed/g) ?? []).length, 1, 'one failure clause only');
-  assert.ok(batch.content.includes('5 failed'), batch.content);
+  assert.match(batch.content, /^Agent Smith · 5 jobs: 5 failed\./, 'one headline counts them');
   // The ids are still named: "5 failed" alone does not tell Claude which five, and
   // naming them is what lets Claude act without the user retyping a job id.
   for (const n of [1, 2, 3, 4, 5]) {
     assert.ok(batch.content.includes(`implement-musm82da-0000000${n}`), `missing job ${n}`);
   }
   assert.equal(batch.keys.length, 5, 'all five are acknowledged in one send');
-  assert.ok(batch.content.includes('/agy-radar'), 'must point at the escape hatch');
+  assert.ok(batch.content.includes('/forge'), 'must point at the escape hatch');
+  assert.ok(!batch.content.includes('agy'), 'unnamed Forge jobs are not called agy jobs');
 });
 
 test('a mixed batch groups by kind, so "three finished, one failed" stays legible', () => {
@@ -196,11 +198,9 @@ test('a mixed batch groups by kind, so "three finished, one failed" stays legibl
 
   const text = batch.content;
   assert.ok(text !== null);
-  assert.ok(text.includes('3 finished'));
-  assert.ok(text.includes('1 failed'));
+  assert.match(text, /^Agent Smith · 4 jobs: 3 succeeded, 1 failed\./);
   // Collapsing these into "4 finished" would throw away the only part that matters.
-  assert.ok(text.includes('d'), 'the failed job must be named');
-  assert.ok(!text.includes('a,'), 'successful ids are not named, only counted');
+  assert.match(text, /✗ job d failed/, 'the failed job must be named');
 });
 
 test('a single event gets the specific message, not a one-item summary', () => {
@@ -210,7 +210,7 @@ test('a single event gets the specific message, not a one-item summary', () => {
   );
   assert.equal(batch.meta['kind'], 'failed');
   assert.equal(batch.meta['count'], '1');
-  assert.ok(batch.content!.startsWith('agy job implement-musm82da-f1dc1fe4 failed'));
+  assert.ok(batch.content!.startsWith('Agent Smith · ✗ job implement-musm82da-f1dc1fe4 failed. Job ID'), batch.content!);
 });
 
 test('nothing to say produces no notification at all', () => {
@@ -235,8 +235,10 @@ test('the failure message is terse, specific, and ends with the escape hatch', (
       cand(
         job({
           id: 'implement-musm82da-f1dc1fe4',
+          source: 'agy-staff',
           status: 'failed',
           warned: true,
+          failureReason: 'agy exited 1',
           lastEventAt: '2026-10-03T16:12:00Z',
           finishedAt: '2026-10-03T16:40:00Z',
         }),
@@ -245,17 +247,17 @@ test('the failure message is terse, specific, and ends with the escape hatch', (
     NOW,
   );
   const text = batch.content!;
-  assert.ok(text.includes('implement-musm82da-f1dc1fe4'));
-  assert.ok(text.includes('warnings'), 'a warned failure must say so');
-  assert.ok(text.includes('/agy-radar'));
+  assert.ok(text.includes('agy-staff job implement-musm82da-f1dc1fe4 failed: agy exited 1'), text);
+  assert.ok(text.includes('/forge'));
+  assert.ok(!text.includes('/agy-radar'), 'no /agy-radar command exists any more');
   // The budget is ~50 tokens. A multi-sentence essay would blow it.
   assert.ok(text.length < 220, `message is ${text.length} chars: ${text}`);
 });
 
-test('no duration is claimed when the two timestamps are too close to be one', () => {
+test('a duration is claimed only from a real start, never from the last event', () => {
   // last_event_at is the last EVENT, not the job start. For a fast job it is
   // seconds before the end, so finished - lastEvent is ~4s for a 28-minute job.
-  // Rendering that as "after 0m" would be nonsense; we render nothing instead.
+  // Without a start time the honest rendering is no duration at all.
   const quick = buildBatch(
     [cand(job({ status: 'failed', lastEventAt: '2026-10-03T16:39:56Z', finishedAt: '2026-10-03T16:40:00Z' }))],
     NOW,
@@ -264,10 +266,10 @@ test('no duration is claimed when the two timestamps are too close to be one', (
 
   // A genuine long run does get a duration.
   const long = buildBatch(
-    [cand(job({ status: 'failed', lastEventAt: '2026-10-03T16:12:00Z', finishedAt: '2026-10-03T16:40:00Z' }))],
+    [cand(job({ status: 'failed', startedAt: '2026-10-03T16:12:00Z', finishedAt: '2026-10-03T16:40:00Z' }))],
     NOW,
   );
-  assert.ok(long.content!.includes('after 28m'), long.content!);
+  assert.ok(long.content!.includes('failed after 28m'), long.content!);
 });
 
 test('an unwarned success is not dressed up as suspicious', () => {

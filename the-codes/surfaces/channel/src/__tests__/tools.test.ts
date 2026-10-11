@@ -148,7 +148,7 @@ test('notifyHint: hook note always, monitorCommand only when the built monitor p
   const { notifyHint } = await import('../tools.ts');
   const none = notifyHint({ job: 'j1' }, '/repo', 60_000, undefined);
   assert.equal(none.mode, 'hook');
-  assert.match(none.note, /announced automatically by the plugin hook/);
+  assert.match(none.note, /announced automatically by the plugin/);
   assert.equal('monitorCommand' in none, false);
   const job = notifyHint({ job: 'j1' }, '/repo', 2_700_000, '/rt/dist/monitor.js') as { monitorCommand: string; monitorTimeoutMs: number };
   assert.equal(job.monitorCommand, 'node "/rt/dist/monitor.js" --job j1 --cwd "/repo"');

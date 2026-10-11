@@ -153,7 +153,8 @@ const INSTRUCTIONS =
  * capability. Only Claude Code can, and the only way to find out is to run with
  * `--channels` and confirm an event arrives. See README.md.
  */
-// The native plugin announces completion with a job-scoped asyncRewake hook (watch-hook.ts), not this channel.
+// The native plugin announces completion through its mod (hooks/notice.ts), falling back to a
+// job-scoped asyncRewake hook (watch-hook.ts) without it; not through this channel.
 const CHANNEL_ENABLED = process.env['AGENT_SMITH_CHANNEL'] !== '0';
 const CAPABILITIES = {
   // REQUIRED for the inbound direction. Without it Claude Code does not surface

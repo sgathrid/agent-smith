@@ -658,3 +658,68 @@ test('pagination makes the tenth worker selectable', async ($, on) => {
   expect(await pane.find({key:'back'})).toBeDefined();
 });
 
+
+// ── completion notices: the mod takes a launch over from the command hook ────
+
+describe('completion notices', () => {
+  /** forgeHost, plus what the mod says and whether the command hook beneath ran. */
+  function noticeHost(on: (...args: any[]) => void, files: Record<string,string>, ids: string[]) {
+    const r = forgeHost(on, files, ids);
+    const said = { logs: [] as string[], prompts: [] as string[], hookRuns: 0 };
+    on('ui.log', (_$: unknown, e: any) => { said.logs.push(e.text); return {value:undefined}; });
+    on('prompt.submit', (_$: unknown, e: any) => { said.prompts.push(e.text); return {text:e.text}; });
+    // Beneath every module: where the plugin's PostToolUse command hook runs.
+    on('classic.PostToolUse', () => { said.hookRuns++; return {}; });
+    return { ...r, said };
+  }
+  const launched = (jobId: string, repo = '/work') => ({
+    hook_event_name: 'PostToolUse', session_id: 's', transcript_path: '/t', cwd: '/work',
+    tool_name: 'mcp__plugin_agent-smith_agent-smith__spawn_job', tool_use_id: `tu-${jobId}`, tool_input: {},
+    tool_response: { structuredContent: { jobId, repo, timeoutMs: 600_000 }, content: [] },
+  }) as never;
+  const ada = (status: string, more: Record<string, unknown> = {}) => canonicalJob('job-ada',
+    {status,name:'Ada',provider:'codex',role:'review',...more},
+    status === 'running' ? {} : {'acceptance.json':JSON.stringify({state:'accepted',checks:[{name:'tests',ok:true},{name:'lint',ok:true}]})});
+
+  test('a finished owned job: the hook stands down, one ui.log and one prompt.submit', async ($, on) => {
+    const files = ada('running');
+    const { clock, said } = noticeHost(on, files, ['job-ada']);
+    await start($);
+    await ($ as any).classic.PostToolUse(launched('job-ada'));
+    expect(said.hookRuns).toBe(0);
+
+    await clock.advance(3000);
+    expect(said.logs).toEqual([]);
+    Object.assign(files, ada('succeeded', {startedAt:iso(RUNNING_NOW-43_000),finishedAt:iso(RUNNING_NOW+1000),updatedAt:iso(RUNNING_NOW+1000),changedFiles:['a.ts','b.ts']}));
+    await clock.advance(3000);
+    await clock.advance(3000);
+
+    expect(said.logs).toEqual(['✓ Ada (codex review) succeeded in 44s · 2 files changed · checks 2/2']);
+    expect(said.prompts).toHaveLength(1);
+    expect(said.prompts[0]).toMatch(/^Agent Smith · ✓ Ada \(codex review\) succeeded in 44s · 2 files changed · checks 2\/2\. Job ID job-ada\./);
+  });
+
+  test("another session's job finishing in the same repo is not announced here", async ($, on) => {
+    const files = ada('running');
+    const { clock, said } = noticeHost(on, files, ['job-ada']);
+    await start($);
+    Object.assign(files, ada('failed', {finishedAt:iso(RUNNING_NOW+1000),error:'exit 1'}));
+    await clock.advance(3000);
+    await clock.advance(3000);
+    expect(said.logs).toEqual([]);
+    expect(said.prompts).toEqual([]);
+  });
+
+  test('a launch in a repo the mod is not watching stays with the hook', async ($, on) => {
+    const files = ada('running');
+    const { clock, said } = noticeHost(on, files, ['job-ada']);
+    await start($);
+    await ($ as any).classic.PostToolUse(launched('job-ada', '/elsewhere'));
+    expect(said.hookRuns).toBe(1);
+    Object.assign(files, ada('succeeded', {finishedAt:iso(RUNNING_NOW+1000)}));
+    await clock.advance(3000);
+    await clock.advance(3000);
+    expect(said.logs).toEqual([]);
+    expect(said.prompts).toEqual([]);
+  });
+});
