@@ -670,6 +670,7 @@ describe('completion notices', () => {
     on('prompt.submit', (_$: unknown, e: any) => { said.prompts.push(e.text); return {text:e.text}; });
     // Beneath every module: where the plugin's PostToolUse command hook runs.
     on('classic.PostToolUse', () => { said.hookRuns++; return {}; });
+    on('fs.write', (_$: unknown, e: any) => { files[e.path] = e.text; return {value:undefined}; });
     return { ...r, said };
   }
   const launched = (jobId: string, repo = '/work') => ({
@@ -687,6 +688,8 @@ describe('completion notices', () => {
     await start($);
     await ($ as any).classic.PostToolUse(launched('job-ada'));
     expect(said.hookRuns).toBe(0);
+    // The second guard: a hook that starts anyway finds the claim and stays silent.
+    expect(Object.hasOwn(files, '/work/.agent-smith/claims/job-job-ada')).toBe(true);
 
     await clock.advance(3000);
     expect(said.logs).toEqual([]);

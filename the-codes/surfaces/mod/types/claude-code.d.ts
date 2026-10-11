@@ -101,6 +101,8 @@ declare module 'claude-code' {
     read(path: string): Promise<string>;
     list(path: string): Promise<readonly FsEntry[]>;
     exists(path: string): Promise<boolean>;
+    /** Writes the whole file, creating it and its directories (host types, 2.1.274+). */
+    write(path: string, text: string): Promise<void>;
   }
 
   /** One directory entry. `kind` distinguishes 'file' from 'dir'. */

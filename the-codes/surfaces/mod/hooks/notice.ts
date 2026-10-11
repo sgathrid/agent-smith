@@ -212,6 +212,15 @@ function repoAbove(file: string, dir: 'jobs' | 'pipelines'): string | null {
   return parts.length >= 3 && parts.at(-2) === dir && parts.at(-3) === '.agent-smith' ? parts.slice(0, -3).join('/') || '/' : null;
 }
 
+/**
+ * The file the mod writes when it claims a launch. The command hook checks it
+ * before waking Claude, so a launch is announced once even if answering
+ * `classic.PostToolUse` without `next` fails to stop the hook from starting.
+ */
+export function claimMarkerPath(repo: string, kind: 'job' | 'run', id: string): string {
+  return `${repo.replace(/\/+$/, '')}/.agent-smith/claims/${kind}-${encodeURIComponent(id)}`;
+}
+
 export interface Launch {
   readonly kind: 'job' | 'run';
   readonly id: string;

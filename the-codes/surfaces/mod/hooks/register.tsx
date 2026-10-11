@@ -33,6 +33,7 @@ import {
   LAUNCH_TOOL,
   asRunRecord,
   claim,
+  claimMarkerPath,
   claudeText,
   due,
   parseLaunch,
@@ -241,6 +242,9 @@ async function claimLaunch($: EngineInterface, e: PostToolUseEvent, next: (e: un
   if (!sameRepo(repo, cfg.repo)) return next(e);
   const at = await $.clock.now();
   await update($, notices, (owned) => claim(owned, launch, at));
+  // Belt and braces: if the host starts the command hook anyway, it finds this
+  // marker and stays silent. A failed write only loses the second guard.
+  await $.fs.write(claimMarkerPath(cfg.repo, launch.kind, launch.id), `${new Date(at).toISOString()}\n`).catch(() => {});
   return {};
 }
 

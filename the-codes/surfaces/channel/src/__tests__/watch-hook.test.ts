@@ -7,6 +7,7 @@ import test from 'node:test';
 import { runJobWatch } from '../monitor.ts';
 import type { WatchableJob } from '../policy.ts';
 import { parseHookInput, runHook } from '../watch-hook.ts';
+import { claimMarkerPath } from '../../../mod/hooks/notice.ts';
 import { clearReadCache, readAll } from '../watch-source.ts';
 
 const T0 = Date.parse('2026-10-07T12:00:00.000Z');
@@ -116,6 +117,20 @@ test('runHook exits 2 with the line for a finished job', async () => {
   assert.equal(code, 2);
   assert.match(out, /^Agent Smith · ✓ W-j1 \(implementer\) succeeded\. Job ID j1\.\n/);
   assert.match(out, /not an error\.\)\n$/);
+});
+
+test('runHook stays silent for a launch the mod claimed', async () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-claim-'));
+  const marker = claimMarkerPath(repo, 'job', 'j1');
+  fs.mkdirSync(path.dirname(marker), { recursive: true });
+  fs.writeFileSync(marker, 'claimed\n');
+  let out = '';
+  const code = await runHook(JSON.stringify(wrap('spawn_job', { ...ack, repo })), (s) => { out += s; }, {
+    readJob: async () => job('j1', 'succeeded'), intervalMs: 50,
+  });
+  assert.equal(code, 0);
+  assert.equal(out, '');
+  fs.rmSync(repo, { recursive: true, force: true });
 });
 
 test('full scan caches terminal jobs instead of re-reading them', async () => {
