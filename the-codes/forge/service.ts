@@ -72,6 +72,7 @@ import type {
   WorkerHandle,
 } from '../providers/types.js';
 import { isMode, MODE_PRESETS, MODES, type ModePreset } from './modes.ts';
+import { buildBrief, type BriefCheck } from './brief.ts';
 import {
   DEFAULT_TIMEOUT_MS,
   FILES,
@@ -127,6 +128,14 @@ export interface SpawnRequest {
   readonly conversation?: string | undefined;
   /** Overrides the repo root. Only pipeline stages set this. */
   readonly cwd?: string | undefined;
+  /** Why the work matters and who it is for. Shown to the worker in its brief. */
+  readonly context?: string | undefined;
+  /**
+   * The acceptance checks, as the worker's brief describes them. The service
+   * never runs these: spawn_job (tools.ts) and the pipeline runner gate
+   * acceptance themselves. This is only so the worker knows its bar.
+   */
+  readonly checks?: readonly BriefCheck[] | undefined;
   readonly pipeline?: string | undefined;
   readonly stage?: string | undefined;
   readonly attempt?: number | undefined;
@@ -160,6 +169,7 @@ export interface SpawnAck {
   readonly modelRequested: string | null;
   readonly modelResolved: string | null;
   readonly modelSource: 'requested' | 'harness-config' | 'reported' | 'unknown';
+  /** True when the worker's prompt starts with the brief (forge/brief.ts). */
   readonly preambleApplied: boolean;
   /** Non-fatal problems the caller should read. Omitted when none. */
   readonly warnings?: readonly string[];
@@ -497,11 +507,18 @@ export class ForgeService {
         'agy cannot prompt for permission headless; commands will be denied and the job will return an empty result. Retry with unrestricted:true if this job needs shell access.',
       );
     }
-    const preambleApplied = preset !== undefined;
-    const sentPrompt =
-      preset === undefined || prompt.startsWith(preset.preamble)
-        ? prompt
-        : `${preset.preamble}\n\n${prompt}`;
+    const brief = buildBrief({
+      preset,
+      cwd,
+      context: request.context,
+      checks: request.checks,
+      pipelineStage: request.pipeline !== undefined && request.pipeline !== null,
+      resuming,
+    });
+    // A caller that already starts its prompt with the brief gets it once, not twice.
+    const prependBrief = brief !== '' && !prompt.startsWith(brief);
+    const preambleApplied = brief !== '';
+    const sentPrompt = prependBrief ? `${brief}\n\n${prompt}` : prompt;
     const jobId = newJobId(mode);
     const name = request.name?.trim() || `${mode}-${jobId.slice(-8)}`;
     if (name.length > 80) throw new Error('worker name must be at most 80 characters');
@@ -539,7 +556,8 @@ export class ForgeService {
       effort: request.effort ?? null,
       cwd,
       prompt,
-      ...(preset === undefined || prompt.startsWith(preset.preamble) ? {} : { preamble: preset.preamble }),
+      // Exactly what was prepended, so the /forge pane's "Show preamble" matches what the worker read.
+      ...(prependBrief ? { preamble: brief } : {}),
       unrestricted,
       conversation: request.conversation ?? null,
       timeoutMs,

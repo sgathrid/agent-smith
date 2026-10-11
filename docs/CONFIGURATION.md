@@ -136,6 +136,7 @@ roleDefaults}`, `aliasConfigErrors?`, `modes[{name,description,readOnly,runsComm
 |---|---|---|
 | `mode` | enum `implement|review|moderate|verify` | required |
 | `prompt` | string | required, nonempty |
+| `context` | string | optional, 1 to 2 000 chars; why the work matters and who it is for, shown to the worker in its brief |
 | `name` | string | worker label for `resume_job`; default `<mode>-<8 hex of id>`; max 80; must not collide with an active job |
 | `task` | string | short description; default first prompt line |
 | `provider` | enum | default: alias/roleDefault provider, else `agy` if installed, else the first installed |
@@ -144,7 +145,7 @@ roleDefaults}`, `aliasConfigErrors?`, `modes[{name,description,readOnly,runsComm
 | `unrestricted` | boolean | default true for agy; false for other providers |
 | `cwd` | string | absolute existing directory; default server repo; checks resolve against it |
 | `conversation` | string | native conversation handle to resume |
-| `checks` | array | items `{name, command}` required, `cwd`, `timeoutMs` (int >= 1; default 60 000), `blocking` (default true); run after success |
+| `checks` | array | items `{name, command}` required, `cwd`, `timeoutMs` (int >= 1; default 60 000), `blocking` (default true); run after success; also listed in the worker's brief as its definition of done |
 
 Result (`SpawnAck`): `jobId, name, workerId, role, provider, status:'running', dir, repo,
 timeoutMs, unrestricted, note, sandbox, sandboxFlags, readOnlyRequested, readOnlyEnforced,
@@ -202,9 +203,9 @@ stopped; check `status`.
 
 ### `run_pipeline`
 Params: `spec` object (unknown fields rejected): `name` (required), `task` (required unless
-`stages`), `workDir` (default repo), `concurrency` 1-32, `unrestricted` (default false),
+`stages`), `workDir` (default repo), `concurrency` 1-32, `unrestricted` (default: true for agy stages, false for others),
 `stages[]`. Stage fields: `name`, `provider` (required); `agentName`, `workerId`,
-`conversation`, `model`, `effort`, `prompt`, `title`, `role`, `dependsOn[]`, `workDir`,
+`conversation`, `model`, `effort`, `prompt`, `context` (as `spawn_job`), `title`, `role`, `dependsOn[]`, `workDir`,
 `resultPath`, `timeoutMs`, `routingPinned`, `checks[]` (same shape as `spawn_job`),
 `consumes[{stage,path,label?}]`. Without `stages`: implement -> review -> moderate from
 installed providers. Result: `{runId, recordPath, stages[{name,provider,dependsOn}],

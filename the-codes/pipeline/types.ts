@@ -94,6 +94,8 @@ export interface Stage {
   readonly role?: StageRole | undefined;
   /** The instruction handed to the worker. */
   readonly prompt?: string | undefined;
+  /** Why the work matters and who it is for. Shown to the worker in its brief (forge/brief.ts). */
+  readonly context?: string | undefined;
   /**
    * Human-facing one-liner for surfaces — the mod's `task` column, the store's
    * `title`.

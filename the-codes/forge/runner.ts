@@ -230,7 +230,7 @@ export function buildStagePrompt(args: {
 
   parts.push(
     `SOURCE WORKSPACE: ${args.workDir}`,
-    'Use the source workspace for code searches and commands. The output artifact directory is only for stage handoff files.',
+    'Search, run commands and make any code changes in the source workspace. The output artifact directory is only for stage handoff files.',
     '',
     args.stage.prompt ?? `Carry out the '${args.stage.name}' stage and write your findings to result.md.`,
   );
@@ -258,17 +258,17 @@ export function buildStagePrompt(args: {
     }
   }
 
-  // The service prepends the mode preamble, and a read-only preamble says "do not
-  // edit files; put findings in your reply". A stage MUST write its artifact, so
-  // say which write is allowed instead of leaving the two instructions to collide.
+  // The service prepends the worker brief, whose review/moderate guidance says to
+  // leave the files as they are. A stage still has to write its artifact, so say
+  // which write is allowed instead of leaving the two instructions to collide.
   const mode = args.stage.role ?? args.stage.name;
   const readOnly = isMode(mode) && MODE_PRESETS[mode].readOnly;
   parts.push(
     '',
     'OUTPUT ARTIFACT (separate from the source workspace):',
     ...(readOnly
-      ? ['This is a read-only stage: do not edit, create or delete any file in the source workspace. ' +
-         'Writing the output artifact below is your only permitted write and it overrides "put findings in your reply".']
+      ? ['This is a read-only stage: leave every file in the source workspace as it is. ' +
+         'Writing the output artifact below is your only permitted write, and it is where your findings go.']
       : []),
     `Write your full answer to ${stageArtifactPath(args.artifactRoot ?? args.workDir, args.stage.name, args.stage.resultPath)}. ` +
       'That file is what the next stage reads; a summary you say in prose is not.',
@@ -320,6 +320,10 @@ export function createForgeRunner(deps: RunnerDeps): StageRunner {
     const stage = ctx.stage;
     const continuation = ctx.continuation as StageContinuationLike | undefined;
 
+    const sameProvider = continuation?.transcriptProvider === undefined || continuation.transcriptProvider === ctx.routing.provider;
+    // A retry that continues this stage's own conversation already has the brief,
+    // context and checks from attempt 1; only a fresh conversation needs them.
+    const continuesAttempt = sameProvider && continuation?.transcriptRef !== undefined;
     const request: SpawnRequest = {
       mode: stage.role ?? stage.name,
       name: stage.agentName,
@@ -337,6 +341,7 @@ export function createForgeRunner(deps: RunnerDeps): StageRunner {
       }),
       provider: ctx.routing.provider,
       cwd: ctx.workDir,
+      ...(continuesAttempt ? {} : { context: stage.context, checks: stage.checks }),
       // 0 means "use the service default" (clampTimeout's DEFAULT_TIMEOUT_MS).
       // A stage timeout is ALSO enforced by the DAG via ctx.signal, so this is a
       // second, independent line of defence rather than the only one.
@@ -350,7 +355,7 @@ export function createForgeRunner(deps: RunnerDeps): StageRunner {
       // is exactly right — the pipeline owns the rung, we do not second-guess.
       ...(stage.effort === undefined && ctx.routing.tier === 't0-cheap' ? {} : { effort: ctx.routing.effort }),
       // routing RULE 3: continue, do not restart.
-      ...((continuation?.transcriptProvider === undefined || continuation.transcriptProvider === ctx.routing.provider)
+      ...(sameProvider
         ? { conversation: continuation?.transcriptRef ?? stage.conversation }
         : {}),
     };

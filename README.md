@@ -89,14 +89,20 @@ worker may touch. It never chooses the model.
 
 | Mode | What the worker is asked to do |
 |---|---|
-| `implement` | Make the change and report what it changed and found. |
+| `implement` | Make the change, keeping it small enough to review. |
 | `review` | Find defects, missed cases and unsupported claims, without editing. |
-| `moderate` | Independently test earlier work and a reviewer's claims. |
-| `verify` | Run the checks and report exactly what happened. |
+| `moderate` | Independently confirm or refute earlier work and a reviewer's claims. |
+| `verify` | Run the checks and report exactly what happened, failures included. |
 
-"Without editing" is enforced only where the harness can enforce it, which
-today means Codex. Elsewhere it is an instruction, and the job's
-`readOnlyEnforced` field tells you which you got.
+Every worker also gets a short brief ahead of your prompt: who it is working for,
+the directory it may change, why the work matters (the optional `context` you
+pass), and the checks that will judge it. Workers do better when they know the
+bar they will be held to.
+
+"Without editing" is enforced where the harness allows it: Codex runs in a
+read-only sandbox, and Claude workers are denied editing tools. For agy and
+OpenCode it is an instruction only. The job's `readOnlyEnforced` field tells you
+which you got.
 
 ### Checks
 

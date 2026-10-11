@@ -23,6 +23,9 @@ const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
 const string = { type: 'string', minLength: 1 };
 const FORMATS = ['concise', 'detailed'];
 const responseFormat = { type: 'string', enum: FORMATS, default: 'concise', description: 'concise (default): short, high-signal fields. detailed: the full record.' };
+/** Long enough for a paragraph of why; short enough that the pane can show the whole brief. */
+export const MAX_CONTEXT_CHARS = 2_000;
+const contextSchema = { type: 'string', minLength: 1, maxLength: MAX_CONTEXT_CHARS, description: 'Why the work matters and who it is for. The worker sees it in its brief.' };
 const checksSchema = { type: 'array', items: {
   type: 'object', required: ['name', 'command'], additionalProperties: false,
   properties: { name: string, command: string, cwd: string, timeoutMs: { type: 'integer', minimum: 1 }, blocking: { type: 'boolean' } },
@@ -31,7 +34,7 @@ const stageSchema = {
   type: 'object', required: ['name', 'provider'], additionalProperties: false,
   properties: {
     name: string, agentName: string, workerId: string, conversation: string, provider: { type: 'string', enum: PROVIDERS }, model: string,
-    effort: { type: 'string', enum: EFFORTS }, prompt: string, title: string, role: string,
+    effort: { type: 'string', enum: EFFORTS }, prompt: string, context: contextSchema, title: string, role: string,
     dependsOn: { type: 'array', items: string }, workDir: string, resultPath: string,
     timeoutMs: { type: 'integer', minimum: 1 }, routingPinned: { type: 'boolean' }, checks: checksSchema,
     consumes: { type: 'array', items: { type: 'object', required: ['stage', 'path'], additionalProperties: false, properties: { stage: string, path: string, label: string } } },
@@ -54,8 +57,8 @@ const LAUNCHES: ToolAnnotations = { readOnlyHint: false, openWorldHint: true };
 const modeDescription = MODES.map(m => `${m}: ${MODE_PRESETS[m].description}`).join(' | ');
 const RAW_TOOL_DEFS: readonly ToolDef[] = [
   { name: 'list_capabilities', annotations: { title: 'List capabilities', ...READ_ONLY }, description: 'List installed providers with their models, efforts and defaults, plus the valid job modes. Call this before choosing provider, model or effort for spawn_job or run_pipeline. refresh=true bypasses the discovery cache.', inputSchema: schema({ refresh: { type: 'boolean', default: false } }) },
-  { name: 'spawn_job', annotations: { title: 'Spawn job', ...LAUNCHES }, description: `Delegate one task to an external coding harness; returns a job ID immediately. Call list_capabilities first to pick provider/model/effort. provider defaults to the first available provider. Name the worker so resume_job can follow up. Exit 0 or completion is NOT acceptance. Pass checks (name, command, cwd, timeoutMs, blocking) to gate acceptance: once the job succeeds they run in cwd and status reports acceptance accepted/rejected/unchecked separately from execution status; a job that does not succeed is rejected. Defaults to unrestricted for agy and restricted for other providers. The ack carries a notify hint: completion is announced automatically by the plugin hook (fallback: notify.monitorCommand under Monitor, or status wait_ms). Modes: ${modeDescription}.`, inputSchema: schema({
-    mode: { type: 'string', enum: [...MODES], description: modeDescription }, prompt: string, name: string, task: string, cwd: { ...string, description: 'Absolute existing working directory. Defaults to the server repository.' },
+  { name: 'spawn_job', annotations: { title: 'Spawn job', ...LAUNCHES }, description: `Delegate one task to an external coding harness; returns a job ID immediately. Call list_capabilities first to pick provider/model/effort. provider defaults to a matching alias or roleDefault, else agy when installed, else the first installed provider. Name the worker so resume_job can follow up. Exit 0 or completion is not acceptance. Pass checks (name, command, cwd, timeoutMs, blocking) to gate acceptance: the worker is shown them as its definition of done; once the job succeeds they run in cwd and status reports acceptance accepted/rejected/unchecked separately from execution status; a job that does not succeed is rejected. Pass context to tell the worker why the work matters. Defaults to unrestricted for agy and restricted for other providers. The ack carries a notify hint: completion is announced automatically by the plugin hook (fallback: notify.monitorCommand under Monitor, or status wait_ms). Modes: ${modeDescription}.`, inputSchema: schema({
+    mode: { type: 'string', enum: [...MODES], description: modeDescription }, prompt: string, context: contextSchema, name: string, task: string, cwd: { ...string, description: 'Absolute existing working directory. Defaults to the server repository.' },
     provider: { type: 'string', enum: PROVIDERS }, model: string, effort: { type: 'string', enum: EFFORTS },
     timeoutMs: { type: 'integer', minimum: 1, default: DEFAULT_TIMEOUT_MS }, unrestricted: { type: 'boolean', description: 'Bypass worker approval prompts. Defaults to true for agy (headless agy cannot prompt), false for other providers.' }, conversation: string, checks: checksSchema,
   }, ['mode', 'prompt']) },
@@ -178,6 +181,11 @@ function text(args: Record<string, unknown>, key: string, required = false): str
   if (typeof v !== 'string' || v.trim() === '') throw new Error(`${key} must be a nonempty string.`);
   return v;
 }
+function contextText(args: Record<string, unknown>): string | undefined {
+  const v = text(args, 'context');
+  if (v !== undefined && v.length > MAX_CONTEXT_CHARS) throw new Error(`context must be at most ${MAX_CONTEXT_CHARS} characters.`);
+  return v;
+}
 function workingDirectory(args: Record<string, unknown>): string | undefined {
   const cwd = text(args, 'cwd');
   if (cwd === undefined) return undefined;
@@ -224,7 +232,7 @@ export function parseStages(raw: unknown): Stage[] | undefined {
       if (!Array.isArray(s.consumes)) throw new Error('consumes must be an array.');
       consumes = s.consumes.map(v => { const a = record(v, 'artifact'); keys(a, ['stage', 'path', 'label']); return { stage: text(a, 'stage', true)!, path: text(a, 'path', true)!, label: text(a, 'label') }; });
     }
-    return { name: text(s, 'name', true)!, agentName: text(s, 'agentName'), workerId: text(s, 'workerId'), conversation: text(s, 'conversation'), provider: allowed(s, 'provider', PROVIDERS) ?? (() => { throw new Error('provider is required.'); })(), model: text(s, 'model'), effort: allowed(s, 'effort', EFFORTS) as Effort | undefined, prompt: text(s, 'prompt'), title: text(s, 'title'), role: text(s, 'role'), dependsOn, consumes, workDir: text(s, 'workDir'), resultPath: text(s, 'resultPath'), timeoutMs: number(s, 'timeoutMs'), routingPinned: boolean(s, 'routingPinned'), checks: parseChecks(s.checks) };
+    return { name: text(s, 'name', true)!, agentName: text(s, 'agentName'), workerId: text(s, 'workerId'), conversation: text(s, 'conversation'), provider: allowed(s, 'provider', PROVIDERS) ?? (() => { throw new Error('provider is required.'); })(), model: text(s, 'model'), effort: allowed(s, 'effort', EFFORTS) as Effort | undefined, prompt: text(s, 'prompt'), context: contextText(s), title: text(s, 'title'), role: text(s, 'role'), dependsOn, consumes, workDir: text(s, 'workDir'), resultPath: text(s, 'resultPath'), timeoutMs: number(s, 'timeoutMs'), routingPinned: boolean(s, 'routingPinned'), checks: parseChecks(s.checks) };
   });
 }
 
@@ -242,7 +250,7 @@ export async function callTool(ctx: HandlerContext, name: string, rawArgs: unkno
         const aliasNotes = [...resolved.warnings, ...cfg.errors.map(e => `models.json: ${e}`)];
         const withNotes = <T extends { warnings?: readonly string[]; jobId?: string; timeoutMs?: number }>(ack: T) => ({ ...ack, ...(ack.jobId ? { notify: notifyHint({ job: ack.jobId }, ctx.service.repo, ack.timeoutMs) } : {}), ...(resolved.appliedAlias ? { aliasApplied: resolved.appliedAlias, aliasSource: resolved.source } : {}), ...(aliasNotes.length ? { warnings: [...(ack.warnings ?? []), ...aliasNotes] } : {}) });
         const checks = parseChecks(args.checks);
-        const request = { mode, prompt: text(args, 'prompt', true)!, cwd: workingDirectory(args), name: text(args, 'name'), task: text(args, 'task'), provider, model: resolved.model, effort: resolved.effort, timeoutMs: number(args, 'timeoutMs'), conversation: text(args, 'conversation'), unrestricted: boolean(args, 'unrestricted') };
+        const request = { mode, prompt: text(args, 'prompt', true)!, context: contextText(args), checks, cwd: workingDirectory(args), name: text(args, 'name'), task: text(args, 'task'), provider, model: resolved.model, effort: resolved.effort, timeoutMs: number(args, 'timeoutMs'), conversation: text(args, 'conversation'), unrestricted: boolean(args, 'unrestricted') };
         if (!checks?.length) return structured({ ...withNotes(await ctx.service.spawnJob(request)), provider });
         const { ack, done } = await ctx.service.spawnTracked(request);
         try { writeAcceptance(ctx.service.repo, ack.jobId, { state: 'unchecked', checks: [], pending: true }); } catch (err) { process.stderr.write(`agent-smith acceptance ${ack.jobId}: ${String(err)}\n`); }

@@ -183,7 +183,7 @@ export interface ForgeManifest {
   readonly modelRequested?: string | null;
   readonly modelResolved?: string | null;
   readonly modelSource?: 'requested' | 'harness-config' | 'reported' | 'unknown';
-  /** True when the mode preset's preamble was prepended to the prompt sent to the provider. */
+  /** True when the prompt sent to the provider starts with the worker brief (forge/brief.ts). */
   readonly preambleApplied?: boolean;
   readonly sandbox?: string;
   readonly sandboxFlags?: readonly string[];
