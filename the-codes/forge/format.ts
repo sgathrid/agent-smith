@@ -554,6 +554,7 @@ export const DEFAULT_TIMEOUT_MS = 45 * 60_000;
 export const LEGACY_ORPHAN_AFTER_MS = 2 * DEFAULT_TIMEOUT_MS;
 
 export const ORPHAN_REASON = 'supervisor process exited before the job finished (orphaned)';
+export const CANCEL_ORPHAN_REASON = 'cancel requested and the supervisor exited before confirming it';
 
 /** `kill(pid, 0)`: ESRCH means gone; EPERM means it exists but is not ours. */
 export function isPidAlive(pid: number): boolean {
@@ -567,9 +568,11 @@ export function isPidAlive(pid: number): boolean {
 }
 
 /**
- * THE orphan rule, pure. The caller guarantees there is no terminal result and
- * no cancel marker. Returns the verdict to report, or null if the job is not
- * (provably) orphaned.
+ * THE orphan rule, pure. The caller guarantees there is no terminal result.
+ * Returns the verdict to report, or null if the job is not (provably) orphaned.
+ * A cancel request outranks the orphan: when the supervisor is dead or unknown
+ * the operator's intent is what happened, so the verdict is `canceled`, not
+ * `failed`. A live supervisor still returns null; it will settle the request.
  *
  * `lastSeenMs` is the newest liveness evidence the caller has (updatedAt,
  * progress.lastEventAt); only the legacy no-pid path uses it.
@@ -579,9 +582,12 @@ export function deriveOrphan(
   lastSeenMs: number | null,
   nowMs: number,
   alive: (pid: number) => boolean = isPidAlive,
+  cancelRequested = false,
 ): StatusVerdict | null {
   if (m.status !== 'running') return null;
-  const verdict: StatusVerdict = { status: 'failed', suspicious: true, reason: ORPHAN_REASON };
+  const verdict: StatusVerdict = cancelRequested
+    ? { status: 'canceled', suspicious: false, reason: CANCEL_ORPHAN_REASON }
+    : { status: 'failed', suspicious: true, reason: ORPHAN_REASON };
   if (typeof m.ownerPid === 'number') return alive(m.ownerPid) ? null : verdict;
   const times = [lastSeenMs, m.createdAt === undefined ? null : Date.parse(m.createdAt)]
     .filter((t): t is number => t !== null && Number.isFinite(t));

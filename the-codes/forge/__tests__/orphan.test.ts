@@ -10,7 +10,7 @@ import { test } from 'node:test';
 import { AgentSmithReader } from '../../harness/agent-smith.ts';
 import { normalize } from '../../harness/normalize.ts';
 import {
-  FILES, LEGACY_ORPHAN_AFTER_MS, ORPHAN_REASON, deriveOrphan, isPidAlive, jobFile,
+  CANCEL_ORPHAN_REASON, FILES, LEGACY_ORPHAN_AFTER_MS, ORPHAN_REASON, deriveOrphan, isPidAlive, jobFile,
 } from '../format.ts';
 import { ForgeService } from '../service.ts';
 import { writeAcceptance, readAcceptance } from '../checks.ts';
@@ -152,4 +152,69 @@ test('service startup recovers dead supervisors before any MCP read', async () =
   assert.equal(persisted.status, 'failed');
   assert.equal(persisted.jobStatus, 'orphaned');
   assert.ok(persisted.finishedAt);
+});
+
+/* ── cancel outranks orphan ───────────────────────────────────────────────── */
+
+/** A running job with the given owner and a cancel request `cancelAgeMs` old (null = none). */
+function cancelFixture(id: string, ownerPid: number | undefined, cancelAgeMs: number | null, marker = false) {
+  const repo = mkdtempSync(path.join(tmpdir(), 'orphan-'));
+  writerFor(repo, id);
+  const file = jobFile(repo, id, FILES.job);
+  const { ownerPid: _drop, ...m } = JSON.parse(readFileSync(file, 'utf8'));
+  writeFileSync(file, JSON.stringify(ownerPid === undefined ? m : { ...m, ownerPid }));
+  if (cancelAgeMs !== null) writeFileSync(jobFile(repo, id, FILES.cancel), iso(Date.now() - cancelAgeMs));
+  if (marker) writeFileSync(jobFile(repo, id, FILES.orphaned), '');
+  return { repo, file };
+}
+
+test('deriveOrphan: cancel request + dead pid => canceled, not suspicious', () => {
+  const v = deriveOrphan({ status: 'running', ownerPid: deadPid() }, NOW, NOW, undefined, true);
+  assert.deepEqual(v, { status: 'canceled', suspicious: false, reason: CANCEL_ORPHAN_REASON });
+  assert.equal(deriveOrphan({ status: 'running', ownerPid: process.pid }, NOW, NOW, undefined, true), null);
+});
+
+test('reader: cancel + dead pid is canceled, even right after the request', async () => {
+  const { repo } = cancelFixture('implement-smith-cccc0001', deadPid(), 1_000);
+  assert.equal((await observe(repo, 'implement-smith-cccc0001')).status, 'canceled');
+});
+
+test('reader: cancel + no pid + old + orphaned marker is canceled (real-world shape)', async () => {
+  const { repo } = cancelFixture('implement-smith-cccc0002', undefined, 10 * 60_000, true);
+  assert.equal((await observe(repo, 'implement-smith-cccc0002')).status, 'canceled');
+});
+
+test('reader: no cancel + dead pid is still failed/orphaned', async () => {
+  const { repo } = cancelFixture('implement-smith-cccc0003', deadPid(), null);
+  const job = await observe(repo, 'implement-smith-cccc0003');
+  assert.equal(job.status, 'failed');
+  assert.ok(job.warnings.some((w) => w.message === ORPHAN_REASON));
+});
+
+test('reader: cancel + live pid is still running, marker or not', async () => {
+  for (const [id, marker] of [['implement-smith-cccc0004', false], ['implement-smith-cccc0005', true]] as const) {
+    const { repo } = cancelFixture(id, process.pid, 10 * 60_000, marker);
+    assert.equal((await observe(repo, id)).status, 'running');
+  }
+});
+
+test('reconcile persists canceled for cancel + dead pid, failed without the request', async () => {
+  const a = cancelFixture('implement-smith-cccc0006', deadPid(), 1_000);
+  const service = new ForgeService({ repo: a.repo, mirror: false });
+  assert.equal((await service.list())[0]?.status, 'canceled');
+  const persisted = JSON.parse(readFileSync(a.file, 'utf8'));
+  assert.equal(persisted.status, 'canceled');
+  assert.equal(persisted.error, CANCEL_ORPHAN_REASON);
+  assert.ok(persisted.finishedAt);
+  const settled = readFileSync(a.file, 'utf8');
+  await service.list();
+  assert.equal(readFileSync(a.file, 'utf8'), settled, 'settled verdict is not rewritten');
+
+  const b = cancelFixture('implement-smith-cccc0007', deadPid(), null);
+  new ForgeService({ repo: b.repo, mirror: false });
+  assert.equal(JSON.parse(readFileSync(b.file, 'utf8')).status, 'failed');
+
+  const c = cancelFixture('implement-smith-cccc0008', process.pid, 10 * 60_000);
+  new ForgeService({ repo: c.repo, mirror: false });
+  assert.equal(JSON.parse(readFileSync(c.file, 'utf8')).status, 'running');
 });

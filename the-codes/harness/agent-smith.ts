@@ -45,6 +45,7 @@ import { existsSafe, readJsonSafe, readTextSafe, readdirSafe } from './safe-fs.t
 import {
   FILES,
   SCHEMA_VERSION,
+  CANCEL_ORPHAN_REASON,
   ORPHAN_REASON,
   deriveOrphan,
   isPidAlive,
@@ -92,6 +93,7 @@ export const SMITH_PAYLOAD = {
   schema: 'schema',
 } as const;
 
+const CANCELED_ORPHAN = { status: 'canceled', suspicious: false, reason: CANCEL_ORPHAN_REASON } as const;
 const ORPHANED = { status: 'failed', suspicious: true, reason: ORPHAN_REASON } as const;
 
 /**
@@ -203,15 +205,17 @@ export class AgentSmithReader implements JobStateReader {
       const lastSeen = Math.max(
         Date.parse(manifest.updatedAt), Date.parse(progress?.lastEventAt ?? ''),
       );
-      orphan = deriveOrphan(manifest, Number.isFinite(lastSeen) ? lastSeen : null, Date.now());
+      orphan = deriveOrphan(manifest, Number.isFinite(lastSeen) ? lastSeen : null, Date.now(), undefined, cancelRequested);
       // A live supervisor honours a cancel request within seconds. A request that
       // is a minute old and still has no terminal state means nobody is listening.
       const cancelAgeMs = cancelAt === null ? NaN : Date.now() - Date.parse(cancelAt);
       const ownerAlive = typeof manifest.ownerPid === 'number' && isPidAlive(manifest.ownerPid);
-      if (orphan === null && cancelRequested && cancelAgeMs > 60_000 && !ownerAlive) {
-        orphan = { status: 'canceled', suspicious: false, reason: 'cancel requested and no supervisor confirmed it' };
+      if (orphan === null && cancelRequested && cancelAgeMs > 60_000 && !ownerAlive) orphan = CANCELED_ORPHAN;
+      // The marker is proof the supervisor is gone; a cancel request makes that
+      // a cancellation. A live pid beside a marker plus cancel is still in flight.
+      if (orphan === null && (await existsSafe(markerPath))) {
+        orphan = !cancelRequested ? ORPHANED : ownerAlive ? null : CANCELED_ORPHAN;
       }
-      if (orphan === null && (await existsSafe(markerPath))) orphan = ORPHANED;
 
     }
 

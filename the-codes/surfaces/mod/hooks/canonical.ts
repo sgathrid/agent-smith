@@ -61,10 +61,13 @@ export async function readForgeJob(fs: FsLike, repo: string, id: string, now: nu
   const warnings = (Array.isArray(p?.warnings) ? p.warnings : []).filter((w): w is string => typeof w === 'string')
     .map(message => ({ code: 'tool_error', message }));
   if (live && await fs.exists(`${dir}/orphaned`) && !await fs.exists(`${dir}/result.json`)) {
-    status = 'failed';
+    // The marker proves the supervisor is gone, so a cancel request it never
+    // confirmed is a cancellation, not a failure (mirrors forge deriveOrphan).
+    const canceled = await fs.exists(`${dir}/cancel`);
+    status = canceled ? 'canceled' : 'failed';
     // The supervisor is gone; its spawn-time placeholder cannot settle itself.
     a = { ...a, pending: false };
-    warnings.unshift({ code: 'orphaned', message: 'supervisor process exited before the job finished (orphaned)' });
+    if (!canceled) warnings.unshift({ code: 'orphaned', message: 'supervisor process exited before the job finished (orphaned)' });
   } else if (live && (lastSeen === null || now - lastSeen > STALL_GRACE_MS)) status = 'attention';
   if (typeof m.error === 'string' && m.error !== '') warnings.unshift({ code: 'tool_error', message: m.error });
   const activities = Array.isArray(p?.recentActivities) ? p.recentActivities.map(record).filter(v => v !== null) : [];

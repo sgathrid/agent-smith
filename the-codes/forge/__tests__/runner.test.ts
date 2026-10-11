@@ -16,6 +16,7 @@ import assert from 'node:assert/strict';
 // captures `AGENT_SMITH_AGY_BIN` into a module-level const the moment it loads, so
 // the shim has to be evaluated before anything below reaches the adapter. See
 // ../testing/shim.ts for what happens when it is not.
+import { MODE_PRESETS } from '../modes.ts';
 import { assertFakeProviderActive } from '../testing/shim.ts';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -156,6 +157,25 @@ test('the stage prompt is passed through, and the artefact is appended', () => {
     prompt.includes(path.resolve(r, 'implement', 'result.md')),
     'and the ABSOLUTE path, so a worker that needs the rest can read it itself',
   );
+});
+
+test('a read-only stage is told its artifact is the only permitted write', () => {
+  // The service prepends the preamble ("Do not edit or rewrite files"); compose it
+  // the same way and check the worker is never left with an unqualified ban plus
+  // an instruction to write.
+  const work = repo();
+  for (const name of ['review', 'moderate']) {
+    const stagePrompt = buildStagePrompt({ stage: stage({ name }), workDir: work, inputs: [], attempt: 1 });
+    const prompt = `${MODE_PRESETS[name as 'review' | 'moderate'].preamble}\n\n${stagePrompt}`;
+    assert.ok(prompt.includes(path.resolve(work, name, 'result.md')));
+    assert.match(stagePrompt, /do not edit, create or delete any file in the source workspace/);
+    assert.match(stagePrompt, /only permitted write/);
+    assert.ok(prompt.indexOf('Do not edit') < prompt.indexOf('only permitted write'), 'the qualification comes after the ban');
+  }
+  // A custom role that is not a read-only mode keeps the plain wording.
+  const implement = buildStagePrompt({ stage: stage({ name: 'implement' }), workDir: work, inputs: [], attempt: 1 });
+  assert.doesNotMatch(implement, /read-only stage/);
+  assert.match(buildStagePrompt({ stage: stage({ name: 'qa', role: 'review' }), workDir: work, inputs: [], attempt: 1 }), /read-only stage/);
 });
 
 test('the continuation goes FIRST, before the restated task', () => {

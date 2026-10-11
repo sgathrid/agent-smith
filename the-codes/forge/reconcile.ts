@@ -9,14 +9,14 @@ import { readAcceptance, writeAcceptance } from './checks.ts';
  * timeout heuristic for PID-less legacy jobs: their writer may still be alive.
  * Re-read the anchor and result immediately before writing, without yielding,
  * so an already published completion always wins. Concurrent recovery passes
- * may publish the same failed verdict; neither can replace a terminal anchor.
+ * may publish the same verdict; neither can replace a terminal anchor.
  */
 export function reconcileOrphan(repo: string, jobId: string, now = Date.now()): boolean {
   const file = jobFile(repo, jobId, FILES.job);
   try {
     const before = readFileSync(file, 'utf8');
     const manifest = JSON.parse(before) as ForgeManifest;
-    if (manifest.schema === SCHEMA_VERSION && manifest.status === 'failed'
+    if (manifest.schema === SCHEMA_VERSION && (manifest.status === 'failed' || manifest.status === 'canceled')
         && manifest.jobStatus === 'orphaned' && manifest.finishedAt !== null) {
       settleAcceptance(repo, jobId, manifest.finishedAt);
       return false;
@@ -24,10 +24,14 @@ export function reconcileOrphan(repo: string, jobId: string, now = Date.now()): 
     if (manifest.schema !== SCHEMA_VERSION || manifest.status !== 'running'
         || typeof manifest.ownerPid !== 'number' || isPidAlive(manifest.ownerPid)
         || existsSync(jobFile(repo, jobId, FILES.result))) return false;
-    const verdict = deriveOrphan(manifest, null, now);
+    // A cancel request outranks the orphan: the dead supervisor never confirmed
+    // it, but the operator's intent is the truer verdict than `failed`.
+    const cancelFile = jobFile(repo, jobId, FILES.cancel);
+    const verdict = deriveOrphan(manifest, null, now, undefined, existsSync(cancelFile));
     if (verdict === null) return false;
     if (readFileSync(file, 'utf8') !== before || isPidAlive(manifest.ownerPid)
-        || existsSync(jobFile(repo, jobId, FILES.result))) return false;
+        || existsSync(jobFile(repo, jobId, FILES.result))
+        || existsSync(cancelFile) !== (verdict.status === 'canceled')) return false;
     const at = new Date(now).toISOString();
     writeJsonAtomic(file, {
       ...manifest, status: verdict.status, error: verdict.reason, jobStatus: 'orphaned',

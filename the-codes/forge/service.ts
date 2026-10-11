@@ -54,7 +54,6 @@
  * implementation.
  */
 
-import { reconcileOrphan } from './reconcile.ts';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 
@@ -86,6 +85,7 @@ import {
   type ForgeStatus,
   nextActionFor,
 } from './format.ts';
+import { reconcileOrphan } from './reconcile.ts';
 import { JobWriter, pipeEvents, reportFor } from './writer.ts';
 import { writeJsonAtomic } from './atomic.ts';
 
