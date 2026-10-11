@@ -72,7 +72,7 @@ try {
     const end = Date.now() + timeoutMs;
     let progressAt = Date.now() + 10_000;
     while (Date.now() < end) {
-      const value = await data(await client.callTool({ name: tool, arguments: { [key]: id } }));
+      const value = await data(await client.callTool({ name: tool, arguments: { [key]: id, response_format: 'detailed' } }));
       if (value.status !== 'running') return value;
       if (progressLabel && Date.now() >= progressAt) {
         process.stderr.write(`[smoke] still waiting: ${progressLabel}\n`);
