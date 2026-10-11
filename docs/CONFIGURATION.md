@@ -124,7 +124,7 @@ accepts. Providers: `agy|codex|opencode|claude`. Tools marked structured also re
 `structuredContent` (arrays wrapped as `{items}`) and declare a per-tool `outputSchema` that types the
 fields below and allows extra ones (`additionalProperties: true`); clients validate against it.
 
-Tasks vocabulary: launch acks (`spawn_job`, `resume_job`, `run_pipeline`) carry `task {taskId, status:
+Tasks vocabulary: launch acks (`spawn_job`, `resume_job`, `run_pipeline`) carry `taskHandle {taskId, status:
 'working', pollIntervalMs: 5000}` (`taskId` is the job or run ID; `pollIntervalMs` is the server's poll
 cadence), and `status`/`list_jobs` rows carry `taskStatus` beside `status`: `running`/`unknown` ->
 `working`, `succeeded` -> `completed`, `failed` -> `failed`, `canceled` -> `cancelled`. These are the
@@ -168,7 +168,7 @@ roleDefaults}`, `aliasConfigErrors?`, `modes[{name,description,readOnly,runsComm
 Result (`SpawnAck`): `jobId, name, workerId, role, provider, status:'running', dir, repo,
 timeoutMs, unrestricted, note, sandbox, sandboxFlags, readOnlyRequested, readOnlyEnforced,
 modelRequested, modelResolved, modelSource` (`requested|harness-config|reported|unknown`),
-`preambleApplied`, `warnings?`; plus `task {taskId, status, pollIntervalMs}`, `notify {mode:'hook', note, monitorCommand?,
+`preambleApplied`, `warnings?`; plus `taskHandle {taskId, status, pollIntervalMs}`, `notify {mode:'hook', note, monitorCommand?,
 monitorTimeoutMs?}`, `aliasApplied?`/`aliasSource?`, and `checks` (names) when checks were
 given.
 
@@ -179,7 +179,7 @@ default: the original job's). An explicit cwd changes the process working direct
 retaining the prior conversation, which can still mention its previous workspace. Provider, mode, workerId,
 name and conversation come from the finished job; no `provider` or `checks` parameter.
 Refuses running workers, workers without a conversation handle, ambiguous names. Result:
-a `SpawnAck` plus `task` and `notify` (not structured).
+a `SpawnAck` plus `taskHandle` and `notify` (not structured).
 
 ### `list_jobs` (read-only, structured)
 Params: `provider` enum `agent-smith|agy-staff|all` (default `agent-smith`), `status` enum

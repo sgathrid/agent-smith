@@ -257,7 +257,7 @@ Claude                MCP server (dist/server.js)      Claude Code hooks        
   the job's own `timeoutMs` + 60 s (from the ack; pipelines get the 6 h cap + 60 s); standalone
   `monitor.js` defaults to `DEFAULT_WATCH_TIMEOUT_MS` = 46 min. On timeout it emits "still
   running; check status <ids>" (exit 2 from the hook).
-- **Tasks-shaped handle**: acks also carry `task {taskId, status:'working', pollIntervalMs}` and
+- **Tasks-shaped handle**: acks also carry `taskHandle {taskId, status:'working', pollIntervalMs}` and
   `status`/`list_jobs` add `taskStatus` (`views.ts` `taskStatus`), the MCP Tasks extension's
   vocabulary, so a future Tasks adapter (once the SDK and Claude Code support it) is a
   translation. `pollIntervalMs` is `poller.ts` `POLL_MS`.

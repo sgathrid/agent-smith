@@ -80,7 +80,7 @@ test('exactly the structured tools declare an outputSchema, all open to new fiel
 
 test('spawn_job acks validate, with and without checks and warnings', async () => {
   const plain = assertValid('spawn_job', await callTool(ctx, 'spawn_job', { mode: 'review', provider: 'codex', prompt: 'x' }), 'spawn_job');
-  assert.deepEqual(plain.task, { taskId: 'job-1', status: 'working', pollIntervalMs: 5_000 });
+  assert.deepEqual(plain.taskHandle, { taskId: 'job-1', status: 'working', pollIntervalMs: 5_000 });
   const gated = assertValid('spawn_job', await callTool(ctx, 'spawn_job', { mode: 'review', provider: 'codex', prompt: 'x', checks: [{ name: 'tests', command: 'true' }] }), 'spawn_job checks');
   assert.deepEqual(gated.checks, ['tests']);
   const prior = process.env.AGENT_SMITH_CONFIRM_UNRESTRICTED; delete process.env.AGENT_SMITH_CONFIRM_UNRESTRICTED;

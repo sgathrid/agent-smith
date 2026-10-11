@@ -52,7 +52,7 @@ setTimeout(()=>{console.log(JSON.stringify({type:'item.completed',item:{id:'answ
     assert.equal(detail.status, 'succeeded'); assert.equal(detail.name, 'Ada'); assert.equal(detail.role, 'review');
     assert.equal(detail.summarySource, 'worker'); assert.match(detail.latestSummary, /Worker findings/); assert.ok(!detail.latestSummary.includes('PRIVATE THINKING'));
     // The SDK Client validates structuredContent against each tool's outputSchema, so these calls are the end-to-end schema check.
-    assert.deepEqual(ack.task, { taskId: ack.jobId, status: 'working', pollIntervalMs: 5_000 });
+    assert.deepEqual(ack.taskHandle, { taskId: ack.jobId, status: 'working', pollIntervalMs: 5_000 });
     assert.equal(detail.taskStatus, 'completed');
     assert.equal(data(await client.callTool({ name: 'status', arguments: { jobId: ack.jobId, include_diff: true } })).taskStatus, 'completed');
     for (const response_format of ['concise', 'detailed']) {
@@ -60,14 +60,14 @@ setTimeout(()=>{console.log(JSON.stringify({type:'item.completed',item:{id:'answ
       assert.equal((listed.structuredContent as { items: { taskStatus: string }[] }).items[0]!.taskStatus, 'completed', response_format);
     }
     const resumed = data(await client.callTool({ name: 'resume_job', arguments: { worker: 'Ada', prompt: 'Address the edge case' } }));
-    assert.deepEqual(resumed.task, { taskId: resumed.jobId, status: 'working', pollIntervalMs: 5_000 });
+    assert.deepEqual(resumed.taskHandle, { taskId: resumed.jobId, status: 'working', pollIntervalMs: 5_000 });
     const followup = await until(async () => data(await client.callTool({ name: 'status', arguments: { jobId: resumed.jobId, response_format: 'detailed' } })), r => r.status !== 'running');
     assert.equal(followup.workerId, detail.workerId); assert.equal(followup.name, 'Ada'); assert.match(followup.report, /follow-up/);
     const argv = JSON.parse(readFileSync(path.join(repo, '.agent-smith', 'jobs', resumed.jobId, 'argv.json'), 'utf8')).argv;
     assert.deepEqual(argv.slice(0, 3), ['exec', 'resume', 'fixture-thread']);
     for (const exitCode of [0, 7]) {
       const run = data(await client.callTool({ name: 'run_pipeline', arguments: { spec: { name: 'fixture', stages: [{ name: 'implement', provider: 'codex', prompt: 'Write detailed findings', checks: [{ name: 'acceptance', command: `node -e 'process.exit(${exitCode})'` }] }] } } }));
-      assert.equal(run.task.taskId, run.runId);
+      assert.equal(run.taskHandle.taskId, run.runId);
       const result = await until(async () => data(await client.callTool({ name: 'pipeline_status', arguments: { runId: run.runId, response_format: 'detailed' } })), r => r.status !== 'running');
       assert.equal(result.status, exitCode === 0 ? 'passed' : 'failed', JSON.stringify(result));
       const stage = result.stageResults.implement;

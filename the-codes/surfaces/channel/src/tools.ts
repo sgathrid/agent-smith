@@ -86,7 +86,7 @@ const NOTIFY_SCHEMA = open({ mode: typed('string'), note: typed('string'), monit
 const SPAWN_OUTPUT = open({
   jobId: jobFields.jobId, name: jobFields.name, workerId: typed('string'), provider: typed('string'),
   status: { type: 'string', enum: JOB_STATUSES, description: 'running on a fresh ack.' },
-  task: { ...TASK_SCHEMA, description: 'MCP Tasks-shaped handle for this job.' },
+  taskHandle: { ...TASK_SCHEMA, description: 'MCP Tasks-shaped handle for this job.' },
   timeoutMs: typed('integer'), unrestricted: typed('boolean', 'Whether worker approval prompts are bypassed.'),
   sandbox: typed('string', "The provider's sandbox posture for this job."), sandboxFlags: strings(),
   readOnlyRequested: typed('boolean'), readOnlyEnforced: typed('boolean'),
@@ -95,7 +95,7 @@ const SPAWN_OUTPUT = open({
   notify: { ...NOTIFY_SCHEMA, description: 'How completion is announced, with a fallback if no notice arrives.' },
   checks: strings('Names of the acceptance checks attached to this job.'),
   aliasApplied: typed('string'), aliasSource: typed('string'),
-}, ['jobId', 'name', 'status', 'task']);
+}, ['jobId', 'name', 'status', 'taskHandle']);
 const STATUS_OUTPUT = open({
   ...jobFields,
   acceptance: open({
@@ -362,7 +362,7 @@ export async function callTool(ctx: HandlerContext, name: string, rawArgs: unkno
         const resolved = resolveRequest({ provider: allowed(args, 'provider', PROVIDERS), model: text(args, 'model'), effort: allowed(args, 'effort', EFFORTS), mode }, cfg);
         const provider = resolved.provider ?? defaultProvider(ctx.catalogs ? (await installedCatalogs(ctx)).map(c => c.provider) : await getInstalledProviders());
         const notes = [...resolved.warnings, ...cfg.errors.map(e => `models.json: ${e}`)];
-        const withNotes = <T extends { warnings?: readonly string[]; jobId?: string; timeoutMs?: number }>(ack: T) => ({ ...ack, ...(ack.jobId ? { task: launchTask(ack.jobId), notify: notifyHint({ job: ack.jobId }, ctx.service.repo, ack.timeoutMs) } : {}), ...(resolved.appliedAlias ? { aliasApplied: resolved.appliedAlias, aliasSource: resolved.source } : {}), ...(notes.length ? { warnings: [...(ack.warnings ?? []), ...notes] } : {}) });
+        const withNotes = <T extends { warnings?: readonly string[]; jobId?: string; timeoutMs?: number }>(ack: T) => ({ ...ack, ...(ack.jobId ? { taskHandle: launchTask(ack.jobId), notify: notifyHint({ job: ack.jobId }, ctx.service.repo, ack.timeoutMs) } : {}), ...(resolved.appliedAlias ? { aliasApplied: resolved.appliedAlias, aliasSource: resolved.source } : {}), ...(notes.length ? { warnings: [...(ack.warnings ?? []), ...notes] } : {}) });
         const checks = parseChecks(args.checks);
         const request = { mode, prompt: text(args, 'prompt', true)!, context: contextText(args), checks, cwd: workingDirectory(args), name: text(args, 'name'), task: text(args, 'task'), provider, model: resolved.model, effort: resolved.effort, timeoutMs: number(args, 'timeoutMs'), conversation: text(args, 'conversation'), unrestricted: boolean(args, 'unrestricted') };
         // After every argument is validated, so the user is never asked about a call that then fails.
@@ -395,7 +395,7 @@ export async function callTool(ctx: HandlerContext, name: string, rawArgs: unkno
         const gate = await confirmUnrestricted(ctx, { unrestricted, provider: detail.provider ?? '', worker: detail.name, cwd });
         if (gate.refused) return gate.refused;
         const resumed = await ctx.service.spawnJob({ mode: detail.mode ?? 'task', prompt, provider: detail.provider ?? undefined, model: resumeModel.model ?? detail.model ?? undefined, effort: resumeModel.effort ?? detail.effort ?? undefined, name: detail.name, workerId: detail.workerId, task: detail.task ?? undefined, cwd, conversation: detail.conversation, timeoutMs, unrestricted: unrestricted ?? detail.unrestricted });
-        return json({ ...resumed, task: launchTask(resumed.jobId), notify: notifyHint({ job: resumed.jobId }, ctx.service.repo, resumed.timeoutMs), ...(gate.warning ? { warnings: [...(resumed.warnings ?? []), gate.warning] } : {}) });
+        return json({ ...resumed, taskHandle: launchTask(resumed.jobId), notify: notifyHint({ job: resumed.jobId }, ctx.service.repo, resumed.timeoutMs), ...(gate.warning ? { warnings: [...(resumed.warnings ?? []), gate.warning] } : {}) });
       }
       case 'list_jobs': {
         const fmt = format(args); const since = text(args, 'since');
@@ -434,7 +434,7 @@ export async function callTool(ctx: HandlerContext, name: string, rawArgs: unkno
         validateSpec(spec);
         const run = startPipeline(ctx.service, spec, { unrestricted: boolean(raw, 'unrestricted') });
         void run.done.catch(err => process.stderr.write(`agent-smith pipeline ${run.runId}: ${String(err)}\n`));
-        return json({ runId: run.runId, recordPath: run.recordPath, stages: spec.stages.map(s => ({ name: s.name, provider: s.provider, dependsOn: s.dependsOn ?? [] })), started: true, task: launchTask(run.runId), notify: notifyHint({ run: run.runId }, ctx.service.repo, Math.max(0, ...spec.stages.map(st => st.timeoutMs ?? 0)) || undefined) });
+        return json({ runId: run.runId, recordPath: run.recordPath, stages: spec.stages.map(s => ({ name: s.name, provider: s.provider, dependsOn: s.dependsOn ?? [] })), started: true, taskHandle: launchTask(run.runId), notify: notifyHint({ run: run.runId }, ctx.service.repo, Math.max(0, ...spec.stages.map(st => st.timeoutMs ?? 0)) || undefined) });
       }
       default: throw new Error(`Unknown tool ${name}.`);
     }
