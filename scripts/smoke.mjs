@@ -41,7 +41,7 @@ try {
   const fakeCodex = path.join(scratch, 'fake-codex.cjs');
   const fakeAgy = path.join(scratch, 'fake-agy.cjs');
   writeFileSync(fakeCodex, `#!${process.execPath}\nconst fs=require('node:fs'),path=require('node:path'),a=process.argv.slice(2),p=a.at(-1)||'';\nconst emit=()=>{const f=/Write your full answer to (.+?)\\. /.exec(p)?.[1];if(f){if(!fs.statSync(path.dirname(f)).isDirectory())process.exit(22);fs.writeFileSync(f,'FAKE IMPLEMENTATION ARTIFACT\\n');}if(p.includes('Review the implementation artifact')&&!p.includes('FAKE IMPLEMENTATION ARTIFACT'))process.exit(21);console.log(JSON.stringify({type:'thread.started',thread_id:'smoke-thread'}));console.log(JSON.stringify({type:'item.completed',item:{id:'answer',type:'agent_message',text:'Fake provider review: smoke passed.'}}));console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:8,output_tokens:4}}));};const delay=p.includes('SMOKE_SLOW')?12000:p.includes('SMOKE_CONCURRENT')?180:0;if(delay)setTimeout(emit,delay);else emit();\n`);
-  writeFileSync(fakeAgy, `#!${process.execPath}\nconst a=process.argv.slice(2),p=a.find(x=>x.includes('Write your full answer to'))||'';const m=/Write your full answer to (.+?)\\. /.exec(p);if(m){const fs=require('node:fs'),path=require('node:path');if(!fs.statSync(path.dirname(m[1])).isDirectory())process.exit(22);fs.writeFileSync(m[1],'FAKE IMPLEMENTATION ARTIFACT\\n');}\nconst emit=()=>{console.log(JSON.stringify({event:'step_update',step_index:1,state:'DONE',step_type:'agent_response',text:'Fake implementation complete.'}));console.log(JSON.stringify({event:'result',result:{conversation_id:'smoke-agy',status:'SUCCESS',response:'Fake implementation complete.',usage:{input_tokens:8,output_tokens:4}}}));};if(p.includes('SMOKE_CONCURRENT'))setTimeout(emit,180);else emit();\n`);
+  writeFileSync(fakeAgy, `#!${process.execPath}\nconst a=process.argv.slice(2),p=a.find(x=>x.includes('Write your full answer to'))||'';const m=/Write your full answer to (.+?)\\. /.exec(p);if(m){const fs=require('node:fs'),path=require('node:path');if(!fs.statSync(path.dirname(m[1])).isDirectory())process.exit(22);fs.writeFileSync(m[1],'FAKE IMPLEMENTATION ARTIFACT\\n');}\nconst emit=()=>{console.log(JSON.stringify({event:'init',init:{model:'smoke-fixture',conversation_id:'smoke-agy'}}));console.log(JSON.stringify({event:'step_update',step_index:1,state:'DONE',step_type:'agent_response',text:'Fake implementation complete.'}));console.log(JSON.stringify({event:'result',result:{conversation_id:'smoke-agy',status:'SUCCESS',response:'Fake implementation complete.',usage:{input_tokens:8,output_tokens:4}}}));};if(p.includes('SMOKE_CONCURRENT'))setTimeout(emit,180);else emit();\n`);
   chmodSync(fakeCodex, 0o755); chmodSync(fakeAgy, 0o755);
   let stderr = '';
   const openClient = async (name, env) => {
@@ -104,6 +104,23 @@ try {
     const reviewArgv = reviewJob && JSON.parse(readFileSync(path.join(repo, '.agent-smith', 'jobs', reviewJob, 'argv.json'), 'utf8')).argv;
     if (!reviewArgv?.at(-1)?.includes('FAKE IMPLEMENTATION ARTIFACT')) throw new Error('Downstream stage prompt omitted upstream artifact contents');
     return { status: done.status, stages: Object.keys(done.stageResults ?? {}), artifactForwarded: true };
+  });
+  await record('implement, review, then the implementer fixes from the review', async () => {
+    const result = await data(await client.callTool({ name: 'run_pipeline', arguments: { spec: { name: 'smoke fix loop', workDir: repo, stages: [
+      { name: 'build', provider: 'agy', prompt: 'Implement the fixture and write the requested artifact', model: 'smoke-fixture' },
+      { name: 'review', provider: 'codex', prompt: 'Review the build', model: 'smoke-fixture', dependsOn: ['build'] },
+      { name: 'fix', continues: 'build', prompt: 'Fix what the review found', model: 'smoke-fixture', dependsOn: ['review'], checks: [{ name: 'executable-check', command: 'node -e "process.exit(0)"', blocking: true }] },
+    ] } } }));
+    const done = await waitStatus('pipeline_status', 'runId', result.runId, 30_000);
+    if (done.status !== 'passed') throw new Error(`Fix loop ended ${done.status}: ${JSON.stringify(done.stageResults)}`);
+    const jobOf = (name) => Object.values(done.stageResults ?? {}).find((stage) => stage.stage === name)?.jobId;
+    const argvOf = (name) => JSON.parse(readFileSync(path.join(repo, '.agent-smith', 'jobs', jobOf(name), 'argv.json'), 'utf8')).argv;
+    const fixArgv = argvOf('fix');
+    if (fixArgv[fixArgv.indexOf('--conversation') + 1] !== 'smoke-agy') throw new Error('Fix stage did not resume the build conversation');
+    if (!fixArgv.some((arg) => arg.includes('--- from stage \'review\'') && arg.includes('FAKE IMPLEMENTATION ARTIFACT'))) throw new Error('Fix stage prompt omitted the review artifact');
+    const workers = new Set(['build', 'fix'].map((name) => JSON.parse(readFileSync(path.join(repo, '.agent-smith', 'jobs', jobOf(name), 'view.json'), 'utf8')).workerId));
+    if (workers.size !== 1) throw new Error('Fix stage did not keep the build worker identity');
+    return { status: done.status, resumedConversation: 'smoke-agy', workerShared: true };
   });
   await record('cancellation', async () => {
     const ack = await data(await client.callTool({ name: 'spawn_job', arguments: { provider: 'codex', mode: 'review', name: 'Smoke Cancel', task: 'Cancel fixture', prompt: 'SMOKE_SLOW cancellation fixture', model: 'smoke-fixture', effort: 'low', cwd: repo } }));

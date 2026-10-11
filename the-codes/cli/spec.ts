@@ -29,7 +29,7 @@
 
 import { readFileSync } from 'node:fs';
 
-import { PipelineSpecError } from '../pipeline/pipeline.ts';
+import { inheritContinuedProviders, PipelineSpecError } from '../pipeline/pipeline.ts';
 import type { Effort, PipelineSpec, Stage, StageCheck, StageRole } from '../pipeline/types.ts';
 
 /** Raised for anything this parser will not interpret. Never a guess. */
@@ -512,6 +512,7 @@ const KNOWN_STAGE_KEYS = new Set([
   'agentName',
   'workerId',
   'conversation',
+  'continues',
   'provider',
   'model',
   'effort',
@@ -614,7 +615,7 @@ function checksFromYaml(value: Scalar | undefined, stage: string, index: number)
  * PRODUCE ITS INPUT, and then reads a file that does not exist yet. That is a
  * silent, concurrent, wrong result, so it must not be a default.
  */
-export function stageFrom(node: Scalar, index: number): Stage {
+export function stageFrom(node: Scalar, index: number): Omit<Stage, 'provider'> & { provider?: string } {
   if (!(node instanceof Map)) {
     throw new PipelineSpecError(`stages[${index}] must be a mapping`);
   }
@@ -634,13 +635,15 @@ export function stageFrom(node: Scalar, index: number): Stage {
     throw new PipelineSpecError(`stages[${index}] needs a name`);
   }
   const provider = asString(node.get('provider') ?? null, 'provider', index);
-  if (provider === undefined || provider === '') {
+  const continues = asString(node.get('continues') ?? null, 'continues', index);
+  // A continuing stage may omit provider; specFrom fills it in from its target.
+  if ((provider === undefined || provider === '') && continues === undefined) {
     throw new PipelineSpecError(`stage '${name}' needs a provider`);
   }
 
-  const stage: Record<string, unknown> = { name, provider };
+  const stage: Record<string, unknown> = { name, ...(provider === undefined ? {} : { provider }) };
 
-  for (const key of ['agentName', 'workerId', 'conversation'] as const) {
+  for (const key of ['agentName', 'workerId', 'conversation', 'continues'] as const) {
     const value = asString(node.get(key) ?? null, key, index);
     if (value !== undefined) {
       if (value.trim() === '') throw new PipelineSpecError(`stage '${name}': ${key} must be nonempty`);
@@ -735,7 +738,7 @@ export function stageFrom(node: Scalar, index: number): Stage {
     });
   }
 
-  return stage as unknown as Stage;
+  return stage as unknown as Omit<Stage, 'provider'> & { provider?: string };
 }
 
 /**
@@ -763,7 +766,7 @@ export function specFrom(tree: Map<string, Scalar>): PipelineSpec {
   if (stagesNode.length === 0) {
     throw new PipelineSpecError('a pipeline spec needs at least one stage');
   }
-  const stages = stagesNode.map((node, i) => stageFrom(node, i));
+  const stages = inheritContinuedProviders(stagesNode.map((node, i) => stageFrom(node, i)));
 
   const spec: Record<string, unknown> = { name, stages };
   const concurrency = tree.get('concurrency') ?? null;

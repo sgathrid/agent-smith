@@ -10,8 +10,9 @@
 #   implement → agy    (Google)     no deps → starts immediately
 #   review    → codex   (OpenAI)     dependsOn: [implement]
 #   moderate  → claude  (Anthropic)  dependsOn: [implement, review]
-#   acceptance → claude (Anthropic)  dependsOn: [review]   ─┐
-#   security   → codex   (OpenAI)     dependsOn: [review]   ─┴─ concurrent fan-out
+#   fix       → agy    (Google)     dependsOn: [review, moderate], continues: implement
+#   acceptance → claude (Anthropic)  dependsOn: [fix]   ─┐
+#   security   → codex   (OpenAI)     dependsOn: [fix]   ─┴─ concurrent fan-out
 #
 # Two properties worth noticing, because they are what ARCHITECTURE.md is about:
 #
@@ -21,11 +22,19 @@
 #      family manufactures agreement and calls it verification. The pipeline
 #      will refuse to let you do that — assertCrossFamily throws.
 #
-#   2. `acceptance` and `security` BOTH depend only on `review`, so they run
+#   2. `acceptance` and `security` BOTH depend only on `fix`, so they run
 #      CONCURRENTLY. That is the measurable claim: 16 jobs across 16.3 hours at a
 #      concurrency ceiling of 3 was the pathology this DAG exists to remove.
 #      `peakConcurrency` is reported on every run, so the claim is checked rather
 #      than asserted.
+#
+# `fix` IS THE REVIEW -> FIX LOOP
+# ===============================
+# `continues: implement` resumes the implementer's own conversation (same agy
+# worker, same working directory), so it fixes from what it already knows about
+# the code it wrote, and the review and moderation artifacts arrive as its
+# inputs because it depends on them. Its `checks` decide acceptance like any
+# stage. A second round is just more stages: review2 → fix2 (continues: fix).
 #
 # WHY THE FAN-OUT IS NOT SIMULATED VOTE-TAKING
 # =============================================
@@ -107,13 +116,29 @@ stages:
 
       Report findings only. Do not rewrite the work.
 
+  # ── the implementer fixes what the review found ─────────────────────────────
+  # Resumes the `implement` worker's conversation instead of starting a fresh
+  # one. `provider` is omitted: it is inherited from `implement` (a conversation
+  # cannot move between providers). Replace the check command with your own.
+  - name: fix
+    continues: implement
+    dependsOn: [review, moderate]
+    role: implement
+    timeout: 30m
+    prompt: |
+      Fix the defects the review and moderation found in your own work. Skip
+      findings you can show are wrong, and say why in your result.
+    checks:
+      - name: typecheck
+        command: npm run typecheck
+
   # ── two concurrent probes off the same node ────────────────────────────────
-  # Both depend on `review` and not on each other, so the DAG dispatches them
+  # Both depend on `fix` and not on each other, so the DAG dispatches them
   # together. `peakConcurrency` on the run report should be 2 here.
   - name: acceptance
     provider: claude
     model: sonnet
-    dependsOn: [review]
+    dependsOn: [fix]
     role: verify
     timeout: 15m
     prompt: |
@@ -123,7 +148,7 @@ stages:
 
   - name: security
     provider: codex
-    dependsOn: [review]
+    dependsOn: [fix]
     role: review
     timeout: 15m
     prompt: |

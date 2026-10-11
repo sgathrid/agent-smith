@@ -30,7 +30,9 @@
  *    `--conversation <id>` (a VERIFIED flag), so an escalation resumes the
  *    worker's own conversation instead of re-paying for everything it already
  *    read. This is pipeline/routing.ts RULE 3, and the only place in the repo
- *    where that rule is actually wired to a CLI.
+ *    where that rule is actually wired to a CLI. A stage with `continues` uses the same
+ *    path on attempt 1: `ctx.continues` carries the target stage's conversation and
+ *    worker identity, so the fix stage resumes the implementer it follows.
  *
  * 3. ARTIFACT PLACEMENT. Every stage gets its OWN directory under the pipeline
  *    work dir — `<workDir>/<stage.name>/` — and writes `result.md` inside it.
@@ -326,8 +328,8 @@ export function createForgeRunner(deps: RunnerDeps): StageRunner {
     const continuesAttempt = sameProvider && continuation?.transcriptRef !== undefined;
     const request: SpawnRequest = {
       mode: stage.role ?? stage.name,
-      name: stage.agentName,
-      workerId: stage.workerId ?? `${runId}:${stage.name}`,
+      name: stage.agentName ?? ctx.continues?.agentName,
+      workerId: stage.workerId ?? (ctx.continues === undefined ? `${runId}:${stage.name}` : ctx.continues.workerId ?? `${runId}:${ctx.continues.stage}`),
       task: stage.title ?? stage.prompt,
       prompt: buildStagePrompt({
         stage,
@@ -356,7 +358,7 @@ export function createForgeRunner(deps: RunnerDeps): StageRunner {
       ...(stage.effort === undefined && ctx.routing.tier === 't0-cheap' ? {} : { effort: ctx.routing.effort }),
       // routing RULE 3: continue, do not restart.
       ...(sameProvider
-        ? { conversation: continuation?.transcriptRef ?? stage.conversation }
+        ? { conversation: continuation?.transcriptRef ?? ctx.continues?.transcriptRef ?? stage.conversation }
         : {}),
     };
 

@@ -204,12 +204,38 @@ stopped; check `status`.
 ### `run_pipeline`
 Params: `spec` object (unknown fields rejected): `name` (required), `task` (required unless
 `stages`), `workDir` (default repo), `concurrency` 1-32, `unrestricted` (default: true for agy stages, false for others),
-`stages[]`. Stage fields: `name`, `provider` (required); `agentName`, `workerId`,
-`conversation`, `model`, `effort`, `prompt`, `context` (as `spawn_job`), `title`, `role`, `dependsOn[]`, `workDir`,
+`stages[]`. Stage fields: `name`, `provider` (required unless `continues` is set); `agentName`, `workerId`,
+`conversation`, `continues` (see below), `model`, `effort`, `prompt`, `context` (as `spawn_job`), `title`, `role`, `dependsOn[]`, `workDir`,
 `resultPath`, `timeoutMs`, `routingPinned`, `checks[]` (same shape as `spawn_job`),
 `consumes[{stage,path,label?}]`. Without `stages`: implement -> review -> moderate from
 installed providers. Result: `{runId, recordPath, stages[{name,provider,dependsOn}],
 started:true, notify}` (not structured).
+
+#### Fixing from a review: `continues`
+`continues: "<stage>"` makes a stage resume an earlier stage's worker instead of starting a
+fresh one: same provider (omit `provider` to inherit it), same worker identity, same
+conversation, and the target's `workDir` unless the stage sets its own. The stage prompt
+gets the artifacts of its `dependsOn` stages (plus `consumes`) as usual, so a stage that
+depends on a review receives the review findings.
+
+```yaml
+- name: build
+  provider: agy
+- name: review
+  provider: codex
+  dependsOn: [build]
+- name: fix
+  continues: build           # agy, build's conversation and worker
+  dependsOn: [review]
+  checks: [{ name: unit, command: npm test }]
+```
+
+The target must be a `dependsOn` ancestor on the same provider, and `conversation` cannot
+be set alongside it; these are rejected at load time. If the target produced no conversation
+handle (or an escalation moved it to another provider) the stage fails with code
+`no-conversation` and the reason. Rounds are explicit: `build -> review1 -> fix1 -> review2 ->
+fix2`, with `fix2` continuing `fix1` or `build`. `checks` on the fix stage gate acceptance
+as on any stage. A complete example is in `the-codes/cli/pipeline.example.yaml`.
 
 ### `pipeline_status` (read-only)
 Params: `runId` (required), `response_format` `concise|detailed` (default `concise`). Detailed result:

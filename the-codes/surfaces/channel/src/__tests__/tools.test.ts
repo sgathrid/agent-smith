@@ -75,6 +75,28 @@ test('default pipeline derives providers from installed catalogs', async () => {
   await assert.rejects(defaultMixedPipeline({ name: 'p', task: 't' }, async () => []), /No providers installed.*agy/);
 });
 
+test('run_pipeline stages accept continues, inherit its provider, and reject a bad spec before starting anything', async () => {
+  const stageSchema = (TOOL_DEFS.find(t => t.name === 'run_pipeline')!.inputSchema as any).properties.spec.properties.stages.items;
+  assert.ok(stageSchema.properties.continues);
+  assert.deepEqual(stageSchema.required, ['name']);
+  const ctx = ctxWith([cat('agy'), cat('codex')]);
+  const run = (fix: Record<string, unknown>) => callTool(ctx, 'run_pipeline', { spec: { name: 'p', stages: [
+    { name: 'build', provider: 'agy', prompt: 'b' }, { name: 'review', provider: 'codex', prompt: 'r', dependsOn: ['build'] },
+    { name: 'fix', prompt: 'f', dependsOn: ['review'], ...fix }] } });
+  const text = (r: { content: unknown }) => ((r.content as { text: string }[])[0]!).text;
+  const cases: Array<[Record<string, unknown>, RegExp]> = [
+    [{}, /stage 'fix' needs a provider/],
+    [{ continues: 'ghost' }, /continues 'ghost', which does not exist/],
+    [{ continues: 'ghost', provider: 'agy' }, /continues 'ghost', which does not exist/],
+    [{ continues: 'build', provider: 'codex' }, /cannot move between providers \(codex vs agy\)/],
+    [{ continues: 'build', conversation: 'c' }, /also sets conversation/],
+  ];
+  for (const [fix, message] of cases) {
+    const r = await run(fix);
+    assert.equal(r.isError, true); assert.match(text(r), message);
+  }
+});
+
 test('explicit stages are unchanged', async () => {
   const stages = [{ name: 'a', provider: 'opencode', prompt: 'x' }];
   const spec = await defaultMixedPipeline({ name: 'p', task: '', stages }, async () => { throw new Error('should not be called'); });
