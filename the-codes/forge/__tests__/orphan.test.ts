@@ -12,6 +12,8 @@ import { normalize } from '../../harness/normalize.ts';
 import {
   FILES, LEGACY_ORPHAN_AFTER_MS, ORPHAN_REASON, deriveOrphan, isPidAlive, jobFile,
 } from '../format.ts';
+import { ForgeService } from '../service.ts';
+import { writeAcceptance, readAcceptance } from '../checks.ts';
 import { JobWriter } from '../writer.ts';
 
 /** A pid that existed and was reaped: guaranteed dead. */
@@ -77,7 +79,7 @@ test('writer records ownerPid; live supervisor reads running and leaves no marke
   assert.equal(existsSync(jobFile(repo, id, FILES.orphaned)), false);
 });
 
-test('dead supervisor reads failed with the reason; job.json is untouched', async () => {
+test('dead supervisor reader is read-only; service persists the orphan verdict', async () => {
   const repo = mkdtempSync(path.join(tmpdir(), 'orphan-'));
   const id = 'implement-smith-aaaa0002';
   writerFor(repo, id);
@@ -90,7 +92,21 @@ test('dead supervisor reads failed with the reason; job.json is untouched', asyn
   assert.equal(job.status, 'failed');
   assert.ok(job.warnings.some((w) => w.message === ORPHAN_REASON));
   assert.equal(readFileSync(file, 'utf8'), before);
-  assert.equal(existsSync(jobFile(repo, id, FILES.orphaned)), true);
+  assert.equal(existsSync(jobFile(repo, id, FILES.orphaned)), false);
+  writeAcceptance(repo, id, { state: 'unchecked', checks: [], pending: true });
+  const service = new ForgeService({ repo, mirror: false });
+  assert.equal((await service.list())[0]?.status, 'failed');
+  const persisted = JSON.parse(readFileSync(file, 'utf8'));
+  assert.equal(persisted.status, 'failed');
+  assert.equal(persisted.error, ORPHAN_REASON);
+  assert.ok(persisted.finishedAt);
+  const acceptance = readAcceptance(repo, id);
+  assert.equal('pending' in acceptance && acceptance.pending, false);
+  const after = readFileSync(file, 'utf8');
+  writeAcceptance(repo, id, { state: 'unchecked', checks: [], pending: true });
+  await service.list();
+  assert.equal(readFileSync(file, 'utf8'), after);
+  assert.equal(readAcceptance(repo, id).state, 'rejected', 'a restart repairs an interrupted sidecar write');
 });
 
 test('a finished job whose supervisor is gone keeps its real verdict', async () => {
@@ -101,4 +117,39 @@ test('a finished job whose supervisor is gone keeps its real verdict', async () 
   const m = JSON.parse(readFileSync(file, 'utf8'));
   writeFileSync(file, JSON.stringify({ ...m, ownerPid: deadPid(), status: 'succeeded' }));
   assert.equal((await observe(repo, id)).status, 'succeeded');
+});
+
+test('service does not reconcile a live supervisor or a terminal result', async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), 'orphan-'));
+  const service = new ForgeService({ repo, mirror: false });
+  const id = 'implement-smith-aaaa0004';
+  writerFor(repo, id);
+  const file = jobFile(repo, id, FILES.job);
+  const before = readFileSync(file, 'utf8');
+  await service.list();
+  assert.equal(readFileSync(file, 'utf8'), before);
+  const m = JSON.parse(before);
+  writeFileSync(file, JSON.stringify({ ...m, ownerPid: deadPid() }));
+  writeFileSync(jobFile(repo, id, FILES.result), JSON.stringify({ ok: true }));
+  const pending = readFileSync(file, 'utf8');
+  await service.list();
+  assert.equal(readFileSync(file, 'utf8'), pending);
+  writeFileSync(file, JSON.stringify({ ...m, status: 'succeeded', finishedAt: iso(NOW) }));
+  const finished = readFileSync(file, 'utf8');
+  await service.list();
+  assert.equal(readFileSync(file, 'utf8'), finished);
+});
+
+test('service startup recovers dead supervisors before any MCP read', async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), 'orphan-'));
+  const id = 'implement-smith-aaaa0005';
+  writerFor(repo, id);
+  const file = jobFile(repo, id, FILES.job);
+  const m = JSON.parse(readFileSync(file, 'utf8'));
+  writeFileSync(file, JSON.stringify({ ...m, ownerPid: deadPid() }));
+  new ForgeService({ repo, mirror: false });
+  const persisted = JSON.parse(readFileSync(file, 'utf8'));
+  assert.equal(persisted.status, 'failed');
+  assert.equal(persisted.jobStatus, 'orphaned');
+  assert.ok(persisted.finishedAt);
 });

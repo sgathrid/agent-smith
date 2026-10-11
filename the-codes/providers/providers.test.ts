@@ -4,13 +4,21 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { buildArgv as buildClaudeArgv } from './claude.ts';
-import { buildArgv as buildCodexArgv } from './codex.ts';
+import { buildArgv as buildCodexArgv, codexStderrLevel } from './codex.ts';
 import { buildArgv as buildAgyArgv } from './agy.ts';
 import { buildArgv as buildOpencodeArgv } from './opencode.ts';
 import { spawnWorker } from './ndjson.ts';
 import type { SpawnSpec } from './types.ts';
 
 const tmpDirs: string[] = [];
+
+test('Codex model-refresh timeout is informational; unrelated stderr errors remain warnings', () => {
+  assert.equal(codexStderrLevel('ERROR codex_core::models_manager: failed to refresh available models: request timed out'), 'info');
+  assert.equal(codexStderrLevel('ERROR failed to refresh available models: unauthorized'), 'warn');
+  assert.equal(codexStderrLevel('ERROR authentication failed\nfailed to refresh available models: request timed out'), 'warn');
+  assert.equal(codexStderrLevel('ERROR authentication failed; failed to refresh available models: request timed out'), 'warn');
+  assert.equal(codexStderrLevel('Not inside a trusted directory'), 'warn');
+});
 
 function tempDir(): string {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'agent-smith-provider-test-'));

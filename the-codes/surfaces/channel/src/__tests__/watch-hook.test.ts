@@ -36,7 +36,7 @@ test('already-terminal job is reported once and watch exits', async () => {
   const { p, lines } = watch({ a: [job('a', 'succeeded')] }, { jobIds: ['a'] });
   assert.equal(await p, 'done');
   assert.equal(lines.length, 1);
-  assert.match(lines[0]!, /^Agent Smith: .*completed execution/);
+  assert.match(lines[0]!, /^Agent Smith: ✓ .*succeeded/);
 });
 
 test('running then succeeded', async () => {

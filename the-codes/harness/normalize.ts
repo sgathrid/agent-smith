@@ -368,11 +368,12 @@ const smithNormalizer: JobNormalizer = (raw: RawJobState): ObservedJob => {
   const schema = asNumber(p[SMITH_PAYLOAD.schema]);
 
   if (deniedCount > 0) {
+    const failedWithoutOutput = status === "failed" && (output === null || output.trim() === '');
     warnings.push({
-      code: "suspicious_success",
-      message:
-        `${deniedCount} tool action(s) were soft-denied. The worker exited 0 and reported ` +
-        "success while doing nothing; the job was recorded FAILED.",
+      code: failedWithoutOutput ? "suspicious_success" : "tool_error",
+      message: failedWithoutOutput
+        ? `${deniedCount} tool action(s) were soft-denied and no report was delivered; the job was recorded FAILED.`
+        : `${deniedCount} tool action(s) were denied by the permission policy; some requested actions may not have run.`,
     });
   }
 
@@ -399,7 +400,7 @@ const smithNormalizer: JobNormalizer = (raw: RawJobState): ObservedJob => {
     });
   } else if (status === "succeeded") {
     resolved = "succeeded";
-    if (output === null || looksEmpty(output)) {
+    if (output === null || output.trim() === '') {
       // Defensive only. deriveStatus cannot produce `succeeded` with an empty
       // report, so reaching here means job.json was written by something other
       // than forge/writer.ts. Believe the file, flag the contradiction, and do

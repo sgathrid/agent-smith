@@ -48,6 +48,9 @@ export interface WatchableJob {
   readonly id: string;
   readonly name?: string;
   readonly role?: string;
+  readonly provider?: string;
+  readonly startedAt?: string | null;
+  readonly changedFileCount?: number;
   readonly latestSummary?: string | null;
   readonly summarySource?: 'worker' | null;
   /** Runtime-owned outcome, separate from worker-authored prose. */
@@ -263,7 +266,7 @@ export function buildBatch(candidates: readonly Candidate[], now: number): Batch
     (pushable.some(c => c.job.name) ? '. /forge to inspect.' : '. /agy-radar to inspect.') + pushable.filter(c => c.job.name).slice(0, 3).map(c => {
       const job = c.job;
       const evidence = job.outcome ?? (job.summarySource === 'worker' ? job.latestSummary : null);
-      return evidence ? ` ${job.name}: ${job.outcome ? 'Runtime outcome' : 'Worker output'}: ${evidence.replace(/\s+/g, ' ').slice(0, 250)}` : '';
+      return evidence ? ` ${job.name}: ${job.outcome ? 'Runtime outcome' : 'Worker output'}: ${compactExcerpt(evidence, 250)}` : '';
     }).join('');
 
   return { content, meta: metaFor('failed', metaJobs), keys };
@@ -292,10 +295,15 @@ const PLURAL: Record<PushKind, string> = {
  */
 function renderOne(kind: PushKind, job: WatchableJob): string {
   if (job.name) {
-    const state = kind === 'finished' ? 'completed execution' : kind === 'attention' ? 'needs attention' : kind;
+    const state = kind === 'finished' ? 'succeeded' : kind === 'attention' ? 'needs attention' : kind;
+    const glyph = kind === 'finished' ? '✓' : kind === 'failed' ? '✗' : kind === 'cancelled' ? '■' : '!';
+    const identity = [job.provider, job.role].filter(Boolean).join(' ');
+    const elapsed = job.startedAt && job.finishedAt ? Date.parse(job.finishedAt) - Date.parse(job.startedAt) : NaN;
+    const duration = Number.isFinite(elapsed) && elapsed >= 0 ? ` · ${Math.round(elapsed / 1000)}s` : '';
+    const changed = job.changedFileCount === undefined ? '' : ` · ${job.changedFileCount} files changed`;
     const summary = job.summarySource === 'worker' && job.latestSummary
-      ? ` Worker output: ${job.latestSummary.replace(/\s+/g, ' ').slice(0, 600)}` : '';
-    return `${job.name}${job.role ? ` (${job.role})` : ''} ${state}. ID ${job.id}.${job.outcome ? ` Runtime outcome: ${job.outcome.slice(0, 600)}` : ''}${summary} /forge or status to inspect.`;
+      ? ` Worker output: ${compactExcerpt(job.latestSummary, 600)}` : '';
+    return `${glyph} ${job.name}${identity ? ` (${identity})` : ''} ${state}${duration}${changed}. ID ${job.id}.${job.outcome ? ` Runtime outcome: ${compactExcerpt(job.outcome, 600)}` : ''}${summary} /forge or status to inspect.`;
   }
   const id = job.id;
   const dur = durationWords(job.finishedAt, job.lastEventAt);
@@ -319,6 +327,16 @@ function renderOne(kind: PushKind, job: WatchableJob): string {
         `It may be stuck — /agy-radar to inspect.`
       );
   }
+}
+
+/** Bound prose without presenting an unfinished word as the worker's answer. */
+export function compactExcerpt(value: string, max: number): string {
+  const text = value.replace(/\s+/g, ' ').trim();
+  if (text.length <= max) return text;
+  const prefix = text.slice(0, Math.max(0, max - 1));
+  const sentence = [...prefix.matchAll(/[.!?](?=\s)/g)].at(-1)?.index;
+  const end = sentence !== undefined && sentence >= max / 2 ? sentence + 1 : prefix.lastIndexOf(' ');
+  return `${end > 0 ? prefix.slice(0, end).trimEnd() : ''}…`;
 }
 
 /**

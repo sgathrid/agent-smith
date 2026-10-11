@@ -30,6 +30,15 @@ import {
 } from '../policy.ts';
 import { STALL_GRACE_MS } from '../../../mod/hooks/stale.ts';
 
+test('named completion notices lead with status and truncate worker prose at a word boundary', () => {
+  const batch = buildBatch([cand(job({ name: 'smoke-codex', role: 'review', provider: 'codex',
+    status: 'succeeded', startedAt: '2026-10-03T16:39:17Z', finishedAt: '2026-10-03T16:40:00Z',
+    changedFileCount: 0, summarySource: 'worker', latestSummary: 'Complete sentence. ' + 'preserved '.repeat(80) }))], NOW);
+  assert.match(batch.content!, /^✓ smoke-codex \(codex review\) succeeded · 43s · 0 files changed/);
+  assert.match(batch.content!, /Worker output:.*… \/forge or status to inspect\.$/);
+  assert.doesNotMatch(batch.content!, /preser…/);
+});
+
 // ── fixtures, built from the real corpus ────────────────────────────────────
 
 /** Real ids and statuses, read from the corpus. */

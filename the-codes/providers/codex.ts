@@ -724,6 +724,14 @@ export function codexHarnessDefaults(home: string = codexHome()): { model?: stri
   return out;
 }
 
+/** Known model discovery noise does not describe the outcome of a worker turn. */
+export function codexStderrLevel(text: string): 'info' | 'warn' {
+  const lines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  const refreshTimeout = /^(?:\d{4}-\d{2}-\d{2}T[\d:.]+Z\s+)?(?:ERROR\s+)?(?:(?:codex_models_manager::manager|codex_core::models_manager):\s+)?failed to refresh available models: request timed out\.?$/i;
+  if (lines.length > 0 && lines.every(line => refreshTimeout.test(line))) return 'info';
+  return /not inside a trusted directory|no such file|error/i.test(text) ? 'warn' : 'info';
+}
+
 export const codexProvider: Provider = {
   name: 'codex',
   harnessDefaults: () => codexHarnessDefaults(),
@@ -788,7 +796,7 @@ export const codexProvider: Provider = {
         // "Not inside a trusted directory..." is the single most useful line
         // codex emits and it is INFO-level, not an error — but it means the job
         // is dead. Level is about presentation, not job status.
-        const level = /not inside a trusted directory|no such file|error/i.test(text) ? 'warn' : 'info';
+        const level = codexStderrLevel(text);
         bus.emit({ kind: 'notice', at: nowIso(), level, message: truncate(text, 800).text });
       },
     });

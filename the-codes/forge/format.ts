@@ -312,6 +312,7 @@ export interface ForgeProgress {
   readonly summarySource?: 'worker' | null;
   readonly lastEventAt: string;
   readonly recentActivities: readonly ForgeActivity[];
+  readonly lastActivity?: ForgeActivity | null;
   readonly latestText: string | null;
   readonly toolCalls: number;
   readonly warnings: readonly string[];
@@ -388,13 +389,10 @@ export function taskTitle(prompt: string): string {
  * ──────────────────────────────────────────────────────────────────────────── */
 
 /**
- * Below this many characters there is no deliverable.
- *
- * The number is not arbitrary and not ours: harness/normalize.ts uses `< 8` and
- * so does the mod's `looksEmpty`. All three readers must agree, or the same job
- * is a green check in the pane and a red row in the channel.
+ * A nonempty final answer is a deliverable, including deliberately short answers.
+ * Provider completion and executable acceptance remain separate requirements.
  */
-export const MIN_USEFUL_CHARS = 8;
+export const MIN_USEFUL_CHARS = 1;
 
 /** Is there no usable output? See MIN_USEFUL_CHARS. */
 export function looksEmpty(text: string | null | undefined): boolean {
@@ -634,7 +632,7 @@ export function nextActionFor(i: NextActionInput): string | null {
   }
   if (NETWORK_RE.test(err)) return 'Transient: retry the same job once; resume_job or spawn again.';
   if (/no usable output/i.test(err) || (i.exitCode === 0 && looksEmpty(i.report))) {
-    return 'Worker returned no usable output; ask for a longer answer via resume_job or rerun.';
+    return 'Worker returned no usable output; ask for a final answer via resume_job or rerun.';
   }
   return 'Worker failed; read status.error and warnings before retrying.';
 }

@@ -54,6 +54,7 @@
  * implementation.
  */
 
+import { reconcileOrphan } from './reconcile.ts';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 
@@ -193,6 +194,7 @@ export interface JobSummary {
   readonly task: string | null;
   readonly toolCalls: number | null;
   readonly currentActivity: ForgeActivity | null;
+  readonly lastActivity: ForgeActivity | null;
   readonly startedAt: string | null;
   readonly updatedAt: string | null;
   readonly finishedAt: string | null;
@@ -379,9 +381,9 @@ export function checkAgainstCatalog(
  * loses the ability to `kill()` an in-flight worker, and that is stated in the
  * cancel result rather than papered over: an honest "I marked it cancelled but
  * there is no handle here to signal" beats a `signalled: true` that never
- * happened. We currently have no cross-process owner lease or PID-safe recovery:
- * if the owner dies, the child may hit its timeout but its final result cannot be
- * written here, so job.json can remain running until an owner recovers it.
+ * happened. Service reads recover jobs whose recorded supervisor has died,
+ * provided no terminal result is already present. PID-less legacy jobs remain
+ * read-only observations because the service cannot prove their writer died.
  */
 export class ForgeService {
   readonly repo: string;
@@ -401,6 +403,13 @@ export class ForgeService {
     this.catalogSource = options.catalogSource ?? ((providers) => getCatalogs({ providers }));
     this.harnessDefaults = options.harnessDefaults ?? getHarnessDefaults;
     this.describeSandbox = options.describeSandbox ?? ((p, spec) => p.describeSandbox?.(spec));
+    // Publish abandoned-job recovery when the owner service starts, so the
+    // read-only pane agrees before an operator makes its first MCP status call.
+    try {
+      for (const entry of readdirSync(jobsDir(this.repo), { withFileTypes: true })) {
+        if (entry.isDirectory()) reconcileOrphan(this.repo, entry.name);
+      }
+    } catch { /* A missing job store is the ordinary fresh-repo case. */ }
   }
 
   /** Never throws, never waits long: a catalog is advice, not a gate on starting. */
@@ -766,6 +775,7 @@ export class ForgeService {
    * `cancellable`.
    */
   async detail(jobId: string): Promise<JobDetail> {
+    reconcileOrphan(this.repo, jobId);
     const observed = await readObservedJob('agent-smith', this.repo, jobId);
     if (observed === null) {
       const interop = await readObservedJob('agy-staff', this.repo, jobId);
@@ -848,6 +858,7 @@ export class ForgeService {
    * silently truncated.
    */
   async state(jobId: string): Promise<ForgeStatus | 'unknown'> {
+    reconcileOrphan(this.repo, jobId);
     const live = this.live.get(jobId)?.writer.snapshot();
     if (live !== null && live !== undefined) return live.status;
     try {
@@ -868,6 +879,7 @@ export class ForgeService {
     const out: JobSummary[] = [];
     for (const id of ids) {
       if (skip(id)) continue;
+      if (provider === 'agent-smith') reconcileOrphan(this.repo, id);
       const observed = await readObservedJob(provider, this.repo, id);
       if (observed === null) continue;
       out.push(toSummary(observed, provider === 'agent-smith' ? 'agent-smith' : 'agy-staff'));
@@ -915,11 +927,20 @@ export function toSummary(observed: ObservedJob, source: 'agent-smith' | 'agy-st
     task,
     toolCalls,
     currentActivity,
+    lastActivity: isForgeActivity(raw['last_activity']) ? raw['last_activity']
+      : [...activities].reverse().find(isForgeActivity) ?? null,
     startedAt: observed.startedAt,
     updatedAt: observed.updatedAt,
     finishedAt: observed.finishedAt,
     warnings: observed.warnings.map((w) => ({ code: w.code, message: w.message })),
   };
+}
+
+function isForgeActivity(value: unknown): value is ForgeActivity {
+  if (typeof value !== 'object' || value === null) return false;
+  const activity = value as Record<string, unknown>;
+  return typeof activity['stepIndex'] === 'number' && typeof activity['tool'] === 'string'
+    && ['active', 'done', 'denied', 'error'].includes(String(activity['status']));
 }
 
 function isActiveForgeActivity(value: unknown): value is ForgeActivity {

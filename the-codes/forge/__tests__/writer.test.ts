@@ -594,3 +594,48 @@ test('ordered activity preserves assistant/tool interleaving while a completed t
   assert.deepEqual(view.timeline.map((e:{sequence:number})=>e.sequence),[0,1,2,3]);
   assert.equal(view.timeline[0].tool,'Read');assert.equal(view.timeline[0].state,'done');
 });
+
+test('running start time and tool count reach the reader before completion', async () => {
+  const r = repo(); const w = start(r);
+  const m = JSON.parse(readFileSync(jobFile(r, w.jobId, FILES.job), 'utf8'));
+  assert.equal(m.startedAt, m.createdAt);
+  w.onEvent({ kind: 'activity-start', at: now(), activity: { stepIndex: 7, tool: 'Read' } });
+  w.onEvent({ kind: 'activity-end', at: now(), activity: { stepIndex: 7, tool: 'Read' }, status: 'done' });
+  const raw = await new AgentSmithReader().read(r, w.jobId);
+  assert.equal(raw?.payload.tool_calls, 1);
+  assert.deepEqual(raw?.payload.last_activity, { stepIndex: 7, tool: 'Read', status: 'done' });
+});
+
+test('last activity follows the newest event even when an earlier concurrent tool finishes', async () => {
+  const r = repo(); const w = start(r);
+  w.onEvent({ kind: 'activity-start', at: now(), activity: { stepIndex: 1, tool: 'Read' } });
+  w.onEvent({ kind: 'activity-start', at: now(), activity: { stepIndex: 2, tool: 'Bash' } });
+  w.onEvent({ kind: 'activity-end', at: now(), activity: { stepIndex: 1, tool: 'Read' }, status: 'done' });
+  const raw = await new AgentSmithReader().read(r, w.jobId);
+  assert.deepEqual(raw?.payload.last_activity, { stepIndex: 1, tool: 'Read', status: 'done' });
+});
+
+test('successful report with denied tools keeps a factual nonfatal warning', async () => {
+  const r = repo(); const w = start(r);
+  w.finish(result({ deniedActions: [{ action: 'tool', displayName: 'Bash' }] }), '# Review\n\nThe implementation handles the edge case correctly.');
+  const raw = await new AgentSmithReader().read(r, w.jobId);
+  const observed = normalize(raw!);
+  assert.equal(observed.status, 'succeeded');
+  assert.ok(observed.warnings.some(w => /denied/i.test(w.message)));
+  assert.ok(observed.warnings.every(w => w.code !== 'suspicious_success'));
+  assert.doesNotMatch(observed.warnings.map(w => w.message).join(' '), /recorded FAILED|doing nothing/);
+});
+
+test('changed file counts are available only from complete recorded evidence', async () => {
+  const r = repo(); const w = start(r);
+  const file = jobFile(r, w.jobId, FILES.job);
+  const m = JSON.parse(readFileSync(file, 'utf8'));
+  const read = async () => (await new AgentSmithReader().read(r, w.jobId))?.payload;
+  assert.equal((await read())?.changed_files, undefined);
+  writeFileSync(file, JSON.stringify({ ...m, changedFiles: [] }));
+  assert.deepEqual((await read())?.changed_files, []);
+  writeFileSync(file, JSON.stringify({ ...m, changedFiles: ['source.ts'] }));
+  assert.deepEqual((await read())?.changed_files, ['source.ts']);
+  writeFileSync(file, JSON.stringify({ ...m, changedFiles: ['source.ts'], changedFilesTruncated: true }));
+  assert.equal((await read())?.changed_files, undefined);
+});

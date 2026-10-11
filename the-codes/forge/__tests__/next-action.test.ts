@@ -17,7 +17,8 @@ test('nextAction taxonomy', () => {
   assert.match(nextActionFor({ ...F, deniedCount: 1 }) ?? '', /unrestricted:true/);
   assert.match(nextActionFor({ ...F, jobStatus: 'timeout' }) ?? '', /timeoutMs/);
   assert.match(nextActionFor({ ...F, error: 'worker reported success but delivered no usable output' }) ?? '', /no usable output/);
-  assert.match(nextActionFor({ ...F, exitCode: 0, report: 'hi' }) ?? '', /no usable output/);
+  assert.match(nextActionFor({ ...F, exitCode: 0, report: '   ' }) ?? '', /no usable output/);
+  assert.doesNotMatch(nextActionFor({ ...F, exitCode: 0, report: 'hi' }) ?? '', /no usable output/);
   assert.match(nextActionFor({ ...F, error: ORPHAN_REASON }) ?? '', /Supervisor exited/);
   assert.match(nextActionFor({ status: 'canceled' }) ?? '', /Canceled by operator/);
   assert.match(nextActionFor({ ...F, error: 'boom', exitCode: 1 }) ?? '', /status\.error/);

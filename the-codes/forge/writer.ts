@@ -119,6 +119,7 @@ export class JobWriter {
   private manifest: ForgeManifest | null = null;
   private progress: ForgeProgress | null = null;
   private recent: ForgeActivity[] = [];
+  private lastActivity: ForgeActivity | null = null;
   private lastFlushMs = 0;
   private toolCalls = 0;
   private toolSteps = new Set<number>();
@@ -185,7 +186,7 @@ export class JobWriter {
       status: 'running',
       createdAt: now,
       updatedAt: now,
-      startedAt: null,
+      startedAt: now,
       finishedAt: null,
       exitCode: null,
       jobStatus: null,
@@ -210,6 +211,7 @@ export class JobWriter {
       jobId: this.jobId,
       lastEventAt: now,
       recentActivities: [],
+      lastActivity: null,
       latestText: null,
       toolCalls: 0,
       warnings: [],
@@ -312,6 +314,7 @@ export class JobWriter {
         status,
         ...(input === undefined ? {} : { input }),
       };
+      this.lastActivity = row;
       if (idx >= 0) this.recent[idx] = row;
       else this.recent.push(row);
       // The pane picks the HIGHEST step_index, not the last entry, because a
@@ -546,6 +549,7 @@ export class JobWriter {
       summarySource: this.manifest.summarySource,
       lastEventAt: at,
       recentActivities: this.recent,
+      lastActivity: this.lastActivity,
       latestText: this.latestText,
       toolCalls: this.toolCalls,
       warnings: this.progress?.warnings ?? [],

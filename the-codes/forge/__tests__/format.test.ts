@@ -103,17 +103,19 @@ test('the task is the first non-empty prompt line, hash-stripped and capped', ()
 
 // ── emptiness ────────────────────────────────────────────────────────────────
 
-test('a result under 8 characters is not a deliverable', () => {
-  // MIN_USEFUL_CHARS is shared with harness/normalize.ts and the mod's
-  // looksEmpty. If the three ever disagree, one surface calls an empty job a
-  // success and another calls it a failure.
-  assert.equal(MIN_USEFUL_CHARS, 8);
+test('a deliberately short final answer is a deliverable; whitespace is not', () => {
+  assert.equal(MIN_USEFUL_CHARS, 1);
   assert.equal(looksEmpty(null), true);
   assert.equal(looksEmpty('   '), true);
-  assert.equal(looksEmpty('ok'), true);
-  assert.equal(looksEmpty('done'), true);
-  assert.equal(looksEmpty('1234567'), true);
+  assert.equal(looksEmpty('ok'), false);
+  assert.equal(looksEmpty('ready'), false);
+  assert.equal(looksEmpty('1234567'), false);
   assert.equal(looksEmpty('12345678'), false);
+});
+
+test('structured success with a one-word final answer succeeds', () => {
+  assert.equal(deriveStatus({ ok: true, jobStatus: 'success', report: 'ready' }).status, 'succeeded');
+  assert.equal(deriveStatus({ ok: false, jobStatus: 'error', report: 'ready' }).status, 'failed');
 });
 
 // ── THE HEADLINE RULE ────────────────────────────────────────────────────────
