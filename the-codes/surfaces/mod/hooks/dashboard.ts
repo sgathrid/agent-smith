@@ -1,6 +1,6 @@
 /** Pure rules for the Forge sidebar: which workers it lists and how it labels them. */
 import type { RadarAcceptance, RadarJob } from '../types/index.d.ts';
-import { elapsedCell, isTerminal, jobLabel, oneLine } from './format.ts';
+import { countSummary, elapsedCell, isTerminal, jobLabel, oneLine } from './format.ts';
 
 /** A settled failure or rejection stops asking for attention this long after it ended. */
 export const ATTENTION_TTL_MS = 24 * 60 * 60 * 1000;
@@ -84,4 +84,26 @@ export function groupWorkers(jobs: readonly RadarJob[]): RadarJob[] {
   }
   return [...groups.values()].sort((a,b) =>
     (b.startedAt??b.endedAt??0)-(a.startedAt??a.endedAt??0) || a.id.localeCompare(b.id));
+}
+
+/** What this session launched: job ids and pipeline run ids, kept for the whole session. */
+export interface Launched { readonly jobs: readonly string[]; readonly runs: readonly string[] }
+export function recordLaunch(prev: Launched, launch: { readonly kind: 'job' | 'run'; readonly id: string }): Launched {
+  const key = launch.kind === 'job' ? 'jobs' : 'runs';
+  return prev[key].includes(launch.id) ? prev : { ...prev, [key]: [...prev[key], launch.id] };
+}
+/** The jobs this session launched, and the stage jobs of the pipeline runs it launched. */
+export function sessionJobs(jobs: readonly RadarJob[], launched: Launched): RadarJob[] {
+  return jobs.filter((job) => launched.jobs.includes(job.id) || (job.pipeline != null && launched.runs.includes(job.pipeline)));
+}
+/** `2 running · 1 failed · 3 finished`: one count per listed worker, zeros left out; '' for none. */
+export function countLine(jobs: readonly RadarJob[]): string {
+  const c = countSummary(forgeList(jobs));
+  return ([['running', c.running], ['failed', c.failed], ['finished', c.finished]] as const)
+    .filter(([, n]) => n > 0).map(([label, n]) => `${n} ${label}`).join(' · ');
+}
+/** The /forge reply and list header: this session's counts, or the repository's, labelled. */
+export function scopeLine(jobs: readonly RadarJob[], scope: 'session' | 'all'): string {
+  const line = countLine(jobs);
+  return scope === 'all' ? `repository: ${line || 'no agents yet'}` : line || 'No agents in this session';
 }

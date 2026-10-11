@@ -2,7 +2,7 @@
 import type { UiComponents } from 'claude-code';
 import type { RadarJob } from '../types/index.d.ts';
 import type { ForgeDetail } from './canonical.ts';
-import { checksLabel, forgeList, isLive, needsAttention, statusLine, workerHeading, workerStatus } from './dashboard.ts';
+import { checksLabel, forgeList, isLive, needsAttention, scopeLine, statusLine, workerHeading, workerStatus } from './dashboard.ts';
 import { elapsed, isTerminal, oneLine, pickColor, pickGlyph } from './format.ts';
 
 export interface ViewActions {
@@ -12,9 +12,11 @@ export interface ViewActions {
   task(): Promise<void>;
   tool(key: string): Promise<void>;
   close(): Promise<void>;
+  /** Switch the list between this session and the repository; absent when there is no session view. */
+  scope?(next: 'session' | 'all'): Promise<void>;
 }
 export interface ViewOptions {
-  width: number; now: number; colour: boolean; page: number;
+  width: number; now: number; colour: boolean; page: number; scope: 'session' | 'all';
   following: boolean; taskOpen: boolean; tools: readonly string[];
 }
 
@@ -29,8 +31,10 @@ export function renderList(W: UiComponents, jobs: readonly RadarJob[], o: ViewOp
   const page = Math.min(o.page,pages-1);
   const start = page*PAGE_SIZE;
   return <Box flexDirection="column">
-    <Text bold wrap="truncate-end">{`Forge · ${live} running`}</Text>
-    {all.length===0 && <Text dimColor wrap="wrap">No workers yet. Running workers appear here and above the prompt.</Text>}
+    <Text bold wrap="truncate-end">{`Forge · ${scopeLine(jobs,o.scope)}`}</Text>
+    {all.length===0 && <Text dimColor wrap="wrap">{o.scope==='session'
+      ? 'Agents you start here appear in this list. /forge all shows the repository\'s history.'
+      : 'No workers yet. Running workers appear here and above the prompt.'}</Text>}
     {all.slice(start,start+PAGE_SIZE).map((job,i) => <Box key={`worker-${job.id}`} flexDirection="column">
       {start+i===live && <Text bold wrap="truncate-end">Recent</Text>}
       <Button key={`job-${job.id}`} plain hotkey={String(i+1)} label={workerHeading(job)} onPress={() => a.pick(job)}>
@@ -43,6 +47,9 @@ export function renderList(W: UiComponents, jobs: readonly RadarJob[], o: ViewOp
       {page>0 && <Button key="previous-page" plain label="Previous" hotkey="p" onPress={() => a.page(page-1)} />}
       {pages>1 && <Text dimColor wrap="truncate-end">{`${page+1}/${pages}`}</Text>}
       {page+1<pages && <Button key="next-page" plain label="Next" hotkey="n" onPress={() => a.page(page+1)} />}
+      {a.scope && (o.scope==='session'
+        ? <Button key="scope-all" plain label="All" hotkey="a" onPress={() => a.scope!('all')} />
+        : <Button key="scope-session" plain label="This session" hotkey="s" onPress={() => a.scope!('session')} />)}
       <Button key="close" plain label="Close" hotkey="x" onPress={a.close} />
     </Box>
   </Box>;

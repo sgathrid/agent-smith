@@ -158,6 +158,13 @@ function engine(
   return clock;
 }
 
+/** A `classic.PostToolUse` for a successful launch ack: how this session comes to own a job or run. */
+const launched = (id: string, repo = '/work', kind: 'job' | 'run' = 'job') => ({
+  hook_event_name: 'PostToolUse', session_id: 's', transcript_path: '/t', cwd: '/work',
+  tool_name: `mcp__plugin_agent-smith_agent-smith__${kind === 'job' ? 'spawn_job' : 'run_pipeline'}`, tool_use_id: `tu-${id}`, tool_input: {},
+  tool_response: { structuredContent: { [kind === 'job' ? 'jobId' : 'runId']: id, repo, timeoutMs: 600_000 }, content: [] },
+}) as never;
+
 // ── pure helpers, re-checked under the engine's own runner ─────────────────
 
 describe('band helpers (pure)', () => {
@@ -427,7 +434,7 @@ describe('the render path uses the tested helpers', () => {
 describe('native task-list projection', () => {
   test('uses host TaskCreate/TaskUpdate and preserves truthful worker metadata', async ($, on) => {
     const calls: { tool: string; input: Record<string, unknown> }[] = [];
-    engine(on, {
+    const clock = engine(on, {
       nativeTask: true,
       nativeTaskCalls: calls,
       files: {
@@ -451,6 +458,12 @@ describe('native task-list projection', () => {
     });
 
     await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
+    // Another session's running job gets no task here.
+    await clock.advance(3000);
+    expect(calls).toHaveLength(0);
+    // This session's launch does.
+    await ($ as any).classic.PostToolUse(launched('job-native-1'));
+    await clock.advance(3000);
 
     const create = calls.find((call) => call.tool === 'TaskCreate');
     const update = calls.find((call) => call.tool === 'TaskUpdate');
@@ -518,10 +531,13 @@ function forgeHost(on: (...args: any[]) => void, files: Record<string,string>, i
   return { host, clock };
 }
 const start = ($: any) => $.session.start({surface:'terminal',isInteractive:true,cwd:'/work'} as never);
+/** Launch through the ack this session's Claude would get back. */
+const launch = ($: any, id: string, kind: 'job' | 'run' = 'job') => $.classic.PostToolUse(launched(id, '/work', kind));
 
 test('a band row is a digit Button that opens the focused sidebar on that worker', async ($, on) => {
   const { host } = forgeHost(on, ada(), ['job-ada']);
   await start($);
+  await launch($, 'job-ada');
   const band = await $.ui.mount({plugin:'agent-smith',surface:'terminal',...BAND} as never);
   const row = await band.find({key:'band-job-ada'}) as { props?: Record<string,unknown> } | undefined;
   expect(row?.props?.hotkey).toBe('1');
@@ -532,26 +548,89 @@ test('a band row is a digit Button that opens the focused sidebar on that worker
   expect(await pane.find({key:'event-1'})).toBeDefined();
 });
 
-test('/forge opens the focused list; /forge pane is the same list', async ($, on) => {
+test('/forge opens the focused session list; /forge pane is the same list; /forge all adds the repository', async ($, on) => {
   const { host } = forgeHost(on, { ...ada(), ...failedJob('job-failed', RUNNING_NOW) }, ['job-ada','job-failed']);
   await start($);
-  await $.command.run({command:'forge',args:''});
+  await launch($, 'job-ada');
+  expect(await $.command.run({command:'forge',args:''})).toMatchObject({text:'1 running'});
   expect(host.opens.at(-1)).toMatchObject({id:'agent-smith',focus:true});
   const pane = await $.ui.mount(PANE_TARGET);
+  expect(await pane.find({type:'Text',text:'Forge · 1 running'})).toBeDefined();
+  expect(await pane.find({key:'job-job-ada'})).toBeDefined();
+  expect(await pane.find({key:'job-job-failed'})).toBeUndefined();
+  await pane.press({key:'job-job-ada'});
+  await $.command.run({command:'forge',args:'pane'});
+  expect(await pane.find({key:'job-job-ada'})).toBeDefined();
+  expect(await pane.find({key:'job-job-failed'})).toBeUndefined();
+
+  expect(await $.command.run({command:'forge',args:'all'})).toMatchObject({text:'repository: 1 running · 1 failed'});
+  expect(await pane.find({type:'Text',text:'Forge · repository: 1 running · 1 failed'})).toBeDefined();
   expect(await pane.find({key:'job-job-ada'})).toBeDefined();
   expect(await pane.find({type:'Text',text:'Recent'})).toBeDefined();
   // A recent failure stays marked: red, with its failure label.
   expect((await pane.find({type:'Text',text:/failed · orphaned/}) as { props?: Record<string,unknown> })?.props?.color).toBe('red');
   expect((await pane.find({type:'Text',text:'✗'}) as { props?: Record<string,unknown> })?.props?.color).toBe('red');
-  await pane.press({key:'job-job-ada'});
-  await $.command.run({command:'forge',args:'pane'});
+  // `s` returns to this session; `a` shows the repository again.
+  await pane.press({key:'scope-session'});
+  expect(await pane.find({key:'job-job-failed'})).toBeUndefined();
+  await pane.press({key:'scope-all'});
+  expect(await pane.find({key:'job-job-failed'})).toBeDefined();
+  expect(host.toasts).toHaveLength(0);
+});
+
+test('a fresh session over old jobs: an empty band, an empty session list, no lifetime counts', async ($, on) => {
+  const { host } = forgeHost(on, { ...ada(), ...failedJob('job-failed', RUNNING_NOW) }, ['job-ada','job-failed']);
+  await start($);
+  const band = await $.ui.mount({plugin:'agent-smith',surface:'terminal',...BAND} as never);
+  expect(await band.find({key:'band-job-ada'})).toBeUndefined();
+  expect(await band.find({type:'Text',text:'REST-OF-BAND'})).toBeDefined();
+  const reply = await $.command.run({command:'forge',args:''}) as { text?: string };
+  expect(reply.text).toBe('No agents in this session');
+  expect(reply.text).not.toMatch(/failed|finished/);
+  const pane = await $.ui.mount(PANE_TARGET);
+  expect(await pane.find({type:'Text',text:'Forge · No agents in this session'})).toBeDefined();
+  expect(await pane.find({type:'Text',text:/\/forge all shows the repository's history/})).toBeDefined();
+  expect(await pane.find({key:'job-job-ada'})).toBeUndefined();
+  await pane.press({key:'scope-all'});
   expect(await pane.find({key:'job-job-ada'})).toBeDefined();
+  expect(await pane.find({key:'job-job-failed'})).toBeDefined();
+  expect(host.toasts).toHaveLength(0);
+});
+
+test('after a launch only that job shows; a pipeline launch shows its stage jobs', async ($, on) => {
+  const stage = canonicalJob('job-stage', {status:'running',name:'Bo',workerId:'bo',pipeline:'run-7',stage:'build'});
+  forgeHost(on, { ...ada(), ...failedJob('job-failed', RUNNING_NOW), ...stage }, ['job-ada','job-failed','job-stage']);
+  await start($);
+  await launch($, 'job-ada');
+  const band = await $.ui.mount({plugin:'agent-smith',surface:'terminal',...BAND} as never);
+  expect(await band.find({key:'band-job-ada'})).toBeDefined();
+  expect(await band.find({key:'band-job-failed'})).toBeUndefined();
+  expect(await band.find({key:'band-job-stage'})).toBeUndefined();
+  await launch($, 'run-7', 'run');
+  expect(await band.find({key:'band-job-stage'})).toBeDefined();
+  expect(await $.command.run({command:'forge',args:''})).toMatchObject({text:'2 running'});
+  const pane = await $.ui.mount(PANE_TARGET);
+  expect(await pane.find({key:'job-job-stage'})).toBeDefined();
+  expect(await pane.find({key:'job-job-failed'})).toBeUndefined();
+});
+
+test('/forge <name> searches the whole repository, so an older worker still opens', async ($, on) => {
+  const grace = canonicalJob('job-old', {status:'failed',name:'Grace',workerId:'grace',startedAt:iso(RUNNING_NOW-90_000),finishedAt:iso(RUNNING_NOW-60_000),error:'supervisor exited (orphaned)'});
+  const { host } = forgeHost(on, { ...ada(), ...grace }, ['job-ada','job-old']);
+  await start($);
+  await launch($, 'job-ada');
+  await $.command.run({command:'forge',args:'grace'});
+  const pane = await $.ui.mount(PANE_TARGET);
+  expect(await pane.find({key:'back'})).toBeDefined();
+  expect(await pane.find({type:'Text',text:/Grace/})).toBeDefined();
+  expect(await pane.find({type:'Text',text:/failed · orphaned/})).toBeDefined();
   expect(host.toasts).toHaveLength(0);
 });
 
 test('/forge Ada opens Ada; an unknown name falls back to the list with a toast', async ($, on) => {
   const { host } = forgeHost(on, ada(), ['job-ada']);
   await start($);
+  await launch($, 'job-ada');
   await $.command.run({command:'forge',args:'ada'});
   const pane = await $.ui.mount(PANE_TARGET);
   expect(await pane.find({key:'back'})).toBeDefined();
@@ -591,6 +670,7 @@ test('the worker view is one scroll: header, task, transcript, then result and f
 test('b returns to the list; x closes the sidebar', async ($, on) => {
   const { host } = forgeHost(on, ada(), ['job-ada']);
   await start($);
+  await launch($, 'job-ada');
   await $.command.run({command:'forge',args:'Ada'});
   const pane = await $.ui.mount(PANE_TARGET);
   await pane.press({key:'back'});
@@ -622,6 +702,7 @@ test('canonical acceptance refreshes in an open worker view; a read failure keep
     {'acceptance.json':JSON.stringify({state:'unchecked',pending:true,checks:[]}),'result.md':'Worker report'});
   const { clock } = forgeHost(on, files, ['job-native-1']);
   await start($);
+  await launch($, 'job-native-1');
   await $.command.run({command:'forge',args:'job-native-1'});
   const pane = await $.ui.mount(PANE_TARGET);
   expect(await pane.find({type:'Text',text:/checks pending/})).toBeDefined();
@@ -639,7 +720,7 @@ test('canonical acceptance refreshes in an open worker view; a read failure keep
 test('a failure older than 24 h stays in Recent but is no longer drawn as one needing attention', async ($, on) => {
   forgeHost(on, { ...failedJob('job-old', RUNNING_NOW - 25*3600*1000), ...failedJob('job-new', RUNNING_NOW - 3600*1000) }, ['job-old','job-new']);
   await start($);
-  await $.command.run({command:'forge',args:''});
+  await $.command.run({command:'forge',args:'all'});
   const pane = await $.ui.mount(PANE_TARGET);
   const rows = await pane.findAll({type:'Text',text:/failed · orphaned/}) as { props?: Record<string,unknown> }[];
   expect(rows.map(row => row.props?.color)).toEqual(['red', undefined]);
@@ -673,11 +754,6 @@ describe('completion notices', () => {
     on('fs.write', (_$: unknown, e: any) => { files[e.path] = e.text; return {value:undefined}; });
     return { ...r, said };
   }
-  const launched = (jobId: string, repo = '/work') => ({
-    hook_event_name: 'PostToolUse', session_id: 's', transcript_path: '/t', cwd: '/work',
-    tool_name: 'mcp__plugin_agent-smith_agent-smith__spawn_job', tool_use_id: `tu-${jobId}`, tool_input: {},
-    tool_response: { structuredContent: { jobId, repo, timeoutMs: 600_000 }, content: [] },
-  }) as never;
   const ada = (status: string, more: Record<string, unknown> = {}) => canonicalJob('job-ada',
     {status,name:'Ada',provider:'codex',role:'review',...more},
     status === 'running' ? {} : {'acceptance.json':JSON.stringify({state:'accepted',checks:[{name:'tests',ok:true},{name:'lint',ok:true}]})});

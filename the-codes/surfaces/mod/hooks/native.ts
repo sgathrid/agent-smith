@@ -146,22 +146,24 @@ function fingerprint(job: NativeJob): string {
 }
 
 /**
- * Create tasks only for currently live jobs, and update only jobs already
- * represented in the host task list. That keeps old finished jobs from flooding
- * TaskList when a session starts.
+ * Create tasks only for currently live jobs this session owns, and update only
+ * jobs already represented in the host task list. That keeps old finished jobs
+ * and other sessions' work from flooding TaskList; a task already linked runs
+ * to completion and closes as before, whoever owns its job.
  */
 export async function syncNativeTasks(
   jobs: readonly NativeJob[],
   previous: NativeTaskLinks,
   client: NativeTaskClient,
   now: number = Date.now(),
+  owned: (id: string) => boolean = () => true,
 ): Promise<NativeTaskLinks> {
   const next: NativeTaskLinks = { ...previous };
   for (const job of jobs) {
     const old = next[job.id];
     if (old?.status === 'deleted') continue;
     const live = job.status === 'running' || job.status === 'attention' || job.acceptance?.pending === true;
-    if (old === undefined && !live) continue;
+    if (old === undefined && (!live || !owned(job.id))) continue;
 
     const subject = subjectFor(job);
     const description = descriptionFor(job);

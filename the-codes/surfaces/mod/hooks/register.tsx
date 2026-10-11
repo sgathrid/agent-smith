@@ -3,8 +3,8 @@ import { atom, read, update } from 'claude-code';
 import type { EngineInterface, PostToolUseEvent, Register, UiRenderEvent } from 'claude-code';
 
 import type { RadarJob } from '../types/index.d.ts';
-import { countSummary, formatHeaderLine, isTerminal } from './format.ts';
-import { findWorker } from './dashboard.ts';
+import { isTerminal } from './format.ts';
+import { findWorker, recordLaunch, scopeLine, sessionJobs, type Launched } from './dashboard.ts';
 import { renderList, renderWorker, type ViewActions, type ViewOptions } from './views.tsx';
 import type { ForgeDetail } from './canonical.ts';
 // ── BAND IMPORTS (band author) ────────────────────────────────────────────────
@@ -43,7 +43,6 @@ import {
   type RunRecord,
 } from './notice.ts';
 import {
-  readNativeJobs,
   nativeJobsFromRadar,
   syncNativeTasks,
   type NativeTaskClient,
@@ -136,9 +135,30 @@ const bandConfig = atom({ plugin: 'agent-smith', key: 'bandConfig' } as const, {
 /**
  * Launches this session claimed (see `claimLaunch`), until announced. Session
  * state, reset by /clear: a job claimed before a /clear is not announced after
- * it, though the band and /forge still show it.
+ * it, and leaves this session's view (`/forge all` still lists it).
  */
 const notices = atom({ plugin: 'agent-smith', key: 'notices' } as const, [] as Owned[]);
+
+/**
+ * Launches this session made in this repo, for the views. Unlike `notices`,
+ * nothing prunes it: an announced or expired claim leaves `notices`, but its
+ * finished job stays in this session's list. Session state, reset like `notices`.
+ */
+const launched = atom({ plugin: 'agent-smith', key: 'launched' } as const, { jobs: [], runs: [] } as Launched);
+/** The /forge list shows this session's workers, or the repository's history. */
+const listScope = atom({ plugin: 'agent-smith', key: 'listScope' } as const, 'session' as 'session' | 'all');
+
+/**
+ * The rows the band, the session list and native tasks show: this session's
+ * launches. Legacy jobs are started outside the launch tools, so ownership is
+ * unknowable there and the legacy view stays the whole repository.
+ */
+async function sessionRows($: EngineInterface): Promise<RadarJob[]> {
+  const cfg = await read($, bandConfig);
+  const jobs = await read($, bandJobs);
+  const mine = await read($, launched);
+  return cfg.legacy ? jobs : sessionJobs(jobs, mine);
+}
 
 // =============================================================================
 // § BAND — band author. See MERGE NOTE above.
@@ -203,7 +223,7 @@ async function pollBand($: EngineInterface): Promise<void> {
   // `ui.invalidate` is rate-limited by the engine for good cause.
   const before = JSON.stringify(previous);
   if (before !== JSON.stringify(next)) await update($, bandJobs, () => next);
-  if (!cfg.legacy) await pollNativeTasks($, cfg.repo, next);
+  if (!cfg.legacy) await pollNativeTasks($, next);
 }
 
 // ── completion notices ───────────────────────────────────────────────────────
@@ -235,10 +255,13 @@ async function claimLaunch($: EngineInterface, e: PostToolUseEvent, next: (e: un
   const launch = parseLaunch(e.tool_name, e.tool_response);
   if (launch === null) return next(e);
   const cfg = await read($, bandConfig);
+  const repo = launch.repo ?? (typeof e.cwd === 'string' ? e.cwd : '');
+  // Whether this session shows the job is a separate question from who
+  // announces it: any launch in this repo is shown, even one the hook keeps.
+  if (cfg.repo !== '' && sameRepo(repo, cfg.repo)) await update($, launched, (l) => recordLaunch(l, launch));
   // Legacy mode reads the agy-staff layout, and a read error means no rows: the
   // mod could not see this job finish, so the hook keeps it.
   if (cfg.legacy || cfg.repo === '' || await read($, readError) !== null) return next(e);
-  const repo = launch.repo ?? (typeof e.cwd === 'string' ? e.cwd : '');
   if (!sameRepo(repo, cfg.repo)) return next(e);
   const at = await $.clock.now();
   await update($, notices, (owned) => claim(owned, launch, at));
@@ -355,7 +378,7 @@ export async function startBand($: EngineInterface, cwd?: string): Promise<void>
     void (async () => {
       const at = await $.clock.now();
       const previousTime = await read($, now);
-      const visible = (await read($, bandJobs)).some(j => isShown(j, previousTime));
+      const visible = (await sessionRows($)).some(j => isShown(j, previousTime));
       // Draw once across the expiry boundary before becoming idle.
       if (visible || await read($, paneOpen)) await update($, now, () => at);
     })().catch(() => {});
@@ -380,17 +403,18 @@ export async function startBand($: EngineInterface, cwd?: string): Promise<void>
 // guard for the mod's current engine session.
 let nativeSyncing = false;
 
-async function pollNativeTasks($: EngineInterface, repo: string, snapshot?: readonly RadarJob[]): Promise<void> {
+async function pollNativeTasks($: EngineInterface, rows: readonly RadarJob[]): Promise<void> {
   if (nativeSyncing) return;
   nativeSyncing = true;
   try {
-    const jobs = snapshot ? nativeJobsFromRadar(snapshot) : await readNativeJobs(fsOf($), repo, await $.clock.now());
     const previous = await read($, nativeTaskLinks);
     const client: NativeTaskClient = {
       create: (input) => $.tool.call({ tool: 'TaskCreate', ...input }),
       update: (input) => $.tool.call({ tool: 'TaskUpdate', ...input }),
     };
-    const next = await syncNativeTasks(jobs, previous, client, await $.clock.now());
+    // Only this session's launches get a new task; tasks already linked finish as before.
+    const mine = new Set(sessionJobs(rows, await read($, launched)).map((job) => job.id));
+    const next = await syncNativeTasks(nativeJobsFromRadar(rows), previous, client, await $.clock.now(), (id) => mine.has(id));
     if (JSON.stringify(previous) !== JSON.stringify(next)) {
       await update($, nativeTaskLinks, () => next);
     }
@@ -440,10 +464,10 @@ export function registerBand(on: Parameters<Register>[0]): void {
     const rest = await next(e);
 
     // Subscribe. `await read($, now)` is what makes a clock tick repaint this
-    // element; reading bandJobs is what makes a poll repaint it.
+    // element; reading bandJobs (in sessionRows) is what makes a poll repaint it.
     const at = await read($, now);
     const cfg = await read($, bandConfig);
-    const all = await read($, bandJobs);
+    const all = await sessionRows($);
 
     // A survey holds the band. Standing aside is not politeness: a survey is a
     // question being asked, and the band would push it off screen.
@@ -555,7 +579,7 @@ export const register: Register = (on) => {
       .register({
         name: 'forge',
         immediate: true,
-        description: 'Show workers; /forge <name> opens one worker\'s live view and result',
+        description: 'Show this session\'s workers; /forge all shows the repository\'s; /forge <name> opens one worker',
       })
       .catch(() => {});
     return rest;
@@ -570,13 +594,20 @@ export const register: Register = (on) => {
   // SILENTLY, so the two strings are deliberately the same string.
   on('command.run', { command: 'forge' }, async ($, e) => {
     await pollBand($);
+    const cfg = await read($, bandConfig);
     const jobs = await read($, bandJobs);
-    // `/forge pane` is the list, kept because people have typed it.
-    const query = typeof e.args === 'string' && e.args.trim() !== 'pane' ? e.args.trim() : '';
-    const job = query === '' ? undefined : findWorker(jobs, query);
-    if (query !== '' && job === undefined) await $.ui.toast(`No worker matches "${query}"; showing all workers`);
+    const mine = await sessionRows($);
+    const args = typeof e.args === 'string' ? e.args.trim() : '';
+    // `/forge pane` is the session list, kept because people have typed it.
+    // Legacy jobs have no session owner, so legacy is always the repository.
+    const scope = args === 'all' || cfg.legacy ? 'all' : 'session';
+    const query = args === 'pane' || args === 'all' ? '' : args;
+    // This session's worker first; then the repository's, so an older one still opens by name.
+    const job = query === '' ? undefined : findWorker(mine, query) ?? findWorker(jobs, query);
+    if (query !== '' && job === undefined) await $.ui.toast(`No worker matches "${query}"; showing the list`);
+    await update($, listScope, () => scope);
     await openForge($, job?.id ?? null);
-    return { text: formatHeaderLine(countSummary(jobs)) };
+    return { text: scopeLine(scope === 'all' ? jobs : mine, scope) };
   });
 
   // Scrolling up pauses following; scrolling back to the end resumes it.
@@ -647,13 +678,18 @@ async function renderForge($: EngineInterface, e: UiRenderEvent): Promise<JSX.El
   const cfg = await read($, bandConfig);
   const t = await read($, now);
   const jobs = await read($, bandJobs);
+  const mine = await sessionRows($);
+  const chosen = await read($, listScope);
+  const scope = cfg.legacy ? 'all' : chosen;
   const pick = await read($, selected);
   const error = await read($, readError);
   const o: ViewOptions = {
-    width: e.props.bodyColumns, now: t, colour: cfg.colour, page: await read($, listPage),
+    width: e.props.bodyColumns, now: t, colour: cfg.colour, page: await read($, listPage), scope,
     following: await read($, follow), taskOpen: await read($, taskOpen), tools: await read($, expandedTools),
   };
   const a: ViewActions = {
+    // Legacy has no session to switch to.
+    ...(cfg.legacy ? {} : { scope: async (next: 'session' | 'all') => { await update($, listScope, () => next); await update($, listPage, () => 0); } }),
     pick: (job) => show($, job.id),
     page: async (page) => { await update($, listPage, () => page); },
     back: () => show($, null),
@@ -661,7 +697,7 @@ async function renderForge($: EngineInterface, e: UiRenderEvent): Promise<JSX.El
     tool: async (key) => { await update($, expandedTools, (keys) => keys.includes(key) ? keys.filter((k) => k !== key) : [...keys, key]); },
     close: async () => { await update($, paneOpen, () => false); await $.ui.close({ id: PANE }); },
   };
-  let content = renderList(W, jobs, o, a);
+  let content = renderList(W, scope === 'all' ? jobs : mine, o, a);
   if (pick !== null) {
     try {
       const detail = await loadDetail($, cfg.repo, cfg.legacy, pick, t);

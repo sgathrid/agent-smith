@@ -133,3 +133,24 @@ test('acceptance settlement starts the native close delay, while failed outcomes
   assert.equal(later.j?.status,'completed');
   assert.match(String(calls.at(-1)?.subject),/\[failed\]/);
 });
+
+test('a job this session does not own gets no new task, but an existing link still finishes and closes', async () => {
+  const calls: Array<{ method: string; input: Record<string, unknown> }> = [];
+  const client: NativeTaskClient = {
+    async create(input) { calls.push({ method: 'create', input }); return { result: { task: { id: 't1' } } }; },
+    async update(input) { calls.push({ method: 'update', input }); return { result: { success: true } }; },
+  };
+  const job = {
+    id: 'job-x', status: 'running' as const, task: 'x', name: 'w', workerId: 'w', role: 'implement',
+    provider: 'codex', model: null, latestSummary: null, summarySource: null,
+  };
+  const notMine = () => false;
+  assert.deepEqual(await syncNativeTasks([job], {}, client, 1000, notMine), {});
+  assert.equal(calls.length, 0);
+  const linked = { 'job-x': { taskId: 't1', status: 'in_progress' as const, fingerprint: '' } };
+  const done = await syncNativeTasks([{ ...job, status: 'succeeded' }], linked, client, 1000, notMine);
+  assert.equal(done['job-x']?.status, 'completed');
+  const closed = await syncNativeTasks([{ ...job, status: 'succeeded' }], done, client, 11_000, notMine);
+  assert.equal(closed['job-x']?.status, 'deleted');
+  assert.equal(calls.filter((c) => c.method === 'create').length, 0);
+});
