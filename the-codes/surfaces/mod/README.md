@@ -126,15 +126,16 @@ while a survey is displayed. It never opens a sidebar automatically.
 
 | Control | Action |
 |---|---|
-| Ctrl+X then Tab | Focus the band or inspector using the host's focus controls |
+| Ctrl+X then Tab | Focus the band or inspector; the pane shows this hint beside its controls |
 | `a` / `h` in roster | Active / History |
 | `1`–`9` | Open a visible worker |
 | `n` / `p` in roster | Next / previous page |
 | `a` / `t` / `r` / `k` in detail | Activity / Task / Result / Checks |
 | `b` | Back to the roster |
+| `y` in a settled failed or rejected job | Acknowledge it and move it to History |
 | `f` in Activity | Toggle following; manual scrolling pauses it |
 | `p` in Task | Show or hide the prompt preamble |
-| `c` / `u` in roster | Dismiss settled rows / restore dismissed rows |
+| `c` / `u` in roster | Acknowledge settled attention items and dismiss other settled rows / restore them |
 | `e` | Open the larger inspector |
 | `x` | Collapse the bottom view or close the inspector |
 | Escape | Return keyboard focus to the prompt |
@@ -142,6 +143,15 @@ while a survey is displayed. It never opens a sidebar automatically.
 The inspector uses the same views. The host chooses its placement: docked on a
 wide fullscreen terminal, otherwise inline. Arrow keys, page keys and the wheel
 use the host's scrolling behavior; the mod does not bind those keys itself.
+
+Acknowledged failures leave Active and remain visible in History. Their
+acknowledgement is stored by repository and job ID in host plugin state, so a
+reload does not reopen the same attention item. Running jobs and pending checks
+stay visible. Restore dismissed resets the acknowledgements as well as settled
+row dismissals. The engine test harness presses rendered component keys; it does
+not inject physical hotkeys. Verify shortcuts in the host by opening `/forge`,
+pressing Ctrl+X then Tab, pressing `h` and `a` to switch roster tabs, and Escape
+to return focus to the prompt.
 
 New writer snapshots add an ordered `timeline` alongside the older fields, with
 up to 100 activity rows, 60 tools and 64,000 assistant characters. Tool completion

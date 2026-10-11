@@ -37,8 +37,54 @@ test('canonical silence and orphan markers have distinct truthful outcomes', asy
   const orphan = (await readForgeJobs(memoryFs({ ...files, [`${base}/orphaned`]: '',
     [`${base}/acceptance.json`]: JSON.stringify({state:'unchecked',pending:true,checks:[]}) }), '/repo', now))[0];
   assert.equal(orphan?.status, 'failed');
+  assert.match(orphan?.failureReason ?? '', /orphaned/);
   assert.equal(orphan?.acceptance?.pending, false, 'an exited supervisor cannot run its pending checks');
   assert.equal(orphan?.acceptance?.state, 'unchecked');
+});
+test('canonical result snapshot prevents a stale orphan marker from overriding a live job', async () => {
+  const job = (await readForgeJobs(memoryFs({
+    [`${base}/job.json`]: JSON.stringify(manifest),
+    [`${base}/orphaned`]: '',
+    [`${base}/result.json`]: JSON.stringify({status:'running'}),
+  }),'/repo',now))[0];
+  assert.equal(job?.status,'running');
+});
+
+test('canonical legacy jobs use createdAt when startedAt is absent', async () => {
+  const legacy = { ...manifest, startedAt: null, createdAt: new Date(now - 8_000).toISOString() };
+  const job = (await readForgeJobs(memoryFs({ [`${base}/job.json`]: JSON.stringify(legacy) }), '/repo', now))[0];
+  assert.equal(job?.startedAt, now - 8_000);
+});
+test('canonical activity prefers lastActivity chronology and falls back to highest legacy step', async () => {
+  const progressPath = `${base}/progress.json`;
+  const files = {
+    [`${base}/job.json`]: JSON.stringify(manifest),
+    [progressPath]: JSON.stringify({
+      lastEventAt: manifest.updatedAt,
+      recentActivities: [{stepIndex:9,tool:'view_file',input:'{"AbsolutePath":"/tmp/older.ts"}'}],
+      lastActivity: {stepIndex:3,tool:'view_file',input:'{"AbsolutePath":"/tmp/latest.ts"}'},
+    }),
+  };
+  const current = (await readForgeJobs(memoryFs(files),'/repo',now))[0];
+  assert.equal(current?.activity,'reading latest.ts');
+  const legacyFiles = {...files,[progressPath]:JSON.stringify({lastEventAt:manifest.updatedAt,
+    recentActivities:[{stepIndex:9,tool:'view_file',input:'{"AbsolutePath":"/tmp/legacy.ts"}'}]})};
+  const legacy = (await readForgeJobs(memoryFs(legacyFiles),'/repo',now))[0];
+  assert.equal(legacy?.activity,'reading legacy.ts');
+});
+
+test('canonical acceptance preserves check reason, timeout, signal and skip metadata', async () => {
+  const job = (await readForgeJobs(memoryFs({
+    [`${base}/job.json`]: JSON.stringify({...manifest,status:'failed'}),
+    [`${base}/acceptance.json`]: JSON.stringify({state:'rejected',checks:[
+      {name:'tests',ok:false,outputTail:'',timedOut:true,signal:'SIGTERM',reason:'command timed out'},
+      {name:'typecheck',ok:false,outputTail:'',skipped:'missing-cwd',reason:'working directory does not exist'},
+    ]}),
+  }),'/repo',now))[0];
+  assert.deepEqual(job?.acceptance?.checks.map(check=>({reason:check.reason,timedOut:check.timedOut,signal:check.signal,skipped:check.skipped})),[
+    {reason:'command timed out',timedOut:true,signal:'SIGTERM',skipped:undefined},
+    {reason:'working directory does not exist',timedOut:undefined,signal:undefined,skipped:'missing-cwd'},
+  ]);
 });
 test('acceptance remains separate from execution, and bounded detail is read once', async () => {
   const reads: string[] = [];

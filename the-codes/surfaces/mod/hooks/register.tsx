@@ -4,6 +4,7 @@ import type { EngineInterface, Register, UiComponents, UiRenderEvent } from 'cla
 
 import type { RadarJob, DetailTab } from '../types/index.d.ts';
 import { countSummary, formatHeaderLine, isTerminal } from './format.ts';
+import { belongsToRepo, needsAttention, scopedJobKey } from './dashboard.ts';
 import { renderRoster, renderWorker, type ViewActions, type ViewOptions } from './views.tsx';
 import type { ForgeDetail } from './canonical.ts';
 // ── BAND IMPORTS (band author) ────────────────────────────────────────────────
@@ -102,6 +103,8 @@ const now = atom({ plugin: 'agent-smith', key: 'now' } as const, 0);
  * state, and an array survives that where a Set does not.
  */
 const cleared = atom({ plugin: 'agent-smith', key: 'cleared' } as const, [] as string[]);
+/** Settled attention items the user acknowledged; failures remain in History. */
+const acknowledged = atom({ plugin: 'agent-smith', key: 'acknowledged' } as const, [] as string[]);
 /**
  * Follow mode (`f`). On, the detail view is a bounded live tail: the newest few
  * transcript chunks and tool rows, and a collapsed prompt, so the pane keeps the
@@ -559,11 +562,13 @@ async function renderForge($: EngineInterface, e: UiRenderEvent, bottom: boolean
   const t = await read($, now);
   const jobs = await read($, bandJobs);
   const hidden = await read($, cleared);
+  const acknowledgedIds = await read($, acknowledged);
   const pick = await read($, selected);
   const error = await read($, readError);
   const o: ViewOptions = {
     width: e.props.bodyColumns, rows: bottom ? e.props.maxRows ?? 10 : e.props.scroll?.bodyRows ?? 30,
     now: t, colour: cfg.colour, bottom, rosterTab: await read($, rosterTab), page: await read($, listPage),
+    repo: cfg.repo, acknowledged: acknowledgedIds,
     tab: await read($, detailTab), following: await read($, follow), preamble: await read($, showPreamble),
     tools: await read($, expandedTools), checks: await read($, expandedChecks),
   };
@@ -599,8 +604,23 @@ async function renderForge($: EngineInterface, e: UiRenderEvent, bottom: boolean
     preamble: async () => { await update($, showPreamble, value => !value); },
     tool: async key => { await update($, expandedTools, keys => keys.includes(key)?keys.filter(k=>k!==key):[...keys,key]); },
     check: async index => { await update($, expandedChecks, ids => ids.includes(index)?ids.filter(i=>i!==index):[...ids,index]); },
-    clear: async () => { await update($, cleared, ids => [...new Set([...ids,...jobs.filter(j=>isTerminal(j.status)&&!j.acceptance?.pending).map(j=>j.id)])]); },
-    restore: async () => { await update($, cleared, () => []); },
+    clear: async () => {
+      const settled = jobs.filter(j=>isTerminal(j.status)&&!j.acceptance?.pending);
+      const ackKeys = settled.filter(j=>needsAttention(j)).map(j=>scopedJobKey(cfg.repo,j.id));
+      const hideKeys = settled.filter(j=>!needsAttention(j)).map(j=>scopedJobKey(cfg.repo,j.id));
+      await update($, acknowledged, ids => [...new Set([...ids,...ackKeys])]);
+      await update($, cleared, ids => [...new Set([...ids,...hideKeys])]);
+    },
+    acknowledge: async () => {
+      const job = jobs.find(item => item.id === pick);
+      if (!job || !isTerminal(job.status) || job.acceptance?.pending || !needsAttention(job)) return;
+      const key = scopedJobKey(cfg.repo,job.id);
+      await update($, acknowledged, ids => ids.includes(key) ? ids : [...ids,key]);
+    },
+    restore: async () => {
+      await update($, cleared, ids => ids.filter(id=>!belongsToRepo(id,cfg.repo)));
+      await update($, acknowledged, ids => ids.filter(id=>!belongsToRepo(id,cfg.repo)));
+    },
     inspector: async () => {
       await update($, expanded, () => false); await update($, paneOpen, () => true);
       followingSite = null; await requestPane($,true);

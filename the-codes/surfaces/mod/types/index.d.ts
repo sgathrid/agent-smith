@@ -64,6 +64,8 @@ export interface RadarJob {
   readonly provider?: string | null;
   readonly model?: string | null;
   readonly acceptance?: RadarAcceptance;
+  /** Canonical failure detail from the manifest, when available. */
+  readonly failureReason?: string | null;
   readonly lastEventAt?: number | null;
   readonly pipeline?: string | null;
   readonly stage?: string | null;
@@ -140,7 +142,10 @@ export type DetailTab = 'activity' | 'task' | 'result' | 'checks';
 export interface RadarAcceptance {
   readonly state: 'accepted' | 'rejected' | 'unchecked';
   readonly pending?: boolean;
-  readonly checks: readonly { name: string; ok: boolean; outputTail: string }[];
+  readonly checks: readonly {
+    name: string; ok: boolean; outputTail: string;
+    reason?: string; timedOut?: boolean; signal?: string | null; skipped?: string;
+  }[];
 }
 
 /** One tool call, for the detail pane's history. */
@@ -176,8 +181,10 @@ declare module 'claude-code' {
       view: 'list' | 'detail';
       /** Clock the pane subscribes to so elapsed cells tick. The BAND writes it. */
       now: number;
-      /** Job ids dismissed with `c`; filtered against on read, never deleted. */
+      /** Repo/job keys dismissed with `c`; filtered on read, never deleted. */
       cleared: string[];
+      /** Repo and job keys acknowledged in the attention inbox; persisted across reloads. */
+      acknowledged: string[];
       /** Follow mode (`f`): bounded live tail in the detail view. Resets on `/forge`. */
       follow: boolean;
       /** `p`: show the prompt as sent, with the mode preamble. Resets on `/forge`. */

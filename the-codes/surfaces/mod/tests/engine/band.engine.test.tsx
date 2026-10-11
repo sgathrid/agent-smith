@@ -49,6 +49,7 @@ test('Forge expands at the bottom; an explicit inspector requests one third of t
   const pane = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', component: 'Pane', requestId: 'agent-smith',
     viewport: { columns: 240, rows: 40, isFullscreen: true },
     props: { title: 'Agent Smith', isFocused: true, bodyColumns: 80, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} } } as never);
+  expect(await pane.find({type:'Text',text:'Ctrl+X then Tab: focus pane hotkeys'})).toBeDefined();
   expect(widths[widths.length - 1]).toBe(80);
   await pane.press({ key: `job-${ID}` });
   expect(await pane.find({ key: 'back' })).toBeDefined();
@@ -503,6 +504,67 @@ test('Clear finished dismisses the completed row', async ($, on) => {
   await pane.press({key:'clear'});
   expect(await pane.find({key:`job-${ID}`})).toBeUndefined();
 });
+
+test('clearing acknowledges a failure into History and keeps running work in Active', async ($, on) => {
+  const files: Record<string, string> = {
+    '/work/.agent-smith/jobs/job-failed/job.json': JSON.stringify({schema:1,jobId:'job-failed',status:'failed',name:'Orphan',workerId:'orphan',task:'Inspect',
+      startedAt:new Date(RUNNING_NOW-5000).toISOString(),finishedAt:new Date(RUNNING_NOW).toISOString(),updatedAt:new Date(RUNNING_NOW).toISOString(),error:'supervisor exited (orphaned)'}),
+    '/work/.agent-smith/jobs/job-failed/acceptance.json': JSON.stringify({state:'unchecked',pending:false,checks:[]}),
+    '/work/.agent-smith/jobs/job-running/job.json': JSON.stringify({schema:1,jobId:'job-running',status:'running',name:'Live',workerId:'live',task:'Inspect',startedAt:new Date(RUNNING_NOW-5000).toISOString(),updatedAt:new Date(RUNNING_NOW).toISOString()}),
+    '/work/.agent-smith/jobs/job-running/acceptance.json': JSON.stringify({state:'unchecked',pending:true,checks:[]}),
+  };
+  on('session.start', (_$, e) => ({sessionId:'s',cwd:e.cwd}));
+  on('command.register', () => ({value:undefined}));
+  on('env.get', () => ({value:undefined}));
+  on('ui.open', () => ({value:{isPlaced:true}}));
+  mock.clock(on,{now:RUNNING_NOW});
+  on('fs.list', () => ({value:[{name:'job-failed',kind:'dir',size:0},{name:'job-running',kind:'dir',size:0}]}));
+  on('fs.exists', (_$, e) => ({value:e.path==='/work/.agent-smith/jobs'||Object.hasOwn(files,e.path)}));
+  on('fs.read', (_$, e) => { const body=files[e.path]; return body===undefined?{deny:'ENOENT'}:{value:body}; });
+  await $.session.start({surface:'terminal',isInteractive:true,cwd:'/work'} as never);
+  await $.command.run({command:'forge',args:''});
+  const pane=await $.ui.mount(PANE_TARGET);
+  expect(await pane.find({key:'job-job-failed'})).toBeDefined();
+  await pane.press({key:'clear'});
+  expect(await pane.find({key:'job-job-failed'})).toBeUndefined();
+  expect(await pane.find({key:'job-job-running'})).toBeDefined();
+  await pane.press({key:'roster-history'});
+  expect(await pane.find({key:'job-job-failed'})).toBeDefined();
+  expect(await pane.find({type:'Text',text:/need attention/})).toBeUndefined();
+  await pane.unmount();
+  const reopened=await $.ui.mount(PANE_TARGET);
+  expect(await reopened.find({key:'job-job-failed'})).toBeDefined();
+});
+
+test('a settled failure can be acknowledged from its detail view and remains in History', async ($, on) => {
+  const files: Record<string, string> = {
+    '/work/.agent-smith/jobs/job-failed/job.json': JSON.stringify({schema:1,jobId:'job-failed',status:'failed',name:'Orphan',workerId:'orphan',task:'Inspect',
+      startedAt:new Date(RUNNING_NOW-5000).toISOString(),finishedAt:new Date(RUNNING_NOW).toISOString(),updatedAt:new Date(RUNNING_NOW).toISOString(),error:'supervisor exited (orphaned)'}),
+    '/work/.agent-smith/jobs/job-failed/acceptance.json': JSON.stringify({state:'unchecked',pending:false,checks:[]}),
+  };
+  on('session.start', (_$, e) => ({sessionId:'s',cwd:e.cwd}));
+  on('command.register', () => ({value:undefined}));
+  on('env.get', () => ({value:undefined}));
+  on('ui.open', () => ({value:{isPlaced:true}}));
+  mock.clock(on,{now:RUNNING_NOW});
+  on('fs.list', () => ({value:[{name:'job-failed',kind:'dir',size:0}]}));
+  on('fs.exists', (_$, e) => ({value:e.path==='/work/.agent-smith/jobs'||Object.hasOwn(files,e.path)}));
+  on('fs.read', (_$, e) => { const body=files[e.path]; return body===undefined?{deny:'ENOENT'}:{value:body}; });
+  await $.session.start({surface:'terminal',isInteractive:true,cwd:'/work'} as never);
+  await $.command.run({command:'forge',args:''});
+  const pane=await $.ui.mount(PANE_TARGET);
+  await pane.press({key:'job-job-failed'});
+  expect(await pane.find({key:'acknowledge'})).toBeDefined();
+  await pane.press({key:'acknowledge'});
+  expect(await pane.find({key:'acknowledge'})).toBeUndefined();
+  await pane.press({key:'back'});
+  expect(await pane.find({key:'job-job-failed'})).toBeUndefined();
+  await pane.press({key:'roster-history'});
+  expect(await pane.find({key:'job-job-failed'})).toBeDefined();
+  await pane.unmount();
+  const reopened=await $.ui.mount(PANE_TARGET);
+  expect(await reopened.find({key:'job-job-failed'})).toBeDefined();
+});
 test('pagination makes the tenth running job selectable', async ($, on) => {
   const ids=Array.from({length:10},(_,i)=>`job-${i}`);
   engine(on,{entries:ids.map(id=>({name:`${id}.spec.json`,kind:'file',size:10})), files:Object.fromEntries(ids.flatMap(id=>[[`${id}.spec.json`,REAL_SPEC],[`${id}.log`,REAL_LOG],[`${id}.progress.json`,REAL_PROGRESS]]))});
@@ -558,9 +620,14 @@ test('canonical jobs refresh acceptance in an open pane and survive Clear while 
   await pane.press({key:'job-job-native-1'});
   await pane.press({key:'tab-checks'});
   expect(await pane.find({type:'Text',text:'Acceptance: checks pending'})).toBeDefined();
-  files['acceptance.json']=JSON.stringify({state:'rejected',pending:false,checks:[{name:'tests',ok:false,outputTail:'Test failed'}]});
+  files['acceptance.json']=JSON.stringify({state:'rejected',pending:false,checks:[
+    {name:'tests',ok:false,outputTail:'',timedOut:true,signal:'SIGTERM',reason:'command timed out'},
+    {name:'typecheck',ok:false,outputTail:'',skipped:'missing-cwd',reason:'working directory does not exist'},
+  ]});
   await clock.advance(3000);
   expect(await pane.find({type:'Text',text:'Acceptance: rejected'})).toBeDefined();
+  expect(await pane.find({type:'Text',text:/command timed out/})).toBeDefined();
+  expect(await pane.find({type:'Text',text:/working directory does not exist/})).toBeDefined();
   expect(calls.some(call => call.tool==='TaskUpdate'&&String(call.input.subject).includes('[checks rejected]'))).toBe(true);
   await clock.advance(30_000);
   expect(calls.some(call => call.input.status==='deleted')).toBe(false);

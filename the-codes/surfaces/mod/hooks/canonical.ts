@@ -35,7 +35,12 @@ function acceptance(value: RecordValue | null): RadarAcceptance {
     checks: (Array.isArray(value.checks) ? value.checks : []).flatMap(c => {
       const check = record(c);
       return check && typeof check.name === 'string' ? [{ name: check.name, ok: check.ok === true,
-        outputTail: text(check.outputTail) ?? '' }] : [];
+        outputTail: text(check.outputTail) ?? '',
+        ...(typeof check.reason === 'string' && check.reason.trim() !== '' ? {reason:check.reason} : {}),
+        ...(typeof check.timedOut === 'boolean' ? {timedOut:check.timedOut} : {}),
+        ...(typeof check.signal === 'string' || check.signal === null ? {signal:check.signal as string|null} : {}),
+        ...(typeof check.skipped === 'string' ? {skipped:check.skipped} : {}),
+      }] : [];
     }) };
 }
 export function acceptanceLabel(value?: RadarAcceptance): string {
@@ -55,16 +60,18 @@ export async function readForgeJob(fs: FsLike, repo: string, id: string, now: nu
   const lastSeen = toEpoch(text(p?.lastEventAt, m.updatedAt));
   const warnings = (Array.isArray(p?.warnings) ? p.warnings : []).filter((w): w is string => typeof w === 'string')
     .map(message => ({ code: 'tool_error', message }));
-  if (live && await fs.exists(`${dir}/orphaned`)) {
+  if (live && await fs.exists(`${dir}/orphaned`) && !await fs.exists(`${dir}/result.json`)) {
     status = 'failed';
     // The supervisor is gone; its spawn-time placeholder cannot settle itself.
     a = { ...a, pending: false };
-    warnings.unshift({ code: 'tool_error', message: 'supervisor process exited before the job finished (orphaned)' });
+    warnings.unshift({ code: 'orphaned', message: 'supervisor process exited before the job finished (orphaned)' });
   } else if (live && (lastSeen === null || now - lastSeen > STALL_GRACE_MS)) status = 'attention';
   if (typeof m.error === 'string' && m.error !== '') warnings.unshift({ code: 'tool_error', message: m.error });
   const activities = Array.isArray(p?.recentActivities) ? p.recentActivities.map(record).filter(v => v !== null) : [];
   const recent = activities.reduce<RecordValue | null>((last, row) =>
     last === null || Number(row.stepIndex) >= Number(last.stepIndex) ? row : last, null);
+  const latestActivity = record(p?.lastActivity);
+  const latest = latestActivity && typeof latestActivity.tool === 'string' ? latestActivity : recent;
   const resolved = record(m.resolved);
   const latestSummary = text(p?.latestSummary, m.latestSummary);
   return {
@@ -72,12 +79,13 @@ export async function readForgeJob(fs: FsLike, repo: string, id: string, now: nu
     role: text(m.role, resolved?.role, p?.role, resolved?.mode, m.mode),
     provider: text(m.provider), model: text(m.modelResolved, m.model),
     lastEventAt: lastSeen, pipeline: text(m.pipeline), stage: text(m.stage), attempt: number(m.attempt),
-    status, startedAt: toEpoch(text(m.startedAt)), endedAt: toEpoch(text(m.finishedAt)) ?? (status === 'failed' && live ? lastSeen : null),
+    status, startedAt: toEpoch(text(m.startedAt, m.createdAt)), endedAt: toEpoch(text(m.finishedAt)) ?? (status === 'failed' && live ? lastSeen : null),
     toolCount: number(p?.toolCalls) ?? number(m.toolCalls),
-    activity: recent ? describeActivity(text(recent.tool) ?? '', text(recent.input) ?? '') : '',
+    activity: latest ? describeActivity(text(latest.tool) ?? '', text(latest.input) ?? '') : '',
     task: text(m.task) ?? '', latestSummary,
     summarySource: (p?.summarySource ?? m.summarySource) === 'worker' && latestSummary !== null ? 'worker' : null,
-    acceptance: a, warnings, report: null, reasoning: text(p?.latestText), raw: {},
+    acceptance: a, failureReason: text(m.failureReason, m.error, status === 'failed' ? warnings[0]?.message : null),
+    warnings, report: null, reasoning: text(p?.latestText), raw: {},
   };
 }
 export async function readForgeJobs(fs: FsLike, repo: string, now: number): Promise<RadarJob[]> {
