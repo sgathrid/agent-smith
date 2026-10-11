@@ -1,55 +1,38 @@
-/** Pure roster rules; shared by the bottom view and the optional inspector. */
-import type { RadarJob } from '../types/index.d.ts';
+/** Pure rules for the Forge sidebar: which workers it lists and how it labels them. */
+import type { RadarAcceptance, RadarJob } from '../types/index.d.ts';
 import { elapsedCell, isTerminal, jobLabel, oneLine } from './format.ts';
-import { acceptanceLabel } from './canonical.ts';
 
-export function scopedJobKey(repo: string, id: string): string {
-  return JSON.stringify([repo.replace(/\/+$/, ''), id]);
-}
-export function belongsToRepo(key: string, repo: string): boolean {
-  if (!key.startsWith('[')) return true; // legacy bare job ids have no repo to inspect
-  try {
-    const value: unknown = JSON.parse(key);
-    return Array.isArray(value) && value[0] === repo.replace(/\/+$/, '');
-  } catch {
-    return false;
-  }
-}
 /** A settled failure or rejection stops asking for attention this long after it ended. */
 export const ATTENTION_TTL_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Settled (terminal, checks not pending) work ages out of attention so a stale
- * failure cannot pin the pane without a keypress. Running, pending and stalled
- * (`attention`) jobs never expire. Without `now` or a timestamp nothing expires.
+ * failure stops being drawn as one. Running, pending and stalled (`attention`)
+ * jobs never expire. Without `now` or a timestamp nothing expires.
  */
 function expired(job: RadarJob, now?: number): boolean {
   if (now === undefined || !isTerminal(job.status) || job.acceptance?.pending) return false;
   const at = job.endedAt ?? job.startedAt;
   return at !== null && now - at > ATTENTION_TTL_MS;
 }
-export function needsAttention(job: RadarJob, acknowledged = false, now?: number): boolean {
-  return !acknowledged && !expired(job, now) && (job.status === 'attention' || job.status === 'failed' || job.acceptance?.state === 'rejected');
+export function needsAttention(job: RadarJob, now?: number): boolean {
+  return !expired(job, now) && (job.status === 'attention' || job.status === 'failed' || job.acceptance?.state === 'rejected');
 }
-export function activeJob(job: RadarJob, acknowledged = false, now?: number): boolean {
-  return !isTerminal(job.status) || job.acceptance?.pending === true || needsAttention(job, acknowledged, now);
+/** Still executing, or finished with checks still running. */
+export function isLive(job: RadarJob): boolean {
+  return !isTerminal(job.status) || job.acceptance?.pending === true;
 }
-export function rosterJobs(jobs: readonly RadarJob[], tab: 'active' | 'history', hidden: readonly string[], acknowledged: readonly string[] = [], repo = '', now?: number): RadarJob[] {
-  // Settled dismissals and acknowledgements only affect this repo. Live/checking work stays visible.
-  const attention = (job: RadarJob) => needsAttention(job, acknowledged.includes(scopedJobKey(repo, job.id)), now);
-  return jobs.filter(job => {
-    const key = scopedJobKey(repo, job.id);
-    const dismissed = hidden.includes(key) || hidden.includes(job.id); // bare ids are pre-scope persisted values
-    const live = !isTerminal(job.status) || job.acceptance?.pending;
-    if (tab === 'history') {
-      if (live || attention(job)) return false;
-      return !(dismissed && !needsAttention(job,false,now));
-    }
-    if (live) return true;
-    if (dismissed && !needsAttention(job,false,now)) return false;
-    return attention(job);
-  }).sort((a,b) => Number(attention(b)) - Number(attention(a)) ||
-      (b.startedAt ?? b.endedAt ?? 0) - (a.startedAt ?? a.endedAt ?? 0) || a.id.localeCompare(b.id));
+/** The sidebar list: one row per worker, running first, then settled work, most recent first. */
+export function forgeList(jobs: readonly RadarJob[]): RadarJob[] {
+  const workers = groupWorkers(jobs);
+  const ended = (job: RadarJob) => job.endedAt ?? job.startedAt ?? 0;
+  return [...workers.filter(isLive), ...workers.filter((job) => !isLive(job)).sort((a, b) => ended(b) - ended(a) || a.id.localeCompare(b.id))];
+}
+/** `/forge <query>`: an exact job id, else a worker name or id (any case), preferring live work. */
+export function findWorker(jobs: readonly RadarJob[], query: string): RadarJob | undefined {
+  const q = query.trim().toLowerCase();
+  return jobs.find((job) => job.id === query.trim()) ??
+    forgeList(jobs).find((job) => job.name?.trim().toLowerCase() === q || job.workerId?.toLowerCase() === q);
 }
 export function workerHeading(job: RadarJob): string {
   const role = job.role ?? job.provider;
@@ -64,8 +47,7 @@ export function workerStatus(job: RadarJob): string {
   if (job.acceptance?.state === 'rejected') return `${job.status} · checks rejected`;
   if (job.status === 'running') return job.activity ? `Running · ${job.activity}` : 'Running';
   if (job.status === 'attention') return 'Needs attention · no recent worker events';
-  const hasChecks = Boolean(job.acceptance?.pending || job.acceptance?.checks.length);
-  return `${job.status}${hasChecks && job.acceptance ? ` · ${acceptanceLabel(job.acceptance)}` : ''}`;
+  return job.status;
 }
 function failureCode(reason?: string | null): string | null {
   if (!reason) return null;
@@ -74,12 +56,14 @@ function failureCode(reason?: string | null): string | null {
   if (/denied|denial/i.test(reason)) return 'denied';
   return /^[a-z][a-z0-9_-]{0,31}$/i.test(reason.trim()) ? reason.trim().toLowerCase() : 'error';
 }
-export function rosterSummary(jobs: readonly RadarJob[], acknowledged: readonly string[] = [], repo = '', now?: number): string {
-  const live = jobs.filter(j => !isTerminal(j.status)).length;
-  const checking = jobs.filter(j => isTerminal(j.status) && j.acceptance?.pending).length;
-  const attention = groupWorkers(rosterJobs(jobs,'active',[],acknowledged,repo,now),now)
-    .filter(job => needsAttention(job,acknowledged.includes(scopedJobKey(repo,job.id)),now)).length;
-  return `Forge · ${live} active${checking ? ` · ${checking} checking` : ''}${attention ? ` · ${attention} need attention` : ''}`;
+/** `checks ✓ 2/2`, `✗ lint, tests`, `checks pending`, or '' when no checks ran. */
+export function checksLabel(acceptance?: RadarAcceptance): string {
+  if (!acceptance) return '';
+  if (acceptance.pending) return 'checks pending';
+  const failed = acceptance.checks.filter((check) => !check.ok);
+  if (failed.length > 0) return `✗ ${failed.map((check) => check.name).join(', ')}`;
+  if (acceptance.checks.length > 0) return `checks ✓ ${acceptance.checks.length}/${acceptance.checks.length}`;
+  return acceptance.state === 'rejected' ? 'checks rejected' : '';
 }
 export function statusLine(job: RadarJob, now: number, width: number): string {
   const elapsed = elapsedCell(job.startedAt === null ? 0 : (job.endedAt ?? now) - job.startedAt);
@@ -88,16 +72,16 @@ export function statusLine(job: RadarJob, now: number, width: number): string {
 }
 
 /** Group only recorded worker identities. The job id fallback never joins strangers. */
-export function groupWorkers(jobs: readonly RadarJob[], now?: number): RadarJob[] {
+export function groupWorkers(jobs: readonly RadarJob[]): RadarJob[] {
   const groups = new Map<string,RadarJob>();
   for (const job of jobs) {
     const key = job.workerId ?? job.id;
     const old = groups.get(key);
-    const live = !isTerminal(job.status) || job.acceptance?.pending;
-    const oldLive = old && (!isTerminal(old.status) || old.acceptance?.pending);
-    if (!old || (live && !oldLive) || (Boolean(live)===Boolean(oldLive) &&
+    const live = isLive(job);
+    const oldLive = old !== undefined && isLive(old);
+    if (!old || (live && !oldLive) || (live===oldLive &&
       (job.startedAt??job.endedAt??0)>(old.startedAt??old.endedAt??0))) groups.set(key,job);
   }
-  return [...groups.values()].sort((a,b) => Number(needsAttention(b,false,now))-Number(needsAttention(a,false,now)) ||
+  return [...groups.values()].sort((a,b) =>
     (b.startedAt??b.endedAt??0)-(a.startedAt??a.endedAt??0) || a.id.localeCompare(b.id));
 }

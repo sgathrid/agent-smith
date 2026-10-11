@@ -1,8 +1,9 @@
 # agent-smith — the band
 
 A Claude Code mod that draws **one live line per running agy / Codex / OpenCode
-job** in the `AbovePrompt` band. `/forge` expands the roster and worker detail
-above the prompt; `/forge pane` requests the optional inspector.
+job** in the `AbovePrompt` band. Each line has a digit: pressing it in an empty
+prompt opens the focused sidebar on that worker's live view. `/forge` opens the
+sidebar on the worker list; `/forge <name or job id>` opens one worker.
 
 ```
  ● implement-musm82da-f1dc1fe4 cargo test --workspace · 341 tools ·     12m04s
@@ -120,47 +121,44 @@ previews, 200 assistant messages / 64,000 characters, 64,000 prompt characters
 and 4,000 preamble characters. Truncation is explicit. Older jobs without a view
 show a warning, summary and report; the UI does not backfill by scanning logs.
 
-`/forge` opens during a turn and expands in the bottom band, whose height and
-scroll window the host controls. It preserves the host's band content and yields
-while a survey is displayed. It never opens a sidebar automatically.
+The band is only the glance: live workers plus finished ones for the linger
+window, at most four rows. Each row is a plain Button with hotkey `1`–`4`. The
+host answers a bare digit in an empty prompt by pressing a band Button without
+focusing the band, so one key opens the sidebar on that worker. `/forge` opens
+the sidebar on the list and `/forge <name or job id>` on one worker; an unknown
+name shows a toast and the list. `/forge pane` is the list too. Each of these
+asks `ui.open` for focus, which the host grants only over an empty prompt.
+
+The list shows running and checking workers first, then a "Recent" section of
+settled ones, most recent first. A failure from the last 24 hours is drawn red
+with its failure label; after that it is drawn dim like other finished work.
+
+The worker view is one scroll: a header (status, name, provider·model, elapsed
+or duration, checks), the task as one line, the live transcript of assistant
+text and tool rows, then the result and the output of failing checks once the
+worker has finished. It keeps its end in view as output arrives. Scrolling up
+pauses that; scrolling back to the bottom resumes it.
 
 | Control | Action |
 |---|---|
-| Ctrl+X then Tab | Focus the band or inspector; the pane shows this hint beside its controls |
-| `a` / `h` in roster | Active / History |
-| `1`–`9` | Open a visible worker |
-| `n` / `p` in roster | Next / previous page |
-| `a` / `t` / `r` / `k` in detail | Activity / Task / Result / Checks |
-| `b` | Back to the roster |
-| `y` in a settled failed or rejected job | Acknowledge it and move it to History |
-| `f` in Activity | Toggle following; manual scrolling pauses it |
-| `p` in Task | Show or hide the prompt preamble |
-| `c` / `u` in roster | Acknowledge settled attention items and dismiss other settled rows / restore them |
-| `e` | Open the larger inspector |
-| `x` | Collapse the bottom view or close the inspector |
-| Escape | Return keyboard focus to the prompt |
+| `1`–`4` in an empty prompt | Open the sidebar on that band row's worker |
+| `1`–`9` in the list | Open a worker; Tab and Enter work too |
+| `n` / `p` in the list | Next / previous page, shown only past nine workers |
+| `t` in a worker | Expand the task to the prompt as sent, preamble included |
+| Enter on a tool row | Show its input and output |
+| `b` | Back to the list |
+| `x` | Close the sidebar |
+| Escape | Return keyboard focus to the prompt (host behaviour) |
 
-The inspector uses the same views. The host chooses its placement: docked on a
-wide fullscreen terminal, otherwise inline. Arrow keys, page keys and the wheel
-use the host's scrolling behavior; the mod does not bind those keys itself.
-
-Acknowledged failures leave Active and remain visible in History. Their
-acknowledgement is stored by repository and job ID in host plugin state, so a
-reload does not reopen the same attention item. Running jobs and pending checks
-stay visible. Restore dismissed resets the acknowledgements as well as settled
-row dismissals. The engine test harness presses rendered component keys; it does
-not inject physical hotkeys. Verify shortcuts in the host by opening `/forge`,
-pressing Ctrl+X then Tab, pressing `h` and `a` to switch roster tabs, and Escape
-to return focus to the prompt.
+Escape cannot also mean "back": the host never delivers it to a mod, it returns
+the focus. The engine test harness presses rendered component keys; it does not
+inject physical hotkeys, so verify the digits in a real session.
 
 New writer snapshots add an ordered `timeline` alongside the older fields, with
 up to 100 activity rows, 60 tools and 64,000 assistant characters. Tool completion
 updates its original row. Missing timelines show an explicit old-snapshot fallback.
-Activity defaults for live/checking jobs; Result defaults for settled jobs. Checks
-show execution-independent acceptance and expandable results. Errors expand by
-default. Recorded worker IDs group invocations; Task links to earlier runs.
-Detail reads are cached for the three-second data cadence. Selection persists
-through completion, and scrolling the output pauses automatic following.
+Recorded worker IDs group invocations into one list row; the worker view links to
+earlier runs. Detail reads are cached for the three-second data cadence.
 
 Native tasks use real host TaskCreate/TaskUpdate IDs. They are a task projection,
 not Claude Agent/subagent sessions. Pending acceptance keeps them in progress.

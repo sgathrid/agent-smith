@@ -137,7 +137,6 @@ export interface RadarJob {
 export type ActivityEvent =
   | { sequence: number; kind: 'assistant'; at: string; text: string }
   | { sequence: number; kind: 'tool'; at: string; stepIndex: number; tool: string; input: string; output: string; state: string };
-export type DetailTab = 'activity' | 'task' | 'result' | 'checks';
 
 export interface RadarAcceptance {
   readonly state: 'accepted' | 'rejected' | 'unchecked';
@@ -175,27 +174,17 @@ declare module 'claude-code' {
    */
   interface PluginState {
     'agent-smith': {
-      /** Job id the user has opened in the detail pane, or null for the list. */
+      /** Job id open in the sidebar's worker view, or null for the list. */
       selected: string | null;
-      /** Scratch: 'list' | 'detail'. Redundant with `selected`, kept for clarity. */
-      view: 'list' | 'detail';
       /** Clock the pane subscribes to so elapsed cells tick. The BAND writes it. */
       now: number;
-      /** Repo/job keys dismissed with `c`; filtered on read, never deleted. */
-      cleared: string[];
-      /** Repo and job keys acknowledged in the attention inbox; persisted across reloads. */
-      acknowledged: string[];
-      /** Follow mode (`f`): bounded live tail in the detail view. Resets on `/forge`. */
+      /** The worker view keeps its end in view; a person scrolling up pauses it. */
       follow: boolean;
-      /** `p`: show the prompt as sent, with the mode preamble. Resets on `/forge`. */
-      showPreamble: boolean;
+      /** The worker view's task line is expanded to the prompt as sent. */
+      taskOpen: boolean;
       listPage: number;
       paneOpen: boolean;
-      expanded: boolean;
-      rosterTab: 'active' | 'history';
-      detailTab: DetailTab;
       expandedTools: string[];
-      expandedChecks: number[];
       readError: string | null;
       /**
        * The band's own snapshot of the jobs directory, from the 3 s poll.

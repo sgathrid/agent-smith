@@ -1,18 +1,17 @@
-/** Forge's bottom roster and optional inspector share canonical state and views. */
+/** The band above the prompt and the /forge sidebar share canonical state and views. */
 import { atom, read, update } from 'claude-code';
-import type { EngineInterface, Register, UiComponents, UiRenderEvent } from 'claude-code';
+import type { EngineInterface, Register, UiRenderEvent } from 'claude-code';
 
-import type { RadarJob, DetailTab } from '../types/index.d.ts';
+import type { RadarJob } from '../types/index.d.ts';
 import { countSummary, formatHeaderLine, isTerminal } from './format.ts';
-import { belongsToRepo, needsAttention, scopedJobKey } from './dashboard.ts';
-import { renderRoster, renderWorker, type ViewActions, type ViewOptions } from './views.tsx';
+import { findWorker } from './dashboard.ts';
+import { renderList, renderWorker, type ViewActions, type ViewOptions } from './views.tsx';
 import type { ForgeDetail } from './canonical.ts';
 // ── BAND IMPORTS (band author) ────────────────────────────────────────────────
 // § PANE reads through this module too, and for the same reason the band does: it
 // is the mod's only reader, it takes an FsLike, and it is handed `$.fs`. See the
 // merge note at the top of this file.
 import {
-  BAND_ROWS,
   buildLine,
   isShown,
   noColor,
@@ -92,37 +91,17 @@ const selected = atom({ plugin: 'agent-smith', key: 'selected' } as const, null 
 const now = atom({ plugin: 'agent-smith', key: 'now' } as const, 0);
 
 /**
- * Job ids the user has dismissed with `c`.
- *
- * WHY THIS IS AN ATOM AND NOT A FILTER ON THE READ: the pane is a READ-ONLY
- * projection (docs/ARCHITECTURE.md) and agy-staff owns `.agy-staff/jobs/`. Deleting
- * or hiding files there would be destroying another process's state to satisfy a UI
- * preference. So `c` records the dismissal locally and the list filters against it.
- *
- * Kept as a list rather than a Set because it round-trips through JSON in host
- * state, and an array survives that where a Set does not.
- */
-const cleared = atom({ plugin: 'agent-smith', key: 'cleared' } as const, [] as string[]);
-/** Settled attention items the user acknowledged; failures remain in History. */
-const acknowledged = atom({ plugin: 'agent-smith', key: 'acknowledged' } as const, [] as string[]);
-/**
- * Follow mode (`f`). On, the detail view is a bounded live tail: the newest few
- * transcript chunks and tool rows, and a collapsed prompt, so the pane keeps the
- * latest activity in view without needing a scroll position. Off, it shows
- * the available snapshot. This mode bounds rendered content; it does not yet
- * drive the host scrolling API.
+ * Whether the worker view keeps its end in view. A person scrolling up pauses
+ * it; scrolling back to the bottom resumes it.
  */
 const follow = atom({ plugin: 'agent-smith', key: 'follow' } as const, true as boolean);
-/** `p`: show the mode preamble Agent Smith prepended to the prompt the worker received. */
-const showPreamble = atom({ plugin: 'agent-smith', key: 'showPreamble' } as const, false as boolean);
+/** The task line is expanded: the prompt as sent, preamble included. */
+const taskOpen = atom({ plugin: 'agent-smith', key: 'taskOpen' } as const, false as boolean);
 const listPage = atom({ plugin: 'agent-smith', key: 'listPage' } as const, 0);
 const paneOpen = atom({ plugin: 'agent-smith', key: 'paneOpen' } as const, false);
 const readError = atom({ plugin: 'agent-smith', key: 'readError' } as const, null as string | null);
-const expanded = atom({ plugin: 'agent-smith', key: 'expanded' } as const, false);
-const rosterTab = atom({ plugin: 'agent-smith', key: 'rosterTab' } as const, 'active' as 'active' | 'history');
-const detailTab = atom({ plugin: 'agent-smith', key: 'detailTab' } as const, 'activity' as DetailTab);
 const expandedTools = atom({ plugin: 'agent-smith', key: 'expandedTools' } as const, [] as string[]);
-const expandedChecks = atom({ plugin: 'agent-smith', key: 'expandedChecks' } as const, [] as number[]);
+/** The worker the host was last asked to keep at its end; null re-anchors on the next draw. */
 let followingSite: string | null = null;
 const nativeTaskLinks = atom(
   { plugin: 'agent-smith', key: 'nativeTaskLinks' } as const,
@@ -204,30 +183,9 @@ async function pollBand($: EngineInterface): Promise<void> {
   // `ui.invalidate` is rate-limited by the engine for good cause.
   const before = JSON.stringify(previous);
   if (before !== JSON.stringify(next)) await update($, bandJobs, () => next);
-  // `fresh` is a successful read (failures returned above), so a key whose job is
-  // gone is stale. Other repos' keys belong to other sessions and are never touched.
-  const liveKeys = new Set(fresh.flatMap((job) => [scopedJobKey(cfg.repo, job.id), job.id]));
-  const isStale = (key: string) => belongsToRepo(key, cfg.repo) && !liveKeys.has(key);
-  if ((await read($, cleared)).some(isStale)) await update($, cleared, (keys) => keys.filter((key) => !isStale(key)));
-  if ((await read($, acknowledged)).some(isStale)) await update($, acknowledged, (keys) => keys.filter((key) => !isStale(key)));
   if (!cfg.legacy) await pollNativeTasks($, cfg.repo, next);
 }
 
-/**
- * What `registerBand` hands back: a continuation to run INSIDE the pane's own
- * `session.start` handler.
- *
- * WHY IT IS NOT A SECOND `on('session.start')`
- * ────────────────────────────────────────────
- * VERIFIED against the loader: registering the same matcher-less event twice is
- * refused outright —
- *   `on("session.start") is registered twice without a matcher; the first is at
- *    …/register.tsx:57`
- * So two `on(...)` calls cannot coexist in one module, whoever owns them. The
- * band therefore returns its session-start work as a function and the pane
- * `await`s it as the first thing in the handler it already has. One extra line
- * in § PANE, and the band keeps every other registration to itself.
- */
 /**
  * The band's half of session start. Await this INSIDE the pane's own
  * `session.start` handler, after its `await next(e)`.
@@ -300,7 +258,7 @@ export async function startBand($: EngineInterface, cwd?: string): Promise<void>
       const previousTime = await read($, now);
       const visible = (await read($, bandJobs)).some(j => isShown(j, previousTime));
       // Draw once across the expiry boundary before becoming idle.
-      if (visible || await read($, paneOpen) || await read($, expanded)) await update($, now, () => at);
+      if (visible || await read($, paneOpen)) await update($, now, () => at);
     })().catch(() => {});
   });
 
@@ -346,9 +304,8 @@ async function pollNativeTasks($: EngineInterface, repo: string, snapshot?: read
 /**
  * Register the band. Called from the pane's `register`.
  *
- * The band deliberately registers NO `command.run` handler and opens NO pane:
- * `/forge` belongs to the pane half, and two handlers for one command is a
- * coin toss over which one the engine picks.
+ * The band registers NO `command.run` handler: `/forge` belongs to the pane
+ * half. Its rows' digit hotkeys open the pane through `openForge`.
  */
 export function registerBand(on: Parameters<Register>[0]): void {
   // A Bash call that looks like a dispatch: refresh NOW, not in up to 3 s.
@@ -382,10 +339,6 @@ export function registerBand(on: Parameters<Register>[0]): void {
     // question being asked, and the band would push it off screen.
     if (e.props.hasSurvey) return rest;
 
-    if (await read($, expanded)) {
-      const { Box } = $.ui.resolve(e);
-      return <Box flexDirection="column">{await renderForge($, e, true)}{rest}</Box>;
-    }
     const error = await read($, readError);
     if (error) {
       const { Box, Text } = $.ui.resolve(e);
@@ -403,15 +356,20 @@ export function registerBand(on: Parameters<Register>[0]): void {
     // #1 in a way the rule does not otherwise mention.
     const budget = rowBudget(shown, Math.max(1, (e.props.maxRows ?? 10) - 1));
     const { Box, Text, Button } = $.ui.resolve(e);
+    // A plain Button draws `1: ` before its children, so the row is sized to the rest.
+    const width = Math.max(1, e.props.bodyColumns - 3);
 
     return (
       <Box flexDirection="column">
-        {budget.rows.map((job) => {
-          const line = buildLine(job, at, { colour: cfg.colour });
+        {budget.rows.map((job, i) => {
+          const line = buildLine(job, at, { colour: cfg.colour, width });
           const detail = job.acceptance?.pending && isTerminal(job.status) ? 'checks pending' :
             job.acceptance?.state === 'rejected' ? 'checks rejected' : line.detail;
+          // A bare digit in an empty prompt presses a band Button without focusing
+          // the band, so one key opens the sidebar on this worker.
           return (
-            <Text key={job.id} dimColor={line.recessive} wrap="truncate-end">
+            <Button key={`band-${job.id}`} plain hotkey={String(i + 1)} label={line.plain.trim()} onPress={() => openForge($, job.id)}>
+            <Text dimColor={line.recessive} wrap="truncate-end">
               {/* Segment 1: the GLYPH ALONE, in the accent and bold while live.
                   `accent` is undefined under NO_COLOR and for canceled/unknown,
                   and `color={undefined}` draws in the terminal's default — the
@@ -435,6 +393,7 @@ export function registerBand(on: Parameters<Register>[0]): void {
                 {` ${detail} ${line.clock}`.replace(/\s+$/, '')}
               </Text>
             </Text>
+            </Button>
           );
         })}
         {budget.hidden > 0 && (
@@ -444,10 +403,6 @@ export function registerBand(on: Parameters<Register>[0]): void {
             {overflowLine(budget.hidden)}
           </Text>
         )}
-        <Button key="forge-expand" plain label="Forge · expand workers" hotkey="w" onPress={async () => {
-          await update($, expanded, () => true);
-          await update($, selected, () => null);
-        }} />
         {rest}
       </Box>
     );
@@ -485,13 +440,12 @@ export const register: Register = (on) => {
     // Band first, and it never throws: a slow or failing band config must not
     // delay `/forge` appearing or take the session's start with it.
     await startBand($, typeof e.cwd === 'string' ? e.cwd : undefined);
-    const cfg = await read($, bandConfig);
 
     await $.command
       .register({
         name: 'forge',
         immediate: true,
-        description: 'Browse worker jobs: tool history, warnings, and the final report',
+        description: 'Show workers; /forge <name> opens one worker\'s live view and result',
       })
       .catch(() => {});
     return rest;
@@ -505,31 +459,24 @@ export const register: Register = (on) => {
   // name. A matcher that matches nothing is a pane nobody can open, and it fails
   // SILENTLY, so the two strings are deliberately the same string.
   on('command.run', { command: 'forge' }, async ($, e) => {
-    await update($, selected, () => null);
-    await update($, listPage, () => 0);
-    await update($, rosterTab, () => 'active');
-    await update($, follow, () => true);
-    await update($, showPreamble, () => false);
-    followingSite = null;
-    if (typeof e.args === 'string' && e.args.trim() === 'pane') {
-      await update($, expanded, () => false);
-      await update($, paneOpen, () => true);
-      await requestPane($, true);
-    } else {
-      if (await read($, paneOpen)) await $.ui.close({ id: PANE });
-      await update($, paneOpen, () => false);
-      await update($, expanded, () => true);
-    }
     await pollBand($);
-    return { text: formatHeaderLine(countSummary(await read($, bandJobs))) };
+    const jobs = await read($, bandJobs);
+    // `/forge pane` is the list, kept because people have typed it.
+    const query = typeof e.args === 'string' && e.args.trim() !== 'pane' ? e.args.trim() : '';
+    const job = query === '' ? undefined : findWorker(jobs, query);
+    if (query !== '' && job === undefined) await $.ui.toast(`No worker matches "${query}"; showing all workers`);
+    await openForge($, job?.id ?? null);
+    return { text: formatHeaderLine(countSummary(jobs)) };
   });
 
+  // Scrolling up pauses following; scrolling back to the end resumes it.
   on('ui.scroll', async ($, e, next) => {
-    const ours = (e.component === 'Pane' && e.requestId === PANE) ||
-      (e.component === 'AbovePrompt' && await read($, expanded));
-    if (ours && e.origin.kind === 'person' && await read($, selected) !== null && await read($, detailTab) === 'activity') {
-      followingSite = null;
-      await update($, follow, () => false);
+    if (e.component === 'Pane' && e.requestId === PANE && e.origin.kind === 'person' && await read($, selected) !== null) {
+      const atEnd = e.offset >= e.contentRows - e.bodyRows;
+      if (atEnd !== await read($, follow)) {
+        followingSite = null;
+        await update($, follow, () => atEnd);
+      }
     }
     return next(e);
   });
@@ -542,9 +489,32 @@ export const register: Register = (on) => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     noteViewport(e.viewport?.columns);
     if (lastPaneRequest !== null && lastPaneRequest !== paneWidthRequest(lastViewportColumns)) await requestPane($).catch(() => {});
-    return renderForge($, e, false);
+    return renderForge($, e);
   });
 };
+
+/** Show one worker (or the list, for null) in the sidebar, following its end. */
+async function show($: EngineInterface, id: string | null): Promise<void> {
+  await update($, selected, () => id);
+  await update($, follow, () => true);
+  await update($, taskOpen, () => false);
+  await update($, expandedTools, () => []);
+  followingSite = null;
+  await $.ui.scroll({ to: 'start', in: PANE }).catch(() => {});
+}
+
+/** Open the sidebar focused, on one worker or on the list. */
+async function openForge($: EngineInterface, id: string | null): Promise<void> {
+  await show($, id);
+  if (id === null) await update($, listPage, () => 0);
+  await update($, paneOpen, () => true);
+  await requestPane($, true);
+}
+
+async function scrollEnd($: EngineInterface): Promise<void> {
+  const result = await $.ui.scroll({ to: 'end', in: PANE });
+  if (result.deny) throw new Error(result.deny);
+}
 
 // Clock and control redraws reuse the bounded detail until the next data cadence.
 let detailCache: { key: string; at: number; detail: ForgeDetail | null } | null = null;
@@ -561,107 +531,46 @@ async function loadDetail($: EngineInterface, repo: string, legacy: boolean, id:
   return detail;
 }
 
-async function renderForge($: EngineInterface, e: UiRenderEvent, bottom: boolean): Promise<JSX.Element> {
+async function renderForge($: EngineInterface, e: UiRenderEvent): Promise<JSX.Element> {
   const W = $.ui.resolve(e);
   const { Box, Text } = W;
   const cfg = await read($, bandConfig);
   const t = await read($, now);
   const jobs = await read($, bandJobs);
-  const hidden = await read($, cleared);
-  const acknowledgedIds = await read($, acknowledged);
   const pick = await read($, selected);
   const error = await read($, readError);
   const o: ViewOptions = {
-    width: e.props.bodyColumns, rows: bottom ? e.props.maxRows ?? 10 : e.props.scroll?.bodyRows ?? 30,
-    now: t, colour: cfg.colour, bottom, rosterTab: await read($, rosterTab), page: await read($, listPage),
-    repo: cfg.repo, acknowledged: acknowledgedIds,
-    tab: await read($, detailTab), following: await read($, follow), preamble: await read($, showPreamble),
-    tools: await read($, expandedTools), checks: await read($, expandedChecks),
-  };
-  const scrollEnd = async (): Promise<void> => {
-    const result = await $.ui.scroll(e.requestId ? { to: 'end', in: e.requestId } : { to: {key:'forge-stream-end'}, block:'end' });
-    if (result.deny) throw new Error(result.deny);
-  };
-  const resetExpansions = async () => {
-    await update($, expandedTools, () => []);
-    await update($, expandedChecks, () => []);
+    width: e.props.bodyColumns, now: t, colour: cfg.colour, page: await read($, listPage),
+    following: await read($, follow), taskOpen: await read($, taskOpen), tools: await read($, expandedTools),
   };
   const a: ViewActions = {
-    pick: async job => {
-      await update($, selected, () => job.id);
-      await update($, detailTab, () => isTerminal(job.status) && !job.acceptance?.pending ? 'result' : 'activity');
-      await update($, follow, () => !isTerminal(job.status) || job.acceptance?.pending === true);
-      await resetExpansions(); followingSite = null;
-      // Starting at the top removes the previous worker's scroll anchor.
-      await $.ui.scroll({ to: 'start', in: e.requestId ?? PANE }).catch(() => {});
-    },
-    roster: async tab => { await update($, rosterTab, () => tab); await update($, listPage, () => 0); },
-    page: async page => { await update($, listPage, () => page); },
-    tab: async tab => {
-      await update($, detailTab, () => tab); followingSite = null;
-      await $.ui.scroll({ to: 'start', in: e.requestId ?? PANE }).catch(() => {});
-    },
-    back: async () => { await update($, selected, () => null); followingSite = null; await $.ui.scroll({ to:'start',in:e.requestId??PANE }).catch(() => {}); },
-    follow: async () => {
-      const enable = !await read($, follow);
-      await update($, follow, () => enable); followingSite = null;
-      if (enable) await scrollEnd().catch(() => {});
-    },
-    preamble: async () => { await update($, showPreamble, value => !value); },
-    tool: async key => { await update($, expandedTools, keys => keys.includes(key)?keys.filter(k=>k!==key):[...keys,key]); },
-    check: async index => { await update($, expandedChecks, ids => ids.includes(index)?ids.filter(i=>i!==index):[...ids,index]); },
-    clear: async () => {
-      const settled = jobs.filter(j=>isTerminal(j.status)&&!j.acceptance?.pending);
-      const ackKeys = settled.filter(j=>needsAttention(j,false,t)).map(j=>scopedJobKey(cfg.repo,j.id));
-      const hideKeys = settled.filter(j=>!needsAttention(j,false,t)).map(j=>scopedJobKey(cfg.repo,j.id));
-      await update($, acknowledged, ids => [...new Set([...ids,...ackKeys])]);
-      await update($, cleared, ids => [...new Set([...ids,...hideKeys])]);
-    },
-    acknowledge: async () => {
-      const job = jobs.find(item => item.id === pick);
-      if (!job || !isTerminal(job.status) || job.acceptance?.pending || !needsAttention(job,false,t)) return;
-      const key = scopedJobKey(cfg.repo,job.id);
-      await update($, acknowledged, ids => ids.includes(key) ? ids : [...ids,key]);
-    },
-    restore: async () => {
-      await update($, cleared, ids => ids.filter(id=>!belongsToRepo(id,cfg.repo)));
-      await update($, acknowledged, ids => ids.filter(id=>!belongsToRepo(id,cfg.repo)));
-    },
-    inspector: async () => {
-      await update($, expanded, () => false); await update($, paneOpen, () => true);
-      followingSite = null; await requestPane($,true);
-    },
-    close: async () => {
-      followingSite = null;
-      if (bottom) await update($, expanded, () => false);
-      else { await update($, paneOpen, () => false); await $.ui.close({id:PANE}); }
-    },
+    pick: (job) => show($, job.id),
+    page: async (page) => { await update($, listPage, () => page); },
+    back: () => show($, null),
+    task: async () => { await update($, taskOpen, (open) => !open); },
+    tool: async (key) => { await update($, expandedTools, (keys) => keys.includes(key) ? keys.filter((k) => k !== key) : [...keys, key]); },
+    close: async () => { await update($, paneOpen, () => false); await $.ui.close({ id: PANE }); },
   };
-  let content: JSX.Element;
+  let content = renderList(W, jobs, o, a);
   if (pick !== null) {
-    let detail: ForgeDetail | null;
     try {
-      detail = await loadDetail($,cfg.repo,cfg.legacy,pick,t);
-    } catch (failure) {
-      return <Box flexDirection="column"><Text wrap="wrap">{`Unable to read job detail: ${String(failure).slice(0,200)}`}</Text>{renderRoster(W,jobs,hidden,o,a)}</Box>;
-    }
-    if (detail) {
-      content = renderWorker(W,detail,o,a, jobs.filter(job => job.id!==pick && job.workerId!=null && job.workerId===detail.job.workerId));
-      const target = `${bottom?'bottom':'pane'}:${pick}:${o.tab}`;
-      if (o.following && o.tab==='activity' && followingSite !== target) {
-        // Host end anchors keep following a growing tree until a user scrolls.
-        try { await scrollEnd(); followingSite = target; }
-        catch (error) {
-          // The testkit has no painted scroll surface. A live refusal is retried
-          // after the new tree is installed, rather than treated as success.
-          if (String(error).includes('no implementation for ui.scroll')) followingSite = target;
+      const detail = await loadDetail($, cfg.repo, cfg.legacy, pick, t);
+      if (detail) {
+        content = renderWorker(W, detail, o, a, jobs.filter((job) => job.id !== pick && job.workerId != null && job.workerId === detail.job.workerId));
+        if (o.following && followingSite !== pick) {
+          // Host end anchors keep following a growing tree until a person scrolls.
+          try { await scrollEnd($); followingSite = pick; }
+          catch (failure) {
+            // The testkit has no painted scroll surface. A live refusal is retried
+            // after the new tree is installed, rather than treated as success.
+            if (String(failure).includes('no implementation for ui.scroll')) followingSite = pick;
+          }
         }
       }
-    } else {
-      await update($, selected, () => null);
-      content = renderRoster(W,jobs,hidden,o,a);
+    } catch (failure) {
+      content = <Box flexDirection="column"><Text wrap="wrap">{`Unable to read job detail: ${String(failure).slice(0, 200)}`}</Text>{content}</Box>;
     }
-  } else content = renderRoster(W,jobs,hidden,o,a);
+  }
   return error ? <Box flexDirection="column"><Text wrap="wrap">{error}</Text>{content}</Box> : content;
 }
 

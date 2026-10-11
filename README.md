@@ -141,11 +141,11 @@ own git worktree.
 
 ## Watching the work
 
-`/forge` opens a panel above the prompt listing live and recent workers. Choose
-one to see its activity, its original task, its result and its checks, updated
-as it runs. Failures stay on the Active list until you acknowledge them or a
-day passes, then move to History. The panel's keys work once it has focus: press Ctrl+X, then Tab.
-Escape returns you to the prompt. The full list of keys is in the
+Running workers appear as numbered rows above the prompt. With the prompt
+empty, press a row's digit to open a sidebar on that worker: its task, its
+live output as it arrives, and then its result and any failing checks.
+`/forge` opens the same sidebar on the list of running and recent workers, and
+`/forge Ada` opens the worker named Ada directly. The keys are in the
 [pane's README](the-codes/surfaces/mod/README.md).
 
 Everything the panel shows is read from plain files in `.agent-smith/jobs/` in

@@ -144,7 +144,7 @@ declare module 'claude-code' {
     scroll(opts: { to: 'start' | 'end' | { key: string }; in?: string; block?: 'start' | 'end' | 'nearest' }): Promise<{ deny?: string }>;
     /** Resolve the render components for this render site. */
     resolve(e: UiRenderEvent): UiComponents;
-    toast(text: string): void;
+    toast(text: string): Promise<unknown>;
   }
 
   export interface CommandApi {
@@ -375,6 +375,8 @@ declare module 'claude-code' {
     plain?: boolean;
     dimColor?: boolean;
     onPress: () => void | Promise<void>;
+    /** Strings and `Text` drawn in the label's place; the label then names the control. */
+    children?: unknown;
   }
 
   export interface BoxProps {

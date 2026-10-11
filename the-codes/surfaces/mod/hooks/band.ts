@@ -41,6 +41,7 @@ import {
   elapsedCell,
   formatJobRow,
   isTerminal,
+  paneColumns,
   pickColor,
   pickGlyph,
   type RowOptions,
@@ -153,14 +154,16 @@ export type BandLine = import('./format.ts').JobRow;
  * exactly a boundary question.
  *
  * `colour: false` drops the accent and nothing else — bold stays, because bold
- * is a contrast affordance rather than a colour.
+ * is a contrast affordance rather than a colour. `width`, the columns the host
+ * gives the row, fits the cells to it; without one the fixed band budget holds.
  */
 export function buildLine(
   job: RadarJob,
   now: number,
-  options: { readonly colour?: boolean } = {},
+  options: { readonly colour?: boolean; readonly width?: number } = {},
 ): BandLine {
-  const row = formatJobRow(job, { now, ...bandColumns() } satisfies RowOptions);
+  const columns = options.width === undefined ? bandColumns() : { ...paneColumns(options.width), tools: false };
+  const row = formatJobRow(job, { now, ...columns } satisfies RowOptions);
   const colour = options.colour !== false;
   return {
     ...row,
