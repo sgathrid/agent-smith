@@ -265,6 +265,16 @@ test('pipeline_status: concise drops observations and repeats; detailed is the r
   assert.deepEqual(body(await callTool(ctx, 'pipeline_status', { runId: 'r1', response_format: 'detailed' })), record);
 });
 
+test('pipeline_status: concise shows a running stage by job and start, and an unwritten artifact as a warning', async () => {
+  const ctx = withService({});
+  writePipelineRecord(ctx.service.repo, 'r2', { runId: 'r2', pipeline: 'p', status: 'running', startedAt: 1_000, finishedAt: null, stageResults: {
+    implement: { stage: 'implement', jobId: 'j1', provider: 'agy', status: 'running', startedAt: 1_000, finishedAt: 1_000, durationMs: 0 },
+    review: { stage: 'review', provider: 'codex', status: 'failed', startedAt: 1_000, finishedAt: 2_000, durationMs: 1_000, artifacts: [], warnings: ['review/result.md not found on disk; the stage wrote no artifact'] } } });
+  const b = body(await callTool(ctx, 'pipeline_status', { runId: 'r2' }));
+  assert.deepEqual(b.stageResults.implement, { status: 'running', startedAt: 1_000, provider: 'agy', jobId: 'j1' });
+  assert.deepEqual(b.stageResults.review.warnings, ['review/result.md not found on disk; the stage wrote no artifact']);
+});
+
 function gitRepo(): { cwd: string; head: string } {
   const cwd = mkdtempSync(path.join(tmpdir(), 'smith-diff-'));
   const g = (...a: string[]) => execFileSync('git', a, { cwd, encoding: 'utf8' }).trim();

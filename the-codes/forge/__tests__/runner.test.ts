@@ -29,6 +29,8 @@ import { createRunnerRouter, runPipeline } from '../../pipeline/pipeline.ts';
 import { CrossFamilyViolation, moderateStage } from '../../pipeline/routing.ts';
 import type { Stage } from '../../pipeline/types.ts';
 import { ForgeService } from '../service.ts';
+import { readAcceptance } from '../checks.ts';
+import { jobsDir } from '../format.ts';
 import {
   ACTIVITY_TAIL,
   ARTIFACT_INLINE_CHARS,
@@ -38,6 +40,7 @@ import {
   readTail,
   stageArtifactPath,
   stageArtifactRef,
+  collectObservations,
   stageDir,
   toObservation,
   toStageResult,
@@ -321,7 +324,19 @@ test('a failure keeps the provider\'s own status word, so `denied` survives', ()
   assert.equal(res.status, 'failed');
   assert.equal(res.failure?.code, 'denied');
   assert.equal(res.failure?.retryable, false);
-  assert.ok(res.resultPath, 'a failed stage still publishes its artefact for a human to read');
+  assert.equal(res.resultPath, undefined, 'nothing was written, so no path is advertised');
+  assert.deepEqual(res.artifacts, []);
+  assert.match(res.warnings?.[0] ?? '', /implement\/result\.md not found on disk/);
+});
+
+test('a failed stage that did leave an artefact still publishes it for a human to read', () => {
+  const r = repo();
+  mkdirSync(stageDir(r, 'implement'), { recursive: true });
+  writeFileSync(stageArtifactPath(r, 'implement'), 'partial notes');
+  const res = toStageResult(stage(), ctxFor(r, stage()), manifestFor({ status: 'failed', jobStatus: 'error' }), [], 0, r);
+  assert.equal(res.resultPath, 'implement/result.md');
+  assert.deepEqual(res.artifacts, [{ stage: 'implement', path: 'implement/result.md', label: 'result.md' }]);
+  assert.equal(res.warnings, undefined);
 });
 
 test('a stage that claims success but wrote nothing is FAILED at the DAG boundary', () => {
@@ -333,6 +348,23 @@ test('a stage that claims success but wrote nothing is FAILED at the DAG boundar
   assert.equal(res.status, 'failed');
   assert.equal(res.failure?.code, 'no-result');
   assert.equal(res.failure?.retryable, true, 'retrying could plausibly produce the artefact');
+});
+
+test('collectObservations keeps one observation per tool step, in its final state', async () => {
+  const snapshots = [
+    [{ stepIndex: 0, tool: 'Bash', input: 'ls', status: 'active' }],
+    [{ stepIndex: 0, tool: 'Bash', input: 'ls', status: 'done' }, { stepIndex: 1, tool: 'Glob', input: '*.ts', status: 'active' }],
+    [{ stepIndex: 0, tool: 'Bash', input: 'ls', status: 'done' }, { stepIndex: 1, tool: 'Glob', input: '*.ts', status: 'error' }],
+  ];
+  let reads = 0;
+  const service = {
+    activities: async () => snapshots[Math.min(reads++, snapshots.length - 1)],
+    state: async () => (reads < snapshots.length ? 'running' : 'succeeded'),
+  } as unknown as ForgeService;
+  const tapped: string[] = [];
+  const out = await collectObservations(service, 'job', 'implement', (_stage, obs) => { tapped.push(`${obs.turn}:${obs.tool}:${obs.ok}`); });
+  assert.deepEqual(out.map((o) => [o.turn, o.tool, o.kind]), [[0, 'Bash', 'tool'], [1, 'Glob', 'error']]);
+  assert.deepEqual(tapped, ['0:Bash:true', '0:Bash:true', '1:Glob:true', '1:Glob:false'], 'the tap still sees every state change');
 });
 
 test('readTail is bounded and null for nothing', () => {
@@ -528,6 +560,37 @@ test('executable stage checks determine acceptance with exit-code evidence', asy
   assert.equal(failed.failure?.code, 'verification-failed');
   assert.match(failed.failure?.message ?? '', /tests/);
   assert.equal(failed.verification?.verdicts[0]?.exitCode, 1);
+});
+
+test("a stage's job carries its acceptance, pending while checks run and decided after", async () => {
+  const r = repo();
+  const service = new ForgeService({ repo: r });
+  // The check reads the job's acceptance sidecar from inside the running check.
+  const probe = path.join(r, 'probe.cjs');
+  writeFileSync(probe, "const fs=require('fs'),p=require('path');const [dir,out]=process.argv.slice(2);" +
+    "const id=fs.readdirSync(dir)[0];fs.copyFileSync(p.join(dir,id,'acceptance.json'),out);");
+  const seen = path.join(r, 'seen.json');
+  const command = `node ${probe} ${jobsDir(r)} ${seen}`;
+  const passed = await createForgeRunner({ service, runId: 'job-acc-pass' }).run(ctxFor(r, stage({ checks: [{ name: 'probe', command }] })));
+  assert.equal(passed.acceptance, 'passed');
+  assert.equal(JSON.parse(readFileSync(seen, 'utf8')).pending, true, 'checks pending, not a premature verdict');
+  const accepted = readAcceptance(r, passed.jobId!);
+  assert.equal(accepted.state, 'accepted');
+  assert.equal((accepted as { pending?: boolean }).pending, undefined);
+
+  const failed = await createForgeRunner({ service, runId: 'job-acc-fail' }).run(
+    ctxFor(r, stage({ checks: [{ name: 'tests', command: 'node -e "process.exit(1)"' }] })));
+  assert.equal(failed.acceptance, 'failed');
+  const rejected = readAcceptance(r, failed.jobId!) as { state: string; checks: { name: string; ok: boolean }[] };
+  assert.equal(rejected.state, 'rejected', 'status <jobId> agrees with pipeline_status');
+  assert.deepEqual(rejected.checks.map((c) => [c.name, c.ok]), [['tests', false]]);
+
+  const denied = await createForgeRunner({ service, runId: 'job-acc-denied' }).run(
+    ctxFor(r, stage({ prompt: 'deny everything', checks: [{ name: 'never', command: 'true' }] })));
+  assert.equal(denied.status, 'failed');
+  const unrun = readAcceptance(r, denied.jobId!) as { state: string; pending?: boolean };
+  assert.equal(unrun.state, 'rejected', 'a failed job does not stay pending forever');
+  assert.equal(unrun.pending, undefined);
 });
 
 /* ── cross-family enforcement ──────────────────────────────────────────────── */

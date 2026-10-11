@@ -107,9 +107,9 @@ export function concisePipeline(r: PipelineRecord) {
     runId: r.runId, pipeline: r.pipeline, status: r.status, startedAt: r.startedAt, finishedAt: r.finishedAt,
     durationMs: r.finishedAt === null ? null : r.finishedAt - r.startedAt, error: r.error ? trimWords(r.error, 500) : null,
     stageResults: Object.fromEntries(Object.entries(r.stageResults).map(([name, s]) => [name, compact({
-      status: s.status, acceptance: s.acceptance, durationMs: s.durationMs, jobId: s.jobId,
+      status: s.status, acceptance: s.acceptance, durationMs: s.status === 'running' ? null : s.durationMs, startedAt: s.status === 'running' ? s.startedAt : null, provider: s.status === 'running' ? s.provider : null, jobId: s.jobId,
       checks: s.verification ? { passed: s.verification.verdicts.filter(v => v.passed).map(v => v.check.name), failed: s.verification.verdicts.filter(v => !v.passed).map(v => v.check.name) } : null,
-      artifact: s.resultPath, failure: s.failure ? `${s.failure.code}: ${trimWords(s.failure.message, 200)}` : null,
+      artifact: s.resultPath, warnings: s.warnings?.length ? s.warnings : null, failure: s.failure ? `${s.failure.code}: ${trimWords(s.failure.message, 200)}` : null,
       outputTail: s.outputTail ? s.outputTail.slice(-OUTPUT_TAIL_CHARS) : null,
     })])),
   });
