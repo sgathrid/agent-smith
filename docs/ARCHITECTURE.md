@@ -36,22 +36,23 @@ State lives in `<repo>/.agent-smith/jobs/<jobId>/` (gitignored). `FILES` in `for
 
 | File | Writer | Meaning |
 |---|---|---|
-| `job.json` | `JobWriter`, atomic whole-file rewrite | The anchor and only mandatory file. Schema v1 manifest: identity, provider/mode/model (requested, resolved, source), sandbox, status, timestamps, `ownerPid`, `exitCode`, `error`, `deniedActions`, `usage`, `gitBaseline`, `changedFiles`. Never deleted. A reader refuses a manifest with a higher `schema`. Holds `task` (first prompt line, 200 chars), not the full prompt. |
-| `progress.json` | `JobWriter`, coalesced to `PROGRESS_FLUSH_MS` = 250 ms | Advisory liveness: `lastEventAt`, recent activities, `latestText`, `latestSummary` (source `worker`), warnings. |
+| `job.json` | `JobWriter`; service-owned orphan recovery; atomic whole-file rewrite | The anchor and only mandatory file. Schema v1 manifest: identity, provider/mode/model (requested, resolved, source), sandbox, status, timestamps, `ownerPid`, `exitCode`, `error`, `deniedActions`, `usage`, `gitBaseline`, `changedFiles`. Never deleted. A reader refuses a manifest with a higher `schema`. Holds `task` (first prompt line, 200 chars), not the full prompt. |
+| `progress.json` | `JobWriter`, coalesced to `PROGRESS_FLUSH_MS` = 250 ms | Advisory liveness: `lastEventAt`, live `toolCalls`, recent activities, `lastActivity` (including completed tools), `latestText`, `latestSummary` (source `worker`), warnings. |
 | `events.jsonl` | `providers/ndjson.ts` | Normalized `ProviderEvent` stream. |
 | `argv.json` | `providers/ndjson.ts` | Exact argv and cwd. |
 | `stderr.log` | `providers/ndjson.ts` | Child stderr, verbatim. |
 | `result.json` | `providers/ndjson.ts` | Verbatim adapter `JobResult`, written once at completion. Its presence stops orphan derivation. |
 | `result.md` | `JobWriter` | The report (worker output). May be absent/empty for a denied job. |
 | `cancel` | `ForgeService.cancel` | Marker holding the ISO instant of the request. It is a request, not a verdict. |
-| `orphaned` | first reader that proves the owner dead | Marker so readers that cannot probe a pid agree. Never edits `job.json`. |
+| `orphaned` | legacy marker | Existing markers remain readable. New readers do not write markers; service recovery persists terminal state in `job.json`. |
 | `acceptance.json` | `forge/checks.ts` (only when `spawn_job` got `checks`) | Sidecar, see Acceptance. Not in `FILES`. |
 
 Pipeline runs sit beside jobs, not inside them: `.agent-smith/pipelines/<runId>.json`
 (`PipelineRecord`: `running|passed|partial|failed`, per-stage results), `<runId>.cancel`
 (marker, polled every 250 ms by the owner), and `<runId>/artifacts/<stage>/<resultPath, default result.md>`
-(handoff artifacts scoped per run and stage; worker cwd stays the source checkout, so this
-is not source isolation).
+(handoff artifacts scoped per run and stage; directories are created before dispatch).
+Worker cwd stays the source checkout. Prompts label the source workspace and output artifact
+separately; this does not isolate filesystem access.
 
 `spawn_job` flow: validate (closed mode for non-pipeline fresh spawns, nonempty prompt,
 timeout clamp, catalog check, identity conflicts) -> `JobWriter.start` writes `job.json`
@@ -71,9 +72,10 @@ names. No live steering.
 ## Status derivation
 
 `deriveStatus` (`forge/format.ts`) is the one place a terminal verdict is computed.
-Precedence: already terminal (a cancel verdict is final) > `deniedActions` non-empty =
+Precedence: already terminal (a cancel verdict is final) > successful nonempty report with
+only non-fatal `tool` denials = success with warning > other `deniedActions` non-empty =
 `failed` + suspicious > `ok === false` = `failed` > `ok === true` with empty report
-(`< 8` chars after trim, `MIN_USEFUL_CHARS`) = `failed` + suspicious > `ok === true` =
+(empty after trim, `MIN_USEFUL_CHARS = 1`) = `failed` + suspicious > `ok === true` =
 `succeeded` > no verdict = `running`. A job that exited 0 and delivered nothing is
 failed, never a quiet success.
 
@@ -84,8 +86,11 @@ manifest with no `result.json`, not canceled:
   counts as alive). Legacy manifests without `ownerPid` are orphaned only when the newest of
   `updatedAt`/`progress.lastEventAt`/`createdAt` is older than `LEGACY_ORPHAN_AFTER_MS` =
   2 x `DEFAULT_TIMEOUT_MS` = 90 minutes. Result: `failed`, suspicious, reason
-  "supervisor process exited before the job finished (orphaned)". A best-effort `orphaned`
-  marker is written; once present, readers keep reporting orphaned.
+  "supervisor process exited before the job finished (orphaned)". Readers are read-only.
+  The service reconciles jobs at startup and before list/detail/state reads: a recorded
+  dead owner permits an atomic failed manifest with reason and finishedAt, and pending
+  acceptance settles as rejected. Live owners, terminal anchors and published results win.
+  PID-less legacy jobs retain the read-only fallback; their writer's death cannot be proven.
 - **Stale cancel**: if no orphan verdict, a `cancel` marker older than 60 s and no live
   `ownerPid` (in practice a manifest without `ownerPid`, since a dead pid is already an
   orphan) reports `canceled` with reason "cancel requested and no supervisor confirmed it".
@@ -163,13 +168,23 @@ Job status says the harness ran, not that the task is done. `spawn_job` `checks`
 the MCP process after a job terminates (`gateAcceptance` -> `evaluateAcceptance`):
 unsuccessful job -> `rejected` without running checks; no checks -> `unchecked`; all
 blocking checks pass -> `accepted`; a blocking failure -> `rejected`. `blocking: false`
-checks are recorded but never gate. A pending `{state:'unchecked', pending:true}` placeholder
+checks are recorded but never gate, including missing-directory/spawn failures. A mandatory
+declared check with an empty command rejects acceptance; optional absent commands remain
+informational. Verdicts preserve timeout, signal, skipped reason and diagnostic reason.
+A pending `{state:'unchecked', pending:true}` placeholder
 is written at spawn; the real verdict replaces it atomically. Check output tails are capped
 at 2000 chars; default per-check timeout 60 s; `cwd` resolves against the job's cwd.
 `status` merges the sidecar (`unchecked` when absent or unreadable). The gate lives in the
 MCP server process: if it exits before the job finishes, the placeholder stays. Pipeline
 stages use the same rules (`StageResult.acceptance` `passed|failed|unchecked`, reported by
 `pipeline_status`).
+
+Completion notices lead with execution status and truncate worker prose at a sentence
+or word boundary. They include provider, elapsed time and changed-file count only when
+recorded evidence exists. The idle wake still uses exit code 2: Claude Code's
+[asyncRewake protocol](https://code.claude.com/docs/en/hooks#run-hooks-in-the-background)
+requires it. Exit 0 would queue feedback until another conversation turn, so the host's
+error-style wake label remains a host limitation rather than a worker failure.
 
 ## Changed files
 

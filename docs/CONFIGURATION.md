@@ -141,7 +141,8 @@ roleDefaults}`, `aliasConfigErrors?`, `modes[{name,description,readOnly,runsComm
 | `provider` | enum | default: alias/roleDefault provider, else `agy` if installed, else the first installed |
 | `model`, `effort` | string, enum | optional; validated against a fresh catalog, otherwise warnings only |
 | `timeoutMs` | integer >= 1 | default 2 700 000, clamped 1 000 to 21 600 000 |
-| `unrestricted` | boolean | default false |
+| `unrestricted` | boolean | default true for agy; false for other providers |
+| `cwd` | string | absolute existing directory; default server repo; checks resolve against it |
 | `conversation` | string | native conversation handle to resume |
 | `checks` | array | items `{name, command}` required, `cwd`, `timeoutMs` (int >= 1; default 60 000), `blocking` (default true); run after success |
 
@@ -154,7 +155,9 @@ given.
 
 ### `resume_job`
 Params: `worker` (name or job id, required), `prompt` (required), `model`, `effort`,
-`timeoutMs`, `unrestricted` (default: the original job's). Provider, mode, cwd, workerId,
+`timeoutMs`, `unrestricted` (default: the original job's), `cwd` (absolute existing directory;
+default: the original job's). An explicit cwd changes the process working directory while
+retaining the prior conversation, which can still mention its previous workspace. Provider, mode, workerId,
 name and conversation come from the finished job; no `provider` or `checks` parameter.
 Refuses running workers, workers without a conversation handle, ambiguous names. Result:
 a `SpawnAck` plus `notify` (not structured).
@@ -163,7 +166,7 @@ a `SpawnAck` plus `notify` (not structured).
 Params: `provider` enum `agent-smith|agy-staff|all` (default `agent-smith`), `status` enum
 `running|succeeded|failed|canceled`, `limit` 1-500 (default 50). Running first, then newest.
 Result rows (`JobSummary`): `jobId, name, workerId, role, latestSummary, summarySource,
-source, status, provider, mode, model, task, toolCalls, currentActivity, startedAt,
+source, status, provider, mode, model, task, toolCalls, currentActivity, lastActivity, startedAt,
 updatedAt, finishedAt, warnings[], nextAction, unrestricted?`. `latestSummary` is untrusted.
 
 ### `status` (read-only, structured)

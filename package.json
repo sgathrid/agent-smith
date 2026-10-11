@@ -9,7 +9,8 @@
     "node": ">=22.18"
   },
   "scripts": {
-    "test": "node --test --experimental-strip-types \"the-codes/**/*.test.ts\" \"the-codes/**/*.node-test.ts\" \"!the-codes/**/node_modules/**\"",
+    "test": "node --test --experimental-strip-types \"the-codes/**/*.test.ts\" \"the-codes/**/*.node-test.ts\" \"!the-codes/**/node_modules/**\" scripts/testing/smoke.test.mjs",
+    "smoke": "node scripts/smoke.mjs",
     "typecheck": "tsc --noEmit",
     "build": "npm --prefix the-codes/surfaces/channel run build",
     "build:plugin": "npm run build && node scripts/build-plugin.mjs",
