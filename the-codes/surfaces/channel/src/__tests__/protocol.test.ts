@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { ElicitRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 
 const server = process.env.SMITH_TEST_SERVER ?? fileURLToPath(new URL('../server.ts', import.meta.url));
 function data(result: unknown): Record<string, any> {
@@ -50,13 +51,23 @@ setTimeout(()=>{console.log(JSON.stringify({type:'item.completed',item:{id:'answ
     const detail = await until(async () => data(await client.callTool({ name: 'status', arguments: { jobId: ack.jobId, response_format: 'detailed' } })), r => r.status !== 'running');
     assert.equal(detail.status, 'succeeded'); assert.equal(detail.name, 'Ada'); assert.equal(detail.role, 'review');
     assert.equal(detail.summarySource, 'worker'); assert.match(detail.latestSummary, /Worker findings/); assert.ok(!detail.latestSummary.includes('PRIVATE THINKING'));
+    // The SDK Client validates structuredContent against each tool's outputSchema, so these calls are the end-to-end schema check.
+    assert.deepEqual(ack.task, { taskId: ack.jobId, status: 'working', pollIntervalMs: 5_000 });
+    assert.equal(detail.taskStatus, 'completed');
+    assert.equal(data(await client.callTool({ name: 'status', arguments: { jobId: ack.jobId, include_diff: true } })).taskStatus, 'completed');
+    for (const response_format of ['concise', 'detailed']) {
+      const listed = await client.callTool({ name: 'list_jobs', arguments: { response_format } });
+      assert.equal((listed.structuredContent as { items: { taskStatus: string }[] }).items[0]!.taskStatus, 'completed', response_format);
+    }
     const resumed = data(await client.callTool({ name: 'resume_job', arguments: { worker: 'Ada', prompt: 'Address the edge case' } }));
+    assert.deepEqual(resumed.task, { taskId: resumed.jobId, status: 'working', pollIntervalMs: 5_000 });
     const followup = await until(async () => data(await client.callTool({ name: 'status', arguments: { jobId: resumed.jobId, response_format: 'detailed' } })), r => r.status !== 'running');
     assert.equal(followup.workerId, detail.workerId); assert.equal(followup.name, 'Ada'); assert.match(followup.report, /follow-up/);
     const argv = JSON.parse(readFileSync(path.join(repo, '.agent-smith', 'jobs', resumed.jobId, 'argv.json'), 'utf8')).argv;
     assert.deepEqual(argv.slice(0, 3), ['exec', 'resume', 'fixture-thread']);
     for (const exitCode of [0, 7]) {
       const run = data(await client.callTool({ name: 'run_pipeline', arguments: { spec: { name: 'fixture', stages: [{ name: 'implement', provider: 'codex', prompt: 'Write detailed findings', checks: [{ name: 'acceptance', command: `node -e 'process.exit(${exitCode})'` }] }] } } }));
+      assert.equal(run.task.taskId, run.runId);
       const result = await until(async () => data(await client.callTool({ name: 'pipeline_status', arguments: { runId: run.runId, response_format: 'detailed' } })), r => r.status !== 'running');
       assert.equal(result.status, exitCode === 0 ? 'passed' : 'failed', JSON.stringify(result));
       const stage = result.stageResults.implement;
@@ -67,4 +78,24 @@ setTimeout(()=>{console.log(JSON.stringify({type:'item.completed',item:{id:'answ
     await client.close(); rmSync(repo, { recursive: true, force: true });
   }
   assert.equal(stderr.includes('Unhandled'), false, stderr);
+});
+
+test('MCP asks the user before unrestricted codex, over the wire; a decline launches nothing', async () => {
+  const repo = mkdtempSync(path.join(os.tmpdir(), 'smith-elicit-'));
+  const env = Object.fromEntries(Object.entries(process.env).filter((e): e is [string, string] => e[1] !== undefined && e[0] !== 'AGENT_SMITH_CONFIRM_UNRESTRICTED'));
+  const transport = new StdioClientTransport({ command: process.execPath, args: ['--experimental-strip-types', server], env: { ...env, AGY_WATCH_CWD: repo, AGENT_SMITH_CODEX_BIN: path.join(repo, 'never-run') }, stderr: 'pipe' });
+  const client = new Client({ name: 'smith-elicit-test', version: '1' }, { capabilities: { elicitation: { form: {} } } });
+  const asked: string[] = [];
+  client.setRequestHandler(ElicitRequestSchema, async (request) => { asked.push(request.params.message); return { action: 'decline' }; });
+  try {
+    await client.connect(transport);
+    const r = await client.callTool({ name: 'spawn_job', arguments: { provider: 'codex', mode: 'review', name: 'Ada', prompt: 'x', unrestricted: true } });
+    assert.equal(r.isError, true);
+    assert.equal((r.content as { text: string }[])[0]!.text, 'The user declined unrestricted access; rerun without unrestricted, or ask the user.');
+    assert.deepEqual(asked, [`Allow codex worker "Ada" to run without approval prompts in ${repo}? It will be able to run any command.`]);
+    const jobs = path.join(repo, '.agent-smith', 'jobs');
+    assert.equal(existsSync(jobs) ? readdirSync(jobs).length : 0, 0, 'a declined call creates no job');
+  } finally {
+    await client.close(); rmSync(repo, { recursive: true, force: true });
+  }
 });

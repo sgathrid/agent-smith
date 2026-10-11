@@ -257,6 +257,10 @@ Claude                MCP server (dist/server.js)      Claude Code hooks        
   the job's own `timeoutMs` + 60 s (from the ack; pipelines get the 6 h cap + 60 s); standalone
   `monitor.js` defaults to `DEFAULT_WATCH_TIMEOUT_MS` = 46 min. On timeout it emits "still
   running; check status <ids>" (exit 2 from the hook).
+- **Tasks-shaped handle**: acks also carry `task {taskId, status:'working', pollIntervalMs}` and
+  `status`/`list_jobs` add `taskStatus` (`views.ts` `taskStatus`), the MCP Tasks extension's
+  vocabulary, so a future Tasks adapter (once the SDK and Claude Code support it) is a
+  translation. `pollIntervalMs` is `poller.ts` `POLL_MS`.
 - **Fallback**: acks carry `notify {mode:'hook', note, monitorCommand?, monitorTimeoutMs?}`;
   `monitorCommand` (only when running from the built `dist/`) is `node .../monitor.js
   --job <id>|--run <id> --cwd <repo>`, to run under Claude's Monitor tool
@@ -282,11 +286,17 @@ Every tool answers fast so the MCP server and the session are never blocked by a
 long-running job: `spawn_job`/`resume_job`/`run_pipeline` return once the anchor is on disk
 (`run_pipeline` persists the run record first); discovery runs only on `list_capabilities` or when a
 model/effort is named, bounded to 2 s on the spawn path; harness defaults are file reads, not
-CLI calls. The only intentional wait is `status wait_ms` (1-60 000 ms, polling every 500 ms),
-meant for when the hook is unavailable.
+CLI calls. The intentional waits are `status wait_ms` (1-60 000 ms, polling every 500 ms),
+meant for when the hook is unavailable, and an unrestricted confirmation, which waits on the
+user (up to 10 minutes) before anything launches.
 
 ## Safety and trust
 
+- An explicit `unrestricted: true` for codex, claude or opencode on `spawn_job`/`resume_job` is
+  confirmed with the user through MCP form elicitation before launch (`tools.ts`
+  `confirmUnrestricted`; the server handle reaches `callTool` as `HandlerContext.server`). It
+  fails closed: decline, cancel or no answer returns `isError`. Clients without form elicitation
+  launch with an ack warning; `AGENT_SMITH_CONFIRM_UNRESTRICTED=0` skips the prompt.
 - `unrestricted` defaults to false for every provider except `agy` (headless agy cannot prompt, so it defaults to true) and is recorded in `job.json`. Each harness
   owns its sandbox (see CONFIGURATION.md); the ack echoes `sandbox`, `sandboxFlags`,
   `readOnlyRequested`, `readOnlyEnforced`.
