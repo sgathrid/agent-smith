@@ -168,6 +168,55 @@ test('agy/opencode/claude describeSandbox matches argv and only claims read-only
   assert.deepEqual(agyProvider.describeSandbox!({ unrestricted: false }).flags, []);
 });
 
+test('claude read-only: an output artifact is the one permitted write', () => {
+  const art = '/w/artifacts/review/result.md';
+  const flagsOf = (argv: string[], flag: string, next: string): string[] => {
+    const rest = argv.slice(argv.indexOf(flag) + 1);
+    const end = rest.findIndex((a) => a === next || a.startsWith('--'));
+    return rest.slice(0, end < 0 ? rest.length : end);
+  };
+  const solo = claudeProvider.describeSandbox!({ unrestricted: false, readOnly: true });
+  const soloArgv = claudeArgv(spec({ readOnly: true }));
+  assert.deepEqual(flagsOf(soloArgv, '--disallowedTools', ''), ['Edit', 'Write', 'NotebookEdit']);
+  assert.ok(!flagsOf(soloArgv, '--allowedTools', '').some((r) => r.startsWith('Edit(')));
+
+  const info = claudeProvider.describeSandbox!({ unrestricted: false, readOnly: true, artifactPath: art });
+  const argv = claudeArgv(spec({ readOnly: true, artifactPath: art }));
+  assert.deepEqual(flagsOf(argv, '--disallowedTools', ''), ['Edit', 'NotebookEdit']);
+  assert.deepEqual(flagsOf(argv, '--allowedTools', '').filter((r) => r.startsWith('Edit(') || r.startsWith('Write')), ['Edit(//w/artifacts/review/result.md)']);
+  assert.ok(argv.join(' ').includes(info.flags.join(' ')), 'describeSandbox flags are literally in argv');
+  assert.equal(info.readOnlyEnforced, true);
+  assert.match(info.sandbox, /except the output artifact \/w\/artifacts\/review\/result\.md/);
+  assert.notEqual(info.sandbox, solo.sandbox);
+  // unrestricted and non-read-only jobs ignore the artifact.
+  assert.deepEqual(claudeProvider.describeSandbox!({ unrestricted: true, readOnly: true, artifactPath: art }).flags, ['--dangerously-skip-permissions']);
+  assert.deepEqual(claudeProvider.describeSandbox!({ unrestricted: false, artifactPath: art }).flags, ['--permission-mode', 'dontAsk', '--permission-prompts', 'none']);
+});
+
+test('codex read-only: an output artifact switches to a profile writable at exactly that file', () => {
+  const saved = process.env['AGENT_SMITH_CODEX_SANDBOX'];
+  delete process.env['AGENT_SMITH_CODEX_SANDBOX'];
+  try {
+    const art = '/w/artifacts/review/result.md';
+    const info = codexProvider.describeSandbox!({ unrestricted: false, readOnly: true, artifactPath: art });
+    assert.deepEqual(info.flags, [
+      '-c', 'default_permissions="agent-smith-artifact"',
+      '-c', 'permissions.agent-smith-artifact.filesystem={":root"="read", "/w/artifacts/review/result.md"="write"}',
+    ]);
+    assert.equal(info.readOnlyEnforced, true);
+    for (const conversation of [undefined, 't1']) {
+      const argv = codexArgv(spec({ readOnly: true, artifactPath: art, ...(conversation === undefined ? {} : { conversation }) }));
+      assert.ok(argv.join('\u0000').includes(info.flags.join('\u0000')));
+      assert.ok(!argv.includes('-s') && !argv.some((a) => a.startsWith('sandbox_mode')), '-s cannot be combined with default_permissions');
+    }
+    assert.deepEqual(codexProvider.describeSandbox!({ unrestricted: false, readOnly: true }).flags, ['-s', 'read-only']);
+    assert.deepEqual(codexProvider.describeSandbox!({ unrestricted: false, artifactPath: art }).flags, ['-s', 'workspace-write']);
+  } finally {
+    if (saved === undefined) delete process.env['AGENT_SMITH_CODEX_SANDBOX'];
+    else process.env['AGENT_SMITH_CODEX_SANDBOX'] = saved;
+  }
+});
+
 // ---- catalog ----
 
 function fakeProvider(name: string, impl: () => Promise<ModelCatalog>, available = true): Provider & { calls: number } {

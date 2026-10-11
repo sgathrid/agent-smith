@@ -346,6 +346,7 @@ export function createForgeRunner(deps: RunnerDeps): StageRunner {
       }),
       provider: ctx.routing.provider,
       cwd: ctx.workDir,
+      artifactPath: path.resolve(stageArtifactPath(artifactRoot, stage.name, stage.resultPath)),
       ...(continuesAttempt ? {} : { context: stage.context, checks: stage.checks }),
       // 0 means "use the service default" (clampTimeout's DEFAULT_TIMEOUT_MS).
       // A stage timeout is ALSO enforced by the DAG via ctx.signal, so this is a

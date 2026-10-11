@@ -103,6 +103,12 @@ export interface SpawnSpec {
    */
   readOnly?: boolean;
 
+  /**
+   * Absolute path of the one file a read-only job may write (a pipeline stage's
+   * output artifact). Only claude and codex act on it; ignored unless `readOnly`.
+   */
+  artifactPath?: string;
+
   /** Extra directories to widen the worker's sandbox to (agy --add-dir / codex --add-dir). */
   addDirs?: string[];
 
@@ -311,7 +317,7 @@ export interface Provider {
    * Report the sandbox/permission posture `spawn(spec)` WILL apply, derived from
    * the same code path that builds argv (not a parallel guess). Pure, no I/O.
    */
-  describeSandbox?(spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly'>): SandboxInfo;
+  describeSandbox?(spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly' | 'artifactPath'>): SandboxInfo;
 
   /**
    * The provider's own configured default model/effort, read from its config

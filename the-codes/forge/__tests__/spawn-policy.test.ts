@@ -29,8 +29,8 @@ function fakeProvider(name: string, withSandbox = true): Fake {
     },
     ...(withSandbox
       ? {
-          describeSandbox: (s: { unrestricted: boolean; readOnly?: boolean }) => ({
-            sandbox: `fake ${s.readOnly ? 'ro' : 'rw'}`,
+          describeSandbox: (s: { unrestricted: boolean; readOnly?: boolean; artifactPath?: string }) => ({
+            sandbox: `fake ${s.readOnly ? 'ro' : 'rw'}${s.artifactPath === undefined ? '' : `+${s.artifactPath}`}`,
             flags: s.readOnly ? ['--ro'] : [],
             readOnlyEnforced: s.readOnly === true,
           }),
@@ -179,6 +179,20 @@ test('a pipeline stage brief leaves the workspace line to the stage prompt', asy
   await service.spawnJob({ mode: 'review', prompt: 'p', pipeline: 'pl', stage: 'review' });
   assert.doesNotMatch(f.specs[0]!.prompt, /Workspace:/);
   assert.ok(f.specs[0]!.prompt.includes(MODE_PRESETS.review.guidance));
+});
+
+test('a read-only stage hands its artifact path to the sandbox describer and the provider; others do not', async () => {
+  const f = fakeProvider('fake');
+  const { service } = svc(f);
+  const ack = await service.spawnJob({ mode: 'review', prompt: 'x', pipeline: 'pl', stage: 'review', artifactPath: '/a/review/result.md' });
+  assert.equal(f.specs[0]!.artifactPath, '/a/review/result.md');
+  assert.equal(ack.sandbox, 'fake ro+/a/review/result.md');
+  await service.spawnJob({ mode: 'review', name: 'solo', prompt: 'x' });
+  assert.equal('artifactPath' in f.specs[1]!, false);
+  await service.spawnJob({ mode: 'implement', name: 'rw', prompt: 'x', artifactPath: '/a/implement/result.md' });
+  assert.equal('artifactPath' in f.specs[2]!, false, 'a writable stage needs no special allowance');
+  await service.spawnJob({ mode: 'review', name: 'open', prompt: 'x', unrestricted: true, artifactPath: '/a/r.md' });
+  assert.equal('artifactPath' in f.specs[3]!, false);
 });
 
 test('read-only comes from the preset and the sandbox is echoed in ack and manifest', async () => {
