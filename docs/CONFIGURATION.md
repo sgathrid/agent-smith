@@ -88,7 +88,9 @@ Sandbox posture per provider (echoed in the ack): agy default = `--dangerously-s
 or `AGENT_SMITH_AGY_RESTRICTED=1`, which gives no flag and auto-denies unapproved tools;
 read-only is not enforceable). codex default = `-s workspace-write`, `-s read-only` for
 read-only modes, bypass flag when unrestricted (resume uses `-c sandbox_mode=...`). claude
-default = `--permission-mode dontAsk --permission-prompts none` (no read-only enforcement),
+default = `--permission-mode dontAsk --permission-prompts none`; review/moderate add an
+inspection-tool allowlist and editing-tool denylist (`readOnlyEnforced: true`, tool-level
+restrictions rather than a filesystem sandbox),
 `--dangerously-skip-permissions` when unrestricted. opencode default = the agent's own rules
 (no flag), `--auto` when unrestricted.
 
