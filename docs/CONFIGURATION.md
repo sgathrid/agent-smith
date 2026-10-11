@@ -108,7 +108,7 @@ default = `--permission-mode dontAsk --permission-prompts none` (no read-only en
 | Stale cancel | marker older than 60 s with no live owner | `harness/agent-smith.ts` |
 | Stall (`attention`) | 15 min without evidence of progress | `mod/hooks/stale.ts` |
 | Check timeout | 60 000 default per check; output tail 2 000 chars | `forge/checks.ts` |
-| `REPORT_HEAD_CHARS` | `status` returns the first 8 000 report chars (`reportTruncated`) | `tools.ts` |
+| `REPORT_HEAD_CHARS` | detailed `status` returns the first 8 000 report chars (`reportTruncated`); concise returns 2 000 | `tools.ts`, `views.ts` |
 | `changedFiles` cap | 200 paths (`changedFilesTruncated`); git calls capped at 2 s | `format.ts`, `writer.ts` |
 | List | default 50, max 500 | `tools.ts` |
 | Pipeline concurrency | 1 to 32 | `pipeline/pipeline.ts` |
@@ -164,14 +164,30 @@ a `SpawnAck` plus `notify` (not structured).
 
 ### `list_jobs` (read-only, structured)
 Params: `provider` enum `agent-smith|agy-staff|all` (default `agent-smith`), `status` enum
-`running|succeeded|failed|canceled`, `limit` 1-500 (default 50). Running first, then newest.
-Result rows (`JobSummary`): `jobId, name, workerId, role, latestSummary, summarySource,
+`running|succeeded|failed|canceled`, `limit` 1-500 (default 20 concise, 50 detailed), `since` (ISO time
+or relative `30m`/`2h`/`1d`; jobs last active at or after it), `session` (only jobs spawned by this server
+process; empty after a restart), `response_format` `concise|detailed` (default `concise`). Running first,
+then newest. Concise rows: `jobId, name, status, provider, model, mode, summary` (trimmed to 200 chars on a
+word boundary), `toolCalls, lastActivity` (one line), `startedAt, finishedAt, nextAction?, warningCount?`.
+Detailed rows (`JobSummary`): `jobId, name, workerId, role, latestSummary, summarySource,
 source, status, provider, mode, model, task, toolCalls, currentActivity, lastActivity, startedAt,
 updatedAt, finishedAt, warnings[], nextAction, unrestricted?`. `latestSummary` is untrusted.
 
 ### `status` (read-only, structured)
-Params: `jobId` (required), `wait_ms` 1-60000 (long-poll while running).
-Result: `JobSummary` fields plus `report` (first 8 000 chars), `reportTruncated`, `error`,
+Params: `jobId` (required), `wait_ms` 1-60000 (long-poll while running), `response_format`
+`concise|detailed` (default `concise`), `include_diff` (boolean).
+Concise result: `jobId, name, provider, model, mode, status`, `acceptance {state, passed[], failed[]
+(check names), pending?, reason?}`, `startedAt, finishedAt, durationMs, toolCalls, lastActivity`,
+`changedFileCount`, `changedFiles` (first 20), `nextAction`, `error`, `warnings` (deduped strings), one `report`
+(first 2 000 chars; a trailing note says it was cut and `reportTruncated` is true), `summary` only when
+the report does not already contain it, and with `wait_ms`: `waited`, `stillRunning`. Null fields are omitted.
+`include_diff` (either format) adds `diff`: a unified diff of `changedFiles` against the job's spawn-time
+`gitBaseline.head`, run in the job's `cwd`, capped at 40 000 chars on a line boundary. `diffNote` says how
+to see the rest (`git diff <head> -- <file>`), lists new untracked files (which a diff cannot show), or
+explains why there is no diff (no git baseline, job still running, no changes; `diff` is then null or empty).
+The diff is evidence, not attribution: parallel workers in one tree see each other's edits, and edits that
+were already uncommitted at spawn in a changed file are included.
+Detailed result (the full record): `JobSummary` fields plus `report` (first 8 000 chars), `reportTruncated`, `error`,
 `exitCode`, `unrestricted`, `pipeline`, `stage`, `usage`, `conversation`, `effort`, `cwd`,
 `modelRequested/modelResolved/modelSource`, `preambleApplied`, `sandbox`, `sandboxFlags`,
 `readOnlyRequested/readOnlyEnforced`, `cancellable`, `gitBaseline?`, `changedFiles?`,
@@ -195,9 +211,17 @@ installed providers. Result: `{runId, recordPath, stages[{name,provider,dependsO
 started:true, notify}` (not structured).
 
 ### `pipeline_status` (read-only)
-Params: `runId` (required). Result: the `PipelineRecord` (`runId, pipeline, status
-running|passed|partial|failed, startedAt, finishedAt, stageResults{stage -> status,
-acceptance passed|failed|unchecked, jobId, ...}, error?`).
+Params: `runId` (required), `response_format` `concise|detailed` (default `concise`). Detailed result:
+the full `PipelineRecord` (`runId, pipeline, status running|passed|partial|failed, startedAt, finishedAt,
+stageResults{stage -> status, acceptance passed|failed|unchecked, jobId, observations, ...}, error?`).
+Concise result: `runId, pipeline, status, startedAt, finishedAt, durationMs, error?` and per stage
+`status, acceptance, durationMs, jobId, checks {passed[], failed[]}, artifact` (the result path),
+`failure` (`code: message`) and `outputTail` (last 500 chars); no `observations`.
+
+### Tool errors
+Bad arguments, unknown jobs/runs/workers and refused actions come back as tool results with
+`isError: true` and one sentence naming the next step (e.g. `Worker "Ada" is still running; wait for its
+completion notice or call cancel.`).
 
 ## Where state lives
 

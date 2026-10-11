@@ -47,17 +47,17 @@ setTimeout(()=>{console.log(JSON.stringify({type:'item.completed',item:{id:'answ
     const invalid = await client.callTool({ name: 'spawn_job', arguments: { mode: 'review', prompt: 'x', effort: 'typo' } });
     assert.equal(invalid.isError, true);
     const ack = data(await client.callTool({ name: 'spawn_job', arguments: { provider: 'codex', mode: 'review', name: 'Ada', task: 'Review fixture', prompt: 'Review the fixture', model: 'fixture-model', effort: 'xhigh' } }));
-    const detail = await until(async () => data(await client.callTool({ name: 'status', arguments: { jobId: ack.jobId } })), r => r.status !== 'running');
+    const detail = await until(async () => data(await client.callTool({ name: 'status', arguments: { jobId: ack.jobId, response_format: 'detailed' } })), r => r.status !== 'running');
     assert.equal(detail.status, 'succeeded'); assert.equal(detail.name, 'Ada'); assert.equal(detail.role, 'review');
     assert.equal(detail.summarySource, 'worker'); assert.match(detail.latestSummary, /Worker findings/); assert.ok(!detail.latestSummary.includes('PRIVATE THINKING'));
     const resumed = data(await client.callTool({ name: 'resume_job', arguments: { worker: 'Ada', prompt: 'Address the edge case' } }));
-    const followup = await until(async () => data(await client.callTool({ name: 'status', arguments: { jobId: resumed.jobId } })), r => r.status !== 'running');
+    const followup = await until(async () => data(await client.callTool({ name: 'status', arguments: { jobId: resumed.jobId, response_format: 'detailed' } })), r => r.status !== 'running');
     assert.equal(followup.workerId, detail.workerId); assert.equal(followup.name, 'Ada'); assert.match(followup.report, /follow-up/);
     const argv = JSON.parse(readFileSync(path.join(repo, '.agent-smith', 'jobs', resumed.jobId, 'argv.json'), 'utf8')).argv;
     assert.deepEqual(argv.slice(0, 3), ['exec', 'resume', 'fixture-thread']);
     for (const exitCode of [0, 7]) {
       const run = data(await client.callTool({ name: 'run_pipeline', arguments: { spec: { name: 'fixture', stages: [{ name: 'implement', provider: 'codex', prompt: 'Write detailed findings', checks: [{ name: 'acceptance', command: `node -e 'process.exit(${exitCode})'` }] }] } } }));
-      const result = await until(async () => data(await client.callTool({ name: 'pipeline_status', arguments: { runId: run.runId } })), r => r.status !== 'running');
+      const result = await until(async () => data(await client.callTool({ name: 'pipeline_status', arguments: { runId: run.runId, response_format: 'detailed' } })), r => r.status !== 'running');
       assert.equal(result.status, exitCode === 0 ? 'passed' : 'failed', JSON.stringify(result));
       const stage = result.stageResults.implement;
       assert.equal(stage.acceptance, exitCode === 0 ? 'passed' : 'failed');

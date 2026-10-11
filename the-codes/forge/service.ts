@@ -177,6 +177,10 @@ export interface ListFilter {
   /** Only jobs in this state. */
   readonly status?: ForgeStatus | undefined;
   readonly limit?: number | undefined;
+  /** Only jobs last touched (finished, updated or started) at or after this epoch ms. */
+  readonly sinceMs?: number | undefined;
+  /** Only these job IDs (e.g. the ones this process spawned). */
+  readonly ids?: ReadonlySet<string> | undefined;
 }
 
 export interface JobSummary {
@@ -388,6 +392,8 @@ export function checkAgainstCatalog(
 export class ForgeService {
   readonly repo: string;
   private readonly live = new Map<string, LiveJob>();
+  /** Job IDs spawned by this process, for `list_jobs session`. */
+  readonly spawnedIds = new Set<string>();
   private readonly mirrorOn: boolean;
   private readonly flushMs: number | undefined;
   private readonly catalogSource: (providers: string[]) => Promise<ModelCatalog[]>;
@@ -502,15 +508,15 @@ export class ForgeService {
     const workerId = request.workerId ?? jobId;
     const canonicalConflict = findActiveIdentity(this.repo, name, workerId);
     if (canonicalConflict !== null) {
-      throw new Error(`worker identity already has an active job (${canonicalConflict.jobId})`);
+      throw new Error(`worker identity already has an active job (${canonicalConflict.jobId}); wait for it to finish or call cancel.`);
     }
     for (const { writer } of this.live.values()) {
       const active = writer.snapshot();
       if (active?.workerId === workerId) {
-        throw new Error(`worker "${workerId}" already has an active job (${active.jobId})`);
+        throw new Error(`worker "${workerId}" already has an active job (${active.jobId}); wait for it to finish or call cancel.`);
       }
       if (active?.name === name) {
-        throw new Error(`worker name "${name}" already has an active job (${active.jobId})`);
+        throw new Error(`worker name "${name}" already has an active job (${active.jobId}); wait for it, call cancel, or pick another name.`);
       }
     }
 
@@ -549,6 +555,7 @@ export class ForgeService {
       readOnlyRequested,
       readOnlyEnforced,
     });
+    this.spawnedIds.add(jobId);
 
     const ack: SpawnAck = {
       jobId,
@@ -713,7 +720,7 @@ export class ForgeService {
 
     const known = live !== undefined || existsSync(jobDir(this.repo, jobId));
     if (!known) {
-      throw new Error(`no job "${jobId}" in ${jobsDir(this.repo)}`);
+      throw new Error(`no job "${jobId}" in ${jobsDir(this.repo)}; call list_jobs for valid job IDs.`);
     }
 
     writer.requestCancel();
@@ -754,7 +761,11 @@ export class ForgeService {
       out.push(...(await this.readSource('agy-staff', new AgyStaffReader(), isForgeJobId)));
     }
 
-    const filtered = out.filter((j) => filter.status === undefined || j.status === filter.status);
+    const touched = (j: JobSummary): number => Date.parse(j.finishedAt ?? j.updatedAt ?? j.startedAt ?? '');
+    const filtered = out.filter((j) =>
+      (filter.status === undefined || j.status === filter.status) &&
+      (filter.ids === undefined || filter.ids.has(j.jobId)) &&
+      (filter.sinceMs === undefined || touched(j) >= filter.sinceMs));
     // Live first, then newest — the same ordering the band draws, so the list a
     // model reads and the list a human sees put the same job on top.
     filtered.sort((a, b) => {
@@ -780,7 +791,7 @@ export class ForgeService {
     if (observed === null) {
       const interop = await readObservedJob('agy-staff', this.repo, jobId);
       if (interop === null) {
-        throw new Error(`no job "${jobId}" in ${jobsDir(this.repo)}`);
+        throw new Error(`no job "${jobId}" in ${jobsDir(this.repo)}; call list_jobs for valid job IDs.`);
       }
       return { ...toSummary(interop, 'agy-staff'), report: interop.output, error: null, exitCode: null, unrestricted: interop.label === 'unrestricted', pipeline: null, stage: null, usage: null, conversation: null, effort: null, cwd: null, cancellable: false };
     }

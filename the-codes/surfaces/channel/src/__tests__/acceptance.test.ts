@@ -15,7 +15,7 @@ function fake(finalStatus: string, runningReads = 0) {
     repo,
     spawnJob: async () => ({ jobId: 'job-1' }),
     spawnTracked: async () => ({ ack: { jobId: 'job-1' }, done }),
-    detail: async () => ({ jobId: 'job-1', status: reads++ < runningReads ? 'running' : finalStatus, report: null }),
+    detail: async () => ({ jobId: 'job-1', status: reads++ < runningReads ? 'running' : finalStatus, report: null, warnings: [] }),
   };
   return { repo, ctx: { service: service as never, pollMs: 5, catalogs: async () => [] } as HandlerContext, finish: () => resolve({ status: finalStatus, cwd: repo }) };
 }
@@ -29,7 +29,7 @@ test('spawn_job with checks writes acceptance after terminal state', async () =>
   assert.equal(body(await callTool(f.ctx, 'status', { jobId: 'job-1' })).acceptance.pending, true);
   f.finish(); await settle();
   const s = body(await callTool(f.ctx, 'status', { jobId: 'job-1' }));
-  assert.equal(s.status, 'succeeded'); assert.equal(s.acceptance.state, 'accepted'); assert.equal(s.acceptance.checks[0].ok, true);
+  assert.equal(s.status, 'succeeded'); assert.equal(s.acceptance.state, 'accepted'); assert.deepEqual(s.acceptance.passed, ['ok']);
 });
 
 test('failing blocking check rejects; failed job rejects', async () => {
@@ -60,7 +60,7 @@ test('status wait_ms long-polls and is capped', async () => {
 });
 
 test('structuredContent wraps arrays; outputSchema is permissive', async () => {
-  const ctx = { service: { list: async () => [{ jobId: 'a' }] } as never } as HandlerContext;
+  const ctx = { service: { list: async () => [{ jobId: 'a', warnings: [] }] } as never } as HandlerContext;
   const r = await callTool(ctx, 'list_jobs', {});
   assert.deepEqual(r.structuredContent, { items: [{ jobId: 'a' }] });
   for (const n of ['status', 'list_jobs', 'list_capabilities', 'spawn_job']) assert.equal(TOOL_DEFS.find(t => t.name === n)!.outputSchema!.additionalProperties, true);
