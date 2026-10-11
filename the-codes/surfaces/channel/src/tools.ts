@@ -211,7 +211,7 @@ export async function defaultMixedPipeline(input: MixedSpecInput, catalogs?: Cat
 }
 // ── completion notice hint ───────────────────────────────────────────────────
 const MONITOR_CAP_MS = 1_800_000;
-const NOTIFY_NOTE = 'Completion is announced automatically by the plugin hook; if you did not receive a completion notice (hook unavailable, e.g. headless -p or other clients), run this under the Monitor tool, re-arm on expiry, or use status wait_ms.';
+const NOTIFY_NOTE = 'Completion is announced automatically by the plugin (a turn from Agent Smith, or a hook notice); if you did not receive a completion notice (hook unavailable, e.g. headless -p or other clients), run this under the Monitor tool, re-arm on expiry, or use status wait_ms.';
 
 /** monitor.js sits at dist/monitor.js; resolvable only when running from the built dist/. */
 function builtMonitorPath(moduleFile = fileURLToPath(import.meta.url)): string | undefined {

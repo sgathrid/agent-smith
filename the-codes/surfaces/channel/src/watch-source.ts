@@ -70,6 +70,7 @@ import { readAcceptance } from '../../../forge/checks.ts';
 // reasoning puts the dedupe rules in ./policy.ts rather than in the server: the
 // server is the only thing that could not be reused.
 import { STALL_GRACE_MS } from '../../mod/hooks/stale.ts';
+import { ACCEPTANCE_HOLD_MS, pipelineOutcome } from '../../mod/hooks/notice.ts';
 import type { WatchableJob, WatchStatus } from './policy.ts';
 
 /** Our own jobs directory. Read first, so it claims ids before interop sees them. */
@@ -94,10 +95,10 @@ export function clearReadCache(): void {
  * Acceptance checks run AFTER the job goes terminal, so for a moment a finished job
  * carries a pending acceptance placeholder. Announcing it then reports `unchecked`
  * and the real verdict lands unannounced. Hold the announcement while the
- * placeholder is pending, but never longer than this: a crashed checker must not
- * silence a finished job forever.
+ * placeholder is pending, but never longer than ACCEPTANCE_HOLD_MS (owned by the
+ * mod's notice.ts, which applies the same hold).
  */
-export const ACCEPTANCE_HOLD_MS = 5 * 60_000;
+export { ACCEPTANCE_HOLD_MS };
 
 function acceptancePending(cwd: string, job: WatchableJob, now: number): boolean {
   if (job.finishedAt === null) return false;
@@ -122,10 +123,11 @@ export function pipelineToWatchable(run: PipelineRecord | null): WatchableJob | 
   return {
     id: run.runId, name: run.pipeline, role: 'pipeline',
     status: run.status === 'running' ? 'running' : run.status === 'passed' ? 'succeeded' : 'failed',
+    startedAt: new Date(run.startedAt).toISOString(),
     lastEventAt: new Date(run.startedAt).toISOString(),
     finishedAt: run.finishedAt === null ? null : new Date(run.finishedAt).toISOString(),
     warned: run.status !== 'passed' && run.status !== 'running',
-    outcome: run.status === 'running' ? undefined : `Pipeline ${run.status}; ${Object.values(run.stageResults).filter(s => s && typeof s.stage === 'string').map(s => `${s.stage}: execution ${s.status}, acceptance ${s.acceptance ?? 'unchecked'}`).join('; ')}.`,
+    outcome: run.status === 'running' ? undefined : pipelineOutcome(run),
   };
 }
 
@@ -141,7 +143,7 @@ export async function readPipelineRecord(cwd: string, runId: string): Promise<{ 
 
 /** Read exactly one job by id from either source (primary first). Never throws. */
 export async function readJob(cwd: string, jobId: string, now: number = Date.now()): Promise<WatchableJob | null> {
-  return (await readOne(new AgentSmithReader(), cwd, jobId, now)) ?? (await readOne(new AgyStaffReader(), cwd, jobId, now));
+  return (await readOne(new AgentSmithReader(), 'agent-smith', cwd, jobId, now)) ?? (await readOne(new AgyStaffReader(), 'agy-staff', cwd, jobId, now));
 }
 
 /** One read of every job. Never throws; an unreadable directory yields []. */
@@ -174,7 +176,7 @@ export async function readAll(cwd: string, now: number = Date.now()): Promise<Wa
 /** Read one source's jobs, skipping ids another source already claimed. */
 async function collect(
   reader: JobStateReader,
-  source: string,
+  source: 'agent-smith' | 'agy-staff',
   cwd: string,
   now: number,
   claimed: Set<string>,
@@ -201,7 +203,7 @@ async function collect(
     claimed.add(id);
     const cached = terminalCache.get(cacheKey(cwd, id));
     if (cached) { out.push(cached); continue; }
-    const job = await readOne(reader, cwd, id, now);
+    const job = await readOne(reader, source, cwd, id, now);
     if (job === null) continue;
     if (isTerminal(job) && acceptancePending(cwd, job, now)) {
       // Not cached and not emitted: re-read next poll, once the verdict is written.
@@ -222,6 +224,7 @@ async function collect(
  */
 async function readOne(
   reader: JobStateReader,
+  source: 'agent-smith' | 'agy-staff',
   cwd: string,
   jobId: string,
   now: number,
@@ -236,9 +239,13 @@ async function readOne(
   }
 
   // `warned` covers both sources harness tracks: a recorded failure reason and
-  // any warning strings the provider reported. We only need the boolean, because
-  // the message we push says "with warnings" and nothing more.
+  // any warning strings the provider reported. The notice states the failure
+  // reason itself (`failureReason`), so only the boolean is kept here.
   const warned = observed.warnings.length > 0;
+  const raw = observed.raw;
+  const acceptance = source === 'agent-smith' ? readAcceptance(cwd, observed.jobId) as { checks?: readonly { ok?: unknown }[] } : {};
+  const checks = Array.isArray(acceptance.checks) && acceptance.checks.length > 0
+    ? { passed: acceptance.checks.filter((c) => c?.ok === true).length, total: acceptance.checks.length } : null;
 
   return {
     id: observed.jobId,
@@ -247,7 +254,10 @@ async function readOne(
     provider: typeof observed.raw['provider'] === 'string' ? observed.raw['provider'] : undefined,
     startedAt: observed.startedAt,
     changedFileCount: Array.isArray(observed.raw['changed_files']) ? observed.raw['changed_files'].length : undefined,
-    latestSummary: typeof observed.raw['latestSummary'] === 'string' ? observed.raw['latestSummary'] : null,
+    latestSummary: typeof raw['latestSummary'] === 'string' ? raw['latestSummary'] : null,
+    failureReason: typeof raw['error'] === 'string' && raw['error'] !== '' ? raw['error'] : null,
+    checks,
+    ...(source === 'agy-staff' ? { source } : {}),
     summarySource: observed.raw['summarySource'] === 'worker' ? 'worker' : null,
     status: toWatchStatus(observed, now),
     lastEventAt: observed.updatedAt,

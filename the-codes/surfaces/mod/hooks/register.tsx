@@ -1,6 +1,6 @@
 /** The band above the prompt and the /forge sidebar share canonical state and views. */
 import { atom, read, update } from 'claude-code';
-import type { EngineInterface, Register, UiRenderEvent } from 'claude-code';
+import type { EngineInterface, PostToolUseEvent, Register, UiRenderEvent } from 'claude-code';
 
 import type { RadarJob } from '../types/index.d.ts';
 import { countSummary, formatHeaderLine, isTerminal } from './format.ts';
@@ -29,6 +29,18 @@ import {
 } from './jobs.ts';
 import { sortForBand } from './format.ts';
 import { readForgeJobs, readForgeDetail } from './canonical.ts';
+import {
+  LAUNCH_TOOL,
+  asRunRecord,
+  claim,
+  claudeText,
+  due,
+  parseLaunch,
+  runFileName,
+  userLines,
+  type Owned,
+  type RunRecord,
+} from './notice.ts';
 import {
   readNativeJobs,
   nativeJobsFromRadar,
@@ -120,6 +132,13 @@ const bandConfig = atom({ plugin: 'agent-smith', key: 'bandConfig' } as const, {
   legacy: false,
 });
 
+/**
+ * Launches this session claimed (see `claimLaunch`), until announced. Session
+ * state, reset by /clear: a job claimed before a /clear is not announced after
+ * it, though the band and /forge still show it.
+ */
+const notices = atom({ plugin: 'agent-smith', key: 'notices' } as const, [] as Owned[]);
+
 // =============================================================================
 // § BAND — band author. See MERGE NOTE above.
 //
@@ -184,6 +203,82 @@ async function pollBand($: EngineInterface): Promise<void> {
   const before = JSON.stringify(previous);
   if (before !== JSON.stringify(next)) await update($, bandJobs, () => next);
   if (!cfg.legacy) await pollNativeTasks($, cfg.repo, next);
+}
+
+// ── completion notices ───────────────────────────────────────────────────────
+//
+// The plugin's PostToolUse command hook (watch-hook.js) can wake Claude, but
+// the host labels its exit-2 wake "Stop hook feedback", which reads as an error.
+// When this mod is loaded it takes the job over at `classic.PostToolUse`, and
+// announces it itself: a dim `$.ui.log` line for the user and a
+// `$.prompt.submit` turn Claude reads as coming from this plugin.
+
+/** Repo paths compare without trailing slashes. */
+const sameRepo = (a: string, b: string): boolean => a.replace(/\/+$/, '') === b.replace(/\/+$/, '');
+
+/**
+ * Claim a launch for this session, so the mod (and only the mod) announces it.
+ *
+ * THE ONE DECISION POINT. Modules sit above settings and plugin command hooks
+ * in the `classic.*` chain, so answering without `next` means the command hook
+ * for this call never starts: there is no second announcer to race. Every case
+ * the mod cannot watch calls `next`, and the hook behaves as it does without
+ * the mod. The claim is the last fallible step before the answer, and there is
+ * deliberately no `.catch`: a hook that throws is skipped, so the command hook
+ * runs, which is the safe way to fail.
+ *
+ * Ownership is per session by construction: this event fires for this
+ * session's own tool calls, and `notices` is session state.
+ */
+async function claimLaunch($: EngineInterface, e: PostToolUseEvent, next: (e: unknown) => Promise<unknown>): Promise<unknown> {
+  const launch = parseLaunch(e.tool_name, e.tool_response);
+  if (launch === null) return next(e);
+  const cfg = await read($, bandConfig);
+  // Legacy mode reads the agy-staff layout, and a read error means no rows: the
+  // mod could not see this job finish, so the hook keeps it.
+  if (cfg.legacy || cfg.repo === '' || await read($, readError) !== null) return next(e);
+  const repo = launch.repo ?? (typeof e.cwd === 'string' ? e.cwd : '');
+  if (!sameRepo(repo, cfg.repo)) return next(e);
+  const at = await $.clock.now();
+  await update($, notices, (owned) => claim(owned, launch, at));
+  return {};
+}
+
+// A slow pass can overlap the next tick; one announcement pass at a time.
+let announcing = false;
+
+/** Announce every claimed launch that has news: one log block, one turn. */
+async function announce($: EngineInterface, repo: string, jobs: readonly RadarJob[], at: number): Promise<void> {
+  if (announcing) return;
+  announcing = true;
+  try {
+    const owned = await read($, notices);
+    if (owned.length === 0) return;
+    const runs = new Map<string, RunRecord>();
+    for (const o of owned) {
+      if (o.kind !== 'run') continue;
+      const file = `${repo.replace(/\/+$/, '')}/.agent-smith/pipelines/${runFileName(o.id)}`;
+      try {
+        const run = await $.fs.exists(file) ? asRunRecord(JSON.parse(await $.fs.read(file))) : null;
+        if (run) runs.set(o.id, run);
+      } catch {
+        // Mid-write or unreadable: try again next poll.
+      }
+    }
+    const result = due(owned, jobs, runs, at);
+    const changed = result.notices.length > 0 || result.owned.length !== owned.length;
+    if (!changed) return;
+    // Record before speaking, so a notice is said once even if the turn it
+    // asks for never starts. Claims made since the read above are kept.
+    const seen = new Set(owned.map((o) => `${o.kind}:${o.id}`));
+    await update($, notices, (current) => [...result.owned, ...current.filter((c) => !seen.has(`${c.kind}:${c.id}`))]);
+    if (result.notices.length === 0) return;
+    for (const line of userLines(result.notices)) $.ui.log(line);
+    // Resolves when the turn starts, which waits for the session to be idle.
+    void $.prompt.submit({ text: claudeText(result.notices) }).catch(() => {});
+  } finally {
+    announcing = false;
+  }
 }
 
 /**
@@ -262,9 +357,17 @@ export async function startBand($: EngineInterface, cwd?: string): Promise<void>
     })().catch(() => {});
   });
 
-  // The data poll, on its own slower cadence.
+  // The data poll, on its own slower cadence. Notices go out from here only:
+  // a timer runs outside any event, which is where `$.prompt.submit` belongs.
+  // The other pollBand callers run inside a hook (a Bash tool.call, /forge),
+  // where a submit could be refused after the notice was already recorded.
   $.clock.every(POLL_MS, () => {
-    void pollBand($).catch(() => {});
+    void (async () => {
+      await pollBand($);
+      const cfg = await read($, bandConfig);
+      if (cfg.legacy || await read($, readError) !== null) return;
+      await announce($, cfg.repo, await read($, bandJobs), await $.clock.now());
+    })().catch(() => {});
   });
 }
 
@@ -321,6 +424,9 @@ export function registerBand(on: Parameters<Register>[0]): void {
     }
     return next(e);
   });
+
+  // A launch this session made: claim it for the mod's notices (see claimLaunch).
+  on('classic.PostToolUse', { tool_name: LAUNCH_TOOL }, claimLaunch);
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     noteViewport(e.viewport?.columns);

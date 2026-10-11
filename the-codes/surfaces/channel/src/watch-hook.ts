@@ -10,6 +10,7 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { parseLaunch, unwrapResponse } from '../../mod/hooks/notice.ts';
 import { type JobWatchOptions, runJobWatch } from './monitor.ts';
 
 /** Longest job a spawn may request (forge MAX_TIMEOUT_MS = 6h). */
@@ -23,65 +24,24 @@ export interface WatchTarget {
   readonly timeoutMs: number;
 }
 
-const TOOLS: Record<string, 'job' | 'run'> = { spawn_job: 'job', resume_job: 'job', run_pipeline: 'run' };
-
-function toolKind(name: unknown): 'job' | 'run' | null {
-  if (typeof name !== 'string') return null;
-  const bare = name.includes('__') ? name.slice(name.lastIndexOf('__') + 2) : name;
-  return TOOLS[bare] ?? null;
-}
+export { unwrapResponse };
 
 const isObj = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v);
 
-/** Normalise any MCP result shape to the tool's payload object, or null on error/unparseable. */
-export function unwrapResponse(response: unknown, depth = 0): Record<string, unknown> | null {
-  if (depth > 4) return null;
-  if (typeof response === 'string') {
-    try { return unwrapResponse(JSON.parse(response) as unknown, depth + 1); } catch { return null; }
-  }
-  if (Array.isArray(response)) {
-    // content array directly
-    for (const part of response) {
-      if (isObj(part) && typeof part['text'] === 'string') {
-        const r = unwrapResponse(part['text'], depth + 1);
-        if (r) return r;
-      }
-    }
-    return null;
-  }
-  if (!isObj(response)) return null;
-  if (response['isError'] === true) return null;
-  if (isObj(response['structuredContent'])) return response['structuredContent'];
-  if (Array.isArray(response['content'])) return unwrapResponse(response['content'], depth + 1);
-  return response;
-}
-
-/** Decide what (if anything) to watch from a parsed hook input. */
+/**
+ * Decide what (if anything) to watch from a parsed hook input. The ack parsing
+ * is the mod's (notice.ts parseLaunch), so both announcers agree on what a
+ * launch started; only the cwd fallbacks are the hook's own.
+ */
 export function parseHookInput(input: unknown, env: NodeJS.ProcessEnv = process.env): WatchTarget | null {
   if (!isObj(input)) return null;
-  const kind = toolKind(input['tool_name']);
-  if (kind === null) return null;
-  const payload = unwrapResponse(input['tool_response']);
-  if (payload === null || typeof payload['error'] === 'string') return null;
-  const id = kind === 'job' ? payload['jobId'] : payload['runId'];
-  if (typeof id !== 'string' || id.length === 0) return null;
-
-  let cwd: string | null = null;
-  if (typeof payload['repo'] === 'string' && payload['repo'].length > 0) cwd = payload['repo'];
-  else if (kind === 'job' && typeof payload['dir'] === 'string') {
-    // .../.agent-smith/jobs/<id>
-    const jobs = path.dirname(payload['dir']);
-    if (path.basename(jobs) === 'jobs' && path.basename(path.dirname(jobs)) === '.agent-smith') cwd = path.dirname(path.dirname(jobs));
-  } else if (kind === 'run' && typeof payload['recordPath'] === 'string') {
-    // .../.agent-smith/pipelines/<id>.json
-    const dir = path.dirname(payload['recordPath']);
-    if (path.basename(dir) === 'pipelines' && path.basename(path.dirname(dir)) === '.agent-smith') cwd = path.dirname(path.dirname(dir));
-  }
+  const launch = parseLaunch(input['tool_name'], input['tool_response']);
+  if (launch === null) return null;
+  let cwd = launch.repo;
   if (cwd === null && typeof input['cwd'] === 'string' && input['cwd'].length > 0) cwd = input['cwd'];
   if (cwd === null) cwd = env['AGY_WATCH_CWD'] || process.cwd();
-  const ackTimeout = payload['timeoutMs'];
-  const timeoutMs = (typeof ackTimeout === 'number' && Number.isFinite(ackTimeout) && ackTimeout > 0 ? ackTimeout : MAX_WATCH_JOB_MS) + 60_000;
-  return { kind, id, cwd: path.resolve(cwd), timeoutMs };
+  const timeoutMs = (launch.timeoutMs ?? MAX_WATCH_JOB_MS) + 60_000;
+  return { kind: launch.kind, id: launch.id, cwd: path.resolve(cwd), timeoutMs };
 }
 
 /** Run the hook. Resolves to the process exit code (2 = wake Claude). */
@@ -102,12 +62,14 @@ export async function runHook(
       jobIds: target.kind === 'job' ? [target.id] : [],
       runIds: target.kind === 'run' ? [target.id] : [],
       onError: () => {},
-      emit: (line) => { lines.push(line); },
+      // The notice as written, line breaks kept; the timeout line has no batch.
+      emit: (line, batch) => { lines.push(batch?.content ?? line); },
     });
     if (lines.length === 0) return 0;
-    // Exit 2 is the wake protocol, and the host labels it "Stop hook blocking error".
-    // Say plainly that this is a job notification so nobody reads the label as a failure.
-    write(lines.join('\n') + '\n(Agent Smith job notification delivered via hook; not an error.)\n');
+    // Exit 2 is the wake protocol, and the host labels it "Stop hook feedback".
+    // This path runs only without the mod (which claims the job and announces it
+    // itself), so say plainly that it is a notice, not an error.
+    write(lines.join('\n') + '\n(Agent Smith completion notice, delivered by hook: not an error.)\n');
     return 2;
   } catch {
     return 0;

@@ -65,8 +65,8 @@ worker fails because a tool was denied, ask the user before retrying with
 
 ## While it runs
 
-`spawn_job` returns at once and the worker runs in the background. Completion is announced
-by a plugin hook, so silence in the meantime is normal and polling only spends context.
+`spawn_job` returns at once and the worker runs in the background. Agent Smith announces
+completion itself, so silence in the meantime is normal and polling only spends context.
 `/forge` shows live activity. If no notice arrives (hooks can't run in headless `-p` or
 other clients), run the ack's `notify.monitorCommand` under the Monitor tool, or call
 `status` with `wait_ms`. Live steering isn't supported: wait for the job to finish, then

@@ -47,8 +47,8 @@ npm run build
 /path/to/agent-smith/dev.sh --repo /path/to/your/project
 ```
 
-That route has no completion hook, so Claude must ask for job status itself
-rather than being woken.
+That route has no completion hook. The mod may still announce finished jobs (not yet
+verified there); if nothing arrives, ask Claude to check job status.
 
 Then ask for work in plain language:
 
@@ -80,8 +80,10 @@ workers (`list_jobs`), cancel work (`cancel`) and read a pipeline's state
 (`pipeline_status`). Every parameter is documented in
 [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
-Claude does not poll for results. A hook watches each job and wakes Claude when
-it finishes or needs attention.
+Claude does not poll for results. When a job finishes or needs attention, Agent
+Smith adds one dim line to the transcript (`agent-smith: ✓ Ada (codex review)
+succeeded in 43s · 2 files changed · checks 2/2`) and starts a turn for Claude
+that names Agent Smith as the sender.
 
 ### Modes
 
@@ -199,9 +201,10 @@ resume_job { "worker": "Rae", "prompt": "Explain finding 2 with a failing input.
   It inherits the `PATH` of whatever launched Claude. Restart Claude, or point at
   the binary with `AGENT_SMITH_CODEX_BIN` (likewise `_OPENCODE_`, `_AGY_`,
   `_CLAUDE_`).
-- **Claude is never woken.** The completion hook exists only in the installed
-  plugin, not under `dev.sh`, and only loads after a restart. Without it, ask for
-  `status` with `wait_ms`.
+- **Claude is never woken.** Notices come from the installed plugin and load only
+  after a restart. Without the plugin's mod, a fallback hook wakes Claude instead,
+  and Claude Code labels that wake "Stop hook feedback"; it is a notice, not an
+  error. If neither arrives, ask for `status` with `wait_ms`.
 - **A worker "succeeded" but did nothing.** It was probably refused a tool.
   Agent Smith records that as a failure. The job's `nextAction` suggests a fix,
   usually rerunning with `unrestricted: true`. Do that only if you accept what

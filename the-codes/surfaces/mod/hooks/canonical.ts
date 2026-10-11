@@ -87,6 +87,7 @@ export async function readForgeJob(fs: FsLike, repo: string, id: string, now: nu
     activity: latest ? describeActivity(text(latest.tool) ?? '', text(latest.input) ?? '') : '',
     task: text(m.task) ?? '', latestSummary,
     summarySource: (p?.summarySource ?? m.summarySource) === 'worker' && latestSummary !== null ? 'worker' : null,
+    changedFileCount: Array.isArray(m.changedFiles) && m.changedFilesTruncated !== true ? m.changedFiles.length : null,
     acceptance: a, failureReason: text(m.failureReason, m.error, status === 'failed' ? warnings[0]?.message : null),
     warnings, report: null, reasoning: text(p?.latestText), raw: {},
   };
