@@ -345,6 +345,11 @@ export function jobsDir(repo: string): string {
   return path.join(repo, ...JOBS_DIR_SEGMENTS);
 }
 
+/** Where `agent-smith gc` moves settled jobs instead of deleting them. */
+export function archivedJobsDir(repo: string): string {
+  return path.join(repo, '.agent-smith', 'archive', 'jobs');
+}
+
 export function jobDir(repo: string, jobId: string): string {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/.test(jobId) || jobId === '.' || jobId === '..') {
     throw new Error(`invalid job id "${jobId}"`);
