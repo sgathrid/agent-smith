@@ -7,9 +7,11 @@
  * the mod, the PostToolUse command hook (channel/src/watch-hook.ts) wakes Claude
  * with exit 2. Both render here, so the two paths cannot drift apart.
  *
- * Who announces is decided once per launch, at `classic.PostToolUse`: the mod
- * claims the job and does not call `next`, so the command hook never starts.
- * Nothing else announces a claimed job (see register.tsx, `claimLaunch`).
+ * Who announces is decided once per launch, when the mod sees the launch
+ * (`tool.call`, or `classic.PostToolUse` where the host delivers it): the mod
+ * claims the job and writes a claim marker; the command hook, if it starts at
+ * all, finds the marker when the job ends and stays silent. Nothing else
+ * announces a claimed job (see register.tsx, `takeLaunch`).
  */
 
 /**

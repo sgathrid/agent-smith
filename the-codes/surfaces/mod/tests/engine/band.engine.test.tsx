@@ -523,7 +523,10 @@ function forgeHost(on: (...args: any[]) => void, files: Record<string,string>, i
   on('ui.scroll', (_$: unknown, e: any) => { host.scrolls.push({...e}); return {}; });
   on('ui.close', (_$: unknown, e: any) => { host.closes.push({...e}); return {value:undefined}; });
   on('ui.render', ($: any, e: any) => $.ui.resolve(e).Text({ children: 'REST-OF-BAND' }));
-  on('tool.call', (_$: unknown, e: any) => e.tool==='TaskCreate'?{result:{task:{id:'native-task-1'}}}:{result:{success:true}});
+  on('tool.call', (_$: unknown, e: any) => e.tool==='TaskCreate'?{result:{task:{id:'native-task-1'}}}
+    // Core answering a spawn_job call with its ack, for launches seen through tool.call.
+    :/__spawn_job$/.test(e.tool)?{result:{structuredContent:{jobId:e.jobId,repo:'/work',timeoutMs:600_000},content:[]}}
+    :{result:{success:true}});
   const clock = mock.clock(on as never,{now:RUNNING_NOW});
   on('fs.list', () => ({value:ids.map(name=>({name,kind:'dir',size:0}))}));
   on('fs.exists', (_$: unknown, e: any) => ({value:e.path==='/work/.agent-smith/jobs'||Object.hasOwn(files,e.path)}));
@@ -776,6 +779,20 @@ describe('completion notices', () => {
     expect(said.logs).toEqual(['✓ Ada (codex review) succeeded in 44s · 2 files changed · checks 2/2']);
     expect(said.prompts).toHaveLength(1);
     expect(said.prompts[0]).toMatch(/^Agent Smith · ✓ Ada \(codex review\) succeeded in 44s · 2 files changed · checks 2\/2\. Job ID job-ada\./);
+  });
+
+  test('a launch seen only through tool.call is claimed, marked and announced once', async ($, on) => {
+    const files = ada('running');
+    const { clock, said } = noticeHost(on, files, ['job-ada']);
+    await start($);
+    const r = await ($ as any).tool.call({ tool: 'mcp__plugin_agent-smith_agent-smith__spawn_job', jobId: 'job-ada' });
+    expect(r.result.structuredContent.jobId).toBe('job-ada'); // passed through untouched
+    expect(Object.hasOwn(files, '/work/.agent-smith/claims/job-job-ada')).toBe(true);
+    Object.assign(files, ada('succeeded', {finishedAt:iso(RUNNING_NOW+1000)}));
+    await clock.advance(3000);
+    await clock.advance(3000);
+    expect(said.logs).toHaveLength(1);
+    expect(said.prompts).toHaveLength(1);
   });
 
   test("another session's job finishing in the same repo is not announced here", async ($, on) => {

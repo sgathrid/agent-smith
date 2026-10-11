@@ -311,7 +311,7 @@ declare module 'claude-code' {
    * unless the user caused it", where the user causing it is dispatching work.
    */
   export interface ToolCallMatcher {
-    readonly tool: string;
+    readonly tool: string | RegExp;
   }
 
   /**
@@ -343,7 +343,7 @@ declare module 'claude-code' {
   /** A tool invocation. Only the fields this mod reads are declared. */
   export interface ToolCallEvent {
     /** Tool name, e.g. 'Bash'. */
-    readonly tool: string;
+    readonly tool: string | RegExp;
     /** For Bash: the command line. */
     readonly command?: string;
     [key: string]: unknown;

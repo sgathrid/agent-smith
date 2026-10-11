@@ -39,6 +39,7 @@ import {
   parseLaunch,
   runFileName,
   userLines,
+  type Launch,
   type Owned,
   type RunRecord,
 } from './notice.ts';
@@ -254,21 +255,32 @@ const sameRepo = (a: string, b: string): boolean => a.replace(/\/+$/, '') === b.
 async function claimLaunch($: EngineInterface, e: PostToolUseEvent, next: (e: unknown) => Promise<unknown>): Promise<unknown> {
   const launch = parseLaunch(e.tool_name, e.tool_response);
   if (launch === null) return next(e);
+  return await takeLaunch($, launch, typeof e.cwd === 'string' ? e.cwd : '') ? {} : next(e);
+}
+
+/**
+ * Record a launch for this session's view and, where the mod can watch it,
+ * claim its announcement. True when claimed. Idempotent: `tool.call` and
+ * `classic.PostToolUse` may both deliver the same launch.
+ */
+async function takeLaunch($: EngineInterface, launch: Launch, cwd: string): Promise<boolean> {
   const cfg = await read($, bandConfig);
-  const repo = launch.repo ?? (typeof e.cwd === 'string' ? e.cwd : '');
+  const repo = launch.repo ?? cwd;
   // Whether this session shows the job is a separate question from who
   // announces it: any launch in this repo is shown, even one the hook keeps.
   if (cfg.repo !== '' && sameRepo(repo, cfg.repo)) await update($, launched, (l) => recordLaunch(l, launch));
   // Legacy mode reads the agy-staff layout, and a read error means no rows: the
   // mod could not see this job finish, so the hook keeps it.
-  if (cfg.legacy || cfg.repo === '' || await read($, readError) !== null) return next(e);
-  if (!sameRepo(repo, cfg.repo)) return next(e);
+  if (cfg.legacy || cfg.repo === '' || await read($, readError) !== null) return false;
+  if (!sameRepo(repo, cfg.repo)) return false;
   const at = await $.clock.now();
   await update($, notices, (owned) => claim(owned, launch, at));
-  // Belt and braces: if the host starts the command hook anyway, it finds this
-  // marker and stays silent. A failed write only loses the second guard.
+  // The hook finds this marker when the job ends and stays silent. Where the
+  // host skips user-tier modules for classic.PostToolUse (observed: "bypassed by
+  // cc-plugin-sec-default"), this marker is the only thing that stops a second
+  // notice, so the tool.call path below writes it too.
   await $.fs.write(claimMarkerPath(cfg.repo, launch.kind, launch.id), `${new Date(at).toISOString()}\n`).catch(() => {});
-  return {};
+  return true;
 }
 
 // A slow pass can overlap the next tick; one announcement pass at a time.
@@ -455,6 +467,16 @@ export function registerBand(on: Parameters<Register>[0]): void {
 
   // A launch this session made: claim it for the mod's notices (see claimLaunch).
   on('classic.PostToolUse', { tool_name: LAUNCH_TOOL }, claimLaunch);
+  // The path that works when classic.PostToolUse is withheld from user-tier
+  // modules: wrap the launch tool, read its result, return it untouched.
+  on('tool.call', { tool: LAUNCH_TOOL }, async ($, e, next) => {
+    const r = await next(e) as { result?: unknown; text?: unknown; deny?: string; isError?: boolean } | undefined;
+    if (r && r.deny === undefined && r.isError !== true) {
+      const launch = parseLaunch(e.tool, r.result) ?? parseLaunch(e.tool, r.text);
+      if (launch !== null) await takeLaunch($, launch, '').catch(() => {});
+    }
+    return r;
+  });
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     noteViewport(e.viewport?.columns);
