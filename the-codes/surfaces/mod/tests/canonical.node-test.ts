@@ -41,6 +41,16 @@ test('canonical silence and orphan markers have distinct truthful outcomes', asy
   assert.equal(orphan?.acceptance?.pending, false, 'an exited supervisor cannot run its pending checks');
   assert.equal(orphan?.acceptance?.state, 'unchecked');
 });
+test('canonical: a cancel request beside the orphan marker is canceled; without the marker it is not orphaned', async () => {
+  const files = { [`${base}/job.json`]: JSON.stringify(manifest), [`${base}/cancel`]: new Date(now).toISOString() };
+  const canceled = (await readForgeJobs(memoryFs({ ...files, [`${base}/orphaned`]: '',
+    [`${base}/acceptance.json`]: JSON.stringify({state:'unchecked',pending:true,checks:[]}) }), '/repo', now))[0];
+  assert.equal(canceled?.status, 'canceled');
+  assert.equal(canceled?.acceptance?.pending, false);
+  assert.ok(!canceled?.warnings.some(w => w.code === 'orphaned'));
+  assert.equal((await readForgeJobs(memoryFs(files), '/repo', now))[0]?.status, 'running', 'cancel alone leaves the supervisor to settle it');
+  assert.equal((await readForgeJobs(memoryFs({ [`${base}/job.json`]: JSON.stringify(manifest), [`${base}/orphaned`]: '' }), '/repo', now))[0]?.status, 'failed');
+});
 test('canonical result snapshot prevents a stale orphan marker from overriding a live job', async () => {
   const job = (await readForgeJobs(memoryFs({
     [`${base}/job.json`]: JSON.stringify(manifest),

@@ -69,6 +69,7 @@ import { FILES, jobDir, jobFile } from './format.ts';
 import type { ForgeService, SpawnRequest } from './service.ts';
 import type { ForgeActivity, ForgeManifest } from './format.ts';
 import { appendBounded } from './writer.ts';
+import { isMode, MODE_PRESETS } from './modes.ts';
 import { runChecks } from '../verify/runner.ts';
 import { normalizeAcceptanceReport, toVerifyChecks } from './checks.ts';
 import type { Check } from '../verify/types.ts';
@@ -257,9 +258,18 @@ export function buildStagePrompt(args: {
     }
   }
 
+  // The service prepends the mode preamble, and a read-only preamble says "do not
+  // edit files; put findings in your reply". A stage MUST write its artifact, so
+  // say which write is allowed instead of leaving the two instructions to collide.
+  const mode = args.stage.role ?? args.stage.name;
+  const readOnly = isMode(mode) && MODE_PRESETS[mode].readOnly;
   parts.push(
     '',
     'OUTPUT ARTIFACT (separate from the source workspace):',
+    ...(readOnly
+      ? ['This is a read-only stage: do not edit, create or delete any file in the source workspace. ' +
+         'Writing the output artifact below is your only permitted write and it overrides "put findings in your reply".']
+      : []),
     `Write your full answer to ${stageArtifactPath(args.artifactRoot ?? args.workDir, args.stage.name, args.stage.resultPath)}. ` +
       'That file is what the next stage reads; a summary you say in prose is not.',
   );
