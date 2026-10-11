@@ -108,7 +108,13 @@ export function startPipeline(
 
   const controller = new AbortController();
   if (existsSync(pipelineCancelPath(service.repo, runId))) controller.abort('pipeline cancellation requested');
-  const runner = createForgeRunner({ service, runId, unrestricted: options.unrestricted });
+  const runner = createForgeRunner({
+    service, runId, unrestricted: options.unrestricted,
+    onStageRunning(result) {
+      current = { ...current, stageResults: { ...current.stageResults, [result.stage]: result } };
+      persist();
+    },
+  });
   const runners = Object.fromEntries(providerNames().map((provider) => [provider, runner]));
   const poll = setInterval(() => {
     if (existsSync(pipelineCancelPath(service.repo, runId))) controller.abort('pipeline cancellation requested');

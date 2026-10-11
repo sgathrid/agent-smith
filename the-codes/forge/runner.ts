@@ -73,7 +73,8 @@ import type { ForgeActivity, ForgeManifest } from './format.ts';
 import { appendBounded } from './writer.ts';
 import { isMode, MODE_PRESETS } from './modes.ts';
 import { runChecks } from '../verify/runner.ts';
-import { normalizeAcceptanceReport, toVerifyChecks } from './checks.ts';
+import { acceptanceChecksFromReport, acceptanceState, normalizeAcceptanceReport, toVerifyChecks, writeAcceptance } from './checks.ts';
+import type { Acceptance } from './checks.ts';
 import type { Check } from '../verify/types.ts';
 
 /**
@@ -311,6 +312,8 @@ export interface RunnerDeps {
   readonly unrestricted?: boolean | undefined;
   /** Test/observability tap. Must not throw; the runner does not guard it. */
   readonly onObservation?: ((stage: string, obs: Observation) => void) | undefined;
+  /** Called once a stage's job exists, so the pipeline record can show it running. Must not throw. */
+  readonly onStageRunning?: ((result: StageResult) => void) | undefined;
 }
 
 /** Build the StageRunner. One closure over the service; nothing global. */
@@ -367,6 +370,14 @@ export function createForgeRunner(deps: RunnerDeps): StageRunner {
       mkdirSync(path.dirname(stageArtifactPath(artifactRoot, stage.name, stage.resultPath)), { recursive: true });
       const tracked = await deps.service.spawnTracked(request);
       jobId = tracked.ack.jobId;
+      // As spawn_job does: the job reads "checks pending" until a verdict exists.
+      if (stage.checks?.length) recordAcceptance(deps.service.repo, jobId, { state: 'unchecked', checks: [], pending: true });
+      deps.onStageRunning?.({
+        stage: stage.name, jobId, status: 'running', provider: ctx.routing.provider,
+        ...(ctx.routing.model === undefined ? {} : { model: ctx.routing.model }),
+        // The record's required timing fields: only startedAt is meaningful until the stage ends.
+        startedAt, finishedAt: startedAt, durationMs: 0,
+      });
 
       // The DAG aborts a stage by firing ctx.signal; the worker is a separate
       // process, so the bridge is `cancel`.
@@ -392,11 +403,16 @@ export function createForgeRunner(deps: RunnerDeps): StageRunner {
 
       publishArtifact(deps.service.repo, jobId, stage, artifactRoot);
       const result = toStageResult(stage, ctx, manifest, observations, startedAt, artifactRoot);
-      if (manifest.status !== 'succeeded') return result;
-      if (!stage.checks?.length) return { ...result, acceptance: 'unchecked' };
+      if (!stage.checks?.length) return manifest.status === 'succeeded' ? { ...result, acceptance: 'unchecked' } : result;
+      if (manifest.status !== 'succeeded') {
+        recordAcceptance(deps.service.repo, jobId, { state: 'rejected', checks: [], at: new Date().toISOString(), reason: 'job did not succeed; checks not run' });
+        return result;
+      }
 
       const checks: Check[] = toVerifyChecks(stage.checks, ctx.workDir);
       const report = normalizeAcceptanceReport(await runChecks(checks, { signal: ctx.signal }), stage.checks);
+      const acceptanceChecks = acceptanceChecksFromReport(report, stage.checks);
+      recordAcceptance(deps.service.repo, jobId, { state: acceptanceState(acceptanceChecks), checks: acceptanceChecks, at: new Date().toISOString() });
       const checkEvidence = report.verdicts.map((verdict) =>
         `${verdict.passed ? 'PASS' : 'FAIL'} ${verdict.check.name}: ${verdict.reason}`,
       ).join('\n');
@@ -437,6 +453,11 @@ export function createForgeRunner(deps: RunnerDeps): StageRunner {
   return { id: 'forge', run };
 }
 
+/** Persist the stage job's acceptance beside its record. A failed write must not fail the stage. */
+function recordAcceptance(repo: string, jobId: string, acceptance: Acceptance): void {
+  try { writeAcceptance(repo, jobId, acceptance); } catch (err) { process.stderr.write(`agent-smith acceptance ${jobId}: ${String(err)}\n`); }
+}
+
 /* ── observation collection ──────────────────────────────────────────────── */
 
 /**
@@ -457,17 +478,21 @@ export async function collectObservations(
   onObservation?: (stage: string, obs: Observation) => void,
 ): Promise<Observation[]> {
   const out: Observation[] = [];
-  const seen = new Set<string>();
+  // A tool step is one row that moves active -> done/error/denied, so a step's
+  // identity is its index and a later state replaces the earlier one.
+  const slots = new Map<number, number>();
+  const states = new Map<number, string>();
   for (;;) {
     const rows = await service.activities(jobId);
     let progressed = false;
     for (const row of rows) {
-      const key = `${row.stepIndex}:${row.tool}:${row.status}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
+      const key = `${row.tool}:${row.status}`;
+      if (states.get(row.stepIndex) === key) continue;
+      states.set(row.stepIndex, key);
       progressed = true;
       const obs = toObservation(row);
-      out.push(obs);
+      const slot = slots.get(row.stepIndex);
+      if (slot === undefined) { slots.set(row.stepIndex, out.length); out.push(obs); } else out[slot] = obs;
       try {
         onObservation?.(stage, obs);
       } catch {
@@ -557,6 +582,8 @@ export function toStageResult(
   const ref = stageArtifactRef(stage.name, stage.resultPath);
   const artifact = path.resolve(stageArtifactPath(workDir, stage.name, stage.resultPath));
   const report = readTail(artifact);
+  // Listing a file that is not there sends the next stage after a ghost.
+  const written = existsSync(artifact);
   const base = {
     stage: stage.name,
     jobId: manifest.jobId,
@@ -565,8 +592,9 @@ export function toStageResult(
     startedAt,
     finishedAt,
     durationMs,
-    resultPath: ref,
-    artifacts: [{ stage: stage.name, path: ref, label: 'result.md' }],
+    ...(written
+      ? { resultPath: ref, artifacts: [{ stage: stage.name, path: ref, label: 'result.md' }] }
+      : { artifacts: [], warnings: [`${ref} not found on disk; the stage wrote no artifact`] }),
     ...(manifest.conversation === null ? {} : { transcriptRef: manifest.conversation }),
     ...(report === null ? {} : { outputTail: report }),
     observations,

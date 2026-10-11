@@ -396,6 +396,8 @@ export interface StageResult {
   /** Everything this stage can hand to downstream stages. */
   readonly artifacts?: readonly ArtifactRef[] | undefined;
   readonly failure?: StageFailure | undefined;
+  /** Non-fatal facts a reader should know, e.g. an artifact the stage did not write. */
+  readonly warnings?: readonly string[] | undefined;
   readonly skippedBecause?: SkipReason | undefined;
   /** Escalations applied before this result was reached. */
   readonly escalations?: readonly Escalation[] | undefined;

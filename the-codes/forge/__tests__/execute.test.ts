@@ -32,3 +32,24 @@ test('pipeline runs receive unique atomic records and a cross-process cancel mar
   assert.equal(canceled.aborted, true);
   assert.equal(readPipeline(repo, cancelAttempt.runId)?.status, canceled.status);
 });
+
+test('a running stage shows in the record with its job, then is replaced by its result', async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-execute-'));
+  const service = new ForgeService({ repo });
+  const spec = { name: 'live', workDir: repo, stages: [{ name: 'slow', provider: 'agy', prompt: 'run slowly' }] } as const;
+  const run = startPipeline(service, spec, { runId: 'run-live' });
+  let running = readPipeline(repo, run.runId)?.stageResults['slow'];
+  for (let i = 0; i < 100 && running?.status !== 'running'; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    running = readPipeline(repo, run.runId)?.stageResults['slow'];
+  }
+  assert.equal(running?.status, 'running');
+  assert.ok(running?.jobId);
+  assert.equal(running?.provider, 'agy');
+  assert.ok(running?.startedAt);
+  run.cancel();
+  await run.done;
+  const final = readPipeline(repo, run.runId)?.stageResults['slow'];
+  assert.notEqual(final?.status, 'running');
+  assert.equal(final?.jobId, running?.jobId);
+});
