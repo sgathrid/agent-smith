@@ -133,6 +133,20 @@ test('runHook stays silent for a launch the mod claimed', async () => {
   fs.rmSync(repo, { recursive: true, force: true });
 });
 
+test('runHook finds the claim through a symlinked repo path', async () => {
+  const real = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'agy-claim-real-')));
+  const link = `${real}-link`;
+  fs.symlinkSync(real, link);
+  const marker = claimMarkerPath(real, 'job', 'j1');
+  fs.mkdirSync(path.dirname(marker), { recursive: true });
+  fs.writeFileSync(marker, 'claimed\n');
+  const code = await runHook(JSON.stringify(wrap('spawn_job', { ...ack, repo: link })), () => {}, {
+    readJob: async () => job('j1', 'succeeded'), intervalMs: 50,
+  });
+  assert.equal(code, 0);
+  fs.rmSync(link); fs.rmSync(real, { recursive: true, force: true });
+});
+
 test('full scan caches terminal jobs instead of re-reading them', async () => {
   clearReadCache();
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-cache-'));

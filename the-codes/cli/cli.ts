@@ -2,7 +2,7 @@
 
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { fileURLToPath } from 'node:url';
@@ -318,6 +318,19 @@ function settledAtMs(job: Record<string, unknown>): number | null {
   return null;
 }
 
+/** Delete completion-notice claim markers (.agent-smith/claims) older than the cutoff; they only matter while a job runs. */
+function sweepClaims(repo: string, cutoff: number): number {
+  const dir = path.join(repo, '.agent-smith', 'claims');
+  let removed = 0;
+  try {
+    for (const name of readdirSync(dir)) {
+      const file = path.join(dir, name);
+      try { if (statSync(file).mtimeMs < cutoff) { rmSync(file); removed += 1; } } catch { /* raced or unreadable: leave it */ }
+    }
+  } catch { /* no claims yet */ }
+  return removed;
+}
+
 /** Archives (default), deletes, or dry-runs settled jobs older than a threshold. Running jobs are never touched. */
 export async function cmdGc(args: GcArgs = {}): Promise<number> {
   const repo = path.resolve(args.repo ?? process.cwd());
@@ -369,6 +382,8 @@ export async function cmdGc(args: GcArgs = {}): Promise<number> {
     process.stdout.write(`${label} ${jobId}\n`);
     acted += 1;
   }
+  const swept = args.dryRun === true ? 0 : sweepClaims(repo, cutoff);
+  if (swept > 0) process.stdout.write(`removed ${swept} completion-notice claim marker(s)\n`);
   process.stdout.write(`gc: ${acted} ${args.dryRun === true ? 'would be ' : ''}${action}d, ${kept} kept, ${skipped} skipped (older than ${ageRaw})\n`);
   return EXIT.ok;
 }

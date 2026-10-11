@@ -1,7 +1,7 @@
 import { assertFakeProviderActive } from '../../forge/testing/shim.ts';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -164,6 +164,22 @@ test('gc archives settled jobs older than the threshold and keeps recent ones', 
   assert.equal(existsSync(jobDir(repo, 'recent-job')), true);
   const archived = path.join(archivedJobsDir(repo), 'old-job', 'job.json');
   assert.equal(JSON.parse(readFileSync(archived, 'utf8')).status, 'succeeded', 'archiving moves job.json intact');
+});
+
+test('gc sweeps claim markers older than the threshold and keeps fresh ones', async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-gc-claims-'));
+  const claims = path.join(repo, '.agent-smith', 'claims');
+  mkdirSync(claims, { recursive: true });
+  writeFileSync(path.join(claims, 'job-old'), 'x'); writeFileSync(path.join(claims, 'job-new'), 'x');
+  const old = new Date(Date.now() - 30 * 86_400_000);
+  utimesSync(path.join(claims, 'job-old'), old, old);
+  const dry = await captureMain(['gc', '--repo', repo, '--dry-run']);
+  assert.equal(existsSync(path.join(claims, 'job-old')), true, 'dry run removes nothing');
+  assert.doesNotMatch(dry.out, /claim marker/);
+  const { out } = await captureMain(['gc', '--repo', repo]);
+  assert.match(out, /removed 1 completion-notice claim marker/);
+  assert.equal(existsSync(path.join(claims, 'job-old')), false);
+  assert.equal(existsSync(path.join(claims, 'job-new')), true);
 });
 
 test('gc never touches running jobs, whatever their age', async () => {

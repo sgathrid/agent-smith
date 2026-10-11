@@ -10,7 +10,7 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { claimMarkerPath, parseLaunch, unwrapResponse } from '../../mod/hooks/notice.ts';
 import { type JobWatchOptions, runJobWatch } from './monitor.ts';
 
@@ -68,7 +68,7 @@ export async function runHook(
     });
     if (lines.length === 0) return 0;
     // The mod claimed this launch and announces it; a second notice would repeat it.
-    if (existsSync(claimMarkerPath(target.cwd, target.kind, target.id))) return 0;
+    if (claimed(target.cwd, target.kind, target.id)) return 0;
     // Exit 2 is the wake protocol, and the host labels it "Stop hook feedback".
     // This path runs only without the mod (which claims the job and announces it
     // itself), so say plainly that it is a notice, not an error.
@@ -77,6 +77,16 @@ export async function runHook(
   } catch {
     return 0;
   }
+}
+
+/**
+ * The mod writes the marker under the repo path it was configured with; the
+ * ack may spell the same repo differently (a symlinked /tmp, say), so check
+ * the canonical path as well.
+ */
+function claimed(cwd: string, kind: 'job' | 'run', id: string): boolean {
+  if (existsSync(claimMarkerPath(cwd, kind, id))) return true;
+  try { return existsSync(claimMarkerPath(realpathSync(cwd), kind, id)); } catch { return false; }
 }
 
 async function readStdin(): Promise<string> {
