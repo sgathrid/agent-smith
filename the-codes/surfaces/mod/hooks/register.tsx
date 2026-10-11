@@ -204,6 +204,12 @@ async function pollBand($: EngineInterface): Promise<void> {
   // `ui.invalidate` is rate-limited by the engine for good cause.
   const before = JSON.stringify(previous);
   if (before !== JSON.stringify(next)) await update($, bandJobs, () => next);
+  // `fresh` is a successful read (failures returned above), so a key whose job is
+  // gone is stale. Other repos' keys belong to other sessions and are never touched.
+  const liveKeys = new Set(fresh.flatMap((job) => [scopedJobKey(cfg.repo, job.id), job.id]));
+  const isStale = (key: string) => belongsToRepo(key, cfg.repo) && !liveKeys.has(key);
+  if ((await read($, cleared)).some(isStale)) await update($, cleared, (keys) => keys.filter((key) => !isStale(key)));
+  if ((await read($, acknowledged)).some(isStale)) await update($, acknowledged, (keys) => keys.filter((key) => !isStale(key)));
   if (!cfg.legacy) await pollNativeTasks($, cfg.repo, next);
 }
 
@@ -606,14 +612,14 @@ async function renderForge($: EngineInterface, e: UiRenderEvent, bottom: boolean
     check: async index => { await update($, expandedChecks, ids => ids.includes(index)?ids.filter(i=>i!==index):[...ids,index]); },
     clear: async () => {
       const settled = jobs.filter(j=>isTerminal(j.status)&&!j.acceptance?.pending);
-      const ackKeys = settled.filter(j=>needsAttention(j)).map(j=>scopedJobKey(cfg.repo,j.id));
-      const hideKeys = settled.filter(j=>!needsAttention(j)).map(j=>scopedJobKey(cfg.repo,j.id));
+      const ackKeys = settled.filter(j=>needsAttention(j,false,t)).map(j=>scopedJobKey(cfg.repo,j.id));
+      const hideKeys = settled.filter(j=>!needsAttention(j,false,t)).map(j=>scopedJobKey(cfg.repo,j.id));
       await update($, acknowledged, ids => [...new Set([...ids,...ackKeys])]);
       await update($, cleared, ids => [...new Set([...ids,...hideKeys])]);
     },
     acknowledge: async () => {
       const job = jobs.find(item => item.id === pick);
-      if (!job || !isTerminal(job.status) || job.acceptance?.pending || !needsAttention(job)) return;
+      if (!job || !isTerminal(job.status) || job.acceptance?.pending || !needsAttention(job,false,t)) return;
       const key = scopedJobKey(cfg.repo,job.id);
       await update($, acknowledged, ids => ids.includes(key) ? ids : [...ids,key]);
     },

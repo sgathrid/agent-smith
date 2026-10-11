@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { rosterJobs, groupWorkers, workerStatus, rosterSummary, scopedJobKey, belongsToRepo } from '../hooks/dashboard.ts';
+import { ATTENTION_TTL_MS, needsAttention, rosterJobs, groupWorkers, workerStatus, rosterSummary, scopedJobKey, belongsToRepo } from '../hooks/dashboard.ts';
 import type { RadarJob } from '../types/index.d.ts';
 const job=(id:string,extra:Partial<RadarJob>={}):RadarJob=>({id,status:'running',startedAt:100,endedAt:null,toolCount:1,activity:'Read file.ts',task:'Review',warnings:[],report:null,reasoning:null,raw:{},...extra});
 test('pending checks and rejected work remain active; settled success moves to history',()=>{
@@ -47,4 +47,26 @@ test('failed rows show their failure reason and do not show unchecked when no ch
   assert.equal(workerStatus(job('orphan',{status:'failed',failureReason:'orphaned',acceptance:{state:'unchecked',checks:[]}})),'failed · orphaned');
   assert.equal(workerStatus(job('failed',{status:'failed',acceptance:{state:'unchecked',checks:[]}})),'failed');
   assert.equal(workerStatus(job('checked',{status:'failed',failureReason:'timeout',acceptance:{state:'rejected',checks:[{name:'tests',ok:false,outputTail:''}]}})),'failed · timeout');
+});
+
+test('settled attention items expire into History; live, pending and stalled work never does',()=>{
+  const now=10*ATTENTION_TTL_MS;
+  const old=now-ATTENTION_TTL_MS-1;
+  const oldFailed=job('old',{status:'failed',startedAt:old-10,endedAt:old,failureReason:'orphaned'});
+  const freshFailed=job('fresh',{status:'failed',startedAt:now-1000,endedAt:now-500});
+  const oldRejected=job('rejected',{status:'succeeded',startedAt:old-10,endedAt:old,acceptance:{state:'rejected',checks:[]}});
+  const startOnly=job('start-only',{status:'failed',startedAt:old,endedAt:null});
+  const undated=job('undated',{status:'failed',startedAt:null,endedAt:null});
+  const running=job('run',{startedAt:old-10});
+  const stalled=job('stalled',{status:'attention',startedAt:old-10});
+  const pending=job('pending',{status:'failed',startedAt:old-10,endedAt:old,acceptance:{state:'unchecked',pending:true,checks:[]}});
+  const all=[oldFailed,freshFailed,oldRejected,startOnly,undated,running,stalled,pending];
+  assert.deepEqual(rosterJobs(all,'active',[],[],'',now).map(j=>j.id).sort(),['fresh','pending','run','stalled','undated']);
+  assert.deepEqual(rosterJobs(all,'history',[],[],'',now).map(j=>j.id).sort(),['old','rejected','start-only']);
+  assert.match(rosterSummary(all,[],'',now),/4 need attention/); // fresh, stalled, undated, pending
+  assert.match(rosterSummary([oldFailed,oldRejected],[],'',now),/Forge · 0 active$/);
+  assert.equal(needsAttention(oldFailed,false,now),false);
+  assert.equal(needsAttention(oldFailed),true); // no clock, no expiry
+  assert.equal(needsAttention(oldFailed,false,old+ATTENTION_TTL_MS),true); // boundary is exclusive
+  assert.equal(workerStatus(oldFailed),'failed · orphaned');
 });

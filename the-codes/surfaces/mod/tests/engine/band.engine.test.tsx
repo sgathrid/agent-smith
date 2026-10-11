@@ -565,6 +565,57 @@ test('a settled failure can be acknowledged from its detail view and remains in 
   const reopened=await $.ui.mount(PANE_TARGET);
   expect(await reopened.find({key:'job-job-failed'})).toBeDefined();
 });
+const failedJob = (id: string, endedAt: number) => ({
+  [`/work/.agent-smith/jobs/${id}/job.json`]: JSON.stringify({schema:1,jobId:id,status:'failed',name:id,workerId:id,task:'Inspect',
+    startedAt:new Date(endedAt-5000).toISOString(),finishedAt:new Date(endedAt).toISOString(),updatedAt:new Date(endedAt).toISOString(),error:'supervisor exited (orphaned)'}),
+  [`/work/.agent-smith/jobs/${id}/acceptance.json`]: JSON.stringify({state:'unchecked',pending:false,checks:[]}),
+});
+function forgeFiles(on: (...args: any[]) => void, files: Record<string,string>, listing: { ids: string[]; fail: boolean }): void {
+  on('session.start', (_$: unknown, e: any) => ({sessionId:'s',cwd:e.cwd}));
+  on('command.register', () => ({value:undefined}));
+  on('env.get', () => ({value:undefined}));
+  on('ui.open', () => ({value:{isPlaced:true}}));
+  mock.clock(on,{now:RUNNING_NOW});
+  on('fs.list', () => listing.fail ? {deny:'EIO'} : {value:listing.ids.map(name=>({name,kind:'dir',size:0}))});
+  on('fs.exists', (_$: unknown, e: any) => ({value:e.path==='/work/.agent-smith/jobs'||Object.hasOwn(files,e.path)}));
+  on('fs.read', (_$: unknown, e: any) => { const body=files[e.path]; return body===undefined?{deny:'ENOENT'}:{value:body}; });
+}
+
+test('an old settled failure leaves Active and the attention count but stays in History', async ($, on) => {
+  const files = { ...failedJob('job-old', RUNNING_NOW - 25*3600*1000), ...failedJob('job-new', RUNNING_NOW - 3600*1000) };
+  forgeFiles(on, files, { ids: ['job-old','job-new'], fail: false });
+  await $.session.start({surface:'terminal',isInteractive:true,cwd:'/work'} as never);
+  await $.command.run({command:'forge',args:''});
+  const pane=await $.ui.mount(PANE_TARGET);
+  expect(await pane.find({key:'job-job-new'})).toBeDefined();
+  expect(await pane.find({key:'job-job-old'})).toBeUndefined();
+  expect(await pane.find({type:'Text',text:/1 need attention/})).toBeDefined();
+  await pane.press({key:'roster-history'});
+  expect(await pane.find({key:'job-job-old'})).toBeDefined();
+  expect(await pane.find({key:'job-job-new'})).toBeUndefined();
+  expect(await pane.find({type:'Text',text:/failed · orphaned/})).toBeDefined();
+  await pane.press({key:'job-job-old'});
+  expect(await pane.find({key:'acknowledge'})).toBeUndefined();
+});
+
+test('persisted dismissals drop when their job is gone, but not on a read failure', async ($, on) => {
+  const files = failedJob('job-failed', RUNNING_NOW);
+  const listing = { ids: ['job-failed'], fail: false };
+  forgeFiles(on, files, listing);
+  await $.session.start({surface:'terminal',isInteractive:true,cwd:'/work'} as never);
+  await $.command.run({command:'forge',args:''});
+  const pane=await $.ui.mount(PANE_TARGET);
+  await pane.press({key:'clear'});
+  expect(await pane.find({key:'restore'})).toBeDefined();
+  listing.fail = true;
+  await $.command.run({command:'forge',args:''});
+  expect(await pane.find({key:'restore'})).toBeDefined();
+  listing.fail = false;
+  listing.ids = [];
+  await $.command.run({command:'forge',args:''});
+  expect(await pane.find({key:'restore'})).toBeUndefined();
+});
+
 test('pagination makes the tenth running job selectable', async ($, on) => {
   const ids=Array.from({length:10},(_,i)=>`job-${i}`);
   engine(on,{entries:ids.map(id=>({name:`${id}.spec.json`,kind:'file',size:10})), files:Object.fromEntries(ids.flatMap(id=>[[`${id}.spec.json`,REAL_SPEC],[`${id}.log`,REAL_LOG],[`${id}.progress.json`,REAL_PROGRESS]]))});

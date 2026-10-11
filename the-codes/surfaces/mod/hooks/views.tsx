@@ -30,13 +30,13 @@ export interface ViewOptions {
 
 export function renderRoster(W: UiComponents, jobs: readonly RadarJob[], hidden: readonly string[], o: ViewOptions, a: ViewActions): JSX.Element {
   const {Box,Text,Button} = W;
-  const sorted = groupWorkers(rosterJobs(jobs,o.rosterTab,hidden,o.acknowledged,o.repo));
+  const sorted = groupWorkers(rosterJobs(jobs,o.rosterTab,hidden,o.acknowledged,o.repo,o.now),o.now);
   const pageSize = o.bottom ? Math.max(1,Math.min(9,Math.floor((o.rows - 6) / 2))) : 9;
   const pages = Math.max(1,Math.ceil(sorted.length/pageSize));
   const page = Math.min(o.page,pages-1);
   const shown = sorted.slice(page*pageSize,(page+1)*pageSize);
   return <Box flexDirection="column">
-    <Text bold wrap="truncate-end">{rosterSummary(jobs,o.acknowledged,o.repo)}</Text>
+    <Text bold wrap="truncate-end">{rosterSummary(jobs,o.acknowledged,o.repo,o.now)}</Text>
     <Box flexDirection="row" gap={2}>
       <Button key="roster-active" plain label="Active" hotkey="a" dimColor={o.rosterTab!=='active'} onPress={() => a.roster('active')} />
       <Button key="roster-history" plain label="History" hotkey="h" dimColor={o.rosterTab!=='history'} onPress={() => a.roster('history')} />
@@ -44,7 +44,7 @@ export function renderRoster(W: UiComponents, jobs: readonly RadarJob[], hidden:
     {shown.length===0 && <Text dimColor wrap="wrap">{o.rosterTab==='active'?'No active workers. Open History for finished work.':'No finished workers in this view.'}</Text>}
     {shown.map((job,i) => <Box key={`worker-${job.id}`} flexDirection="column">
       <Button key={`job-${job.id}`} plain hotkey={String(i+1)} label={`${pickGlyph(job.status)} ${oneLine(workerHeading(job),Math.max(1,o.width-5))}`} onPress={() => a.pick(job)} />
-      <Text dimColor={!activeJob(job)} color={o.colour&&job.status==='failed'?'red':undefined} wrap="truncate-end">{statusLine(job,o.now,Math.max(1,o.width-2))}</Text>
+      <Text dimColor={!activeJob(job,false,o.now)} color={o.colour&&job.status==='failed'?'red':undefined} wrap="truncate-end">{statusLine(job,o.now,Math.max(1,o.width-2))}</Text>
     </Box>)}
     {pages>1 && <Box flexDirection="row" gap={2}>
       {page>0 && <Button key="previous-page" plain label="Previous" hotkey="p" onPress={() => a.page(page-1)} />}
@@ -66,7 +66,7 @@ export function renderWorker(W: UiComponents, d: ForgeDetail, o: ViewOptions, a:
   return <Box flexDirection="column">
     <Text bold color={o.colour?pickColor(job.status):undefined} wrap="truncate-end">{workerHeading(job)}</Text>
     <Text wrap="truncate-end">{workerStatus(job)}</Text>
-    {isTerminal(job.status)&&!job.acceptance?.pending&&needsAttention(job)&&!o.acknowledged.includes(scopedJobKey(o.repo,job.id))&&
+    {isTerminal(job.status)&&!job.acceptance?.pending&&needsAttention(job,false,o.now)&&!o.acknowledged.includes(scopedJobKey(o.repo,job.id))&&
       <Button key="acknowledge" plain label="Acknowledge" hotkey="y" onPress={a.acknowledge} />}
     <Text dimColor wrap="truncate-end">{`${job.toolCount??'?'} tool calls${job.lastEventAt==null?'':` · last event ${Math.max(0,Math.floor((o.now-job.lastEventAt)/1000))}s ago`}`}</Text>
     <Box flexDirection={o.width<48?'column':'row'} gap={1}>{tabs.map(([tab,label,key]) => <Button key={`tab-${tab}`} plain label={label} hotkey={key} dimColor={o.tab!==tab} onPress={() => a.tab(tab)} />)}</Box>
