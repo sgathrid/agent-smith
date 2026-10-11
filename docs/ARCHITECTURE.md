@@ -111,13 +111,43 @@ running/succeeded. Surfaced in `list_jobs` and `status`.
 ## Modes
 
 `forge/modes.ts`: closed set `implement | review | moderate | verify`. A mode is a preset
-of a prompt preamble plus a sandbox posture, nothing else; it never picks provider or model.
+of one line of brief guidance plus a sandbox posture, nothing else; it never picks provider
+or model.
 `review` and `moderate` are `readOnly` (requested; enforced only where the CLI can:
 codex `-s read-only`; the ack's `readOnlyEnforced` says which); `implement` and `verify`
-`runsCommands`. `readOnlyRequested = preset.readOnly && !unrestricted`. The preamble is
-prepended unless the prompt already starts with it (`preambleApplied`). `agy` with a
+`runsCommands`. `readOnlyRequested = preset.readOnly && !unrestricted`. `agy` with a
 command-running mode and `unrestricted:false` gets an ack warning: headless agy auto-denies
 unapproved tools. Pipeline stages and resumes may keep arbitrary legacy roles.
+
+| Mode | Guidance (reason given to the worker) | readOnly | runsCommands |
+|---|---|---|---|
+| `implement` | Keep the change small: the orchestrator reviews the diff. | no | yes |
+| `review` | Find problems, don't fix them: the author fixes from the findings. Evidence per defect, no style nits. | yes | no |
+| `moderate` | Independently confirm or refute the earlier work and the reviewer's claims; leave files as they are. | yes | no |
+| `verify` | Run the checks and report exactly what happened; report failures rather than fixing them. | no | yes |
+
+### Worker brief
+
+`forge/brief.ts` `buildBrief` builds the text `spawnTracked` prepends to every fresh job's
+prompt, joined by a blank line:
+
+1. who the worker works for (an orchestrating agent that checks its work);
+2. `Workspace: <cwd>` and that changes belong inside it. Pipeline stages omit this line,
+   because `buildStagePrompt` already names the source workspace and output artifact;
+3. `Context: <context>` when `spawn_job.context` or `stage.context` is set;
+4. the checks as `name: command` (with `(in cwd)` when a check has its own), under "you're
+   done when these pass; they run after you finish". `blocking:false` checks are listed
+   separately as information only. The service only describes checks; `tools.ts` and
+   `runner.ts` still run them;
+5. the mode's guidance, when the mode is in the closed set;
+6. an evidence line: only claim what you can point to, and say what isn't verified.
+
+A resume (`conversation` set) already holds the brief, so it gets only the context and
+check lines, and only when that request supplies them; otherwise nothing is prepended.
+Pipeline retries that continue the same conversation pass neither. The brief is not
+prepended when the prompt already starts with it. `preambleApplied` is true when the sent
+prompt starts with the brief; `view.json` (and the mirrored spec) keep the prepended brief as
+`preamble`, so the `/forge` pane's "Show preamble" shows exactly what was added.
 
 ## Model discovery and validation
 

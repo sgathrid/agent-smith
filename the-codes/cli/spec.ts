@@ -518,6 +518,7 @@ const KNOWN_STAGE_KEYS = new Set([
   'dependsOn',
   'role',
   'prompt',
+  'context',
   'title',
   'workDir',
   'resultPath',
@@ -668,6 +669,9 @@ export function stageFrom(node: Scalar, index: number): Stage {
 
   const prompt = asString(node.get('prompt') ?? null, 'prompt', index);
   if (prompt !== undefined) stage['prompt'] = prompt;
+
+  const context = asString(node.get('context') ?? null, 'context', index);
+  if (context !== undefined) stage['context'] = context;
 
   const title = asString(node.get('title') ?? null, 'title', index);
   if (title !== undefined) stage['title'] = title;

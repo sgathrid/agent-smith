@@ -17,6 +17,7 @@ import assert from 'node:assert/strict';
 // the shim has to be evaluated before anything below reaches the adapter. See
 // ../testing/shim.ts for what happens when it is not.
 import { MODE_PRESETS } from '../modes.ts';
+import { buildBrief } from '../brief.ts';
 import { assertFakeProviderActive } from '../testing/shim.ts';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -77,7 +78,25 @@ test('stage output directory exists before dispatch and prompt separates source 
   assert.equal(outputReady, true);
   assert.ok(prompt.includes(`SOURCE WORKSPACE: ${work}`));
   assert.ok(prompt.includes('OUTPUT ARTIFACT'));
-  assert.ok(prompt.includes('Use the source workspace for code searches and commands'));
+  assert.ok(prompt.includes('Search, run commands and make any code changes in the source workspace'));
+});
+
+test("a stage's context and checks reach its worker's prompt, and a same-conversation retry does not repeat them", async () => {
+  const r = repo(); const service = new ForgeService({ repo: r });
+  const runner = createForgeRunner({ service, runId: 'brief' });
+  const st = stage({ context: 'Ships in the next release.', checks: [{ name: 'unit', command: 'true' }] });
+  const first = await runner.run(ctxFor(r, st));
+  const view = JSON.parse(readFileSync(path.join(r, '.agent-smith', 'jobs', first.jobId!, 'view.json'), 'utf8')) as { preamble: string | null };
+  assert.ok(view.preamble?.includes('Context: Ships in the next release.'));
+  assert.ok(view.preamble?.includes('- unit: `true`'));
+  assert.ok(view.preamble?.includes("You're done when these checks pass"));
+
+  const ctx = ctxFor(r, st);
+  ctx.attempt = 2;
+  ctx.continuation = { attempt: 1, priorStatus: 'failed', transcriptRef: 'prior-thread', transcriptProvider: st.provider, appendedContext: 'Previous check failed' };
+  const retry = await runner.run(ctx);
+  const retryView = JSON.parse(readFileSync(path.join(r, '.agent-smith', 'jobs', retry.jobId!, 'view.json'), 'utf8')) as { preamble: string | null };
+  assert.equal(retryView.preamble, null, 'the continued conversation already holds the brief');
 });
 
 /* ── paths ─────────────────────────────────────────────────────────────────── */
@@ -160,17 +179,18 @@ test('the stage prompt is passed through, and the artefact is appended', () => {
 });
 
 test('a read-only stage is told its artifact is the only permitted write', () => {
-  // The service prepends the preamble ("Do not edit or rewrite files"); compose it
-  // the same way and check the worker is never left with an unqualified ban plus
-  // an instruction to write.
+  // The service prepends the brief, whose review guidance says to leave the files
+  // as they are; compose it the same way and check the worker is never left with
+  // an unqualified "leave the files" plus an instruction to write.
   const work = repo();
-  for (const name of ['review', 'moderate']) {
+  for (const name of ['review', 'moderate'] as const) {
     const stagePrompt = buildStagePrompt({ stage: stage({ name }), workDir: work, inputs: [], attempt: 1 });
-    const prompt = `${MODE_PRESETS[name as 'review' | 'moderate'].preamble}\n\n${stagePrompt}`;
+    const prompt = `${buildBrief({ preset: MODE_PRESETS[name], cwd: work, pipelineStage: true })}\n\n${stagePrompt}`;
     assert.ok(prompt.includes(path.resolve(work, name, 'result.md')));
-    assert.match(stagePrompt, /do not edit, create or delete any file in the source workspace/);
+    assert.match(stagePrompt, /leave every file in the source workspace as it is/);
     assert.match(stagePrompt, /only permitted write/);
-    assert.ok(prompt.indexOf('Do not edit') < prompt.indexOf('only permitted write'), 'the qualification comes after the ban');
+    const guidanceAt = prompt.toLowerCase().indexOf('leave the files as they are');
+    assert.ok(guidanceAt >= 0 && guidanceAt < prompt.indexOf('only permitted write'), 'the qualification comes after the guidance');
   }
   // A custom role that is not a read-only mode keeps the plain wording.
   const implement = buildStagePrompt({ stage: stage({ name: 'implement' }), workDir: work, inputs: [], attempt: 1 });

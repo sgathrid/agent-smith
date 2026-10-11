@@ -90,15 +90,17 @@ The `spawn_job` ack includes `sandbox`, `readOnlyRequested`, `readOnlyEnforced`,
 
 ### Modes
 
-A job `mode` is one of four. A mode sets only a prompt preamble and a sandbox
-posture; it never picks a provider or model.
+A job `mode` is one of four. A mode sets only one line of the worker's brief and a
+sandbox posture; it never picks a provider or model. The brief also tells the worker
+who it works for, its workspace, the `context` you pass and the checks that will judge
+it (see docs/ARCHITECTURE.md, Worker brief).
 
-| Mode | Preamble gist | Read-only requested |
+| Mode | Guidance gist | Read-only requested |
 |---|---|---|
-| `implement` | Do the work and report what changed and found. | no |
-| `review` | Report defects, missed cases and unsupported claims; do not edit. | yes |
-| `moderate` | Probe prior work independently; findings only, do not edit. | yes |
-| `verify` | Run the checks and report what actually happened. | no |
+| `implement` | Keep the change small: the orchestrator reviews the diff. | no |
+| `review` | Find problems, don't fix them: the author fixes from your findings. | yes |
+| `moderate` | Independently confirm or refute the earlier work and the reviewer's claims. | yes |
+| `verify` | Run the checks and report exactly what happened, failures included. | no |
 
 Read-only is enforced only where the provider's CLI can enforce it. Today that is
 Codex (`-s read-only`); for agy, OpenCode and Claude the request is made through

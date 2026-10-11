@@ -85,7 +85,7 @@ export interface StartInput {
   readonly effort: string | null;
   readonly cwd: string;
   readonly prompt: string;
-  /** The mode preamble the service prepends before the provider sees the prompt. */
+  /** The brief the service prepended before the provider saw the prompt (forge/brief.ts). */
   readonly preamble?: string;
   readonly unrestricted: boolean;
   readonly conversation: string | null;
