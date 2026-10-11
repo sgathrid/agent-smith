@@ -150,7 +150,10 @@ Running workers appear as numbered rows above the prompt. With the prompt
 empty, press a row's digit to open a sidebar on that worker: its task, its
 live output as it arrives, and then its result and any failing checks.
 `/forge` opens the same sidebar on the list of running and recent workers, and
-`/forge Ada` opens the worker named Ada directly. The keys are in the
+`/forge Ada` opens the worker named Ada directly. Like Claude Code's own
+sub-agents, the rows, the list and its counts cover only the workers this
+session started; `/forge all` (or `a` in the list) shows every job the
+repository has run. The keys are in the
 [pane's README](the-codes/surfaces/mod/README.md).
 
 Everything the panel shows is read from plain files in `.agent-smith/jobs/` in

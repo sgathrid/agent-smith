@@ -5,6 +5,12 @@ job** in the `AbovePrompt` band. Each line has a digit: pressing it in an empty
 prompt opens the focused sidebar on that worker's live view. `/forge` opens the
 sidebar on the worker list; `/forge <name or job id>` opens one worker.
 
+Like Claude Code's own sub-agents, the band, `/forge` and native tasks show only
+the workers **this session** launched (and the stage jobs of pipelines it ran),
+and `/clear`, `/resume` and `/branch` start that list afresh. `/forge all` lists
+every job in the repository. Legacy `.agy-staff` jobs have no session owner, so
+legacy mode always shows the repository.
+
 ```
  ● implement-musm82da-f1dc1fe4 cargo test --workspace · 341 tools ·     12m04s
  ● implement-muroviej-a23df195 reading decoded_view.rs ·  22 tools ·     02m18s
@@ -125,9 +131,13 @@ The band is only the glance: live workers plus finished ones for the linger
 window, at most four rows. Each row is a plain Button with hotkey `1`–`4`. The
 host answers a bare digit in an empty prompt by pressing a band Button without
 focusing the band, so one key opens the sidebar on that worker. `/forge` opens
-the sidebar on the list and `/forge <name or job id>` on one worker; an unknown
-name shows a toast and the list. `/forge pane` is the list too. Each of these
-asks `ui.open` for focus, which the host grants only over an empty prompt.
+the sidebar on this session's list, `/forge all` on the repository's, and
+`/forge <name or job id>` on one worker from either, this session's first; an
+unknown name shows a toast and the list. `/forge pane` is the session list too.
+Each of these asks `ui.open` for focus, which the host grants only over an empty
+prompt. The command's reply counts this session's workers (`2 running · 1
+finished`, or `No agents in this session`); `/forge all` labels its counts
+`repository: …`.
 
 The list shows running and checking workers first, then a "Recent" section of
 settled ones, most recent first. A failure from the last 24 hours is drawn red
@@ -144,6 +154,7 @@ pauses that; scrolling back to the bottom resumes it.
 | `1`–`4` in an empty prompt | Open the sidebar on that band row's worker |
 | `1`–`9` in the list | Open a worker; Tab and Enter work too |
 | `n` / `p` in the list | Next / previous page, shown only past nine workers |
+| `a` / `s` in the list | Show the repository's workers / this session's again |
 | `t` in a worker | Expand the task to the prompt as sent, preamble included |
 | Enter on a tool row | Show its input and output |
 | `b` | Back to the list |
@@ -161,7 +172,8 @@ Recorded worker IDs group invocations into one list row; the worker view links t
 earlier runs. Detail reads are cached for the three-second data cadence.
 
 Native tasks use real host TaskCreate/TaskUpdate IDs. They are a task projection,
-not Claude Agent/subagent sessions. Pending acceptance keeps them in progress.
+not Claude Agent/subagent sessions, and are created only for this session's
+live launches. Pending acceptance keeps them in progress.
 Successful settled tasks close after ten seconds; failed, canceled or rejected
 tasks remain completed with an explicit outcome in their subject.
 

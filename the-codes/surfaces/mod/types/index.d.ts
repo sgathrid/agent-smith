@@ -222,6 +222,14 @@ declare module 'claude-code' {
        * The shape is hooks/notice.ts `Owned`, spelled out for the validator.
        */
       notices: { kind: 'job' | 'run'; id: string; at: number; until: number; saidAttention?: boolean }[];
+      /**
+       * Job and pipeline run IDs this session launched in this repo, never pruned
+       * within the session: what the band, /forge and native tasks show.
+       * The shape is hooks/dashboard.ts `Launched`, spelled out for the validator.
+       */
+      launched: { jobs: string[]; runs: string[] };
+      /** The /forge list: this session's workers, or the repository's. */
+      listScope: 'session' | 'all';
     };
   }
 }

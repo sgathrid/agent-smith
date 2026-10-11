@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { ATTENTION_TTL_MS, checksLabel, findWorker, forgeList, groupWorkers, needsAttention, workerStatus } from '../hooks/dashboard.ts';
+import { ATTENTION_TTL_MS, checksLabel, countLine, findWorker, forgeList, groupWorkers, needsAttention, recordLaunch, scopeLine, sessionJobs, workerStatus } from '../hooks/dashboard.ts';
 import type { RadarJob } from '../types/index.d.ts';
 const job=(id:string,extra:Partial<RadarJob>={}):RadarJob=>({id,status:'running',startedAt:100,endedAt:null,toolCount:1,activity:'Read file.ts',task:'Review',warnings:[],report:null,reasoning:null,raw:{},...extra});
 test('the list puts running and checking work first, then settled work most recent first',()=>{
@@ -51,4 +51,24 @@ test('settled failures stop needing attention after 24 h; live, pending and stal
   assert.equal(needsAttention(oldFailed),true); // no clock, no expiry
   assert.equal(needsAttention(oldFailed,old+ATTENTION_TTL_MS),true); // boundary is exclusive
   assert.equal(workerStatus(oldFailed),'failed · orphaned');
+});
+test('session launches are recorded once and select their jobs and pipeline stage jobs',()=>{
+  let launched=recordLaunch({jobs:[],runs:[]},{kind:'job',id:'mine'});
+  launched=recordLaunch(launched,{kind:'run',id:'run-1'});
+  assert.equal(recordLaunch(launched,{kind:'job',id:'mine'}),launched);
+  assert.deepEqual(launched,{jobs:['mine'],runs:['run-1']});
+  const rows=[job('mine'),job('other'),job('stage',{pipeline:'run-1'}),job('foreign-stage',{pipeline:'run-2'})];
+  assert.deepEqual(sessionJobs(rows,launched).map(j=>j.id),['mine','stage']);
+  assert.deepEqual(sessionJobs(rows,{jobs:[],runs:[]}),[]);
+});
+test('the /forge counts name this session, or label the repository, never padded lifetime totals',()=>{
+  const rows=[job('a'),job('b'),job('c',{status:'failed',endedAt:200}),job('d',{status:'succeeded',endedAt:300})];
+  assert.equal(countLine(rows),'2 running · 1 failed · 1 finished');
+  assert.equal(countLine([job('x',{status:'succeeded',endedAt:1})]),'1 finished');
+  assert.equal(scopeLine(rows.slice(0,2),'session'),'2 running');
+  assert.equal(scopeLine([],'session'),'No agents in this session');
+  assert.equal(scopeLine(rows,'all'),'repository: 2 running · 1 failed · 1 finished');
+  assert.equal(scopeLine([],'all'),'repository: no agents yet');
+  // One count per listed worker: a resumed worker is one row.
+  assert.equal(countLine([job('r1',{workerId:'ada',status:'succeeded',endedAt:1}),job('r2',{workerId:'ada',startedAt:200})]),'1 running');
 });
