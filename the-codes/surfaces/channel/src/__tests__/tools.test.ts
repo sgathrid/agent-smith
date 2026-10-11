@@ -13,6 +13,30 @@ const cat = (provider: string, extra: Partial<ModelCatalog> = {}): ModelCatalog 
 const ctxWith = (cats: ModelCatalog[]) => ({ service: { repo: mkdtempSync(path.join(tmpdir(), 'agent-smith-tools-')) } as never, catalogs: async () => cats }) as HandlerContext;
 const body = (r: { content: unknown }) => JSON.parse(((r.content as { text: string }[])[0]!).text);
 
+test('spawn and resume validate and forward absolute working directories', async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), 'smith-cwd-store-'));
+  const cwd = mkdtempSync(path.join(tmpdir(), 'smith-cwd-work-'));
+  const seen: Array<Record<string, unknown>> = [];
+  const service = { repo, spawnJob: async (request: Record<string, unknown>) => {
+    seen.push(request); return { jobId: 'job-cwd' };
+  }, detail: async () => ({ status: 'succeeded', provider: 'codex', mode: 'review',
+    name: 'Ada', workerId: 'Ada', conversation: 'thread', cwd }) } as never;
+  const ctx = { service, catalogs: async () => [cat('codex')] } as HandlerContext;
+  assert.equal((await callTool(ctx, 'spawn_job', { mode: 'review', provider: 'codex', prompt: 'review', cwd })).isError, undefined);
+  assert.equal(seen[0]!.cwd, cwd);
+  assert.equal((await callTool(ctx, 'resume_job', { worker: 'Ada', prompt: 'continue' })).isError, undefined);
+  assert.equal(seen[1]!.cwd, cwd);
+  assert.equal((await callTool(ctx, 'resume_job', { worker: 'Ada', prompt: 'continue', cwd: repo })).isError, undefined);
+  assert.equal(seen[2]!.cwd, repo);
+  for (const invalid of ['relative', path.join(cwd, 'missing')]) {
+    for (const tool of ['spawn_job', 'resume_job']) {
+      const args = tool === 'spawn_job' ? { mode: 'review', provider: 'codex', prompt: 'review' } : { worker: 'Ada', prompt: 'continue' };
+      assert.equal((await callTool(ctx, tool, { ...args, cwd: invalid })).isError, true);
+    }
+  }
+  assert.equal(seen.length, 3, 'invalid cwd must not launch a worker');
+});
+
 test('mode enum rejects unknown modes', async () => {
   const r = await callTool(ctxWith([cat('agy')]), 'spawn_job', { mode: 'task', prompt: 'x' });
   assert.equal(r.isError, true);

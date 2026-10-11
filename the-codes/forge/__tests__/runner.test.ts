@@ -61,6 +61,24 @@ function stage(over: Partial<Stage> = {}): Stage {
   return { name: 'implement', provider: 'agy', prompt: 'do the work', ...over };
 }
 
+test('stage output directory exists before dispatch and prompt separates source from output', async () => {
+  const store = repo(); const work = repo(); let outputReady = false; let prompt = '';
+  const service = { repo: store, spawnTracked: async (request: { prompt: string; cwd: string }) => {
+    outputReady = existsSync(path.join(pipelineArtifactRoot(store, 'precreated'), 'implement', 'nested'));
+    prompt = request.prompt;
+    assert.equal(request.cwd, work);
+    throw new Error('fixture stops before launching');
+  } } as unknown as ForgeService;
+  await createForgeRunner({ service, runId: 'precreated' }).run({
+    pipeline: 'fixture', stage: stage({ resultPath: 'nested/result.md' }), attempt: 1, workDir: work,
+    inputs: [], routing: { provider: 'agy', tier: 't0-cheap', effort: 'low' }, signal: new AbortController().signal,
+  } as never);
+  assert.equal(outputReady, true);
+  assert.ok(prompt.includes(`SOURCE WORKSPACE: ${work}`));
+  assert.ok(prompt.includes('OUTPUT ARTIFACT'));
+  assert.ok(prompt.includes('Use the source workspace for code searches and commands'));
+});
+
 /* ── paths ─────────────────────────────────────────────────────────────────── */
 
 test('each stage gets its OWN directory, so a stage cannot overwrite its input', () => {
@@ -393,6 +411,20 @@ test('continuation handles stay in their provider namespace', async () => {
     assert.ok(outcome.jobId);
     const argv = JSON.parse(readFileSync(path.join(r, '.agent-smith', 'jobs', outcome.jobId!, 'argv.json'), 'utf8')).argv as string[];
     assert.equal(argv.includes('prior-thread'), priorProvider === 'agy');
+  }
+});
+
+test('pipeline acceptance respects optional preflight failures and mandatory blank checks', async () => {
+  for (const [checks, expected] of [
+    [[{ name: 'optional', command: 'true', cwd: 'missing', blocking: false }], 'passed'],
+    [[{ name: 'mandatory', command: '   ' }], 'failed'],
+    [[{ name: 'optional-empty', command: '   ', blocking: false }], 'passed'],
+  ] as const) {
+    const r = repo(); const service = new ForgeService({ repo: r });
+    const outcome = await createForgeRunner({ service }).run(ctxFor(r, stage({ checks: [...checks] })));
+    assert.equal(outcome.acceptance, expected);
+    assert.equal(outcome.status, expected);
+    assert.ok(outcome.verification?.verdicts[0]?.skipped);
   }
 });
 

@@ -70,7 +70,7 @@ import type { ForgeService, SpawnRequest } from './service.ts';
 import type { ForgeActivity, ForgeManifest } from './format.ts';
 import { appendBounded } from './writer.ts';
 import { runChecks } from '../verify/runner.ts';
-import { toVerifyChecks } from './checks.ts';
+import { normalizeAcceptanceReport, toVerifyChecks } from './checks.ts';
 import type { Check } from '../verify/types.ts';
 
 /**
@@ -228,6 +228,9 @@ export function buildStagePrompt(args: {
   }
 
   parts.push(
+    `SOURCE WORKSPACE: ${args.workDir}`,
+    'Use the source workspace for code searches and commands. The output artifact directory is only for stage handoff files.',
+    '',
     args.stage.prompt ?? `Carry out the '${args.stage.name}' stage and write your findings to result.md.`,
   );
 
@@ -240,7 +243,7 @@ export function buildStagePrompt(args: {
         continue;
       }
       const limit = Math.min(ARTIFACT_INLINE_CHARS, budget);
-      const found = readArtifact(args.workDir, input, limit);
+      const found = readArtifact(args.artifactRoot ?? args.workDir, input, limit);
       if (found.text === null) {
         parts.push(`- ${input.stage}: not found on disk — try ${found.from}.`);
         continue;
@@ -256,6 +259,7 @@ export function buildStagePrompt(args: {
 
   parts.push(
     '',
+    'OUTPUT ARTIFACT (separate from the source workspace):',
     `Write your full answer to ${stageArtifactPath(args.artifactRoot ?? args.workDir, args.stage.name, args.stage.resultPath)}. ` +
       'That file is what the next stage reads; a summary you say in prose is not.',
   );
@@ -313,7 +317,7 @@ export function createForgeRunner(deps: RunnerDeps): StageRunner {
       task: stage.title ?? stage.prompt,
       prompt: buildStagePrompt({
         stage,
-        workDir: artifactRoot,
+        workDir: ctx.workDir,
         artifactRoot,
         inputs: ctx.inputs,
         attempt: ctx.attempt,
@@ -322,7 +326,7 @@ export function createForgeRunner(deps: RunnerDeps): StageRunner {
           continuation?.transcriptRef === undefined || continuation.transcriptProvider === undefined || continuation.transcriptProvider === ctx.routing.provider,
       }),
       provider: ctx.routing.provider,
-        cwd: ctx.workDir,
+      cwd: ctx.workDir,
       // 0 means "use the service default" (clampTimeout's DEFAULT_TIMEOUT_MS).
       // A stage timeout is ALSO enforced by the DAG via ctx.signal, so this is a
       // second, independent line of defence rather than the only one.
@@ -343,6 +347,7 @@ export function createForgeRunner(deps: RunnerDeps): StageRunner {
 
     let jobId: string;
     try {
+      mkdirSync(path.dirname(stageArtifactPath(artifactRoot, stage.name, stage.resultPath)), { recursive: true });
       const tracked = await deps.service.spawnTracked(request);
       jobId = tracked.ack.jobId;
 
@@ -374,12 +379,12 @@ export function createForgeRunner(deps: RunnerDeps): StageRunner {
       if (!stage.checks?.length) return { ...result, acceptance: 'unchecked' };
 
       const checks: Check[] = toVerifyChecks(stage.checks, ctx.workDir);
-      const report = await runChecks(checks, { signal: ctx.signal });
+      const report = normalizeAcceptanceReport(await runChecks(checks, { signal: ctx.signal }), stage.checks);
       const checkEvidence = report.verdicts.map((verdict) =>
         `${verdict.passed ? 'PASS' : 'FAIL'} ${verdict.check.name}: ${verdict.reason}`,
       ).join('\n');
       if (report.passed && !report.incomplete) return { ...result, acceptance: 'passed', verification: report };
-      const failedChecks = report.verdicts.filter((verdict) => !verdict.passed && (verdict.blocking || verdict.skipped !== undefined));
+      const failedChecks = report.verdicts.filter((verdict) => !verdict.passed && verdict.blocking);
       return {
         ...result,
         status: 'failed',
