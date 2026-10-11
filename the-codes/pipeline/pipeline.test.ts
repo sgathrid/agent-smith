@@ -7,11 +7,13 @@
  */
 
 import assert from 'node:assert/strict';
+import path from 'node:path';
 import { test } from 'node:test';
 
 import {
   createRunnerRouter,
   DEFAULT_CONCURRENCY,
+  inheritContinuedProviders,
   PipelineSpecError,
   runPipeline,
   validateSpec,
@@ -549,4 +551,75 @@ test('lifecycle hooks fire for skipped stages too', async () => {
   // A skipped stage is not started, but it MUST still be reported — silence
   // here is what makes a partial pipeline look like a complete one.
   assert.deepEqual(ended, ['a:failed', 'b:skipped', 'c:skipped']);
+});
+
+/* -------------------------------- continues -------------------------------- */
+
+const fixFlow = (fix: Partial<Stage> = {}): Stage[] => [
+  stage('build', { provider: 'agy' }),
+  stage('review', { provider: 'codex', dependsOn: ['build'] }),
+  stage('fix', { provider: 'agy', dependsOn: ['review'], continues: 'build', ...fix }),
+];
+
+test('continues is validated at load time with an actionable message per mistake', () => {
+  validateSpec(spec('ok', fixFlow()));
+  const cases: Array<[string, Stage[], RegExp]> = [
+    ['unknown target', fixFlow({ continues: 'nope' }), /continues 'nope', which does not exist/],
+    ['itself', fixFlow({ continues: 'fix' }), /continues 'fix', which is itself/],
+    ['not an ancestor', [stage('build'), stage('other'), stage('fix', { continues: 'build', dependsOn: ['other'] })], /does not depend on; add 'build' to its dependsOn/],
+    ['a descendant', [stage('fix', { continues: 'later' }), stage('later', { dependsOn: ['fix'] })], /does not depend on/],
+    ['provider mismatch', fixFlow({ provider: 'codex' }), /cannot move between providers \(codex vs agy\)/],
+    ['explicit conversation', fixFlow({ conversation: 'c1' }), /also sets conversation/],
+  ];
+  for (const [label, stages, message] of cases) {
+    assert.throws(() => validateSpec(spec(label, stages)), (err) => err instanceof PipelineSpecError && message.test(err.message), label);
+  }
+});
+
+test('a continuing stage inherits its target provider, through a chain, or fails when none can be found', () => {
+  const { provider: _build, ...build } = stage('build', { provider: 'agy' });
+  const { provider: _fix1, ...fix1 } = stage('fix1', { continues: 'build', dependsOn: ['build'] });
+  const { provider: _fix2, ...fix2 } = stage('fix2', { continues: 'fix1', dependsOn: ['fix1'] });
+  const resolved = inheritContinuedProviders([{ ...build, provider: 'agy' }, fix1, fix2]);
+  assert.deepEqual(resolved.map((s) => s.provider), ['agy', 'agy', 'agy']);
+  assert.throws(() => inheritContinuedProviders([fix1]), /continues 'build', which does not exist/);
+  assert.throws(() => inheritContinuedProviders([{ ...fix1, continues: 'fix2' }, { ...fix2, continues: 'fix1' }]), /'fix1' needs a provider/);
+});
+
+test('a continuing stage resumes its target: handle, worker identity, workDir, and the review as input', async () => {
+  const seen = new Map<string, StageContext>();
+  const runner: StageRunner = {
+    id: 'fake',
+    async run(ctx) {
+      seen.set(ctx.stage.name, ctx);
+      return ok(ctx, { transcriptRef: `conv-${ctx.stage.name}`, artifacts: [{ stage: ctx.stage.name, path: `${ctx.stage.name}/result.md` }] });
+    },
+  };
+  const stages = fixFlow();
+  stages[0] = { ...stages[0]!, workerId: 'w-build', agentName: 'builder', workDir: 'pkg' };
+  const run = await runPipeline(spec('fix-loop', stages), { runner, workDir: WORKDIR, ladders: { agy: { label: 'agy' }, codex: { label: 'codex' } } });
+  assert.equal(run.status, 'passed');
+  const fix = seen.get('fix')!;
+  assert.deepEqual(fix.continues, { stage: 'build', transcriptRef: 'conv-build', workerId: 'w-build', agentName: 'builder' });
+  assert.ok(fix.inputs.some((a) => a.stage === 'review'), 'the review artifact arrives through dependsOn');
+  assert.equal(fix.workDir, path.resolve(WORKDIR, 'pkg'));
+  assert.equal(seen.get('review')!.continues, undefined);
+});
+
+test('a continuing stage fails cleanly when its target left no conversation handle, or ran on another provider', async () => {
+  for (const [target, expected] of [[{}, /no conversation handle to resume/], [{ transcriptRef: 'c', provider: 'codex' }, /cannot move between providers/]] as const) {
+    let fixRan = false;
+    const runner: StageRunner = {
+      id: 'fake',
+      async run(ctx) {
+        if (ctx.stage.name === 'fix') fixRan = true;
+        return ctx.stage.name === 'build' ? ok(ctx, target) : ok(ctx);
+      },
+    };
+    const run = await runPipeline(spec('no-handle', fixFlow()), { runner, workDir: WORKDIR, ladders: { agy: { label: 'agy' }, codex: { label: 'codex' } } });
+    assert.equal(fixRan, false);
+    assert.equal(run.outcomes['fix']?.status, 'failed');
+    assert.equal(run.outcomes['fix']?.failure?.code, 'no-conversation');
+    assert.match(run.outcomes['fix']?.failure?.message ?? '', expected);
+  }
 });

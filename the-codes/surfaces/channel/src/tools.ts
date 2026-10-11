@@ -7,7 +7,7 @@ import type { ForgeStatus } from '../../../forge/format.ts';
 import { DEFAULT_TIMEOUT_MS, type ForgeService } from '../../../forge/service.ts';
 import { startPipeline, readPipeline, cancelPipeline } from '../../../forge/execute.ts';
 import { evaluateAcceptance, readAcceptance, writeAcceptance } from '../../../forge/checks.ts';
-import { validateSpec } from '../../../pipeline/pipeline.ts';
+import { inheritContinuedProviders, validateSpec } from '../../../pipeline/pipeline.ts';
 import { MODES, MODE_PRESETS } from '../../../forge/modes.ts';
 import { getCatalogs, getInstalledProviders } from '../../../providers/catalog.ts';
 import { providerNames } from '../../../providers/registry.ts';
@@ -31,9 +31,10 @@ const checksSchema = { type: 'array', items: {
   properties: { name: string, command: string, cwd: string, timeoutMs: { type: 'integer', minimum: 1 }, blocking: { type: 'boolean' } },
 } };
 const stageSchema = {
-  type: 'object', required: ['name', 'provider'], additionalProperties: false,
+  type: 'object', required: ['name'], additionalProperties: false,
   properties: {
-    name: string, agentName: string, workerId: string, conversation: string, provider: { type: 'string', enum: PROVIDERS }, model: string,
+    name: string, agentName: string, workerId: string, conversation: string, continues: { ...string, description: 'Name of an earlier stage (an ancestor via dependsOn) whose worker conversation this stage resumes, e.g. to fix what a review found. provider defaults to that stage\'s.' },
+    provider: { type: 'string', enum: PROVIDERS, description: 'Required unless continues is set.' }, model: string,
     effort: { type: 'string', enum: EFFORTS }, prompt: string, context: contextSchema, title: string, role: string,
     dependsOn: { type: 'array', items: string }, workDir: string, resultPath: string,
     timeoutMs: { type: 'integer', minimum: 1 }, routingPinned: { type: 'boolean' }, checks: checksSchema,
@@ -220,7 +221,7 @@ export function parseChecks(raw: unknown): StageCheck[] | undefined {
 export function parseStages(raw: unknown): Stage[] | undefined {
   if (raw === undefined) return undefined;
   if (!Array.isArray(raw) || raw.length === 0) throw new Error('stages must be a nonempty array.');
-  return raw.map((v, i) => {
+  return inheritContinuedProviders(raw.map((v, i) => {
     const s = record(v, `stages[${i}]`); keys(s, Object.keys(stageSchema.properties));
     let dependsOn: string[] | undefined;
     if (s.dependsOn !== undefined) {
@@ -232,8 +233,8 @@ export function parseStages(raw: unknown): Stage[] | undefined {
       if (!Array.isArray(s.consumes)) throw new Error('consumes must be an array.');
       consumes = s.consumes.map(v => { const a = record(v, 'artifact'); keys(a, ['stage', 'path', 'label']); return { stage: text(a, 'stage', true)!, path: text(a, 'path', true)!, label: text(a, 'label') }; });
     }
-    return { name: text(s, 'name', true)!, agentName: text(s, 'agentName'), workerId: text(s, 'workerId'), conversation: text(s, 'conversation'), provider: allowed(s, 'provider', PROVIDERS) ?? (() => { throw new Error('provider is required.'); })(), model: text(s, 'model'), effort: allowed(s, 'effort', EFFORTS) as Effort | undefined, prompt: text(s, 'prompt'), context: contextText(s), title: text(s, 'title'), role: text(s, 'role'), dependsOn, consumes, workDir: text(s, 'workDir'), resultPath: text(s, 'resultPath'), timeoutMs: number(s, 'timeoutMs'), routingPinned: boolean(s, 'routingPinned'), checks: parseChecks(s.checks) };
-  });
+    return { name: text(s, 'name', true)!, agentName: text(s, 'agentName'), workerId: text(s, 'workerId'), conversation: text(s, 'conversation'), continues: text(s, 'continues'), provider: allowed(s, 'provider', PROVIDERS), model: text(s, 'model'), effort: allowed(s, 'effort', EFFORTS) as Effort | undefined, prompt: text(s, 'prompt'), context: contextText(s), title: text(s, 'title'), role: text(s, 'role'), dependsOn, consumes, workDir: text(s, 'workDir'), resultPath: text(s, 'resultPath'), timeoutMs: number(s, 'timeoutMs'), routingPinned: boolean(s, 'routingPinned'), checks: parseChecks(s.checks) };
+  }));
 }
 
 export async function callTool(ctx: HandlerContext, name: string, rawArgs: unknown): Promise<ToolOutcome> {

@@ -454,6 +454,47 @@ test('continuation handles stay in their provider namespace', async () => {
   }
 });
 
+test('a continuing stage resumes its target worker with the review in its prompt', async () => {
+  const store = repo(); const work = repo(); const requests: Array<Record<string, unknown>> = [];
+  const review = stageArtifactPath(pipelineArtifactRoot(store, 'fixloop'), 'review');
+  mkdirSync(path.dirname(review), { recursive: true });
+  writeFileSync(review, 'FINDING-17: the cache is never invalidated');
+  const service = { repo: store, spawnTracked: async (request: Record<string, unknown>) => { requests.push(request); throw new Error('fixture stops before launching'); } } as unknown as ForgeService;
+  const ctx = ctxFor(work, stage({ name: 'fix', role: 'implement', checks: [{ name: 'unit', command: 'true' }] }), [{ stage: 'review', path: 'result.md' }]);
+  ctx.continues = { stage: 'implement', transcriptRef: 'conv-implement', workerId: 'w-impl', agentName: 'builder' };
+  await createForgeRunner({ service, runId: 'fixloop' }).run(ctx);
+  await createForgeRunner({ service, runId: 'fixloop' }).run({ ...ctx, continues: { stage: 'implement', transcriptRef: 'conv-implement' } });
+  const [explicit, defaulted] = requests;
+  assert.equal(explicit?.['conversation'], 'conv-implement');
+  assert.equal(explicit?.['workerId'], 'w-impl');
+  assert.equal(explicit?.['name'], 'builder');
+  assert.equal(explicit?.['cwd'], work);
+  assert.equal(defaulted?.['workerId'], 'fixloop:implement', 'the default identity is the target stage\'s');
+  assert.match(String(explicit?.['prompt']), /FINDING-17: the cache is never invalidated/);
+  assert.deepEqual(explicit?.['checks'], [{ name: 'unit', command: 'true' }], 'the fix stage\'s own checks reach the resumed worker');
+});
+
+test('implement -> review -> fix: the fix stage resumes the implementer and the review is its input', async () => {
+  const r = repo(); const service = new ForgeService({ repo: r });
+  const run = await runPipeline({
+    name: 'fix-loop', workDir: r,
+    stages: [
+      { name: 'implement', provider: 'agy', role: 'implement', prompt: 'build it' },
+      { name: 'review', provider: 'agy', dependsOn: ['implement'], role: 'review', prompt: 'review it' },
+      { name: 'fix', provider: 'agy', continues: 'implement', dependsOn: ['review'], role: 'implement', prompt: 'fix it' },
+    ],
+  } as never, { runner: createRunnerRouter({ agy: createForgeRunner({ service, runId: 'fix-loop' }) }), ladders: { agy: { label: 'agy' } } });
+  assert.equal(run.status, 'passed', JSON.stringify(run.outcomes, null, 2));
+  const argvOf = (stageName: string): string[] => JSON.parse(readFileSync(path.join(r, '.agent-smith', 'jobs', run.outcomes[stageName]!.jobId!, 'argv.json'), 'utf8')).argv;
+  const conversation = run.outcomes['implement']!.transcriptRef!;
+  assert.ok(conversation);
+  assert.equal(argvOf('fix')[argvOf('fix').indexOf('--conversation') + 1], conversation);
+  assert.equal(argvOf('review').includes('--conversation'), false, 'a plain stage starts fresh');
+  const worker = async (stageName: string) => (await service.detail(run.outcomes[stageName]!.jobId!)).workerId;
+  assert.equal(await worker('fix'), await worker('implement'));
+  assert.notEqual(await worker('review'), await worker('implement'));
+});
+
 test('pipeline acceptance respects optional preflight failures and mandatory blank checks', async () => {
   for (const [checks, expected] of [
     [[{ name: 'optional', command: 'true', cwd: 'missing', blocking: false }], 'passed'],

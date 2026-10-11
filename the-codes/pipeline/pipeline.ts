@@ -34,10 +34,12 @@ import {
 } from './routing.ts';
 import type {
   ArtifactRef,
+  ContinuedWorker,
   Escalation,
   PipelineRun,
   PipelineSpec,
   PipelineStatus,
+  ProviderId,
   Stage,
   StageContext,
   StageContinuation,
@@ -139,6 +141,30 @@ export function validateSpec(spec: PipelineSpec): void {
       if (dep === stage.name) {
         throw new PipelineSpecError(`stage '${stage.name}' depends on itself`);
       }
+    }
+  }
+
+  const byName = new Map(spec.stages.map((s) => [s.name, s]));
+  const ancestorsOf = (name: string, into = new Set<string>()): Set<string> => {
+    for (const dep of byName.get(name)?.dependsOn ?? []) {
+      if (!into.has(dep)) ancestorsOf(dep, into.add(dep));
+    }
+    return into;
+  };
+  for (const stage of spec.stages) {
+    if (stage.continues === undefined) continue;
+    const target = byName.get(stage.continues);
+    const label = `stage '${stage.name}' continues '${stage.continues}'`;
+    if (stage.continues === stage.name) throw new PipelineSpecError(`${label}, which is itself`);
+    if (target === undefined) throw new PipelineSpecError(`${label}, which does not exist`);
+    if (!ancestorsOf(stage.name).has(target.name)) {
+      throw new PipelineSpecError(`${label}, which it does not depend on; add '${target.name}' to its dependsOn (directly or through another stage)`);
+    }
+    if (target.provider !== stage.provider) {
+      throw new PipelineSpecError(`${label}, but a conversation cannot move between providers (${stage.provider} vs ${target.provider}); use provider ${target.provider} or omit provider to inherit it`);
+    }
+    if (stage.conversation !== undefined) {
+      throw new PipelineSpecError(`${label} and also sets conversation; use one or the other`);
     }
   }
 
@@ -272,6 +298,29 @@ export function createRunnerRouter(runners: Readonly<Record<string, StageRunner>
   };
 }
 
+/**
+ * Give a stage that `continues` another and omits `provider` that stage's
+ * provider. Parsers call this before validateSpec, because a conversation can
+ * only resume on the provider that holds it, so asking again is noise.
+ */
+export function inheritContinuedProviders(stages: readonly (Omit<Stage, 'provider'> & { provider?: ProviderId | undefined })[]): Stage[] {
+  const byName = new Map(stages.map((s) => [s.name, s]));
+  const providerOf = (stage: (typeof stages)[number], seen: Set<string>): ProviderId | undefined => {
+    if (stage.provider !== undefined) return stage.provider;
+    if (stage.continues === undefined || seen.has(stage.name)) return undefined;
+    const target = byName.get(stage.continues);
+    return target === undefined ? undefined : providerOf(target, seen.add(stage.name));
+  };
+  return stages.map((stage) => {
+    const provider = providerOf(stage, new Set());
+    if (provider === undefined && stage.continues !== undefined && !byName.has(stage.continues)) {
+      throw new PipelineSpecError(`stage '${stage.name}' continues '${stage.continues}', which does not exist`);
+    }
+    if (provider === undefined) throw new PipelineSpecError(`stage '${stage.name}' needs a provider`);
+    return { ...stage, provider };
+  });
+}
+
 /** Standard result for a stage that never really ran. */
 function failedResult(
   ctx: StageContext,
@@ -337,6 +386,11 @@ export async function runPipeline(
   let aborted = false;
 
   const depsOf = (stage: Stage): readonly string[] => stage.dependsOn ?? [];
+  /** A continuing stage works where its target worked unless it names its own workDir. */
+  const workDirOf = (stage: Stage): string => {
+    const own = stage.workDir ?? (stage.continues === undefined ? undefined : stages.get(stage.continues)?.workDir);
+    return own ? path.resolve(workDir, own) : workDir;
+  };
 
   /** A stage is dispatchable when it is unstarted, not skipped, and every dep passed. */
   const isDispatchable = (stage: Stage): boolean => {
@@ -440,6 +494,32 @@ export async function runPipeline(
     const escalations: Escalation[] = [];
     let routing = planInitialRouting(stage, options.ladders);
 
+    // `continues`: resume the target's worker conversation. validateSpec proved
+    // it is an ancestor, so it has passed by now; what can still be missing is the
+    // conversation handle (the provider reported none) or its provider (an
+    // escalation moved the target to another one). Fail with the remedy.
+    let continued: ContinuedWorker | undefined;
+    if (stage.continues !== undefined) {
+      const target = stages.get(stage.continues)!;
+      const done = outcomes.get(target.name);
+      const ref = done?.transcriptRef;
+      const problem = ref === undefined
+        ? `stage '${target.name}' produced no conversation handle to resume (the provider reported none); keep the fix in '${target.name}' or start a fresh worker`
+        : done?.provider !== routing.provider
+          ? `stage '${target.name}' finished on ${done?.provider}, but this stage runs on ${routing.provider} and a conversation cannot move between providers; pin '${target.name}' with routingPinned`
+          : undefined;
+      if (ref === undefined || problem !== undefined) {
+        const t = now();
+        record({
+          stage: stage.name, provider: routing.provider, model: routing.model, status: 'failed',
+          startedAt: stageStart, finishedAt: t, durationMs: t - stageStart,
+          failure: { code: 'no-conversation', message: `cannot continue: ${problem}`, retryable: false },
+        }, []);
+        return;
+      }
+      continued = { stage: target.name, transcriptRef: ref, workerId: target.workerId, agentName: target.agentName };
+    }
+
     for (;;) {
       if (abort.signal.aborted) {
         aborted = true;
@@ -479,10 +559,11 @@ export async function runPipeline(
         pipeline: spec.name,
         stage,
         attempt,
-        workDir: stage.workDir ? path.resolve(workDir, stage.workDir) : workDir,
+        workDir: workDirOf(stage),
         inputs: inputsFor(stage),
         routing,
         ...(continuation ? { continuation } : {}),
+        ...(continued ? { continues: continued } : {}),
         signal: stageAbort.signal,
       };
 
