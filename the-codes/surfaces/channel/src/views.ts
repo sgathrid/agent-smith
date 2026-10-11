@@ -14,6 +14,23 @@ export const DIFF_MAX_CHARS = 40_000;
 const DETAIL_HINT = 'use response_format: "detailed"';
 const flat = (s: string): string => s.replace(/\s+/g, ' ').trim();
 
+/**
+ * Job lifecycle in the vocabulary of the MCP Tasks extension (protocol 2026-07-28):
+ * working | input_required | completed | failed | cancelled. Reported beside `status`
+ * so a later Tasks adapter is a translation, not a redesign. `input_required` is
+ * reserved: no job pauses for input today. `unknown` (state not yet determinable,
+ * never terminal) maps to `working`.
+ */
+export type TaskStatus = 'working' | 'input_required' | 'completed' | 'failed' | 'cancelled';
+export function taskStatus(status: JobSummary['status']): TaskStatus {
+  switch (status) {
+    case 'running': case 'unknown': return 'working';
+    case 'succeeded': return 'completed';
+    case 'failed': return 'failed';
+    case 'canceled': return 'cancelled';
+  }
+}
+
 /** Cut at a word boundary within max chars, marking the cut with an ellipsis. */
 export function trimWords(text: string, max: number): string {
   const t = flat(text);
@@ -44,7 +61,7 @@ const warningTexts = (ws: JobSummary['warnings']): string[] => [...new Set(ws.ma
 /** One compact row for list_jobs. */
 export function conciseRow(j: JobSummary) {
   return compact({
-    jobId: j.jobId, name: j.name, status: j.status, provider: j.provider, model: j.model, mode: j.mode,
+    jobId: j.jobId, name: j.name, status: j.status, taskStatus: taskStatus(j.status), provider: j.provider, model: j.model, mode: j.mode,
     summary: j.latestSummary ? trimWords(j.latestSummary, CONCISE_SUMMARY_CHARS) : null,
     toolCalls: j.toolCalls, lastActivity: lastActivity(j.lastActivity), startedAt: j.startedAt, finishedAt: j.finishedAt,
     nextAction: j.nextAction, warningCount: j.warnings.length || null,
@@ -70,7 +87,7 @@ export function conciseStatus(d: JobDetail, acceptance: AcceptanceView | null, e
   const ended = d.finishedAt ? Date.parse(d.finishedAt) : Date.now();
   const files = d.changedFiles ?? [];
   return compact({
-    jobId: d.jobId, name: d.name, provider: d.provider, model: d.model, mode: d.mode, status: d.status,
+    jobId: d.jobId, name: d.name, provider: d.provider, model: d.model, mode: d.mode, status: d.status, taskStatus: taskStatus(d.status),
     acceptance: checkVerdicts(acceptance),
     startedAt: d.startedAt, finishedAt: d.finishedAt, durationMs: Number.isNaN(started) ? null : Math.max(0, ended - started),
     toolCalls: d.toolCalls, lastActivity: lastActivity(d.lastActivity),

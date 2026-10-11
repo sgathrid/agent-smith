@@ -138,6 +138,21 @@ function remember(jobId: string, key: string): void {
 }
 
 /**
+ * Poll interval: 5 seconds.
+ *
+ * WHY NOT 3, WHICH IS WHAT THE MOD USES: the mod redraws, and a 3 s poll costs
+ * nothing because nobody reads between frames. This surface spends TOKENS.
+ * Polling faster cannot make a change visible before agy-staff writes it — it
+ * republishes every 100 ms, so 3 s versus 5 s is noise — while making us more
+ * likely to sample and re-evaluate an intermediate state. The slower cadence is
+ * the correct number, not a compromise.
+ *
+ * Lives here, not in server.ts, so tools.ts can advertise the same cadence as
+ * the `pollIntervalMs` of a launch ack without importing the server.
+ */
+export const POLL_MS = 5_000;
+
+/**
  * Self-scheduling poll loop.
  *
  * setTimeout chained onto completion, NOT setInterval. An async callback in

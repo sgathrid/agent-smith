@@ -98,7 +98,7 @@ import {
 
 import { ForgeService } from '../../../forge/service.ts';
 import { type Batch } from './policy.ts';
-import { pollOnce, scheduleLoop } from './poller.ts';
+import { POLL_MS, pollOnce, scheduleLoop } from './poller.ts';
 import { TOOL_DEFS, callTool } from './tools.ts';
 
 /**
@@ -112,18 +112,6 @@ import { TOOL_DEFS, callTool } from './tools.ts';
  * for that reason alone.
  */
 const SOURCE = 'agent-smith';
-
-/**
- * Poll interval: 5 seconds.
- *
- * WHY NOT 3, WHICH IS WHAT THE MOD USES: the mod redraws, and a 3 s poll costs
- * nothing because nobody reads between frames. This surface spends TOKENS.
- * Polling faster cannot make a change visible before agy-staff writes it — it
- * republishes every 100 ms, so 3 s versus 5 s is noise — while making us more
- * likely to sample and re-evaluate an intermediate state. The slower cadence is
- * the correct number, not a compromise.
- */
-const POLL_MS = 5_000;
 
 /**
  * Instructions handed to Claude at session start.
@@ -211,8 +199,9 @@ const forge = new ForgeService({ repo: resolveCwd() });
  */
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOL_DEFS }));
 
+// `server: mcp` lets a tool ask the user mid-call (elicitation), e.g. to confirm unrestricted access.
 mcp.setRequestHandler(CallToolRequestSchema, async (request) =>
-  callTool({ service: forge }, request.params.name, request.params.arguments ?? {}),
+  callTool({ service: forge, server: mcp }, request.params.name, request.params.arguments ?? {}),
 );
 
 /** The transport call. The only place in the repo that touches the SDK. */
