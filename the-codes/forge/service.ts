@@ -128,6 +128,11 @@ export interface SpawnRequest {
   readonly conversation?: string | undefined;
   /** Overrides the repo root. Only pipeline stages set this. */
   readonly cwd?: string | undefined;
+  /**
+   * Absolute path of the output artifact a pipeline stage writes. A read-only job
+   * may write exactly this file (claude, codex). Solo spawns leave it unset.
+   */
+  readonly artifactPath?: string | undefined;
   /** Why the work matters and who it is for. Shown to the worker in its brief. */
   readonly context?: string | undefined;
   /**
@@ -315,7 +320,7 @@ export interface ForgeOptions {
   readonly providerSource?: ((name: string) => Provider) | undefined;
   /** Sandbox describer. Default: provider.describeSandbox. Injectable for tests. */
   readonly describeSandbox?:
-    | ((provider: Provider, spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly'>) => SandboxInfo | undefined)
+    | ((provider: Provider, spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly' | 'artifactPath'>) => SandboxInfo | undefined)
     | undefined;
 }
 
@@ -498,7 +503,12 @@ export class ForgeService {
       }
     }
     const readOnlyRequested = preset?.readOnly === true && !unrestricted;
-    const sandboxInfo = this.describeSandbox(provider, { unrestricted, readOnly: readOnlyRequested });
+    const artifactPath = readOnlyRequested ? request.artifactPath : undefined;
+    const sandboxInfo = this.describeSandbox(provider, {
+      unrestricted,
+      readOnly: readOnlyRequested,
+      ...(artifactPath === undefined ? {} : { artifactPath }),
+    });
     const sandbox = sandboxInfo?.sandbox ?? 'unknown';
     const sandboxFlags = sandboxInfo?.flags ?? [];
     const readOnlyEnforced = sandboxInfo?.readOnlyEnforced ?? false;
@@ -608,6 +618,7 @@ export class ForgeService {
       jobId,
       prompt: sentPrompt,
       readOnly: readOnlyRequested,
+      artifactPath,
       cwd,
       model: request.model,
       effort: request.effort,
@@ -633,6 +644,7 @@ export class ForgeService {
       jobId: string;
       prompt: string;
       readOnly: boolean;
+      artifactPath: string | undefined;
       cwd: string;
       model: string | undefined;
       effort: string | undefined;
@@ -650,6 +662,7 @@ export class ForgeService {
         timeoutMs: spec.timeoutMs,
         unrestricted: spec.unrestricted,
         ...(spec.readOnly ? { readOnly: true } : {}),
+        ...(spec.artifactPath === undefined ? {} : { artifactPath: spec.artifactPath }),
         ...(spec.model === undefined ? {} : { model: spec.model }),
         ...(spec.effort === undefined ? {} : { effort: spec.effort }),
         ...(spec.conversation === undefined ? {} : { conversation: spec.conversation }),

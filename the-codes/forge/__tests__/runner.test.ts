@@ -469,6 +469,7 @@ test('a continuing stage resumes its target worker with the review in its prompt
   assert.equal(explicit?.['workerId'], 'w-impl');
   assert.equal(explicit?.['name'], 'builder');
   assert.equal(explicit?.['cwd'], work);
+  assert.equal(explicit?.['artifactPath'], stageArtifactPath(pipelineArtifactRoot(store, 'fixloop'), 'fix'), 'the request names the file the prompt tells the worker to write');
   assert.equal(defaulted?.['workerId'], 'fixloop:implement', 'the default identity is the target stage\'s');
   assert.match(String(explicit?.['prompt']), /FINDING-17: the cache is never invalidated/);
   assert.deepEqual(explicit?.['checks'], [{ name: 'unit', command: 'true' }], 'the fix stage\'s own checks reach the resumed worker');

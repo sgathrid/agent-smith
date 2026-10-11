@@ -159,7 +159,19 @@ export const READ_ONLY_ALLOWED: readonly string[] = [
 /** Tools a read-only worker may never use, even if user settings would allow them. */
 export const READ_ONLY_DENIED: readonly string[] = ['Edit', 'Write', 'NotebookEdit'];
 
-export function sandboxPlan(spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly'>): SandboxInfo {
+/**
+ * Allow rule for the one file a read-only pipeline stage may write.
+ *
+ * Verified on claude 2.1.296 (dontAsk): `Write(<path>)` rules never match, in
+ * `/abs`, `//abs` or glob form, so the write is denied. `Edit(//<abs path>)` is
+ * the rule that matches, and it covers the Write tool for exactly that file;
+ * `//` marks a filesystem-absolute path. A bare `Edit` deny does not shadow it.
+ */
+export function artifactWriteRule(artifactPath: string): string {
+  return `Edit(/${path.resolve(artifactPath)})`;
+}
+
+export function sandboxPlan(spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly' | 'artifactPath'>): SandboxInfo {
   if (spec.unrestricted) {
     return {
       sandbox: 'claude --dangerously-skip-permissions (unrestricted)',
@@ -172,9 +184,17 @@ export function sandboxPlan(spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly'>):
     // Read-only modes get an explicit allowlist (so a reviewer can inspect bytes
     // and history instead of being denied) and an explicit write-tool denylist,
     // which is what makes read-only enforced rather than merely requested.
-    flags.push('--allowedTools', ...READ_ONLY_ALLOWED, '--disallowedTools', ...READ_ONLY_DENIED);
+    // A stage's output artifact is its one permitted write: Write comes off the
+    // denylist and only that file goes on the allowlist, so dontAsk still denies
+    // every other write. Edit and NotebookEdit stay denied.
+    const artifact = spec.artifactPath;
+    const allowed = artifact === undefined ? READ_ONLY_ALLOWED : [...READ_ONLY_ALLOWED, artifactWriteRule(artifact)];
+    const denied = artifact === undefined ? READ_ONLY_DENIED : READ_ONLY_DENIED.filter((t) => t !== 'Write');
+    flags.push('--allowedTools', ...allowed, '--disallowedTools', ...denied);
     return {
-      sandbox: 'claude dontAsk + read-only allowlist (writes disallowed; shell limited to inspection commands)',
+      sandbox: artifact === undefined
+        ? 'claude dontAsk + read-only allowlist (writes disallowed; shell limited to inspection commands)'
+        : `claude dontAsk + read-only allowlist (writes disallowed except the output artifact ${path.resolve(artifact)}; shell limited to inspection commands)`,
       flags,
       readOnlyEnforced: true,
     };

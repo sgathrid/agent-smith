@@ -173,7 +173,7 @@ function envSandbox(): CodexSandbox | undefined {
  * exposed, so the same mode goes through `-c sandbox_mode="..."`.
  */
 export function sandboxPlan(
-  spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly'>,
+  spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly' | 'artifactPath'>,
   resuming = false,
 ): SandboxInfo {
   const mode = (m: CodexSandbox): SandboxInfo => {
@@ -189,7 +189,25 @@ export function sandboxPlan(
     const flags = sandboxFor(true).argv;
     return { sandbox: `codex ${flags[0]} (unrestricted)`, flags, readOnlyEnforced: false };
   }
+  if (spec.readOnly === true && spec.artifactPath !== undefined) {
+    // `-s read-only` blocks every write, `--add-dir` included (verified on codex
+    // 0.162.1), so a pipeline stage could not write its artifact. A permission
+    // profile that reads everything and writes exactly that file can; it cannot
+    // be combined with `-s`.
+    const artifact = path.resolve(spec.artifactPath);
+    const flags = [
+      '-c', `default_permissions=${JSON.stringify(ARTIFACT_PROFILE)}`,
+      '-c', `permissions.${ARTIFACT_PROFILE}.filesystem=${tomlInlineTable({ ':root': 'read', [artifact]: 'write' })}`,
+    ];
+    return { sandbox: `codex read-only except the output artifact ${artifact}`, flags, readOnlyEnforced: true };
+  }
   return mode(spec.readOnly === true ? 'read-only' : 'workspace-write');
+}
+
+const ARTIFACT_PROFILE = 'agent-smith-artifact';
+
+function tomlInlineTable(entries: Record<string, string>): string {
+  return `{${Object.entries(entries).map(([k, v]) => `${JSON.stringify(k)}=${JSON.stringify(v)}`).join(', ')}}`;
 }
 
 /**
