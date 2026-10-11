@@ -163,7 +163,7 @@ test('list_jobs: concise rows trim summaries on a word boundary and default to l
   const ctx = withService({ list: async (f: Record<string, unknown>) => { seen.push(f); return [summary(1)]; } });
   const concise = await callTool(ctx, 'list_jobs', {});
   const row = body(concise)[0];
-  assert.equal(seen[0]!.limit, 20);
+  assert.equal(seen[0]!.limit, 21); // one extra row detects a cut list
   assert.ok(row.summary.length <= 200 && LONG.startsWith(row.summary.slice(0, -1)) && LONG[row.summary.length - 1] === ' ', row.summary);
   assert.match(row.lastActivity, /^step 12: Bash npm test .*\(done\)$/); assert.ok(row.lastActivity.length < 120);
   assert.equal('latestSummary' in row, false);
@@ -171,8 +171,17 @@ test('list_jobs: concise rows trim summaries on a word boundary and default to l
   const detailed = await callTool(ctx, 'list_jobs', { response_format: 'detailed' });
   assert.equal(seen[1]!.limit, undefined);
   assert.equal(body(detailed)[0].latestSummary, LONG);
-  await callTool(ctx, 'list_jobs', { limit: 5 }); assert.equal(seen[2]!.limit, 5);
-  console.log('concise list_jobs row:', JSON.stringify(row));
+  await callTool(ctx, 'list_jobs', { limit: 5 }); assert.equal(seen[2]!.limit, 6);
+});
+
+test('list_jobs: a concise list cut by its limit says so; an uncut one stays a plain list', async () => {
+  const ctx = withService({ list: async (f: { limit: number }) => Array.from({ length: Math.min(f.limit, 3) }, (_, i) => summary(i)) });
+  const cut = await callTool(ctx, 'list_jobs', { limit: 2 });
+  assert.equal(body(cut).items.length, 2);
+  assert.match(body(cut).more, /More than 2 jobs match; narrow with since, status or session/);
+  assert.deepEqual(cut.structuredContent, body(cut));
+  const whole = await callTool(ctx, 'list_jobs', { limit: 3 });
+  assert.equal(body(whole).length, 3);
 });
 
 test('list_jobs: since parses ISO and relative times; session restricts to jobs this process spawned', async () => {
@@ -251,6 +260,13 @@ test('status include_diff: returns the diff of changedFiles against the baseline
   assert.match(b.diffNote, /untracked files not shown.*new\.txt/);
   assert.equal('diff' in body(await callTool(ctx, 'status', { jobId: 'j' })), false, 'off by default');
   assert.equal(body(await callTool(ctx, 'status', { jobId: 'j', include_diff: true, response_format: 'detailed' })).diff, b.diff);
+});
+
+test('status include_diff: flags changed files that were already dirty at spawn', async () => {
+  const { cwd, head } = gitRepo();
+  writeFileSync(path.join(cwd, 'a.txt'), 'one\nmine\njob\n');
+  const ctx = withService({ detail: async () => detail({ cwd, gitBaseline: { head, dirty: ['a.txt'] }, changedFiles: ['a.txt'] }) });
+  assert.match(body(await callTool(ctx, 'status', { jobId: 'j', include_diff: true })).diffNote, /Already uncommitted when the job started.*a\.txt/);
 });
 
 test('status include_diff: bounded at 40000 chars on a line boundary, with a note saying how to see the rest', async () => {

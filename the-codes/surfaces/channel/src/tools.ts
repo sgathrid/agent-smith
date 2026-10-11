@@ -268,9 +268,15 @@ export async function callTool(ctx: HandlerContext, name: string, rawArgs: unkno
       }
       case 'list_jobs': {
         const fmt = format(args); const since = text(args, 'since');
+        const limit = number(args, 'limit', 500) ?? (fmt === 'concise' ? CONCISE_LIST_LIMIT : undefined);
+        // Concise asks for one extra row so a cut list says so instead of looking complete.
         const jobs = await ctx.service.list({ provider: allowed(args, 'provider', ['agent-smith', 'agy-staff', 'all']), status: allowed(args, 'status', ['running', 'succeeded', 'failed', 'canceled']) as ForgeStatus | undefined,
-          limit: number(args, 'limit', 500) ?? (fmt === 'concise' ? CONCISE_LIST_LIMIT : undefined), sinceMs: since === undefined ? undefined : parseSince(since), ids: boolean(args, 'session') ? ctx.service.spawnedIds : undefined });
-        return structured(fmt === 'concise' ? jobs.map(conciseRow) : jobs);
+          limit: fmt === 'concise' && limit !== undefined ? limit + 1 : limit, sinceMs: since === undefined ? undefined : parseSince(since), ids: boolean(args, 'session') ? ctx.service.spawnedIds : undefined });
+        if (fmt !== 'concise') return structured(jobs);
+        const rows = jobs.slice(0, limit).map(conciseRow);
+        return structured(jobs.length > rows.length
+          ? { items: rows, more: `More than ${rows.length} jobs match; narrow with since, status or session, or raise limit.` }
+          : rows);
       }
       case 'status': {
         const jobId = text(args, 'jobId', true)!; const waitMs = number(args, 'wait_ms', MAX_WAIT_MS); const fmt = format(args); const wantDiff = boolean(args, 'include_diff') ?? false;

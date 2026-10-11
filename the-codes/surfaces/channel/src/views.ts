@@ -128,6 +128,9 @@ export async function jobDiff(d: JobDetail): Promise<{ diff: string | null; diff
     }
     const added = untracked.out.split('\n').filter(Boolean);
     if (added.length) notes.push(`New untracked files not shown in the diff: ${added.join(', ')}.`);
+    // The diff is against HEAD, so a file already dirty at spawn carries edits the job did not make.
+    const preDirty = d.changedFiles.filter(f => d.gitBaseline!.dirty.includes(f));
+    if (preDirty.length) notes.push(`Already uncommitted when the job started, so their diff includes earlier edits: ${preDirty.join(', ')}.`);
     return { diff, ...(notes.length ? { diffNote: notes.join(' ') } : {}) };
   } catch (err) {
     return { diff: null, diffNote: `git diff failed in ${d.cwd}: ${trimWords(String(err), 200)}. Run git diff ${head} -- <file> yourself.` };
