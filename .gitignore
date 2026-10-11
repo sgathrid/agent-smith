@@ -1,4 +1,4 @@
-node_modules/
+node_modules
 *.log
 !the-codes/harness/__tests__/fixtures/**/*.log
 .DS_Store
