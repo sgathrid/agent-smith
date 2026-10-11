@@ -1,9 +1,10 @@
 # Agent Smith
 
 Claude Code is good at delegating. Until now it could only delegate to copies of
-itself. Agent Smith lets it hand work to Codex, OpenCode, agy and other Claude
-models as first-class sub-agents. Each runs in its own real command-line harness,
-under its own permissions, and reports back to the session that sent it.
+itself. Agent Smith lets it hand work to Codex, OpenCode and agy as first-class
+sub-agents, and to Claude itself when the job needs more than a native sub-agent
+offers. Each runs in its own real command-line harness, under its own
+permissions, and reports back to the session that sent it.
 
 The result is a mixed team with Claude in charge: one model writes the change,
 another reviews it, and a test suite decides whether it is finished. That last
@@ -120,9 +121,11 @@ you the worker finished, but not that it was right. A check marked
 ### Models
 
 Agent Smith ships no model list. It asks each installed harness what it
-supports, so the choice is always current. To run Sonnet as a sub-agent, use the
-Claude provider with `model: "sonnet"`; for Codex, any model its CLI offers. Leave
-the model out and each harness uses its own default. Recurring choices can be
+supports, so the choice is always current. Leave the model out and each harness
+uses its own default. Claude Code already runs Claude models as native
+sub-agents, and Claude prefers those. It uses Agent Smith's `claude` provider
+only when a Claude worker needs checks, a place in a pipeline, a name to resume
+later, or permissions separate from your session. Recurring choices can be
 named in an optional `models.json`, as in "use `sol-high` for every review"; see
 [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
@@ -182,11 +185,11 @@ run_pipeline { "spec": { "name": "session-expiry",
 `continues` resumes the builder's own conversation, so it fixes code it already
 knows, with the review in front of it.
 
-A Sonnet worker for a second opinion, then a follow-up:
+A second opinion from a different model family, then a follow-up:
 
 ```
-spawn_job  { "mode": "review", "name": "Rae", "provider": "claude",
-             "model": "sonnet", "prompt": "Review the diff on this branch." }
+spawn_job  { "mode": "review", "name": "Rae", "provider": "codex",
+             "prompt": "Review the diff on this branch." }
 resume_job { "worker": "Rae", "prompt": "Explain finding 2 with a failing input." }
 ```
 

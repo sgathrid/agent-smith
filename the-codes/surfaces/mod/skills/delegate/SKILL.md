@@ -47,9 +47,12 @@ What we've seen so far:
 - **codex** has been fast and precise for reviews.
 - **agy** is slower, about 1 to 3 minutes even for a small review, and needs broad access to
   run commands.
-- **Claude workers** (`provider: "claude"`, `model: "sonnet"`) are a cheaper second opinion.
-  Pass the provider as well as the model: without it the job goes to the default provider
-  (agy when installed), unless the model name is a configured alias.
+- **Claude models**: for a Claude model on its own, use your native Agent tool. It is
+  lighter and shows up in the user's own task list. Use Agent Smith's `claude` provider
+  only when you need what it adds: executable checks, a stage in a pipeline, a worker you
+  can resume later by name, or isolation from this session's permissions. Then pass
+  `provider: "claude"` with the model, or the job goes to the default provider (agy when
+  installed).
 
 ## Permissions
 
