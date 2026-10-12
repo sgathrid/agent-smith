@@ -2,12 +2,14 @@
 
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { fileURLToPath } from 'node:url';
 
 import { ForgeService, pipelineRecordPath } from '../forge/service.ts';
 import { writeJsonAtomic } from '../forge/atomic.ts';
+import { archivedJobsDir, FILES, jobFile, jobsDir } from '../forge/format.ts';
 import { startPipeline, cancelPipeline, readPipeline } from '../forge/execute.ts';
 import type { PipelineRun, PipelineSpec, Stage } from '../pipeline/types.ts';
 import { detectAvailable, missingProviders } from '../providers/registry.ts';
@@ -282,6 +284,110 @@ export async function cmdCancel(id: string, repo = process.cwd()): Promise<numbe
   }
 }
 
+interface GcArgs {
+  readonly olderThan?: string;
+  readonly delete?: boolean;
+  readonly dryRun?: boolean;
+  readonly repo?: string;
+}
+
+const GC_DEFAULT_AGE = '14d';
+const GC_SETTLED_STATUSES = new Set(['succeeded', 'failed', 'canceled']);
+const GC_UNIT_HOURS: Readonly<Record<'h' | 'd' | 'w', number>> = { h: 1, d: 24, w: 168 };
+
+/** Parses gc ages such as 12h, 14d or 2w. */
+function parseGcAge(raw: string): number {
+  const match = /^(\d+)([hdw])$/.exec(raw.trim());
+  if (match === null) throw new UsageError(`--older-than: '${raw}' is not an age. Use e.g. 12h, 14d or 2w.`);
+  return Number(match[1]) * GC_UNIT_HOURS[match[2] as 'h' | 'd' | 'w'] * 3_600_000;
+}
+
+function readJobRecord(repo: string, jobId: string): Record<string, unknown> | null {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(jobFile(repo, jobId, FILES.job), 'utf8'));
+    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null;
+  } catch { return null; }
+}
+
+/** finishedAt, else startedAt, else createdAt. Null when none is present; NaN when the chosen one does not parse. */
+function settledAtMs(job: Record<string, unknown>): number | null {
+  for (const key of ['finishedAt', 'startedAt', 'createdAt']) {
+    const value = job[key];
+    if (typeof value === 'string') return Date.parse(value);
+  }
+  return null;
+}
+
+/** Delete completion-notice claim markers (.agent-smith/claims) older than the cutoff; they only matter while a job runs. */
+function sweepClaims(repo: string, cutoff: number): number {
+  const dir = path.join(repo, '.agent-smith', 'claims');
+  let removed = 0;
+  try {
+    for (const name of readdirSync(dir)) {
+      const file = path.join(dir, name);
+      try { if (statSync(file).mtimeMs < cutoff) { rmSync(file); removed += 1; } } catch { /* raced or unreadable: leave it */ }
+    }
+  } catch { /* no claims yet */ }
+  return removed;
+}
+
+/** Archives (default), deletes, or dry-runs settled jobs older than a threshold. Running jobs are never touched. */
+export async function cmdGc(args: GcArgs = {}): Promise<number> {
+  const repo = path.resolve(args.repo ?? process.cwd());
+  const ageRaw = args.olderThan ?? GC_DEFAULT_AGE;
+  const cutoff = Date.now() - parseGcAge(ageRaw);
+  let jobIds: string[] = [];
+  try {
+    jobIds = readdirSync(jobsDir(repo), { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
+  } catch { /* A missing job store is the ordinary fresh-repo case. */ }
+  const action = args.delete === true ? 'delete' : 'archive';
+  const label = args.dryRun === true ? `would ${action}` : `${action}d`;
+  let acted = 0;
+  let kept = 0;
+  let skipped = 0;
+  for (const jobId of jobIds) {
+    const job = readJobRecord(repo, jobId);
+    if (job === null) {
+      process.stderr.write(`agent-smith: skipped ${jobId}: job.json is missing or unreadable\n`);
+      skipped += 1;
+      continue;
+    }
+    if (job['status'] === 'running') { kept += 1; continue; }
+    if (typeof job['status'] !== 'string' || !GC_SETTLED_STATUSES.has(job['status'])) {
+      process.stderr.write(`agent-smith: skipped ${jobId}: unknown status ${JSON.stringify(job['status'])}\n`);
+      skipped += 1;
+      continue;
+    }
+    const settled = settledAtMs(job);
+    if (settled === null || Number.isNaN(settled)) {
+      process.stderr.write(`agent-smith: skipped ${jobId}: no valid finishedAt, startedAt or createdAt\n`);
+      skipped += 1;
+      continue;
+    }
+    if (settled > cutoff) { kept += 1; continue; }
+    const source = path.join(jobsDir(repo), jobId);
+    const target = path.join(archivedJobsDir(repo), jobId);
+    if (args.delete !== true && existsSync(target)) {
+      process.stderr.write(`agent-smith: skipped ${jobId}: ${target} already exists\n`);
+      skipped += 1;
+      continue;
+    }
+    if (args.dryRun !== true) {
+      if (args.delete === true) rmSync(source, { recursive: true });
+      else {
+        mkdirSync(archivedJobsDir(repo), { recursive: true });
+        renameSync(source, target);
+      }
+    }
+    process.stdout.write(`${label} ${jobId}\n`);
+    acted += 1;
+  }
+  const swept = args.dryRun === true ? 0 : sweepClaims(repo, cutoff);
+  if (swept > 0) process.stdout.write(`removed ${swept} completion-notice claim marker(s)\n`);
+  process.stdout.write(`gc: ${acted} ${args.dryRun === true ? 'would be ' : ''}${action}d, ${kept} kept, ${skipped} skipped (older than ${ageRaw})\n`);
+  return EXIT.ok;
+}
+
 export async function cmdDoctor(): Promise<number> {
   process.stdout.write('agent-smith doctor\n\n');
   const rows = await detectAvailable();
@@ -295,7 +401,7 @@ export async function cmdDoctor(): Promise<number> {
   return any ? EXIT.ok : EXIT.failed;
 }
 
-export const USAGE = `agent-smith — forge for coding agents\n\n  agent-smith run implement --prompt "…" [--name worker] [--repo path] [--cwd path]\n                            [--provider agy] [--model …] [--effort low] [--check "npm test"]\n  agent-smith run ./pipeline.yaml [--foreground]\n  agent-smith resume <jobId|worker-name> --prompt "…" [--repo path] [--cwd path]\n  agent-smith ls [--status running]\n  agent-smith status <runId|jobId>\n  agent-smith cancel <runId|jobId>\n  agent-smith doctor\n\nWorkers run on this machine. They are restricted by default; --unrestricted bypasses provider approval prompts.\n`;
+export const USAGE = `agent-smith — forge for coding agents\n\n  agent-smith run implement --prompt "…" [--name worker] [--repo path] [--cwd path]\n                            [--provider agy] [--model …] [--effort low] [--check "npm test"]\n  agent-smith run ./pipeline.yaml [--foreground]\n  agent-smith resume <jobId|worker-name> --prompt "…" [--repo path] [--cwd path]\n  agent-smith ls [--status running]\n  agent-smith status <runId|jobId>\n  agent-smith cancel <runId|jobId>\n  agent-smith gc [--older-than 14d] [--delete] [--dry-run] [--repo path]\n  agent-smith doctor\n\nWorkers run on this machine. They are restricted by default; --unrestricted bypasses provider approval prompts.\n`;
 
 class UsageError extends Error {}
 
@@ -307,6 +413,7 @@ export async function main(argv: readonly string[]): Promise<number> {
       timeout: { type: 'string' }, repo: { type: 'string' }, cwd: { type: 'string' }, name: { type: 'string' }, unrestricted: { type: 'boolean', default: false },
       foreground: { type: 'boolean', default: false }, concurrency: { type: 'string' }, check: { type: 'string', multiple: true },
       status: { type: 'string' }, limit: { type: 'string' }, help: { type: 'boolean', short: 'h', default: false },
+      'older-than': { type: 'string' }, delete: { type: 'boolean', default: false }, 'dry-run': { type: 'boolean', default: false },
     }, allowPositionals: true, strict: true });
   } catch (error) {
     process.stderr.write(`agent-smith: ${error instanceof Error ? error.message : String(error)}\n\n${USAGE}`);
@@ -322,6 +429,7 @@ export async function main(argv: readonly string[]): Promise<number> {
       case 'ls': return await cmdLs({ status: values.status, limit: values.limit === undefined ? undefined : Number(values.limit), repo: values.repo });
       case 'status': if (positionals[1] === undefined) throw new UsageError('status needs a run or job id'); return await cmdStatus(positionals[1], values.repo);
       case 'cancel': if (positionals[1] === undefined) throw new UsageError('cancel needs a run or job id'); return await cmdCancel(positionals[1], values.repo);
+      case 'gc': return await cmdGc({ olderThan: values['older-than'], delete: values.delete, dryRun: values['dry-run'], repo: values.repo });
       case 'doctor': return await cmdDoctor();
       case 'supervise': if (positionals[1] === undefined) throw new UsageError('supervise takes a JSON payload'); return await supervise(JSON.parse(positionals[1]) as SupervisePayload);
       default: process.stderr.write(`agent-smith: unknown command '${command}'\n\n${USAGE}`); return EXIT.usage;

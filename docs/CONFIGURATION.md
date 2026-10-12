@@ -64,6 +64,7 @@ Only variables the code reads.
 | `AGENT_SMITH_HOME` | `providers/aliases.ts` | `os.homedir()` | Where the user-level `.agent-smith/models.json` is looked up. |
 | `AGENT_SMITH_STATE_DIR` | `providers/ndjson.ts` | `~/.agent-smith/state` | Provider state root used only when a spawn gives no `stateDir`. The forge always passes the job directory, so MCP/CLI jobs do not use it. |
 | `AGENT_SMITH_CHANNEL` | `surfaces/channel/src/server.ts` | enabled | `0` disables the `claude/channel` capability, the startup baseline and the 5 s poll loop. The built plugin sets it to `0`; `dev.sh --channels` leaves it unset. |
+| `AGENT_SMITH_CONFIRM_UNRESTRICTED` | `surfaces/channel/src/tools.ts` | enabled | `0` stops `spawn_job`/`resume_job` asking the user to confirm an explicit `unrestricted: true` for codex, claude or opencode, and drops the "not confirmed" ack warning. For automation with no one to answer. |
 | `AGY_WATCH_CWD` | `server.ts`, `monitor.ts`, `watch-hook.ts` | `process.cwd()` | Repo to operate on. MCP server order: positional argv path, then this, then cwd. `monitor.js`: `--cwd`, positional first arg, then this. Hook: last resort after payload `repo`/`dir`/`recordPath` and hook `cwd`. `dev.sh` sets it to `--repo`. |
 | `HOME`, `PATH` | `discovery.ts`, `ndjson.ts` | process env | `HOME` roots the default config dirs; `PATH` is probed for provider binaries (cached per binary+PATH). |
 
@@ -83,9 +84,10 @@ never a CLI call on the spawn path.
 | `opencode` | `opencode models` (`verified: false`; use `provider/model` ids) | none |
 | `claude` | static `fable`, `opus`, `sonnet`, `haiku` (efforts low/medium/high/xhigh/max) | `<claudeHome>/settings.json` top-level `model` (no effort) |
 
-Sandbox posture per provider (echoed in the ack): agy default = no flag, cannot prompt,
-unapproved tools auto-denied, read-only not enforceable; `unrestricted` =
-`--dangerously-skip-permissions`. codex default = `-s workspace-write`, `-s read-only` for
+Sandbox posture per provider (echoed in the ack): agy default = `--dangerously-skip-permissions`
+(headless agy cannot prompt, so restricted means silent denial; opt out with `unrestricted:false`
+or `AGENT_SMITH_AGY_RESTRICTED=1`, which gives no flag and auto-denies unapproved tools;
+read-only is not enforceable). codex default = `-s workspace-write`, `-s read-only` for
 read-only modes, bypass flag when unrestricted (resume uses `-c sandbox_mode=...`). claude
 default = `--permission-mode dontAsk --permission-prompts none` (no read-only enforcement),
 `--dangerously-skip-permissions` when unrestricted. opencode default = the agent's own rules
@@ -107,7 +109,7 @@ default = `--permission-mode dontAsk --permission-prompts none` (no read-only en
 | Stale cancel | marker older than 60 s with no live owner | `harness/agent-smith.ts` |
 | Stall (`attention`) | 15 min without evidence of progress | `mod/hooks/stale.ts` |
 | Check timeout | 60 000 default per check; output tail 2 000 chars | `forge/checks.ts` |
-| `REPORT_HEAD_CHARS` | `status` returns the first 8 000 report chars (`reportTruncated`) | `tools.ts` |
+| `REPORT_HEAD_CHARS` | detailed `status` returns the first 8 000 report chars (`reportTruncated`); concise returns 2 000 | `tools.ts`, `views.ts` |
 | `changedFiles` cap | 200 paths (`changedFilesTruncated`); git calls capped at 2 s | `format.ts`, `writer.ts` |
 | List | default 50, max 500 | `tools.ts` |
 | Pipeline concurrency | 1 to 32 | `pipeline/pipeline.ts` |
@@ -119,7 +121,24 @@ default = `--permission-mode dontAsk --permission-prompts none` (no read-only en
 All tools reject unknown fields. Failures return `isError` with a sentence to act on.
 Efforts (`EFFORTS`): `low|medium|high|xhigh|max|ultra`; each model lists the efforts it
 accepts. Providers: `agy|codex|opencode|claude`. Tools marked structured also return
-`structuredContent` (arrays wrapped as `{items}`).
+`structuredContent` (arrays wrapped as `{items}`) and declare a per-tool `outputSchema` that types the
+fields below and allows extra ones (`additionalProperties: true`); clients validate against it.
+
+Tasks vocabulary: launch acks (`spawn_job`, `resume_job`, `run_pipeline`) carry `taskHandle {taskId, status:
+'working', pollIntervalMs: 5000}` (`taskId` is the job or run ID; `pollIntervalMs` is the server's poll
+cadence), and `status`/`list_jobs` rows carry `taskStatus` beside `status`: `running`/`unknown` ->
+`working`, `succeeded` -> `completed`, `failed` -> `failed`, `canceled` -> `cancelled`. These are the
+MCP Tasks extension's (2026-07-28) names; the extension itself is not implemented. No `ttlMs`: jobs
+are kept until `agent-smith gc` is run.
+
+Confirming `unrestricted`: an explicit `unrestricted: true` on `spawn_job` or `resume_job` for codex,
+claude or opencode asks the user first via MCP form elicitation ("Allow codex worker "Ada" to run
+without approval prompts in <cwd>? It will be able to run any command."). Accept launches; decline,
+cancel or no answer within 10 minutes returns `isError` (`The user declined unrestricted access; rerun
+without unrestricted, or ask the user.`) and launches nothing. A client without form elicitation gets
+the launch as before plus an ack warning that it was not confirmed. Never asked for agy, for
+`unrestricted: false` or absent, for a setting `resume_job` inherits, or with
+`AGENT_SMITH_CONFIRM_UNRESTRICTED=0`. `run_pipeline`'s `unrestricted` is not confirmed.
 
 ### `list_capabilities` (read-only, structured)
 Params: `refresh` boolean (default false; bypass the catalog cache).
@@ -135,39 +154,60 @@ roleDefaults}`, `aliasConfigErrors?`, `modes[{name,description,readOnly,runsComm
 |---|---|---|
 | `mode` | enum `implement|review|moderate|verify` | required |
 | `prompt` | string | required, nonempty |
+| `context` | string | optional, 1 to 2 000 chars; why the work matters and who it is for, shown to the worker in its brief |
 | `name` | string | worker label for `resume_job`; default `<mode>-<8 hex of id>`; max 80; must not collide with an active job |
 | `task` | string | short description; default first prompt line |
 | `provider` | enum | default: alias/roleDefault provider, else `agy` if installed, else the first installed |
 | `model`, `effort` | string, enum | optional; validated against a fresh catalog, otherwise warnings only |
 | `timeoutMs` | integer >= 1 | default 2 700 000, clamped 1 000 to 21 600 000 |
-| `unrestricted` | boolean | default false |
+| `unrestricted` | boolean | default true for agy; false for other providers; `true` for codex, claude or opencode asks the user to confirm (above) |
+| `cwd` | string | absolute existing directory; default server repo; checks resolve against it |
 | `conversation` | string | native conversation handle to resume |
-| `checks` | array | items `{name, command}` required, `cwd`, `timeoutMs` (int >= 1; default 60 000), `blocking` (default true); run after success |
+| `checks` | array | items `{name, command}` required, `cwd`, `timeoutMs` (int >= 1; default 60 000), `blocking` (default true); run after success; also listed in the worker's brief as its definition of done |
 
 Result (`SpawnAck`): `jobId, name, workerId, role, provider, status:'running', dir, repo,
 timeoutMs, unrestricted, note, sandbox, sandboxFlags, readOnlyRequested, readOnlyEnforced,
 modelRequested, modelResolved, modelSource` (`requested|harness-config|reported|unknown`),
-`preambleApplied`, `warnings?`; plus `notify {mode:'hook', note, monitorCommand?,
+`preambleApplied`, `warnings?`; plus `taskHandle {taskId, status, pollIntervalMs}`, `notify {mode:'hook', note, monitorCommand?,
 monitorTimeoutMs?}`, `aliasApplied?`/`aliasSource?`, and `checks` (names) when checks were
 given.
 
 ### `resume_job`
 Params: `worker` (name or job id, required), `prompt` (required), `model`, `effort`,
-`timeoutMs`, `unrestricted` (default: the original job's). Provider, mode, cwd, workerId,
+`timeoutMs`, `unrestricted` (default: the original job's; an explicit `true` is confirmed as for `spawn_job`), `cwd` (absolute existing directory;
+default: the original job's). An explicit cwd changes the process working directory while
+retaining the prior conversation, which can still mention its previous workspace. Provider, mode, workerId,
 name and conversation come from the finished job; no `provider` or `checks` parameter.
 Refuses running workers, workers without a conversation handle, ambiguous names. Result:
-a `SpawnAck` plus `notify` (not structured).
+a `SpawnAck` plus `taskHandle` and `notify` (not structured).
 
 ### `list_jobs` (read-only, structured)
 Params: `provider` enum `agent-smith|agy-staff|all` (default `agent-smith`), `status` enum
-`running|succeeded|failed|canceled`, `limit` 1-500 (default 50). Running first, then newest.
-Result rows (`JobSummary`): `jobId, name, workerId, role, latestSummary, summarySource,
-source, status, provider, mode, model, task, toolCalls, currentActivity, startedAt,
+`running|succeeded|failed|canceled`, `limit` 1-500 (default 20 concise, 50 detailed), `since` (ISO time
+or relative `30m`/`2h`/`1d`; jobs last active at or after it), `session` (only jobs spawned by this server
+process; empty after a restart), `response_format` `concise|detailed` (default `concise`). Running first,
+then newest. Every row (both formats) adds `taskStatus`. Concise rows: `jobId, name, status, provider, model, mode, summary` (trimmed to 200 chars on a
+word boundary), `toolCalls, lastActivity` (one line), `startedAt, finishedAt, nextAction?, warningCount?`.
+Detailed rows (`JobSummary`): `jobId, name, workerId, role, latestSummary, summarySource,
+source, status, provider, mode, model, task, toolCalls, currentActivity, lastActivity, startedAt,
 updatedAt, finishedAt, warnings[], nextAction, unrestricted?`. `latestSummary` is untrusted.
 
 ### `status` (read-only, structured)
-Params: `jobId` (required), `wait_ms` 1-60000 (long-poll while running).
-Result: `JobSummary` fields plus `report` (first 8 000 chars), `reportTruncated`, `error`,
+Params: `jobId` (required), `wait_ms` 1-60000 (long-poll while running), `response_format`
+`concise|detailed` (default `concise`), `include_diff` (boolean).
+Both formats add `taskStatus`.
+Concise result: `jobId, name, provider, model, mode, status, taskStatus`, `acceptance {state, passed[], failed[]
+(check names), pending?, reason?}`, `startedAt, finishedAt, durationMs, toolCalls, lastActivity`,
+`changedFileCount`, `changedFiles` (first 20), `nextAction`, `error`, `warnings` (deduped strings), one `report`
+(first 2 000 chars; a trailing note says it was cut and `reportTruncated` is true), `summary` only when
+the report does not already contain it, and with `wait_ms`: `waited`, `stillRunning`. Null fields are omitted.
+`include_diff` (either format) adds `diff`: a unified diff of `changedFiles` against the job's spawn-time
+`gitBaseline.head`, run in the job's `cwd`, capped at 40 000 chars on a line boundary. `diffNote` says how
+to see the rest (`git diff <head> -- <file>`), lists new untracked files (which a diff cannot show), or
+explains why there is no diff (no git baseline, job still running, no changes; `diff` is then null or empty).
+The diff is evidence, not attribution: parallel workers in one tree see each other's edits, and edits that
+were already uncommitted at spawn in a changed file are included.
+Detailed result (the full record): `JobSummary` fields plus `report` (first 8 000 chars), `reportTruncated`, `error`,
 `exitCode`, `unrestricted`, `pipeline`, `stage`, `usage`, `conversation`, `effort`, `cwd`,
 `modelRequested/modelResolved/modelSource`, `preambleApplied`, `sandbox`, `sandboxFlags`,
 `readOnlyRequested/readOnlyEnforced`, `cancellable`, `gitBaseline?`, `changedFiles?`,
@@ -182,18 +222,52 @@ stopped; check `status`.
 
 ### `run_pipeline`
 Params: `spec` object (unknown fields rejected): `name` (required), `task` (required unless
-`stages`), `workDir` (default repo), `concurrency` 1-32, `unrestricted` (default false),
-`stages[]`. Stage fields: `name`, `provider` (required); `agentName`, `workerId`,
-`conversation`, `model`, `effort`, `prompt`, `title`, `role`, `dependsOn[]`, `workDir`,
+`stages`), `workDir` (default repo), `concurrency` 1-32, `unrestricted` (default: true for agy stages, false for others),
+`stages[]`. Stage fields: `name`, `provider` (required unless `continues` is set); `agentName`, `workerId`,
+`conversation`, `continues` (see below), `model`, `effort`, `prompt`, `context` (as `spawn_job`), `title`, `role`, `dependsOn[]`, `workDir`,
 `resultPath`, `timeoutMs`, `routingPinned`, `checks[]` (same shape as `spawn_job`),
 `consumes[{stage,path,label?}]`. Without `stages`: implement -> review -> moderate from
 installed providers. Result: `{runId, recordPath, stages[{name,provider,dependsOn}],
-started:true, notify}` (not structured).
+started:true, task, notify}` (not structured).
+
+#### Fixing from a review: `continues`
+`continues: "<stage>"` makes a stage resume an earlier stage's worker instead of starting a
+fresh one: same provider (omit `provider` to inherit it), same worker identity, same
+conversation, and the target's `workDir` unless the stage sets its own. The stage prompt
+gets the artifacts of its `dependsOn` stages (plus `consumes`) as usual, so a stage that
+depends on a review receives the review findings.
+
+```yaml
+- name: build
+  provider: agy
+- name: review
+  provider: codex
+  dependsOn: [build]
+- name: fix
+  continues: build           # agy, build's conversation and worker
+  dependsOn: [review]
+  checks: [{ name: unit, command: npm test }]
+```
+
+The target must be a `dependsOn` ancestor on the same provider, and `conversation` cannot
+be set alongside it; these are rejected at load time. If the target produced no conversation
+handle (or an escalation moved it to another provider) the stage fails with code
+`no-conversation` and the reason. Rounds are explicit: `build -> review1 -> fix1 -> review2 ->
+fix2`, with `fix2` continuing `fix1` or `build`. `checks` on the fix stage gate acceptance
+as on any stage. A complete example is in `the-codes/cli/pipeline.example.yaml`.
 
 ### `pipeline_status` (read-only)
-Params: `runId` (required). Result: the `PipelineRecord` (`runId, pipeline, status
-running|passed|partial|failed, startedAt, finishedAt, stageResults{stage -> status,
-acceptance passed|failed|unchecked, jobId, ...}, error?`).
+Params: `runId` (required), `response_format` `concise|detailed` (default `concise`). Detailed result:
+the full `PipelineRecord` (`runId, pipeline, status running|passed|partial|failed, startedAt, finishedAt,
+stageResults{stage -> status, acceptance passed|failed|unchecked, jobId, observations, ...}, error?`).
+Concise result: `runId, pipeline, status, startedAt, finishedAt, durationMs, error?` and per stage
+`status, acceptance, durationMs, jobId, checks {passed[], failed[]}, artifact` (the result path),
+`failure` (`code: message`) and `outputTail` (last 500 chars); no `observations`.
+
+### Tool errors
+Bad arguments, unknown jobs/runs/workers and refused actions come back as tool results with
+`isError: true` and one sentence naming the next step (e.g. `Worker "Ada" is still running; wait for its
+completion notice or call cancel.`).
 
 ## Where state lives
 

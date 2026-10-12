@@ -165,11 +165,16 @@ export function buildArgv(spec: SpawnSpec): string[] {
     argv.push('--session', spec.conversation);
   }
 
-  if (spec.addDirs !== undefined && spec.addDirs.length > 0) {
-    for (const dir of spec.addDirs) {
-      argv.push('--dir', dir);
-    }
-  }
+  // addDirs: DELIBERATELY IGNORED.
+  //
+  // The v2 docs list a `--dir` flag, but it is NOT in `opencode run --help` on
+  // v2.0.26, and passing it makes the CLI print usage and exit non-zero — a
+  // guaranteed spawn failure for any job that set addDirs. Verified 2026-10-09.
+  // Emitting a flag that the binary rejects is strictly worse than not emitting
+  // it, so we drop the request rather than pretending the directories were
+  // widened. `run` has no sandbox to widen anyway: it works from the cwd we
+  // spawn it in, which spawnWorker already sets to spec.cwd. core/ should treat
+  // opencode as having no addDirs support rather than assume otherwise.
 
   // Trailing positional message, last.
   argv.push(spec.prompt);

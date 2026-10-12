@@ -31,9 +31,15 @@
  *                 happened and I don't know what" costs tokens and buys nothing.
  *   succeeded→? — a re-read of an unchanged terminal job is not a change.
  *
- * Budget: ~50 tokens per event. That is one short sentence plus a `meta` object.
- * A push longer than that is a bug, not a feature.
+ * Budget: one short line per job plus a closing next step (the text is
+ * mod/hooks/notice.ts claudeText). Worker prose is excerpted, never pasted whole.
  */
+
+// The words live in the mod (hooks/notice.ts), which announces the same jobs
+// when it is loaded: one renderer, so the hook and the mod cannot drift apart.
+import { type NoticeJob, claudeText, compactExcerpt } from '../../mod/hooks/notice.ts';
+
+export { compactExcerpt };
 
 // ── what we are allowed to say ──────────────────────────────────────────────
 
@@ -48,16 +54,25 @@ export interface WatchableJob {
   readonly id: string;
   readonly name?: string;
   readonly role?: string;
+  readonly provider?: string;
+  readonly startedAt?: string | null;
+  readonly changedFileCount?: number;
   readonly latestSummary?: string | null;
   readonly summarySource?: 'worker' | null;
   /** Runtime-owned outcome, separate from worker-authored prose. */
   readonly outcome?: string;
+  /** Runtime-owned failure reason (job.json error), when recorded. */
+  readonly failureReason?: string | null;
+  /** Acceptance check tally, when checks ran. */
+  readonly checks?: { readonly passed: number; readonly total: number } | null;
+  /** `agy-staff` for a legacy interop job; absent for Forge jobs and runs. */
+  readonly source?: 'agy-staff';
   readonly status: WatchStatus;
   /** ISO-8601 of the last evidence of real work. Null ⇒ we have no evidence. */
   readonly lastEventAt: string | null;
   /** ISO-8601 the job reached a terminal state. Null while it has not. */
   readonly finishedAt: string | null;
-  /** Whether the provider flagged warnings. Meaningful only once terminal. */
+  /** Whether the provider flagged warnings. Meaningful only once terminal; not rendered. */
   readonly warned: boolean;
 }
 
@@ -189,8 +204,8 @@ export function shouldPush(candidate: Candidate, now: number): boolean {
  * What the channel will actually send for one poll.
  *
  * THE ANTI-SPAM RULE: N simultaneous events become at most ONE notification.
- * If five jobs fail in the same tick, the user gets one line naming five jobs.
- * Not five lines. This is not a formatting preference — it is the difference
+ * If five jobs fail in the same tick, Claude gets one block: a counted headline
+ * and a line per job. Not five wakes. This is not a formatting preference — it is the difference
  * between an event feed and a firehose, and a firehome gets muted, and a muted
  * channel costs the user the one thing they installed it for.
  */
@@ -208,11 +223,10 @@ export interface Batch {
  *
  * PURE. Given the same candidates and the same `seen`, always the same batch.
  *
- * The grouping is by KIND, not by job. "three finished, one failed" is a
- * different piece of news from "four failed", and Claude's useful next action
- * differs: several successes is usually "carry on", several failures is usually
- * "stop and look". Collapsing them into one undifferentiated list would throw
- * that away.
+ * The headline counts by KIND. "three succeeded, one failed" is a different
+ * piece of news from "four failed", and Claude's useful next action differs:
+ * several successes is usually "carry on", several failures is usually "stop
+ * and look". Each job still gets its own line so Claude can act on its id.
  */
 export function buildBatch(candidates: readonly Candidate[], now: number): Batch {
   const pushable = candidates.filter((c) => shouldPush(c, now));
@@ -222,126 +236,35 @@ export function buildBatch(candidates: readonly Candidate[], now: number): Batch
   }
 
   const keys = pushable.map((c) => dedupeKey(c.job));
+  const content = claudeText(pushable.map((c) => toNotice(c.job, pushKindFor(c.job)!, now)));
 
-  // Single event: the specific, terse, per-event message. This is the common
-  // case and it is the one that earns its tokens by being actionable.
+  // Single event: its own kind. Several at once: the batch is one notice, and
+  // its meta lists every job.
   if (pushable.length === 1) {
     const only = pushable[0]!;
-    const kind = pushKindFor(only.job)!;
-    return {
-      content: renderOne(kind, only.job),
-      meta: metaFor(kind, [only.job]),
-      keys,
-    };
+    return { content, meta: metaFor(pushKindFor(only.job)!, [only.job]), keys };
   }
-
-  // Several at once: one line per KIND, joined. Never one line per job.
-  const byKind = new Map<PushKind, WatchableJob[]>();
-  for (const c of pushable) {
-    const kind = pushKindFor(c.job)!;
-    const list = byKind.get(kind);
-    if (list) list.push(c.job);
-    else byKind.set(kind, [c.job]);
-  }
-
-  const clauses: string[] = [];
-  const metaJobs: WatchableJob[] = [];
-  for (const [kind, jobs] of byKind) {
-    clauses.push(`${jobs.length} ${PLURAL[kind]}`);
-    metaJobs.push(...jobs);
-  }
-  const failedCount = byKind.get('failed')?.length ?? 0;
-
-  // Failures are named even in a batch. "4 failed" does not tell Claude which
-  // four, and the whole value of the channel is that Claude can act without the
-  // user retyping a job id. Names cost ~4 tokens each; four of them is worth it.
-  const named = (byKind.get('failed') ?? []).map((j) => j.name ? `${j.name} (${j.id})` : j.id).join(', ');
-
-  const content =
-    `agy: ${clauses.join(', ')}` +
-    (failedCount > 0 ? ` (${named})` : '') +
-    (pushable.some(c => c.job.name) ? '. /forge to inspect.' : '. /agy-radar to inspect.') + pushable.filter(c => c.job.name).slice(0, 3).map(c => {
-      const job = c.job;
-      const evidence = job.outcome ?? (job.summarySource === 'worker' ? job.latestSummary : null);
-      return evidence ? ` ${job.name}: ${job.outcome ? 'Runtime outcome' : 'Worker output'}: ${evidence.replace(/\s+/g, ' ').slice(0, 250)}` : '';
-    }).join('');
-
-  return { content, meta: metaFor('failed', metaJobs), keys };
-}
-
-/** Plural noun for each kind, used only in batch headlines. */
-const PLURAL: Record<PushKind, string> = {
-  finished: 'finished',
-  failed: 'failed',
-  attention: 'need attention',
-  cancelled: 'cancelled',
-};
-
-/**
- * The single-event message.
- *
- * The required shape:
- *
- *   agy job implement-musm82da finished after 28m with warnings. cargo test
- *   exited 1. It reported tests passing. /agy-radar to inspect.
- *
- * Every clause is a fact we actually hold, and the order is chosen so the most
- * decision-relevant fact comes first: what happened, then how long, then the
- * evidence, then the contradiction. It ends with the escape hatch, because the
- * channel's job is to make Claude aware, not to make Claude do the work.
- */
-function renderOne(kind: PushKind, job: WatchableJob): string {
-  if (job.name) {
-    const state = kind === 'finished' ? 'completed execution' : kind === 'attention' ? 'needs attention' : kind;
-    const summary = job.summarySource === 'worker' && job.latestSummary
-      ? ` Worker output: ${job.latestSummary.replace(/\s+/g, ' ').slice(0, 600)}` : '';
-    return `${job.name}${job.role ? ` (${job.role})` : ''} ${state}. ID ${job.id}.${job.outcome ? ` Runtime outcome: ${job.outcome.slice(0, 600)}` : ''}${summary} /forge or status to inspect.`;
-  }
-  const id = job.id;
-  const dur = durationWords(job.finishedAt, job.lastEventAt);
-
-  switch (kind) {
-    case 'finished':
-      return (
-        `agy job ${id} finished${dur}${job.warned ? ' with warnings' : ''}. ` +
-        `/agy-radar to inspect.`
-      );
-    case 'failed':
-      return (
-        `agy job ${id} failed${dur}${job.warned ? ' with warnings' : ''}. ` +
-        `It may have claimed otherwise — /agy-radar to inspect.`
-      );
-    case 'cancelled':
-      return `agy job ${id} was cancelled. /agy-radar to inspect.`;
-    case 'attention':
-      return (
-        `agy job ${id} has stopped making progress${dur}. ` +
-        `It may be stuck — /agy-radar to inspect.`
-      );
-  }
+  return { content, meta: metaFor('failed', pushable.map((c) => c.job)), keys };
 }
 
 /**
- * " after 28m" from the two timestamps, or '' when we cannot say.
- *
- * We only speak about a duration we can actually derive. job.finishedAt minus
- * job.lastEventAt is not the runtime — lastEventAt is the last EVENT, which for a
- * fast job is seconds before it ended. So we do not pretend: if the only two
- * times we hold are within a minute of each other, the honest rendering is no
- * duration at all rather than "after 4s" for a 28-minute job.
+ * A watched job as the shared notice shape. A pipeline run (role `pipeline`)
+ * carries its stage verdicts as `outcome`; a job carries its failure reason.
  */
-function durationWords(finishedAt: string | null, lastEventAt: string | null): string {
-  if (finishedAt === null) return '';
-  const end = Date.parse(finishedAt);
-  if (Number.isNaN(end)) return '';
-  if (lastEventAt === null) return '';
-  const start = Date.parse(lastEventAt);
-  if (Number.isNaN(start)) return '';
-  const ms = end - start;
-  // Under a minute apart is not a runtime; it is a measurement artifact.
-  if (ms <= 0 || ms < 60_000) return '';
-  const mins = Math.round(ms / 60_000);
-  return mins >= 1 ? ` after ${mins}m` : '';
+export function toNotice(job: WatchableJob, kind: PushKind, now: number): NoticeJob {
+  const run = job.role === 'pipeline' && job.outcome !== undefined;
+  const span = kind === 'attention'
+    ? (job.lastEventAt === null ? NaN : now - Date.parse(job.lastEventAt))
+    : (job.startedAt && job.finishedAt ? Date.parse(job.finishedAt) - Date.parse(job.startedAt) : NaN);
+  return {
+    id: job.id, kind, name: job.name ?? null, provider: job.provider ?? null, role: job.role ?? null,
+    source: job.source ?? null, run,
+    durationMs: Number.isFinite(span) ? span : null,
+    changedFiles: job.changedFileCount ?? null,
+    checks: job.checks ?? null,
+    reason: run ? job.outcome! : kind === 'failed' ? job.failureReason ?? null : null,
+    summary: job.summarySource === 'worker' ? job.latestSummary ?? null : null,
+  };
 }
 
 // ── meta ────────────────────────────────────────────────────────────────────

@@ -18,3 +18,11 @@ test('job summary exposes only an observed active tool call as currentActivity',
   assert.equal(toSummary(observed({ recent_activities: [] }), 'agent-smith').currentActivity, null);
   assert.equal(toSummary(observed({ recent_activities: [activity] }, 'succeeded'), 'agent-smith').currentActivity, null);
 });
+
+test('lastActivity retains a completed agy tool while currentActivity is empty', () => {
+  const activity = { stepIndex: 3, tool: 'run_command', status: 'done', input: 'npm test' };
+  const summary = toSummary(observed({ recent_activities: [activity] }), 'agent-smith');
+  assert.equal(summary.currentActivity, null);
+  assert.deepEqual(summary.lastActivity, activity);
+  assert.deepEqual(toSummary(observed({ recent_activities: [activity] }, 'succeeded'), 'agent-smith').lastActivity, activity);
+});

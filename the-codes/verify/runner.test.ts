@@ -242,6 +242,15 @@ test('a missing cwd is reported, not thrown', async () => {
   assert.equal(verdict.blocking, true);
 });
 
+test('a missing cwd preserves an explicitly non-blocking check', async () => {
+  const verdict = await runCheck({
+    name: 'optional-ghost', command: 'exit 0', cwd: join(tmpdir(), 'definitely-not-here-optional'),
+    timeoutMs: 1_000, blocking: false,
+  });
+  assert.equal(verdict.skipped, 'missing-cwd');
+  assert.equal(verdict.blocking, false);
+});
+
 test('an empty command is absent, not a failure to fix', async () => {
   const cwd = scratch();
   try {

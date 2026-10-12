@@ -100,7 +100,10 @@ export function mirrorAt(repo: string, jobId: string, suffix: string): string {
  * ──────────────────────────────────────────────────────────────────────────── */
 
 /** `.spec.json`. The `task` is what the band and pane show as the job's title. */
-export function mirrorSpec(m: ForgeManifest): Record<string, unknown> {
+/** Cap on the prompt copy kept in the spec; the pane shows it, nothing else reads it. */
+export const MIRROR_PROMPT_CAP = 64_000;
+
+export function mirrorSpec(m: ForgeManifest, prompt?: string, preamble?: string): Record<string, unknown> {
   return {
     [MIRROR_MARKER]: true,
     job_id: m.jobId,
@@ -108,7 +111,12 @@ export function mirrorSpec(m: ForgeManifest): Record<string, unknown> {
     workerId: m.workerId,
     role: m.role,
     cwd: m.cwd,
-    prompt_source: { kind: MIRROR_MARKER, task: m.task },
+    prompt_source: {
+      kind: MIRROR_MARKER,
+      task: m.task,
+      ...(prompt === undefined ? {} : { prompt: prompt.slice(0, MIRROR_PROMPT_CAP) }),
+      ...(preamble === undefined || preamble === '' ? {} : { preamble }),
+    },
     resolved: {
       name: m.name,
       workerId: m.workerId,
@@ -255,6 +263,13 @@ export function tokenWords(usage: Readonly<Record<string, number>> | null): stri
  */
 export function mirrorEventLine(event: Record<string, unknown>): Record<string, unknown> | null {
   const kind = event['kind'];
+  // Assistant prose, for the pane's live transcript. A separate top-level key so
+  // tool-count/tool-history readers (which only look at `step_update`) ignore it.
+  if (kind === 'text') {
+    const text = event['text'];
+    if (event['stream'] !== 'assistant' || typeof text !== 'string' || text === '' || (event['delta'] !== true && text.trim() === '')) return null;
+    return { agent_text: { at: event['at'] ?? null, text: text.slice(0, 16_000), delta: event['delta'] === true } };
+  }
   if (kind !== 'activity-start' && kind !== 'activity-end') return null;
   const activity = event['activity'] as Record<string, unknown> | undefined;
   if (activity === undefined) return null;
@@ -361,9 +376,9 @@ export class MirrorWriter {
     throw new MirrorClaimError(specPath);
   }
 
-  writeSpec(m: ForgeManifest): void {
+  writeSpec(m: ForgeManifest, prompt?: string, preamble?: string): void {
     if (!this.enabled) return;
-    writeJsonAtomic(mirrorAt(this.repo, m.jobId, SPEC), mirrorSpec(m));
+    writeJsonAtomic(mirrorAt(this.repo, m.jobId, SPEC), mirrorSpec(m, prompt, preamble));
     appendLine(mirrorAt(this.repo, m.jobId, LOG), mirrorDispatchLine(m).trimEnd());
   }
 

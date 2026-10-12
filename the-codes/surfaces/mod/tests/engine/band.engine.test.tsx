@@ -33,26 +33,6 @@ import type { BandLine, BandBudget } from '../../hooks/band.ts';
 import { BAND_ROWS, buildLine, isShown, noColor, rowBudget } from '../../hooks/band.ts';
 import type { RadarJob } from '../../../types/index.d.ts';
 
-test('Forge list and detail request one third of the measured terminal', async ($, on) => {
-  engine(on);
-  const widths: number[] = [];
-  on('ui.open', (_$, e) => { widths.push(e.columns); return { value: { isPlaced: true } }; });
-  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
-  const band = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', ...BAND,
-    viewport: { columns: 180, rows: 40, isFullscreen: true } } as never);
-  await $.command.run({ command: 'forge', args: '' });
-  expect(widths[widths.length - 1]).toBe(60);
-  await band.unmount();
-  const pane = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', component: 'Pane', requestId: 'agent-smith',
-    viewport: { columns: 240, rows: 40, isFullscreen: true },
-    props: { title: 'Agent Smith', isFocused: true, bodyColumns: 80, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} } } as never);
-  expect(widths[widths.length - 1]).toBe(80);
-  await pane.press({ key: `job-${ID}` });
-  expect(await pane.find({ key: 'back' })).toBeDefined();
-  expect(widths[widths.length - 1]).toBe(80);
-  await pane.unmount();
-});
-
 // ── fixtures, verbatim from the corpus ──────────────────────────────────────
 
 /** `<id>.log`, real: implement-musm82da-f1dc1fe4.log */
@@ -89,6 +69,7 @@ const RUNNING_NOW = Date.parse('2026-10-03T16:49:45.031Z');
 
 const BAND = {
   component: 'AbovePrompt' as const,
+  requestId: 'forge-band',
   props: { hasSurvey: false, isWorking: true, maxRows: 10, bodyColumns: 120 },
 };
 
@@ -106,6 +87,7 @@ function engine(
     noColorEnv?: string;
     files?: Record<string, string>;
     entries?: { name: string; kind: 'file' | 'dir'; size: number }[];
+    scrollCalls?: Record<string,unknown>[];
     nativeTask?: boolean;
     nativeTaskCalls?: { tool: string; input: Record<string, unknown> }[];
   } = {},
@@ -133,10 +115,13 @@ function engine(
     cwd: (e as { cwd?: string }).cwd,
   }));
   on('command.register', () => ({ value: undefined }));
-  mock.clock(on as never, { now: options.now ?? RUNNING_NOW });
+  on('ui.scroll', (_$,e) => { options.scrollCalls?.push(e as Record<string,unknown>); return {}; });
+  on('ui.close', () => ({value:undefined}));
+  const clock = mock.clock(on as never, { now: options.now ?? RUNNING_NOW });
   on('env.get', (_$: unknown, e: unknown) => {
     const name = (e as { name: string }).name;
     if (name === 'AGY_RADAR_REPO') return { value: options.nativeTask ? '/work' : '/corpus' };
+    if (name === 'AGENT_SMITH_LEGACY_JOBS') return { value: options.nativeTask ? undefined : '1' };
     if (name === 'NO_COLOR') return { value: options.noColorEnv };
     return { value: undefined };
   });
@@ -150,7 +135,7 @@ function engine(
   on('fs.read', (_$: unknown, e: unknown) => {
     const path = (e as { path: string }).path;
     const name = path.slice(path.lastIndexOf('/') + 1);
-    const body = files[name];
+    const body = options.files?.[name] ?? files[name];
     if (body === undefined) {
       // The real `$.fs.read` rejects with the OS errno; the band must survive it.
       return { deny: `ENOENT: no such file or directory, open '${path}'` };
@@ -158,7 +143,7 @@ function engine(
     return { value: body };
   });
   on('fs.exists', (_$: unknown, e: unknown) => ({
-    value: Object.hasOwn(files, (e as { path: string }).path.slice((e as { path: string }).path.lastIndexOf('/') + 1)),
+    value: (options.nativeTask && (e as {path:string}).path === '/work/.agent-smith/jobs') || Object.hasOwn(options.files ?? {}, (e as {path:string}).path.split('/').pop()!) || Object.hasOwn(files, (e as { path: string }).path.slice((e as { path: string }).path.lastIndexOf('/') + 1)),
   }));
   if (options.nativeTaskCalls) {
     on('tool.call', (_$: unknown, e: unknown) => {
@@ -170,7 +155,15 @@ function engine(
     });
   }
   on('ui.render', ($: any, e: any) => $.ui.resolve(e).Text({ children: 'REST-OF-BAND' }));
+  return clock;
 }
+
+/** A `classic.PostToolUse` for a successful launch ack: how this session comes to own a job or run. */
+const launched = (id: string, repo = '/work', kind: 'job' | 'run' = 'job') => ({
+  hook_event_name: 'PostToolUse', session_id: 's', transcript_path: '/t', cwd: '/work',
+  tool_name: `mcp__plugin_agent-smith_agent-smith__${kind === 'job' ? 'spawn_job' : 'run_pipeline'}`, tool_use_id: `tu-${id}`, tool_input: {},
+  tool_response: { structuredContent: { [kind === 'job' ? 'jobId' : 'runId']: id, repo, timeoutMs: 600_000 }, content: [] },
+}) as never;
 
 // ── pure helpers, re-checked under the engine's own runner ─────────────────
 
@@ -310,7 +303,7 @@ describe('HAZARD A, as drawn', () => {
     // THE headline rule. agy-staff exits 0 having delivered nothing when a tool
     // is soft-denied. A `✓` here is the most expensive lie this project could tell.
     engine(on, {
-      now: Date.parse('2026-10-03T17:06:00.000Z'),
+      now: Date.parse('2026-10-03T17:05:45.000Z'),
       entries: [
         { name: `${ID}.spec.json`, kind: 'file', size: REAL_SPEC.length },
         { name: `${ID}.log`, kind: 'file', size: REAL_LOG.length },
@@ -403,7 +396,7 @@ describe('HAZARD A, as drawn', () => {
       props: { hasSurvey: false, isWorking: true, maxRows: 3, bodyColumns: 80 },
     } as never);
     // 5 jobs, 2 rows + overflow ⇒ +3 more, not +1.
-    expect(await band.find({ type: 'Text', text: '+3 more' })).toBeDefined();
+    expect(await band.find({ type: 'Text', text: '+4 more' })).toBeDefined();
   });
 });
 
@@ -441,7 +434,7 @@ describe('the render path uses the tested helpers', () => {
 describe('native task-list projection', () => {
   test('uses host TaskCreate/TaskUpdate and preserves truthful worker metadata', async ($, on) => {
     const calls: { tool: string; input: Record<string, unknown> }[] = [];
-    engine(on, {
+    const clock = engine(on, {
       nativeTask: true,
       nativeTaskCalls: calls,
       files: {
@@ -449,6 +442,7 @@ describe('native task-list projection', () => {
           schema: 1,
           jobId: 'job-native-1',
           status: 'running',
+          updatedAt: new Date(RUNNING_NOW).toISOString(),
           name: 'Codex reviewer',
           workerId: 'worker-codex-7',
           role: 'reviewer',
@@ -464,6 +458,12 @@ describe('native task-list projection', () => {
     });
 
     await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
+    // Another session's running job gets no task here.
+    await clock.advance(3000);
+    expect(calls).toHaveLength(0);
+    // This session's launch does.
+    await ($ as any).classic.PostToolUse(launched('job-native-1'));
+    await clock.advance(3000);
 
     const create = calls.find((call) => call.tool === 'TaskCreate');
     const update = calls.find((call) => call.tool === 'TaskUpdate');
@@ -480,5 +480,342 @@ describe('native task-list projection', () => {
     expect(update?.input.status).toBe('in_progress');
     expect(update?.input.description).toContain('Outcome: running');
     expect(update?.input.description).toContain('Latest worker output:\nFound a retry loop');
+  });
+});
+
+test('the last finished band row expires and stops repainting', async ($, on) => {
+  const clock=engine(on,{now:Date.parse('2026-10-03T17:05:45Z'),files:{[`${ID}.result.md`]:'A complete worker report with enough content to pass the output validator.',[`${ID}.result.md.status.json`]:REAL_STATUS}});
+  await $.session.start({surface:'terminal',isInteractive:true,cwd:'/work'} as never);
+  const band=await $.ui.mount({plugin:'agent-smith',surface:'terminal',...BAND} as never);
+  expect(await band.find({type:'Text',text:/open an agent-built dashboard/})).toBeDefined();
+  await clock.advance(60_000);
+  expect(await band.find({type:'Text',text:/open an agent-built dashboard/})).toBeUndefined();
+});
+
+// ── /forge: the band's digits and the command open one focused sidebar ─────
+
+const PANE_TARGET = { plugin: 'agent-smith', surface: 'terminal', component: 'Pane', requestId: 'agent-smith', viewport: { columns: 180, rows: 40, isFullscreen: true }, props: { title: 'Agent Smith', isFocused: true, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} } } as never;
+const iso = (ms: number) => new Date(ms).toISOString();
+/** One canonical job directory, keyed by full path. */
+function canonicalJob(id: string, job: Record<string, unknown>, extra: Record<string, string> = {}): Record<string, string> {
+  const dir = `/work/.agent-smith/jobs/${id}`;
+  return {
+    [`${dir}/job.json`]: JSON.stringify({schema:1,jobId:id,workerId:id,task:'Inspect',startedAt:iso(RUNNING_NOW-5000),updatedAt:iso(RUNNING_NOW),...job}),
+    ...Object.fromEntries(Object.entries(extra).map(([name, body]) => [`${dir}/${name}`, body])),
+  };
+}
+const failedJob = (id: string, endedAt: number) => canonicalJob(id,
+  {status:'failed',name:id,startedAt:iso(endedAt-5000),finishedAt:iso(endedAt),updatedAt:iso(endedAt),error:'supervisor exited (orphaned)'},
+  {'acceptance.json':JSON.stringify({state:'unchecked',pending:false,checks:[]})});
+const ADA_VIEW = JSON.stringify({schema:1,prompt:'Long task instructions',preamble:'Mode preamble',truncated:false,tools:[],transcript:[],timeline:[
+  {kind:'assistant',sequence:0,at:iso(RUNNING_NOW),text:'Tracing the renderer.'},
+  {kind:'tool',sequence:1,at:iso(RUNNING_NOW),stepIndex:0,tool:'Read',input:'register.tsx',output:'file contents',state:'active'}]});
+const ada = () => canonicalJob('job-ada', {status:'running',name:'Ada',workerId:'ada',role:'reviewer',provider:'codex',model:'gpt-6-sol'}, {'view.json':ADA_VIEW});
+
+/** A host over canonical jobs that records what the mod asks of the UI. */
+function forgeHost(on: (...args: any[]) => void, files: Record<string,string>, ids: string[]) {
+  const host = { opens: [] as Record<string,unknown>[], closes: [] as Record<string,unknown>[], toasts: [] as string[], scrolls: [] as Record<string,unknown>[] };
+  on('session.start', (_$: unknown, e: any) => ({sessionId:'s',cwd:e.cwd}));
+  on('command.register', () => ({value:undefined}));
+  on('env.get', () => ({value:undefined}));
+  on('ui.open', (_$: unknown, e: any) => { host.opens.push({...e}); return {value:{isPlaced:true}}; });
+  on('ui.toast', (_$: unknown, e: any) => { host.toasts.push(e.text); return {value:undefined}; });
+  on('ui.scroll', (_$: unknown, e: any) => { host.scrolls.push({...e}); return {}; });
+  on('ui.close', (_$: unknown, e: any) => { host.closes.push({...e}); return {value:undefined}; });
+  on('ui.render', ($: any, e: any) => $.ui.resolve(e).Text({ children: 'REST-OF-BAND' }));
+  on('tool.call', (_$: unknown, e: any) => e.tool==='TaskCreate'?{result:{task:{id:'native-task-1'}}}
+    // Core answering a spawn_job call with its ack, for launches seen through tool.call.
+    :/__spawn_job$/.test(e.tool)?{result:{structuredContent:{jobId:e.jobId,repo:'/work',timeoutMs:600_000},content:[]}}
+    :{result:{success:true}});
+  const clock = mock.clock(on as never,{now:RUNNING_NOW});
+  on('fs.list', () => ({value:ids.map(name=>({name,kind:'dir',size:0}))}));
+  on('fs.exists', (_$: unknown, e: any) => ({value:e.path==='/work/.agent-smith/jobs'||Object.hasOwn(files,e.path)}));
+  on('fs.read', (_$: unknown, e: any) => { const body=files[e.path]; return body===undefined?{deny:'ENOENT'}:{value:body}; });
+  return { host, clock };
+}
+const start = ($: any) => $.session.start({surface:'terminal',isInteractive:true,cwd:'/work'} as never);
+/** Launch through the ack this session's Claude would get back. */
+const launch = ($: any, id: string, kind: 'job' | 'run' = 'job') => $.classic.PostToolUse(launched(id, '/work', kind));
+
+test('a band row is a digit Button that opens the focused sidebar on that worker', async ($, on) => {
+  const { host } = forgeHost(on, ada(), ['job-ada']);
+  await start($);
+  await launch($, 'job-ada');
+  const band = await $.ui.mount({plugin:'agent-smith',surface:'terminal',...BAND} as never);
+  const row = await band.find({key:'band-job-ada'}) as { props?: Record<string,unknown> } | undefined;
+  expect(row?.props?.hotkey).toBe('1');
+  await band.press({key:'band-job-ada'});
+  expect(host.opens.at(-1)).toMatchObject({id:'agent-smith',focus:true});
+  const pane = await $.ui.mount(PANE_TARGET);
+  expect(await pane.find({type:'Text',text:/Ada · reviewer/})).toBeDefined();
+  expect(await pane.find({key:'event-1'})).toBeDefined();
+});
+
+test('/forge opens the focused session list; /forge pane is the same list; /forge all adds the repository', async ($, on) => {
+  const { host } = forgeHost(on, { ...ada(), ...failedJob('job-failed', RUNNING_NOW) }, ['job-ada','job-failed']);
+  await start($);
+  await launch($, 'job-ada');
+  expect(await $.command.run({command:'forge',args:''})).toMatchObject({text:'1 running'});
+  expect(host.opens.at(-1)).toMatchObject({id:'agent-smith',focus:true});
+  const pane = await $.ui.mount(PANE_TARGET);
+  expect(await pane.find({type:'Text',text:'Forge · 1 running'})).toBeDefined();
+  expect(await pane.find({key:'job-job-ada'})).toBeDefined();
+  expect(await pane.find({key:'job-job-failed'})).toBeUndefined();
+  await pane.press({key:'job-job-ada'});
+  await $.command.run({command:'forge',args:'pane'});
+  expect(await pane.find({key:'job-job-ada'})).toBeDefined();
+  expect(await pane.find({key:'job-job-failed'})).toBeUndefined();
+
+  expect(await $.command.run({command:'forge',args:'all'})).toMatchObject({text:'repository: 1 running · 1 failed'});
+  expect(await pane.find({type:'Text',text:'Forge · repository: 1 running · 1 failed'})).toBeDefined();
+  expect(await pane.find({key:'job-job-ada'})).toBeDefined();
+  expect(await pane.find({type:'Text',text:'Recent'})).toBeDefined();
+  // A recent failure stays marked: red, with its failure label.
+  expect((await pane.find({type:'Text',text:/failed · orphaned/}) as { props?: Record<string,unknown> })?.props?.color).toBe('red');
+  expect((await pane.find({type:'Text',text:'✗'}) as { props?: Record<string,unknown> })?.props?.color).toBe('red');
+  // `s` returns to this session; `a` shows the repository again.
+  await pane.press({key:'scope-session'});
+  expect(await pane.find({key:'job-job-failed'})).toBeUndefined();
+  await pane.press({key:'scope-all'});
+  expect(await pane.find({key:'job-job-failed'})).toBeDefined();
+  expect(host.toasts).toHaveLength(0);
+});
+
+test('a fresh session over old jobs: an empty band, an empty session list, no lifetime counts', async ($, on) => {
+  const { host } = forgeHost(on, { ...ada(), ...failedJob('job-failed', RUNNING_NOW) }, ['job-ada','job-failed']);
+  await start($);
+  const band = await $.ui.mount({plugin:'agent-smith',surface:'terminal',...BAND} as never);
+  expect(await band.find({key:'band-job-ada'})).toBeUndefined();
+  expect(await band.find({type:'Text',text:'REST-OF-BAND'})).toBeDefined();
+  const reply = await $.command.run({command:'forge',args:''}) as { text?: string };
+  expect(reply.text).toBe('No agents in this session');
+  expect(reply.text).not.toMatch(/failed|finished/);
+  const pane = await $.ui.mount(PANE_TARGET);
+  expect(await pane.find({type:'Text',text:'Forge · No agents in this session'})).toBeDefined();
+  expect(await pane.find({type:'Text',text:/\/forge all shows the repository's history/})).toBeDefined();
+  expect(await pane.find({key:'job-job-ada'})).toBeUndefined();
+  await pane.press({key:'scope-all'});
+  expect(await pane.find({key:'job-job-ada'})).toBeDefined();
+  expect(await pane.find({key:'job-job-failed'})).toBeDefined();
+  expect(host.toasts).toHaveLength(0);
+});
+
+test('after a launch only that job shows; a pipeline launch shows its stage jobs', async ($, on) => {
+  const stage = canonicalJob('job-stage', {status:'running',name:'Bo',workerId:'bo',pipeline:'run-7',stage:'build'});
+  forgeHost(on, { ...ada(), ...failedJob('job-failed', RUNNING_NOW), ...stage }, ['job-ada','job-failed','job-stage']);
+  await start($);
+  await launch($, 'job-ada');
+  const band = await $.ui.mount({plugin:'agent-smith',surface:'terminal',...BAND} as never);
+  expect(await band.find({key:'band-job-ada'})).toBeDefined();
+  expect(await band.find({key:'band-job-failed'})).toBeUndefined();
+  expect(await band.find({key:'band-job-stage'})).toBeUndefined();
+  await launch($, 'run-7', 'run');
+  expect(await band.find({key:'band-job-stage'})).toBeDefined();
+  expect(await $.command.run({command:'forge',args:''})).toMatchObject({text:'2 running'});
+  const pane = await $.ui.mount(PANE_TARGET);
+  expect(await pane.find({key:'job-job-stage'})).toBeDefined();
+  expect(await pane.find({key:'job-job-failed'})).toBeUndefined();
+});
+
+test('/forge <name> searches the whole repository, so an older worker still opens', async ($, on) => {
+  const grace = canonicalJob('job-old', {status:'failed',name:'Grace',workerId:'grace',startedAt:iso(RUNNING_NOW-90_000),finishedAt:iso(RUNNING_NOW-60_000),error:'supervisor exited (orphaned)'});
+  const { host } = forgeHost(on, { ...ada(), ...grace }, ['job-ada','job-old']);
+  await start($);
+  await launch($, 'job-ada');
+  await $.command.run({command:'forge',args:'grace'});
+  const pane = await $.ui.mount(PANE_TARGET);
+  expect(await pane.find({key:'back'})).toBeDefined();
+  expect(await pane.find({type:'Text',text:/Grace/})).toBeDefined();
+  expect(await pane.find({type:'Text',text:/failed · orphaned/})).toBeDefined();
+  expect(host.toasts).toHaveLength(0);
+});
+
+test('/forge Ada opens Ada; an unknown name falls back to the list with a toast', async ($, on) => {
+  const { host } = forgeHost(on, ada(), ['job-ada']);
+  await start($);
+  await launch($, 'job-ada');
+  await $.command.run({command:'forge',args:'ada'});
+  const pane = await $.ui.mount(PANE_TARGET);
+  expect(await pane.find({key:'back'})).toBeDefined();
+  expect(await pane.find({type:'Markdown',text:'Tracing the renderer.'})).toBeDefined();
+  await $.command.run({command:'forge',args:'Grace'});
+  expect(host.toasts.at(-1)).toMatch(/No worker matches "Grace"/);
+  expect(await pane.find({key:'job-job-ada'})).toBeDefined();
+  expect(await pane.find({key:'back'})).toBeUndefined();
+});
+
+test('the worker view is one scroll: header, task, transcript, then result and failing checks', async ($, on) => {
+  const files = ada();
+  const { clock } = forgeHost(on, files, ['job-ada']);
+  await start($);
+  await $.command.run({command:'forge',args:'Ada'});
+  const pane = await $.ui.mount(PANE_TARGET);
+  expect(await pane.find({type:'Text',text:/codex·gpt-6-sol · 5s/})).toBeDefined();
+  expect(await pane.find({key:'task',text:/Task: Long task instructions/})).toBeDefined();
+  expect(await pane.find({type:'Markdown',text:/Mode preamble/})).toBeUndefined();
+  expect(await pane.find({type:'Text',text:'Following live output.'})).toBeDefined();
+  expect(await pane.find({key:'tab-activity'})).toBeUndefined();
+  await pane.press({key:'task'});
+  expect(await pane.find({type:'Markdown',text:'Mode preamble\n\nLong task instructions'})).toBeDefined();
+
+  files['/work/.agent-smith/jobs/job-ada/job.json'] = JSON.stringify({...JSON.parse(files['/work/.agent-smith/jobs/job-ada/job.json']!),status:'succeeded',finishedAt:iso(RUNNING_NOW+2000),updatedAt:iso(RUNNING_NOW+2000)});
+  files['/work/.agent-smith/jobs/job-ada/result.md'] = 'Final findings';
+  files['/work/.agent-smith/jobs/job-ada/acceptance.json'] = JSON.stringify({state:'rejected',pending:false,checks:[
+    {name:'tests',ok:true,outputTail:''},{name:'lint',ok:false,outputTail:'src/a.ts: unused import',reason:'exit 1'}]});
+  await clock.advance(3000);
+  expect(await pane.find({type:'Text',text:/✗ lint/})).toBeDefined();
+  expect(await pane.find({type:'Markdown',text:'Tracing the renderer.'})).toBeDefined();
+  expect(await pane.find({type:'Markdown',text:'Final findings'})).toBeDefined();
+  expect(await pane.find({type:'Text',text:'✗ lint · exit 1'})).toBeDefined();
+  expect(await pane.find({type:'Text',text:'src/a.ts: unused import'})).toBeDefined();
+});
+
+test('b returns to the list; x closes the sidebar', async ($, on) => {
+  const { host } = forgeHost(on, ada(), ['job-ada']);
+  await start($);
+  await launch($, 'job-ada');
+  await $.command.run({command:'forge',args:'Ada'});
+  const pane = await $.ui.mount(PANE_TARGET);
+  await pane.press({key:'back'});
+  expect(await pane.find({key:'job-job-ada'})).toBeDefined();
+  await pane.press({key:'job-job-ada'});
+  expect(await pane.find({key:'back'})).toBeDefined();
+  await pane.press({key:'close'});
+  expect(host.closes.at(-1)).toMatchObject({id:'agent-smith'});
+});
+
+test('scrolling up pauses following and scrolling back to the end resumes it', async ($, on) => {
+  const { host, clock } = forgeHost(on, ada(), ['job-ada']);
+  await start($);
+  await $.command.run({command:'forge',args:'Ada'});
+  const pane = await $.ui.mount(PANE_TARGET);
+  const person = {component:'Pane',requestId:'agent-smith',bodyRows:30,contentRows:50,origin:{kind:'person'}};
+  await $.ui.scroll({...person,offset:10,by:-10} as never);
+  expect(await pane.find({type:'Text',text:/^Paused/})).toBeDefined();
+  const ends = () => host.scrolls.filter(s => s.to==='end').length;
+  const before = ends();
+  await clock.advance(3000);
+  expect(ends()).toBe(before);
+  await $.ui.scroll({...person,offset:20,by:10} as never);
+  expect(await pane.find({type:'Text',text:'Following live output.'})).toBeDefined();
+});
+
+test('canonical acceptance refreshes in an open worker view; a read failure keeps the rows', async ($, on) => {
+  const files = canonicalJob('job-native-1', {status:'succeeded',name:'Ada',workerId:'ada',finishedAt:iso(RUNNING_NOW-1000),toolCalls:1},
+    {'acceptance.json':JSON.stringify({state:'unchecked',pending:true,checks:[]}),'result.md':'Worker report'});
+  const { clock } = forgeHost(on, files, ['job-native-1']);
+  await start($);
+  await launch($, 'job-native-1');
+  await $.command.run({command:'forge',args:'job-native-1'});
+  const pane = await $.ui.mount(PANE_TARGET);
+  expect(await pane.find({type:'Text',text:/checks pending/})).toBeDefined();
+  files['/work/.agent-smith/jobs/job-native-1/acceptance.json']=JSON.stringify({state:'rejected',pending:false,checks:[
+    {name:'tests',ok:false,outputTail:'',timedOut:true,signal:'SIGTERM',reason:'command timed out'}]});
+  await clock.advance(3000);
+  expect(await pane.find({type:'Text',text:/✗ tests · timed out · signal SIGTERM · command timed out/})).toBeDefined();
+  await pane.press({key:'back'});
+  files['/work/.agent-smith/jobs/job-native-1/job.json']='{broken';
+  await clock.advance(3000);
+  expect(await pane.find({type:'Text',text:/Unable to read Forge state/})).toBeDefined();
+  expect(await pane.find({key:'job-job-native-1'})).toBeDefined();
+});
+
+test('a failure older than 24 h stays in Recent but is no longer drawn as one needing attention', async ($, on) => {
+  forgeHost(on, { ...failedJob('job-old', RUNNING_NOW - 25*3600*1000), ...failedJob('job-new', RUNNING_NOW - 3600*1000) }, ['job-old','job-new']);
+  await start($);
+  await $.command.run({command:'forge',args:'all'});
+  const pane = await $.ui.mount(PANE_TARGET);
+  const rows = await pane.findAll({type:'Text',text:/failed · orphaned/}) as { props?: Record<string,unknown> }[];
+  expect(rows.map(row => row.props?.color)).toEqual(['red', undefined]);
+  expect(await pane.find({key:'job-job-old'})).toBeDefined();
+});
+
+test('pagination makes the tenth worker selectable', async ($, on) => {
+  const ids=Array.from({length:10},(_,i)=>`job-${i}`);
+  engine(on,{entries:ids.map(id=>({name:`${id}.spec.json`,kind:'file',size:10})), files:Object.fromEntries(ids.flatMap(id=>[[`${id}.spec.json`,REAL_SPEC],[`${id}.log`,REAL_LOG],[`${id}.progress.json`,REAL_PROGRESS]]))});
+  await $.session.start({surface:'terminal',isInteractive:true,cwd:'/work'} as never);
+  const pane=await $.ui.mount(PANE_TARGET);
+  expect(await pane.find({key:'job-job-9'})).toBeUndefined();
+  await pane.press({key:'next-page'});
+  expect(await pane.find({key:'job-job-9'})).toBeDefined();
+  await pane.press({key:'job-job-9'});
+  expect(await pane.find({key:'back'})).toBeDefined();
+});
+
+
+// ── completion notices: the mod takes a launch over from the command hook ────
+
+describe('completion notices', () => {
+  /** forgeHost, plus what the mod says and whether the command hook beneath ran. */
+  function noticeHost(on: (...args: any[]) => void, files: Record<string,string>, ids: string[]) {
+    const r = forgeHost(on, files, ids);
+    const said = { logs: [] as string[], prompts: [] as string[], hookRuns: 0 };
+    on('ui.log', (_$: unknown, e: any) => { said.logs.push(e.text); return {value:undefined}; });
+    on('prompt.submit', (_$: unknown, e: any) => { said.prompts.push(e.text); return {text:e.text}; });
+    // Beneath every module: where the plugin's PostToolUse command hook runs.
+    on('classic.PostToolUse', () => { said.hookRuns++; return {}; });
+    on('fs.write', (_$: unknown, e: any) => { files[e.path] = e.text; return {value:undefined}; });
+    return { ...r, said };
+  }
+  const ada = (status: string, more: Record<string, unknown> = {}) => canonicalJob('job-ada',
+    {status,name:'Ada',provider:'codex',role:'review',...more},
+    status === 'running' ? {} : {'acceptance.json':JSON.stringify({state:'accepted',checks:[{name:'tests',ok:true},{name:'lint',ok:true}]})});
+
+  test('a finished owned job: the hook stands down, no ui.log, one prompt.submit', async ($, on) => {
+    const files = ada('running');
+    const { clock, said } = noticeHost(on, files, ['job-ada']);
+    await start($);
+    await ($ as any).classic.PostToolUse(launched('job-ada'));
+    expect(said.hookRuns).toBe(0);
+    // The second guard: a hook that starts anyway finds the claim and stays silent.
+    expect(Object.hasOwn(files, '/work/.agent-smith/claims/job-job-ada')).toBe(true);
+
+    await clock.advance(3000);
+    expect(said.logs).toEqual([]);
+    Object.assign(files, ada('succeeded', {startedAt:iso(RUNNING_NOW-43_000),finishedAt:iso(RUNNING_NOW+1000),updatedAt:iso(RUNNING_NOW+1000),changedFiles:['a.ts','b.ts']}));
+    await clock.advance(3000);
+    await clock.advance(3000);
+
+    expect(said.logs).toEqual([]); // the plugin message is the only notice
+    expect(said.prompts).toHaveLength(1);
+    expect(said.prompts[0]).toMatch(/^Agent Smith · ✓ Ada \(codex review\) succeeded in 44s · 2 files changed · checks 2\/2\. Job ID job-ada\.\nRead it with status before acting\.$/);
+  });
+
+  test('a launch seen only through tool.call is claimed, marked and announced once', async ($, on) => {
+    const files = ada('running');
+    const { clock, said } = noticeHost(on, files, ['job-ada']);
+    await start($);
+    const r = await ($ as any).tool.call({ tool: 'mcp__plugin_agent-smith_agent-smith__spawn_job', jobId: 'job-ada' });
+    expect(r.result.structuredContent.jobId).toBe('job-ada'); // passed through untouched
+    expect(Object.hasOwn(files, '/work/.agent-smith/claims/job-job-ada')).toBe(true);
+    Object.assign(files, ada('succeeded', {finishedAt:iso(RUNNING_NOW+1000)}));
+    await clock.advance(3000);
+    await clock.advance(3000);
+    expect(said.logs).toEqual([]);
+    expect(said.prompts).toHaveLength(1);
+  });
+
+  test("another session's job finishing in the same repo is not announced here", async ($, on) => {
+    const files = ada('running');
+    const { clock, said } = noticeHost(on, files, ['job-ada']);
+    await start($);
+    Object.assign(files, ada('failed', {finishedAt:iso(RUNNING_NOW+1000),error:'exit 1'}));
+    await clock.advance(3000);
+    await clock.advance(3000);
+    expect(said.logs).toEqual([]);
+    expect(said.prompts).toEqual([]);
+  });
+
+  test('a launch in a repo the mod is not watching stays with the hook', async ($, on) => {
+    const files = ada('running');
+    const { clock, said } = noticeHost(on, files, ['job-ada']);
+    await start($);
+    await ($ as any).classic.PostToolUse(launched('job-ada', '/elsewhere'));
+    expect(said.hookRuns).toBe(1);
+    Object.assign(files, ada('succeeded', {finishedAt:iso(RUNNING_NOW+1000)}));
+    await clock.advance(3000);
+    await clock.advance(3000);
+    expect(said.logs).toEqual([]);
+    expect(said.prompts).toEqual([]);
   });
 });

@@ -59,7 +59,8 @@ export async function runMonitor(options: MonitorOptions): Promise<void> {
     try {
       await pollOnce(options.cwd, now(), async (batch) => {
         if (batch.content === null) return;
-        const line = `Agent Smith: ${batch.content.replace(/\s+/g, ' ').trim()}`;
+        // One stdout line per milestone; the notice already names Agent Smith.
+        const line = batch.content.replace(/\s+/g, ' ').trim();
         await emit(line, batch);
       }, read);
     } catch (error) {
@@ -146,7 +147,7 @@ export async function runJobWatch(options: JobWatchOptions): Promise<JobWatchEnd
       }
       const batch = buildBatch([...jobs.values()].map((job) => ({ job, seen: seen.get(job.id) ?? new Set<string>(), knownBefore: true })), t);
       if (batch.content !== null) {
-        await emit(`Agent Smith: ${batch.content.replace(/\s+/g, ' ').trim()}`, batch);
+        await emit(batch.content.replace(/\s+/g, ' ').trim(), batch);
         for (const key of batch.keys) {
           const id = key.slice(0, key.indexOf('#'));
           const set = seen.get(id);
@@ -163,7 +164,7 @@ export async function runJobWatch(options: JobWatchOptions): Promise<JobWatchEnd
     }
     if (now() - startedAt >= timeoutMs) {
       const ids = [...jobIds, ...runIds].filter((id) => !done.has(id));
-      try { await emit(`Agent Smith: still running; check status ${ids.join(', ')}`, null); } catch (error) { onError(error); }
+      try { await emit(`Agent Smith · still running; check status ${ids.join(', ')}`, null); } catch (error) { onError(error); }
       return 'timeout';
     }
     await delay(intervalMs, options.signal);

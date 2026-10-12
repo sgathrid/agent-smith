@@ -4,12 +4,21 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { buildArgv as buildClaudeArgv } from './claude.ts';
-import { buildArgv as buildCodexArgv } from './codex.ts';
+import { buildArgv as buildCodexArgv, codexStderrLevel } from './codex.ts';
 import { buildArgv as buildAgyArgv } from './agy.ts';
+import { buildArgv as buildOpencodeArgv } from './opencode.ts';
 import { spawnWorker } from './ndjson.ts';
 import type { SpawnSpec } from './types.ts';
 
 const tmpDirs: string[] = [];
+
+test('Codex model-refresh timeout is informational; unrelated stderr errors remain warnings', () => {
+  assert.equal(codexStderrLevel('ERROR codex_core::models_manager: failed to refresh available models: request timed out'), 'info');
+  assert.equal(codexStderrLevel('ERROR failed to refresh available models: unauthorized'), 'warn');
+  assert.equal(codexStderrLevel('ERROR authentication failed\nfailed to refresh available models: request timed out'), 'warn');
+  assert.equal(codexStderrLevel('ERROR authentication failed; failed to refresh available models: request timed out'), 'warn');
+  assert.equal(codexStderrLevel('Not inside a trusted directory'), 'warn');
+});
 
 function tempDir(): string {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'agent-smith-provider-test-'));
@@ -156,4 +165,14 @@ const proc=await spawnWorker({provider:'fixture',binary:process.execPath,argv:[$
   await promisify(execFile)(process.execPath, ['--experimental-strip-types', supervisor], { timeout: 5000 });
   await new Promise(resolve => setTimeout(resolve, 900));
   assert.equal(existsSync(marker), false, 'the supervisor exited while its tool continued running');
+});
+
+test('opencode: addDirs must NOT emit --dir, which the CLI rejects', () => {
+  // `opencode run` on v2.0.26 has no --dir flag; passing it prints usage and
+  // exits non-zero, failing the whole job. The v2 docs still list it, so this
+  // is a regression guard against "fixing" the adapter to match stale docs.
+  const argv = buildOpencodeArgv(spec({ addDirs: ['/tmp/extra-a', '/tmp/extra-b'] }));
+  assert.equal(argv.includes('--dir'), false, `argv must not contain --dir: ${argv.join(' ')}`);
+  assert.equal(argv.includes('/tmp/extra-a'), false);
+  assert.equal(argv.includes('/tmp/extra-b'), false);
 });

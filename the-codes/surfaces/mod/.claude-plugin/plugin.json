@@ -1,7 +1,7 @@
 {
   "name": "agent-smith",
   "version": "0.1.0",
-  "description": "Native Claude Code task-list projection and a live progress band for Agent Smith workers. The /forge command opens the job pane.",
+  "description": "Native Claude Code task-list projection and a live progress band for Agent Smith workers. The /forge command expands the bottom worker roster; an inspector is optional.",
   "author": {
     "name": "Agent Smith"
   },

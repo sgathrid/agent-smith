@@ -1,4 +1,5 @@
-// Enable the built plugin for this checkout only. Never writes user settings.
+// Enable the built plugin for one project only (default: this checkout, or --repo DIR).
+// Never writes user settings.
 import { mkdir, readFile, access, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -6,7 +7,10 @@ import { fileURLToPath } from 'node:url';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const plugin = path.join(root, 'builds', 'local-plugin', 'agent-smith');
 await access(path.join(plugin, '.claude-plugin', 'plugin.json'));
-const directory = path.join(root, '.claude');
+const repoFlag = process.argv.indexOf('--repo');
+const target = repoFlag === -1 ? root : path.resolve(process.argv[repoFlag + 1] ?? '');
+if (repoFlag !== -1) await access(target);
+const directory = path.join(target, '.claude');
 const settingsFile = path.join(directory, 'settings.local.json');
 let settings = {};
 try {
@@ -27,4 +31,4 @@ settings.extraKnownMarketplaces = {
 settings.enabledPlugins = { ...settings.enabledPlugins, 'agent-smith@agent-smith-dev': true };
 await mkdir(directory, { recursive: true });
 await writeFile(settingsFile, JSON.stringify(settings, null, 2) + '\n');
-process.stdout.write(`Agent Smith enabled in ${settingsFile}\nStart Claude from ${root} with: claude\nClaude maintains its own plugin runtime state under ~/.claude/plugins.\n`);
+process.stdout.write(`Agent Smith enabled in ${settingsFile}\nStart Claude from ${target} with: claude\nClaude maintains its own plugin runtime state under ~/.claude/plugins.\n`);

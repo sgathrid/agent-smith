@@ -72,6 +72,20 @@ declare module 'claude-code' {
      */
     readonly fs: FsApi;
     readonly env: EnvApi;
+    /** Start a turn. Agent Smith uses it to hand Claude a completion notice. */
+    readonly prompt: PromptApi;
+  }
+
+  /**
+   * `$.prompt.submit({ text })`: the event `prompt.submit` with origin
+   * `{ kind: 'plugin', name }`. It runs once the session is idle, and Claude
+   * reads the text after a sentence naming this plugin as the sender. It
+   * resolves when that turn STARTS, so a poll must not await it. (Host types,
+   * CoreEngineInterface.prompt.submit; docs mods/api "Start a turn from a
+   * background job".)
+   */
+  export interface PromptApi {
+    submit(input: { text: string }): Promise<unknown>;
   }
 
   /**
@@ -87,6 +101,8 @@ declare module 'claude-code' {
     read(path: string): Promise<string>;
     list(path: string): Promise<readonly FsEntry[]>;
     exists(path: string): Promise<boolean>;
+    /** Writes the whole file, creating it and its directories (host types, 2.1.274+). */
+    write(path: string, text: string): Promise<void>;
   }
 
   /** One directory entry. `kind` distinguishes 'file' from 'dir'. */
@@ -141,9 +157,15 @@ declare module 'claude-code' {
       columns?: number;
     }): Promise<unknown>;
     close(opts: { id: string }): Promise<unknown>;
+    scroll(opts: { to: 'start' | 'end' | { key: string }; in?: string; block?: 'start' | 'end' | 'nearest' }): Promise<{ deny?: string }>;
     /** Resolve the render components for this render site. */
     resolve(e: UiRenderEvent): UiComponents;
-    toast(text: string): void;
+    toast(text: string): Promise<unknown>;
+    /**
+     * One dim transcript line, prefixed by the host with this plugin's name.
+     * Not sent to the model, and it does not start a turn. Returns void.
+     */
+    log(text: string): void;
   }
 
   export interface CommandApi {
@@ -152,7 +174,7 @@ declare module 'claude-code' {
      * is why every call site `.catch(() => {})`es it: refusing to start would take
      * the whole mod down over a name collision.
      */
-    register(opts: { name: string; description: string }): Promise<unknown>;
+    register(opts: { name: string; description: string; immediate?: true }): Promise<unknown>;
   }
 
   export interface ClockApi {
@@ -220,6 +242,7 @@ declare module 'claude-code' {
        * (TERMINAL-UI.md §Timing: cap at 4, then `+N more`).
        */
       readonly maxRows?: number;
+      readonly scroll?: { readonly offset: number; readonly bodyRows: number };
     };
   }
 
@@ -288,20 +311,39 @@ declare module 'claude-code' {
    * unless the user caused it", where the user causing it is dispatching work.
    */
   export interface ToolCallMatcher {
-    readonly tool: string;
+    readonly tool: string | RegExp;
+  }
+
+  /**
+   * `classic.PostToolUse`: the PostToolUse settings-hook event as a module event;
+   * `e` is the hook's stdin JSON. The chain is [managed settings hooks, hooks
+   * modules, every other settings hook as core], so a module that answers
+   * without `next` keeps plugin `hooks.json` command hooks for the call from
+   * running. Every result field is optional, so `{}` is a complete answer.
+   * Only what this mod reads is declared.
+   */
+  export interface PostToolUseEvent {
+    readonly tool_name: string;
+    readonly tool_response: unknown;
+    readonly tool_use_id: string;
+    readonly session_id?: string;
+    readonly cwd?: string;
   }
 
   export interface Registrar {
     (event: 'ui.render', matcher: Matcher, handler: Handler<UiRenderEvent>): void;
     (event: 'command.run', matcher: { command: string }, handler: CommandHandler): void;
     (event: 'tool.call', matcher: ToolCallMatcher, handler: Handler<ToolCallEvent>): void;
+    (event: 'classic.PostToolUse', matcher: { tool_name: string | RegExp }, handler: Handler<PostToolUseEvent>): void;
     (event: 'session.start', handler: Handler): void;
+    (event: 'ui.close', handler: Handler<{ id: string }>): void;
+    (event: 'ui.scroll', handler: Handler<{ component: string; requestId: string; origin: { kind: 'person' | 'plugin' }; offset: number; by: number; bodyRows: number; contentRows: number }>): void;
   }
 
   /** A tool invocation. Only the fields this mod reads are declared. */
   export interface ToolCallEvent {
     /** Tool name, e.g. 'Bash'. */
-    readonly tool: string;
+    readonly tool: string | RegExp;
     /** For Bash: the command line. */
     readonly command?: string;
     [key: string]: unknown;
@@ -371,6 +413,8 @@ declare module 'claude-code' {
     plain?: boolean;
     dimColor?: boolean;
     onPress: () => void | Promise<void>;
+    /** Strings and `Text` drawn in the label's place; the label then names the control. */
+    children?: unknown;
   }
 
   export interface BoxProps {
@@ -390,6 +434,7 @@ declare module 'claude-code' {
      * When the two disagree, the runtime error IS the specification.
      */
     text: string;
+    key?: string;
   }
 
   // CodeProps deliberately NOT declared. It was a guess (`source`), and the

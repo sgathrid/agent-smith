@@ -61,6 +61,17 @@ export interface RadarJob {
 
   /** Worker role/stage, when the source records one. */
   readonly role?: string | null;
+  readonly provider?: string | null;
+  readonly model?: string | null;
+  readonly acceptance?: RadarAcceptance;
+  /** Files the job changed (job.json changedFiles), when recorded and not truncated. */
+  readonly changedFileCount?: number | null;
+  /** Canonical failure detail from the manifest, when available. */
+  readonly failureReason?: string | null;
+  readonly lastEventAt?: number | null;
+  readonly pipeline?: string | null;
+  readonly stage?: string | null;
+  readonly attempt?: number | null;
 
   /** Latest actual assistant output, kept separate from reasoning/tool activity. */
   readonly latestSummary?: string | null;
@@ -98,6 +109,12 @@ export interface RadarJob {
   /** The task description, first line only. Never the whole prompt. */
   readonly task: string;
 
+  /** The full prompt sent to the worker. Detail view only; null elsewhere or on older jobs. */
+  readonly prompt?: string | null;
+
+  /** The mode preamble Agent Smith prepended to the prompt. Detail view only. */
+  readonly preamble?: string | null;
+
   /** Non-fatal signals, provider codes preserved. Empty means "nothing flagged". */
   readonly warnings: readonly { code: string; message: string }[];
 
@@ -117,6 +134,19 @@ export interface RadarJob {
 
   /** Raw provider payload, for the pane's debug view only. Never parsed by a surface. */
   readonly raw: Record<string, unknown>;
+}
+
+export type ActivityEvent =
+  | { sequence: number; kind: 'assistant'; at: string; text: string }
+  | { sequence: number; kind: 'tool'; at: string; stepIndex: number; tool: string; input: string; output: string; state: string };
+
+export interface RadarAcceptance {
+  readonly state: 'accepted' | 'rejected' | 'unchecked';
+  readonly pending?: boolean;
+  readonly checks: readonly {
+    name: string; ok: boolean; outputTail: string;
+    reason?: string; timedOut?: boolean; signal?: string | null; skipped?: string;
+  }[];
 }
 
 /** One tool call, for the detail pane's history. */
@@ -146,14 +176,18 @@ declare module 'claude-code' {
    */
   interface PluginState {
     'agent-smith': {
-      /** Job id the user has opened in the detail pane, or null for the list. */
+      /** Job id open in the sidebar's worker view, or null for the list. */
       selected: string | null;
-      /** Scratch: 'list' | 'detail'. Redundant with `selected`, kept for clarity. */
-      view: 'list' | 'detail';
       /** Clock the pane subscribes to so elapsed cells tick. The BAND writes it. */
       now: number;
-      /** Job ids dismissed with `c`; filtered against on read, never deleted. */
-      cleared: string[];
+      /** The worker view keeps its end in view; a person scrolling up pauses it. */
+      follow: boolean;
+      /** The worker view's task line is expanded to the prompt as sent. */
+      taskOpen: boolean;
+      listPage: number;
+      paneOpen: boolean;
+      expandedTools: string[];
+      readError: string | null;
       /**
        * The band's own snapshot of the jobs directory, from the 3 s poll.
        *
@@ -167,8 +201,9 @@ declare module 'claude-code' {
       /** Host-created task IDs for live Agent Smith jobs; keys are Agent Smith job IDs. */
       nativeTaskLinks: Record<string, {
         taskId: string;
-        status: 'in_progress' | 'completed';
+        status: 'in_progress' | 'completed' | 'deleted';
         fingerprint: string;
+        doneAt?: number;
       }>;
       /**
        * Resolved once at session start: which repo to watch, and whether colour
@@ -180,7 +215,21 @@ declare module 'claude-code' {
        * folded in here; the pane reading the result means the band and the pane
        * cannot end up pointed at different repos.
        */
-      bandConfig: { repo: string; colour: boolean };
+      bandConfig: { repo: string; colour: boolean; legacy: boolean };
+      /**
+       * Launches this session claimed at `classic.PostToolUse`, until announced.
+       * Session state on purpose: another session's jobs are never in it.
+       * The shape is hooks/notice.ts `Owned`, spelled out for the validator.
+       */
+      notices: { kind: 'job' | 'run'; id: string; at: number; until: number; saidAttention?: boolean }[];
+      /**
+       * Job and pipeline run IDs this session launched in this repo, never pruned
+       * within the session: what the band, /forge and native tasks show.
+       * The shape is hooks/dashboard.ts `Launched`, spelled out for the validator.
+       */
+      launched: { jobs: string[]; runs: string[] };
+      /** The /forge list: this session's workers, or the repository's. */
+      listScope: 'session' | 'all';
     };
   }
 }

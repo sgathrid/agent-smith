@@ -36,22 +36,23 @@ State lives in `<repo>/.agent-smith/jobs/<jobId>/` (gitignored). `FILES` in `for
 
 | File | Writer | Meaning |
 |---|---|---|
-| `job.json` | `JobWriter`, atomic whole-file rewrite | The anchor and only mandatory file. Schema v1 manifest: identity, provider/mode/model (requested, resolved, source), sandbox, status, timestamps, `ownerPid`, `exitCode`, `error`, `deniedActions`, `usage`, `gitBaseline`, `changedFiles`. Never deleted. A reader refuses a manifest with a higher `schema`. Holds `task` (first prompt line, 200 chars), not the full prompt. |
-| `progress.json` | `JobWriter`, coalesced to `PROGRESS_FLUSH_MS` = 250 ms | Advisory liveness: `lastEventAt`, recent activities, `latestText`, `latestSummary` (source `worker`), warnings. |
+| `job.json` | `JobWriter`; service-owned orphan recovery; atomic whole-file rewrite | The anchor and only mandatory file. Schema v1 manifest: identity, provider/mode/model (requested, resolved, source), sandbox, status, timestamps, `ownerPid`, `exitCode`, `error`, `deniedActions`, `usage`, `gitBaseline`, `changedFiles`. Never deleted. A reader refuses a manifest with a higher `schema`. Holds `task` (first prompt line, 200 chars), not the full prompt. |
+| `progress.json` | `JobWriter`, coalesced to `PROGRESS_FLUSH_MS` = 250 ms | Advisory liveness: `lastEventAt`, live `toolCalls`, recent activities, `lastActivity` (including completed tools), `latestText`, `latestSummary` (source `worker`), warnings. |
 | `events.jsonl` | `providers/ndjson.ts` | Normalized `ProviderEvent` stream. |
 | `argv.json` | `providers/ndjson.ts` | Exact argv and cwd. |
 | `stderr.log` | `providers/ndjson.ts` | Child stderr, verbatim. |
 | `result.json` | `providers/ndjson.ts` | Verbatim adapter `JobResult`, written once at completion. Its presence stops orphan derivation. |
 | `result.md` | `JobWriter` | The report (worker output). May be absent/empty for a denied job. |
 | `cancel` | `ForgeService.cancel` | Marker holding the ISO instant of the request. It is a request, not a verdict. |
-| `orphaned` | first reader that proves the owner dead | Marker so readers that cannot probe a pid agree. Never edits `job.json`. |
+| `orphaned` | legacy marker | Existing markers remain readable. New readers do not write markers; service recovery persists terminal state in `job.json`. |
 | `acceptance.json` | `forge/checks.ts` (only when `spawn_job` got `checks`) | Sidecar, see Acceptance. Not in `FILES`. |
 
 Pipeline runs sit beside jobs, not inside them: `.agent-smith/pipelines/<runId>.json`
 (`PipelineRecord`: `running|passed|partial|failed`, per-stage results), `<runId>.cancel`
 (marker, polled every 250 ms by the owner), and `<runId>/artifacts/<stage>/<resultPath, default result.md>`
-(handoff artifacts scoped per run and stage; worker cwd stays the source checkout, so this
-is not source isolation).
+(handoff artifacts scoped per run and stage; directories are created before dispatch).
+Worker cwd stays the source checkout. Prompts label the source workspace and output artifact
+separately; this does not isolate filesystem access.
 
 `spawn_job` flow: validate (closed mode for non-pipeline fresh spawns, nonempty prompt,
 timeout clamp, catalog check, identity conflicts) -> `JobWriter.start` writes `job.json`
@@ -71,9 +72,10 @@ names. No live steering.
 ## Status derivation
 
 `deriveStatus` (`forge/format.ts`) is the one place a terminal verdict is computed.
-Precedence: already terminal (a cancel verdict is final) > `deniedActions` non-empty =
+Precedence: already terminal (a cancel verdict is final) > successful nonempty report with
+only non-fatal `tool` denials = success with warning > other `deniedActions` non-empty =
 `failed` + suspicious > `ok === false` = `failed` > `ok === true` with empty report
-(`< 8` chars after trim, `MIN_USEFUL_CHARS`) = `failed` + suspicious > `ok === true` =
+(empty after trim, `MIN_USEFUL_CHARS = 1`) = `failed` + suspicious > `ok === true` =
 `succeeded` > no verdict = `running`. A job that exited 0 and delivered nothing is
 failed, never a quiet success.
 
@@ -84,8 +86,11 @@ manifest with no `result.json`, not canceled:
   counts as alive). Legacy manifests without `ownerPid` are orphaned only when the newest of
   `updatedAt`/`progress.lastEventAt`/`createdAt` is older than `LEGACY_ORPHAN_AFTER_MS` =
   2 x `DEFAULT_TIMEOUT_MS` = 90 minutes. Result: `failed`, suspicious, reason
-  "supervisor process exited before the job finished (orphaned)". A best-effort `orphaned`
-  marker is written; once present, readers keep reporting orphaned.
+  "supervisor process exited before the job finished (orphaned)". Readers are read-only.
+  The service reconciles jobs at startup and before list/detail/state reads: a recorded
+  dead owner permits an atomic failed manifest with reason and finishedAt, and pending
+  acceptance settles as rejected. Live owners, terminal anchors and published results win.
+  PID-less legacy jobs retain the read-only fallback; their writer's death cannot be proven.
 - **Stale cancel**: if no orphan verdict, a `cancel` marker older than 60 s and no live
   `ownerPid` (in practice a manifest without `ownerPid`, since a dead pid is already an
   orphan) reports `canceled` with reason "cancel requested and no supervisor confirmed it".
@@ -106,13 +111,43 @@ running/succeeded. Surfaced in `list_jobs` and `status`.
 ## Modes
 
 `forge/modes.ts`: closed set `implement | review | moderate | verify`. A mode is a preset
-of a prompt preamble plus a sandbox posture, nothing else; it never picks provider or model.
+of one line of brief guidance plus a sandbox posture, nothing else; it never picks provider
+or model.
 `review` and `moderate` are `readOnly` (requested; enforced only where the CLI can:
 codex `-s read-only`; the ack's `readOnlyEnforced` says which); `implement` and `verify`
-`runsCommands`. `readOnlyRequested = preset.readOnly && !unrestricted`. The preamble is
-prepended unless the prompt already starts with it (`preambleApplied`). `agy` with a
+`runsCommands`. `readOnlyRequested = preset.readOnly && !unrestricted`. `agy` with a
 command-running mode and `unrestricted:false` gets an ack warning: headless agy auto-denies
 unapproved tools. Pipeline stages and resumes may keep arbitrary legacy roles.
+
+| Mode | Guidance (reason given to the worker) | readOnly | runsCommands |
+|---|---|---|---|
+| `implement` | Keep the change small: the orchestrator reviews the diff. | no | yes |
+| `review` | Find problems, don't fix them: the author fixes from the findings. Evidence per defect, no style nits. | yes | no |
+| `moderate` | Independently confirm or refute the earlier work and the reviewer's claims; leave files as they are. | yes | no |
+| `verify` | Run the checks and report exactly what happened; report failures rather than fixing them. | no | yes |
+
+### Worker brief
+
+`forge/brief.ts` `buildBrief` builds the text `spawnTracked` prepends to every fresh job's
+prompt, joined by a blank line:
+
+1. who the worker works for (an orchestrating agent that checks its work);
+2. `Workspace: <cwd>` and that changes belong inside it. Pipeline stages omit this line,
+   because `buildStagePrompt` already names the source workspace and output artifact;
+3. `Context: <context>` when `spawn_job.context` or `stage.context` is set;
+4. the checks as `name: command` (with `(in cwd)` when a check has its own), under "you're
+   done when these pass; they run after you finish". `blocking:false` checks are listed
+   separately as information only. The service only describes checks; `tools.ts` and
+   `runner.ts` still run them;
+5. the mode's guidance, when the mode is in the closed set;
+6. an evidence line: only claim what you can point to, and say what isn't verified.
+
+A resume (`conversation` set) already holds the brief, so it gets only the context and
+check lines, and only when that request supplies them; otherwise nothing is prepended.
+Pipeline retries that continue the same conversation pass neither. The brief is not
+prepended when the prompt already starts with it. `preambleApplied` is true when the sent
+prompt starts with the brief; `view.json` (and the mirrored spec) keep the prepended brief as
+`preamble`, so the `/forge` pane's "Show preamble" shows exactly what was added.
 
 ## Model discovery and validation
 
@@ -163,13 +198,21 @@ Job status says the harness ran, not that the task is done. `spawn_job` `checks`
 the MCP process after a job terminates (`gateAcceptance` -> `evaluateAcceptance`):
 unsuccessful job -> `rejected` without running checks; no checks -> `unchecked`; all
 blocking checks pass -> `accepted`; a blocking failure -> `rejected`. `blocking: false`
-checks are recorded but never gate. A pending `{state:'unchecked', pending:true}` placeholder
+checks are recorded but never gate, including missing-directory/spawn failures. A mandatory
+declared check with an empty command rejects acceptance; optional absent commands remain
+informational. Verdicts preserve timeout, signal, skipped reason and diagnostic reason.
+A pending `{state:'unchecked', pending:true}` placeholder
 is written at spawn; the real verdict replaces it atomically. Check output tails are capped
 at 2000 chars; default per-check timeout 60 s; `cwd` resolves against the job's cwd.
 `status` merges the sidecar (`unchecked` when absent or unreadable). The gate lives in the
 MCP server process: if it exits before the job finishes, the placeholder stays. Pipeline
 stages use the same rules (`StageResult.acceptance` `passed|failed|unchecked`, reported by
 `pipeline_status`).
+
+Completion notices lead with execution status and truncate worker prose at a sentence
+or word boundary. They include provider, elapsed time, changed-file count and the
+check tally only when recorded evidence exists. One renderer, `mod/hooks/notice.ts`,
+writes them for both announcers (see Notifications).
 
 ## Changed files
 
@@ -197,21 +240,43 @@ Claude                MCP server (dist/server.js)      Claude Code hooks        
   |   (asyncRewake: Claude keeps working)                             runJobWatch: read job every 2 s,
   |                                                                   no baseline, buildBatch/dedupe
   |                                                                   (job done before start is reported)
-  | <==== exit 2 + one stderr line "Agent Smith: <finished|failed|...>" ===== terminal state seen
+  | <==== exit 2 + stderr "Agent Smith · ✓ Ada (codex review) succeeded…" == terminal state seen
   |   Claude wakes -> status(jobId) / pipeline_status -> acts on report + acceptance
 ```
 
-- **Hook watcher** (`watch-hook.ts`): `build-plugin.mjs` generates `hooks/watch-hooks.json`
+- **Mod announcer** (`mod/hooks/register.tsx` `takeLaunch`/`announce`, rules in
+  `notice.ts`): when the mod is loaded it wraps the three launch tools in
+  `tool.call`, reads the ack from the result, claims the job or run in session
+  state (`notices` atom) and writes `.agent-smith/claims/<kind>-<id>`. The hook
+  watcher still starts, but at completion it finds the claim and stays silent: one
+  announcer per job. (A `classic.PostToolUse` handler does the same where the host
+  delivers that event; Claude Code 2.1.296 withholds it from user-tier modules,
+  "bypassed by cc-plugin-sec-default".)
+  It declines (calls `next`) in legacy mode, after a read error, or when the ack's
+  repo is not the one it polls. Each 3 s poll announces claimed jobs that ended (or
+  stalled, once), holding a pending acceptance verdict up to 5 min, with one
+  `$.prompt.submit` turn credited to the plugin. Claude Code shows that message to
+  the user in full, so it is the only notice: one line per job, no worker summary. Only claimed ids are announced, so two sessions on one repo
+  never wake each other. A claimed run is announced with its stage jobs when the
+  run ends. `/clear` resets session state, so a job claimed before it goes
+  unannounced (the band still shows it).
+- **Hook watcher** (`watch-hook.ts`), the fallback when no mod claims the launch: `build-plugin.mjs` generates `hooks/watch-hooks.json`
   (`PostToolUse`, `asyncRewake: true`, `timeout: 21900` s) running
   `runtime/dist/watch-hook.js`. `parseHookInput` strips the MCP prefix, unwraps the result
   (`structuredContent` or JSON text), takes `jobId` or `runId`, and resolves the repo from
   `payload.repo`, else `dir`/`recordPath`, else hook `cwd`, else `AGY_WATCH_CWD`, else
   `process.cwd()`. It watches that one job/run (a run also its stage jobs) in-process,
-  prints the milestone line to stderr and exits 2. Any error or non-matching tool exits 0
+  prints the notice to stderr and exits 2 (Claude Code labels that wake "Stop hook
+  feedback" and the label can't be changed, so the notice ends by saying it is not an
+  error). Any error or non-matching tool exits 0
   silently: a hook must never break the session. The hook passes `runJobWatch` a timeout of
   the job's own `timeoutMs` + 60 s (from the ack; pipelines get the 6 h cap + 60 s); standalone
   `monitor.js` defaults to `DEFAULT_WATCH_TIMEOUT_MS` = 46 min. On timeout it emits "still
   running; check status <ids>" (exit 2 from the hook).
+- **Tasks-shaped handle**: acks also carry `taskHandle {taskId, status:'working', pollIntervalMs}` and
+  `status`/`list_jobs` add `taskStatus` (`views.ts` `taskStatus`), the MCP Tasks extension's
+  vocabulary, so a future Tasks adapter (once the SDK and Claude Code support it) is a
+  translation. `pollIntervalMs` is `poller.ts` `POLL_MS`.
 - **Fallback**: acks carry `notify {mode:'hook', note, monitorCommand?, monitorTimeoutMs?}`;
   `monitorCommand` (only when running from the built `dist/`) is `node .../monitor.js
   --job <id>|--run <id> --cwd <repo>`, to run under Claude's Monitor tool
@@ -237,12 +302,18 @@ Every tool answers fast so the MCP server and the session are never blocked by a
 long-running job: `spawn_job`/`resume_job`/`run_pipeline` return once the anchor is on disk
 (`run_pipeline` persists the run record first); discovery runs only on `list_capabilities` or when a
 model/effort is named, bounded to 2 s on the spawn path; harness defaults are file reads, not
-CLI calls. The only intentional wait is `status wait_ms` (1-60 000 ms, polling every 500 ms),
-meant for when the hook is unavailable.
+CLI calls. The intentional waits are `status wait_ms` (1-60 000 ms, polling every 500 ms),
+meant for when the hook is unavailable, and an unrestricted confirmation, which waits on the
+user (up to 10 minutes) before anything launches.
 
 ## Safety and trust
 
-- `unrestricted` defaults to false everywhere and is recorded in `job.json`. Each harness
+- An explicit `unrestricted: true` for codex, claude or opencode on `spawn_job`/`resume_job` is
+  confirmed with the user through MCP form elicitation before launch (`tools.ts`
+  `confirmUnrestricted`; the server handle reaches `callTool` as `HandlerContext.server`). It
+  fails closed: decline, cancel or no answer returns `isError`. Clients without form elicitation
+  launch with an ack warning; `AGENT_SMITH_CONFIRM_UNRESTRICTED=0` skips the prompt.
+- `unrestricted` defaults to false for every provider except `agy` (headless agy cannot prompt, so it defaults to true) and is recorded in `job.json`. Each harness
   owns its sandbox (see CONFIGURATION.md); the ack echoes `sandbox`, `sandboxFlags`,
   `readOnlyRequested`, `readOnlyEnforced`.
 - Worker-authored fields (`report`, `latestSummary`) are untrusted data; `latestSummary`

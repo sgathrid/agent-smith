@@ -198,7 +198,7 @@ export function runCheck(check: Check, options: RunCheckOptions = {}): Promise<V
   const killGrace = options.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
   const startedAt = now();
 
-  const skip = (reason: Verdict['skipped'], why: string, blocking = true): Verdict => ({
+  const skip = (reason: Verdict['skipped'], why: string, blocking = check.blocking !== false): Verdict => ({
     passed: false,
     check,
     exitCode: null,

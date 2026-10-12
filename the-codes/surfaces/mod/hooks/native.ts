@@ -7,6 +7,8 @@
  */
 
 import type { FsLike } from './jobs.ts';
+import type { RadarJob, RadarAcceptance } from '../types/index.d.ts';
+import { readForgeJobs, acceptanceLabel } from './canonical.ts';
 
 export type NativeJobStatus = 'running' | 'attention' | 'succeeded' | 'failed' | 'canceled';
 
@@ -20,12 +22,15 @@ export interface NativeJob {
   readonly provider: string | null;
   readonly model: string | null;
   readonly latestSummary: string | null;
+  readonly acceptance?: RadarAcceptance;
   readonly summarySource: 'worker' | null;
 }
 
 export interface NativeTaskLink {
   readonly taskId: string;
-  readonly status: 'in_progress' | 'completed';
+  readonly status: 'in_progress' | 'completed' | 'deleted';
+  /** When this job was first seen finished (epoch ms); starts the close delay. */
+  readonly doneAt?: number;
   /** Last description/status sent successfully; lets the poll avoid no-op writes. */
   readonly fingerprint: string;
 }
@@ -44,17 +49,9 @@ export interface NativeTaskClient {
     subject: string;
     description: string;
     activeForm?: string;
-    status: 'in_progress' | 'completed';
+    status: 'in_progress' | 'completed' | 'deleted';
   }): Promise<unknown>;
 }
-
-const VALID_STATUSES = new Set<NativeJobStatus>([
-  'running',
-  'attention',
-  'succeeded',
-  'failed',
-  'canceled',
-]);
 
 function record(value: unknown): Record<string, unknown> | null {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -69,62 +66,18 @@ function text(...values: unknown[]): string | null {
   return null;
 }
 
-async function jsonFile(fs: FsLike, path: string): Promise<Record<string, unknown> | null> {
-  try {
-    const parsed: unknown = JSON.parse(await fs.read(path));
-    return record(parsed);
-  } catch {
-    return null;
-  }
+/** Both native tasks and /forge use the same canonical projection and liveness. */
+export function nativeJobsFromRadar(jobs: readonly RadarJob[]): NativeJob[] {
+  return jobs.filter(job => job.status !== 'unknown').map(job => ({
+    id: job.id, status: job.status as NativeJobStatus, task: job.task,
+    name: job.name ?? null, workerId: job.workerId ?? job.id, role: job.role ?? null,
+    provider: job.provider ?? null, model: job.model ?? null,
+    latestSummary: job.latestSummary ?? null, summarySource: job.summarySource ?? null,
+    acceptance: job.acceptance,
+  }));
 }
-
-/** Read only Agent Smith's durable jobs; legacy files are projected elsewhere. */
-export async function readNativeJobs(fs: FsLike, repo: string): Promise<NativeJob[]> {
-  const dir = `${repo.replace(/\/+$/, '')}/.agent-smith/jobs`;
-  let entries: readonly { name: string; kind: string }[];
-  try {
-    entries = await fs.list(dir);
-  } catch {
-    return [];
-  }
-
-  const jobs: NativeJob[] = [];
-  for (const entry of entries) {
-    if (entry.kind !== 'dir' || entry.name.startsWith('.')) continue;
-    const base = `${dir}/${entry.name}`;
-    const manifest = await jsonFile(fs, `${base}/job.json`);
-    if (manifest === null) continue;
-    // This projection needs only schema v1 fields. A future layout is left to
-    // its matching reader rather than guessed at by a stale plugin.
-    if (typeof manifest.schema === 'number' && manifest.schema > 1) continue;
-    const status = manifest.status;
-    if (typeof status !== 'string' || !VALID_STATUSES.has(status as NativeJobStatus)) continue;
-    const progress = await jsonFile(fs, `${base}/progress.json`);
-    // `orphaned` is left by the node reader once it proves the supervisor pid is
-    // dead (forge/format.ts deriveOrphan); a running anchor with it is failed.
-    const orphaned = status === 'running' || status === 'attention'
-      ? await fs.exists(`${base}/orphaned`).catch(() => false)
-      : false;
-    const resolved = record(manifest.resolved);
-    const latestSummary = text(progress?.latestSummary, manifest.latestSummary);
-    const summarySource = (progress?.summarySource ?? manifest.summarySource) === 'worker' && latestSummary !== null
-      ? 'worker'
-      : null;
-
-    jobs.push({
-      id: text(manifest.jobId) ?? entry.name,
-      status: orphaned ? 'failed' : status as NativeJobStatus,
-      task: text(manifest.task) ?? '',
-      name: text(manifest.name, resolved?.name, progress?.name),
-      workerId: text(manifest.workerId, resolved?.workerId, progress?.workerId) ?? entry.name,
-      role: text(manifest.role, resolved?.role, progress?.role, resolved?.mode, manifest.mode),
-      provider: text(manifest.provider),
-      model: text(manifest.model),
-      latestSummary,
-      summarySource,
-    });
-  }
-  return jobs;
+export async function readNativeJobs(fs: FsLike, repo: string, now = Date.now()): Promise<NativeJob[]> {
+  return nativeJobsFromRadar(await readForgeJobs(fs, repo, now));
 }
 
 function subjectFor(job: NativeJob): string {
@@ -132,7 +85,9 @@ function subjectFor(job: NativeJob): string {
   const subject = job.name !== null && task !== ''
     ? `${job.name}: ${task}`
     : job.name ?? (task !== '' ? task : null) ?? job.role ?? job.id;
-  return subject.slice(0, 120) || job.id;
+  const outcome = job.status === 'failed' || job.status === 'canceled' ? `[${job.status}] ` :
+    job.acceptance?.state === 'rejected' && !job.acceptance.pending ? '[checks rejected] ' : '';
+  return (outcome + subject).slice(0, 120) || job.id;
 }
 
 function descriptionFor(job: NativeJob): string {
@@ -144,6 +99,7 @@ function descriptionFor(job: NativeJob): string {
     ...(job.provider === null ? [] : [`Provider: ${job.provider}`]),
     ...(job.model === null ? [] : [`Model: ${job.model}`]),
     `Outcome: ${job.status}`,
+    `Acceptance: ${acceptanceLabel(job.acceptance)}`,
     ...(job.task === '' ? [] : [`Task: ${job.task}`]),
   ];
   if (job.summarySource === 'worker' && job.latestSummary !== null) {
@@ -153,6 +109,7 @@ function descriptionFor(job: NativeJob): string {
 }
 
 function activeForm(job: NativeJob): string {
+  if (job.acceptance?.pending && job.status !== 'running' && job.status !== 'attention') return 'Waiting for acceptance checks';
   if (job.status === 'attention') return `Checking ${job.role ?? 'worker'} progress`;
   return `Running ${job.role ?? 'worker'}`;
 }
@@ -172,8 +129,11 @@ function updateSucceeded(result: unknown): boolean {
   return output?.success === true;
 }
 
-function taskStatus(job: NativeJob): NativeTaskLink['status'] {
-  return job.status === 'running' || job.status === 'attention' ? 'in_progress' : 'completed';
+/** How long a finished job's task stays in the host list before it is closed. */
+export const CLOSE_DELAY_MS = 10_000;
+
+function taskStatus(job: NativeJob): 'in_progress' | 'completed' {
+  return job.status === 'running' || job.status === 'attention' || job.acceptance?.pending ? 'in_progress' : 'completed';
 }
 
 function fingerprint(job: NativeJob): string {
@@ -186,20 +146,24 @@ function fingerprint(job: NativeJob): string {
 }
 
 /**
- * Create tasks only for currently live jobs, and update only jobs already
- * represented in the host task list. That keeps old finished jobs from flooding
- * TaskList when a session starts.
+ * Create tasks only for currently live jobs this session owns, and update only
+ * jobs already represented in the host task list. That keeps old finished jobs
+ * and other sessions' work from flooding TaskList; a task already linked runs
+ * to completion and closes as before, whoever owns its job.
  */
 export async function syncNativeTasks(
   jobs: readonly NativeJob[],
   previous: NativeTaskLinks,
   client: NativeTaskClient,
+  now: number = Date.now(),
+  owned: (id: string) => boolean = () => true,
 ): Promise<NativeTaskLinks> {
   const next: NativeTaskLinks = { ...previous };
   for (const job of jobs) {
     const old = next[job.id];
-    const live = job.status === 'running' || job.status === 'attention';
-    if (old === undefined && !live) continue;
+    if (old?.status === 'deleted') continue;
+    const live = job.status === 'running' || job.status === 'attention' || job.acceptance?.pending === true;
+    if (old === undefined && (!live || !owned(job.id))) continue;
 
     const subject = subjectFor(job);
     const description = descriptionFor(job);
@@ -229,6 +193,22 @@ export async function syncNativeTasks(
     }
 
     const link = next[job.id]!;
+    // A finished job's task is closed (deleted from the host list) CLOSE_DELAY_MS
+    // after we first see it finished, so the list does not fill with done work.
+    if (!live) {
+      const doneAt = link.doneAt ?? now;
+      const dismissible = job.status === 'succeeded' && job.acceptance?.state !== 'rejected';
+      if (dismissible && now - doneAt >= CLOSE_DELAY_MS && link.status === 'completed') {
+        try {
+          const closed = await client.update({ taskId, subject, description, status: 'deleted' });
+          if (updateSucceeded(closed)) next[job.id] = { taskId, status: 'deleted', fingerprint: '', doneAt };
+        } catch {
+          // Retried on the next poll.
+        }
+        continue;
+      }
+      if (link.doneAt === undefined) next[job.id] = { ...link, doneAt };
+    }
     if (link.fingerprint === currentFingerprint) continue;
     try {
       const updated = await client.update({
@@ -238,7 +218,10 @@ export async function syncNativeTasks(
         ...(live ? { activeForm: activeForm(job) } : {}),
         status,
       });
-      if (updateSucceeded(updated)) next[job.id] = { taskId, status, fingerprint: currentFingerprint };
+      if (updateSucceeded(updated)) {
+        const prior = next[job.id];
+        next[job.id] = { taskId, status, fingerprint: currentFingerprint, ...(prior?.doneAt === undefined ? {} : { doneAt: prior.doneAt }) };
+      }
     } catch {
       // Retain the old fingerprint so a later poll retries the update.
     }

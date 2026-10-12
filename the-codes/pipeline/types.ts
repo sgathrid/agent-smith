@@ -94,6 +94,8 @@ export interface Stage {
   readonly role?: StageRole | undefined;
   /** The instruction handed to the worker. */
   readonly prompt?: string | undefined;
+  /** Why the work matters and who it is for. Shown to the worker in its brief (forge/brief.ts). */
+  readonly context?: string | undefined;
   /**
    * Human-facing one-liner for surfaces — the mod's `task` column, the store's
    * `title`.
@@ -112,6 +114,15 @@ export interface Stage {
   readonly workerId?: string;
   /** Provider-native conversation handle for an explicit follow-up. */
   readonly conversation?: string;
+  /**
+   * Name of an earlier stage whose worker this stage continues: it resumes that
+   * stage's conversation (same provider, worker identity and workDir) instead of
+   * starting a fresh worker. The target must be an ancestor via `dependsOn`, so
+   * its artifacts arrive as this stage's inputs. This is how a stage fixes from a
+   * review: `build -> review -> fix`, where `fix` continues `build`. Omit
+   * `provider` to inherit the target's.
+   */
+  readonly continues?: string | undefined;
   /** Working directory for the worker. Relative to the pipeline work dir. */
   readonly workDir?: string | undefined;
   /**
@@ -258,6 +269,14 @@ export interface StageContinuation {
   readonly priorEscalations?: readonly Escalation[] | undefined;
 }
 
+/** The earlier stage's worker that a `continues` stage resumes. */
+export interface ContinuedWorker {
+  readonly stage: string;
+  readonly transcriptRef: string;
+  readonly workerId?: string | undefined;
+  readonly agentName?: string | undefined;
+}
+
 /**
  * What a StageRunner receives.
  *
@@ -277,6 +296,8 @@ export interface StageContext {
   readonly routing: StageRouting;
   /** Present only on attempt > 1. */
   readonly continuation?: StageContinuation | undefined;
+  /** Present when `stage.continues` is set: the worker conversation to resume on attempt 1. */
+  readonly continues?: ContinuedWorker | undefined;
   /** Aborted on pipeline abort or stage timeout. Honor it. */
   readonly signal: AbortSignal;
 }
@@ -375,6 +396,8 @@ export interface StageResult {
   /** Everything this stage can hand to downstream stages. */
   readonly artifacts?: readonly ArtifactRef[] | undefined;
   readonly failure?: StageFailure | undefined;
+  /** Non-fatal facts a reader should know, e.g. an artifact the stage did not write. */
+  readonly warnings?: readonly string[] | undefined;
   readonly skippedBecause?: SkipReason | undefined;
   /** Escalations applied before this result was reached. */
   readonly escalations?: readonly Escalation[] | undefined;

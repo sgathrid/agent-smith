@@ -1,69 +1,17 @@
-// =============================================================================
-// register.tsx — the /forge pane, in an AbovePrompt-style mod.
-//
-// ─────────────────────────────────────────────────────────────────────────────
-// ⚠ MERGE NOTE — READ THIS BEFORE EDITING. ⚠
-// ─────────────────────────────────────────────────────────────────────────────
-// Another engineer may be writing the BAND half of this file concurrently. The
-// band is the 1–4 line strip above the prompt; the pane is what /forge opens.
-//
-// The split is structural, not advisory:
-//
-//   § BAND  — owned by the band author. Do not edit to fix a pane bug.
-//   § PANE  — owned by this file. Entirely self-contained below the marker.
-//
-// Every pane helper lives in ./format.ts (pure) and ./jobs.ts (I/O), both of
-// which are modules with no JSX. So merging this half is: copy the § PANE
-// section, add its four imports, and add the pane's `on(...)` calls to
-// register(). There is no shared local state between the halves beyond the atom
-// block at the top, which is documented per-atom.
-//
-// WHY THE PANE'S LOGIC IS NOT IN THIS FILE AT ALL:
-// `node --test --experimental-strip-types` cannot load a .tsx — TypeScript's type
-// stripping has no JSX transform, so any JSX in an imported module is a hard parse
-// error. Logic living here would be untestable under the repo's own test runner.
-// Everything testable is in format.ts (pure) and jobs.ts (I/O).
-//
-// ONE READER, AND WHY THE PANE USES ./jobs.ts
-// ──────────────────────────────────────────
-// § BAND and § PANE both read through ./jobs.ts. There is no second reader. The
-// pane used to have its own (./job-source.ts), and it could not load: it imported
-// `node:path`, `node:fs/promises` and `../../../harness/`, and a hooks module may
-// import only its own files by relative path and "claude-code". Two readers would
-// also have meant two answers to "is this job still running", which is the drift
-// this project exists to prevent. Its extra capability — result.md, the tool
-// history, stripSystemNotifications — now lives in jobs.ts behind flags, so the
-// status function is still the only one.
-// =============================================================================
-
+/** The band above the prompt and the /forge sidebar share canonical state and views. */
 import { atom, read, update } from 'claude-code';
-import type { EngineInterface, Register, UiComponents, UiRenderEvent } from 'claude-code';
+import type { EngineInterface, PostToolUseEvent, Register, UiRenderEvent } from 'claude-code';
 
 import type { RadarJob } from '../types/index.d.ts';
-import {
-  EMPTY_STATE,
-  countSummary,
-  describeTool,
-  elapsedCell,
-  formatHeaderLine,
-  formatJobLine,
-  isRecessive,
-  isTerminal,
-  jobLabel,
-  oneLine,
-  paneColumns,
-  pickColor,
-  pickGlyph,
-  SEP,
-  sortJobs,
-} from './format.ts';
+import { isTerminal } from './format.ts';
+import { findWorker, recordLaunch, scopeLine, sessionJobs, type Launched } from './dashboard.ts';
+import { renderList, renderWorker, type ViewActions, type ViewOptions } from './views.tsx';
+import type { ForgeDetail } from './canonical.ts';
 // ── BAND IMPORTS (band author) ────────────────────────────────────────────────
 // § PANE reads through this module too, and for the same reason the band does: it
 // is the mod's only reader, it takes an FsLike, and it is handed `$.fs`. See the
 // merge note at the top of this file.
 import {
-  BAND_ROWS,
-  TICK_CUSHION_MS,
   buildLine,
   isShown,
   noColor,
@@ -76,12 +24,26 @@ import {
   readAllJobs,
   readJob,
   readToolHistory,
+  readTranscript,
   type FsLike,
 } from './jobs.ts';
 import { sortForBand } from './format.ts';
-import type { ToolEntry } from '../types/index.d.ts';
+import { readForgeJobs, readForgeDetail } from './canonical.ts';
 import {
-  readNativeJobs,
+  LAUNCH_TOOL,
+  asRunRecord,
+  claim,
+  claimMarkerPath,
+  claudeText,
+  due,
+  parseLaunch,
+  runFileName,
+  type Launch,
+  type Owned,
+  type RunRecord,
+} from './notice.ts';
+import {
+  nativeJobsFromRadar,
   syncNativeTasks,
   type NativeTaskClient,
   type NativeTaskLinks,
@@ -141,44 +103,62 @@ const selected = atom({ plugin: 'agent-smith', key: 'selected' } as const, null 
 const now = atom({ plugin: 'agent-smith', key: 'now' } as const, 0);
 
 /**
- * Job ids the user has dismissed with `c`.
- *
- * WHY THIS IS AN ATOM AND NOT A FILTER ON THE READ: the pane is a READ-ONLY
- * projection (docs/ARCHITECTURE.md) and agy-staff owns `.agy-staff/jobs/`. Deleting
- * or hiding files there would be destroying another process's state to satisfy a UI
- * preference. So `c` records the dismissal locally and the list filters against it.
- *
- * Kept as a list rather than a Set because it round-trips through JSON in host
- * state, and an array survives that where a Set does not.
+ * Whether the worker view keeps its end in view. A person scrolling up pauses
+ * it; scrolling back to the bottom resumes it.
  */
-const cleared = atom({ plugin: 'agent-smith', key: 'cleared' } as const, [] as string[]);
+const follow = atom({ plugin: 'agent-smith', key: 'follow' } as const, true as boolean);
+/** The task line is expanded: the prompt as sent, preamble included. */
+const taskOpen = atom({ plugin: 'agent-smith', key: 'taskOpen' } as const, false as boolean);
+const listPage = atom({ plugin: 'agent-smith', key: 'listPage' } as const, 0);
+const paneOpen = atom({ plugin: 'agent-smith', key: 'paneOpen' } as const, false);
+const readError = atom({ plugin: 'agent-smith', key: 'readError' } as const, null as string | null);
+const expandedTools = atom({ plugin: 'agent-smith', key: 'expandedTools' } as const, [] as string[]);
+/** The worker the host was last asked to keep at its end; null re-anchors on the next draw. */
+let followingSite: string | null = null;
 const nativeTaskLinks = atom(
   { plugin: 'agent-smith', key: 'nativeTaskLinks' } as const,
   {} as NativeTaskLinks,
 );
 
 // ── BAND STATE (band author) ──────────────────────────────────────────────────
-// `jobs` is the band's own snapshot of the jobs directory. It is NOT shared with
-// the pane on purpose: the pane re-reads on demand (a press is a deliberate act
-// and deserves fresh data), while the band is driven by a 3 s poll and must not
-// block a redraw on 20 file reads. Both are read-only projections of the same
-// files, so they cannot disagree about the truth — only about when they looked.
-//
-// `config` holds the two things resolved once at session start: which repo to
-// watch, and whether colour is allowed. Re-reading env on every render would be
-// a filesystem-free but pointless syscall per frame.
+// The band, pane list and native task projection share this polled snapshot.
+// Detail reads the selected job's bounded view on demand. Configuration is
+// resolved once at session start, including explicit legacy-view opt-in.
 
 const bandJobs = atom({ plugin: 'agent-smith', key: 'bandJobs' } as const, [] as RadarJob[]);
 const bandConfig = atom({ plugin: 'agent-smith', key: 'bandConfig' } as const, {
   repo: DEFAULT_REPO,
   colour: true,
+  legacy: false,
 });
 
-/** Rows visible in the list before `… N older`. Pane height is bounded. */
-const LIST_ROWS = 9;
+/**
+ * Launches this session claimed (see `claimLaunch`), until announced. Session
+ * state, reset by /clear: a job claimed before a /clear is not announced after
+ * it, and leaves this session's view (`/forge all` still lists it).
+ */
+const notices = atom({ plugin: 'agent-smith', key: 'notices' } as const, [] as Owned[]);
 
-/** Tool calls shown in the detail pane's history. */
-const HISTORY_ROWS = 12;
+/**
+ * Launches this session made in this repo, for the views. Unlike `notices`,
+ * nothing prunes it: an announced or expired claim leaves `notices`, but its
+ * finished job stays in this session's list. Session state, reset like `notices`.
+ */
+const launched = atom({ plugin: 'agent-smith', key: 'launched' } as const, { jobs: [], runs: [] } as Launched);
+/** The /forge list shows this session's workers, or the repository's history. */
+const listScope = atom({ plugin: 'agent-smith', key: 'listScope' } as const, 'session' as 'session' | 'all');
+
+/**
+ * The rows the band, the session list and native tasks show: this session's
+ * launches. Legacy jobs are started outside the launch tools, so ownership is
+ * unknowable there and the legacy view stays the whole repository.
+ */
+async function sessionRows($: EngineInterface): Promise<RadarJob[]> {
+  const cfg = await read($, bandConfig);
+  const jobs = await read($, bandJobs);
+  const mine = await read($, launched);
+  return cfg.legacy ? jobs : sessionJobs(jobs, mine);
+}
 
 // =============================================================================
 // § BAND — band author. See MERGE NOTE above.
@@ -216,44 +196,129 @@ const fsOf = ($: EngineInterface): FsLike => ({
 /**
  * One sweep of the jobs directory into the `bandJobs` atom.
  *
- * NEVER THROWS. A read failure of one job is that job's absence, not a dead
- * band. See the fault-isolation note in ./jobs.ts readAllJobs.
+ * Read failures retain the last snapshot and expose an error to the user.
  */
 async function pollBand($: EngineInterface): Promise<void> {
   const cfg = await read($, bandConfig);
   const at = await $.clock.now();
-  const fresh = await readAllJobs(fsOf($), cfg.repo, at);
+  let fresh: RadarJob[];
+  try {
+    fresh = cfg.legacy ? await readAllJobs(fsOf($), cfg.repo, at) : await readForgeJobs(fsOf($), cfg.repo, at);
+    if (await read($, readError) !== null) await update($, readError, () => null);
+  } catch (error) {
+    const message = `Unable to read Forge state: ${String(error).slice(0, 200)}`;
+    if (await read($, readError) !== message) await update($, readError, () => message);
+    return; // Retain the last observed rows; a read failure is not an empty project.
+  }
 
-  // Fold over what we already had. `reconcile` is what makes a transient read
-  // failure unable to blink a row out — see its doc comment for the two halves
-  // (terminal-anchored status in ./jobs.ts, stickiness once terminal).
+
+  // The legacy adapter reconciles partial files. Canonical records are atomic
+  // and authoritative; all three surfaces receive exactly that projection.
   const previous = await read($, bandJobs);
   const byId = new Map(previous.map((j) => [j.id, j]));
-  const next = fresh.map((job) => reconcile(byId.get(job.id), job));
+  const next = cfg.legacy ? fresh.map((job) => reconcile(byId.get(job.id), job)) : fresh;
 
   // Only write when something actually changed. A 3 s poll that rewrites an
   // identical list would invalidate the band on every tick for no reason, and
   // `ui.invalidate` is rate-limited by the engine for good cause.
   const before = JSON.stringify(previous);
-  if (before === JSON.stringify(next)) return;
-  await update($, bandJobs, () => next);
+  if (before !== JSON.stringify(next)) await update($, bandJobs, () => next);
+  if (!cfg.legacy) await pollNativeTasks($, next);
+}
+
+// ── completion notices ───────────────────────────────────────────────────────
+//
+// The plugin's PostToolUse command hook (watch-hook.js) can wake Claude, but
+// the host labels its exit-2 wake "Stop hook feedback", which reads as an error.
+// When this mod is loaded it claims the launch (tool.call, or
+// classic.PostToolUse where delivered) and announces it itself, with one
+// `$.prompt.submit` turn credited to this plugin. Claude Code shows that
+// message to the user in full, so it is the only notice.
+
+/** Repo paths compare without trailing slashes. */
+const sameRepo = (a: string, b: string): boolean => a.replace(/\/+$/, '') === b.replace(/\/+$/, '');
+
+/**
+ * Claim a launch for this session, so the mod (and only the mod) announces it.
+ *
+ * THE ONE DECISION POINT. Modules sit above settings and plugin command hooks
+ * in the `classic.*` chain, so answering without `next` means the command hook
+ * for this call never starts: there is no second announcer to race. Every case
+ * the mod cannot watch calls `next`, and the hook behaves as it does without
+ * the mod. The claim is the last fallible step before the answer, and there is
+ * deliberately no `.catch`: a hook that throws is skipped, so the command hook
+ * runs, which is the safe way to fail.
+ *
+ * Ownership is per session by construction: this event fires for this
+ * session's own tool calls, and `notices` is session state.
+ */
+async function claimLaunch($: EngineInterface, e: PostToolUseEvent, next: (e: unknown) => Promise<unknown>): Promise<unknown> {
+  const launch = parseLaunch(e.tool_name, e.tool_response);
+  if (launch === null) return next(e);
+  return await takeLaunch($, launch, typeof e.cwd === 'string' ? e.cwd : '') ? {} : next(e);
 }
 
 /**
- * What `registerBand` hands back: a continuation to run INSIDE the pane's own
- * `session.start` handler.
- *
- * WHY IT IS NOT A SECOND `on('session.start')`
- * ────────────────────────────────────────────
- * VERIFIED against the loader: registering the same matcher-less event twice is
- * refused outright —
- *   `on("session.start") is registered twice without a matcher; the first is at
- *    …/register.tsx:57`
- * So two `on(...)` calls cannot coexist in one module, whoever owns them. The
- * band therefore returns its session-start work as a function and the pane
- * `await`s it as the first thing in the handler it already has. One extra line
- * in § PANE, and the band keeps every other registration to itself.
+ * Record a launch for this session's view and, where the mod can watch it,
+ * claim its announcement. True when claimed. Idempotent: `tool.call` and
+ * `classic.PostToolUse` may both deliver the same launch.
  */
+async function takeLaunch($: EngineInterface, launch: Launch, cwd: string): Promise<boolean> {
+  const cfg = await read($, bandConfig);
+  const repo = launch.repo ?? cwd;
+  // Whether this session shows the job is a separate question from who
+  // announces it: any launch in this repo is shown, even one the hook keeps.
+  if (cfg.repo !== '' && sameRepo(repo, cfg.repo)) await update($, launched, (l) => recordLaunch(l, launch));
+  // Legacy mode reads the agy-staff layout, and a read error means no rows: the
+  // mod could not see this job finish, so the hook keeps it.
+  if (cfg.legacy || cfg.repo === '' || await read($, readError) !== null) return false;
+  if (!sameRepo(repo, cfg.repo)) return false;
+  const at = await $.clock.now();
+  await update($, notices, (owned) => claim(owned, launch, at));
+  // The hook finds this marker when the job ends and stays silent. Where the
+  // host skips user-tier modules for classic.PostToolUse (observed: "bypassed by
+  // cc-plugin-sec-default"), this marker is the only thing that stops a second
+  // notice, so the tool.call path below writes it too.
+  await $.fs.write(claimMarkerPath(cfg.repo, launch.kind, launch.id), `${new Date(at).toISOString()}\n`).catch(() => {});
+  return true;
+}
+
+// A slow pass can overlap the next tick; one announcement pass at a time.
+let announcing = false;
+
+/** Announce every claimed launch that has news: one log block, one turn. */
+async function announce($: EngineInterface, repo: string, jobs: readonly RadarJob[], at: number): Promise<void> {
+  if (announcing) return;
+  announcing = true;
+  try {
+    const owned = await read($, notices);
+    if (owned.length === 0) return;
+    const runs = new Map<string, RunRecord>();
+    for (const o of owned) {
+      if (o.kind !== 'run') continue;
+      const file = `${repo.replace(/\/+$/, '')}/.agent-smith/pipelines/${runFileName(o.id)}`;
+      try {
+        const run = await $.fs.exists(file) ? asRunRecord(JSON.parse(await $.fs.read(file))) : null;
+        if (run) runs.set(o.id, run);
+      } catch {
+        // Mid-write or unreadable: try again next poll.
+      }
+    }
+    const result = due(owned, jobs, runs, at);
+    const changed = result.notices.length > 0 || result.owned.length !== owned.length;
+    if (!changed) return;
+    // Record before speaking, so a notice is said once even if the turn it
+    // asks for never starts. Claims made since the read above are kept.
+    const seen = new Set(owned.map((o) => `${o.kind}:${o.id}`));
+    await update($, notices, (current) => [...result.owned, ...current.filter((c) => !seen.has(`${c.kind}:${c.id}`))]);
+    if (result.notices.length === 0) return;
+    // Resolves when the turn starts, which waits for the session to be idle.
+    void $.prompt.submit({ text: claudeText(result.notices) }).catch(() => {});
+  } finally {
+    announcing = false;
+  }
+}
+
 /**
  * The band's half of session start. Await this INSIDE the pane's own
  * `session.start` handler, after its `await next(e)`.
@@ -286,11 +351,12 @@ export async function startBand($: EngineInterface, cwd?: string): Promise<void>
   // refused at compile time, "so the variables a module reads and writes can be
   // listed"), so each is spelled out. no-color.org: present AND non-empty means
   // no colour; FORCE_COLOR=0/false and TERM=dumb are the same request.
-  const [nc, force, term, repo] = await Promise.all([
+  const [nc, force, term, repo, legacy] = await Promise.all([
     $.env.get('NO_COLOR').catch(() => undefined),
     $.env.get('FORCE_COLOR').catch(() => undefined),
     $.env.get('TERM').catch(() => undefined),
     $.env.get('AGY_RADAR_REPO').catch(() => undefined),
+    $.env.get('AGENT_SMITH_LEGACY_JOBS').catch(() => undefined),
   ]);
   await update($, bandConfig, () => ({
     // Precedence: explicit AGY_RADAR_REPO, else the session cwd, else
@@ -299,6 +365,7 @@ export async function startBand($: EngineInterface, cwd?: string): Promise<void>
     repo: repo !== undefined && repo.trim() !== '' ? repo.trim()
       : (cwd !== undefined && cwd !== '' ? cwd : DEFAULT_REPO),
     colour: !noColor({ NO_COLOR: nc, FORCE_COLOR: force, TERM: term }),
+    legacy: legacy === '1',
   }));
 
   // First read is immediate and warm. TERMINAL-UI.md L140-146 INVERTS the web
@@ -316,25 +383,29 @@ export async function startBand($: EngineInterface, cwd?: string): Promise<void>
   const seeded = await $.clock.now();
   await update($, now, () => seeded).catch(() => {});
 
-  // The band clock, GATED. TERMINAL-UI.md L155-162: "Idle means idle. A 1Hz
-  // repaint of nothing is a laptop fan." Each tick reads the clock, asks
-  // whether anything would still be on screen in three seconds, and writes
-  // only then. So an idle session costs one comparison a second and never a
-  // redraw. The cushion is why the row that expires is dropped on THIS tick
-  // rather than surviving one extra.
+  // Tick while a row was visible at the previous time, so its expiry gets one
+  // final redraw. Keep ticking for an open pane; become idle only afterwards.
   $.clock.every(BAND_TICK_MS, () => {
     void (async () => {
       const at = await $.clock.now();
-      const visible = (await read($, bandJobs)).some((j) =>
-        isShown(j, at + TICK_CUSHION_MS),
-      );
-      if (visible) await update($, now, () => at);
+      const previousTime = await read($, now);
+      const visible = (await sessionRows($)).some(j => isShown(j, previousTime));
+      // Draw once across the expiry boundary before becoming idle.
+      if (visible || await read($, paneOpen)) await update($, now, () => at);
     })().catch(() => {});
   });
 
-  // The data poll, on its own slower cadence.
+  // The data poll, on its own slower cadence. Notices go out from here only:
+  // a timer runs outside any event, which is where `$.prompt.submit` belongs.
+  // The other pollBand callers run inside a hook (a Bash tool.call, /forge),
+  // where a submit could be refused after the notice was already recorded.
   $.clock.every(POLL_MS, () => {
-    void pollBand($).catch(() => {});
+    void (async () => {
+      await pollBand($);
+      const cfg = await read($, bandConfig);
+      if (cfg.legacy || await read($, readError) !== null) return;
+      await announce($, cfg.repo, await read($, bandJobs), await $.clock.now());
+    })().catch(() => {});
   });
 }
 
@@ -343,17 +414,18 @@ export async function startBand($: EngineInterface, cwd?: string): Promise<void>
 // guard for the mod's current engine session.
 let nativeSyncing = false;
 
-async function pollNativeTasks($: EngineInterface, repo: string): Promise<void> {
+async function pollNativeTasks($: EngineInterface, rows: readonly RadarJob[]): Promise<void> {
   if (nativeSyncing) return;
   nativeSyncing = true;
   try {
-    const jobs = await readNativeJobs(fsOf($), repo);
     const previous = await read($, nativeTaskLinks);
     const client: NativeTaskClient = {
       create: (input) => $.tool.call({ tool: 'TaskCreate', ...input }),
       update: (input) => $.tool.call({ tool: 'TaskUpdate', ...input }),
     };
-    const next = await syncNativeTasks(jobs, previous, client);
+    // Only this session's launches get a new task; tasks already linked finish as before.
+    const mine = new Set(sessionJobs(rows, await read($, launched)).map((job) => job.id));
+    const next = await syncNativeTasks(nativeJobsFromRadar(rows), previous, client, await $.clock.now(), (id) => mine.has(id));
     if (JSON.stringify(previous) !== JSON.stringify(next)) {
       await update($, nativeTaskLinks, () => next);
     }
@@ -365,12 +437,6 @@ async function pollNativeTasks($: EngineInterface, repo: string): Promise<void> 
   }
 }
 
-/** Start a live-only projection into Claude's TaskList, using host-assigned ids. */
-async function startNativeTasks($: EngineInterface, repo: string): Promise<void> {
-  await pollNativeTasks($, repo);
-  $.clock.every(POLL_MS, () => pollNativeTasks($, repo));
-}
-
 // ── the band's remaining registrations ─────────────────────────────────────
 //
 // Its session-start half is `startBand` above, because the engine refuses two
@@ -380,9 +446,8 @@ async function startNativeTasks($: EngineInterface, repo: string): Promise<void>
 /**
  * Register the band. Called from the pane's `register`.
  *
- * The band deliberately registers NO `command.run` handler and opens NO pane:
- * `/forge` belongs to the pane half, and two handlers for one command is a
- * coin toss over which one the engine picks.
+ * The band registers NO `command.run` handler: `/forge` belongs to the pane
+ * half. Its rows' digit hotkeys open the pane through `openForge`.
  */
 export function registerBand(on: Parameters<Register>[0]): void {
   // A Bash call that looks like a dispatch: refresh NOW, not in up to 3 s.
@@ -399,6 +464,19 @@ export function registerBand(on: Parameters<Register>[0]): void {
     return next(e);
   });
 
+  // A launch this session made: claim it for the mod's notices (see claimLaunch).
+  on('classic.PostToolUse', { tool_name: LAUNCH_TOOL }, claimLaunch);
+  // The path that works when classic.PostToolUse is withheld from user-tier
+  // modules: wrap the launch tool, read its result, return it untouched.
+  on('tool.call', { tool: LAUNCH_TOOL }, async ($, e, next) => {
+    const r = await next(e) as { result?: unknown; text?: unknown; deny?: string; isError?: boolean } | undefined;
+    if (r && r.deny === undefined && r.isError !== true) {
+      const launch = parseLaunch(e.tool, r.result) ?? parseLaunch(e.tool, r.text);
+      if (launch !== null) await takeLaunch($, launch, '').catch(() => {});
+    }
+    return r;
+  });
+
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     noteViewport(e.viewport?.columns);
     // Yield FIRST. Everything Claude Code and every other mod draw in this band
@@ -407,15 +485,20 @@ export function registerBand(on: Parameters<Register>[0]): void {
     const rest = await next(e);
 
     // Subscribe. `await read($, now)` is what makes a clock tick repaint this
-    // element; reading bandJobs is what makes a poll repaint it.
+    // element; reading bandJobs (in sessionRows) is what makes a poll repaint it.
     const at = await read($, now);
     const cfg = await read($, bandConfig);
-    const all = await read($, bandJobs);
+    const all = await sessionRows($);
 
     // A survey holds the band. Standing aside is not politeness: a survey is a
     // question being asked, and the band would push it off screen.
     if (e.props.hasSurvey) return rest;
 
+    const error = await read($, readError);
+    if (error) {
+      const { Box, Text } = $.ui.resolve(e);
+      return <Box flexDirection="column"><Text wrap="truncate-end">{error}</Text>{rest}</Box>;
+    }
     const shown = sortForBand(all).filter((j) => isShown(j, at));
     // No jobs → render NOTHING (TERMINAL-UI.md L168-171). Not "no jobs", not an
     // empty box: the host's own output, exactly as it was. A band that "appears
@@ -426,15 +509,22 @@ export function registerBand(on: Parameters<Register>[0]): void {
     // slot's, or the terminal's height. Passing it in means the band cannot be
     // the reason the prompt leaves the screen in a short terminal, which is rule
     // #1 in a way the rule does not otherwise mention.
-    const budget = rowBudget(shown, e.props.maxRows);
-    const { Box, Text } = $.ui.resolve(e);
+    const budget = rowBudget(shown, Math.max(1, (e.props.maxRows ?? 10) - 1));
+    const { Box, Text, Button } = $.ui.resolve(e);
+    // A plain Button draws `1: ` before its children, so the row is sized to the rest.
+    const width = Math.max(1, e.props.bodyColumns - 3);
 
     return (
       <Box flexDirection="column">
-        {budget.rows.map((job) => {
-          const line = buildLine(job, at, { colour: cfg.colour });
+        {budget.rows.map((job, i) => {
+          const line = buildLine(job, at, { colour: cfg.colour, width });
+          const detail = job.acceptance?.pending && isTerminal(job.status) ? 'checks pending' :
+            job.acceptance?.state === 'rejected' ? 'checks rejected' : line.detail;
+          // A bare digit in an empty prompt presses a band Button without focusing
+          // the band, so one key opens the sidebar on this worker.
           return (
-            <Text key={job.id} dimColor={line.recessive} wrap="truncate-end">
+            <Button key={`band-${job.id}`} plain hotkey={String(i + 1)} label={line.plain.trim()} onPress={() => openForge($, job.id)}>
+            <Text dimColor={line.recessive} wrap="truncate-end">
               {/* Segment 1: the GLYPH ALONE, in the accent and bold while live.
                   `accent` is undefined under NO_COLOR and for canceled/unknown,
                   and `color={undefined}` draws in the terminal's default — the
@@ -455,9 +545,10 @@ export function registerBand(on: Parameters<Register>[0]): void {
                   the rule per element. */}
               <Text wrap="truncate-end">{` ${line.label}`}</Text>
               <Text dimColor={!line.recessive} wrap="truncate-end">
-                {` ${line.detail} ${line.clock}`.replace(/\s+$/, '')}
+                {` ${detail} ${line.clock}`.replace(/\s+$/, '')}
               </Text>
             </Text>
+            </Button>
           );
         })}
         {budget.hidden > 0 && (
@@ -504,12 +595,12 @@ export const register: Register = (on) => {
     // Band first, and it never throws: a slow or failing band config must not
     // delay `/forge` appearing or take the session's start with it.
     await startBand($, typeof e.cwd === 'string' ? e.cwd : undefined);
-    const cfg = await read($, bandConfig);
-    await startNativeTasks($, cfg.repo);
+
     await $.command
       .register({
         name: 'forge',
-        description: 'Browse worker jobs: tool history, warnings, and the final report',
+        immediate: true,
+        description: 'Show this session\'s workers; /forge all shows the repository\'s; /forge <name> opens one worker',
       })
       .catch(() => {});
     return rest;
@@ -519,438 +610,136 @@ export const register: Register = (on) => {
   // some other handler's contribution to the command; there is nothing to chain
   // here, and the reference mod's command handler also ignores it.
   //
-  // The matcher must equal the name registered above — 'radar', not the plugin
+  // The matcher must equal the name registered above — 'forge', not the plugin
   // name. A matcher that matches nothing is a pane nobody can open, and it fails
   // SILENTLY, so the two strings are deliberately the same string.
-  on('command.run', { command: 'forge' }, async ($, _e, _next) => {
-    // Reset the selection so the pane always opens on the list. Opening directly
-    // into a stale detail view would be disorienting: the user asked for a
-    // browser, not for wherever they happened to be last time.
-    await update($, selected, () => null);
-
-    // Claude accepts a width REQUEST and lets the user resize/relocate the pane.
-    // Ask for one third of the measured terminal so `/forge` occupies the right
-    // third by default, with 60 columns before measurement and the host's 24
-    // column floor on very narrow terminals. The host may still override it.
-    await requestPane($, true);
-
-    // Read once here so the command's own return value is honest about what is
-    // running. The pane re-reads on every render; this is just for the command's
-    // response text.
-    //
-    // THE REPO COMES FROM `bandConfig`, NOT FROM `$.cwd`. `$.cwd` is refused at
-    // compile time — "`$.cwd` is used as a value … `$` is always spelled
-    // `$.noun.event(...)`" — and `session.start`'s `e.cwd` is already folded into
-    // that atom by startBand. Reading it from there rather than re-deriving it
-    // also means the band and the pane cannot end up pointed at different repos.
+  on('command.run', { command: 'forge' }, async ($, e) => {
+    await pollBand($);
     const cfg = await read($, bandConfig);
-    const jobs = await readAllJobs(fsOf($), cfg.repo, await $.clock.now());
-    return { text: formatHeaderLine(countSummary(jobs)) };
+    const jobs = await read($, bandJobs);
+    const mine = await sessionRows($);
+    const args = typeof e.args === 'string' ? e.args.trim() : '';
+    // `/forge pane` is the session list, kept because people have typed it.
+    // Legacy jobs have no session owner, so legacy is always the repository.
+    const scope = args === 'all' || cfg.legacy ? 'all' : 'session';
+    const query = args === 'pane' || args === 'all' ? '' : args;
+    // This session's worker first; then the repository's, so an older one still opens by name.
+    const job = query === '' ? undefined : findWorker(mine, query) ?? findWorker(jobs, query);
+    if (query !== '' && job === undefined) await $.ui.toast(`No worker matches "${query}"; showing the list`);
+    await update($, listScope, () => scope);
+    await openForge($, job?.id ?? null);
+    return { text: scopeLine(scope === 'all' ? jobs : mine, scope) };
   });
 
-  // ── the pane itself ───────────────────────────────────────────────────────
-  //
-  // A PANE IS OURS. Unlike the band, we do NOT call `next(e)` and we do not defer
-  // to the host: a pane exists to be our own surface, and there is no host content
-  // in it to preserve. TERMINAL-UI.md's "yield to the host" rule applies to the
-  // band, where other mods and Claude Code draw above the prompt; it does not
-  // apply here, and calling next(e) would be cargo-culting.
-  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e, _next) => {
-    noteViewport(e.viewport?.columns);
-    // Terminal resizes may change the desired third. Reissue exactly once per
-    // changed request; the guard prevents a render/open feedback loop.
-    if (lastPaneRequest !== null && lastPaneRequest !== paneWidthRequest(lastViewportColumns)) {
-      await requestPane($).catch(() => {});
-    }
-    const { Box, Text, Button, Markdown } = $.ui.resolve(e);
-
-    // Subscribe to the clock. This read is what repaints the pane as elapsed cells
-    // tick; without it the pane would redraw only when something else changed.
-    const clock: number = await read($, now);
-    const t = clock > 0 ? clock : Date.now();
-
-    const pick: string | null = await read($, selected);
-    const hidden: string[] = await read($, cleared);
-    // Same `bandConfig.repo` the band reads: one repo, resolved once. See the note
-    // on the `command.run` handler above for why this is not `$.cwd`.
-    const repo = (await read($, bandConfig)).repo;
-    const fs = fsOf($);
-
-    if (pick !== null) {
-      // WITH REPORTS. The detail view is the one place a report is shown, and it
-      // shows one at a time — unlike the band, which would be re-reading and
-      // re-stringifying every report in the directory on a 3 s poll forever.
-      const job = await readJob(fs, repo, pick, t);
-      if (job !== null) {
-        // Read the tool history HERE, not inside the history component: components
-        // here are synchronous factory functions, so an async one would return a
-        // Promise, and a Promise is not a renderable element. Reading in the hook
-        // also means exactly one read per render.
-        const history = await readToolHistory(fs, repo, pick);
-        return renderDetail($, e, job, t, history, hidden, { Box, Text, Button, Markdown });
+  // Scrolling up pauses following; scrolling back to the end resumes it.
+  on('ui.scroll', async ($, e, next) => {
+    if (e.component === 'Pane' && e.requestId === PANE && e.origin.kind === 'person' && await read($, selected) !== null) {
+      const atEnd = e.offset >= e.contentRows - e.bodyRows;
+      if (atEnd !== await read($, follow)) {
+        followingSite = null;
+        await update($, follow, () => atEnd);
       }
-      // The selected job vanished — agy-staff cleaned the directory, or the id
-      // came from a stale list. Fall back to the list rather than rendering a
-      // detail view for nothing; a blank pane reads as a crash.
-      await update($, selected, () => null);
     }
+    return next(e);
+  });
 
-    // WITHOUT reports: the list row is a glyph, a clock and a count. Pulling
-    // 256 KB of markdown into a list of 20 rows to draw none of it is the kind
-    // of read that makes a pane feel broken.
-    return renderList($, e, await readAllJobs(fs, repo, t), t, hidden, { Box, Text, Button });
+  on('ui.close', async ($, e, next) => {
+    if (e.id === PANE) await update($, paneOpen, () => false);
+    return next(e);
+  });
+
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    noteViewport(e.viewport?.columns);
+    if (lastPaneRequest !== null && lastPaneRequest !== paneWidthRequest(lastViewportColumns)) await requestPane($).catch(() => {});
+    return renderForge($, e);
   });
 };
 
-/**
- * The components `$.ui.resolve(e)` hands back.
- *
- * Resolved ONCE per render and threaded through the two view functions, rather
- * than re-resolved inside each. `resolve` is cheap, but threading them makes it
- * structurally impossible for the list and the detail view to disagree about
- * which component set they are drawing with.
- */
-interface Widgets extends UiComponents {}
-
-/** The subset the list needs. The detail view needs all five. */
-type ListWidgets = Pick<Widgets, 'Box' | 'Text' | 'Button'>;
-
-// ── level 1: the list ───────────────────────────────────────────────────────
-
-/**
- * The list level of the two-level pane.
- *
- * Header, then one Button per job, then the footer. The header carries the counts
- * because a count is a determinate quantity and a spinner is not: polling has no
- * progress to report, so an indeterminate spinner would claim work that is not
- * happening (TERMINAL-UI.md §Empty/loading).
- *
- * JOBS ARE `Button`s, NOT `Text`s. That is what makes the list navigable — every
- * row gets a hotkey and keyboard selection for free, and a pane the user can only
- * read by clicking is a worse pane.
- */
-function renderList(
-  $: EngineInterface,
-  e: UiRenderEvent,
-  all: readonly RadarJob[],
-  t: number,
-  hidden: readonly string[],
-  W: ListWidgets,
-): JSX.Element {
-  const { Box, Text, Button } = W;
-  // `c` filters locally rather than deleting anything: agy-staff owns this
-  // directory and a UI preference must not destroy another process's state.
-  const sorted = sortJobs(all.filter((j) => !hidden.includes(j.id) || !isTerminal(j.status)));
-
-  // Empty state: one literal line. NOT a box, NOT a spinner, NOT "0 jobs".
-  // A pane whose whole content is a border and the word "empty" is louder than a
-  // pane with nothing in it.
-  if (sorted.length === 0) {
-    return (
-      <Box flexDirection="column">
-        <Text dimColor wrap="truncate-end">{EMPTY_STATE}</Text>
-        {footer($, W, false, hidden)}
-      </Box>
-    );
-  }
-
-  const shown = sorted.slice(0, LIST_ROWS);
-
-  // The two variable column widths come from the width the ENGINE reports, not
-  // from the width of the content. That is the fix for the pane's worst visible
-  // flaw: the rows used to be laid out against the longest job id (30 columns of
-  // `implement-musm82da-f1dc1fe4`) and then truncated at 90 by a pane that was
-  // only 85 wide, so every row wrapped to two lines. `bodyColumns` is the real
-  // budget, and `paneColumns` guarantees label + detail + overhead fits inside
-  // it — so a row cannot wrap at ANY terminal width, including 60.
-  const cols = paneColumns(e.props.bodyColumns);
-
-  return (
-    <Box flexDirection="column">
-      {/* Counts, not a spinner. `wrap="truncate-end"` on every Text: a wrapped
-          status line becomes two rows and the pane's height changes under the
-          user's cursor. */}
-      <Text bold wrap="truncate-end">{formatHeaderLine(countSummary(sorted))}</Text>
-
-      {shown.map((job, i) => (
-        <Button
-          key={`job-${job.id}`}
-          plain
-          hotkey={String(i + 1)}
-          // Recessive for finished/canceled/unknown, NOT for failed. A failed job
-          // is the one terminal state the user has to act on, and dimming it is
-          // how a failure becomes the thing nobody reads. `dimColor`, never
-          // `gray` — a fixed colour that vanishes on one of light/dark.
-          dimColor={isRecessive(job.status)}
-          label={formatJobLine(job, { ...cols, tools: true, now: t })}
-          // `void`: Button.onPress is Promise<void> and update() resolves to the new
-          // value, which is not assignable. The value is discarded by design.
-          onPress={() => void update($, selected, () => job.id)}
-        />
-      ))}
-
-      {/* Row cap. A list that grows without bound pushes the footer off screen.
-          `+N older` rather than an ellipsis: `…` is EAW=Ambiguous, and this row
-          is dim text at the left edge where a one-column drift is invisible but
-          a two-column one is not. */}
-      {sorted.length > LIST_ROWS && (
-        <Text dimColor wrap="truncate-end">{`  +${sorted.length - LIST_ROWS} older`}</Text>
-      )}
-
-      {footer($, W, false, hidden)}
-    </Box>
-  );
+/** Show one worker (or the list, for null) in the sidebar, following its end. */
+async function show($: EngineInterface, id: string | null): Promise<void> {
+  await update($, selected, () => id);
+  await update($, follow, () => true);
+  await update($, taskOpen, () => false);
+  await update($, expandedTools, () => []);
+  followingSite = null;
+  await $.ui.scroll({ to: 'start', in: PANE }).catch(() => {});
 }
 
-// ── level 2: the detail view ────────────────────────────────────────────────
-
-/**
- * The detail level: task, tool history, current reasoning, warnings, report.
- *
- * THE ORDER IS AN ARGUMENT. The user's first question about a job is "what did it
- * do", so the task comes first and the report last: a reader who stops after the
- * first screen has still learned what the job was for. Warnings sit immediately
- * above the report because a warning changes how the report should be read — a
- * "done" job with `suspicious_success` must not be read as a success, and burying
- * that below the report would guarantee it gets missed.
- */
-function renderDetail(
-  $: EngineInterface,
-  e: UiRenderEvent,
-  job: RadarJob,
-  t: number,
-  history: readonly ToolEntry[],
-  hidden: readonly string[],
-  W: Widgets,
-): JSX.Element {
-  const { Box, Text, Button, Markdown } = W;
-  const rule = '─'.repeat(Math.max(10, Math.min(e.props.bodyColumns - 2, 200)));
-
-  return (
-    <Box flexDirection="column">
-      {/* Header: the TASK as the title, the elapsed beside it, and the job id
-          demoted to a dim line of its own.
-
-          THE ID IS HERE AND NOT ON THE LIST ROW, which is the whole point of the
-          split: on a list row, `implement-musm82da-f1dc1fe4` is 30 columns of
-          which the mode is constant and the suffix is a UUID fragment; on a
-          detail page, where there are four things to read and rows are not being
-          scanned against each other, the id is exactly what a person needs in
-          order to say "show me job f1dc1fe4". Keeping it here costs nothing and
-          removing it from the row is what buys the row its width. */}
-      <Text wrap="truncate-end">
-        <Text color={pickColor(job.status)} bold>
-          {`${pickGlyph(job.status)} ${jobLabel(job)}`}
-        </Text>
-        <Text dimColor>{`  ${elapsedCell(job.startedAt === null ? 0 : (job.endedAt ?? t) - job.startedAt)}`}</Text>
-      </Text>
-
-      <Text dimColor wrap="truncate-end">
-        {`${job.id}${job.workerId ? `  worker ${job.workerId}` : ''}${job.role ? `  ${job.role}` : ''}  ${detailSummary(job, t)}`}
-      </Text>
-
-      {/* The task. prompt_source.task's first line only — the real tasks run to
-          60+ lines and the pane has no room, and the whole body is available in
-          the spec file if anyone needs it. */}
-      {job.task.length > 0 && (
-        <Text wrap="truncate-end">{oneLine(job.task, e.props.bodyColumns - 2)}</Text>
-      )}
-
-      {/* Current reasoning. Only for a live job: a finished job's last thought is
-          not news, and its report says the same thing better. */}
-      {job.status === 'running' && job.reasoning !== null && job.summarySource !== 'worker' && (
-        <Text dimColor wrap="truncate-end">{oneLine(job.reasoning, 300)}</Text>
-      )}
-
-      {job.summarySource === 'worker' && typeof job.latestSummary === 'string' && job.latestSummary.trim() !== '' && (
-        <Box flexDirection="column">
-          <Text bold wrap="truncate-end">Latest worker output</Text>
-          <Markdown text={job.latestSummary} />
-        </Box>
-      )}
-
-      <Text dimColor>{rule}</Text>
-
-      {/* Tool history, newest last so it reads forward in time. Empty is stated in
-          words: for a cleanly finished job there IS no history on disk, and a
-          silent section would look like a rendering failure. */}
-      <ToolHistory entries={history} W={W} />
-
-      {/* Warnings, above the report on purpose. See the order note above. */}
-      {job.warnings.length > 0 && (
-        <>
-          <Text bold wrap="truncate-end">{`Warnings (${job.warnings.length})`}</Text>
-          {job.warnings.map((w) => (
-            <Text key={`w-${w.code}`} color="yellow" wrap="truncate-end">
-              {`⚠ ${oneLine(w.message, 300)}`}
-            </Text>
-          ))}
-          <Text dimColor>{rule}</Text>
-        </>
-      )}
-
-      {/* The report. Markdown, not Code: it is prose written by a worker, and
-          rendering it as a monospace blob would make it harder to skim than the
-          one-line summary above it already did. */}
-      {job.report !== null && job.report.trim().length > 0 ? (
-        <Markdown text={job.report} />
-      ) : (
-        // No report. On a terminal status this is the headline rule from
-        // normalize.ts: empty output + warnings is a suspicious success, not a
-        // success, so we say plainly that there is nothing to read.
-        <Text dimColor wrap="truncate-end">
-          {isTerminal(job.status) ? 'No report was written.' : 'No report yet — still running.'}
-        </Text>
-      )}
-
-      {footer($, W, true, hidden)}
-    </Box>
-  );
+/** Open the sidebar focused, on one worker or on the list. */
+async function openForge($: EngineInterface, id: string | null): Promise<void> {
+  await show($, id);
+  if (id === null) await update($, listPage, () => 0);
+  await update($, paneOpen, () => true);
+  await requestPane($, true);
 }
 
-/**
- * The detail page's one-line summary: `running ∙ running tests ∙ 341 tools`.
- *
- * A separate helper rather than slicing the output of formatJobLine: slicing a
- * formatted line back into parts means the header silently breaks the day
- * formatJobLine's layout changes. Both call the same primitives instead, so they
- * cannot drift, and neither depends on the other's string layout.
- *
- * The tool count IS shown here, on every status, unlike on a list row. On a row
- * it competes with nine neighbours for one glance and 504-versus-36 means
- * nothing; on a detail page it is one number in one line and it answers "how much
- * work was this", which is a fair question to ask a job you have opened on purpose.
- */
-function detailSummary(job: RadarJob, _t: number): string {
-  // Annotated as string[] because the first element is a RadarStatus and TS would
-  // otherwise infer the array as RadarStatus[] and reject the strings pushed after.
-  const bits: string[] = [job.status];
-  if (job.activity !== '' && !isTerminal(job.status)) bits.push(job.activity);
-  if (job.toolCount !== null) bits.push(`${job.toolCount} tools`);
-  return bits.join(` ${SEP} `);
+async function scrollEnd($: EngineInterface): Promise<void> {
+  const result = await $.ui.scroll({ to: 'end', in: PANE });
+  if (result.deny) throw new Error(result.deny);
 }
 
-/**
- * The tool history section.
- *
- * PURE and SYNCHRONOUS by design. An earlier draft made this an async component
- * that read events.jsonl itself, which does not work: an async function returns a
- * Promise, and a Promise is not a valid JSX element. The read is hoisted into the
- * render hook (see the call to readToolHistory above), which also means it happens
- * exactly once per render instead of once per component mount.
- *
- * events.jsonl is 500 KB on a long job, and the list view never touches it at all —
- * a pane that read half a megabyte per job per render would be unusable, and would
- * pay that cost for a section most users never open.
- */
-function ToolHistory({ entries, W }: { entries: readonly ToolEntry[]; W: Widgets }): JSX.Element {
+// Clock and control redraws reuse the bounded detail until the next data cadence.
+let detailCache: { key: string; at: number; detail: ForgeDetail | null } | null = null;
+async function loadDetail($: EngineInterface, repo: string, legacy: boolean, id: string, t: number): Promise<ForgeDetail | null> {
+  const key = `${repo}:${legacy}:${id}`;
+  if (detailCache?.key === key && t >= detailCache.at && t - detailCache.at < POLL_MS) return detailCache.detail;
+  const fs = fsOf($);
+  let detail: ForgeDetail | null;
+  if (legacy) {
+    const job = await readJob(fs,repo,id,t);
+    detail = job ? { job, history:await readToolHistory(fs,repo,id), transcript:await readTranscript(fs,repo,id), timeline:null } : null;
+  } else detail = await readForgeDetail(fs,repo,id,t);
+  detailCache = { key, at:t, detail };
+  return detail;
+}
+
+async function renderForge($: EngineInterface, e: UiRenderEvent): Promise<JSX.Element> {
+  const W = $.ui.resolve(e);
   const { Box, Text } = W;
-
-  if (entries.length === 0) {
-    return (
-      <Box flexDirection="column">
-        <Text dimColor wrap="truncate-end">No tool history available.</Text>
-      </Box>
-    );
+  const cfg = await read($, bandConfig);
+  const t = await read($, now);
+  const jobs = await read($, bandJobs);
+  const mine = await sessionRows($);
+  const chosen = await read($, listScope);
+  const scope = cfg.legacy ? 'all' : chosen;
+  const pick = await read($, selected);
+  const error = await read($, readError);
+  const o: ViewOptions = {
+    width: e.props.bodyColumns, now: t, colour: cfg.colour, page: await read($, listPage), scope,
+    following: await read($, follow), taskOpen: await read($, taskOpen), tools: await read($, expandedTools),
+  };
+  const a: ViewActions = {
+    // Legacy has no session to switch to.
+    ...(cfg.legacy ? {} : { scope: async (next: 'session' | 'all') => { await update($, listScope, () => next); await update($, listPage, () => 0); } }),
+    pick: (job) => show($, job.id),
+    page: async (page) => { await update($, listPage, () => page); },
+    back: () => show($, null),
+    task: async () => { await update($, taskOpen, (open) => !open); },
+    tool: async (key) => { await update($, expandedTools, (keys) => keys.includes(key) ? keys.filter((k) => k !== key) : [...keys, key]); },
+    close: async () => { await update($, paneOpen, () => false); await $.ui.close({ id: PANE }); },
+  };
+  let content = renderList(W, scope === 'all' ? jobs : mine, o, a);
+  if (pick !== null) {
+    try {
+      const detail = await loadDetail($, cfg.repo, cfg.legacy, pick, t);
+      if (detail) {
+        content = renderWorker(W, detail, o, a, jobs.filter((job) => job.id !== pick && job.workerId != null && job.workerId === detail.job.workerId));
+        if (o.following && followingSite !== pick) {
+          // Host end anchors keep following a growing tree until a person scrolls.
+          try { await scrollEnd($); followingSite = pick; }
+          catch (failure) {
+            // The testkit has no painted scroll surface. A live refusal is retried
+            // after the new tree is installed, rather than treated as success.
+            if (String(failure).includes('no implementation for ui.scroll')) followingSite = pick;
+          }
+        }
+      }
+    } catch (failure) {
+      content = <Box flexDirection="column"><Text wrap="wrap">{`Unable to read job detail: ${String(failure).slice(0, 200)}`}</Text>{content}</Box>;
+    }
   }
-
-  const shown = entries.slice(-HISTORY_ROWS);
-  return (
-    <Box flexDirection="column">
-      <Text bold wrap="truncate-end">{`Tools (last ${shown.length})`}</Text>
-      {shown.map((entry, i) => (
-        <Text key={`t-${i}-${entry.tool}`} wrap="truncate-end">
-          {/* One accent per line maximum, and red is reserved (TERMINAL-UI.md
-              §Colour): the tool name is coloured, its output never is. */}
-          <Text color={entry.state === 'error' ? 'red' : 'cyan'}>{`${entry.tool} `}</Text>
-          <Text dimColor wrap="truncate-end">
-            {entry.output.length > 0 ? `${entry.label} ${SEP} ${oneLine(entry.output, 120)}` : entry.label}
-          </Text>
-        </Text>
-      ))}
-      {entries.length > HISTORY_ROWS && (
-        <Text dimColor wrap="truncate-end">{`  +${entries.length - HISTORY_ROWS} earlier`}</Text>
-      )}
-    </Box>
-  );
+  return error ? <Box flexDirection="column"><Text wrap="wrap">{error}</Text>{content}</Box> : content;
 }
 
-// ── the footer ──────────────────────────────────────────────────────────────
-
-/**
- * The footer. Identical in both levels except for the `back` button, which exists
- * only in the detail view — the same key in both levels keeps muscle memory.
- *
- * Buttons rather than a text line: the host renders the hotkey hints, so `q` and
- * `c` are discoverable without this file having to draw them, and the reference
- * mod's shape is a Button row for exactly this reason.
- */
-function footer(
-  $: EngineInterface,
-  W: ListWidgets,
-  inDetail: boolean,
-  hiddenFinished: readonly string[],
-): JSX.Element {
-  const { Box, Button } = W;
-  return (
-    <Box flexDirection="row" gap={1}>
-      {/* `b` in the detail view only; `c` on the list only. Deliberately the SAME
-          letter across both levels where they overlap, so muscle memory survives
-          navigating. `q` closes from anywhere. */}
-      {inDetail && (
-        <Button
-          key="back"
-          label="Back"
-          hotkey="b"
-          variant="primary"
-          // `void` on every onPress: Button's onPress is typed `Promise<void>`, and
-          // update() resolves to the new value (string | null here), which is not
-          // assignable. The value is discarded by design — this is a command, not a
-          // query.
-          onPress={() => void update($, selected, () => null)}
-        />
-      )}
-      {!inDetail && (
-        <Button
-          key="clear"
-          label="Clear finished"
-          hotkey="c"
-          // Dismiss the FINISHED jobs only. A running job is never dismissed: hiding
-          // work in flight would defeat the point of the surface.
-          onPress={() => void update($, cleared, () => hiddenFinished)}
-        />
-      )}
-      <Button
-        key="close"
-        label="Close"
-        hotkey="q"
-        onPress={() => void $.ui.close({ id: PANE })}
-      />
-    </Box>
-  );
-}
-
-// =============================================================================
-// § END PANE — end of this file's section.
-// =============================================================================
-
-/**
- * Re-exported so the pane's pure surface is importable from one place, and so the
- * band half (if it wants the same line formatting) does not have to know which
- * module the helpers live in.
- */
-export {
-  EMPTY_STATE,
-  describeTool,
-  elapsed,
-  elapsedCell,
-  formatHeaderLine,
-  formatJobLine,
-  isTerminal,
-  oneLine,
-  pickColor,
-  pickGlyph,
-  SEP,
-} from './format.ts';
-
-export type { RadarJob, RadarStatus } from '../types/index.d.ts';
+export { EMPTY_STATE, describeTool, elapsed, elapsedCell, formatHeaderLine, formatJobLine,
+  pickGlyph, pickColor, isRecessive, isTerminal, countSummary, oneLine } from './format.ts';

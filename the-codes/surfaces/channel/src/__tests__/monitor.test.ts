@@ -43,8 +43,8 @@ test('monitor emits one compact milestone after a silent baseline and running po
 
   assert.equal(reads, 4);
   assert.equal(lines.length, 1, 'baseline, in-progress polls, and repeated terminal state stay silent');
-  assert.match(lines[0]!, /^Agent Smith: Codex implementer .*completed execution/);
-  assert.match(lines[0]!, /Worker output: Implemented the retry guard\. All focused checks passed\./);
+  assert.match(lines[0]!, /^Agent Smith · ✓ Codex implementer .*succeeded/);
+  assert.doesNotMatch(lines[0]!, /Worker summary|Implemented the retry guard/, 'the worker summary is not repeated in the notice');
   assert.ok(!lines[0]!.includes('\n'), 'each milestone is exactly one output line');
 });
 

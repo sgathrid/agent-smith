@@ -173,7 +173,7 @@ function envSandbox(): CodexSandbox | undefined {
  * exposed, so the same mode goes through `-c sandbox_mode="..."`.
  */
 export function sandboxPlan(
-  spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly'>,
+  spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly' | 'artifactPath'>,
   resuming = false,
 ): SandboxInfo {
   const mode = (m: CodexSandbox): SandboxInfo => {
@@ -189,7 +189,25 @@ export function sandboxPlan(
     const flags = sandboxFor(true).argv;
     return { sandbox: `codex ${flags[0]} (unrestricted)`, flags, readOnlyEnforced: false };
   }
+  if (spec.readOnly === true && spec.artifactPath !== undefined) {
+    // `-s read-only` blocks every write, `--add-dir` included (verified on codex
+    // 0.162.1), so a pipeline stage could not write its artifact. A permission
+    // profile that reads everything and writes exactly that file can; it cannot
+    // be combined with `-s`.
+    const artifact = path.resolve(spec.artifactPath);
+    const flags = [
+      '-c', `default_permissions=${JSON.stringify(ARTIFACT_PROFILE)}`,
+      '-c', `permissions.${ARTIFACT_PROFILE}.filesystem=${tomlInlineTable({ ':root': 'read', [artifact]: 'write' })}`,
+    ];
+    return { sandbox: `codex read-only except the output artifact ${artifact}`, flags, readOnlyEnforced: true };
+  }
   return mode(spec.readOnly === true ? 'read-only' : 'workspace-write');
+}
+
+const ARTIFACT_PROFILE = 'agent-smith-artifact';
+
+function tomlInlineTable(entries: Record<string, string>): string {
+  return `{${Object.entries(entries).map(([k, v]) => `${JSON.stringify(k)}=${JSON.stringify(v)}`).join(', ')}}`;
 }
 
 /**
@@ -724,6 +742,14 @@ export function codexHarnessDefaults(home: string = codexHome()): { model?: stri
   return out;
 }
 
+/** Known model discovery noise does not describe the outcome of a worker turn. */
+export function codexStderrLevel(text: string): 'info' | 'warn' {
+  const lines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  const refreshTimeout = /^(?:\d{4}-\d{2}-\d{2}T[\d:.]+Z\s+)?(?:ERROR\s+)?(?:(?:codex_models_manager::manager|codex_core::models_manager):\s+)?failed to refresh available models: request timed out\.?$/i;
+  if (lines.length > 0 && lines.every(line => refreshTimeout.test(line))) return 'info';
+  return /not inside a trusted directory|no such file|error/i.test(text) ? 'warn' : 'info';
+}
+
 export const codexProvider: Provider = {
   name: 'codex',
   harnessDefaults: () => codexHarnessDefaults(),
@@ -788,7 +814,7 @@ export const codexProvider: Provider = {
         // "Not inside a trusted directory..." is the single most useful line
         // codex emits and it is INFO-level, not an error — but it means the job
         // is dead. Level is about presentation, not job status.
-        const level = /not inside a trusted directory|no such file|error/i.test(text) ? 'warn' : 'info';
+        const level = codexStderrLevel(text);
         bus.emit({ kind: 'notice', at: nowIso(), level, message: truncate(text, 800).text });
       },
     });

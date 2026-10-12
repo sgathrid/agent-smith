@@ -11,7 +11,7 @@ function fsFrom(files: Record<string, string>, names: readonly { name: string; k
       if (value === undefined) throw new Error(`ENOENT ${path}`);
       return value;
     },
-    async exists(path) { return Object.hasOwn(files, path); },
+    async exists(path) { return Object.hasOwn(files, path) || Object.keys(files).some(file => file.startsWith(path + '/')); },
     async list() { return names.map(entry => ({ ...entry, size: 0 })); },
   };
 }
@@ -75,6 +75,31 @@ test('native completion records real outcome and latest worker output without cr
   assert.deepEqual(calls, [], 'finished jobs without an existing native link must not flood TaskList');
 });
 
+test('a finished job native task is deleted after the close delay, once', async () => {
+  const calls: Array<Record<string, unknown>> = [];
+  const client: NativeTaskClient = {
+    async create() { return { result: { task: { id: 't1' } } }; },
+    async update(input) { calls.push(input); return { result: { success: true } }; },
+  };
+  const job = {
+    id: 'job-d', status: 'succeeded' as const, task: 'x', name: 'w', workerId: 'w', role: 'implement',
+    provider: 'codex', model: null, latestSummary: null, summarySource: null,
+  };
+  const linked = { 'job-d': { taskId: 't1', status: 'in_progress' as const, fingerprint: '' } };
+  const t0 = 1_000_000;
+  const done = await syncNativeTasks([job], linked, client, t0);
+  assert.equal(done['job-d']?.status, 'completed');
+  assert.equal(done['job-d']?.doneAt, t0);
+  const early = await syncNativeTasks([job], done, client, t0 + 9_999);
+  assert.equal(early['job-d']?.status, 'completed', 'still shown inside the delay');
+  const closed = await syncNativeTasks([job], early, client, t0 + 10_000);
+  assert.equal(closed['job-d']?.status, 'deleted');
+  assert.equal(calls.at(-1)?.status, 'deleted');
+  const n = calls.length;
+  await syncNativeTasks([job], closed, client, t0 + 60_000);
+  assert.equal(calls.length, n, 'a deleted task is never touched again');
+});
+
 test('an orphaned running job is projected as failed, not live', async () => {
   const base = '/repo/.agent-smith/jobs/job-o';
   const jobs = await readNativeJobs(fsFrom({
@@ -82,4 +107,50 @@ test('an orphaned running job is projected as failed, not live', async () => {
     [`${base}/orphaned`]: 'x',
   }, [{ name: 'job-o', kind: 'dir' }] as never), '/repo');
   assert.equal(jobs[0]?.status, 'failed');
+});
+
+test('acceptance settlement starts the native close delay, while failed outcomes remain inspectable', async () => {
+  const calls: Array<Record<string, unknown>> = [];
+  const client: NativeTaskClient = {
+    async create() { return {result:{task:{id:'t1'}}}; },
+    async update(input) { calls.push(input);return {result:{success:true}}; },
+  };
+  const job = {id:'j',status:'succeeded' as const,task:'Review',name:'Ada',workerId:'ada',role:'review',
+    provider:'codex',model:null,latestSummary:null,summarySource:null,
+    acceptance:{state:'unchecked' as const,pending:true,checks:[]}};
+  const pending=await syncNativeTasks([job],{},client,1000);
+  assert.equal(pending.j?.status,'in_progress');
+  assert.equal(pending.j?.doneAt,undefined);
+  const accepted={...job,acceptance:{state:'accepted' as const,pending:false,checks:[]}};
+  const settled=await syncNativeTasks([accepted],pending,client,60_000);
+  assert.equal(settled.j?.status,'completed');
+  assert.equal(settled.j?.doneAt,60_000);
+  assert.equal((await syncNativeTasks([accepted],settled,client,69_999)).j?.status,'completed');
+  assert.equal((await syncNativeTasks([accepted],settled,client,70_000)).j?.status,'deleted');
+  const failed={...accepted,status:'failed' as const};
+  const failure=await syncNativeTasks([failed],pending,client,60_000);
+  const later=await syncNativeTasks([failed],failure,client,100_000);
+  assert.equal(later.j?.status,'completed');
+  assert.match(String(calls.at(-1)?.subject),/\[failed\]/);
+});
+
+test('a job this session does not own gets no new task, but an existing link still finishes and closes', async () => {
+  const calls: Array<{ method: string; input: Record<string, unknown> }> = [];
+  const client: NativeTaskClient = {
+    async create(input) { calls.push({ method: 'create', input }); return { result: { task: { id: 't1' } } }; },
+    async update(input) { calls.push({ method: 'update', input }); return { result: { success: true } }; },
+  };
+  const job = {
+    id: 'job-x', status: 'running' as const, task: 'x', name: 'w', workerId: 'w', role: 'implement',
+    provider: 'codex', model: null, latestSummary: null, summarySource: null,
+  };
+  const notMine = () => false;
+  assert.deepEqual(await syncNativeTasks([job], {}, client, 1000, notMine), {});
+  assert.equal(calls.length, 0);
+  const linked = { 'job-x': { taskId: 't1', status: 'in_progress' as const, fingerprint: '' } };
+  const done = await syncNativeTasks([{ ...job, status: 'succeeded' }], linked, client, 1000, notMine);
+  assert.equal(done['job-x']?.status, 'completed');
+  const closed = await syncNativeTasks([{ ...job, status: 'succeeded' }], done, client, 11_000, notMine);
+  assert.equal(closed['job-x']?.status, 'deleted');
+  assert.equal(calls.filter((c) => c.method === 'create').length, 0);
 });

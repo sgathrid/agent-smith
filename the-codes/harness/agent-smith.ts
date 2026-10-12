@@ -41,11 +41,11 @@
  * `cancel` can exist before job.json reaches a terminal state, so it outranks it.
  */
 
-import { createMarker } from '../forge/atomic.ts';
 import { existsSafe, readJsonSafe, readTextSafe, readdirSafe } from './safe-fs.ts';
 import {
   FILES,
   SCHEMA_VERSION,
+  CANCEL_ORPHAN_REASON,
   ORPHAN_REASON,
   deriveOrphan,
   isPidAlive,
@@ -84,6 +84,7 @@ export const SMITH_PAYLOAD = {
   cancelAt: 'cancel_at',
   lastEventAt: 'last_event_at',
   recentActivities: 'recent_activities',
+  lastActivity: 'last_activity',
   latestText: 'latest_text',
   progressWarnings: 'progress_warnings',
   pipeline: 'pipeline',
@@ -92,6 +93,7 @@ export const SMITH_PAYLOAD = {
   schema: 'schema',
 } as const;
 
+const CANCELED_ORPHAN = { status: 'canceled', suspicious: false, reason: CANCEL_ORPHAN_REASON } as const;
 const ORPHANED = { status: 'failed', suspicious: true, reason: ORPHAN_REASON } as const;
 
 /**
@@ -172,7 +174,9 @@ export class AgentSmithReader implements JobStateReader {
     const report = await readTextSafe(jobFile(cwd, jobId, FILES.report));
     const progress = await readJsonSafe<{
       lastEventAt?: string;
+      toolCalls?: number;
       recentActivities?: unknown[];
+      lastActivity?: unknown;
       latestText?: string | null;
       warnings?: string[];
       latestSummary?: string | null;
@@ -192,8 +196,8 @@ export class AgentSmithReader implements JobStateReader {
 
     // Orphan derivation (forge/format.ts deriveOrphan): a `running` anchor with
     // no terminal result whose supervisor is gone. Derived, never written into
-    // job.json; the `orphaned` marker only lets readers that cannot probe a pid
-    // (the mod) agree with this one.
+    // job.json. Only the service reconciler persists the verdict; this reader
+    // is read-only, including when used by notifications and validation.
     let orphan: ReturnType<typeof deriveOrphan> = null;
     if (manifest !== null && manifest.status === 'running' && !canceled
         && !(await existsSafe(jobFile(cwd, jobId, FILES.result)))) {
@@ -201,18 +205,18 @@ export class AgentSmithReader implements JobStateReader {
       const lastSeen = Math.max(
         Date.parse(manifest.updatedAt), Date.parse(progress?.lastEventAt ?? ''),
       );
-      orphan = deriveOrphan(manifest, Number.isFinite(lastSeen) ? lastSeen : null, Date.now());
+      orphan = deriveOrphan(manifest, Number.isFinite(lastSeen) ? lastSeen : null, Date.now(), undefined, cancelRequested);
       // A live supervisor honours a cancel request within seconds. A request that
       // is a minute old and still has no terminal state means nobody is listening.
       const cancelAgeMs = cancelAt === null ? NaN : Date.now() - Date.parse(cancelAt);
       const ownerAlive = typeof manifest.ownerPid === 'number' && isPidAlive(manifest.ownerPid);
-      if (orphan === null && cancelRequested && cancelAgeMs > 60_000 && !ownerAlive) {
-        orphan = { status: 'canceled', suspicious: false, reason: 'cancel requested and no supervisor confirmed it' };
+      if (orphan === null && cancelRequested && cancelAgeMs > 60_000 && !ownerAlive) orphan = CANCELED_ORPHAN;
+      // The marker is proof the supervisor is gone; a cancel request makes that
+      // a cancellation. A live pid beside a marker plus cancel is still in flight.
+      if (orphan === null && (await existsSafe(markerPath))) {
+        orphan = !cancelRequested ? ORPHANED : ownerAlive ? null : CANCELED_ORPHAN;
       }
-      if (orphan === null && (await existsSafe(markerPath))) orphan = ORPHANED;
-      else if (orphan !== null) {
-        try { createMarker(markerPath, orphan.reason ?? ''); } catch { /* read-only repo: still derived */ }
-      }
+
     }
 
     const payload: Record<string, unknown> = {
@@ -239,7 +243,9 @@ export class AgentSmithReader implements JobStateReader {
       [SMITH_PAYLOAD.error]: orphan?.reason ?? manifest?.error ?? null,
       [SMITH_PAYLOAD.deniedActions]: manifest?.deniedActions ?? [],
       [SMITH_PAYLOAD.usage]: manifest?.usage ?? null,
-      [SMITH_PAYLOAD.toolCalls]: manifest?.toolCalls ?? 0,
+      ...(Array.isArray(manifest?.changedFiles) && manifest.changedFilesTruncated !== true
+        ? { changed_files: manifest.changedFiles } : {}),
+      [SMITH_PAYLOAD.toolCalls]: progress?.toolCalls ?? manifest?.toolCalls ?? 0,
       [SMITH_PAYLOAD.pipeline]: manifest?.pipeline ?? null,
       [SMITH_PAYLOAD.stage]: manifest?.stage ?? null,
       [SMITH_PAYLOAD.attempt]: manifest?.attempt ?? null,
@@ -248,6 +254,7 @@ export class AgentSmithReader implements JobStateReader {
       [SMITH_PAYLOAD.cancelAt]: cancelAt,
       [SMITH_PAYLOAD.lastEventAt]: progress?.lastEventAt ?? manifest?.updatedAt ?? null,
       [SMITH_PAYLOAD.recentActivities]: progress?.recentActivities ?? [],
+      [SMITH_PAYLOAD.lastActivity]: progress?.lastActivity ?? null,
       [SMITH_PAYLOAD.latestText]: progress?.latestText ?? null,
       [SMITH_PAYLOAD.progressWarnings]: progress?.warnings ?? [],
     };

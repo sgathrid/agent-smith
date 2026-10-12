@@ -40,6 +40,9 @@ import readline from 'node:readline';
  * ~20 lines, has zero process overhead, and behaves identically on all three
  * platforms. Cached per (binary, PATH) pair because detectAvailable() probes
  * four providers back to back and PATH does not change mid-run.
+ *
+ * NOTE: the PATH list separator is path.DELIMITER, not path.SEP. See the
+ * comment inside the function below, which has the details.
  */
 const pathProbeCache = new Map<string, boolean>();
 

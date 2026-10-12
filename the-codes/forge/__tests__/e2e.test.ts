@@ -364,6 +364,19 @@ test('a cancel for a job this process never started is recorded and admitted, no
   assert.match(outcome.note, /no live worker handle/);
 });
 
+test('list: spawnedIds tracks this process; ids and sinceMs filter', async () => {
+  const r = repo();
+  const { ForgeService } = await import('../service.ts');
+  const service = new ForgeService({ repo: r });
+  const ack = await service.spawnJob({ mode: 'implement', prompt: 'quick one', provider: 'agy' });
+  await waitForTerminal(r, ack.jobId, 20_000);
+  assert.deepEqual([...service.spawnedIds], [ack.jobId]);
+  assert.equal((await service.list({ ids: service.spawnedIds })).length, 1);
+  assert.equal((await service.list({ ids: new ForgeService({ repo: r }).spawnedIds })).length, 0, 'a restarted server has spawned nothing');
+  assert.equal((await service.list({ sinceMs: Date.now() - 60_000 })).length, 1);
+  assert.equal((await service.list({ sinceMs: Date.now() + 60_000 })).length, 0);
+});
+
 test('an unknown provider is rejected with a list, not a stack trace', async () => {
   const r = repo();
   const { ForgeService } = await import('../service.ts');

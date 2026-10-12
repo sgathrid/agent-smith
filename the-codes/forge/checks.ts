@@ -16,7 +16,7 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { runChecks } from '../verify/runner.ts';
-import type { Check } from '../verify/types.ts';
+import type { Check, CheckReport, CheckSkipReason, Verdict } from '../verify/types.ts';
 import type { StageCheck } from '../pipeline/types.ts';
 import { jobDir } from './format.ts';
 
@@ -29,6 +29,8 @@ export interface AcceptanceCheck {
   readonly name: string; readonly ok: boolean; readonly exitCode: number | null;
   readonly durationMs: number; readonly outputTail: string;
   readonly blocking: boolean;
+  readonly timedOut: boolean; readonly signal: NodeJS.Signals | null;
+  readonly skipped?: CheckSkipReason; readonly reason?: string;
 }
 export interface Acceptance {
   readonly state: AcceptanceState;
@@ -37,6 +39,55 @@ export interface Acceptance {
   /** True only in the placeholder written at spawn, before the job is terminal. */
   readonly pending?: boolean;
   readonly reason?: string;
+}
+
+/** Normalize a runner report into the persisted acceptance shape. */
+export function acceptanceChecksFromReport(
+  report: CheckReport,
+  configuredChecks: readonly StageCheck[],
+): AcceptanceCheck[] {
+  return report.verdicts.map((v, index): AcceptanceCheck => {
+    const configured = configuredChecks[index]!;
+    // runCheck deliberately treats an empty command as absent/non-blocking for
+    // generic callers. At an acceptance boundary, a declared required check
+    // that never ran must still fail closed.
+    const blocking = v.skipped === 'not-configured'
+      ? configured.blocking !== false
+      : v.blocking;
+    return {
+      name: v.check.name, ok: v.passed, exitCode: v.exitCode, durationMs: v.durationMs, blocking,
+      timedOut: v.timedOut, signal: v.signal,
+      ...(v.skipped === undefined ? {} : { skipped: v.skipped }),
+      ...(v.reason === undefined ? {} : { reason: v.reason }),
+      outputTail: `${v.stdoutTail}${v.stderrTail === '' ? '' : `\n${v.stderrTail}`}`.slice(-OUTPUT_TAIL_MAX),
+    };
+  });
+}
+
+/** Apply configured acceptance policy to the generic runner report. */
+export function normalizeAcceptanceReport(
+  report: CheckReport,
+  configuredChecks: readonly StageCheck[],
+): CheckReport {
+  const verdicts = report.verdicts.map((verdict, index): Verdict => {
+    const configured = configuredChecks[index]!;
+    const blocking = verdict.skipped === 'not-configured'
+      ? configured.blocking !== false
+      : verdict.blocking;
+    return blocking === verdict.blocking ? verdict : { ...verdict, blocking };
+  });
+  const failing = verdicts.filter((verdict) => !verdict.passed && verdict.blocking);
+  return {
+    ...report,
+    verdicts,
+    failing,
+    passed: failing.length === 0,
+    incomplete: verdicts.some((verdict) => verdict.skipped !== undefined && verdict.blocking),
+  };
+}
+
+export function acceptanceState(checks: readonly AcceptanceCheck[]): AcceptanceState {
+  return checks.some((check) => check.blocking && !check.ok) ? 'rejected' : 'accepted';
 }
 
 /** StageCheck -> verify Check, resolving cwd against baseDir. */
@@ -57,14 +108,13 @@ export async function evaluateAcceptance(input: {
   const at = (input.now ?? (() => new Date()))().toISOString();
   if (!input.checks?.length) return { state: 'unchecked', checks: [], at };
   if (!input.succeeded) return { state: 'rejected', checks: [], at, reason: 'job did not succeed; checks not run' };
-  const report = await runChecks(toVerifyChecks(input.checks, input.baseDir), { signal: input.signal });
+  const rawReport = await runChecks(toVerifyChecks(input.checks, input.baseDir), { signal: input.signal });
+  const report = normalizeAcceptanceReport(rawReport, input.checks);
+  const checks = acceptanceChecksFromReport(report, input.checks);
   return {
-    state: report.passed ? 'accepted' : 'rejected',
+    state: acceptanceState(checks),
     at,
-    checks: report.verdicts.map((v) => ({
-      name: v.check.name, ok: v.passed, exitCode: v.exitCode, durationMs: v.durationMs, blocking: v.blocking,
-      outputTail: `${v.stdoutTail}${v.stderrTail === '' ? '' : `\n${v.stderrTail}`}`.slice(-OUTPUT_TAIL_MAX),
-    })),
+    checks,
   };
 }
 

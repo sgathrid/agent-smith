@@ -113,6 +113,7 @@ export const PROGRESS_FLUSH_MS = 250;
 export const FILES = {
   job: 'job.json',
   progress: 'progress.json',
+  view: 'view.json',
   events: 'events.jsonl',
   argv: 'argv.json',
   stderr: 'stderr.log',
@@ -182,7 +183,7 @@ export interface ForgeManifest {
   readonly modelRequested?: string | null;
   readonly modelResolved?: string | null;
   readonly modelSource?: 'requested' | 'harness-config' | 'reported' | 'unknown';
-  /** True when the mode preset's preamble was prepended to the prompt sent to the provider. */
+  /** True when the prompt sent to the provider starts with the worker brief (forge/brief.ts). */
   readonly preambleApplied?: boolean;
   readonly sandbox?: string;
   readonly sandboxFlags?: readonly string[];
@@ -236,11 +237,36 @@ export interface ForgeManifest {
    */
   readonly changedFiles?: readonly string[];
   readonly changedFilesTruncated?: boolean;
+  /**
+   * Paths that changed while this job ran but that none of this job's own tool
+   * calls mention: another job's or the operator's edits (or shell side effects).
+   * Present only when the job's tool inputs were captured.
+   */
+  readonly unattributedFiles?: readonly string[];
 }
 
 export interface GitBaseline {
   readonly head: string | null;
   readonly dirty: readonly string[];
+}
+
+/**
+ * Pure: split changed paths into those this job's own tool inputs mention (by full
+ * path or basename) and those it never touched. With no captured input there is
+ * nothing to attribute against, so everything stays attributed.
+ */
+export function attributeChanged(
+  files: readonly string[],
+  toolInputs: string,
+): { mine: string[]; other: string[] } {
+  if (toolInputs === '') return { mine: [...files], other: [] };
+  const mine: string[] = [];
+  const other: string[] = [];
+  for (const p of files) {
+    const base = p.slice(p.lastIndexOf('/') + 1);
+    (toolInputs.includes(p) || (base !== '' && toolInputs.includes(base)) ? mine : other).push(p);
+  }
+  return { mine, other };
 }
 
 /** Max entries kept in `changedFiles`. */
@@ -286,9 +312,29 @@ export interface ForgeProgress {
   readonly summarySource?: 'worker' | null;
   readonly lastEventAt: string;
   readonly recentActivities: readonly ForgeActivity[];
+  readonly lastActivity?: ForgeActivity | null;
   readonly latestText: string | null;
   readonly toolCalls: number;
   readonly warnings: readonly string[];
+}
+
+export type ForgeViewEvent =
+  | { sequence: number; kind: 'assistant'; at: string; text: string }
+  | { sequence: number; kind: 'tool'; at: string; stepIndex: number; tool: string; input: string; output: string; state: 'active' | 'done' | 'error' };
+
+/** Bounded detail projection. Lists use job/progress/acceptance, never this file. */
+export interface ForgeView {
+  readonly schema: 1;
+  readonly prompt: string;
+  readonly preamble: string | null;
+  readonly truncated: boolean;
+  readonly transcript: readonly string[];
+  /** Missing on snapshots written before ordered activity was supported. */
+  readonly timeline?: readonly ForgeViewEvent[];
+  readonly tools: readonly {
+    stepIndex: number; at: string; tool: string; input: string; output: string;
+    state: 'active' | 'done' | 'error';
+  }[];
 }
 
 /* ────────────────────────────────────────────────────────────────────────────
@@ -297,6 +343,11 @@ export interface ForgeProgress {
 
 export function jobsDir(repo: string): string {
   return path.join(repo, ...JOBS_DIR_SEGMENTS);
+}
+
+/** Where `agent-smith gc` moves settled jobs instead of deleting them. */
+export function archivedJobsDir(repo: string): string {
+  return path.join(repo, '.agent-smith', 'archive', 'jobs');
 }
 
 export function jobDir(repo: string, jobId: string): string {
@@ -343,13 +394,10 @@ export function taskTitle(prompt: string): string {
  * ──────────────────────────────────────────────────────────────────────────── */
 
 /**
- * Below this many characters there is no deliverable.
- *
- * The number is not arbitrary and not ours: harness/normalize.ts uses `< 8` and
- * so does the mod's `looksEmpty`. All three readers must agree, or the same job
- * is a green check in the pane and a red row in the channel.
+ * A nonempty final answer is a deliverable, including deliberately short answers.
+ * Provider completion and executable acceptance remain separate requirements.
  */
-export const MIN_USEFUL_CHARS = 8;
+export const MIN_USEFUL_CHARS = 1;
 
 /** Is there no usable output? See MIN_USEFUL_CHARS. */
 export function looksEmpty(text: string | null | undefined): boolean {
@@ -383,6 +431,8 @@ export interface StatusVerdict {
    */
   readonly suspicious: boolean;
   readonly reason: string | null;
+  /** A non-fatal caveat on a success (e.g. some tool calls were denied); surfaced as a warning. */
+  readonly note?: string | null;
 }
 
 /**
@@ -424,6 +474,17 @@ export function deriveStatus(d: StatusDerivation): StatusVerdict {
   }
 
   const denials = d.deniedActions ?? [];
+  // Denials the provider itself marked non-fatal (action 'tool': a delivered report
+  // plus denied calls, e.g. a read-only reviewer that wanted a shell) do not fail
+  // the job. agy's soft-denials carry other actions and keep failing below.
+  if (denials.length > 0 && d.ok === true && !looksEmpty(d.report) && denials.every((x) => x.action === 'tool')) {
+    return {
+      status: 'succeeded',
+      suspicious: false,
+      reason: null,
+      note: `${denials.length} tool call(s) were denied by the permission policy; the report was delivered but some checks may not have run.`,
+    };
+  }
   if (denials.length > 0) {
     const names = denials
       .map((x) => x.displayName ?? x.action)
@@ -470,6 +531,7 @@ export function deriveStatus(d: StatusDerivation): StatusVerdict {
 export function warningsFor(v: StatusVerdict, progress: ForgeProgress | null): string[] {
   const out: string[] = [];
   if (v.suspicious) out.push(v.reason ?? 'suspicious success');
+  if (v.note) out.push(v.note);
   for (const w of progress?.warnings ?? []) out.push(w);
   return out;
 }
@@ -497,6 +559,7 @@ export const DEFAULT_TIMEOUT_MS = 45 * 60_000;
 export const LEGACY_ORPHAN_AFTER_MS = 2 * DEFAULT_TIMEOUT_MS;
 
 export const ORPHAN_REASON = 'supervisor process exited before the job finished (orphaned)';
+export const CANCEL_ORPHAN_REASON = 'cancel requested and the supervisor exited before confirming it';
 
 /** `kill(pid, 0)`: ESRCH means gone; EPERM means it exists but is not ours. */
 export function isPidAlive(pid: number): boolean {
@@ -510,9 +573,11 @@ export function isPidAlive(pid: number): boolean {
 }
 
 /**
- * THE orphan rule, pure. The caller guarantees there is no terminal result and
- * no cancel marker. Returns the verdict to report, or null if the job is not
- * (provably) orphaned.
+ * THE orphan rule, pure. The caller guarantees there is no terminal result.
+ * Returns the verdict to report, or null if the job is not (provably) orphaned.
+ * A cancel request outranks the orphan: when the supervisor is dead or unknown
+ * the operator's intent is what happened, so the verdict is `canceled`, not
+ * `failed`. A live supervisor still returns null; it will settle the request.
  *
  * `lastSeenMs` is the newest liveness evidence the caller has (updatedAt,
  * progress.lastEventAt); only the legacy no-pid path uses it.
@@ -522,9 +587,12 @@ export function deriveOrphan(
   lastSeenMs: number | null,
   nowMs: number,
   alive: (pid: number) => boolean = isPidAlive,
+  cancelRequested = false,
 ): StatusVerdict | null {
   if (m.status !== 'running') return null;
-  const verdict: StatusVerdict = { status: 'failed', suspicious: true, reason: ORPHAN_REASON };
+  const verdict: StatusVerdict = cancelRequested
+    ? { status: 'canceled', suspicious: false, reason: CANCEL_ORPHAN_REASON }
+    : { status: 'failed', suspicious: true, reason: ORPHAN_REASON };
   if (typeof m.ownerPid === 'number') return alive(m.ownerPid) ? null : verdict;
   const times = [lastSeenMs, m.createdAt === undefined ? null : Date.parse(m.createdAt)]
     .filter((t): t is number => t !== null && Number.isFinite(t));
@@ -575,7 +643,7 @@ export function nextActionFor(i: NextActionInput): string | null {
   }
   if (NETWORK_RE.test(err)) return 'Transient: retry the same job once; resume_job or spawn again.';
   if (/no usable output/i.test(err) || (i.exitCode === 0 && looksEmpty(i.report))) {
-    return 'Worker returned no usable output; ask for a longer answer via resume_job or rerun.';
+    return 'Worker returned no usable output; ask for a final answer via resume_job or rerun.';
   }
   return 'Worker failed; read status.error and warnings before retrying.';
 }

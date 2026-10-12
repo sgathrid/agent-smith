@@ -7,7 +7,7 @@ import { readAll } from '../watch-source.ts';
 import { pollOnce, resetPoller } from '../poller.ts';
 import type { Batch } from '../policy.ts';
 
-test('acceptance failure is announced after successful worker execution without inventing a worker summary', async () => {
+test('acceptance failure is announced after successful worker execution with no worker summary', async () => {
   const repo = mkdtempSync(path.join(os.tmpdir(), 'smith-events-'));
   try {
     const dir = path.join(repo, '.agent-smith', 'pipelines'); mkdirSync(dir, { recursive: true });
@@ -23,7 +23,7 @@ test('acceptance failure is announced after successful worker execution without 
     assert.equal(jobs[0]?.status, 'failed'); assert.equal(jobs[0]?.summarySource, undefined);
     await pollOnce(repo, Date.now(), send); await pollOnce(repo, Date.now(), send);
     assert.equal(sent.length, 1); assert.match(sent[0]!.content!, /Release review.*failed/);
-    assert.match(sent[0]!.content!, /Runtime outcome:.*acceptance failed/);
-    assert.doesNotMatch(sent[0]!.content!, /Worker output:/);
+    assert.match(sent[0]!.content!, /acceptance failed/);
+    assert.doesNotMatch(sent[0]!.content!, /Worker output:|Worker summary|Runtime outcome/);
   } finally { resetPoller(); rmSync(repo, { recursive: true, force: true }); }
 });

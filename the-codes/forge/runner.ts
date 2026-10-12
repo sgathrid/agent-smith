@@ -30,7 +30,9 @@
  *    `--conversation <id>` (a VERIFIED flag), so an escalation resumes the
  *    worker's own conversation instead of re-paying for everything it already
  *    read. This is pipeline/routing.ts RULE 3, and the only place in the repo
- *    where that rule is actually wired to a CLI.
+ *    where that rule is actually wired to a CLI. A stage with `continues` uses the same
+ *    path on attempt 1: `ctx.continues` carries the target stage's conversation and
+ *    worker identity, so the fix stage resumes the implementer it follows.
  *
  * 3. ARTIFACT PLACEMENT. Every stage gets its OWN directory under the pipeline
  *    work dir — `<workDir>/<stage.name>/` — and writes `result.md` inside it.
@@ -69,8 +71,10 @@ import { FILES, jobDir, jobFile } from './format.ts';
 import type { ForgeService, SpawnRequest } from './service.ts';
 import type { ForgeActivity, ForgeManifest } from './format.ts';
 import { appendBounded } from './writer.ts';
+import { isMode, MODE_PRESETS } from './modes.ts';
 import { runChecks } from '../verify/runner.ts';
-import { toVerifyChecks } from './checks.ts';
+import { acceptanceChecksFromReport, acceptanceState, normalizeAcceptanceReport, toVerifyChecks, writeAcceptance } from './checks.ts';
+import type { Acceptance } from './checks.ts';
 import type { Check } from '../verify/types.ts';
 
 /**
@@ -228,6 +232,9 @@ export function buildStagePrompt(args: {
   }
 
   parts.push(
+    `SOURCE WORKSPACE: ${args.workDir}`,
+    'Search, run commands and make any code changes in the source workspace. The output artifact directory is only for stage handoff files.',
+    '',
     args.stage.prompt ?? `Carry out the '${args.stage.name}' stage and write your findings to result.md.`,
   );
 
@@ -240,7 +247,7 @@ export function buildStagePrompt(args: {
         continue;
       }
       const limit = Math.min(ARTIFACT_INLINE_CHARS, budget);
-      const found = readArtifact(args.workDir, input, limit);
+      const found = readArtifact(args.artifactRoot ?? args.workDir, input, limit);
       if (found.text === null) {
         parts.push(`- ${input.stage}: not found on disk — try ${found.from}.`);
         continue;
@@ -254,8 +261,18 @@ export function buildStagePrompt(args: {
     }
   }
 
+  // The service prepends the worker brief, whose review/moderate guidance says to
+  // leave the files as they are. A stage still has to write its artifact, so say
+  // which write is allowed instead of leaving the two instructions to collide.
+  const mode = args.stage.role ?? args.stage.name;
+  const readOnly = isMode(mode) && MODE_PRESETS[mode].readOnly;
   parts.push(
     '',
+    'OUTPUT ARTIFACT (separate from the source workspace):',
+    ...(readOnly
+      ? ['This is a read-only stage: leave every file in the source workspace as it is. ' +
+         'Writing the output artifact below is your only permitted write, and it is where your findings go.']
+      : []),
     `Write your full answer to ${stageArtifactPath(args.artifactRoot ?? args.workDir, args.stage.name, args.stage.resultPath)}. ` +
       'That file is what the next stage reads; a summary you say in prose is not.',
   );
@@ -295,6 +312,8 @@ export interface RunnerDeps {
   readonly unrestricted?: boolean | undefined;
   /** Test/observability tap. Must not throw; the runner does not guard it. */
   readonly onObservation?: ((stage: string, obs: Observation) => void) | undefined;
+  /** Called once a stage's job exists, so the pipeline record can show it running. Must not throw. */
+  readonly onStageRunning?: ((result: StageResult) => void) | undefined;
 }
 
 /** Build the StageRunner. One closure over the service; nothing global. */
@@ -306,14 +325,18 @@ export function createForgeRunner(deps: RunnerDeps): StageRunner {
     const stage = ctx.stage;
     const continuation = ctx.continuation as StageContinuationLike | undefined;
 
+    const sameProvider = continuation?.transcriptProvider === undefined || continuation.transcriptProvider === ctx.routing.provider;
+    // A retry that continues this stage's own conversation already has the brief,
+    // context and checks from attempt 1; only a fresh conversation needs them.
+    const continuesAttempt = sameProvider && continuation?.transcriptRef !== undefined;
     const request: SpawnRequest = {
       mode: stage.role ?? stage.name,
-      name: stage.agentName,
-      workerId: stage.workerId ?? `${runId}:${stage.name}`,
+      name: stage.agentName ?? ctx.continues?.agentName,
+      workerId: stage.workerId ?? (ctx.continues === undefined ? `${runId}:${stage.name}` : ctx.continues.workerId ?? `${runId}:${ctx.continues.stage}`),
       task: stage.title ?? stage.prompt,
       prompt: buildStagePrompt({
         stage,
-        workDir: artifactRoot,
+        workDir: ctx.workDir,
         artifactRoot,
         inputs: ctx.inputs,
         attempt: ctx.attempt,
@@ -322,7 +345,9 @@ export function createForgeRunner(deps: RunnerDeps): StageRunner {
           continuation?.transcriptRef === undefined || continuation.transcriptProvider === undefined || continuation.transcriptProvider === ctx.routing.provider,
       }),
       provider: ctx.routing.provider,
-        cwd: ctx.workDir,
+      cwd: ctx.workDir,
+      artifactPath: path.resolve(stageArtifactPath(artifactRoot, stage.name, stage.resultPath)),
+      ...(continuesAttempt ? {} : { context: stage.context, checks: stage.checks }),
       // 0 means "use the service default" (clampTimeout's DEFAULT_TIMEOUT_MS).
       // A stage timeout is ALSO enforced by the DAG via ctx.signal, so this is a
       // second, independent line of defence rather than the only one.
@@ -336,15 +361,24 @@ export function createForgeRunner(deps: RunnerDeps): StageRunner {
       // is exactly right — the pipeline owns the rung, we do not second-guess.
       ...(stage.effort === undefined && ctx.routing.tier === 't0-cheap' ? {} : { effort: ctx.routing.effort }),
       // routing RULE 3: continue, do not restart.
-      ...((continuation?.transcriptProvider === undefined || continuation.transcriptProvider === ctx.routing.provider)
-        ? { conversation: continuation?.transcriptRef ?? stage.conversation }
+      ...(sameProvider
+        ? { conversation: continuation?.transcriptRef ?? ctx.continues?.transcriptRef ?? stage.conversation }
         : {}),
     };
 
     let jobId: string;
     try {
+      mkdirSync(path.dirname(stageArtifactPath(artifactRoot, stage.name, stage.resultPath)), { recursive: true });
       const tracked = await deps.service.spawnTracked(request);
       jobId = tracked.ack.jobId;
+      // As spawn_job does: the job reads "checks pending" until a verdict exists.
+      if (stage.checks?.length) recordAcceptance(deps.service.repo, jobId, { state: 'unchecked', checks: [], pending: true });
+      deps.onStageRunning?.({
+        stage: stage.name, jobId, status: 'running', provider: ctx.routing.provider,
+        ...(ctx.routing.model === undefined ? {} : { model: ctx.routing.model }),
+        // The record's required timing fields: only startedAt is meaningful until the stage ends.
+        startedAt, finishedAt: startedAt, durationMs: 0,
+      });
 
       // The DAG aborts a stage by firing ctx.signal; the worker is a separate
       // process, so the bridge is `cancel`.
@@ -370,16 +404,21 @@ export function createForgeRunner(deps: RunnerDeps): StageRunner {
 
       publishArtifact(deps.service.repo, jobId, stage, artifactRoot);
       const result = toStageResult(stage, ctx, manifest, observations, startedAt, artifactRoot);
-      if (manifest.status !== 'succeeded') return result;
-      if (!stage.checks?.length) return { ...result, acceptance: 'unchecked' };
+      if (!stage.checks?.length) return manifest.status === 'succeeded' ? { ...result, acceptance: 'unchecked' } : result;
+      if (manifest.status !== 'succeeded') {
+        recordAcceptance(deps.service.repo, jobId, { state: 'rejected', checks: [], at: new Date().toISOString(), reason: 'job did not succeed; checks not run' });
+        return result;
+      }
 
       const checks: Check[] = toVerifyChecks(stage.checks, ctx.workDir);
-      const report = await runChecks(checks, { signal: ctx.signal });
+      const report = normalizeAcceptanceReport(await runChecks(checks, { signal: ctx.signal }), stage.checks);
+      const acceptanceChecks = acceptanceChecksFromReport(report, stage.checks);
+      recordAcceptance(deps.service.repo, jobId, { state: acceptanceState(acceptanceChecks), checks: acceptanceChecks, at: new Date().toISOString() });
       const checkEvidence = report.verdicts.map((verdict) =>
         `${verdict.passed ? 'PASS' : 'FAIL'} ${verdict.check.name}: ${verdict.reason}`,
       ).join('\n');
       if (report.passed && !report.incomplete) return { ...result, acceptance: 'passed', verification: report };
-      const failedChecks = report.verdicts.filter((verdict) => !verdict.passed && (verdict.blocking || verdict.skipped !== undefined));
+      const failedChecks = report.verdicts.filter((verdict) => !verdict.passed && verdict.blocking);
       return {
         ...result,
         status: 'failed',
@@ -415,6 +454,11 @@ export function createForgeRunner(deps: RunnerDeps): StageRunner {
   return { id: 'forge', run };
 }
 
+/** Persist the stage job's acceptance beside its record. A failed write must not fail the stage. */
+function recordAcceptance(repo: string, jobId: string, acceptance: Acceptance): void {
+  try { writeAcceptance(repo, jobId, acceptance); } catch (err) { process.stderr.write(`agent-smith acceptance ${jobId}: ${String(err)}\n`); }
+}
+
 /* ── observation collection ──────────────────────────────────────────────── */
 
 /**
@@ -435,17 +479,21 @@ export async function collectObservations(
   onObservation?: (stage: string, obs: Observation) => void,
 ): Promise<Observation[]> {
   const out: Observation[] = [];
-  const seen = new Set<string>();
+  // A tool step is one row that moves active -> done/error/denied, so a step's
+  // identity is its index and a later state replaces the earlier one.
+  const slots = new Map<number, number>();
+  const states = new Map<number, string>();
   for (;;) {
     const rows = await service.activities(jobId);
     let progressed = false;
     for (const row of rows) {
-      const key = `${row.stepIndex}:${row.tool}:${row.status}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
+      const key = `${row.tool}:${row.status}`;
+      if (states.get(row.stepIndex) === key) continue;
+      states.set(row.stepIndex, key);
       progressed = true;
       const obs = toObservation(row);
-      out.push(obs);
+      const slot = slots.get(row.stepIndex);
+      if (slot === undefined) { slots.set(row.stepIndex, out.length); out.push(obs); } else out[slot] = obs;
       try {
         onObservation?.(stage, obs);
       } catch {
@@ -535,6 +583,8 @@ export function toStageResult(
   const ref = stageArtifactRef(stage.name, stage.resultPath);
   const artifact = path.resolve(stageArtifactPath(workDir, stage.name, stage.resultPath));
   const report = readTail(artifact);
+  // Listing a file that is not there sends the next stage after a ghost.
+  const written = existsSync(artifact);
   const base = {
     stage: stage.name,
     jobId: manifest.jobId,
@@ -543,8 +593,9 @@ export function toStageResult(
     startedAt,
     finishedAt,
     durationMs,
-    resultPath: ref,
-    artifacts: [{ stage: stage.name, path: ref, label: 'result.md' }],
+    ...(written
+      ? { resultPath: ref, artifacts: [{ stage: stage.name, path: ref, label: 'result.md' }] }
+      : { artifacts: [], warnings: [`${ref} not found on disk; the stage wrote no artifact`] }),
     ...(manifest.conversation === null ? {} : { transcriptRef: manifest.conversation }),
     ...(report === null ? {} : { outputTail: report }),
     observations,

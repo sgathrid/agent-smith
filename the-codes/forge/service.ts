@@ -72,6 +72,7 @@ import type {
   WorkerHandle,
 } from '../providers/types.js';
 import { isMode, MODE_PRESETS, MODES, type ModePreset } from './modes.ts';
+import { buildBrief, type BriefCheck } from './brief.ts';
 import {
   DEFAULT_TIMEOUT_MS,
   FILES,
@@ -85,6 +86,7 @@ import {
   type ForgeStatus,
   nextActionFor,
 } from './format.ts';
+import { reconcileOrphan } from './reconcile.ts';
 import { JobWriter, pipeEvents, reportFor } from './writer.ts';
 import { writeJsonAtomic } from './atomic.ts';
 
@@ -126,6 +128,19 @@ export interface SpawnRequest {
   readonly conversation?: string | undefined;
   /** Overrides the repo root. Only pipeline stages set this. */
   readonly cwd?: string | undefined;
+  /**
+   * Absolute path of the output artifact a pipeline stage writes. A read-only job
+   * may write exactly this file (claude, codex). Solo spawns leave it unset.
+   */
+  readonly artifactPath?: string | undefined;
+  /** Why the work matters and who it is for. Shown to the worker in its brief. */
+  readonly context?: string | undefined;
+  /**
+   * The acceptance checks, as the worker's brief describes them. The service
+   * never runs these: spawn_job (tools.ts) and the pipeline runner gate
+   * acceptance themselves. This is only so the worker knows its bar.
+   */
+  readonly checks?: readonly BriefCheck[] | undefined;
   readonly pipeline?: string | undefined;
   readonly stage?: string | undefined;
   readonly attempt?: number | undefined;
@@ -159,6 +174,7 @@ export interface SpawnAck {
   readonly modelRequested: string | null;
   readonly modelResolved: string | null;
   readonly modelSource: 'requested' | 'harness-config' | 'reported' | 'unknown';
+  /** True when the worker's prompt starts with the brief (forge/brief.ts). */
   readonly preambleApplied: boolean;
   /** Non-fatal problems the caller should read. Omitted when none. */
   readonly warnings?: readonly string[];
@@ -176,6 +192,10 @@ export interface ListFilter {
   /** Only jobs in this state. */
   readonly status?: ForgeStatus | undefined;
   readonly limit?: number | undefined;
+  /** Only jobs last touched (finished, updated or started) at or after this epoch ms. */
+  readonly sinceMs?: number | undefined;
+  /** Only these job IDs (e.g. the ones this process spawned). */
+  readonly ids?: ReadonlySet<string> | undefined;
 }
 
 export interface JobSummary {
@@ -193,6 +213,7 @@ export interface JobSummary {
   readonly task: string | null;
   readonly toolCalls: number | null;
   readonly currentActivity: ForgeActivity | null;
+  readonly lastActivity: ForgeActivity | null;
   readonly startedAt: string | null;
   readonly updatedAt: string | null;
   readonly finishedAt: string | null;
@@ -232,6 +253,7 @@ export interface JobDetail extends JobSummary {
    */
   readonly changedFiles?: readonly string[];
   readonly changedFilesTruncated?: boolean;
+  readonly unattributedFiles?: readonly string[];
 }
 
 export interface CancelResult {
@@ -298,7 +320,7 @@ export interface ForgeOptions {
   readonly providerSource?: ((name: string) => Provider) | undefined;
   /** Sandbox describer. Default: provider.describeSandbox. Injectable for tests. */
   readonly describeSandbox?:
-    | ((provider: Provider, spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly'>) => SandboxInfo | undefined)
+    | ((provider: Provider, spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly' | 'artifactPath'>) => SandboxInfo | undefined)
     | undefined;
 }
 
@@ -378,13 +400,15 @@ export function checkAgainstCatalog(
  * loses the ability to `kill()` an in-flight worker, and that is stated in the
  * cancel result rather than papered over: an honest "I marked it cancelled but
  * there is no handle here to signal" beats a `signalled: true` that never
- * happened. We currently have no cross-process owner lease or PID-safe recovery:
- * if the owner dies, the child may hit its timeout but its final result cannot be
- * written here, so job.json can remain running until an owner recovers it.
+ * happened. Service reads recover jobs whose recorded supervisor has died,
+ * provided no terminal result is already present. PID-less legacy jobs remain
+ * read-only observations because the service cannot prove their writer died.
  */
 export class ForgeService {
   readonly repo: string;
   private readonly live = new Map<string, LiveJob>();
+  /** Job IDs spawned by this process, for `list_jobs session`. */
+  readonly spawnedIds = new Set<string>();
   private readonly mirrorOn: boolean;
   private readonly flushMs: number | undefined;
   private readonly catalogSource: (providers: string[]) => Promise<ModelCatalog[]>;
@@ -400,6 +424,13 @@ export class ForgeService {
     this.catalogSource = options.catalogSource ?? ((providers) => getCatalogs({ providers }));
     this.harnessDefaults = options.harnessDefaults ?? getHarnessDefaults;
     this.describeSandbox = options.describeSandbox ?? ((p, spec) => p.describeSandbox?.(spec));
+    // Publish abandoned-job recovery when the owner service starts, so the
+    // read-only pane agrees before an operator makes its first MCP status call.
+    try {
+      for (const entry of readdirSync(jobsDir(this.repo), { withFileTypes: true })) {
+        if (entry.isDirectory()) reconcileOrphan(this.repo, entry.name);
+      }
+    } catch { /* A missing job store is the ordinary fresh-repo case. */ }
   }
 
   /** Never throws, never waits long: a catalog is advice, not a gate on starting. */
@@ -472,7 +503,12 @@ export class ForgeService {
       }
     }
     const readOnlyRequested = preset?.readOnly === true && !unrestricted;
-    const sandboxInfo = this.describeSandbox(provider, { unrestricted, readOnly: readOnlyRequested });
+    const artifactPath = readOnlyRequested ? request.artifactPath : undefined;
+    const sandboxInfo = this.describeSandbox(provider, {
+      unrestricted,
+      readOnly: readOnlyRequested,
+      ...(artifactPath === undefined ? {} : { artifactPath }),
+    });
     const sandbox = sandboxInfo?.sandbox ?? 'unknown';
     const sandboxFlags = sandboxInfo?.flags ?? [];
     const readOnlyEnforced = sandboxInfo?.readOnlyEnforced ?? false;
@@ -481,26 +517,33 @@ export class ForgeService {
         'agy cannot prompt for permission headless; commands will be denied and the job will return an empty result. Retry with unrestricted:true if this job needs shell access.',
       );
     }
-    const preambleApplied = preset !== undefined;
-    const sentPrompt =
-      preset === undefined || prompt.startsWith(preset.preamble)
-        ? prompt
-        : `${preset.preamble}\n\n${prompt}`;
+    const brief = buildBrief({
+      preset,
+      cwd,
+      context: request.context,
+      checks: request.checks,
+      pipelineStage: request.pipeline !== undefined && request.pipeline !== null,
+      resuming,
+    });
+    // A caller that already starts its prompt with the brief gets it once, not twice.
+    const prependBrief = brief !== '' && !prompt.startsWith(brief);
+    const preambleApplied = brief !== '';
+    const sentPrompt = prependBrief ? `${brief}\n\n${prompt}` : prompt;
     const jobId = newJobId(mode);
     const name = request.name?.trim() || `${mode}-${jobId.slice(-8)}`;
     if (name.length > 80) throw new Error('worker name must be at most 80 characters');
     const workerId = request.workerId ?? jobId;
     const canonicalConflict = findActiveIdentity(this.repo, name, workerId);
     if (canonicalConflict !== null) {
-      throw new Error(`worker identity already has an active job (${canonicalConflict.jobId})`);
+      throw new Error(`worker identity already has an active job (${canonicalConflict.jobId}); wait for it to finish or call cancel.`);
     }
     for (const { writer } of this.live.values()) {
       const active = writer.snapshot();
       if (active?.workerId === workerId) {
-        throw new Error(`worker "${workerId}" already has an active job (${active.jobId})`);
+        throw new Error(`worker "${workerId}" already has an active job (${active.jobId}); wait for it to finish or call cancel.`);
       }
       if (active?.name === name) {
-        throw new Error(`worker name "${name}" already has an active job (${active.jobId})`);
+        throw new Error(`worker name "${name}" already has an active job (${active.jobId}); wait for it, call cancel, or pick another name.`);
       }
     }
 
@@ -523,6 +566,8 @@ export class ForgeService {
       effort: request.effort ?? null,
       cwd,
       prompt,
+      // Exactly what was prepended, so the /forge pane's "Show preamble" matches what the worker read.
+      ...(prependBrief ? { preamble: brief } : {}),
       unrestricted,
       conversation: request.conversation ?? null,
       timeoutMs,
@@ -538,6 +583,7 @@ export class ForgeService {
       readOnlyRequested,
       readOnlyEnforced,
     });
+    this.spawnedIds.add(jobId);
 
     const ack: SpawnAck = {
       jobId,
@@ -572,6 +618,7 @@ export class ForgeService {
       jobId,
       prompt: sentPrompt,
       readOnly: readOnlyRequested,
+      artifactPath,
       cwd,
       model: request.model,
       effort: request.effort,
@@ -597,6 +644,7 @@ export class ForgeService {
       jobId: string;
       prompt: string;
       readOnly: boolean;
+      artifactPath: string | undefined;
       cwd: string;
       model: string | undefined;
       effort: string | undefined;
@@ -614,6 +662,7 @@ export class ForgeService {
         timeoutMs: spec.timeoutMs,
         unrestricted: spec.unrestricted,
         ...(spec.readOnly ? { readOnly: true } : {}),
+        ...(spec.artifactPath === undefined ? {} : { artifactPath: spec.artifactPath }),
         ...(spec.model === undefined ? {} : { model: spec.model }),
         ...(spec.effort === undefined ? {} : { effort: spec.effort }),
         ...(spec.conversation === undefined ? {} : { conversation: spec.conversation }),
@@ -702,7 +751,7 @@ export class ForgeService {
 
     const known = live !== undefined || existsSync(jobDir(this.repo, jobId));
     if (!known) {
-      throw new Error(`no job "${jobId}" in ${jobsDir(this.repo)}`);
+      throw new Error(`no job "${jobId}" in ${jobsDir(this.repo)}; call list_jobs for valid job IDs.`);
     }
 
     writer.requestCancel();
@@ -743,7 +792,11 @@ export class ForgeService {
       out.push(...(await this.readSource('agy-staff', new AgyStaffReader(), isForgeJobId)));
     }
 
-    const filtered = out.filter((j) => filter.status === undefined || j.status === filter.status);
+    const touched = (j: JobSummary): number => Date.parse(j.finishedAt ?? j.updatedAt ?? j.startedAt ?? '');
+    const filtered = out.filter((j) =>
+      (filter.status === undefined || j.status === filter.status) &&
+      (filter.ids === undefined || filter.ids.has(j.jobId)) &&
+      (filter.sinceMs === undefined || touched(j) >= filter.sinceMs));
     // Live first, then newest — the same ordering the band draws, so the list a
     // model reads and the list a human sees put the same job on top.
     filtered.sort((a, b) => {
@@ -764,11 +817,12 @@ export class ForgeService {
    * `cancellable`.
    */
   async detail(jobId: string): Promise<JobDetail> {
+    reconcileOrphan(this.repo, jobId);
     const observed = await readObservedJob('agent-smith', this.repo, jobId);
     if (observed === null) {
       const interop = await readObservedJob('agy-staff', this.repo, jobId);
       if (interop === null) {
-        throw new Error(`no job "${jobId}" in ${jobsDir(this.repo)}`);
+        throw new Error(`no job "${jobId}" in ${jobsDir(this.repo)}; call list_jobs for valid job IDs.`);
       }
       return { ...toSummary(interop, 'agy-staff'), report: interop.output, error: null, exitCode: null, unrestricted: interop.label === 'unrestricted', pipeline: null, stage: null, usage: null, conversation: null, effort: null, cwd: null, cancellable: false };
     }
@@ -810,6 +864,7 @@ export class ForgeService {
             ...(manifest.gitBaseline === undefined ? {} : { gitBaseline: manifest.gitBaseline }),
             ...(manifest.changedFiles === undefined ? {} : { changedFiles: manifest.changedFiles }),
             ...(manifest.changedFilesTruncated === undefined ? {} : { changedFilesTruncated: manifest.changedFilesTruncated }),
+            ...(manifest.unattributedFiles === undefined ? {} : { unattributedFiles: manifest.unattributedFiles }),
           }),
       cancellable: this.live.has(jobId),
     };
@@ -845,6 +900,7 @@ export class ForgeService {
    * silently truncated.
    */
   async state(jobId: string): Promise<ForgeStatus | 'unknown'> {
+    reconcileOrphan(this.repo, jobId);
     const live = this.live.get(jobId)?.writer.snapshot();
     if (live !== null && live !== undefined) return live.status;
     try {
@@ -865,6 +921,7 @@ export class ForgeService {
     const out: JobSummary[] = [];
     for (const id of ids) {
       if (skip(id)) continue;
+      if (provider === 'agent-smith') reconcileOrphan(this.repo, id);
       const observed = await readObservedJob(provider, this.repo, id);
       if (observed === null) continue;
       out.push(toSummary(observed, provider === 'agent-smith' ? 'agent-smith' : 'agy-staff'));
@@ -912,11 +969,20 @@ export function toSummary(observed: ObservedJob, source: 'agent-smith' | 'agy-st
     task,
     toolCalls,
     currentActivity,
+    lastActivity: isForgeActivity(raw['last_activity']) ? raw['last_activity']
+      : [...activities].reverse().find(isForgeActivity) ?? null,
     startedAt: observed.startedAt,
     updatedAt: observed.updatedAt,
     finishedAt: observed.finishedAt,
     warnings: observed.warnings.map((w) => ({ code: w.code, message: w.message })),
   };
+}
+
+function isForgeActivity(value: unknown): value is ForgeActivity {
+  if (typeof value !== 'object' || value === null) return false;
+  const activity = value as Record<string, unknown>;
+  return typeof activity['stepIndex'] === 'number' && typeof activity['tool'] === 'string'
+    && ['active', 'done', 'denied', 'error'].includes(String(activity['status']));
 }
 
 function isActiveForgeActivity(value: unknown): value is ForgeActivity {

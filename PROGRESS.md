@@ -30,6 +30,8 @@ for design and [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for knobs and tool
   `hooks/watch-hooks.json`, timeout 21 900 s) replaces the always-on monitor; `monitor.js --job|--run`
   stays as a manual Monitor fallback; acks carry `notify`; `status wait_ms` as last resort.
   The built plugin runs the MCP server with `AGENT_SMITH_CHANNEL=0` so only the hook notifies.
+  When the mod is loaded it claims each launch through `tool.call` (the claim marker keeps the
+  hook silent) and announces it with one `$.prompt.submit`; text from `mod/hooks/notice.ts`.
 - **Mod**: `/forge` pane, live band, native task-list projection; reads the `.agy-staff/jobs/`
   compat mirror and the `orphaned` marker.
 - **Local setup**: `npm run setup:claude` builds a self-contained plugin and enables it for

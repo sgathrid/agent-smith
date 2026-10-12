@@ -16,6 +16,8 @@ import assert from 'node:assert/strict';
 // captures `AGENT_SMITH_AGY_BIN` into a module-level const the moment it loads, so
 // the shim has to be evaluated before anything below reaches the adapter. See
 // ../testing/shim.ts for what happens when it is not.
+import { MODE_PRESETS } from '../modes.ts';
+import { buildBrief } from '../brief.ts';
 import { assertFakeProviderActive } from '../testing/shim.ts';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -27,6 +29,8 @@ import { createRunnerRouter, runPipeline } from '../../pipeline/pipeline.ts';
 import { CrossFamilyViolation, moderateStage } from '../../pipeline/routing.ts';
 import type { Stage } from '../../pipeline/types.ts';
 import { ForgeService } from '../service.ts';
+import { readAcceptance } from '../checks.ts';
+import { jobsDir } from '../format.ts';
 import {
   ACTIVITY_TAIL,
   ARTIFACT_INLINE_CHARS,
@@ -36,6 +40,7 @@ import {
   readTail,
   stageArtifactPath,
   stageArtifactRef,
+  collectObservations,
   stageDir,
   toObservation,
   toStageResult,
@@ -60,6 +65,42 @@ assertFakeProviderActive();
 function stage(over: Partial<Stage> = {}): Stage {
   return { name: 'implement', provider: 'agy', prompt: 'do the work', ...over };
 }
+
+test('stage output directory exists before dispatch and prompt separates source from output', async () => {
+  const store = repo(); const work = repo(); let outputReady = false; let prompt = '';
+  const service = { repo: store, spawnTracked: async (request: { prompt: string; cwd: string }) => {
+    outputReady = existsSync(path.join(pipelineArtifactRoot(store, 'precreated'), 'implement', 'nested'));
+    prompt = request.prompt;
+    assert.equal(request.cwd, work);
+    throw new Error('fixture stops before launching');
+  } } as unknown as ForgeService;
+  await createForgeRunner({ service, runId: 'precreated' }).run({
+    pipeline: 'fixture', stage: stage({ resultPath: 'nested/result.md' }), attempt: 1, workDir: work,
+    inputs: [], routing: { provider: 'agy', tier: 't0-cheap', effort: 'low' }, signal: new AbortController().signal,
+  } as never);
+  assert.equal(outputReady, true);
+  assert.ok(prompt.includes(`SOURCE WORKSPACE: ${work}`));
+  assert.ok(prompt.includes('OUTPUT ARTIFACT'));
+  assert.ok(prompt.includes('Search, run commands and make any code changes in the source workspace'));
+});
+
+test("a stage's context and checks reach its worker's prompt, and a same-conversation retry does not repeat them", async () => {
+  const r = repo(); const service = new ForgeService({ repo: r });
+  const runner = createForgeRunner({ service, runId: 'brief' });
+  const st = stage({ context: 'Ships in the next release.', checks: [{ name: 'unit', command: 'true' }] });
+  const first = await runner.run(ctxFor(r, st));
+  const view = JSON.parse(readFileSync(path.join(r, '.agent-smith', 'jobs', first.jobId!, 'view.json'), 'utf8')) as { preamble: string | null };
+  assert.ok(view.preamble?.includes('Context: Ships in the next release.'));
+  assert.ok(view.preamble?.includes('- unit: `true`'));
+  assert.ok(view.preamble?.includes("You're done when these checks pass"));
+
+  const ctx = ctxFor(r, st);
+  ctx.attempt = 2;
+  ctx.continuation = { attempt: 1, priorStatus: 'failed', transcriptRef: 'prior-thread', transcriptProvider: st.provider, appendedContext: 'Previous check failed' };
+  const retry = await runner.run(ctx);
+  const retryView = JSON.parse(readFileSync(path.join(r, '.agent-smith', 'jobs', retry.jobId!, 'view.json'), 'utf8')) as { preamble: string | null };
+  assert.equal(retryView.preamble, null, 'the continued conversation already holds the brief');
+});
 
 /* ── paths ─────────────────────────────────────────────────────────────────── */
 
@@ -138,6 +179,26 @@ test('the stage prompt is passed through, and the artefact is appended', () => {
     prompt.includes(path.resolve(r, 'implement', 'result.md')),
     'and the ABSOLUTE path, so a worker that needs the rest can read it itself',
   );
+});
+
+test('a read-only stage is told its artifact is the only permitted write', () => {
+  // The service prepends the brief, whose review guidance says to leave the files
+  // as they are; compose it the same way and check the worker is never left with
+  // an unqualified "leave the files" plus an instruction to write.
+  const work = repo();
+  for (const name of ['review', 'moderate'] as const) {
+    const stagePrompt = buildStagePrompt({ stage: stage({ name }), workDir: work, inputs: [], attempt: 1 });
+    const prompt = `${buildBrief({ preset: MODE_PRESETS[name], cwd: work, pipelineStage: true })}\n\n${stagePrompt}`;
+    assert.ok(prompt.includes(path.resolve(work, name, 'result.md')));
+    assert.match(stagePrompt, /leave every file in the source workspace as it is/);
+    assert.match(stagePrompt, /only permitted write/);
+    const guidanceAt = prompt.toLowerCase().indexOf('leave the files as they are');
+    assert.ok(guidanceAt >= 0 && guidanceAt < prompt.indexOf('only permitted write'), 'the qualification comes after the guidance');
+  }
+  // A custom role that is not a read-only mode keeps the plain wording.
+  const implement = buildStagePrompt({ stage: stage({ name: 'implement' }), workDir: work, inputs: [], attempt: 1 });
+  assert.doesNotMatch(implement, /read-only stage/);
+  assert.match(buildStagePrompt({ stage: stage({ name: 'qa', role: 'review' }), workDir: work, inputs: [], attempt: 1 }), /read-only stage/);
 });
 
 test('the continuation goes FIRST, before the restated task', () => {
@@ -263,7 +324,19 @@ test('a failure keeps the provider\'s own status word, so `denied` survives', ()
   assert.equal(res.status, 'failed');
   assert.equal(res.failure?.code, 'denied');
   assert.equal(res.failure?.retryable, false);
-  assert.ok(res.resultPath, 'a failed stage still publishes its artefact for a human to read');
+  assert.equal(res.resultPath, undefined, 'nothing was written, so no path is advertised');
+  assert.deepEqual(res.artifacts, []);
+  assert.match(res.warnings?.[0] ?? '', /implement\/result\.md not found on disk/);
+});
+
+test('a failed stage that did leave an artefact still publishes it for a human to read', () => {
+  const r = repo();
+  mkdirSync(stageDir(r, 'implement'), { recursive: true });
+  writeFileSync(stageArtifactPath(r, 'implement'), 'partial notes');
+  const res = toStageResult(stage(), ctxFor(r, stage()), manifestFor({ status: 'failed', jobStatus: 'error' }), [], 0, r);
+  assert.equal(res.resultPath, 'implement/result.md');
+  assert.deepEqual(res.artifacts, [{ stage: 'implement', path: 'implement/result.md', label: 'result.md' }]);
+  assert.equal(res.warnings, undefined);
 });
 
 test('a stage that claims success but wrote nothing is FAILED at the DAG boundary', () => {
@@ -275,6 +348,23 @@ test('a stage that claims success but wrote nothing is FAILED at the DAG boundar
   assert.equal(res.status, 'failed');
   assert.equal(res.failure?.code, 'no-result');
   assert.equal(res.failure?.retryable, true, 'retrying could plausibly produce the artefact');
+});
+
+test('collectObservations keeps one observation per tool step, in its final state', async () => {
+  const snapshots = [
+    [{ stepIndex: 0, tool: 'Bash', input: 'ls', status: 'active' }],
+    [{ stepIndex: 0, tool: 'Bash', input: 'ls', status: 'done' }, { stepIndex: 1, tool: 'Glob', input: '*.ts', status: 'active' }],
+    [{ stepIndex: 0, tool: 'Bash', input: 'ls', status: 'done' }, { stepIndex: 1, tool: 'Glob', input: '*.ts', status: 'error' }],
+  ];
+  let reads = 0;
+  const service = {
+    activities: async () => snapshots[Math.min(reads++, snapshots.length - 1)],
+    state: async () => (reads < snapshots.length ? 'running' : 'succeeded'),
+  } as unknown as ForgeService;
+  const tapped: string[] = [];
+  const out = await collectObservations(service, 'job', 'implement', (_stage, obs) => { tapped.push(`${obs.turn}:${obs.tool}:${obs.ok}`); });
+  assert.deepEqual(out.map((o) => [o.turn, o.tool, o.kind]), [[0, 'Bash', 'tool'], [1, 'Glob', 'error']]);
+  assert.deepEqual(tapped, ['0:Bash:true', '0:Bash:true', '1:Glob:true', '1:Glob:false'], 'the tap still sees every state change');
 });
 
 test('readTail is bounded and null for nothing', () => {
@@ -396,6 +486,62 @@ test('continuation handles stay in their provider namespace', async () => {
   }
 });
 
+test('a continuing stage resumes its target worker with the review in its prompt', async () => {
+  const store = repo(); const work = repo(); const requests: Array<Record<string, unknown>> = [];
+  const review = stageArtifactPath(pipelineArtifactRoot(store, 'fixloop'), 'review');
+  mkdirSync(path.dirname(review), { recursive: true });
+  writeFileSync(review, 'FINDING-17: the cache is never invalidated');
+  const service = { repo: store, spawnTracked: async (request: Record<string, unknown>) => { requests.push(request); throw new Error('fixture stops before launching'); } } as unknown as ForgeService;
+  const ctx = ctxFor(work, stage({ name: 'fix', role: 'implement', checks: [{ name: 'unit', command: 'true' }] }), [{ stage: 'review', path: 'result.md' }]);
+  ctx.continues = { stage: 'implement', transcriptRef: 'conv-implement', workerId: 'w-impl', agentName: 'builder' };
+  await createForgeRunner({ service, runId: 'fixloop' }).run(ctx);
+  await createForgeRunner({ service, runId: 'fixloop' }).run({ ...ctx, continues: { stage: 'implement', transcriptRef: 'conv-implement' } });
+  const [explicit, defaulted] = requests;
+  assert.equal(explicit?.['conversation'], 'conv-implement');
+  assert.equal(explicit?.['workerId'], 'w-impl');
+  assert.equal(explicit?.['name'], 'builder');
+  assert.equal(explicit?.['cwd'], work);
+  assert.equal(explicit?.['artifactPath'], stageArtifactPath(pipelineArtifactRoot(store, 'fixloop'), 'fix'), 'the request names the file the prompt tells the worker to write');
+  assert.equal(defaulted?.['workerId'], 'fixloop:implement', 'the default identity is the target stage\'s');
+  assert.match(String(explicit?.['prompt']), /FINDING-17: the cache is never invalidated/);
+  assert.deepEqual(explicit?.['checks'], [{ name: 'unit', command: 'true' }], 'the fix stage\'s own checks reach the resumed worker');
+});
+
+test('implement -> review -> fix: the fix stage resumes the implementer and the review is its input', async () => {
+  const r = repo(); const service = new ForgeService({ repo: r });
+  const run = await runPipeline({
+    name: 'fix-loop', workDir: r,
+    stages: [
+      { name: 'implement', provider: 'agy', role: 'implement', prompt: 'build it' },
+      { name: 'review', provider: 'agy', dependsOn: ['implement'], role: 'review', prompt: 'review it' },
+      { name: 'fix', provider: 'agy', continues: 'implement', dependsOn: ['review'], role: 'implement', prompt: 'fix it' },
+    ],
+  } as never, { runner: createRunnerRouter({ agy: createForgeRunner({ service, runId: 'fix-loop' }) }), ladders: { agy: { label: 'agy' } } });
+  assert.equal(run.status, 'passed', JSON.stringify(run.outcomes, null, 2));
+  const argvOf = (stageName: string): string[] => JSON.parse(readFileSync(path.join(r, '.agent-smith', 'jobs', run.outcomes[stageName]!.jobId!, 'argv.json'), 'utf8')).argv;
+  const conversation = run.outcomes['implement']!.transcriptRef!;
+  assert.ok(conversation);
+  assert.equal(argvOf('fix')[argvOf('fix').indexOf('--conversation') + 1], conversation);
+  assert.equal(argvOf('review').includes('--conversation'), false, 'a plain stage starts fresh');
+  const worker = async (stageName: string) => (await service.detail(run.outcomes[stageName]!.jobId!)).workerId;
+  assert.equal(await worker('fix'), await worker('implement'));
+  assert.notEqual(await worker('review'), await worker('implement'));
+});
+
+test('pipeline acceptance respects optional preflight failures and mandatory blank checks', async () => {
+  for (const [checks, expected] of [
+    [[{ name: 'optional', command: 'true', cwd: 'missing', blocking: false }], 'passed'],
+    [[{ name: 'mandatory', command: '   ' }], 'failed'],
+    [[{ name: 'optional-empty', command: '   ', blocking: false }], 'passed'],
+  ] as const) {
+    const r = repo(); const service = new ForgeService({ repo: r });
+    const outcome = await createForgeRunner({ service }).run(ctxFor(r, stage({ checks: [...checks] })));
+    assert.equal(outcome.acceptance, expected);
+    assert.equal(outcome.status, expected);
+    assert.ok(outcome.verification?.verdicts[0]?.skipped);
+  }
+});
+
 test('executable stage checks determine acceptance with exit-code evidence', async () => {
   const r = repo();
   const service = new ForgeService({ repo: r });
@@ -415,6 +561,37 @@ test('executable stage checks determine acceptance with exit-code evidence', asy
   assert.equal(failed.failure?.code, 'verification-failed');
   assert.match(failed.failure?.message ?? '', /tests/);
   assert.equal(failed.verification?.verdicts[0]?.exitCode, 1);
+});
+
+test("a stage's job carries its acceptance, pending while checks run and decided after", async () => {
+  const r = repo();
+  const service = new ForgeService({ repo: r });
+  // The check reads the job's acceptance sidecar from inside the running check.
+  const probe = path.join(r, 'probe.cjs');
+  writeFileSync(probe, "const fs=require('fs'),p=require('path');const [dir,out]=process.argv.slice(2);" +
+    "const id=fs.readdirSync(dir)[0];fs.copyFileSync(p.join(dir,id,'acceptance.json'),out);");
+  const seen = path.join(r, 'seen.json');
+  const command = `node ${probe} ${jobsDir(r)} ${seen}`;
+  const passed = await createForgeRunner({ service, runId: 'job-acc-pass' }).run(ctxFor(r, stage({ checks: [{ name: 'probe', command }] })));
+  assert.equal(passed.acceptance, 'passed');
+  assert.equal(JSON.parse(readFileSync(seen, 'utf8')).pending, true, 'checks pending, not a premature verdict');
+  const accepted = readAcceptance(r, passed.jobId!);
+  assert.equal(accepted.state, 'accepted');
+  assert.equal((accepted as { pending?: boolean }).pending, undefined);
+
+  const failed = await createForgeRunner({ service, runId: 'job-acc-fail' }).run(
+    ctxFor(r, stage({ checks: [{ name: 'tests', command: 'node -e "process.exit(1)"' }] })));
+  assert.equal(failed.acceptance, 'failed');
+  const rejected = readAcceptance(r, failed.jobId!) as { state: string; checks: { name: string; ok: boolean }[] };
+  assert.equal(rejected.state, 'rejected', 'status <jobId> agrees with pipeline_status');
+  assert.deepEqual(rejected.checks.map((c) => [c.name, c.ok]), [['tests', false]]);
+
+  const denied = await createForgeRunner({ service, runId: 'job-acc-denied' }).run(
+    ctxFor(r, stage({ prompt: 'deny everything', checks: [{ name: 'never', command: 'true' }] })));
+  assert.equal(denied.status, 'failed');
+  const unrun = readAcceptance(r, denied.jobId!) as { state: string; pending?: boolean };
+  assert.equal(unrun.state, 'rejected', 'a failed job does not stay pending forever');
+  assert.equal(unrun.pending, undefined);
 });
 
 /* ── cross-family enforcement ──────────────────────────────────────────────── */

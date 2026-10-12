@@ -41,6 +41,7 @@ import {
   elapsedCell,
   formatJobRow,
   isTerminal,
+  paneColumns,
   pickColor,
   pickGlyph,
   type RowOptions,
@@ -59,23 +60,15 @@ export { fitCell, formatJobLine, formatJobRow, paneColumns } from './format.ts';
  * 1 Hz is exact rather than merely frequent.
  */
 
-/** How long a finished job stays in the band. TERMINAL-UI.md L150, both mods. */
-export const LINGER_MS = 30_000;
+/**
+ * How long a finished job stays in the band (and in the host task list). Shorter
+ * than TERMINAL-UI.md's 30 s on purpose: the completion hook and `/forge` already
+ * carry the result, so a lingering row only clutters the prompt.
+ */
+export const LINGER_MS = 10_000;
 
 /** Rows the band draws before `+N more`. TERMINAL-UI.md L151. */
 export const BAND_ROWS = 4;
-
-/**
- * How far past the linger the tick keeps drawing.
- *
- * A finished job's row has to disappear ~30s after it finished, and the band
- * clock is what redraws it. Without this cushion the row survives one extra
- * tick — `isShown` is true at 29_999ms and false at 30_001ms — and the row you
- * were reading blinks out for one frame. Both reference mods add 3s for exactly
- * this reason. This is rule #1 of TERMINAL-UI.md (nothing moves unless the user
- * caused it) arriving as a flicker rather than as a row count change.
- */
-export const TICK_CUSHION_MS = 3000;
 
 /* ────────────────────────────────────────────────────────────────────────────
  * NO_COLOR (TERMINAL-UI.md L88-89, https://no-color.org/)
@@ -161,14 +154,16 @@ export type BandLine = import('./format.ts').JobRow;
  * exactly a boundary question.
  *
  * `colour: false` drops the accent and nothing else — bold stays, because bold
- * is a contrast affordance rather than a colour.
+ * is a contrast affordance rather than a colour. `width`, the columns the host
+ * gives the row, fits the cells to it; without one the fixed band budget holds.
  */
 export function buildLine(
   job: RadarJob,
   now: number,
-  options: { readonly colour?: boolean } = {},
+  options: { readonly colour?: boolean; readonly width?: number } = {},
 ): BandLine {
-  const row = formatJobRow(job, { now, ...bandColumns() } satisfies RowOptions);
+  const columns = options.width === undefined ? bandColumns() : { ...paneColumns(options.width), tools: false };
+  const row = formatJobRow(job, { now, ...columns } satisfies RowOptions);
   const colour = options.colour !== false;
   return {
     ...row,
@@ -192,11 +187,11 @@ export function buildLine(
  * NOT from when we first noticed. That distinction is load-bearing against the
  * real corpus: `/Users/gathrid/Repos/renyi/.agy-staff/jobs` holds 20 jobs
  * finished hours ago, and a band that showed four of them at session start would
- * be asserting that work is in flight when it is not. The 30 s therefore also
+ * be asserting that work is in flight when it is not. The linger therefore also
  * serves as the honest bound on "I missed the finish, and that is fine".
  */
 export function isShown(job: RadarJob, now: number): boolean {
-  if (!isTerminal(job.status)) return true;
+  if (!isTerminal(job.status) || job.acceptance?.pending) return true;
   if (job.endedAt === null) return false;
   return now - job.endedAt < LINGER_MS;
 }

@@ -309,7 +309,7 @@ test('ambiguous and nonpositive numeric budgets are rejected', () => {
 test('the shipped example parses and validates', () => {
   const spec = loadSpec(EXAMPLE);
   assert.equal(spec.name, 'dashboard-rework');
-  assert.equal(spec.stages.length, 5);
+  assert.equal(spec.stages.length, 6);
   // validateSpec is pipeline/'s own check (duplicates, unknown deps, cycles).
   // Running it here means the example cannot drift into a spec the DAG rejects.
   validateSpec(spec);
@@ -328,12 +328,16 @@ test('the example is the mixed-provider path the architecture describes', () => 
   assert.equal(byName.get('moderate')?.provider, 'claude');
   assert.equal(byName.get('moderate')?.routingPinned, true);
 
-  // The concurrency claim: two stages depend only on `review`, never on each
+  // fix → continues the implementer; its provider is inherited, not repeated.
+  assert.equal(byName.get('fix')?.continues, 'implement');
+  assert.equal(byName.get('fix')?.provider, 'agy');
+
+  // The concurrency claim: two stages depend only on `fix`, never on each
   // other, so the DAG can run them at the same time.
   const acceptance = byName.get('acceptance');
   const security = byName.get('security');
-  assert.deepEqual(acceptance?.dependsOn, ['review']);
-  assert.deepEqual(security?.dependsOn, ['review']);
+  assert.deepEqual(acceptance?.dependsOn, ['fix']);
+  assert.deepEqual(security?.dependsOn, ['fix']);
   assert.equal(acceptance?.dependsOn?.includes('security'), false);
   assert.equal(security?.dependsOn?.includes('acceptance'), false);
 });
@@ -346,4 +350,15 @@ test('the example stages declare different model families', () => {
   const providers = new Set(spec.stages.map((s) => s.provider));
   assert.ok(providers.has('agy') && providers.has('codex') && providers.has('claude'));
   assert.ok(providers.size >= 3, 'the example must exercise at least three workers');
+});
+
+test('continues is a stage key; provider is inherited when omitted and required otherwise', () => {
+  const yaml = (fix: string): ReturnType<typeof specFrom> => specFrom(tree(
+    `name: p\nstages:\n  - name: build\n    provider: agy\n  - name: fix\n    dependsOn: [build]\n${fix}`));
+  const inherited = yaml('    continues: build');
+  assert.deepEqual([inherited.stages[1]?.continues, inherited.stages[1]?.provider], ['build', 'agy']);
+  validateSpec(inherited);
+  assert.throws(() => yaml('    prompt: x'), /stage 'fix' needs a provider/);
+  assert.throws(() => validateSpec(yaml('    provider: codex\n    continues: build')), /cannot move between providers/);
+  assert.throws(() => yaml('    continues: ""'), /continues must be nonempty/);
 });
