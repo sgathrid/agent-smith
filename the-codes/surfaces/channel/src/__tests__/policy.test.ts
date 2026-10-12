@@ -30,15 +30,14 @@ import {
 } from '../policy.ts';
 import { STALL_GRACE_MS } from '../../../mod/hooks/stale.ts';
 
-test('named completion notices lead with status and truncate worker prose at a word boundary', () => {
+test('named completion notices lead with status and leave the worker summary out', () => {
   const batch = buildBatch([cand(job({ name: 'smoke-codex', role: 'review', provider: 'codex',
     status: 'succeeded', startedAt: '2026-10-03T16:39:17Z', finishedAt: '2026-10-03T16:40:00Z',
     changedFileCount: 0, summarySource: 'worker', latestSummary: 'Complete sentence. ' + 'preserved '.repeat(80) }))], NOW);
-  assert.match(batch.content!, /^Agent Smith · ✓ smoke-codex \(codex review\) succeeded in 43s\. Job ID /);
+  assert.match(batch.content!, /^Agent Smith · ✓ smoke-codex \(codex review\) succeeded in 43s · no checks\. Job ID /);
   assert.doesNotMatch(batch.content!, /0 files changed/, 'no change is not a fact worth a clause');
-  assert.match(batch.content!, /Worker summary \(unverified claim\): Complete sentence\..*…\n/);
-  assert.match(batch.content!, /\/forge shows it to the user\.$/);
-  assert.doesNotMatch(batch.content!, /preser…/);
+  assert.doesNotMatch(batch.content!, /Worker summary|Complete sentence|preserved/, 'the worker summary is not repeated in the notice');
+  assert.match(batch.content!, /\nRead it with status before acting\.$/);
 });
 
 // ── fixtures, built from the real corpus ────────────────────────────────────
@@ -181,7 +180,7 @@ test('five simultaneous failures become ONE notification', () => {
     assert.ok(batch.content.includes(`implement-musm82da-0000000${n}`), `missing job ${n}`);
   }
   assert.equal(batch.keys.length, 5, 'all five are acknowledged in one send');
-  assert.ok(batch.content.includes('/forge'), 'must point at the escape hatch');
+  assert.ok(batch.content.endsWith('Read them with status before acting.'), 'must point at status');
   assert.ok(!batch.content.includes('agy'), 'unnamed Forge jobs are not called agy jobs');
 });
 
@@ -210,7 +209,7 @@ test('a single event gets the specific message, not a one-item summary', () => {
   );
   assert.equal(batch.meta['kind'], 'failed');
   assert.equal(batch.meta['count'], '1');
-  assert.ok(batch.content!.startsWith('Agent Smith · ✗ job implement-musm82da-f1dc1fe4 failed. Job ID'), batch.content!);
+  assert.ok(batch.content!.startsWith('Agent Smith · ✗ job implement-musm82da-f1dc1fe4 failed.\n'), batch.content!);
 });
 
 test('nothing to say produces no notification at all', () => {
@@ -229,7 +228,7 @@ test('a batch of already-seen events is silent', () => {
 
 // ── message content ─────────────────────────────────────────────────────────
 
-test('the failure message is terse, specific, and ends with the escape hatch', () => {
+test('the failure message is terse, specific, and ends with the next step', () => {
   const batch = buildBatch(
     [
       cand(
@@ -248,7 +247,7 @@ test('the failure message is terse, specific, and ends with the escape hatch', (
   );
   const text = batch.content!;
   assert.ok(text.includes('agy-staff job implement-musm82da-f1dc1fe4 failed: agy exited 1'), text);
-  assert.ok(text.includes('/forge'));
+  assert.ok(text.endsWith('Read it with status before acting.'));
   assert.ok(!text.includes('/agy-radar'), 'no /agy-radar command exists any more');
   // The budget is ~50 tokens. A multi-sentence essay would blow it.
   assert.ok(text.length < 220, `message is ${text.length} chars: ${text}`);

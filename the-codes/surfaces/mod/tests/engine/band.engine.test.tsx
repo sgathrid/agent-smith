@@ -761,7 +761,7 @@ describe('completion notices', () => {
     {status,name:'Ada',provider:'codex',role:'review',...more},
     status === 'running' ? {} : {'acceptance.json':JSON.stringify({state:'accepted',checks:[{name:'tests',ok:true},{name:'lint',ok:true}]})});
 
-  test('a finished owned job: the hook stands down, one ui.log and one prompt.submit', async ($, on) => {
+  test('a finished owned job: the hook stands down, no ui.log, one prompt.submit', async ($, on) => {
     const files = ada('running');
     const { clock, said } = noticeHost(on, files, ['job-ada']);
     await start($);
@@ -776,9 +776,9 @@ describe('completion notices', () => {
     await clock.advance(3000);
     await clock.advance(3000);
 
-    expect(said.logs).toEqual(['✓ Ada (codex review) succeeded in 44s · 2 files changed · checks 2/2']);
+    expect(said.logs).toEqual([]); // the plugin message is the only notice
     expect(said.prompts).toHaveLength(1);
-    expect(said.prompts[0]).toMatch(/^Agent Smith · ✓ Ada \(codex review\) succeeded in 44s · 2 files changed · checks 2\/2\. Job ID job-ada\./);
+    expect(said.prompts[0]).toMatch(/^Agent Smith · ✓ Ada \(codex review\) succeeded in 44s · 2 files changed · checks 2\/2\. Job ID job-ada\.\nRead it with status before acting\.$/);
   });
 
   test('a launch seen only through tool.call is claimed, marked and announced once', async ($, on) => {
@@ -791,7 +791,7 @@ describe('completion notices', () => {
     Object.assign(files, ada('succeeded', {finishedAt:iso(RUNNING_NOW+1000)}));
     await clock.advance(3000);
     await clock.advance(3000);
-    expect(said.logs).toHaveLength(1);
+    expect(said.logs).toEqual([]);
     expect(said.prompts).toHaveLength(1);
   });
 

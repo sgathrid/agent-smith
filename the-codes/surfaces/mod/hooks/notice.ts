@@ -92,11 +92,23 @@ export function durationWords(ms: number | null | undefined): string {
   return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}m`;
 }
 
-/** `Ada (codex review)`, or `agy-staff job <id>` for a legacy job with no name. */
+/**
+ * The service names an unnamed worker `<mode>-<last 8 of the job id>`. Beside
+ * the job id that reads as a typo, so it counts as no name.
+ */
+function chosenName(job: NoticeJob): string | null {
+  if (!job.name) return null;
+  return !job.run && job.id.length >= 8 && job.name.endsWith(`-${job.id.slice(-8)}`) ? null : job.name;
+}
+
+/** `Ada (codex review)`, `review-smith-1a2b3c4d (agy review)`, or `agy-staff job <id>`. */
 function who(job: NoticeJob): string {
   const identity = [job.provider, job.role].filter(Boolean).join(' ');
-  if (job.name) return identity ? `${job.name} (${identity})` : job.name;
-  return `${job.source === 'agy-staff' ? 'agy-staff job' : job.run ? 'pipeline' : 'job'} ${job.id}`;
+  const name = chosenName(job);
+  if (name) return identity ? `${name} (${identity})` : name;
+  if (job.source === 'agy-staff') return `agy-staff job ${job.id}`;
+  if (job.run) return `pipeline ${job.id}`;
+  return identity ? `${job.id} (${identity})` : `job ${job.id}`;
 }
 
 /**
@@ -120,26 +132,19 @@ export function headline(job: NoticeJob): string {
   }
   if (job.checks && job.checks.total > 0) {
     facts.push(`checks ${job.checks.passed}/${job.checks.total}${job.checks.passed < job.checks.total ? ' (rejected)' : ''}`);
+  } else if (job.kind === 'finished' && !job.run) {
+    facts.push('no checks'); // success here is the worker's word, not evidence
   }
   return [`${GLYPH[job.kind]} ${who(job)} ${state}`, ...facts].join(' · ');
-}
-
-/** Lines shown to the user: one per job, capped, with a short excerpt where it helps. */
-export const USER_LINES = 5;
-export function userLines(jobs: readonly NoticeJob[]): string[] {
-  const lines = jobs.slice(0, USER_LINES).map((job) => {
-    const excerpt = job.kind === 'finished' && job.summary ? ` — ${compactExcerpt(job.summary, 90)}` : '';
-    return `${headline(job)}${excerpt}`;
-  });
-  if (jobs.length > USER_LINES) lines.push(`+${jobs.length - USER_LINES} more · /forge`);
-  return lines;
 }
 
 const CLAUDE_JOBS = 8;
 
 /**
- * What Claude reads. Worker prose is labelled as a claim; runtime outcomes are
- * labelled as such. Ends with the one next step, naming the real tools.
+ * What Claude reads, and what the user sees: Claude Code shows a plugin's
+ * message in full. One line per job and the one next step. The worker's own
+ * summary is left out: Claude reads the result with status anyway, and a
+ * claim repeated in the notice only lengthens it.
  */
 export function claudeText(jobs: readonly NoticeJob[]): string {
   if (jobs.length === 0) return '';
@@ -151,14 +156,13 @@ export function claudeText(jobs: readonly NoticeJob[]): string {
     lines.push(`Agent Smith · ${jobs.length} jobs: ${[...counts].map(([k, n]) => `${n} ${k}`).join(', ')}.`);
   }
   for (const job of jobs.slice(0, CLAUDE_JOBS)) {
-    const budget = one ? 600 : 250;
-    const outcome = job.run && job.reason ? ` Runtime outcome: ${compactExcerpt(job.reason, budget)}` : '';
-    const summary = job.summary ? ` Worker summary (unverified claim): ${compactExcerpt(job.summary, budget)}` : '';
-    lines.push(`${one ? 'Agent Smith · ' : ''}${headline(job)}. ${job.run ? 'Run' : 'Job'} ID ${job.id}.${outcome}${summary}`);
+    const outcome = job.run && job.reason ? ` ${compactExcerpt(job.reason, one ? 400 : 200)}` : '';
+    const id = chosenName(job) || job.run ? ` ${job.run ? 'Run' : 'Job'} ID ${job.id}.` : '';
+    lines.push(`${one ? 'Agent Smith · ' : ''}${headline(job)}.${id}${outcome}`);
   }
   if (jobs.length > CLAUDE_JOBS) lines.push(`…and ${jobs.length - CLAUDE_JOBS} more; list_jobs shows them.`);
   const runs = jobs.some((j) => j.run);
-  lines.push(`Judge the result with ${runs ? 'pipeline_status (runs) or status (jobs)' : 'status'} before acting; /forge shows it to the user.`);
+  lines.push(`Read ${one ? 'it' : 'them'} with ${runs ? 'pipeline_status (runs) or status (jobs)' : 'status'} before acting.`);
   return lines.join('\n');
 }
 

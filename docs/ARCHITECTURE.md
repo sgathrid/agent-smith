@@ -244,17 +244,19 @@ Claude                MCP server (dist/server.js)      Claude Code hooks        
   |   Claude wakes -> status(jobId) / pipeline_status -> acts on report + acceptance
 ```
 
-- **Mod announcer** (`mod/hooks/register.tsx` `claimLaunch`/`announce`, rules in
-  `notice.ts`): when the mod is loaded it hooks `classic.PostToolUse` for the three
-  launch tools, claims the job or run in session state (`notices` atom) and answers
-  without `next`. Modules sit above settings and plugin command hooks in that chain,
-  so the hook watcher below never starts for a claimed launch: one announcer per job
-  (the documented hook order; not yet confirmed in a live session).
+- **Mod announcer** (`mod/hooks/register.tsx` `takeLaunch`/`announce`, rules in
+  `notice.ts`): when the mod is loaded it wraps the three launch tools in
+  `tool.call`, reads the ack from the result, claims the job or run in session
+  state (`notices` atom) and writes `.agent-smith/claims/<kind>-<id>`. The hook
+  watcher still starts, but at completion it finds the claim and stays silent: one
+  announcer per job. (A `classic.PostToolUse` handler does the same where the host
+  delivers that event; Claude Code 2.1.296 withholds it from user-tier modules,
+  "bypassed by cc-plugin-sec-default".)
   It declines (calls `next`) in legacy mode, after a read error, or when the ack's
   repo is not the one it polls. Each 3 s poll announces claimed jobs that ended (or
-  stalled, once), holding a pending acceptance verdict up to 5 min: one `$.ui.log`
-  line per job for the user, and one `$.prompt.submit` turn that Claude reads as
-  sent by the plugin. Only claimed ids are announced, so two sessions on one repo
+  stalled, once), holding a pending acceptance verdict up to 5 min, with one
+  `$.prompt.submit` turn credited to the plugin. Claude Code shows that message to
+  the user in full, so it is the only notice: one line per job, no worker summary. Only claimed ids are announced, so two sessions on one repo
   never wake each other. A claimed run is announced with its stage jobs when the
   run ends. `/clear` resets session state, so a job claimed before it goes
   unannounced (the band still shows it).

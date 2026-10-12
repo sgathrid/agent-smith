@@ -38,7 +38,6 @@ import {
   due,
   parseLaunch,
   runFileName,
-  userLines,
   type Launch,
   type Owned,
   type RunRecord,
@@ -231,9 +230,10 @@ async function pollBand($: EngineInterface): Promise<void> {
 //
 // The plugin's PostToolUse command hook (watch-hook.js) can wake Claude, but
 // the host labels its exit-2 wake "Stop hook feedback", which reads as an error.
-// When this mod is loaded it takes the job over at `classic.PostToolUse`, and
-// announces it itself: a dim `$.ui.log` line for the user and a
-// `$.prompt.submit` turn Claude reads as coming from this plugin.
+// When this mod is loaded it claims the launch (tool.call, or
+// classic.PostToolUse where delivered) and announces it itself, with one
+// `$.prompt.submit` turn credited to this plugin. Claude Code shows that
+// message to the user in full, so it is the only notice.
 
 /** Repo paths compare without trailing slashes. */
 const sameRepo = (a: string, b: string): boolean => a.replace(/\/+$/, '') === b.replace(/\/+$/, '');
@@ -312,7 +312,6 @@ async function announce($: EngineInterface, repo: string, jobs: readonly RadarJo
     const seen = new Set(owned.map((o) => `${o.kind}:${o.id}`));
     await update($, notices, (current) => [...result.owned, ...current.filter((c) => !seen.has(`${c.kind}:${c.id}`))]);
     if (result.notices.length === 0) return;
-    for (const line of userLines(result.notices)) $.ui.log(line);
     // Resolves when the turn starts, which waits for the session to be idle.
     void $.prompt.submit({ text: claudeText(result.notices) }).catch(() => {});
   } finally {

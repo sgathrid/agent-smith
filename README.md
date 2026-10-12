@@ -81,9 +81,9 @@ workers (`list_jobs`), cancel work (`cancel`) and read a pipeline's state
 [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
 Claude does not poll for results. When a job finishes or needs attention, Agent
-Smith adds one dim line to the transcript (`agent-smith: ✓ Ada (codex review)
-succeeded in 43s · 2 files changed · checks 2/2`) and starts a turn for Claude
-that names Agent Smith as the sender.
+Smith sends one short message, which you and Claude both see: `Agent Smith · ✓
+Ada (codex review) succeeded in 43s · 2 files changed · checks 2/2`. Claude then
+reads the result with `status` before acting on it.
 
 ### Modes
 

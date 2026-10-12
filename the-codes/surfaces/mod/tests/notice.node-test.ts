@@ -8,7 +8,7 @@ import { test } from 'node:test';
 
 import {
   ACCEPTANCE_HOLD_MS, LAUNCH_TOOL, type NoticeJob, type NoticeRow, type Owned, type RunRecord,
-  claim, claudeText, due, headline, noticeFromRadar, parseLaunch, userLines,
+  claim, claudeText, due, headline, noticeFromRadar, parseLaunch,
 } from '../hooks/notice.ts';
 import { buildBatch } from '../../channel/src/policy.ts';
 
@@ -60,11 +60,11 @@ test('every provider is named as itself; agy is not the default', () => {
   assert.match(headline(notice({ id: 'implement-1', source: 'agy-staff' })), /^✓ agy-staff job implement-1 succeeded/);
 });
 
-test("Claude's text: one job carries its id, its claim labelled, and the next step", () => {
+test("Claude's text: one job carries its id and the next step, never the worker's summary", () => {
   const text = claudeText([notice({ name: 'Ada', provider: 'codex', role: 'review', summary: 'Found two bugs in parser.ts.' })]);
   assert.equal(text, [
-    'Agent Smith · ✓ Ada (codex review) succeeded. Job ID job-1. Worker summary (unverified claim): Found two bugs in parser.ts.',
-    'Judge the result with status before acting; /forge shows it to the user.',
+    'Agent Smith · ✓ Ada (codex review) succeeded · no checks. Job ID job-1.',
+    'Read it with status before acting.',
   ].join('\n'));
 });
 
@@ -78,22 +78,32 @@ test("Claude's text: a batch is one block, counted by outcome, one line per job"
   assert.equal(lines[0], 'Agent Smith · 3 jobs: 1 succeeded, 1 failed, 1 cancelled.');
   assert.equal(lines[2], '✗ Bo (agy) failed: exit 1. Job ID b.');
   assert.equal(lines.length, 5);
+  assert.equal(lines[4], 'Read them with status before acting.');
+});
+
+test('a finished job without checks says so; a pipeline run does not', () => {
+  assert.equal(headline(notice({ name: 'Ada', provider: 'codex', role: 'review' })), '✓ Ada (codex review) succeeded · no checks');
+  assert.doesNotMatch(headline(notice({ name: 'ship', run: true })), /no checks/);
+});
+
+test('a generated name is shown as the job id, with no Job ID sentence', () => {
+  const text = claudeText([notice({ id: 'review-smith-1a2b3c4d', name: 'review-1a2b3c4d', provider: 'agy', role: 'review' })]);
+  assert.equal(text, [
+    'Agent Smith · ✓ review-smith-1a2b3c4d (agy review) succeeded · no checks.',
+    'Read it with status before acting.',
+  ].join('\n'));
+  assert.doesNotMatch(text, /Job ID/);
+});
+
+test('a chosen name keeps its identity and the Job ID sentence', () => {
+  const text = claudeText([notice({ id: 'review-smith-1a2b3c4d', name: 'Ada', provider: 'agy', role: 'review' })]);
+  assert.match(text, /^Agent Smith · ✓ Ada \(agy review\) succeeded · no checks\. Job ID review-smith-1a2b3c4d\.\n/);
 });
 
 test('a pipeline run points at pipeline_status and states its stage verdicts', () => {
   const text = claudeText([notice({ id: 'run-1', name: 'ship', role: 'pipeline', run: true, kind: 'failed', reason: 'Pipeline partial; test: execution failed, acceptance rejected.' })]);
-  assert.match(text, /^Agent Smith · ✗ ship \(pipeline\) failed\. Run ID run-1\. Runtime outcome: Pipeline partial/);
+  assert.match(text, /^Agent Smith · ✗ ship \(pipeline\) failed\. Run ID run-1\. Pipeline partial/);
   assert.match(text, /pipeline_status/);
-});
-
-test("the user's lines: one per job, a short excerpt for successes, capped", () => {
-  const lines = userLines([notice({ name: 'Ada', provider: 'codex', summary: 'Implemented the guard. ' + 'More words here. '.repeat(20) })]);
-  assert.equal(lines.length, 1);
-  assert.match(lines[0]!, /^✓ Ada \(codex\) succeeded — Implemented the guard\..*…$/);
-  assert.ok(lines[0]!.length < 140, lines[0]);
-  const many = userLines(Array.from({ length: 7 }, (_, i) => notice({ id: `j${i}` })));
-  assert.equal(many.length, 6);
-  assert.equal(many.at(-1), '+2 more · /forge');
 });
 
 // ── launch acks ─────────────────────────────────────────────────────────────
@@ -172,7 +182,7 @@ test('a claimed run is announced with its stage jobs when it ends, not before', 
   assert.deepEqual(due(owned, [stage], new Map([['run-1', record('running', null)]]), NOW).notices, [], 'a finished stage waits for its run');
   const r = due(owned, [stage], new Map([['run-1', record('passed', NOW)]]), NOW);
   assert.deepEqual(r.notices.map((n) => n.id), ['run-1', 'stage-1']);
-  assert.match(claudeText(r.notices), /✓ ship \(pipeline\) succeeded in 2m\. Run ID run-1\. Runtime outcome: Pipeline passed; test: execution succeeded, acceptance accepted\./);
+  assert.match(claudeText(r.notices), /✓ ship \(pipeline\) succeeded in 2m\. Run ID run-1\. Pipeline passed; test: execution succeeded, acceptance accepted\./);
 });
 
 test('a claim that never shows up expires silently', () => {
