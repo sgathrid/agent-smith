@@ -56,7 +56,7 @@ try {
   fakeEnv.AGENT_SMITH_AGY_BIN = fakeAgy;
   client = await openClient('agent-smith-smoke-fake', fakeEnv);
   const tools = (await client.listTools()).tools.map((tool) => tool.name);
-  const required = ['spawn_job', 'resume_job', 'run_pipeline', 'pipeline_status', 'cancel', 'list_capabilities'];
+  const required = ['spawn_job', 'resume_job', 'status', 'list_jobs', 'run_pipeline', 'pipeline_status', 'cancel', 'list_capabilities'];
   await record('MCP stdio tool discovery', async () => {
     for (const name of required) if (!tools.includes(name)) throw new Error(`Missing MCP tool ${name}`);
     return { tools: required };
