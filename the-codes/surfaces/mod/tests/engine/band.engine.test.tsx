@@ -526,6 +526,7 @@ function forgeHost(on: (...args: any[]) => void, files: Record<string,string>, i
   on('tool.call', (_$: unknown, e: any) => e.tool==='TaskCreate'?{result:{task:{id:'native-task-1'}}}
     // Core answering a spawn_job call with its ack, for launches seen through tool.call.
     :/__spawn_job$/.test(e.tool)?{result:{structuredContent:{jobId:e.jobId,repo:'/work',timeoutMs:600_000},content:[]}}
+    :/__status$/.test(e.tool)?{result:{structuredContent:{jobId:e.jobId,status:e.status??'succeeded',acceptance:{state:'accepted',pending:false}},content:[]}}
     :{result:{success:true}});
   const clock = mock.clock(on as never,{now:RUNNING_NOW});
   on('fs.list', () => ({value:ids.map(name=>({name,kind:'dir',size:0}))}));
@@ -749,9 +750,9 @@ describe('completion notices', () => {
   /** forgeHost, plus what the mod says and whether the command hook beneath ran. */
   function noticeHost(on: (...args: any[]) => void, files: Record<string,string>, ids: string[]) {
     const r = forgeHost(on, files, ids);
-    const said = { logs: [] as string[], prompts: [] as string[], hookRuns: 0 };
+    const said = { logs: [] as string[], prompts: [] as string[], origins: [] as any[], hookRuns: 0 };
     on('ui.log', (_$: unknown, e: any) => { said.logs.push(e.text); return {value:undefined}; });
-    on('prompt.submit', (_$: unknown, e: any) => { said.prompts.push(e.text); return {text:e.text}; });
+    on('prompt.submit', (_$: unknown, e: any) => { said.prompts.push(e.text); said.origins.push(e.origin); return {text:e.text}; });
     // Beneath every module: where the plugin's PostToolUse command hook runs.
     on('classic.PostToolUse', () => { said.hookRuns++; return {}; });
     on('fs.write', (_$: unknown, e: any) => { files[e.path] = e.text; return {value:undefined}; });
@@ -778,7 +779,20 @@ describe('completion notices', () => {
 
     expect(said.logs).toEqual([]); // the plugin message is the only notice
     expect(said.prompts).toHaveLength(1);
+    expect(said.origins[0]?.asUser).toBe(true);
     expect(said.prompts[0]).toMatch(/^Agent Smith · ✓ Ada \(codex review\) succeeded in 44s · 2 files changed · checks 2\/2\. Job ID job-ada\.\nRead it with status before acting\.$/);
+  });
+
+  test('a job whose settled status was already read by Claude is not announced again', async ($, on) => {
+    const files = ada('running');
+    const { clock, said } = noticeHost(on, files, ['job-ada']);
+    await start($);
+    await ($ as any).tool.call({ tool: 'mcp__plugin_agent-smith_agent-smith__spawn_job', jobId: 'job-ada' });
+    await ($ as any).tool.call({ tool: 'mcp__plugin_agent-smith_agent-smith__status', jobId: 'job-ada' });
+    Object.assign(files, ada('succeeded', { finishedAt: iso(RUNNING_NOW + 1000) }));
+    await clock.advance(3000);
+    await clock.advance(3000);
+    expect(said.prompts).toEqual([]);
   });
 
   test('a launch seen only through tool.call is claimed, marked and announced once', async ($, on) => {

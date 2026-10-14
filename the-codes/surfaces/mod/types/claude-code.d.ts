@@ -85,7 +85,7 @@ declare module 'claude-code' {
    * background job".)
    */
   export interface PromptApi {
-    submit(input: { text: string }): Promise<unknown>;
+    submit(input: { text: string; asUser?: true }): Promise<unknown>;
   }
 
   /**
@@ -243,6 +243,9 @@ declare module 'claude-code' {
        */
       readonly maxRows?: number;
       readonly scroll?: { readonly offset: number; readonly bodyRows: number };
+      readonly text?: string;
+      readonly isExpanded?: boolean;
+      readonly origin?: { readonly kind: string; readonly name?: string; readonly asUser?: boolean };
     };
   }
 

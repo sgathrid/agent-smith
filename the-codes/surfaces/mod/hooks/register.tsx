@@ -31,13 +31,17 @@ import { sortForBand } from './format.ts';
 import { readForgeJobs, readForgeDetail } from './canonical.ts';
 import {
   LAUNCH_TOOL,
+  STATUS_TOOL,
   asRunRecord,
   claim,
   claimMarkerPath,
   claudeText,
+  displayNoticeText,
   due,
   parseLaunch,
+  parseSettledRead,
   runFileName,
+  unclaim,
   type Launch,
   type Owned,
   type RunRecord,
@@ -313,7 +317,10 @@ async function announce($: EngineInterface, repo: string, jobs: readonly RadarJo
     await update($, notices, (current) => [...result.owned, ...current.filter((c) => !seen.has(`${c.kind}:${c.id}`))]);
     if (result.notices.length === 0) return;
     // Resolves when the turn starts, which waits for the session to be idle.
-    void $.prompt.submit({ text: claudeText(result.notices) }).catch(() => {});
+    // `asUser: true` omits the host's "The agent-smith plugin sent a message …
+    // This is how Claude Code surfaces a prompt a plugin submits between turns"
+    // wrapper while keeping `{ kind: 'plugin', name: 'agent-smith' }` origin.
+    void $.prompt.submit({ text: claudeText(result.notices), asUser: true }).catch(() => {});
   } finally {
     announcing = false;
   }
@@ -475,6 +482,37 @@ export function registerBand(on: Parameters<Register>[0]): void {
       if (launch !== null) await takeLaunch($, launch, '').catch(() => {});
     }
     return r;
+  });
+
+  // When Claude reads a job or pipeline that has already settled via status /
+  // pipeline_status, retire its pending notice so we don't wake Claude a second time.
+  on('classic.PostToolUse', { tool_name: STATUS_TOOL }, async ($, e, next) => {
+    const settled = parseSettledRead(e.tool_name, e.tool_response);
+    if (settled !== null) await update($, notices, (owned) => unclaim(owned, settled)).catch(() => {});
+    return next(e);
+  });
+  on('tool.call', { tool: STATUS_TOOL }, async ($, e, next) => {
+    const r = await next(e) as { result?: unknown; text?: unknown; deny?: string; isError?: boolean } | undefined;
+    if (r && r.deny === undefined && r.isError !== true) {
+      const settled = parseSettledRead(e.tool, r.result) ?? parseSettledRead(e.tool, r.text);
+      if (settled !== null) await update($, notices, (owned) => unclaim(owned, settled)).catch(() => {});
+    }
+    return r;
+  });
+
+  // Render our completion notices in the transcript as a single clean status
+  // line, while leaving the stored prompt (and ctrl+o expanded view) intact.
+  on('ui.render', { component: 'UserMessage' }, async (_$, e, next) => {
+    const origin = e.props.origin;
+    if (
+      origin?.kind === 'plugin' &&
+      origin.name === 'agent-smith' &&
+      e.props.isExpanded !== true &&
+      typeof e.props.text === 'string'
+    ) {
+      return next({ ...e, props: { ...e.props, text: displayNoticeText(e.props.text) } });
+    }
+    return next(e);
   });
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {

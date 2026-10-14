@@ -214,10 +214,15 @@ const MONITOR_CAP_MS = 1_800_000;
 const NOTIFY_NOTE = 'Completion is announced automatically by the plugin (a turn from Agent Smith, or a hook notice); if you did not receive a completion notice (hook unavailable, e.g. headless -p or other clients), run this under the Monitor tool, re-arm on expiry, or use status wait_ms.';
 
 /** monitor.js sits at dist/monitor.js; resolvable only when running from the built dist/. */
-function builtMonitorPath(moduleFile = fileURLToPath(import.meta.url)): string | undefined {
+export function builtMonitorPath(moduleFile = fileURLToPath(import.meta.url)): string | undefined {
   const marker = `${path.sep}dist${path.sep}surfaces${path.sep}channel${path.sep}src${path.sep}`;
   const at = moduleFile.lastIndexOf(marker);
-  return at < 0 ? undefined : path.join(moduleFile.slice(0, at), 'dist', 'monitor.js');
+  if (at >= 0) return path.join(moduleFile.slice(0, at), 'dist', 'monitor.js');
+  const dir = path.dirname(moduleFile);
+  if (path.basename(dir) === 'dist' && path.basename(moduleFile) === 'server.js') {
+    return path.join(dir, 'monitor.js');
+  }
+  return undefined;
 }
 
 /** The `notify` hint attached to spawn/resume/pipeline acks. Exported for tests. */

@@ -1,0 +1,5 @@
+{
+  "name": "agent-smith-runtime",
+  "private": true,
+  "type": "module"
+}

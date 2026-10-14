@@ -279,19 +279,18 @@ completion notice or call cancel.`).
 | `<repo>/.agy-staff/jobs/` | compat mirror for the mod | ignored (`.agy-staff/`) |
 | `~/.agent-smith/models.json` | user aliases | n/a |
 | `~/.agent-smith/state` (`AGENT_SMITH_STATE_DIR`) | provider state when no `stateDir` is given | n/a |
-| `builds/local-plugin/`, `.claude/settings.local.json`, `the-codes/surfaces/channel/dist/` | build output / local enablement | ignored |
-| `~/.claude/plugins` | Claude's own plugin registry/data; not written by Agent Smith setup | n/a |
+| `builds/local-plugin/agent-smith/` | self-contained built plugin (bundled runtime, hooks, types, skills) | tracked |
+| `.claude/settings.local.json`, `the-codes/surfaces/channel/dist/` | local enablement / intermediate channel build output | ignored |
+| `~/.claude/plugins` | Claude's own plugin registry/data; not written by Agent Smith local setup | n/a |
 
 ## Build and launch
 
-- `npm run build` builds the channel (`dist/server.js`, `monitor.js`, `watch-hook.js`).
-- `npm run setup:claude`: builds `builds/local-plugin/agent-smith` (copies hooks/types/skills
-  and `runtime/` with dist and node_modules, generates `hooks/watch-hooks.json`, rewrites
-  `plugin.json` with the MCP server entry `node ${CLAUDE_PLUGIN_ROOT}/runtime/dist/server.js`
-  and `AGENT_SMITH_CHANNEL=0`), validates it, and enables it in
-  `.claude/settings.local.json` via a directory marketplace. No global config is touched.
+- `/plugin install agent-smith --marketplace sgathrid/agent-smith` (or `claude plugin install agent-smith --marketplace sgathrid/agent-smith`): installs the self-contained plugin directly from the repository marketplace.
+- `npm run build` builds the channel (`dist/server.js`, `monitor.js`, `watch-hook.js`), installing channel dependencies first if missing.
+- `npm run build:plugin`: builds the channel and bundles the self-contained plugin (`builds/local-plugin/agent-smith`, with `@modelcontextprotocol/sdk` bundled into `runtime/dist/` and no `node_modules`).
+- `npm run setup:claude`: runs `build:plugin`, validates `builds/local-plugin/agent-smith`, and enables it in `.claude/settings.local.json` via a directory marketplace. No global config is touched.
 - `dev.sh [--repo DIR] [--channels] [claude flags]`: session-scoped launch with
   `--plugin-dir the-codes/surfaces/mod` and an inline MCP config (`AGY_WATCH_CWD=<repo>`);
   `--channels` adds `--dangerously-load-development-channels server:agent-smith`.
-- CLI: `agent-smith run|resume|ls|status|cancel|doctor` (`scripts/agent-smith.mjs`; Node
+- CLI: `agent-smith setup|run|resume|ls|status|cancel|gc|doctor` (`scripts/agent-smith.mjs`; Node
   >= 22.18 with native TypeScript stripping).

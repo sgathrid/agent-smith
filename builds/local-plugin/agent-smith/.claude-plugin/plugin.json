@@ -1,0 +1,22 @@
+{
+  "name": "agent-smith",
+  "version": "0.1.0",
+  "description": "Native Claude Code task-list projection and a live progress band for Agent Smith workers. The /forge command expands the bottom worker roster; an inspector is optional.",
+  "author": {
+    "name": "Agent Smith"
+  },
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "mcpServers": {
+    "agent-smith": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/runtime/dist/server.js"
+      ],
+      "env": {
+        "AGENT_SMITH_CHANNEL": "0"
+      }
+    }
+  },
+  "hooks": "./hooks/watch-hooks.json"
+}

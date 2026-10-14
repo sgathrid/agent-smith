@@ -1,8 +1,8 @@
 /** Thin terminal adapter for the canonical forge runtime. */
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { fileURLToPath } from 'node:url';
@@ -388,6 +388,83 @@ export async function cmdGc(args: GcArgs = {}): Promise<number> {
   return EXIT.ok;
 }
 
+export interface SetupArgs {
+  readonly scope?: string;
+  readonly local?: boolean;
+  readonly repo?: string;
+  readonly marketplace?: string;
+}
+
+const CHECKOUT_ROOT = path.resolve(HERE, '..', '..');
+const DEFAULT_MARKETPLACE = 'sgathrid/agent-smith';
+
+function configureLocalClaudeSettings(targetRepo: string, marketplaceRoot = CHECKOUT_ROOT): string {
+  const pluginManifest = path.join(marketplaceRoot, 'builds', 'local-plugin', 'agent-smith', '.claude-plugin', 'plugin.json');
+  const marketplaceManifest = path.join(marketplaceRoot, '.claude-plugin', 'marketplace.json');
+  if (!existsSync(pluginManifest)) throw new Error(`Missing built plugin manifest at ${pluginManifest}. Run 'npm run build:plugin' first.`);
+  if (!existsSync(marketplaceManifest)) throw new Error(`Missing marketplace manifest at ${marketplaceManifest}.`);
+  const directory = path.join(targetRepo, '.claude');
+  const settingsFile = path.join(directory, 'settings.local.json');
+  let settings: Record<string, unknown> = {};
+  if (existsSync(settingsFile)) {
+    const parsed: unknown = JSON.parse(readFileSync(settingsFile, 'utf8'));
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      throw new Error('Local Claude settings must be a JSON object.');
+    }
+    settings = { ...(parsed as Record<string, unknown>) };
+  }
+  const marketplaces = typeof settings['extraKnownMarketplaces'] === 'object' && settings['extraKnownMarketplaces'] !== null && !Array.isArray(settings['extraKnownMarketplaces'])
+    ? { ...(settings['extraKnownMarketplaces'] as Record<string, unknown>) }
+    : {};
+  delete marketplaces['agent-smith-dev'];
+  marketplaces['agent-smith'] = { source: { source: 'directory', path: marketplaceRoot } };
+  settings['extraKnownMarketplaces'] = marketplaces;
+
+  const enabled = typeof settings['enabledPlugins'] === 'object' && settings['enabledPlugins'] !== null && !Array.isArray(settings['enabledPlugins'])
+    ? { ...(settings['enabledPlugins'] as Record<string, unknown>) }
+    : {};
+  delete enabled['agent-smith@agent-smith-dev'];
+  enabled['agent-smith@agent-smith'] = true;
+  settings['enabledPlugins'] = enabled;
+
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(settingsFile, `${JSON.stringify(settings, null, 2)}\n`);
+  return settingsFile;
+}
+
+export async function cmdSetup(args: SetupArgs = {}): Promise<number> {
+  const scope = args.local === true ? 'local' : (args.scope ?? (args.repo !== undefined ? 'local' : 'user'));
+  if (scope !== 'user' && scope !== 'project' && scope !== 'local') {
+    throw new UsageError(`--scope must be user, project, or local; got '${scope}'`);
+  }
+  if (scope === 'local' && args.marketplace === undefined) {
+    const targetRepo = path.resolve(args.repo ?? process.cwd());
+    if (!existsSync(targetRepo)) throw new UsageError(`repository path does not exist: ${targetRepo}`);
+    const settingsFile = configureLocalClaudeSettings(targetRepo);
+    process.stdout.write(`Agent Smith enabled in ${settingsFile}\nStart Claude from ${targetRepo} with: claude\n\n`);
+    return cmdDoctor();
+  }
+  const localBuilt = existsSync(path.join(CHECKOUT_ROOT, '.claude-plugin', 'marketplace.json')) &&
+    existsSync(path.join(CHECKOUT_ROOT, 'builds', 'local-plugin', 'agent-smith', '.claude-plugin', 'plugin.json'));
+  const marketplace = args.marketplace ?? (localBuilt ? CHECKOUT_ROOT : DEFAULT_MARKETPLACE);
+  const claudeBin = process.env['AGENT_SMITH_CLAUDE_BIN'] || 'claude';
+  const cwd = args.repo === undefined ? process.cwd() : path.resolve(args.repo);
+  const result = spawnSync(claudeBin, ['plugin', 'install', 'agent-smith', '--marketplace', marketplace, '--scope', scope], {
+    cwd,
+    encoding: 'utf8',
+    env: process.env,
+  });
+  if (result.error !== undefined) {
+    process.stderr.write(`agent-smith: failed to run '${claudeBin} plugin install': ${result.error.message}\n`);
+    return EXIT.failed;
+  }
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+  if (result.status !== 0) return EXIT.failed;
+  process.stdout.write('\n');
+  return cmdDoctor();
+}
+
 export async function cmdDoctor(): Promise<number> {
   process.stdout.write('agent-smith doctor\n\n');
   const rows = await detectAvailable();
@@ -401,7 +478,7 @@ export async function cmdDoctor(): Promise<number> {
   return any ? EXIT.ok : EXIT.failed;
 }
 
-export const USAGE = `agent-smith — forge for coding agents\n\n  agent-smith run implement --prompt "…" [--name worker] [--repo path] [--cwd path]\n                            [--provider agy] [--model …] [--effort low] [--check "npm test"]\n  agent-smith run ./pipeline.yaml [--foreground]\n  agent-smith resume <jobId|worker-name> --prompt "…" [--repo path] [--cwd path]\n  agent-smith ls [--status running]\n  agent-smith status <runId|jobId>\n  agent-smith cancel <runId|jobId>\n  agent-smith gc [--older-than 14d] [--delete] [--dry-run] [--repo path]\n  agent-smith doctor\n\nWorkers run on this machine. They are restricted by default; --unrestricted bypasses provider approval prompts.\n`;
+export const USAGE = `agent-smith — forge for coding agents\n\n  agent-smith setup [--scope user|project|local] [--local] [--repo path]\n  agent-smith run implement --prompt "…" [--name worker] [--repo path] [--cwd path]\n                            [--provider agy] [--model …] [--effort low] [--check "npm test"]\n  agent-smith run ./pipeline.yaml [--foreground]\n  agent-smith resume <jobId|worker-name> --prompt "…" [--repo path] [--cwd path]\n  agent-smith ls [--status running]\n  agent-smith status <runId|jobId>\n  agent-smith cancel <runId|jobId>\n  agent-smith gc [--older-than 14d] [--delete] [--dry-run] [--repo path]\n  agent-smith doctor\n\nWorkers run on this machine. They are restricted by default; --unrestricted bypasses provider approval prompts.\n`;
 
 class UsageError extends Error {}
 
@@ -414,6 +491,7 @@ export async function main(argv: readonly string[]): Promise<number> {
       foreground: { type: 'boolean', default: false }, concurrency: { type: 'string' }, check: { type: 'string', multiple: true },
       status: { type: 'string' }, limit: { type: 'string' }, help: { type: 'boolean', short: 'h', default: false },
       'older-than': { type: 'string' }, delete: { type: 'boolean', default: false }, 'dry-run': { type: 'boolean', default: false },
+      scope: { type: 'string' }, local: { type: 'boolean', default: false }, marketplace: { type: 'string' },
     }, allowPositionals: true, strict: true });
   } catch (error) {
     process.stderr.write(`agent-smith: ${error instanceof Error ? error.message : String(error)}\n\n${USAGE}`);
@@ -424,6 +502,7 @@ export async function main(argv: readonly string[]): Promise<number> {
   if (values.help === true || command === undefined || command === 'help') { process.stdout.write(USAGE); return EXIT.ok; }
   try {
     switch (command) {
+      case 'setup': return await cmdSetup({ scope: values.scope, local: values.local, repo: values.repo, marketplace: values.marketplace });
       case 'run': return await cmdRun({ target: positionals[1] ?? '', prompt: values.prompt, provider: values.provider, model: values.model, effort: values.effort, timeout: values.timeout, repo: values.repo, cwd: values.cwd, name: values.name, unrestricted: values.unrestricted, foreground: values.foreground, concurrency: values.concurrency, checks: values.check });
       case 'resume': if (positionals[1] === undefined) throw new UsageError('resume needs a job id or worker name'); return await cmdResume(positionals[1], { target: 'resume', prompt: values.prompt, provider: values.provider, model: values.model, effort: values.effort, timeout: values.timeout, repo: values.repo, cwd: values.cwd, name: values.name, unrestricted: values.unrestricted, foreground: values.foreground, concurrency: values.concurrency, checks: values.check });
       case 'ls': return await cmdLs({ status: values.status, limit: values.limit === undefined ? undefined : Number(values.limit), repo: values.repo });

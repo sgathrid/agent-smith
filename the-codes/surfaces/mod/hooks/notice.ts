@@ -166,6 +166,26 @@ export function claudeText(jobs: readonly NoticeJob[]): string {
   return lines.join('\n');
 }
 
+/**
+ * The compact transcript text drawn for the user on a non-expanded UserMessage
+ * from this plugin. Strips the model instruction line ("Read it with status
+ * before acting."), the redundant "Agent Smith · " prefix (already in the host's
+ * "Prompt from the agent-smith plugin" label), and the inline Job/Run ID clause.
+ */
+export function displayNoticeText(text: string): string {
+  const lines = text
+    .split('\n')
+    .filter((line) => !/^Read (?:it|them) with (?:pipeline_status \(runs\) or )?status/.test(line))
+    .map((line) =>
+      line
+        .replace(/^Agent Smith · /, '')
+        .replace(/\. (?:Job|Run) ID [^\s.]+\.(?: )?/, (m) => (m.endsWith(' ') ? ' · ' : ''))
+        .replace(/\.$/, ''),
+    )
+    .filter((line) => line.length > 0);
+  return lines.length > 0 ? lines.join('\n') : text;
+}
+
 const STATE: Record<NoticeKind, string> = {
   finished: 'succeeded', failed: 'failed', cancelled: 'cancelled', attention: 'need attention',
 };
@@ -204,6 +224,38 @@ const LAUNCH: Record<string, 'job' | 'run'> = { spawn_job: 'job', resume_job: 'j
  * plugin (`mcp__plugin_agent-smith_agent-smith__`) and dev.sh (`mcp__agent-smith__`).
  */
 export const LAUNCH_TOOL = /^mcp__(?:plugin_agent-smith_)?agent-smith__(?:spawn_job|resume_job|run_pipeline)$/;
+export const STATUS_TOOL = /^mcp__(?:plugin_agent-smith_)?agent-smith__(?:status|pipeline_status)$/;
+
+/**
+ * When Claude reads a job or pipeline run that has already settled (including
+ * acceptance checks), return its { kind, id } so the session can retire its
+ * pending completion notice instead of waking Claude a second time.
+ */
+export function parseSettledRead(toolName: unknown, response: unknown): { readonly kind: 'job' | 'run'; readonly id: string } | null {
+  if (typeof toolName !== 'string' || !STATUS_TOOL.test(toolName)) return null;
+  const payload = unwrapResponse(response);
+  if (payload === null || typeof payload['error'] === 'string') return null;
+  const bare = toolName.slice(toolName.lastIndexOf('__') + 2);
+  if (bare === 'pipeline_status') {
+    const runId = payload['runId'];
+    const status = payload['status'];
+    if (typeof runId === 'string' && runId.length > 0 && (status === 'passed' || status === 'partial' || status === 'failed')) {
+      return { kind: 'run', id: runId };
+    }
+    return null;
+  }
+  const jobId = payload['jobId'];
+  const status = payload['status'];
+  if (typeof jobId !== 'string' || jobId.length === 0) return null;
+  if (status !== 'succeeded' && status !== 'failed' && status !== 'canceled') return null;
+  const acceptance = payload['acceptance'];
+  if (isObj(acceptance) && acceptance['pending'] === true) return null;
+  return { kind: 'job', id: jobId };
+}
+
+export function unclaim(owned: readonly Owned[], settled: { readonly kind: 'job' | 'run'; readonly id: string }): Owned[] {
+  return owned.filter((o) => !(o.kind === settled.kind && o.id === settled.id));
+}
 
 export function launchKind(toolName: unknown): 'job' | 'run' | null {
   if (typeof toolName !== 'string') return null;

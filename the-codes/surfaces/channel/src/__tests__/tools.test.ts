@@ -145,7 +145,10 @@ test('pipelines expand aliases in explicit stages and apply roleDefaults to the 
 });
 
 test('notifyHint: hook note always, monitorCommand only when the built monitor path is known, timeout capped', async () => {
-  const { notifyHint } = await import('../tools.ts');
+  const { builtMonitorPath, notifyHint } = await import('../tools.ts');
+  assert.equal(builtMonitorPath('/repo/the-codes/surfaces/channel/src/tools.ts'), undefined);
+  assert.equal(builtMonitorPath('/repo/the-codes/surfaces/channel/dist/surfaces/channel/src/tools.js'), '/repo/the-codes/surfaces/channel/dist/monitor.js');
+  assert.equal(builtMonitorPath('/plugin/runtime/dist/server.js'), '/plugin/runtime/dist/monitor.js');
   const none = notifyHint({ job: 'j1' }, '/repo', 60_000, undefined);
   assert.equal(none.mode, 'hook');
   assert.match(none.note, /announced automatically by the plugin/);

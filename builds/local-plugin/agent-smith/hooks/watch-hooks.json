@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "mcp__plugin_agent-smith_agent-smith__spawn_job|mcp__plugin_agent-smith_agent-smith__run_pipeline|mcp__plugin_agent-smith_agent-smith__resume_job",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/runtime/dist/watch-hook.js\"",
+            "asyncRewake": true,
+            "timeout": 21900
+          }
+        ]
+      }
+    ]
+  }
+}

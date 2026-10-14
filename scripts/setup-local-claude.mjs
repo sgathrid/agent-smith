@@ -24,11 +24,15 @@ if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
 // Local settings cannot set CLAUDE_CODE_PLUGIN_DIRS. A directory marketplace
 // with a relative plugin source loads the built files in place instead.
 await access(path.join(root, '.claude-plugin', 'marketplace.json'));
-settings.extraKnownMarketplaces = {
-  ...settings.extraKnownMarketplaces,
-  'agent-smith-dev': { source: { source: 'directory', path: root } },
-};
-settings.enabledPlugins = { ...settings.enabledPlugins, 'agent-smith@agent-smith-dev': true };
+const extraKnownMarketplaces = { ...settings.extraKnownMarketplaces };
+delete extraKnownMarketplaces['agent-smith-dev'];
+extraKnownMarketplaces['agent-smith'] = { source: { source: 'directory', path: root } };
+settings.extraKnownMarketplaces = extraKnownMarketplaces;
+
+const enabledPlugins = { ...settings.enabledPlugins };
+delete enabledPlugins['agent-smith@agent-smith-dev'];
+enabledPlugins['agent-smith@agent-smith'] = true;
+settings.enabledPlugins = enabledPlugins;
 await mkdir(directory, { recursive: true });
 await writeFile(settingsFile, JSON.stringify(settings, null, 2) + '\n');
 process.stdout.write(`Agent Smith enabled in ${settingsFile}\nStart Claude from ${target} with: claude\nClaude maintains its own plugin runtime state under ~/.claude/plugins.\n`);

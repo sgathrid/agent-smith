@@ -3,8 +3,8 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'no
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { buildArgv as buildClaudeArgv } from './claude.ts';
-import { buildArgv as buildCodexArgv, codexStderrLevel } from './codex.ts';
+import { buildArgv as buildClaudeArgv, buildResult as buildClaudeResult, createClaudeTranslator } from './claude.ts';
+import { buildArgv as buildCodexArgv, codexStderrLevel, createCodexTranslator } from './codex.ts';
 import { buildArgv as buildAgyArgv } from './agy.ts';
 import { buildArgv as buildOpencodeArgv } from './opencode.ts';
 import { spawnWorker } from './ndjson.ts';
@@ -59,6 +59,57 @@ test('Codex rejects an effort the CLI adapter does not support', () => {
     () => buildCodexArgv(spec({ effort: 'maximum-ish' })),
     /codex does not support effort 'maximum-ish'/,
   );
+});
+
+test('Codex completed file and MCP items without exit codes are successful activities', () => {
+  const tx = createCodexTranslator(200);
+  for (const [id, type] of [['file-1', 'file_change'], ['mcp-1', 'mcp_tool_call']] as const) {
+    const events = tx.onEvent({ type: 'item.completed', item: { id, type, output: 'done' } });
+    const end = events.at(-1);
+    assert.ok(end?.kind === 'activity-end');
+    assert.equal(end.status, 'done');
+  }
+  const command = tx.onEvent({ type: 'item.completed', item: { id: 'cmd-1', type: 'command_execution', exit_code: 0 } });
+  const commandEnd = command.at(-1);
+  assert.ok(commandEnd?.kind === 'activity-end');
+  assert.equal(commandEnd.status, 'done');
+});
+
+test('Codex output mentioning denied requests does not mark the activity denied', () => {
+  const tx = createCodexTranslator(200);
+  const events = tx.onEvent({
+    type: 'item.completed',
+    item: { id: 'mcp-1', type: 'mcp_tool_call', output: 'No denied requests were found.' },
+  });
+  const end = events.at(-1);
+  assert.ok(end?.kind === 'activity-end');
+  assert.equal(end.status, 'done');
+});
+
+test('Claude structured permission denials are deduplicated and retained on successful reports', () => {
+  const tx = createClaudeTranslator(200);
+  tx.onEvent({ type: 'system', subtype: 'permission_denied', tool_name: 'Write', tool_use_id: 'toolu-1' });
+  tx.onEvent({ type: 'result', subtype: 'success', is_error: false, result: 'Report', permission_denials: [
+    { tool_name: 'Write', tool_use_id: 'toolu-1' }, { tool_name: 'Bash', tool_use_id: 'toolu-2' },
+  ] });
+  const result = buildClaudeResult({
+    jobId: 'claude-denied-success', startedAtMs: Date.now() - 1, stateDir: '/tmp',
+    exit: { code: 0, signal: null, killReason: undefined, stderr: '' }, tx,
+  });
+  assert.equal(result.status, 'success');
+  assert.equal(result.deniedActions?.length, 2);
+});
+
+test('Claude structured permission denials block a failed report', () => {
+  const tx = createClaudeTranslator(200);
+  tx.onEvent({ type: 'result', subtype: 'error_during_execution', is_error: true, permission_denials: [
+    { tool_name: 'Bash', tool_use_id: 'toolu-2' },
+  ] });
+  const result = buildClaudeResult({
+    jobId: 'claude-denied-failure', startedAtMs: Date.now() - 1, stateDir: '/tmp',
+    exit: { code: 1, signal: null, killReason: undefined, stderr: '' }, tx,
+  });
+  assert.equal(result.status, 'denied');
 });
 
 test('Claude argv applies effort and uses --resume for continuation', () => {

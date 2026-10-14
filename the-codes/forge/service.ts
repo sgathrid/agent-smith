@@ -600,9 +600,7 @@ export class ForgeService {
         `queued ${provider.name}/${mode}` +
         (request.model === undefined ? '' : ` model=${request.model}`) +
         ` budget=${Math.round(timeoutMs / 1000)}s` +
-        (unrestricted
-          ? ' — UNRESTRICTED: tool approvals bypassed'
-          : ' — approvals enforced; a tool that needs one will be denied'),
+        (unrestricted ? '' : ' — approvals enforced; a tool that needs one will be denied'),
       sandbox,
       sandboxFlags,
       readOnlyRequested,

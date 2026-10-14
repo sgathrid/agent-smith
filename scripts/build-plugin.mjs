@@ -1,8 +1,12 @@
 #!/usr/bin/env node
-import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import commonjs from '@rollup/plugin-commonjs';
+import json from '@rollup/plugin-json';
+import nodeResolve from '@rollup/plugin-node-resolve';
+import { rollup } from 'rollup';
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_ROOT = path.resolve(SCRIPT_DIR, '..');
@@ -29,8 +33,42 @@ function writeJson(file, value) {
   writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
 }
 
+/** Bundle the channel entrypoints and MCP SDK into self-contained ESM files with no node_modules. */
+async function bundleRuntime({ channelRoot, serverSource, monitorSource, watchHookSource, outDir }) {
+  const bundle = await rollup({
+    input: {
+      server: serverSource,
+      monitor: monitorSource,
+      'watch-hook': watchHookSource,
+    },
+    plugins: [
+      nodeResolve({ preferBuiltins: true, rootDir: channelRoot }),
+      commonjs(),
+      json(),
+    ],
+    onwarn(warning, warn) {
+      if (warning.code === 'CIRCULAR_DEPENDENCY' || warning.code === 'INVALID_ANNOTATION') return;
+      warn(warning);
+    },
+  });
+  try {
+    await bundle.write({
+      dir: outDir,
+      format: 'esm',
+      compact: true,
+      entryFileNames: '[name].js',
+      chunkFileNames: 'chunk-[name].js',
+    });
+  } finally {
+    await bundle.close();
+  }
+  for (const name of ['server.js', 'monitor.js', 'watch-hook.js']) {
+    chmodSync(path.join(outDir, name), 0o755);
+  }
+}
+
 /** Build the self-contained local Claude plugin into outputRoot/agent-smith. */
-export function buildPlugin({ repoRoot = DEFAULT_ROOT, outputRoot = path.join(repoRoot, 'builds', 'local-plugin'), modRoot = path.join(repoRoot, 'the-codes', 'surfaces', 'mod'), channelRoot = path.join(repoRoot, 'the-codes', 'surfaces', 'channel') } = {}) {
+export async function buildPlugin({ repoRoot = DEFAULT_ROOT, outputRoot = path.join(repoRoot, 'builds', 'local-plugin'), modRoot = path.join(repoRoot, 'the-codes', 'surfaces', 'mod'), channelRoot = path.join(repoRoot, 'the-codes', 'surfaces', 'channel') } = {}) {
   const sourceManifest = path.join(modRoot, '.claude-plugin', 'plugin.json');
   const hooksSource = path.join(modRoot, 'hooks');
   const typesSource = path.join(modRoot, 'types');
@@ -75,14 +113,13 @@ export function buildPlugin({ repoRoot = DEFAULT_ROOT, outputRoot = path.join(re
     if (existsSync(skillsSource)) copyTree(skillsSource, path.join(staging, 'skills'), { excludeTests: true });
 
     const runtime = path.join(staging, 'runtime');
-    mkdirSync(runtime, { recursive: true });
-    copyTree(path.join(channelRoot, 'dist'), path.join(runtime, 'dist'));
-    copyTree(modulesSource, path.join(runtime, 'node_modules'));
+    const runtimeDist = path.join(runtime, 'dist');
+    mkdirSync(runtimeDist, { recursive: true });
+    await bundleRuntime({ channelRoot, serverSource, monitorSource, watchHookSource, outDir: runtimeDist });
     writeJson(path.join(runtime, 'package.json'), {
       name: 'agent-smith-runtime',
       private: true,
       type: 'module',
-      dependencies: { '@modelcontextprotocol/sdk': runtimePackage.dependencies['@modelcontextprotocol/sdk'] },
     });
 
     const toolPrefix = 'mcp__plugin_agent-smith_agent-smith__';
@@ -121,7 +158,6 @@ export function buildPlugin({ repoRoot = DEFAULT_ROOT, outputRoot = path.join(re
     required(path.join(staging, 'runtime', 'dist', 'monitor.js'), 'staged monitor entrypoint');
     required(path.join(staging, 'runtime', 'dist', 'watch-hook.js'), 'staged watch hook entrypoint');
     required(path.join(staging, 'hooks', 'watch-hooks.json'), 'staged watch hooks');
-    required(path.join(staging, 'runtime', 'node_modules', '@modelcontextprotocol', 'sdk'), 'staged MCP SDK');
 
     if (existsSync(target)) renameSync(target, backup);
     try {
@@ -140,7 +176,7 @@ export function buildPlugin({ repoRoot = DEFAULT_ROOT, outputRoot = path.join(re
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   try {
-    const target = buildPlugin();
+    const target = await buildPlugin();
     process.stdout.write(`Built local Claude plugin: ${target}${os.EOL}`);
   } catch (error) {
     process.stderr.write(`build:plugin failed: ${error instanceof Error ? error.message : String(error)}${os.EOL}`);

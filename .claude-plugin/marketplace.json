@@ -1,9 +1,9 @@
 {
-  "name": "agent-smith-dev",
+  "name": "agent-smith",
   "owner": {
     "name": "Agent Smith"
   },
-  "description": "Local Agent Smith development plugin",
+  "description": "Delegate work to Codex, OpenCode, agy, and Claude workers with executable acceptance checks and a live worker band.",
   "plugins": [
     {
       "name": "agent-smith",

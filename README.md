@@ -1,242 +1,261 @@
-# Agent Smith
+# Agent Smith <picture><source media="(prefers-color-scheme: dark)" srcset="docs/logo-options/hairline-icon-shades-dark.svg" /><source media="(prefers-color-scheme: light)" srcset="docs/logo-options/smith-shades-opencode-shadow.svg" /><img alt="" src="docs/logo-options/smith-shades-opencode-shadow.svg" height="45" align="center" /></picture>
 
-Claude Code is good at delegating. Until now it could only delegate to copies of
-itself. Agent Smith lets it hand work to Codex, OpenCode and agy as first-class
-sub-agents, and to Claude itself when the job needs more than a native sub-agent
-offers. Each runs in its own real command-line harness, under its own
-permissions, and reports back to the session that sent it.
+**Run `codex`, `agy`, and `opencode` as native sub-agents inside Claude Code.**
 
-The result is a mixed team with Claude in charge: one model writes the change,
-another reviews it, and a test suite decides whether it is finished. That last
-part matters most.
+Out of the box, Claude Code can only delegate to copies of itself. Agent Smith lets you spawn **Codex**, **agy**, **OpenCode**, and isolated **Claude** workers the exact same way you use a built-in Claude sub-agent: ask in plain English, watch them run live above your prompt and in Claude's native task list, follow up with them by name, and gate their work on real shell checks (`npm test`, `cargo check`) before Claude accepts the result.
 
-## Why another layer
+```text
+ ● Ada · codex review     reading src/pager.ts · 22 tools ·           02m18s
+ ● Gus · agy implement    cargo test --workspace · 341 tools ·        12m04s
+ ✓ Rae · codex review     finished · 2 files · checks 2/2 ·              48s
+   +1 more · /forge
+```
 
-An external agent that exits cleanly has told you only that it stopped. It may
-have been denied the tools it needed, timed out, or "succeeded" with an empty
-reply. Each of these looks like success from the outside. Agent Smith exists to
-stop that fiction reaching the session that delegated the work.
+## Install
 
-It keeps two questions apart. *Did the worker finish?* is execution, and comes
-from the harness. *Is the work acceptable?* is acceptance, and comes only from
-checks you attach, such as a test command or a linter, run after the worker
-stops. A worker's own summary is treated as a claim to be verified, never as an
-instruction to be followed.
+Requires **Node 22.18+**, **Claude Code**, and at least one worker CLI on your `PATH` (`codex`, `agy`, `opencode`, or `claude`).
 
-## Getting started
+**Inside a Claude Code session:**
+```text
+/plugin install agent-smith --marketplace sgathrid/agent-smith
+```
 
-You need Node 22.18 or later, Claude Code, and at least one worker CLI installed
-and logged in: `codex`, `opencode`, `agy` or `claude`.
+**Or from your terminal:**
+```sh
+claude plugin install agent-smith --marketplace sgathrid/agent-smith
+```
+
+Restart Claude Code after installing so the live UI band, native task projection, and completion hooks load.
+
+<details>
+<summary><strong>Local clone & single-repo setup</strong></summary>
+
+If you cloned this repository locally:
 
 ```sh
 npm install
-npm --prefix the-codes/surfaces/channel install
-npm run setup:claude
-claude
+npm run build:plugin
 ```
 
-`setup:claude` builds the plugin and registers this checkout with Claude Code for
-this project only. It writes no user-wide settings. After changing the source,
-run `npm run build:plugin` and restart Claude.
+- **Install user-wide + run `doctor`:** `npx . setup` (or `node scripts/agent-smith.mjs setup`)
+- **Enable for this checkout only** (writes `.claude/settings.local.json` with `agent-smith@agent-smith`, cleans up legacy `agent-smith-dev` entries, and never touches `~/.claude`):
+  ```sh
+  npm run setup:claude
+  ```
+- **Enable for another repo only:**
+  ```sh
+  node scripts/agent-smith.mjs setup --local --repo /path/to/your/project
+  ```
+- **Verify detected worker CLIs:** `node scripts/agent-smith.mjs doctor`
 
-To use Agent Smith in another project for a single session, without installing
-anything:
+</details>
 
-```sh
-npm run build
-/path/to/agent-smith/dev.sh --repo /path/to/your/project
+## Quick Start
+
+Talk to Claude the same way you would for a native sub-agent:
+
+> **"Have Codex review the diff on this branch. Call the worker Ada. When she finishes, ask her for a failing input on her top finding."**
+
+Or chain multiple agents together:
+
+> **"Have agy implement 30-minute idle session expiry, have Codex review the diff, and have agy fix anything Codex flags. Gate it on `npm test`."**
+
+What happens under the hood:
+1. **Background spawn:** Claude checks `list_capabilities` and launches the worker in the background. No polling loops burning your context window.
+2. **Native UI & task list:** The worker appears in Claude Code's task list and in the live status band above your prompt. Press `1`–`4` on an empty prompt (or run `/forge Ada`) to open its live transcript in the sidebar.
+3. **Verified wake:** When the worker exits, Agent Smith records the git diff, runs your shell `checks`, and wakes Claude with a single status line:
+   ```text
+   Agent Smith · ✓ Ada (codex review) succeeded in 43s · 2 files changed · checks 2/2
+   ```
+4. **Stateful follow-up:** Claude reads the report and check verdicts via `status`, and can continue that worker's exact conversation thread by name via `resume_job`.
+
+## Why Agent Smith
+
+When you shell out to an external CLI in the background, **`exit 0` only tells you the process stopped.** It might have hit a headless permission denial and exited cleanly after doing nothing, timed out, or claimed *"All tests pass!"* without running a single test.
+
+> [!IMPORTANT]
+> **Execution is not acceptance.** Agent Smith treats every worker's summary as an untrusted claim. If a worker exits `0` with an empty response or blocked tool calls, it is marked `failed` (`✗ failed · suspicious success`). A job is only marked `accepted` when the shell `checks` you attach (`npm test`, `tsc --noEmit`, `cargo test`) actually pass after the worker exits.
+
+## Core Workflows
+
+### 1. Second Opinion + Follow-Up (`spawn_job` → `resume_job`)
+
+Give a worker a `name` so Claude (or you) can follow up in the same native conversation thread:
+
+```jsonc
+// 1. Run a read-only review on Codex
+spawn_job({
+  "name": "Ada",
+  "provider": "codex",
+  "mode": "review",
+  "prompt": "Review the changes on this branch for race conditions and missed edge cases."
+})
+
+// 2. Follow up with Ada in the same Codex conversation
+resume_job({
+  "worker": "Ada",
+  "prompt": "Show a minimal reproducer for finding #2."
+})
 ```
 
-That route has no completion hook. The mod may still announce finished jobs (not yet
-verified there); if nothing arrives, ask Claude to check job status.
+### 2. Test-Gated Implementation (`checks`)
 
-Then ask for work in plain language:
+The worker sees `checks` in its brief as its definition of done, and Agent Smith executes them after the worker exits:
 
-> Have Codex review the changes on this branch. Call it Ada. When it finishes,
-> ask it to explain its most serious finding with a failing input.
+```jsonc
+spawn_job({
+  "name": "Gus",
+  "provider": "codex",
+  "mode": "implement",
+  "prompt": "Fix the off-by-one boundary in pager.ts and add a regression test.",
+  "checks": [
+    { "name": "typecheck", "command": "npm run typecheck" },
+    { "name": "unit", "command": "npm test", "timeoutMs": 120000 }
+  ]
+})
+```
 
-Claude looks up which agents and models are installed, starts the worker, and is
-woken when it finishes. It then reads the findings and follows up with the same
-worker, which still remembers the conversation.
+### 3. Multi-Model Build → Review → Fix (`run_pipeline` + `continues`)
 
-## How it works
+One model builds, another model family reviews in a read-only sandbox, and the original builder resumes its own conversation (`continues: "build"`) with the review findings to fix what was flagged:
 
-Agent Smith is an MCP server plus a small Claude Code plugin. Claude sees eight
-tools; in practice it uses four.
+```jsonc
+run_pipeline({
+  "spec": {
+    "name": "session-expiry",
+    "stages": [
+      {
+        "name": "build",
+        "provider": "agy",
+        "role": "implement",
+        "prompt": "Expire idle sessions after 30 minutes."
+      },
+      {
+        "name": "review",
+        "provider": "codex",
+        "role": "review",
+        "dependsOn": ["build"],
+        "prompt": "Review the diff for bugs, regressions, and missing tests."
+      },
+      {
+        "name": "fix",
+        "continues": "build",
+        "role": "implement",
+        "dependsOn": ["review"],
+        "prompt": "Fix every defect raised in the review.",
+        "checks": [{ "name": "tests", "command": "npm test" }]
+      }
+    ]
+  }
+})
+```
 
-- **`spawn_job`** starts a named worker on a provider (Codex, OpenCode, agy or
-  Claude) with a mode, a prompt, and optionally a working directory, model,
-  effort level and checks. It returns at once; the work carries on in the
-  background.
-- **`status`** reads a job: whether it finished, what the worker said, which
-  files changed, and whether the checks passed.
-- **`resume_job`** sends a follow-up to a finished worker by name, keeping its
-  conversation.
-- **`run_pipeline`** chains workers. For example, agy implements, Codex reviews,
-  and each stage has its own checks.
+## Live Terminal UI (`AbovePrompt` Band & `/forge`)
 
-The remaining tools list what is installed (`list_capabilities`), list past
-workers (`list_jobs`), cancel work (`cancel`) and read a pipeline's state
-(`pipeline_status`). Every parameter is documented in
-[docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+Active workers render as numbered rows right above your prompt—zero spinners, zero flicker, and invisible when idle.
 
-Claude does not poll for results. When a job finishes or needs attention, Agent
-Smith sends one short message, which you and Claude both see: `Agent Smith · ✓
-Ada (codex review) succeeded in 43s · 2 files changed · checks 2/2`. Claude then
-reads the result with `status` before acting on it.
+| Key / Command | Action |
+|---|---|
+| `1`–`4` (empty prompt) | Open the sidebar directly on band row `1`–`4` |
+| `/forge` | Open the sidebar on this session's workers |
+| `/forge <name\|jobId>` | Open a specific worker's live transcript, diff, and check output |
+| `/forge all` | Show all repository jobs across sessions (`a` / `s` toggles inside the list) |
+| `t` (in worker view) | Show the full prompt sent to the worker, including the Agent Smith brief |
+| `Enter` (on a tool row) | Inspect tool call input and output |
+| `b` / `x` | Back to worker list / Close the sidebar |
+
+## Modes, Sandboxes & Models
 
 ### Modes
 
-Every job has one of four modes. A mode frames the request and sets how much the
-worker may touch. It never chooses the model.
+A mode sets the worker's brief and sandbox posture—never the model.
 
-| Mode | What the worker is asked to do |
-|---|---|
-| `implement` | Make the change, keeping it small enough to review. |
-| `review` | Find defects, missed cases and unsupported claims, without editing. |
-| `moderate` | Independently confirm or refute earlier work and a reviewer's claims. |
-| `verify` | Run the checks and report exactly what happened, failures included. |
+| Mode | Purpose | Read-Only? | Runs Commands? |
+|---|---|---|---|
+| `implement` | Make focused code changes small enough to review | No | Yes |
+| `review` | Find defects, regressions, and unsupported claims without editing files | Yes | No |
+| `moderate` | Independently verify or refute earlier work and reviewer claims | Yes | No |
+| `verify` | Run verification commands and report exact outcomes without editing | No | Yes |
 
-Every worker also gets a short brief ahead of your prompt: who it is working for,
-the directory it may change, why the work matters (the optional `context` you
-pass), and the checks that will judge it. Workers do better when they know the
-bar they will be held to.
+### Sandboxing & Permissions
 
-"Without editing" is enforced where the harness allows it: Codex runs in a
-read-only sandbox, and Claude workers are denied editing tools. For agy and
-OpenCode it is an instruction only. The job's `readOnlyEnforced` field tells you
-which you got.
+Workers do not inherit your Claude Code session's permissions. Each runs under its own CLI harness defaults:
 
-### Checks
+| Provider | Default Sandbox Posture | Read-Only Enforcement (`review` / `moderate`) |
+|---|---|---|
+| **`codex`** | `-s workspace-write` (writes restricted to workspace) | Enforced by sandbox (`-s read-only`) |
+| **`claude`** | `--permission-mode dontAsk --permission-prompts none` | Enforced (`--disallowedTools Edit Write NotebookEdit` + read-only shell allowlist) |
+| **`opencode`** | Harness default permission rules | Prompt instruction (`readOnlyEnforced: false`) |
+| **`agy`** | Unrestricted by default (headless `agy` cannot prompt and silently refuses tools otherwise; pass `unrestricted: false` or `AGENT_SMITH_AGY_RESTRICTED=1` to restrict) | Prompt instruction (`readOnlyEnforced: false`) |
 
-A check is a command that must succeed:
+Passing `unrestricted: true` to `codex`, `claude`, or `opencode` asks for confirmation in Claude Code before launching (disable in headless automation with `AGENT_SMITH_CONFIRM_UNRESTRICTED=0`). To keep parallel `implement` workers from stepping on each other's uncommitted edits, point each at its own git worktree via `cwd`.
+
+### Dynamic Model Discovery & `models.json`
+
+Agent Smith ships **no hardcoded model list**. It queries your installed CLIs (`codex debug models`, `agy models`, `opencode models`, and local config files) so new models work immediately.
+
+> [!NOTE]
+> For ordinary Claude sub-agents, Claude Code uses its built-in `Agent` tool by default. It only uses Agent Smith's `claude` provider when a Claude worker needs executable `checks`, a stage in a pipeline, a named conversation to `resume_job` later, or isolated permissions.
+
+You can optionally define model aliases or per-mode defaults in `<repo>/.agent-smith/models.json` or `~/.agent-smith/models.json`:
 
 ```json
-{ "name": "tests", "command": "npm test", "timeoutMs": 300000 }
+{
+  "aliases": {
+    "fast": { "provider": "codex", "model": "gpt-5-mini", "effort": "low" },
+    "deep": { "provider": "codex", "effort": "high" }
+  },
+  "roleDefaults": { "review": "deep", "moderate": "deep" }
+}
 ```
 
-Checks run in the worker's directory after it finishes. The job is then
-*accepted* or *rejected*. Without checks it is *unchecked*: Agent Smith will tell
-you the worker finished, but not that it was right. A check marked
-`"blocking": false` is reported but does not decide the verdict.
+## MCP Tools & Standalone CLI
 
-### Models
+| MCP Tool | What it does |
+|---|---|
+| `spawn_job` | Launch a named background worker (`implement`, `review`, `moderate`, `verify`) with optional `context`, `cwd`, `model`, `effort`, and `checks`. |
+| `resume_job` | Follow up with a finished worker by `name` or `jobId`, continuing its native conversation. |
+| `run_pipeline` | Run a multi-stage DAG of workers with per-stage `checks`, artifact handoffs, and `continues` loops. |
+| `status` | Read a job's state, worker report, `acceptance` check results, `changedFiles`, and optional git `diff` (`include_diff: true`). |
+| `pipeline_status` | Read per-stage statuses, acceptance verdicts, and artifacts for a pipeline run. |
+| `list_jobs` | List running and recent jobs (filtered by `status`, `since`, `session`). |
+| `list_capabilities` | Discover installed provider CLIs, available models, effort levels, and configured aliases. |
+| `cancel` | Cancel a running job or pipeline. |
 
-Agent Smith ships no model list. It asks each installed harness what it
-supports, so the choice is always current. Leave the model out and each harness
-uses its own default. Claude Code already runs Claude models as native
-sub-agents, and Claude prefers those. It uses Agent Smith's `claude` provider
-only when a Claude worker needs checks, a place in a pipeline, a name to resume
-later, or permissions separate from your session. Recurring choices can be
-named in an optional `models.json`, as in "use `sol-high` for every review"; see
-[docs/CONFIGURATION.md](docs/CONFIGURATION.md).
-
-### Permissions
-
-Workers start with their harness's own restricted settings, not the permissions
-of your Claude session. Codex can write to its workspace and nothing else.
-Claude, run headless, is refused any tool it would have to ask about.
-`unrestricted: true` lifts these limits.
-
-agy is the exception. Headless, it cannot ask permission and silently refuses
-instead, so it runs unrestricted by default. Set `unrestricted: false`, or
-`AGENT_SMITH_AGY_RESTRICTED=1`, to change that. Workers edit the directory they
-are given. To keep parallel workers from treading on each other, give each its
-own git worktree.
-
-## Watching the work
-
-Running workers appear as numbered rows above the prompt. With the prompt
-empty, press a row's digit to open a sidebar on that worker: its task, its
-live output as it arrives, and then its result and any failing checks.
-`/forge` opens the same sidebar on the list of running and recent workers, and
-`/forge Ada` opens the worker named Ada directly. Like Claude Code's own
-sub-agents, the rows, the list and its counts cover only the workers this
-session started; `/forge all` (or `a` in the list) shows every job the
-repository has run. The keys are in the
-[pane's README](the-codes/surfaces/mod/README.md).
-
-Everything the panel shows is read from plain files in `.agent-smith/jobs/` in
-your repository, one directory per job. If the panel and Claude ever disagree,
-those files are the record. They accumulate. `node scripts/agent-smith.mjs gc`
-moves finished jobs older than a fortnight into `.agent-smith/archive/`.
-`--dry-run` shows what would move; `--delete` discards them instead.
-
-## Examples
-
-A fix that only counts if the tests pass:
-
-```
-spawn_job { "mode": "implement", "name": "Ada", "provider": "codex",
-            "prompt": "Fix the off-by-one in pager.ts and add a test.",
-            "checks": [{ "name": "tests", "command": "npm test" }] }
-```
-
-One agent builds, another reviews, and the first fixes what the review found:
-
-```
-run_pipeline { "spec": { "name": "session-expiry",
-  "stages": [
-    { "name": "build",  "provider": "agy",   "role": "implement",
-      "prompt": "Expire idle sessions after 30 minutes." },
-    { "name": "review", "provider": "codex", "role": "review",
-      "dependsOn": ["build"], "prompt": "Review the change." },
-    { "name": "fix", "continues": "build", "role": "implement",
-      "dependsOn": ["review"], "prompt": "Fix what the review found.",
-      "checks": [{ "name": "tests", "command": "npm test" }] }
-  ] } }
-```
-
-`continues` resumes the builder's own conversation, so it fixes code it already
-knows, with the review in front of it.
-
-A second opinion from a different model family, then a follow-up:
-
-```
-spawn_job  { "mode": "review", "name": "Rae", "provider": "codex",
-             "prompt": "Review the diff on this branch." }
-resume_job { "worker": "Rae", "prompt": "Explain finding 2 with a failing input." }
-```
-
-## When things go wrong
-
-- **A provider shows as unavailable.** The MCP server could not find the binary.
-  It inherits the `PATH` of whatever launched Claude. Restart Claude, or point at
-  the binary with `AGENT_SMITH_CODEX_BIN` (likewise `_OPENCODE_`, `_AGY_`,
-  `_CLAUDE_`).
-- **Claude is never woken.** Notices come from the installed plugin and load only
-  after a restart. Without the plugin's mod, a fallback hook wakes Claude instead,
-  and Claude Code labels that wake "Stop hook feedback"; it is a notice, not an
-  error. If neither arrives, ask for `status` with `wait_ms`.
-- **A worker "succeeded" but did nothing.** It was probably refused a tool.
-  Agent Smith records that as a failure. The job's `nextAction` suggests a fix,
-  usually rerunning with `unrestricted: true`. Do that only if you accept what
-  the worker could then do.
-- **A job was cut off.** The default budget is 45 minutes; raise `timeoutMs` or
-  split the task. A job whose supervising process died is marked as orphaned
-  rather than left "running" for ever.
-
-## Limits
-
-Running workers cannot be steered; you can follow up only once they finish. MCP's
-new Tasks extension is not used, because Claude Code does not yet support it.
-Agent Smith's own job files already do that work. OpenCode support is
-provisional until it has been tested against a working account. Whether a very
-long job's completion hook survives Claude's own time limits has not been
-verified.
-
-## Working on Agent Smith
+Every feature also works directly from your shell via the standalone CLI:
 
 ```sh
-npm run verify          # typecheck and the full test suite
-npm run smoke           # MCP smoke test against fake Codex and agy CLIs
-npm run build:plugin    # rebuild the plugin, then restart Claude
+node scripts/agent-smith.mjs doctor
+node scripts/agent-smith.mjs run implement --provider codex --name Ada --prompt "Fix pager.ts" --check "npm test"
+node scripts/agent-smith.mjs resume Ada --prompt "Add an edge-case test for empty pages"
+node scripts/agent-smith.mjs run ./the-codes/cli/pipeline.example.yaml
+node scripts/agent-smith.mjs ls --status running
+node scripts/agent-smith.mjs status <jobId-or-runId>
+node scripts/agent-smith.mjs cancel <jobId-or-runId>
+node scripts/agent-smith.mjs gc --older-than 14d        # archive old settled jobs (--dry-run, --delete)
 ```
 
-Tests use fake CLIs through the real process and MCP boundaries, so they spend
-no model quota. `node scripts/smoke.mjs --live --providers=agy,codex` repeats the
-smoke test against the real agents. The design is described in
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and delivery status in
-[PROGRESS.md](PROGRESS.md).
+All job state is stored as plain files in `<repo>/.agent-smith/jobs/<jobId>/` (`job.json`, `progress.json`, `events.jsonl`, `result.md`, `acceptance.json`).
+
+## Troubleshooting
+
+- **Provider shows as unavailable:** The MCP server inherits the `PATH` of the shell that launched Claude Code. Restart Claude Code where `codex` / `agy` / `opencode` / `claude` is on `PATH`, or set `AGENT_SMITH_CODEX_BIN`, `AGENT_SMITH_AGY_BIN`, `AGENT_SMITH_OPENCODE_BIN`, or `AGENT_SMITH_CLAUDE_BIN`.
+- **Claude isn't woken when a job finishes:** Restart Claude Code after installing the plugin. When the fallback hook wakes Claude, Claude Code labels the message *"Stop hook feedback"*—that label is normal host behavior, not an error.
+- **Worker failed with denied actions:** The worker hit a sandbox limit. Check `nextAction` in `status`; if appropriate, re-run or resume with `unrestricted: true`.
+- **Job timed out or orphaned:** Default timeout is 45 minutes (`timeoutMs` up to 6 hours). If a supervising process dies, Agent Smith marks the job `failed (orphaned)` instead of leaving it stuck on `running`.
+
+## Development & Docs
+
+```sh
+npm install
+npm run verify          # Typecheck + test suite (uses fake CLIs, zero token spend)
+npm run smoke           # End-to-end MCP smoke test against fake Codex and agy CLIs
+npm run build:plugin    # Bundle self-contained plugin into builds/local-plugin/agent-smith
+npm run setup:claude    # Build, validate, and enable in .claude/settings.local.json
+```
+
+- [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — MCP tool schemas, environment variables, timeouts, and `models.json`.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — Job directory format, status derivation, orphan recovery, and notifications.
+- [the-codes/surfaces/mod/README.md](the-codes/surfaces/mod/README.md) — `AbovePrompt` worker band and `/forge` sidebar internals.
 
 MIT licensed.

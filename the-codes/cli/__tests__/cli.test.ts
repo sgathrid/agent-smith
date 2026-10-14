@@ -1,7 +1,7 @@
 import { assertFakeProviderActive } from '../../forge/testing/shim.ts';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -240,4 +240,50 @@ test('gc rejects an --older-than value that is not an age', async () => {
   const { code, err } = await captureMain(['gc', '--repo', repo, '--older-than', '2 weeks']);
   assert.equal(code, 1);
   assert.match(err, /--older-than: '2 weeks' is not an age/);
+});
+
+test('setup --repo writes local Claude settings, migrates agent-smith-dev, and runs doctor', async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-setup-local-'));
+  const claudeDir = path.join(repo, '.claude');
+  mkdirSync(claudeDir, { recursive: true });
+  writeFileSync(path.join(claudeDir, 'settings.local.json'), JSON.stringify({
+    extraKnownMarketplaces: { 'agent-smith-dev': { source: { source: 'directory', path: '/old' } } },
+    enabledPlugins: { 'agent-smith@agent-smith-dev': true, 'other@mkt': true },
+  }));
+
+  const { code, out, err } = await captureMain(['setup', '--repo', repo]);
+  assert.equal(code, 0, err);
+  assert.match(out, /Agent Smith enabled in /);
+  assert.match(out, /agent-smith doctor/);
+  const settings = JSON.parse(readFileSync(path.join(claudeDir, 'settings.local.json'), 'utf8'));
+  assert.equal('agent-smith-dev' in settings.extraKnownMarketplaces, false);
+  assert.equal(settings.extraKnownMarketplaces['agent-smith'].source.source, 'directory');
+  assert.equal('agent-smith@agent-smith-dev' in settings.enabledPlugins, false);
+  assert.equal(settings.enabledPlugins['agent-smith@agent-smith'], true);
+  assert.equal(settings.enabledPlugins['other@mkt'], true);
+});
+
+test('setup installs via claude plugin install at user scope by default and rejects bad scopes', async () => {
+  const scratch = mkdtempSync(path.join(tmpdir(), 'agent-smith-setup-user-'));
+  const fakeClaude = path.join(scratch, 'fake-claude');
+  const argsFile = path.join(scratch, 'args.json');
+  writeFileSync(fakeClaude, `#!${process.execPath}\nconst fs = require('node:fs');\nfs.writeFileSync(${JSON.stringify(argsFile)}, JSON.stringify(process.argv.slice(2)));\nconsole.log('Successfully installed plugin: agent-smith@agent-smith (scope: user)');\n`);
+  chmodSync(fakeClaude, 0o755);
+  const prevClaude = process.env['AGENT_SMITH_CLAUDE_BIN'];
+  process.env['AGENT_SMITH_CLAUDE_BIN'] = fakeClaude;
+  try {
+    const { code, out, err } = await captureMain(['setup', '--marketplace', 'sgathrid/agent-smith']);
+    assert.equal(code, 0, err);
+    assert.match(out, /Successfully installed plugin: agent-smith@agent-smith/);
+    assert.match(out, /agent-smith doctor/);
+    const recorded = JSON.parse(readFileSync(argsFile, 'utf8'));
+    assert.deepEqual(recorded, ['plugin', 'install', 'agent-smith', '--marketplace', 'sgathrid/agent-smith', '--scope', 'user']);
+
+    const bad = await captureMain(['setup', '--scope', 'bogus']);
+    assert.equal(bad.code, 1);
+    assert.match(bad.err, /--scope must be user, project, or local/);
+  } finally {
+    if (prevClaude === undefined) delete process.env['AGENT_SMITH_CLAUDE_BIN'];
+    else process.env['AGENT_SMITH_CLAUDE_BIN'] = prevClaude;
+  }
 });
