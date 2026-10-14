@@ -47,6 +47,12 @@ npm run build:plugin
   node scripts/agent-smith.mjs setup --local --repo /path/to/your/project
   ```
 - **Verify detected worker CLIs:** `node scripts/agent-smith.mjs doctor`
+- **Uninstall (leave zero trace):**
+  - Inside Claude Code: `/plugin marketplace remove agent-smith` (removes the marketplace and uninstalls the plugin, mod, hooks, and MCP server)
+  - Full zero-trace cleanup (also purges `.agent-smith/`, mirrored `.agy-staff/jobs/` entries, `.claude/settings.local.json`, and cached plugin folders):
+    ```sh
+    node scripts/agent-smith.mjs uninstall
+    ```
 
 </details>
 

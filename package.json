@@ -14,10 +14,11 @@
     "test": "node --test --experimental-strip-types \"the-codes/**/*.test.ts\" \"the-codes/**/*.node-test.ts\" \"!the-codes/**/node_modules/**\" scripts/testing/smoke.test.mjs",
     "smoke": "node scripts/smoke.mjs",
     "typecheck": "tsc --noEmit",
-    "prebuild": "[ -d the-codes/surfaces/channel/node_modules/@modelcontextprotocol/sdk ] || npm --prefix the-codes/surfaces/channel install --no-audit --no-fund",
+    "prebuild": "[ -d the-codes/surfaces/channel/node_modules/@modelcontextprotocol/server ] || npm --prefix the-codes/surfaces/channel install --no-audit --no-fund",
     "build": "npm --prefix the-codes/surfaces/channel run build",
     "build:plugin": "npm run build && node scripts/build-plugin.mjs",
     "setup:claude": "npm run build:plugin && claude plugin validate builds/local-plugin/agent-smith && node scripts/setup-local-claude.mjs",
+    "uninstall:claude": "node scripts/agent-smith.mjs uninstall --local",
     "test:plugin": "claude plugin validate the-codes/surfaces/mod && claude plugin test the-codes/surfaces/mod",
     "verify": "npm run typecheck && npm test"
   },

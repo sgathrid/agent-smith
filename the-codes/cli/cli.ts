@@ -2,16 +2,19 @@
 
 import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmdirSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { fileURLToPath } from 'node:url';
 
 import { ForgeService, pipelineRecordPath } from '../forge/service.ts';
 import { writeJsonAtomic } from '../forge/atomic.ts';
-import { archivedJobsDir, FILES, jobFile, jobsDir } from '../forge/format.ts';
+import { archivedJobsDir, FILES, isForgeJobId, jobFile, jobsDir } from '../forge/format.ts';
+import { MIRROR_MARKER, mirrorDir } from '../forge/mirror.ts';
 import { startPipeline, cancelPipeline, readPipeline } from '../forge/execute.ts';
 import type { PipelineRun, PipelineSpec, Stage } from '../pipeline/types.ts';
+import { checkCompatibility } from '../providers/compatibility.ts';
 import { detectAvailable, missingProviders } from '../providers/registry.ts';
 import { allLadders } from './ladders.ts';
 import { loadSpec, parseDuration, parseYaml, specFrom } from './spec.ts';
@@ -465,20 +468,245 @@ export async function cmdSetup(args: SetupArgs = {}): Promise<number> {
   return cmdDoctor();
 }
 
+export interface UninstallArgs {
+  readonly local?: boolean;
+  readonly repo?: string;
+  readonly keepJobs?: boolean;
+  readonly homeDir?: string;
+}
+
+const MARKETPLACE_KEYS = ['agent-smith', 'agent-smith-dev'] as const;
+const PLUGIN_IDS = ['agent-smith@agent-smith', 'agent-smith@agent-smith-dev', 'agent-smith@inline'] as const;
+const MIRROR_SUFFIXES = ['.spec.json', '.progress.json', '.result.md.status.json', '.result.md', '.log', '.events.jsonl', '.spec.json.cancel'] as const;
+
+function removeEmptyDirIfPossible(dir: string): void {
+  try {
+    if (existsSync(dir) && readdirSync(dir).length === 0) rmdirSync(dir);
+  } catch { /* non-empty or raced */ }
+}
+
+/** Remove Agent Smith entries from a Claude settings JSON file; delete the file if it becomes empty. */
+function scrubClaudeSettingsFile(settingsFile: string): boolean {
+  if (!existsSync(settingsFile)) return false;
+  let parsed: unknown;
+  try { parsed = JSON.parse(readFileSync(settingsFile, 'utf8')); } catch { return false; }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return false;
+  const settings = { ...(parsed as Record<string, unknown>) };
+  let changed = false;
+
+  for (const [sectionKey, targetKeys] of [
+    ['extraKnownMarketplaces', MARKETPLACE_KEYS],
+    ['enabledPlugins', PLUGIN_IDS],
+    ['pluginConfigs', PLUGIN_IDS],
+  ] as const) {
+    const raw = settings[sectionKey];
+    if (typeof raw === 'object' && raw !== null && !Array.isArray(raw)) {
+      const copy = { ...(raw as Record<string, unknown>) };
+      for (const k of targetKeys) {
+        if (k in copy) { delete copy[k]; changed = true; }
+      }
+      if (Object.keys(copy).length === 0) delete settings[sectionKey];
+      else settings[sectionKey] = copy;
+    }
+  }
+  if (!changed) return false;
+  if (Object.keys(settings).length === 0) {
+    try { unlinkSync(settingsFile); } catch { /* ignore */ }
+    removeEmptyDirIfPossible(path.dirname(settingsFile));
+  } else {
+    writeFileSync(settingsFile, `${JSON.stringify(settings, null, 2)}\n`);
+  }
+  return true;
+}
+
+/** Remove only Agent Smith's own mirrored files from `<repo>/.agy-staff/jobs/`, leaving genuine agy-staff jobs untouched. */
+function scrubMirrorDir(repo: string): number {
+  const dir = mirrorDir(repo);
+  if (!existsSync(dir)) return 0;
+  let removedJobs = 0;
+  let entries: string[] = [];
+  try { entries = readdirSync(dir); } catch { return 0; }
+  for (const name of entries) {
+    if (!name.endsWith('.spec.json')) continue;
+    const jobId = name.slice(0, -'.spec.json'.length);
+    let ours = isForgeJobId(jobId);
+    if (!ours) {
+      try {
+        const spec = JSON.parse(readFileSync(path.join(dir, name), 'utf8')) as Record<string, unknown>;
+        ours = spec[MIRROR_MARKER] === true;
+      } catch { /* unreadable spec: leave it alone */ }
+    }
+    if (!ours) continue;
+    for (const suffix of MIRROR_SUFFIXES) {
+      rmSync(path.join(dir, `${jobId}${suffix}`), { force: true });
+    }
+    removedJobs += 1;
+  }
+  removeEmptyDirIfPossible(dir);
+  removeEmptyDirIfPossible(path.dirname(dir));
+  return removedJobs;
+}
+
+/** Cancel any live pipelines or jobs in `repo` before removing state. */
+function cancelLiveWorkInRepo(repo: string): void {
+  const pipelinesDir = path.join(repo, '.agent-smith', 'pipelines');
+  try {
+    for (const name of readdirSync(pipelinesDir)) {
+      if (!name.endsWith('.json')) continue;
+      const runId = name.slice(0, -'.json'.length);
+      try {
+        const rec = readPipeline(repo, runId);
+        if (rec?.status === 'running') cancelPipeline(repo, runId);
+      } catch { /* ignore */ }
+    }
+  } catch { /* no pipelines dir */ }
+  try {
+    const service = new ForgeService({ repo });
+    for (const entry of readdirSync(jobsDir(repo), { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const job = readJobRecord(repo, entry.name);
+      if (job?.['status'] === 'running') {
+        try { service.cancel(entry.name); } catch { /* ignore */ }
+      }
+    }
+  } catch { /* no jobs dir */ }
+}
+
+/** Remove Agent Smith entries and cached directories under `~/.claude/plugins`. */
+function scrubClaudePluginsRoot(pluginsRoot: string): string[] {
+  const removed: string[] = [];
+  for (const rel of [
+    path.join('cache', 'agent-smith'),
+    path.join('cache', 'agent-smith-dev'),
+    path.join('marketplaces', 'agent-smith'),
+    path.join('marketplaces', 'agent-smith-dev'),
+    path.join('data', 'agent-smith-agent-smith'),
+    path.join('data', 'agent-smith-agent-smith-dev'),
+    path.join('store', 'agent-smith'),
+    path.join('store', 'agent-smith-agent-smith'),
+  ]) {
+    const target = path.join(pluginsRoot, rel);
+    if (existsSync(target)) {
+      rmSync(target, { recursive: true, force: true });
+      removed.push(target);
+    }
+  }
+  const knownFile = path.join(pluginsRoot, 'known_marketplaces.json');
+  if (existsSync(knownFile)) {
+    try {
+      const parsed = JSON.parse(readFileSync(knownFile, 'utf8')) as Record<string, unknown>;
+      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+        let changed = false;
+        for (const key of MARKETPLACE_KEYS) {
+          if (key in parsed) { delete parsed[key]; changed = true; }
+        }
+        if (changed) writeFileSync(knownFile, `${JSON.stringify(parsed, null, 2)}\n`);
+      }
+    } catch { /* leave unreadable file alone */ }
+  }
+  const installedFile = path.join(pluginsRoot, 'installed_plugins.json');
+  if (existsSync(installedFile)) {
+    try {
+      const parsed = JSON.parse(readFileSync(installedFile, 'utf8')) as Record<string, unknown>;
+      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+        let changed = false;
+        for (const key of PLUGIN_IDS) {
+          if (key in parsed) { delete parsed[key]; changed = true; }
+        }
+        if (typeof parsed['plugins'] === 'object' && parsed['plugins'] !== null && !Array.isArray(parsed['plugins'])) {
+          const pluginsMap = parsed['plugins'] as Record<string, unknown>;
+          for (const key of PLUGIN_IDS) {
+            if (key in pluginsMap) { delete pluginsMap[key]; changed = true; }
+          }
+        }
+        if (changed) writeFileSync(installedFile, `${JSON.stringify(parsed, null, 2)}\n`);
+      }
+    } catch { /* leave unreadable file alone */ }
+  }
+  return removed;
+}
+
+/**
+ * Leave-zero-trace uninstaller: removes plugin/mod/hooks/MCP registrations,
+ * immediate-purges Claude Code's 14-day plugin cache/data/marketplace clones,
+ * and cleans `.agent-smith/` + mirrored `.agy-staff/jobs/` entries.
+ */
+export async function cmdUninstall(args: UninstallArgs = {}): Promise<number> {
+  const targetRepo = path.resolve(args.repo ?? process.cwd());
+  const localOnly = args.local === true;
+  const home = args.homeDir ?? os.homedir();
+  const actions: string[] = [];
+
+  cancelLiveWorkInRepo(targetRepo);
+
+  if (!localOnly) {
+    const claudeBin = process.env['AGENT_SMITH_CLAUDE_BIN'] || 'claude';
+    for (const mkt of MARKETPLACE_KEYS) {
+      spawnSync(claudeBin, ['plugin', ' uninstall', `agent-smith@${mkt}`].map((s) => s.trim()), { cwd: targetRepo, encoding: 'utf8', env: process.env });
+      spawnSync(claudeBin, ['plugin', 'marketplace', 'remove', mkt], { cwd: targetRepo, encoding: 'utf8', env: process.env });
+    }
+  }
+
+  for (const settingsFile of [
+    path.join(targetRepo, '.claude', 'settings.local.json'),
+    path.join(targetRepo, '.claude', 'settings.json'),
+    ...(localOnly ? [] : [path.join(home, '.claude', 'settings.json')]),
+  ]) {
+    if (scrubClaudeSettingsFile(settingsFile)) actions.push(`cleaned ${settingsFile}`);
+  }
+
+  if (!localOnly) {
+    const pluginsRoot = process.env['CLAUDE_CODE_PLUGIN_CACHE_DIR'] || path.join(home, '.claude', 'plugins');
+    for (const dir of scrubClaudePluginsRoot(pluginsRoot)) actions.push(`removed ${dir}`);
+  }
+
+  if (args.keepJobs !== true) {
+    const repoState = path.join(targetRepo, '.agent-smith');
+    if (existsSync(repoState)) {
+      rmSync(repoState, { recursive: true, force: true });
+      actions.push(`removed ${repoState}`);
+    }
+    const mirrored = scrubMirrorDir(targetRepo);
+    if (mirrored > 0) actions.push(`removed ${mirrored} mirrored job(s) from ${mirrorDir(targetRepo)}`);
+
+    if (!localOnly) {
+      const userState = process.env['AGENT_SMITH_STATE_DIR']
+        ? path.resolve(process.env['AGENT_SMITH_STATE_DIR'])
+        : path.join(home, '.agent-smith');
+      if (existsSync(userState)) {
+        rmSync(userState, { recursive: true, force: true });
+        actions.push(`removed ${userState}`);
+      }
+    }
+  }
+
+  if (actions.length === 0) {
+    process.stdout.write('Agent Smith: nothing to remove (already clean).\n');
+  } else {
+    for (const line of actions) process.stdout.write(`✓ ${line}\n`);
+    process.stdout.write('Agent Smith uninstalled cleanly.\n');
+  }
+  return EXIT.ok;
+}
+
 export async function cmdDoctor(): Promise<number> {
-  process.stdout.write('agent-smith doctor\n\n');
+  process.stdout.write('agent-smith doctor — adapter feature compatibility\n\n');
   const rows = await detectAvailable();
+  const compatibility = await Promise.all(rows.map(row => row.available
+    ? checkCompatibility(row.name, row.binary) : Promise.resolve(null)));
   const width = Math.max(0, ...rows.map((row) => row.name.length));
   let any = false;
-  for (const row of rows) {
-    if (row.available) any = true;
-    process.stdout.write(` ${row.available ? '●' : '○'} ${row.name.padEnd(width)}  ${row.available ? 'available' : 'not installed'}  (${row.binary})\n`);
+  for (const [index, row] of rows.entries()) {
+    const diagnostic = compatibility[index];
+    if (diagnostic?.state === 'compatible') any = true;
+    process.stdout.write(` ${diagnostic?.state === 'compatible' ? '●' : '○'} ${row.name.padEnd(width)}  ${diagnostic?.state ?? 'not installed'}  (${row.binary})\n`);
+    if (diagnostic) process.stdout.write(`   ${diagnostic.version ?? 'version unknown'} — ${diagnostic.reason}\n`);
   }
   process.stdout.write(`\nstate\n  repo  ${process.cwd()}\n  jobs  ${path.join(process.cwd(), '.agent-smith', 'jobs')}\n`);
   return any ? EXIT.ok : EXIT.failed;
 }
 
-export const USAGE = `agent-smith — forge for coding agents\n\n  agent-smith setup [--scope user|project|local] [--local] [--repo path]\n  agent-smith run implement --prompt "…" [--name worker] [--repo path] [--cwd path]\n                            [--provider agy] [--model …] [--effort low] [--check "npm test"]\n  agent-smith run ./pipeline.yaml [--foreground]\n  agent-smith resume <jobId|worker-name> --prompt "…" [--repo path] [--cwd path]\n  agent-smith ls [--status running]\n  agent-smith status <runId|jobId>\n  agent-smith cancel <runId|jobId>\n  agent-smith gc [--older-than 14d] [--delete] [--dry-run] [--repo path]\n  agent-smith doctor\n\nWorkers run on this machine. They are restricted by default; --unrestricted bypasses provider approval prompts.\n`;
+export const USAGE = `agent-smith — forge for coding agents\n\n  agent-smith setup [--scope user|project|local] [--local] [--repo path]\n  agent-smith uninstall [--local] [--repo path] [--keep-jobs]\n  agent-smith run implement --prompt "…" [--name worker] [--repo path] [--cwd path]\n                            [--provider agy] [--model …] [--effort low] [--check "npm test"]\n  agent-smith run ./pipeline.yaml [--foreground]\n  agent-smith resume <jobId|worker-name> --prompt "…" [--repo path] [--cwd path]\n  agent-smith ls [--status running]\n  agent-smith status <runId|jobId>\n  agent-smith cancel <runId|jobId>\n  agent-smith gc [--older-than 14d] [--delete] [--dry-run] [--repo path]\n  agent-smith doctor\n\nWorkers run on this machine. They are restricted by default; --unrestricted bypasses provider approval prompts.\n`;
 
 class UsageError extends Error {}
 
@@ -491,7 +719,7 @@ export async function main(argv: readonly string[]): Promise<number> {
       foreground: { type: 'boolean', default: false }, concurrency: { type: 'string' }, check: { type: 'string', multiple: true },
       status: { type: 'string' }, limit: { type: 'string' }, help: { type: 'boolean', short: 'h', default: false },
       'older-than': { type: 'string' }, delete: { type: 'boolean', default: false }, 'dry-run': { type: 'boolean', default: false },
-      scope: { type: 'string' }, local: { type: 'boolean', default: false }, marketplace: { type: 'string' },
+      scope: { type: 'string' }, local: { type: 'boolean', default: false }, marketplace: { type: 'string' }, 'keep-jobs': { type: 'boolean', default: false },
     }, allowPositionals: true, strict: true });
   } catch (error) {
     process.stderr.write(`agent-smith: ${error instanceof Error ? error.message : String(error)}\n\n${USAGE}`);
@@ -503,6 +731,7 @@ export async function main(argv: readonly string[]): Promise<number> {
   try {
     switch (command) {
       case 'setup': return await cmdSetup({ scope: values.scope, local: values.local, repo: values.repo, marketplace: values.marketplace });
+      case 'uninstall': return await cmdUninstall({ local: values.local, repo: values.repo, keepJobs: values['keep-jobs'] });
       case 'run': return await cmdRun({ target: positionals[1] ?? '', prompt: values.prompt, provider: values.provider, model: values.model, effort: values.effort, timeout: values.timeout, repo: values.repo, cwd: values.cwd, name: values.name, unrestricted: values.unrestricted, foreground: values.foreground, concurrency: values.concurrency, checks: values.check });
       case 'resume': if (positionals[1] === undefined) throw new UsageError('resume needs a job id or worker name'); return await cmdResume(positionals[1], { target: 'resume', prompt: values.prompt, provider: values.provider, model: values.model, effort: values.effort, timeout: values.timeout, repo: values.repo, cwd: values.cwd, name: values.name, unrestricted: values.unrestricted, foreground: values.foreground, concurrency: values.concurrency, checks: values.check });
       case 'ls': return await cmdLs({ status: values.status, limit: values.limit === undefined ? undefined : Number(values.limit), repo: values.repo });

@@ -1,7 +1,7 @@
 import { assertFakeProviderActive } from '../../forge/testing/shim.ts';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -286,4 +286,38 @@ test('setup installs via claude plugin install at user scope by default and reje
     if (prevClaude === undefined) delete process.env['AGENT_SMITH_CLAUDE_BIN'];
     else process.env['AGENT_SMITH_CLAUDE_BIN'] = prevClaude;
   }
+});
+
+test('uninstall leaves zero trace of Agent Smith while preserving unrelated settings and genuine agy-staff jobs', async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-uninstall-'));
+  const claudeDir = path.join(repo, '.claude');
+  mkdirSync(claudeDir, { recursive: true });
+  writeFileSync(path.join(claudeDir, 'settings.local.json'), JSON.stringify({
+    extraKnownMarketplaces: { 'agent-smith': { source: { source: 'directory', path: '/x' } } },
+    enabledPlugins: { 'agent-smith@agent-smith': true, 'agent-smith@agent-smith-dev': true },
+  }));
+
+  writeJob(repo, 'implement-smith-12345678', { status: 'succeeded', createdAt: daysAgo(1) });
+  const mirror = path.join(repo, '.agy-smith-tmp');
+  rmSync(mirror, { recursive: true, force: true });
+  const agyJobs = path.join(repo, '.agy-staff', 'jobs');
+  mkdirSync(agyJobs, { recursive: true });
+  writeFileSync(path.join(agyJobs, 'implement-smith-12345678.spec.json'), JSON.stringify({ 'agent-smith': true, job_id: 'implement-smith-12345678' }));
+  writeFileSync(path.join(agyJobs, 'implement-smith-12345678.result.md'), 'mirrored');
+  writeFileSync(path.join(agyJobs, 'implement-real-aaaa1111.spec.json'), JSON.stringify({ job_id: 'implement-real-aaaa1111' }));
+
+  const { code, out, err } = await captureMain(['uninstall', '--local', '--repo', repo]);
+  assert.equal(code, 0, err);
+  assert.match(out, /Agent Smith uninstalled cleanly/);
+  assert.equal(existsSync(path.join(claudeDir, 'settings.local.json')), false, 'empty settings.local.json should be removed');
+  assert.equal(existsSync(claudeDir), false, 'empty .claude dir should be removed');
+  assert.equal(existsSync(path.join(repo, '.agent-smith')), false, '.agent-smith state should be removed');
+  assert.equal(existsSync(path.join(agyJobs, 'implement-smith-12345678.spec.json')), false, 'mirrored spec should be removed');
+  assert.equal(existsSync(path.join(agyJobs, 'implement-smith-12345678.result.md')), false, 'mirrored result should be removed');
+  assert.equal(existsSync(path.join(agyJobs, 'implement-real-aaaa1111.spec.json')), true, 'genuine agy-staff job must be untouched');
+
+  rmSync(path.join(agyJobs, 'implement-real-aaaa1111.spec.json'));
+  writeFileSync(path.join(agyJobs, 'implement-smith-99999999.spec.json'), JSON.stringify({ 'agent-smith': true }));
+  await captureMain(['uninstall', '--local', '--repo', repo]);
+  assert.equal(existsSync(path.join(repo, '.agy-staff')), false, '.agy-staff should be removed when only Agent Smith mirror files were inside');
 });
