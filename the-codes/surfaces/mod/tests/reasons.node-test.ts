@@ -19,11 +19,17 @@ test('old prose maps to the same short reasons', () => {
     ['worker reported success but delivered no usable output — treating as failed, not as a clean success.', 'no output'],
     ['exceeded the 2700000 ms budget and was killed', 'timed out'],
     ['Error: 401 Unauthorized', 'not logged in'],
+    ['RESOURCE_EXHAUSTED: TPM quota exhausted. No spare capacity is currently available… Resource exhausted. Please try again later.', 'provider busy'],
+    ['503 Service Unavailable', 'provider busy'],
+    ['UNAVAILABLE: backend overloaded, please try again later', 'provider busy'],
     ['insufficient_quota: You exceeded your current quota', 'out of credits'],
+    ['insufficient_quota', 'out of credits'],
+    ['quota exhausted', 'out of credits'],
     ['429 Too Many Requests', 'rate limited'],
     ["error: unexpected argument '--effort' found", 'bad flag or model'],
     ['spawn codex ENOENT', "couldn't start"],
     ['fetch failed: ECONNRESET', 'network error'],
+    ['socket hang up', 'network error'],
     ['agy exited with code 1 without emitting a result event. stderr tail: (empty)', 'crashed'],
     ['Job preparation failed: Error: Task store capacity reached', 'setup failed'],
     ['codex exited with code 2: something odd happened in a long way that is not short', 'exit 2'],
@@ -37,4 +43,9 @@ test('old prose maps to the same short reasons', () => {
 test('a stored reason keeps its count when read back', () => {
   for (const stored of ['denied view_file +2', 'denied view_file', 'denied']) assert.equal(reasonFromText(stored), stored);
   assert.equal(reasonFromText(deniedReason(['a', 'b', 'c'])), 'denied a +2');
+});
+
+test('an unavailable file or model is not a busy provider', () => {
+  assert.notEqual(reasonFromText('file unavailable: /w/x.py'), 'provider busy');
+  assert.equal(reasonFromText('503 Service Unavailable'), 'provider busy');
 });

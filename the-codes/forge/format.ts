@@ -93,7 +93,7 @@
 
 import type { ProgressDigest } from '../surfaces/mod/types/index.d.ts';
 import {
-  AUTH_RE, COMPATIBILITY_RE, DENIED_RE, NETWORK_RE, NO_OUTPUT_RE, ORPHAN_RE, QUOTA_RE, RATE_LIMIT_RE,
+  AUTH_RE, BUSY_RE, COMPATIBILITY_RE, DENIED_RE, NETWORK_RE, NO_OUTPUT_RE, ORPHAN_RE, QUOTA_RE, RATE_LIMIT_RE,
   REASONS, START_RE, TIMEOUT_RE, deniedReason, reasonFromText,
 } from '../surfaces/mod/hooks/reasons.ts';
 import path from 'node:path';
@@ -677,8 +677,9 @@ export function nextActionFor(i: NextActionInput): string | null {
       : 'Ask the user before retrying with unrestricted:true.';
   }
   if (AUTH_RE.test(err)) return 'Not logged in: fix the provider login, then retry.';
-  if (QUOTA_RE.test(err)) return 'Out of credits: top up, or use another provider.';
-  if (RATE_LIMIT_RE.test(err)) return 'Rate limited: wait, or run fewer workers.';
+  if (BUSY_RE.test(err)) return 'Provider busy (temporary); resume_job to continue.';
+  if (QUOTA_RE.test(err)) return 'Out of credits on the provider account.';
+  if (RATE_LIMIT_RE.test(err)) return 'Rate limited; resume_job after a short wait.';
   if (COMPATIBILITY_RE.test(err)) return 'Bad flag or model: run agent-smith doctor, then fix the request.';
   if (START_RE.test(err)) return "Couldn't start: run agent-smith doctor.";
   if (i.jobStatus === 'timeout' || TIMEOUT_RE.test(err)) {

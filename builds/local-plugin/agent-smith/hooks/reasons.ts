@@ -13,11 +13,12 @@
  * no `claude-code` import, no filesystem.
  */
 
-export const NETWORK_RE = /network issue|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|fetch failed|connection (?:reset|refused|closed|error)|temporarily unavailable|overloaded/i;
+export const NETWORK_RE = /network issue|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|fetch failed|connection (?:reset|refused|closed|error)|temporarily unavailable/i;
 export const TIMEOUT_RE = /timed? ?out|exceeded the .*budget|\btimeout\b/i;
 export const AUTH_RE = /\b(?:unauthorized|unauthenticated)\b|authentication (?:failed|required)|invalid (?:api[ _-]?key|access token)|(?:access |auth |refresh )token (?:has )?expired|not (?:logged|signed) in|please (?:log|sign) in/i;
+export const BUSY_RE = /resource[_ ]exhausted|no spare capacity|\b503\b|\bservice unavailable\b|\boverloaded\b|provider busy/i;
 export const RATE_LIMIT_RE = /\brate[ _-]?limit(?:ed|ing)?\b|too many requests|\b429\b/i;
-export const QUOTA_RE = /insufficient[_ ]quota|quota exceeded|exceeded.{0,30}quota|credit balance.{0,30}(?:low|exhausted)|billing.{0,30}(?:limit|exhausted)|out of credits/i;
+export const QUOTA_RE = /insufficient[_ ]quota|quota (?:exceeded|exhausted)|exceeded.{0,30}quota|credit balance.{0,30}(?:low|exhausted)|billing.{0,30}(?:limit|exhausted)|out of credits/i;
 export const COMPATIBILITY_RE = /unknown (?:option|argument|flag)|unrecognized (?:option|argument|flag|subcommand)|unexpected argument|unsupported (?:option|flag)|invalid value.{0,80}(?:--model|--effort|reasoning_effort)|unknown model|does not support effort|bad flag or model/i;
 export const START_RE = /\bENOENT\b|spawn.{0,100}(?:not found|no such file)|couldn't start|could not start/i;
 /** The orphan reason, old and new wording: the process that owned the job is gone. */
@@ -31,6 +32,7 @@ export const REASONS = {
   noOutput: 'no output',
   timedOut: 'timed out',
   notLoggedIn: 'not logged in',
+  providerBusy: 'provider busy',
   outOfCredits: 'out of credits',
   rateLimited: 'rate limited',
   badFlagOrModel: 'bad flag or model',
@@ -85,6 +87,7 @@ export function reasonFromText(text: string | null | undefined): string {
   if (NO_OUTPUT_RE.test(t)) return REASONS.noOutput;
   if (TIMEOUT_RE.test(t)) return REASONS.timedOut;
   if (AUTH_RE.test(t)) return REASONS.notLoggedIn;
+  if (BUSY_RE.test(t)) return REASONS.providerBusy;
   if (QUOTA_RE.test(t)) return REASONS.outOfCredits;
   if (RATE_LIMIT_RE.test(t)) return REASONS.rateLimited;
   if (COMPATIBILITY_RE.test(t)) return REASONS.badFlagOrModel;

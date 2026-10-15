@@ -35,7 +35,7 @@ function deniedRun(response: string, status = 'SUCCESS', code: number | null = 0
   tx.onEvent({ event: 'step_update', step_update: { step_index: 3, step_type: 'tool', state: 'ACTIVE', tool_name: 'run_command', tool_info: {} } });
   tx.onEvent({ event: 'step_update', step_update: { step_index: 3, step_type: 'tool', state: 'ERROR', tool_name: 'run_command', tool_info: { error: REAL_DENIAL } } });
   return buildResult({
-    jobId: 'agy-denied', startedAtMs: Date.now() - 1, stateDir: '/tmp', denials: tx.denials, sawAnyToolCall: true,
+    jobId: 'agy-denied', startedAtMs: Date.now() - 1, stateDir: '/tmp', denials: tx.denials, sawAnyToolCall: true, errorIsStale: false,
     exit: { code, signal: null, stderr: '' } as never,
     resultEvent: { status, response } as never,
   });
