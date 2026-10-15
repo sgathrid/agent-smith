@@ -331,6 +331,8 @@ declare module 'claude-code' {
     readonly tool_use_id: string;
     readonly session_id?: string;
     readonly cwd?: string;
+    /** Set when the call ran inside a subagent; absent on the main thread. */
+    readonly agent_id?: string;
   }
 
   export interface Registrar {

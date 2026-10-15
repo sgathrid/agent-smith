@@ -492,11 +492,11 @@ export function createCodexTranslator(maxChars: number): CodexTranslator {
       // error. UNVERIFIED — see README.
       const error = obj(item, 'error');
       const denialReason = str(item, 'decision') ?? str(item, 'approval_status') ?? str(error, 'type');
-      const errorMessage = str(error, 'message')?.toLowerCase();
+      const messages = [str(error, 'message'), str(item, 'message')].filter((m) => m !== undefined).map((m) => m.toLowerCase());
       const denied = item['permission_denied'] === true || item['denied'] === true ||
-        itemStatus === 'denied' || itemStatus === 'rejected' ||
+        itemStatus === 'denied' || itemStatus === 'rejected' || itemStatus === 'declined' ||
         (denialReason !== undefined && /^(?:denied|rejected|declined|approval_denied|permission_denied)$/i.test(denialReason)) ||
-        (errorMessage !== undefined && /(?:permission|approval).{0,50}(?:denied|rejected)|(?:denied|rejected).{0,50}(?:permission|approval)/.test(errorMessage));
+        messages.some((m) => /(?:permission|approval).{0,50}(?:denied|rejected)|(?:denied|rejected).{0,50}(?:permission|approval)|(?:rejected|declined) by (?:the )?user/.test(m));
       if (denied) status = 'denied';
 
       const ref: ActivityRef = { stepIndex: idx, tool };

@@ -779,20 +779,40 @@ describe('completion notices', () => {
 
     expect(said.logs).toEqual([]); // the plugin message is the only notice
     expect(said.prompts).toHaveLength(1);
-    expect(said.origins[0]?.asUser).toBe(true);
+    // Keeps the host's plugin wrapper: the notice quotes worker-controlled text.
+    expect(said.origins[0]?.asUser).not.toBe(true);
     expect(said.prompts[0]).toMatch(/^Agent Smith · ✓ Ada \(codex review\) succeeded in 44s · 2 files changed · checks 2\/2\. Job ID job-ada\.\nRead it with status before acting\.$/);
   });
 
-  test('a job whose settled status was already read by Claude is not announced again', async ($, on) => {
+  const settledRead = (id: string, more: Record<string, unknown> = {}) => ({
+    hook_event_name: 'PostToolUse', session_id: 's', transcript_path: '/t', cwd: '/work',
+    tool_name: 'mcp__plugin_agent-smith_agent-smith__status', tool_use_id: `tu-read-${id}`, tool_input: { jobId: id },
+    tool_response: { structuredContent: { jobId: id, status: 'succeeded', acceptance: { state: 'accepted', pending: false } }, content: [] },
+    ...more,
+  }) as never;
+
+  test('a job whose settled status the main agent already read is not announced again', async ($, on) => {
     const files = ada('running');
     const { clock, said } = noticeHost(on, files, ['job-ada']);
     await start($);
-    await ($ as any).tool.call({ tool: 'mcp__plugin_agent-smith_agent-smith__spawn_job', jobId: 'job-ada' });
-    await ($ as any).tool.call({ tool: 'mcp__plugin_agent-smith_agent-smith__status', jobId: 'job-ada' });
+    await ($ as any).classic.PostToolUse(launched('job-ada'));
     Object.assign(files, ada('succeeded', { finishedAt: iso(RUNNING_NOW + 1000) }));
+    await ($ as any).classic.PostToolUse(settledRead('job-ada'));
     await clock.advance(3000);
     await clock.advance(3000);
     expect(said.prompts).toEqual([]);
+  });
+
+  test("a subagent's settled status read does not retire the main agent's notice", async ($, on) => {
+    const files = ada('running');
+    const { clock, said } = noticeHost(on, files, ['job-ada']);
+    await start($);
+    await ($ as any).classic.PostToolUse(launched('job-ada'));
+    Object.assign(files, ada('succeeded', { finishedAt: iso(RUNNING_NOW + 1000) }));
+    await ($ as any).classic.PostToolUse(settledRead('job-ada', { agent_id: 'sub-1' }));
+    await clock.advance(3000);
+    await clock.advance(3000);
+    expect(said.prompts).toHaveLength(1);
   });
 
   test('a launch seen only through tool.call is claimed, marked and announced once', async ($, on) => {

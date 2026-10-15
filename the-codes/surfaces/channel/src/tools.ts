@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import type { CallToolResult } from '@modelcontextprotocol/server';
 import type { Server } from '@modelcontextprotocol/server';
 import type { ForgeStatus } from '../../../forge/format.ts';
-import { DEFAULT_TIMEOUT_MS, type ForgeService } from '../../../forge/service.ts';
+import { DEFAULT_TIMEOUT_MS, type ForgeService, type JobDetail } from '../../../forge/service.ts';
 import { startPipeline, readPipeline, cancelPipeline } from '../../../forge/execute.ts';
 import { evaluateAcceptance, readAcceptance, writeAcceptance } from '../../../forge/checks.ts';
 import { inheritContinuedProviders, validateSpec } from '../../../pipeline/pipeline.ts';
@@ -356,6 +356,11 @@ export function parseStages(raw: unknown): Stage[] | undefined {
   }));
 }
 
+/** The full `status` view of one job; Tasks results reuse it. */
+export function fullStatus(detail: JobDetail, acceptance: ReturnType<typeof readAcceptance>) {
+  return { ...detail, taskStatus: taskStatus(detail.status), report: detail.report?.slice(0, REPORT_HEAD_CHARS) ?? null, reportTruncated: (detail.report?.length ?? 0) > REPORT_HEAD_CHARS, acceptance };
+}
+
 export async function callTool(ctx: HandlerContext, name: string, rawArgs: unknown): Promise<ToolOutcome> {
   try {
     const def = TOOL_DEFS.find(t => t.name === name); if (!def) throw new Error(`Unknown tool ${name}; available: ${TOOL_DEFS.map(t => t.name).join(', ')}.`);
@@ -372,11 +377,12 @@ export async function callTool(ctx: HandlerContext, name: string, rawArgs: unkno
         const checks = parseChecks(args.checks);
         let prepared = false;
         const onPrepared = (jobId: string) => {
+          // First: if it throws, the job is aborted and must not be left with checks pending.
+          ctx.onJobPrepared?.(jobId);
           prepared = true;
           if (checks?.length) {
             try { writeAcceptance(ctx.service.repo, jobId, { state: 'unchecked', checks: [], pending: true }); } catch (err) { process.stderr.write(`agent-smith acceptance ${jobId}: ${String(err)}\n`); }
           }
-          ctx.onJobPrepared?.(jobId);
         };
         const request = { mode, prompt: text(args, 'prompt', true)!, context: contextText(args), checks, cwd: workingDirectory(args), name: text(args, 'name'), task: text(args, 'task'), provider, model: resolved.model, effort: resolved.effort, timeoutMs: number(args, 'timeoutMs'), conversation: text(args, 'conversation'), unrestricted: boolean(args, 'unrestricted'), onPrepared };
         // After every argument is validated, so the user is never asked about a call that then fails.
@@ -435,7 +441,7 @@ export async function callTool(ctx: HandlerContext, name: string, rawArgs: unkno
         const acceptance = readAcceptance(ctx.service.repo, jobId); const wait = waited ? { waited: true, stillRunning: detail.status === 'running' } : {};
         const diff = wantDiff ? await jobDiff(detail) : {};
         if (fmt === 'concise') return structured({ ...conciseStatus(detail, acceptance, wait), ...diff });
-        return structured({ ...detail, taskStatus: taskStatus(detail.status), report: detail.report?.slice(0, REPORT_HEAD_CHARS) ?? null, reportTruncated: (detail.report?.length ?? 0) > REPORT_HEAD_CHARS, acceptance, ...wait, ...diff });
+        return structured({ ...fullStatus(detail, acceptance), ...wait, ...diff });
       }
       case 'pipeline_status': {
         const runId = text(args, 'runId', true)!; const r = readPipeline(ctx.service.repo, runId);

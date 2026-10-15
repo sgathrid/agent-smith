@@ -100,6 +100,19 @@ test('Codex MCP errors use structured results, including a null error on success
   }
 });
 
+test('Codex declined or user-rejected commands render as denied, not done', () => {
+  for (const fields of [
+    { status: 'declined' },
+    { message: 'exec command rejected by the user' },
+    { error: { message: 'Command declined by user' } },
+  ]) {
+    const tx = createCodexTranslator(200);
+    const end = tx.onEvent({ type: 'item.completed', item: { id: 'cmd', type: 'command_execution', command: 'rm -rf build', ...fields } }).at(-1);
+    assert.ok(end?.kind === 'activity-end');
+    assert.equal(end.status, 'denied', JSON.stringify(fields));
+  }
+});
+
 test('Claude structured permission denials are deduplicated and retained on successful reports', () => {
   const tx = createClaudeTranslator(200);
   tx.onEvent({ type: 'system', subtype: 'permission_denied', tool_name: 'Write', tool_use_id: 'toolu-1' });

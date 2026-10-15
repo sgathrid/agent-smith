@@ -8,7 +8,7 @@ import { test } from 'node:test';
 
 assertFakeProviderActive();
 
-const { main, cmdStatus } = await import('../cli.ts');
+const { main, cmdStatus, cmdUninstall } = await import('../cli.ts');
 const { cancelPipeline, readPipeline } = await import('../../forge/execute.ts');
 const { ForgeService } = await import('../../forge/service.ts');
 const { archivedJobsDir, jobDir } = await import('../../forge/format.ts');
@@ -25,21 +25,32 @@ function writeJob(repo: string, jobId: string, job: Record<string, unknown>): vo
   writeJobFile(repo, jobId, JSON.stringify({ jobId, ...job }));
 }
 
-async function captureMain(argv: string[]): Promise<{ code: number; out: string; err: string }> {
+/**
+ * Capture the CLI's text output. Only strings are captured: under `node --test`
+ * the runner reports results to its parent as binary chunks on this same
+ * stdout, and swallowing those silently drops tests from the run.
+ */
+async function capture(run: () => Promise<number>): Promise<{ code: number; out: string; err: string }> {
   const stdout = process.stdout.write;
   const stderr = process.stderr.write;
   let out = '';
   let err = '';
-  process.stdout.write = ((chunk: string) => { out += chunk; return true; }) as typeof process.stdout.write;
-  process.stderr.write = ((chunk: string) => { err += chunk; return true; }) as typeof process.stderr.write;
+  const tap = (stream: NodeJS.WriteStream, original: typeof process.stdout.write, sink: (text: string) => void) =>
+    ((chunk: unknown, ...rest: unknown[]) => {
+      if (typeof chunk === 'string') { sink(chunk); return true; }
+      return (original as (...args: unknown[]) => boolean).call(stream, chunk, ...rest);
+    }) as typeof process.stdout.write;
+  process.stdout.write = tap(process.stdout, stdout, (text) => { out += text; });
+  process.stderr.write = tap(process.stderr, stderr, (text) => { err += text; });
   try {
-    const code = await main(argv);
-    return { code, out, err };
+    return { code: await run(), out, err };
   } finally {
     process.stdout.write = stdout;
     process.stderr.write = stderr;
   }
 }
+
+const captureMain = (argv: string[]) => capture(() => main(argv));
 
 test('CLI run uses the canonical forge, records a pipeline, and resumes a named worker', async () => {
   const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-cli-'));
@@ -279,6 +290,12 @@ test('setup installs via claude plugin install at user scope by default and reje
     const recorded = JSON.parse(readFileSync(argsFile, 'utf8'));
     assert.deepEqual(recorded, ['plugin', 'install', 'agent-smith', '--marketplace', 'sgathrid/agent-smith', '--scope', 'user']);
 
+    // A clone has a committed build, but the default must stay the published
+    // marketplace: a project install would otherwise commit this absolute path.
+    const project = await captureMain(['setup', '--scope', 'project']);
+    assert.equal(project.code, 0, project.err);
+    assert.deepEqual(JSON.parse(readFileSync(argsFile, 'utf8')), ['plugin', 'install', 'agent-smith', '--marketplace', 'sgathrid/agent-smith', '--scope', 'project']);
+
     const bad = await captureMain(['setup', '--scope', 'bogus']);
     assert.equal(bad.code, 1);
     assert.match(bad.err, /--scope must be user, project, or local/);
@@ -320,4 +337,58 @@ test('uninstall leaves zero trace of Agent Smith while preserving unrelated sett
   writeFileSync(path.join(agyJobs, 'implement-smith-99999999.spec.json'), JSON.stringify({ 'agent-smith': true }));
   await captureMain(['uninstall', '--local', '--repo', repo]);
   assert.equal(existsSync(path.join(repo, '.agy-staff')), false, '.agy-staff should be removed when only Agent Smith mirror files were inside');
+});
+
+const captureUninstall = (args: Parameters<typeof cmdUninstall>[0]) => capture(() => cmdUninstall(args));
+
+test('uninstall removes nothing while a cancelled worker is still owned by a live process', async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-uninstall-live-'));
+  mkdirSync(path.join(repo, '.claude'), { recursive: true });
+  const settingsFile = path.join(repo, '.claude', 'settings.local.json');
+  writeFileSync(settingsFile, JSON.stringify({ enabledPlugins: { 'agent-smith@agent-smith': true } }));
+  writeJob(repo, 'implement-smith-live0001', { status: 'running', ownerPid: process.pid, createdAt: daysAgo(0) });
+
+  const { code, out, err } = await captureUninstall({ local: true, repo, settleMs: 300 });
+  assert.equal(code, 2);
+  assert.match(err, /still running after cancel: implement-smith-live0001/);
+  assert.doesNotMatch(out, /uninstalled cleanly/);
+  assert.equal(existsSync(jobDir(repo, 'implement-smith-live0001')), true, 'job state, with its cancel marker, is kept for the owner');
+  assert.equal(existsSync(settingsFile), true, 'settings are untouched');
+});
+
+test('uninstall proceeds past a running job whose owner process is gone', async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-uninstall-orphan-'));
+  writeJob(repo, 'implement-smith-orphan01', { status: 'running', ownerPid: 2 ** 22 + 12345, createdAt: daysAgo(0) });
+  const { code, err } = await captureUninstall({ local: true, repo, settleMs: 300 });
+  assert.equal(code, 0, err);
+  assert.equal(existsSync(path.join(repo, '.agent-smith')), false);
+});
+
+test('uninstall removes only provider folders inside AGENT_SMITH_STATE_DIR and honours the home override', async () => {
+  const scratch = mkdtempSync(path.join(tmpdir(), 'agent-smith-uninstall-state-'));
+  const repo = path.join(scratch, 'repo');
+  const home = path.join(scratch, 'home');
+  const shared = path.join(scratch, 'shared');
+  mkdirSync(repo, { recursive: true });
+  mkdirSync(path.join(home, '.agent-smith'), { recursive: true });
+  writeFileSync(path.join(home, '.agent-smith', 'models.json'), '{}');
+  mkdirSync(path.join(shared, 'codex', 'job-1'), { recursive: true });
+  writeFileSync(path.join(shared, 'unrelated.txt'), 'keep me');
+
+  const saved = { bin: process.env['AGENT_SMITH_CLAUDE_BIN'], state: process.env['AGENT_SMITH_STATE_DIR'], cache: process.env['CLAUDE_CODE_PLUGIN_CACHE_DIR'] };
+  process.env['AGENT_SMITH_CLAUDE_BIN'] = 'true';
+  process.env['AGENT_SMITH_STATE_DIR'] = shared;
+  process.env['CLAUDE_CODE_PLUGIN_CACHE_DIR'] = path.join(scratch, 'plugins');
+  try {
+    const { code, err } = await captureUninstall({ repo, homeDir: home, settleMs: 0 });
+    assert.equal(code, 0, err);
+  } finally {
+    for (const [key, value] of [['AGENT_SMITH_CLAUDE_BIN', saved.bin], ['AGENT_SMITH_STATE_DIR', saved.state], ['CLAUDE_CODE_PLUGIN_CACHE_DIR', saved.cache]] as const) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+  assert.equal(existsSync(path.join(home, '.agent-smith')), false, 'the Agent Smith home is removed');
+  assert.equal(existsSync(path.join(shared, 'codex')), false, 'provider state is removed');
+  assert.equal(readFileSync(path.join(shared, 'unrelated.txt'), 'utf8'), 'keep me', 'unrelated files in the state dir survive');
 });

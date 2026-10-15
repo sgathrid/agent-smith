@@ -5,7 +5,7 @@ import path from 'node:path';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { TOOL_DEFS, callTool, defaultMixedPipeline, type HandlerContext } from '../tools.ts';
-import { writeAcceptance } from '../../../../forge/checks.ts';
+import { readAcceptance, writeAcceptance } from '../../../../forge/checks.ts';
 import { writePipelineRecord } from '../../../../forge/service.ts';
 import type { ModelCatalog } from '../../../../providers/types.ts';
 
@@ -347,4 +347,19 @@ test('tool failures are isError results that say what to do next', async () => {
   await fail('pipeline_status', {}, /runId is required/);
   await fail('status', { jobId: 'j', bogus: 1 }, /Unknown field bogus; valid fields: jobId, wait_ms, include_diff, response_format/);
   await fail('nope', {}, /Unknown tool nope; available: list_capabilities/);
+});
+
+test('a failed job preparation never leaves checks pending', async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), 'smith-prepare-fail-'));
+  // Like ForgeService: onPrepared throws, the job is aborted and the error rethrown.
+  const service = { repo, spawnTracked: async (request: { onPrepared: (id: string) => void }) => {
+    request.onPrepared('job-prep');
+    throw new Error('unreachable');
+  } } as never;
+  const ctx = { service, catalogs: async () => [cat('codex')],
+    onJobPrepared: () => { throw new Error('Task store capacity reached'); } } as HandlerContext;
+  const result = await callTool(ctx, 'spawn_job', { mode: 'review', provider: 'codex', prompt: 'review', checks: [{ name: 'tests', command: 'true' }] });
+  assert.equal(result.isError, true);
+  const acceptance = readAcceptance(repo, 'job-prep');
+  assert.equal('pending' in acceptance && acceptance.pending, false);
 });

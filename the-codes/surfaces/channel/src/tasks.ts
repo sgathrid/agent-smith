@@ -11,8 +11,7 @@ import {
 } from '@modelcontextprotocol/ext-tasks/core/v2';
 import { readAcceptance } from '../../../forge/checks.ts';
 import { TaskStore, type TaskRecord } from './task-store.ts';
-import { REPORT_HEAD_CHARS, callTool, structured, type HandlerContext } from './tools.ts';
-import { taskStatus } from './views.ts';
+import { callTool, fullStatus, structured, type HandlerContext } from './tools.ts';
 
 export { TASKS_EXTENSION_ID_V2 };
 export const TASK_RESULT_META = 'io.agent-smith/task-result';
@@ -72,13 +71,7 @@ export class ForgeTasks {
           if (['succeeded', 'failed', 'canceled'].includes(detail.status) && !('pending' in acceptance && acceptance.pending)) {
             if (detail.status === 'canceled') task = this.store.cancel(taskId);
             else {
-              const result = structured({
-                ...detail,
-                taskStatus: taskStatus(detail.status),
-                report: detail.report?.slice(0, REPORT_HEAD_CHARS) ?? null,
-                reportTruncated: (detail.report?.length ?? 0) > REPORT_HEAD_CHARS,
-                acceptance,
-              });
+              const result = structured(fullStatus(detail, acceptance));
               task = this.store.complete(taskId, { ...result, resultType: 'complete',
                 isError: detail.status !== 'succeeded' || acceptance.state === 'rejected',
                 _meta: { [TASK_RESULT_META]: true } });
