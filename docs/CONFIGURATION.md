@@ -150,8 +150,20 @@ the launch as before plus an ack warning that it was not confirmed. Never asked 
 `AGENT_SMITH_CONFIRM_UNRESTRICTED=0`. `run_pipeline`'s `unrestricted` is not confirmed.
 
 ### `list_capabilities` (read-only, structured)
-Params: `refresh` boolean (default false; bypass the catalog cache).
-Result: `providers[]` (`name`, `available`, `defaultModel`, `defaultEffort`, `defaultSource`
+Params: `refresh` boolean (default false; bypass the catalog cache), `provider` (only that
+provider, with its full model list), `response_format` `concise|detailed` (default concise).
+
+Concise result (unindented JSON): `providers[]` with `name`, `available`, and for installed
+providers `defaultModel?`/`defaultEffort?` (absent means the CLI's own default), `efforts?`
+(the list most models share), and either `models[{id, efforts?, defaultEffort?, via?}]` or,
+past 15 models without `provider`, `modelCount` and `more`. Non-coding models (embedding,
+speech, image, video, music, live, computer-use, research) are left out, and a model offered
+through several opencode routes appears once under the `opencode/` route with the rest in
+`via`. Fields are omitted when they repeat a default; `unverified` and `stale` appear only
+when they apply. `aliases` appears only when configured; `aliasConfigErrors?` as below.
+Modes and efforts are described in the tool descriptions instead.
+
+Detailed result: `providers[]` (`name`, `available`, `defaultModel`, `defaultEffort`, `defaultSource`
 `harness-config|unknown`, `models[{id,label,efforts,defaultEffort}]`, `source`
 `live|cache|static`, `stale`, `verified`, `error?`; uninstalled providers appear with
 `available:false` and no models), `aliases {aliases[{name,provider,model?,effort?,scope}],

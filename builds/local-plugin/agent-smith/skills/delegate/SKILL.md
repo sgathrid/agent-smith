@@ -38,7 +38,8 @@ For an implement, review and moderate chain, `run_pipeline` runs the stages for 
 each stage takes `context` and `checks` the same way.
 
 Call `list_capabilities` before choosing provider, model or effort; it lists what is
-installed and what each model accepts. Use the model the user asked for.
+installed and what each model accepts. A provider with many models shows a count; pass
+`provider` to list them. Use the model the user asked for.
 
 ## Choosing a provider
 
