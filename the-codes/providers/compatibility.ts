@@ -44,7 +44,7 @@ export const probeCommand: ProbeCommand = (binary, args, timeoutMs) => new Promi
 export async function checkCompatibility(provider: string, binary: string,
   options: { timeoutMs?: number; probe?: ProbeCommand } = {}): Promise<ProviderCompatibility> {
   const commands = HELP[provider];
-  if (commands === undefined) return { state: 'unknown', version: null, reason: 'no adapter compatibility contract' };
+  if (commands === undefined) return { state: 'unknown', version: null, reason: 'no compatibility check' };
   const probe = options.probe ?? probeCommand;
   const timeoutMs = options.timeoutMs ?? 2_000;
   const run = async (args: readonly string[]): Promise<CompatibilityProbe> => {
@@ -68,9 +68,9 @@ export async function checkCompatibility(provider: string, binary: string,
   });
   if (missing.length) return { state: 'incompatible', version, reason: missing.join('; ')
     + (provider === 'claude' && missing.some(reason => reason.includes('--permission-prompts'))
-      ? '; --permission-prompts requires Claude Code >=2.1.259; update the configured binary' : '; update the configured binary to support the adapter flags') };
+      ? '; needs Claude Code 2.1.259 or newer; update it' : '; update the binary') };
   if (versionProbe!.error !== undefined) unknown.push(`${binary} --version: ${versionProbe!.error}`);
   if (version === null && versionProbe!.error === undefined) unknown.push(`${binary} --version: unrecognized or empty version output`);
   if (unknown.length) return { state: 'unknown', version, reason: unknown.join('; ') };
-  return { state: 'compatible', version, reason: 'adapter flags present; authentication and model execution not checked' };
+  return { state: 'compatible', version, reason: 'ok (login not checked)' };
 }

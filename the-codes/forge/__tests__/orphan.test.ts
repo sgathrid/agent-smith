@@ -99,6 +99,7 @@ test('dead supervisor reader is read-only; service persists the orphan verdict',
   const persisted = JSON.parse(readFileSync(file, 'utf8'));
   assert.equal(persisted.status, 'failed');
   assert.equal(persisted.error, ORPHAN_REASON);
+  assert.equal(persisted.reason, 'server stopped');
   assert.ok(persisted.finishedAt);
   const acceptance = readAcceptance(repo, id);
   assert.equal('pending' in acceptance && acceptance.pending, false);

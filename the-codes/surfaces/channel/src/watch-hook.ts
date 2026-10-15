@@ -72,7 +72,7 @@ export async function runHook(
     // Exit 2 is the wake protocol, and the host labels it "Stop hook feedback".
     // This path runs only without the mod (which claims the job and announces it
     // itself), so say plainly that it is a notice, not an error.
-    write(lines.join('\n') + '\n(Agent Smith completion notice, delivered by hook: not an error.)\n');
+    write(lines.join('\n') + '\n(notice, not an error)\n');
     return 2;
   } catch {
     return 0;

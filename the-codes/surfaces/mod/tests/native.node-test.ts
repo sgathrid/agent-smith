@@ -64,7 +64,7 @@ test('native completion records real outcome and latest worker output without cr
   assert.equal(last?.method, 'update');
   assert.equal(last?.input.status, 'completed');
   assert.match(String(last?.input.description), /Outcome: failed/);
-  assert.match(String(last?.input.description), /Latest worker output:\nBuild failed/);
+  assert.match(String(last?.input.description), /Worker said:\nBuild failed/);
   assert.equal(completed['job-a']?.status, 'completed');
 
   calls.length = 0;

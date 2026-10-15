@@ -76,6 +76,7 @@
 
 import { describeActivity, describeTool, parseInputPreview } from './format.ts';
 import { STALL_GRACE_MS } from './stale.ts';
+import { REASONS } from './reasons.ts';
 import type { RadarJob, RadarStatus, ToolEntry } from '../types/index.d.ts';
 
 /* ────────────────────────────────────────────────────────────────────────────
@@ -112,8 +113,8 @@ export function jobsDir(repo: string): string {
   return [repo.replace(/\/+$/, ''), ...JOBS_SUFFIX].join('/');
 }
 
-/** Mirrors forge/format.ts ORPHAN_REASON (the mod may not import outside its folder). */
-const ORPHAN_REASON = 'supervisor process exited before the job finished (orphaned)';
+/** What an orphaned job shows. Old job records say it at length; ORPHAN_RE (reasons.ts) still matches those. */
+const ORPHAN_REASON = REASONS.serverStopped;
 
 /** `<repo>/.agent-smith/jobs/<id>/orphaned`, from `<repo>/.agy-staff/jobs`. */
 export function orphanMarker(dir: string, id: string): string {

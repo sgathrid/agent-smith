@@ -133,9 +133,9 @@ test('the header names failures, and drops a zero bucket rather than printing it
   // noise. `finished` is always shown because it is the bucket that holds "the
   // rest", and a pane with two running jobs and nothing else should still say
   // what happened to everything that is not running.
-  assert.equal(formatHeaderLine({ running: 2, failed: 0, finished: 18 }), ' 2 running ∙ 18 finished');
-  assert.equal(formatHeaderLine({ running: 2, failed: 1, finished: 17 }), ' 2 running ∙  1 failed ∙ 17 finished');
-  assert.equal(formatHeaderLine({ running: 0, failed: 0, finished: 0 }), ' 0 finished');
+  assert.equal(formatHeaderLine({ running: 2, failed: 0, finished: 18 }), ' 2 running ∙ 18 done');
+  assert.equal(formatHeaderLine({ running: 2, failed: 1, finished: 17 }), ' 2 running ∙  1 failed ∙ 17 done');
+  assert.equal(formatHeaderLine({ running: 0, failed: 0, finished: 0 }), ' 0 done');
 });
 
 test('the header counts are padded to equal width so a separator cannot move', () => {
@@ -158,13 +158,13 @@ test('the header counts are padded to equal width so a separator cannot move', (
       .filter((n, i) => n > 0 || i === 2).map((n) => String(n).length));
     for (const [i, original] of parts.entries()) {
       const part = i === 0 ? original : original;
-      const label = / (running|failed|finished)$/.exec(part)?.[1];
+      const label = / (running|failed|done)$/.exec(part)?.[1];
       assert.ok(label, `unparseable count: ${part}`);
       const countCell = /^(\s*\d+) /.exec(part)?.[1];
       assert.ok(countCell, `missing padded count in ${JSON.stringify(line)}`);
       assert.equal(countCell.length, expectedWidth, `count cell drift: ${JSON.stringify(line)}`);
     }
-    assert.ok(line.includes(`${summary.finished} finished`), `wrong finished count: ${line}`);
+    assert.ok(line.includes(`${summary.finished} done`), `wrong done count: ${line}`);
   }
 });
 
@@ -386,7 +386,7 @@ test('every line reads in its first 40 columns', () => {
 });
 
 test('the header renders the design line exactly', () => {
-  assert.equal(formatHeaderLine({ running: 2, failed: 0, finished: 14 }), ' 2 running ∙ 14 finished');
+  assert.equal(formatHeaderLine({ running: 2, failed: 0, finished: 14 }), ' 2 running ∙ 14 done');
 });
 
 test('the header counts are padded to equal width so the separator cannot move', () => {
@@ -408,7 +408,7 @@ test('the header counts are padded to equal width so the separator cannot move',
       .filter((n, i) => n > 0 || i === 2).map((n) => String(n).length));
     for (const [i, original] of parts.entries()) {
       const part = original;
-      const label = / (running|failed|finished)$/.exec(part)?.[1];
+      const label = / (running|failed|done)$/.exec(part)?.[1];
       assert.ok(label, `unparseable header: ${JSON.stringify(line)}`);
       assert.equal(/^(\s*\d+) /.exec(part)?.[1]?.length, expectedWidth);
     }
@@ -419,7 +419,7 @@ test('the empty state is a literal string and nothing else', () => {
   // TERMINAL-UI.md §Empty: "No jobs → render nothing. Not 'no jobs', not an empty
   // box." The pane's one concession is this single line, because a pane with
   // genuinely zero content is indistinguishable from a pane that failed to render.
-  assert.equal(EMPTY_STATE, 'No jobs yet');
+  assert.equal(EMPTY_STATE, 'No workers yet');
 });
 
 // ── activity ────────────────────────────────────────────────────────────────

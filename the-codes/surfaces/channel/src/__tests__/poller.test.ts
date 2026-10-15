@@ -138,7 +138,7 @@ test('five jobs finishing on the same tick produce one notification', async () =
   const sent = await run(script);
 
   assert.equal(sent.length, 1, 'one tick, one notification');
-  assert.match(sent[0]!.content!, /^Agent Smith · 5 jobs: 5 succeeded\./);
+  assert.match(sent[0]!.content!, /^Agent Smith · 5 jobs: 5 done\n/);
 });
 
 test('a job going silent after the baseline is announced once as attention', async () => {
@@ -289,5 +289,5 @@ test('a realistic session: 12 jobs, mixed outcomes, bounded cost', async () => {
   // Exactly one notification mentions a failure, and it is the 4-way batch.
   const failures = sent.filter((b) => b.content!.includes('failed'));
   assert.equal(failures.length, 1, 'four simultaneous failures must be one notification');
-  assert.match(failures[0]!.content!, /^Agent Smith · \d+ jobs: (\d+ succeeded, )?4 failed\./);
+  assert.match(failures[0]!.content!, /^Agent Smith · \d+ jobs: (\d+ done, )?4 failed\n/);
 });

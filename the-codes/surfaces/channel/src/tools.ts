@@ -24,7 +24,7 @@ const PROVIDERS = ['agy', 'codex', 'opencode', 'claude'];
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
 const string = { type: 'string', minLength: 1 };
 const FORMATS = ['concise', 'detailed'];
-const responseFormat = { type: 'string', enum: FORMATS, default: 'concise', description: 'concise (default): short, high-signal fields. detailed: the full record.' };
+const responseFormat = { type: 'string', enum: FORMATS, default: 'concise', description: 'concise (default) or detailed (full record).' };
 /** Long enough for a paragraph of why; short enough that the pane can show the whole brief. */
 export const MAX_CONTEXT_CHARS = 2_000;
 const contextSchema = { type: 'string', minLength: 1, maxLength: MAX_CONTEXT_CHARS, description: 'Why the work matters and who it is for. The worker sees it in its brief.' };
@@ -212,7 +212,7 @@ export async function defaultMixedPipeline(input: MixedSpecInput, catalogs?: Cat
 }
 // ── completion notice hint ───────────────────────────────────────────────────
 const MONITOR_CAP_MS = 1_800_000;
-const NOTIFY_NOTE = 'Completion is announced automatically by the plugin (a turn from Agent Smith, or a hook notice); if you did not receive a completion notice (hook unavailable, e.g. headless -p or other clients), run this under the Monitor tool, re-arm on expiry, or use status wait_ms.';
+const NOTIFY_NOTE = 'Completion is announced. No notice? Run monitorCommand under Monitor, or status wait_ms.';
 
 /** monitor.js sits at dist/monitor.js; resolvable only when running from the built dist/. */
 export function builtMonitorPath(moduleFile = fileURLToPath(import.meta.url)): string | undefined {
@@ -311,11 +311,11 @@ function contextText(args: Record<string, unknown>): string | undefined {
 function workingDirectory(args: Record<string, unknown>): string | undefined {
   const cwd = text(args, 'cwd');
   if (cwd === undefined) return undefined;
-  if (!path.isAbsolute(cwd)) throw new Error(`cwd must be an absolute path (got "${cwd}"); pass a full path or omit cwd to use the default.`);
+  if (!path.isAbsolute(cwd)) throw new Error(`cwd must be an absolute path (got "${cwd}").`);
   try {
     if (statSync(cwd).isDirectory()) return cwd;
   } catch { /* report the same validation error for absent/inaccessible paths */ }
-  throw new Error(`cwd "${cwd}" does not exist or is not a directory; create it, pass another, or omit cwd to use the default.`);
+  throw new Error(`cwd "${cwd}" is not a directory.`);
 }
 function number(args: Record<string, unknown>, key: string, max = Number.MAX_SAFE_INTEGER): number | undefined {
   const v = args[key]; if (v === undefined) return undefined;
@@ -409,13 +409,13 @@ export async function callTool(ctx: HandlerContext, name: string, rawArgs: unkno
         try { detail = await ctx.service.detail(worker); } catch {
           const candidates = (await ctx.service.list({ limit: 500 })).filter(j => j.name === worker);
           const identities = new Set(candidates.map(j => j.workerId));
-          if (candidates.length === 0) throw new Error(`No worker named "${worker}"; call list_jobs for names and job IDs.`);
-          if (identities.size !== 1) throw new Error(`Worker name "${worker}" matches ${identities.size} different workers; pass one job ID from list_jobs.`);
+          if (candidates.length === 0) throw new Error(`No worker "${worker}"; see list_jobs.`);
+          if (identities.size !== 1) throw new Error(`"${worker}" matches ${identities.size} workers; pass a job ID from list_jobs.`);
           candidates.sort((a, b) => Date.parse(b.startedAt ?? b.updatedAt ?? '') - Date.parse(a.startedAt ?? a.updatedAt ?? ''));
           detail = await ctx.service.detail(candidates[0]!.jobId);
         }
-        if (detail.status === 'running') throw new Error(`Worker "${detail.name}" is still running; wait for its completion notice or call cancel.`);
-        if (!detail.conversation) throw new Error(`Worker "${detail.name}" has no resumable conversation (it may have failed before starting); start a fresh worker with spawn_job.`);
+        if (detail.status === 'running') throw new Error(`"${detail.name}" is still running; wait or cancel.`);
+        if (!detail.conversation) throw new Error(`"${detail.name}" has no conversation to resume; use spawn_job.`);
         const resumeModel = resolveRequest({ provider: detail.provider ?? undefined, model: text(args, 'model'), effort: allowed(args, 'effort', EFFORTS) }, loadModelConfig({ repo: ctx.service.repo }));
         const prompt = text(args, 'prompt', true)!; const cwd = workingDirectory(args) ?? detail.cwd ?? ctx.service.repo;
         const timeoutMs = number(args, 'timeoutMs'); const unrestricted = boolean(args, 'unrestricted');
@@ -451,7 +451,7 @@ export async function callTool(ctx: HandlerContext, name: string, rawArgs: unkno
       }
       case 'pipeline_status': {
         const runId = text(args, 'runId', true)!; const r = readPipeline(ctx.service.repo, runId);
-        if (!r) throw new Error(`No pipeline run "${runId}"; use the runId returned by run_pipeline.`);
+        if (!r) throw new Error(`No pipeline run "${runId}".`);
         return json(format(args) === 'concise' ? concisePipeline(r) : r);
       }
       case 'cancel': { const id = text(args, 'jobId', true)!; return json(readPipeline(ctx.service.repo, id) ? cancelPipeline(ctx.service.repo, id) : ctx.service.cancel(id)); }

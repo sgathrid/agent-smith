@@ -23,7 +23,7 @@ test('acceptance failure is announced after successful worker execution with no 
     assert.equal(jobs[0]?.status, 'failed'); assert.equal(jobs[0]?.summarySource, undefined);
     await pollOnce(repo, Date.now(), send); await pollOnce(repo, Date.now(), send);
     assert.equal(sent.length, 1); assert.match(sent[0]!.content!, /Release review.*failed/);
-    assert.match(sent[0]!.content!, /acceptance failed/);
+    assert.match(sent[0]!.content!, /Release review .*1 stages passed|0\/1 stages passed · implement: checks failed/);
     assert.doesNotMatch(sent[0]!.content!, /Worker output:|Worker summary|Runtime outcome/);
   } finally { resetPoller(); rmSync(repo, { recursive: true, force: true }); }
 });

@@ -92,6 +92,10 @@
  */
 
 import type { ProgressDigest } from '../surfaces/mod/types/index.d.ts';
+import {
+  AUTH_RE, COMPATIBILITY_RE, DENIED_RE, NETWORK_RE, NO_OUTPUT_RE, ORPHAN_RE, QUOTA_RE, RATE_LIMIT_RE,
+  REASONS, START_RE, TIMEOUT_RE, deniedReason, reasonFromText,
+} from '../surfaces/mod/hooks/reasons.ts';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 
@@ -215,6 +219,12 @@ export interface ForgeManifest {
   /** The provider adapter's JobStatus. Diagnostic; `status` is the verdict. */
   readonly jobStatus: string | null;
   readonly error: string | null;
+  /**
+   * Why it failed, in two to four words (surfaces/mod/hooks/reasons.ts): what
+   * notices, the band and `status` show. `error` keeps the full detail. Absent on
+   * jobs recorded before it existed; readers derive it with reasonFromText.
+   */
+  readonly reason?: string | null;
   readonly deniedActions: readonly ForgeDenial[];
   readonly usage: Readonly<Record<string, number>> | null;
   readonly toolCalls: number;
@@ -467,12 +477,54 @@ export interface StatusVerdict {
  * not the provider was kind enough to mention it, and a warning flag that gates
  * this is a warning flag that can be forgotten.
  */
+function denialNames(denials: readonly ForgeDenial[]): string[] {
+  return denials
+    .map((x) => x.displayName ?? x.action)
+    .filter((n): n is string => typeof n === 'string' && n.length > 0);
+}
+
+/** `view_file` or `view_file +2`; empty when no denial has a name. */
+function deniedNames(denials: readonly ForgeDenial[]): string {
+  const names = [...new Set(denialNames(denials))];
+  if (names.length === 0) return '';
+  return names.length === 1 ? names[0]! : `${names[0]} +${names.length - 1}`;
+}
+
+/**
+ * What a failed finish stores: the full `error` (the adapter's own text, else the
+ * verdict's reason; never both) and the short `reason`. Not failed: both null-ish.
+ */
+/** Keep both ends of a long error: the cause leads, the stderr tail closes. */
+function elide(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const head = Math.floor(max / 3);
+  return `${text.slice(0, head)} … ${text.slice(text.length - (max - head - 3))}`;
+}
+
+export function failureFields(
+  verdict: StatusVerdict,
+  result: { readonly status: string; readonly error?: string | undefined; readonly deniedActions?: readonly ForgeDenial[] | undefined },
+  maxError = 1_200,
+): { error: string | null; reason: string | null } {
+  const adapterError = (result.error ?? '').trim();
+  const error = adapterError !== '' ? elide(adapterError, maxError) : verdict.reason;
+  if (verdict.status !== 'failed') return { error, reason: null };
+  const denials = result.deniedActions ?? [];
+  const fatal = denials.length > 0 && verdict.reason !== null && DENIED_RE.test(verdict.reason);
+  let reason: string;
+  if (fatal) reason = deniedReason(denialNames(denials));
+  else if (result.status === 'timeout') reason = REASONS.timedOut;
+  else if (verdict.reason === REASONS.noOutput) reason = REASONS.noOutput;
+  else reason = reasonFromText(adapterError !== '' ? adapterError : verdict.reason);
+  return { error, reason };
+}
+
 export function deriveStatus(d: StatusDerivation): StatusVerdict {
   const terminal = d.alreadyTerminal ?? null;
-  if (terminal === 'canceled') return { status: 'canceled', suspicious: false, reason: 'cancelled by operator' };
+  if (terminal === 'canceled') return { status: 'canceled', suspicious: false, reason: 'canceled' };
   if (terminal === 'succeeded') return { status: 'succeeded', suspicious: false, reason: null };
   if (terminal === 'failed') {
-    return { status: 'failed', suspicious: false, reason: `worker reported failure (${d.jobStatus ?? 'unknown'})` };
+    return { status: 'failed', suspicious: false, reason: REASONS.workerError };
   }
 
   if (d.ok === null || d.ok === undefined) {
@@ -488,30 +540,18 @@ export function deriveStatus(d: StatusDerivation): StatusVerdict {
       status: 'succeeded',
       suspicious: false,
       reason: null,
-      note: `${denials.length} tool call(s) were denied by the permission policy; the report was delivered but some checks may not have run.`,
+      note: `${denials.length} ${denials.length === 1 ? 'call' : 'calls'} denied` + (deniedNames(denials) === '' ? '' : `: ${deniedNames(denials)}`),
     };
   }
   if (denials.length > 0) {
-    const names = denials
-      .map((x) => x.displayName ?? x.action)
-      .filter((n): n is string => typeof n === 'string' && n.length > 0)
-      .join(', ');
-    return {
-      status: 'failed',
-      suspicious: true,
-      reason:
-        `worker soft-denied ${denials.length} tool action(s)` +
-        (names === '' ? '' : ` (${names})`) +
-        ' — it exited 0 and reported success while doing nothing. ' +
-        'This is NOT a clean success.',
-    };
+    return { status: 'failed', suspicious: true, reason: deniedReason(denialNames(denials)) };
   }
 
   if (d.ok === false) {
     return {
       status: 'failed',
       suspicious: false,
-      reason: `worker reported failure (${d.jobStatus ?? 'unknown'})`,
+      reason: d.jobStatus === 'timeout' ? REASONS.timedOut : REASONS.workerError,
     };
   }
 
@@ -519,9 +559,7 @@ export function deriveStatus(d: StatusDerivation): StatusVerdict {
     return {
       status: 'failed',
       suspicious: true,
-      reason:
-        'worker reported success but delivered no usable output — ' +
-        'treating as failed, not as a clean success.',
+      reason: REASONS.noOutput,
     };
   }
 
@@ -564,8 +602,8 @@ export const DEFAULT_TIMEOUT_MS = 45 * 60_000;
 /** A legacy manifest (no ownerPid) is orphaned only when silent this long. */
 export const LEGACY_ORPHAN_AFTER_MS = 2 * DEFAULT_TIMEOUT_MS;
 
-export const ORPHAN_REASON = 'supervisor process exited before the job finished (orphaned)';
-export const CANCEL_ORPHAN_REASON = 'cancel requested and the supervisor exited before confirming it';
+export const ORPHAN_REASON = REASONS.serverStopped;
+export const CANCEL_ORPHAN_REASON = 'canceled; server stopped before confirming';
 
 /** `kill(pid, 0)`: ESRCH means gone; EPERM means it exists but is not ours. */
 export function isPidAlive(pid: number): boolean {
@@ -623,13 +661,6 @@ export interface NextActionInput {
   readonly unrestricted?: boolean | undefined;
 }
 
-const NETWORK_RE = /network issue|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|fetch failed|connection (?:reset|refused|closed|error)|temporarily unavailable|overloaded/i;
-const TIMEOUT_RE = /timed? ?out|exceeded the .*budget|\btimeout\b/i;
-const AUTH_RE = /\b(?:unauthorized|unauthenticated)\b|authentication (?:failed|required)|invalid (?:api[ _-]?key|access token)|(?:access |auth |refresh )token (?:has )?expired|not (?:logged|signed) in|please (?:log|sign) in/i;
-const RATE_LIMIT_RE = /\brate[ _-]?limit(?:ed|ing)?\b|too many requests|\b429\b/i;
-const QUOTA_RE = /insufficient[_ ]quota|quota exceeded|exceeded.{0,30}quota|credit balance.{0,30}(?:low|exhausted)|billing.{0,30}(?:limit|exhausted)/i;
-const COMPATIBILITY_RE = /unknown (?:option|argument|flag)|unrecognized (?:option|argument|flag|subcommand)|unexpected argument|unsupported (?:option|flag)|invalid value.{0,80}(?:--model|--effort|reasoning_effort)|unknown model|does not support effort/i;
-
 /**
  * THE one place a next step is derived. Derived on read, never stored in
  * job.json. Null for running/succeeded jobs. A short imperative for the
@@ -637,30 +668,25 @@ const COMPATIBILITY_RE = /unknown (?:option|argument|flag)|unrecognized (?:optio
  */
 export function nextActionFor(i: NextActionInput): string | null {
   const status = i.status ?? null;
-  if (status === 'canceled') return 'Canceled by operator; nothing to do.';
   if (status !== 'failed') return null;
   const err = i.error ?? '';
-  if (err.includes('orphaned') || err.includes(ORPHAN_REASON)) {
-    return 'Supervisor exited; resume_job if it has a conversation handle, else rerun.';
-  }
-  if (i.jobStatus === 'denied' || (i.deniedCount ?? 0) > 0 || /soft-denied/i.test(err)) {
+  if (ORPHAN_RE.test(err)) return 'Server stopped: resume_job if it has a conversation, else rerun.';
+  if (i.jobStatus === 'denied' || (i.deniedCount ?? 0) > 0 || DENIED_RE.test(err)) {
     return i.unrestricted === true
-      ? 'Worker was denied actions even with unrestricted:true; give it an approved path or narrow the task.'
-      : 'Worker permissions blocked the task; use an approved path or ask for authorization before retrying with unrestricted:true.';
+      ? 'Denied even with unrestricted:true: narrow the task or give an approved path.'
+      : 'Ask the user before retrying with unrestricted:true.';
   }
-  if (AUTH_RE.test(err)) return 'Provider authentication failed; restore the provider login or credentials before retrying.';
-  if (QUOTA_RE.test(err)) return 'Provider quota or credits are exhausted; resolve the account limit or choose another available provider.';
-  if (RATE_LIMIT_RE.test(err)) return 'Provider rate limit reached; wait for its retry window or reduce concurrent workers before retrying.';
-  if (COMPATIBILITY_RE.test(err)) return 'Provider rejected its arguments or model; run agent-smith doctor and list_capabilities, then correct the request or update the provider CLI.';
-  if (/\bENOENT\b|spawn.{0,100}(?:not found|no such file)/i.test(err)) {
-    return 'Worker could not start; check the provider executable and working directory with agent-smith doctor before retrying.';
-  }
+  if (AUTH_RE.test(err)) return 'Not logged in: fix the provider login, then retry.';
+  if (QUOTA_RE.test(err)) return 'Out of credits: top up, or use another provider.';
+  if (RATE_LIMIT_RE.test(err)) return 'Rate limited: wait, or run fewer workers.';
+  if (COMPATIBILITY_RE.test(err)) return 'Bad flag or model: run agent-smith doctor, then fix the request.';
+  if (START_RE.test(err)) return "Couldn't start: run agent-smith doctor.";
   if (i.jobStatus === 'timeout' || TIMEOUT_RE.test(err)) {
-    return 'Raise timeoutMs or split the task; resume_job keeps the conversation.';
+    return 'Raise timeoutMs or split the task; resume_job keeps context.';
   }
-  if (NETWORK_RE.test(err)) return 'Transient: retry the same job once; resume_job or spawn again.';
-  if (/no usable output/i.test(err) || (i.exitCode === 0 && looksEmpty(i.report))) {
-    return 'Worker returned no usable output; ask for a final answer via resume_job or rerun.';
+  if (NETWORK_RE.test(err)) return 'Network error: retry once with resume_job or a new spawn.';
+  if (NO_OUTPUT_RE.test(err) || (i.exitCode === 0 && looksEmpty(i.report))) {
+    return 'No output: ask for a final answer via resume_job, or rerun.';
   }
-  return 'Worker failed; read status.error and warnings before retrying.';
+  return 'Read status.error and warnings before retrying.';
 }

@@ -210,7 +210,7 @@ async function pollBand($: EngineInterface): Promise<void> {
     fresh = cfg.legacy ? await readAllJobs(fsOf($), cfg.repo, at) : await readForgeJobs(fsOf($), cfg.repo, at);
     if (await read($, readError) !== null) await update($, readError, () => null);
   } catch (error) {
-    const message = `Unable to read Forge state: ${String(error).slice(0, 200)}`;
+    const message = `Can't read job state: ${String(error).slice(0, 200)}`;
     if (await read($, readError) !== message) await update($, readError, () => message);
     return; // Retain the last observed rows; a read failure is not an empty project.
   }
@@ -554,8 +554,7 @@ export function registerBand(on: Parameters<Register>[0]): void {
       <Box flexDirection="column">
         {budget.rows.map((job, i) => {
           const line = buildLine(job, at, { colour: cfg.colour, width, longestLabel });
-          const detail = job.acceptance?.pending && isTerminal(job.status) ? 'checks pending' :
-            job.acceptance?.state === 'rejected' ? 'checks rejected' : line.detail;
+          const detail = job.acceptance?.pending && isTerminal(job.status) ? 'checking' : line.detail;
           // A bare digit in an empty prompt presses a band Button without focusing
           // the band, so one key opens the sidebar on this worker.
           return (

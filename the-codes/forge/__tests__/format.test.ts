@@ -132,7 +132,7 @@ test('THE TRAP: exit 0, SUCCESS, denied_actions, empty response ⇒ FAILED', () 
   assert.equal(v.status, 'failed');
   assert.equal(v.suspicious, true);
   assert.match(v.reason ?? '', /RunCommand/);
-  assert.match(v.reason ?? '', /NOT a clean success/);
+  assert.equal(v.reason, 'denied RunCommand');
 });
 
 test('a delivered report with non-fatal tool denials succeeds with a warning', () => {
@@ -144,7 +144,7 @@ test('a delivered report with non-fatal tool denials succeeds with a warning', (
   });
   assert.equal(v.status, 'succeeded');
   assert.equal(v.suspicious, false);
-  assert.match(v.note ?? '', /1 tool call\(s\) were denied/);
+  assert.match(v.note ?? '', /^1 call denied/);
   // Same denial with no report is still a failure.
   assert.equal(deriveStatus({ ok: true, jobStatus: 'success', deniedActions: [{ action: 'tool' }], report: '' }).status, 'failed');
 });
@@ -156,7 +156,7 @@ test('the paranoid net: SUCCESS, no denials reported, empty response ⇒ FAILED'
   const v = deriveStatus({ ok: true, jobStatus: 'success', deniedActions: [], report: '' });
   assert.equal(v.status, 'failed');
   assert.equal(v.suspicious, true);
-  assert.match(v.reason ?? '', /no usable output/);
+  assert.equal(v.reason, 'no output');
 });
 
 test('whitespace-only output is also empty', () => {
@@ -247,7 +247,7 @@ test('a suspicious success always produces exactly one warning', () => {
   const v = deriveStatus({ ok: true, deniedActions: [], report: '' });
   const warnings = warningsFor(v, null);
   assert.equal(warnings.length, 1);
-  assert.match(warnings[0] ?? '', /no usable output/);
+  assert.match(warnings[0] ?? '', /no output/);
 });
 
 test('warnings from progress are carried through', () => {

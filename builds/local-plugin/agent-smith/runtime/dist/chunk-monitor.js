@@ -1,4 +1,4 @@
-import path from'node:path';import {fileURLToPath}from'node:url';import {J as readJob,K as readPipelineRecord,L as buildBatch,M as dedupeKey,N as resetPoller,E as pollOnce,O as readAll}from'./chunk-poller.js';/**
+import path from'node:path';import {fileURLToPath}from'node:url';import {M as readJob,N as readPipelineRecord,O as buildBatch,Q as dedupeKey,T as resetPoller,I as pollOnce,U as readAll}from'./chunk-poller.js';/**
  * Native Claude monitor entrypoint.
  *
  * This process is deliberately separate from the MCP server: Claude Code can
@@ -138,7 +138,7 @@ async function runJobWatch(options) {
         if (now() - startedAt >= timeoutMs) {
             const ids = [...jobIds, ...runIds].filter((id) => !done.has(id));
             try {
-                await emit(`Agent Smith · still running; check status ${ids.join(', ')}`, null);
+                await emit(`Agent Smith · still running: ${ids.join(', ')}`, null);
             }
             catch (error) {
                 onError(error);

@@ -95,7 +95,7 @@ const agyNormalizer: JobNormalizer = (raw: RawJobState): ObservedJob => {
   if (strippedCount > 0) {
     warnings.push({
       code: "polluted_result",
-      message: `Removed ${strippedCount} <system_notification> block(s) from the result text.`,
+      message: `Removed ${strippedCount} <system_notification> block${strippedCount === 1 ? '' : 's'} from the result text.`,
     });
   }
 
@@ -105,12 +105,12 @@ const agyNormalizer: JobNormalizer = (raw: RawJobState): ObservedJob => {
     const detail =
       asString(telemetry["agy_error_reason"]) ??
       (progressWarnings[0] ?? "provider reported warnings");
-    warnings.push({ code: "tool_error", message: `Job reported warnings: ${detail}` });
+    warnings.push({ code: "tool_error", message: detail });
   }
 
   // -- warning: cancellation --------------------------------------------------
   if (canceled || terminalStatus === "canceled") {
-    warnings.push({ code: "canceled", message: "Job was cancelled." });
+    warnings.push({ code: "canceled", message: "canceled" });
   }
 
   // -- status resolution ------------------------------------------------------
@@ -131,19 +131,17 @@ const agyNormalizer: JobNormalizer = (raw: RawJobState): ObservedJob => {
       status = "failed";
       warnings.push({
         code: "empty_output",
-        message: "Job reported 'done' but produced no usable output.",
+        message: "no output",
       });
       if (statusWarnings === true || progressWarnings.length > 0) {
         warnings.push({
           code: "suspicious_success",
-          message:
-            "Provider reported success with warnings AND an empty response — " +
-            "treating as failed, not clean success.",
+          message: "success with warnings and no output",
         });
       } else {
         warnings.push({
           code: "suspicious_success",
-          message: "Provider reported 'done' with an empty response — treating as failed.",
+          message: "success with no output",
         });
       }
     } else {
@@ -157,9 +155,7 @@ const agyNormalizer: JobNormalizer = (raw: RawJobState): ObservedJob => {
       if (statusWarnings === true) {
         warnings.push({
           code: "suspicious_success",
-          message:
-            "Provider set warnings:true on a 'done' job. Output is non-empty, " +
-            "so status stays succeeded, but review before trusting it.",
+          message: "done with warnings; review it",
         });
       }
     }
@@ -172,7 +168,7 @@ const agyNormalizer: JobNormalizer = (raw: RawJobState): ObservedJob => {
     status = "unknown";
     warnings.push({
       code: "incomplete_state",
-      message: "No terminal status and no progress evidence found.",
+      message: "no status or progress found",
     });
   }
 
@@ -262,18 +258,18 @@ const claudeNormalizer: JobNormalizer = (raw: RawJobState): ObservedJob => {
 
   // -- warnings ---------------------------------------------------------------
   if (stoppedByUser) {
-    warnings.push({ code: "canceled", message: "Subagent was stopped by the user." });
+    warnings.push({ code: "canceled", message: "stopped by the user" });
   }
   if (errorRecords > 0) {
     warnings.push({
       code: "tool_error",
-      message: `Transcript contains ${errorRecords} API-error record(s).`,
+      message: `${errorRecords} API ${errorRecords === 1 ? 'error' : 'errors'}`,
     });
   }
   if (malformed > 0) {
     warnings.push({
       code: "incomplete_state",
-      message: `Skipped ${malformed} malformed transcript line(s); format may have changed.`,
+      message: `skipped ${malformed} unreadable transcript ${malformed === 1 ? 'line' : 'lines'}`,
     });
   }
   // Same headline rule as agy: no deliverable + warnings ⇒ not a clean success.
@@ -281,7 +277,7 @@ const claudeNormalizer: JobNormalizer = (raw: RawJobState): ObservedJob => {
   if (emptyOutput && !stoppedByUser) {
     warnings.push({
       code: "empty_output",
-      message: "Subagent produced no handback message and no final text.",
+      message: "no output",
     });
   }
 
@@ -371,13 +367,12 @@ const smithNormalizer: JobNormalizer = (raw: RawJobState): ObservedJob => {
     const failedWithoutOutput = status === "failed" && (output === null || output.trim() === '');
     warnings.push({
       code: failedWithoutOutput ? "suspicious_success" : "tool_error",
-      message: failedWithoutOutput
-        ? `${deniedCount} tool action(s) were soft-denied and no report was delivered; the job was recorded FAILED.`
-        : `${deniedCount} tool action(s) were denied by the permission policy; some requested actions may not have run.`,
+      message: `${deniedCount} ${deniedCount === 1 ? 'call' : 'calls'} denied`,
     });
   }
 
-  if (errorText !== null) {
+  // The forge's error for a denial restates it ("denied view_file · …"); any other error still shows.
+  if (errorText !== null && !(deniedCount > 0 && /^denied\b/.test(errorText))) {
     warnings.push({ code: "tool_error", message: errorText });
   }
 
@@ -388,7 +383,7 @@ const smithNormalizer: JobNormalizer = (raw: RawJobState): ObservedJob => {
   let resolved: ObservedStatus;
   if (canceled) {
     resolved = "canceled";
-    warnings.push({ code: "canceled", message: "Cancelled by the operator." });
+    warnings.push({ code: "canceled", message: "canceled" });
   } else if (schema !== null && schema > SCHEMA_VERSION) {
     // A newer writer's file. `unknown`, and NOT `running`: "we cannot read this"
     // is a different claim from "it is working", and drawing one as the other is
@@ -396,7 +391,7 @@ const smithNormalizer: JobNormalizer = (raw: RawJobState): ObservedJob => {
     resolved = "unknown";
     warnings.push({
       code: "incomplete_state",
-      message: `on-disk schema v${schema} is newer than this reader (v${SCHEMA_VERSION}); state unknown.`,
+      message: `schema v${schema} is newer than this reader (v${SCHEMA_VERSION})`,
     });
   } else if (status === "succeeded") {
     resolved = "succeeded";
@@ -407,7 +402,7 @@ const smithNormalizer: JobNormalizer = (raw: RawJobState): ObservedJob => {
       // not silently upgrade a job with no output to a success.
       warnings.push({
         code: "empty_output",
-        message: "Status says succeeded but no usable output is on disk; verify before trusting.",
+        message: "done, but no output on disk",
       });
     }
   } else if (status === "failed") {
@@ -422,13 +417,13 @@ const smithNormalizer: JobNormalizer = (raw: RawJobState): ObservedJob => {
     resolved = "unknown";
     warnings.push({
       code: "incomplete_state",
-      message: "job.json is missing or unreadable; state is unknown, not running.",
+      message: "job.json missing or unreadable",
     });
   } else {
     resolved = "unknown";
     warnings.push({
       code: "incomplete_state",
-      message: "No status in the anchor and no cancel marker.",
+      message: "no status in job.json",
     });
   }
 

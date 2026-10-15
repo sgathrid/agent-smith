@@ -132,7 +132,7 @@ try {
   await record('timeout', async () => {
     const ack = await data(await client.callTool({ name: 'spawn_job', arguments: { provider: 'codex', mode: 'review', name: 'Smoke Timeout', task: 'Timeout fixture', prompt: 'SMOKE_SLOW timeout fixture', model: 'smoke-fixture', effort: 'low', timeoutMs: 1_000, cwd: repo } }));
     const terminal = await waitStatus('status', 'jobId', ack.jobId, 8_000);
-    if (terminal.status !== 'failed' || !/timeout/i.test(terminal.error ?? '')) throw new Error(`Timeout did not surface as timeout failure: ${JSON.stringify(terminal)}`);
+    if (terminal.status !== 'failed' || !/timeout|timed out/i.test(terminal.error ?? '')) throw new Error(`Timeout did not surface as timeout failure: ${JSON.stringify(terminal)}`);
     return { status: terminal.status, reason: 'timeout' };
   });
   await record('concurrency limit', async () => {

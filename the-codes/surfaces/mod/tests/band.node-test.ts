@@ -213,7 +213,7 @@ test('the required layout renders: one line per job, readable in its first 40 co
   assert.ok(running.plain.includes('implement-musm82da'));
   assert.ok(review.plain.includes('review-muroviej'));
   assert.ok(done.plain.includes('research-muroabc'));
-  assert.ok(done.plain.includes('finished'));
+  assert.ok(done.plain.includes('done'));
   assert.ok(done.plain.includes('48s'));
 });
 
@@ -258,6 +258,30 @@ test('a failed job says WHY in a stable code, not a sentence', () => {
   assert.equal(line.accent, 'red');
 });
 
+test('a denial shows what was denied, not "no output"', () => {
+  const line = buildLine(
+    job({
+      status: 'failed', startedAt: 0, endedAt: 2_000,
+      failureReason: 'worker soft-denied 1 tool action(s) (view_file) — it exited 0 and reported success while doing nothing.',
+      warnings: [{ code: 'suspicious_success', message: 'x' }],
+    }),
+    2_000,
+ { width: 100 });
+  assert.ok(line.plain.includes('failed ∙ denied view_file'), line.plain);
+});
+
+test('checks that failed after a clean run say which, and are not "done"', () => {
+  const line = buildLine(
+    job({
+      status: 'succeeded', startedAt: 0, endedAt: 2_000,
+      acceptance: { state: 'rejected', checks: [{ name: 'lint', ok: false, outputTail: '' }] },
+    }),
+    2_000,
+  );
+  assert.ok(line.plain.includes('checks failed: lint'), line.plain);
+  assert.ok(!line.plain.includes('done'), line.plain);
+});
+
 test('a succeeded job with warnings says so in words, not in colour', () => {
   // harness/normalize.ts is explicit: a NON-EMPTY result with warnings:true stays
   // `succeeded`. A recolour would contradict that, and TERMINAL-UI.md L85-87
@@ -272,7 +296,7 @@ test('a succeeded job with warnings says so in words, not in colour', () => {
     2_000,
   );
   assert.equal(line.accent, 'green', 'still a success: the output was real');
-  assert.ok(line.plain.includes('finished, warnings'), line.plain);
+  assert.ok(line.plain.includes('done ∙ warnings'), line.plain);
 });
 
 test('an unknown tool count is omitted entirely, with no dangling separator', () => {
@@ -284,7 +308,7 @@ test('an unknown tool count is omitted entirely, with no dangling separator', ()
   // The clock keeps its ELAPSED_WIDTH cell even as the only segment, so the line
   // is the same width whether or not a count was available. That is what stops
   // the band re-flowing when the last running job finishes and loses its count.
-  assert.ok(line.plain.includes('finished'));
+  assert.ok(line.plain.includes('done'));
   assert.ok(line.plain.endsWith('5s'));
   // Dropping the count shortens the tail by exactly that one segment — no
   // leftover separator, and no other field moves.

@@ -186,8 +186,9 @@ export function mirrorStatus(m: ForgeManifest, suspicious: boolean): Record<stri
     warnings: suspicious,
     finished_at: m.finishedAt ?? m.updatedAt,
   };
-  if (m.error !== null && m.error !== '') out['reason'] = m.error;
-  else if (suspicious) out['reason'] = 'reported success with no usable output';
+  const reason = m.reason ?? m.error;
+  if (reason !== null && reason !== undefined && reason !== '') out['reason'] = reason;
+  else if (suspicious) out['reason'] = 'no output';
   return out;
 }
 

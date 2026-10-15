@@ -43,6 +43,7 @@ import {
   FILES,
   PROGRESS_FLUSH_MS,
   attributeChanged,
+  failureFields,
   diffChangedFiles,
   isForgeStatePath,
   SCHEMA_VERSION,
@@ -431,6 +432,8 @@ export class JobWriter {
       report,
     });
 
+    const failure = failureFields(verdict, result);
+
     const usage =
       result.usage === undefined
         ? null
@@ -446,15 +449,9 @@ export class JobWriter {
       startedAt: this.manifest.startedAt ?? result.startedAt,
       exitCode: result.exitCode,
       jobStatus: result.status,
-      // BOTH strings, verdict first. The verdict leads because it is this repo's
-      // own vocabulary and reads identically for every provider. The adapter's
-      // message follows because it is the SPECIFIC one — `agy exited without
-      // emitting a result event` on its own does not say ENOENT, and dropping it
-      // would turn a diagnosable spawn failure into an unexplained `error`.
-      error:
-        verdict.reason === null
-          ? (result.error ?? null)
-          : appendBounded(`${verdict.reason} — `, result.error ?? '', 1_200),
+      // The adapter's own text when it has one, else the verdict's reason; never both.
+      error: failure.error,
+      reason: failure.reason,
       deniedActions: (result.deniedActions ?? []).map((d) => ({
         ...(d.action === undefined ? {} : { action: d.action }),
         ...(d.displayName === undefined ? {} : { displayName: d.displayName }),
@@ -498,6 +495,7 @@ export class JobWriter {
       updatedAt: now,
       finishedAt: now,
       error: reason,
+      reason: status === 'failed' ? reason.split(' · ')[0]! : null,
       jobStatus: status === 'canceled' ? 'cancelled' : 'malformed',
     };
     this.manifest = manifest;

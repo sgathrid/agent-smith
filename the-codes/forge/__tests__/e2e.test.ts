@@ -146,7 +146,7 @@ test('ACCEPTANCE: a job spawned through the tool appears in the mod pane, unmodi
   });
   assert.match(ack.jobId, /^implement-smith-[0-9a-f]{8}$/);
   assert.equal(ack.unrestricted, false);
-  assert.match(ack.note, /approvals enforced/);
+  assert.match(ack.note, /^queued · 30s limit · approvals on$/);
 
   // The ANCHOR exists before the caller has finished reading this response. That
   // is what makes a spawn failure a `failed` job rather than a vanished one.
@@ -240,9 +240,9 @@ test('SAFETY: a soft-denied tool is recorded FAILED, never a clean success', asy
   assert.equal(manifest.status, 'failed');
   assert.equal(manifest.jobStatus, 'denied');
   assert.ok((manifest.deniedActions ?? []).length > 0, 'the denials survived into the state file');
-  assert.match(manifest.error ?? '', /NOT a clean success/);
+  assert.match(manifest.reason ?? '', /^denied /);
   // …and the adapter's specific evidence rides underneath it.
-  assert.match(manifest.error ?? '', /soft-denied/);
+  assert.match(manifest.error ?? '', /^denied /);
 
   // And the pane draws it as failed, from the mirrored anchor — not as a green
   // check. The mirror only ever writes `done` for a real success, so the pane's
@@ -268,7 +268,7 @@ test('a provider that reports no denials and returns nothing is ALSO failed', as
   const manifest = await waitForTerminal(r, ack.jobId, 20_000);
 
   assert.equal(manifest.status, 'failed');
-  assert.match(manifest.error ?? '', /no usable output/);
+  assert.equal(manifest.reason, 'no output');
 });
 
 test('a worker that dies without a result event is not a success', async () => {
@@ -286,7 +286,7 @@ test('a worker that dies without a result event is not a success', async () => {
   // adapter's: it is the difference between "the CLI changed its output format"
   // and "the CLI died".
   assert.equal(manifest.jobStatus, 'error');
-  assert.match(manifest.error ?? '', /without emitting a result event|dying before the result/);
+  assert.match(manifest.error ?? '', /no result/);
 });
 
 test('CANCEL: the marker is written first and the pane sees it as canceled', async () => {
@@ -331,7 +331,7 @@ test('CANCEL: a second ForgeService marker is observed by the running owner', as
   await waitFor(() => existsSync(path.join(ack.dir, 'progress.json')), 5_000);
   await assert.rejects(
     owner.spawnJob({ mode: 'review', name: 'follow-up', workerId: 'stable-worker', prompt: 'overlapping follow-up', provider: 'agy' }),
-    /already has an active job/,
+    /is busy/,
   );
 
   const request = requester.cancel(ack.jobId);
@@ -361,7 +361,7 @@ test('a cancel for a job this process never started is recorded and admitted, no
   const outcome = fresh.cancel(ack.jobId);
   assert.equal(outcome.requested, true);
   assert.equal(outcome.signalled, false);
-  assert.match(outcome.note, /no live worker handle/);
+  assert.match(outcome.note, /no live worker here/);
 });
 
 test('list: spawnedIds tracks this process; ids and sinceMs filter', async () => {
@@ -432,7 +432,7 @@ test('a missing binary produces a FAILED job, not a rejected promise', async () 
   // the whole reason the writer joins the two strings. Without it the error is the
   // useless half-sentence "worker reported failure (error)"; with it the cause is
   // on the page.
-  assert.match(got.error ?? '', /without emitting a result event|spawn error/);
+  assert.match(got.error ?? '', /no result|spawn/);
 });
 
 /* ── helpers ───────────────────────────────────────────────────────────────── */
@@ -451,3 +451,11 @@ async function waitForTerminal(repoRoot: string, jobId: string, timeoutMs: numbe
     readFileSync(path.join(repoRoot, '.agent-smith', 'jobs', jobId, 'job.json'), 'utf8'),
   );
 }
+
+test('humanDuration reads at a glance', async () => {
+  const { humanDuration } = await import('../service.ts');
+  assert.equal(humanDuration(30_000), '30s');
+  assert.equal(humanDuration(45 * 60_000), '45m');
+  assert.equal(humanDuration(65 * 60_000), '1h05m');
+  assert.equal(humanDuration(2 * 3_600_000), '2h');
+});

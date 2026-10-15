@@ -1,6 +1,6 @@
 /** Pure rules for the Forge sidebar: which workers it lists and how it labels them. */
 import type { RadarAcceptance, RadarJob } from '../types/index.d.ts';
-import { countSummary, elapsedCell, isTerminal, jobLabel, oneLine } from './format.ts';
+import { countSummary, elapsedCell, failedChecks, failureWords, isTerminal, jobLabel, oneLine } from './format.ts';
 
 /** A settled failure or rejection stops asking for attention this long after it ended. */
 export const ATTENTION_TTL_MS = 24 * 60 * 60 * 1000;
@@ -39,31 +39,25 @@ export function workerHeading(job: RadarJob): string {
   return `${jobLabel(job)}${role ? ` · ${role}` : ''}`;
 }
 export function workerStatus(job: RadarJob): string {
-  if (job.acceptance?.pending && isTerminal(job.status)) return `${job.status === 'succeeded' ? 'Execution complete' : job.status} · checks pending`;
+  if (job.acceptance?.pending && isTerminal(job.status)) return `${job.status === 'succeeded' ? 'done' : job.status} · checking`;
   if (job.status === 'failed') {
-    const reason = failureCode(job.failureReason ?? job.warnings.find(w => /orphan|timeout|timed out|denied/i.test(w.message))?.message);
-    return `${job.status}${reason ? ` · ${reason}` : job.acceptance?.state === 'rejected' && job.acceptance.checks.length ? ' · checks rejected' : ''}`;
+    const why = failureWords(job);
+    return why === '' ? 'failed' : `failed · ${why}`;
   }
-  if (job.acceptance?.state === 'rejected') return `${job.status} · checks rejected`;
+  if (job.status === 'succeeded' && job.acceptance?.state === 'rejected' && job.acceptance.checks.length > 0) return failedChecks(job);
+  if (job.acceptance?.state === 'rejected') return `${job.status} · checks failed`;
   if (job.status === 'running') return job.activity ? `Running · ${job.activity}` : 'Running';
-  if (job.status === 'attention') return 'Needs attention · no recent worker events';
-  return job.status;
+  if (job.status === 'attention') return 'stalled';
+  return job.status === 'succeeded' ? 'done' : job.status;
 }
-function failureCode(reason?: string | null): string | null {
-  if (!reason) return null;
-  if (/orphan/i.test(reason)) return 'orphaned';
-  if (/timeout|timed out/i.test(reason)) return 'timeout';
-  if (/denied|denial/i.test(reason)) return 'denied';
-  return /^[a-z][a-z0-9_-]{0,31}$/i.test(reason.trim()) ? reason.trim().toLowerCase() : 'error';
-}
-/** `checks ✓ 2/2`, `✗ lint, tests`, `checks pending`, or '' when no checks ran. */
+/** `checks ✓ 2/2`, `✗ lint, tests`, `checking`, or '' when no checks ran. */
 export function checksLabel(acceptance?: RadarAcceptance): string {
   if (!acceptance) return '';
-  if (acceptance.pending) return 'checks pending';
+  if (acceptance.pending) return 'checking';
   const failed = acceptance.checks.filter((check) => !check.ok);
   if (failed.length > 0) return `✗ ${failed.map((check) => check.name).join(', ')}`;
   if (acceptance.checks.length > 0) return `checks ✓ ${acceptance.checks.length}/${acceptance.checks.length}`;
-  return acceptance.state === 'rejected' ? 'checks rejected' : '';
+  return acceptance.state === 'rejected' ? 'checks failed' : '';
 }
 export function statusLine(job: RadarJob, now: number, width: number): string {
   const elapsed = elapsedCell(job.startedAt === null ? 0 : (job.endedAt ?? now) - job.startedAt);
@@ -99,11 +93,11 @@ export function sessionJobs(jobs: readonly RadarJob[], launched: Launched): Rada
 /** `2 running · 1 failed · 3 finished`: one count per listed worker, zeros left out; '' for none. */
 export function countLine(jobs: readonly RadarJob[]): string {
   const c = countSummary(forgeList(jobs));
-  return ([['running', c.running], ['failed', c.failed], ['finished', c.finished]] as const)
+  return ([['running', c.running], ['failed', c.failed], ['done', c.finished]] as const)
     .filter(([, n]) => n > 0).map(([label, n]) => `${n} ${label}`).join(' · ');
 }
 /** The /forge reply and list header: this session's counts, or the repository's, labelled. */
 export function scopeLine(jobs: readonly RadarJob[], scope: 'session' | 'all'): string {
   const line = countLine(jobs);
-  return scope === 'all' ? `repository: ${line || 'no agents yet'}` : line || 'No agents in this session';
+  return scope === 'all' ? `repository: ${line || 'no workers yet'}` : line || 'No workers in this session';
 }

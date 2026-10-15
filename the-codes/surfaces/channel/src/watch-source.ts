@@ -243,9 +243,12 @@ async function readOne(
   // reason itself (`failureReason`), so only the boolean is kept here.
   const warned = observed.warnings.length > 0;
   const raw = observed.raw;
-  const acceptance = source === 'agent-smith' ? readAcceptance(cwd, observed.jobId) as { checks?: readonly { ok?: unknown }[] } : {};
+  const acceptance = source === 'agent-smith' ? readAcceptance(cwd, observed.jobId) as { checks?: readonly { ok?: unknown; name?: unknown }[] } : {};
   const checks = Array.isArray(acceptance.checks) && acceptance.checks.length > 0
-    ? { passed: acceptance.checks.filter((c) => c?.ok === true).length, total: acceptance.checks.length } : null;
+    ? {
+      passed: acceptance.checks.filter((c) => c?.ok === true).length, total: acceptance.checks.length,
+      failed: acceptance.checks.flatMap((c) => (c?.ok !== true && typeof c?.name === 'string' ? [c.name] : [])),
+    } : null;
 
   return {
     id: observed.jobId,
@@ -255,7 +258,7 @@ async function readOne(
     startedAt: observed.startedAt,
     changedFileCount: Array.isArray(observed.raw['changed_files']) ? observed.raw['changed_files'].length : undefined,
     latestSummary: typeof raw['latestSummary'] === 'string' ? raw['latestSummary'] : null,
-    failureReason: typeof raw['error'] === 'string' && raw['error'] !== '' ? raw['error'] : null,
+    failureReason: [raw['reason'], raw['error']].find((v): v is string => typeof v === 'string' && v !== '') ?? null,
     checks,
     ...(source === 'agy-staff' ? { source } : {}),
     summarySource: observed.raw['summarySource'] === 'worker' ? 'worker' : null,

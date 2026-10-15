@@ -39,7 +39,7 @@ test('Claude missing permission-prompts names the flag and known minimum version
     ({ output: args[0] === '--version' ? '2.1.200' : help.claude.replace('--permission-prompts', '') }) });
   assert.equal(result.state, 'incompatible');
   assert.match(result.reason, /missing --permission-prompts/);
-  assert.match(result.reason, />=2\.1\.259/);
+  assert.match(result.reason, /2\.1\.259 or newer/);
   assert.equal(result.version, '2.1.200');
 });
 
@@ -105,6 +105,6 @@ test('CLI doctor reports adapter compatibility using the configured binaries', (
   const result = spawnSync(process.execPath, [fileURLToPath(new URL('../../scripts/agent-smith.mjs', import.meta.url)), 'doctor'],
     { env, encoding: 'utf8', timeout: 10_000 });
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /adapter feature compatibility/);
+  assert.match(result.stdout, /agent-smith doctor/);
   for (const provider of Object.keys(help)) assert.match(result.stdout, new RegExp(`${provider} +compatible`));
 });

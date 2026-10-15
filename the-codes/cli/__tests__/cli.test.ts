@@ -343,7 +343,7 @@ test('uninstall leaves zero trace of Agent Smith while preserving unrelated sett
 
   const { code, out, err } = await captureMain(['uninstall', '--local', '--repo', repo]);
   assert.equal(code, 0, err);
-  assert.match(out, /Agent Smith uninstalled cleanly/);
+  assert.match(out, /Agent Smith removed/);
   assert.equal(existsSync(path.join(claudeDir, 'settings.local.json')), false, 'empty settings.local.json should be removed');
   assert.equal(existsSync(claudeDir), false, 'empty .claude dir should be removed');
   assert.equal(existsSync(path.join(repo, '.agent-smith')), false, '.agent-smith state should be removed');
@@ -369,7 +369,7 @@ test('uninstall removes nothing while a cancelled worker is still owned by a liv
   const { code, out, err } = await captureUninstall({ local: true, repo, settleMs: 300 });
   assert.equal(code, 2);
   assert.match(err, /still running after cancel: implement-smith-live0001/);
-  assert.doesNotMatch(out, /uninstalled cleanly/);
+  assert.doesNotMatch(out, /Agent Smith removed/);
   assert.equal(existsSync(jobDir(repo, 'implement-smith-live0001')), true, 'job state, with its cancel marker, is kept for the owner');
   assert.equal(existsSync(settingsFile), true, 'settings are untouched');
 });

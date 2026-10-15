@@ -7,6 +7,7 @@ import { toEpoch, type FsLike } from './jobs.ts';
 import type { ProgressDigest } from '../types/index.d.ts';
 import { classify, progressPhrase } from './progress.ts';
 import { STALL_GRACE_MS } from './stale.ts';
+import { REASONS, reasonFromText } from './reasons.ts';
 
 type RecordValue = Record<string, unknown>;
 const STATUSES = new Set(['running', 'attention', 'succeeded', 'failed', 'canceled']);
@@ -45,7 +46,7 @@ function acceptance(value: RecordValue | null): RadarAcceptance {
     }) };
 }
 export function acceptanceLabel(value?: RadarAcceptance): string {
-  return value?.pending ? 'checks pending' : value?.state ?? 'unchecked';
+  return value?.pending ? 'checking' : value?.state ?? 'unchecked';
 }
 
 export async function readForgeJob(fs: FsLike, repo: string, id: string, now: number): Promise<RadarJob | null> {
@@ -68,7 +69,7 @@ export async function readForgeJob(fs: FsLike, repo: string, id: string, now: nu
     status = canceled ? 'canceled' : 'failed';
     // The supervisor is gone; its spawn-time placeholder cannot settle itself.
     a = { ...a, pending: false };
-    if (!canceled) warnings.unshift({ code: 'orphaned', message: 'supervisor process exited before the job finished (orphaned)' });
+    if (!canceled) warnings.unshift({ code: 'orphaned', message: REASONS.serverStopped });
   } else if (live && (lastSeen === null || now - lastSeen > STALL_GRACE_MS)) status = 'attention';
   if (typeof m.error === 'string' && m.error !== '') warnings.unshift({ code: 'tool_error', message: m.error });
   const activities = Array.isArray(p?.recentActivities) ? p.recentActivities.map(record).filter(v => v !== null) : [];
@@ -92,7 +93,7 @@ export async function readForgeJob(fs: FsLike, repo: string, id: string, now: nu
     task: text(m.task) ?? '', latestSummary,
     summarySource: (p?.summarySource ?? m.summarySource) === 'worker' && latestSummary !== null ? 'worker' : null,
     changedFileCount: Array.isArray(m.changedFiles) && m.changedFilesTruncated !== true ? m.changedFiles.length : null,
-    acceptance: a, failureReason: text(m.failureReason, m.error, status === 'failed' ? warnings[0]?.message : null),
+    acceptance: a, failureReason: text(m.reason, m.failureReason, m.error, status === 'failed' ? warnings[0]?.message : null),
     warnings, report: null, reasoning: text(p?.latestText), raw: {},
   };
 }
