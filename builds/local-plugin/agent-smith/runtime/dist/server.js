@@ -25675,8 +25675,10 @@ function errMessage(e) {
  * each fails in a different situation:
  *
  *   (1) result.denied_actions is non-empty  -> JobStatus 'denied'.  [primary]
+ *       Unless agy still finished with SUCCESS, exit 0 and a non-empty report:
+ *       then 'success' with the denials marked nonfatal, as claude does.
  *   (2) tool_info.error.type === 'TOOL_ERROR' whose message mentions a
- *       permission/denial                             -> 'denied'.  [early signal]
+ *       permission check failure or denial            -> 'denied'.  [early signal]
  *   (3) status !== 'SUCCESS'                        -> 'error'.
  *   (4) status === 'SUCCESS' AND response.trim() === '' AND no usage beyond the
  *       preamble -> still 'denied'/'error', never 'success'. [last-resort net]
@@ -25860,9 +25862,11 @@ function isDenialError(toolError) {
     if (toolError === undefined)
         return false;
     const hay = `${toolError.type ?? ''} ${toolError.message ?? ''}`.toLowerCase();
-    return (hay.includes('permission') ||
+    // Not a bare "permission": agy prefixes ordinary tool failures with its
+    // permission-declaration phase ("declaring permissions: ... no such file or
+    // directory"), and a missing file must not fail a finished job as denied.
+    return (hay.includes('permission check failed') ||
         hay.includes('denied') ||
-        hay.includes('user denied') ||
         hay.includes('not permitted'));
 }
 function createAgyTranslator(maxChars) {
@@ -26051,9 +26055,17 @@ function buildResult$3(args) {
         status = 'timeout';
         error = `exceeded the ${durationMs} ms budget and was killed`;
     }
+    else if (distinctDenials.length > 0 && reportedStatus === 'SUCCESS' && exit.code === 0 && response.trim() !== '') {
+        // Denied calls, but agy finished and delivered a report: a success with a
+        // warning, exactly as claude reports it. The forge verdict keeps the
+        // denials visible as a note; an empty report still falls to THE TRAP.
+        status = 'success';
+        for (const d of distinctDenials)
+            d.nonfatal = true;
+    }
     else if (distinctDenials.length > 0) {
-        // THE TRAP. exit code 0, status "SUCCESS", empty response — and yet the job
-        // did nothing. Reported as a failure, loudly.
+        // THE TRAP. exit code 0, status "SUCCESS", empty response — and yet the
+        // job did nothing. Reported as a failure, loudly.
         status = 'denied';
         const names = distinctDenials
             .map((d) => d.displayName ?? d.action)
@@ -26062,9 +26074,11 @@ function buildResult$3(args) {
         error =
             `agy soft-denied ${distinctDenials.length} tool action(s)` +
                 `${names !== '' ? ` (${names})` : ''}. ` +
-                'agy exited 0 with status "SUCCESS" and an empty response — this is NOT a success. ' +
-                'The usual cause is running without --dangerously-skip-permissions in headless ' +
-                'mode, where agy cannot prompt and auto-denies instead. ' +
+                (response.trim() === ''
+                    ? 'agy exited with an empty response — this is NOT a success. '
+                    : `agy did not finish cleanly (status "${reportedStatus ?? 'none'}", exit ${exit.code ?? 'signal'}). `) +
+                'Headless agy auto-denies tools it cannot prompt for unless run with ' +
+                '--dangerously-skip-permissions; an explicit deny rule overrides that flag. ' +
                 'stderr tail: ' + (exit.stderr.slice(0, 400) || '(empty)');
     }
     else if (resultEvent === undefined) {
@@ -26862,7 +26876,7 @@ function buildResult$2(args) {
     // orchestrator must know some checks did not run (normalize.ts turns this
     // into a warning).
     if (tx.deniedTools.length > 0) {
-        out.deniedActions = tx.deniedTools.map((id) => ({ action: 'tool', displayName: id }));
+        out.deniedActions = tx.deniedTools.map((id) => ({ action: 'tool', displayName: id, nonfatal: true }));
     }
     if (tx.usage !== undefined)
         out.usage = tx.usage;
@@ -29544,6 +29558,7 @@ class JobWriter {
             deniedActions: (result.deniedActions ?? []).map((d) => ({
                 ...(d.action === undefined ? {} : { action: d.action }),
                 ...(d.displayName === undefined ? {} : { displayName: d.displayName }),
+                ...(d.nonfatal === true ? { nonfatal: true } : {}),
             })),
             usage,
             toolCalls: this.toolCalls,
@@ -29884,9 +29899,10 @@ function reconcileOrphan(repo, jobId, now = Date.now()) {
                 conversation: recoveredConversation(result) ?? manifest.conversation,
                 error: verdict.reason === null ? result.error ?? null
                     : appendBounded(`${verdict.reason} — `, result.error ?? '', 1_200),
-                deniedActions: (result.deniedActions ?? []).map(({ action, displayName }) => ({
+                deniedActions: (result.deniedActions ?? []).map(({ action, displayName, nonfatal }) => ({
                     ...(action === undefined ? {} : { action }),
                     ...(displayName === undefined ? {} : { displayName }),
+                    ...(nonfatal === true ? { nonfatal: true } : {}),
                 })),
                 usage: result.usage === undefined ? null : Object.fromEntries(Object.entries(result.usage).filter((entry) => typeof entry[1] === 'number')),
                 latestSummary: result.response.trim().slice(0, 1_000) || manifest.latestSummary || null,
@@ -32796,6 +32812,87 @@ async function jobDiff(d) {
     catch (err) {
         return { diff: null, diffNote: `git diff failed in ${d.cwd}: ${trimWords(String(err), 200)}. Run git diff ${head} -- <file> yourself.` };
     }
+}
+// ── capabilities ─────────────────────────────────────────────────────────────
+/** Concise list_capabilities lists a provider's models inline up to this many; beyond it, a count and a hint. */
+const CONCISE_MODELS_CAP = 15;
+/** Models that cannot run a coding job: embeddings, speech, image, video, music, live audio, computer use, research. */
+const NON_CODING_MODEL = /embedding|(?:^|[-/])tts(?:$|-)|-tts\b|image|(?:^|\/)veo-|(?:^|\/)lyria-|-live-|computer-use|deep-research|translate/i;
+/** When one model is reachable through several opencode routes, concise shows this route and lists the others under `via`. */
+const PREFERRED_ROUTE = 'opencode';
+/** `route/name` → [route, name]; an id without a route is its own name. */
+function splitRoute(id) {
+    const i = id.indexOf('/');
+    return i === -1 ? [null, id] : [id.slice(0, i), id.slice(i + 1)];
+}
+/** One row per model name: the preferred route's id, the other routes under `via`. */
+function collapseRoutes(models) {
+    const byName = new Map();
+    for (const model of models) {
+        const [route, name] = splitRoute(model.id);
+        const seen = byName.get(name);
+        if (seen === undefined) {
+            byName.set(name, { model, via: [] });
+            continue;
+        }
+        if (route === PREFERRED_ROUTE) {
+            const [kept] = splitRoute(seen.model.id);
+            if (kept !== null)
+                seen.via.push(kept);
+            seen.model = model;
+        }
+        else if (route !== null)
+            seen.via.push(route);
+    }
+    return [...byName.values()].map(({ model, via }) => ({ model, via: via.sort() }));
+}
+/**
+ * The orchestrator needs enough to pick a provider, model and effort, and no
+ * more. Drop fields that repeat a default or say nothing, models that cannot
+ * code, and duplicate routes to one model. A provider with more models than the
+ * cap reports a count; naming it in `provider` lists them all.
+ */
+function conciseCapabilities(providers, only) {
+    return providers.map((p) => {
+        if (!p.available)
+            return { name: p.name, available: false };
+        const coding = collapseRoutes(p.models.filter((m) => !NON_CODING_MODEL.test(m.id)));
+        const efforts = commonEfforts(coding.map(({ model }) => model.efforts ?? []));
+        const rows = coding.map(({ model, via }) => ({
+            id: model.id,
+            ...(model.efforts?.length && model.efforts.join() !== efforts?.join() ? { efforts: model.efforts } : {}),
+            ...(model.defaultEffort && model.defaultEffort !== p.defaultEffort ? { defaultEffort: model.defaultEffort } : {}),
+            ...(via.length ? { via } : {}),
+        }));
+        const listed = only !== undefined || rows.length <= CONCISE_MODELS_CAP;
+        return {
+            name: p.name, available: true,
+            ...(p.defaultModel ? { defaultModel: p.defaultModel } : {}),
+            ...(p.defaultEffort ? { defaultEffort: p.defaultEffort } : {}),
+            ...(efforts ? { efforts } : {}),
+            ...(listed ? { models: rows } : { modelCount: rows.length, more: `pass provider: "${p.name}" to list its ${rows.length} models` }),
+            ...(p.verified === false ? { unverified: 'model list parsed from unconfirmed CLI output; prefer an explicit, known model' } : {}),
+            ...(p.stale ? { stale: true } : {}),
+            ...(p.error ? { error: p.error } : {}),
+        };
+    });
+}
+/** The effort list most models share, stated once on the provider; models list theirs only when it differs. */
+function commonEfforts(lists) {
+    const counts = new Map();
+    for (const list of lists) {
+        if (list.length === 0)
+            continue;
+        const key = list.join();
+        const entry = counts.get(key) ?? { list, n: 0 };
+        entry.n += 1;
+        counts.set(key, entry);
+    }
+    let best;
+    for (const entry of counts.values())
+        if (best === undefined || entry.n > best.n)
+            best = entry;
+    return best?.list;
 }/** MCP control surface over the canonical forge runtime. */
 const REPORT_HEAD_CHARS = 8_000;
 const PROVIDERS = ['agy', 'codex', 'opencode', 'claude'];
@@ -32894,20 +32991,22 @@ const CAPABILITIES_OUTPUT = open({
     providers: { type: 'array', items: open({
             name: typed('string'), available: typed('boolean', 'Installed and usable.'),
             defaultModel: typed(['string', 'null']), defaultEffort: typed(['string', 'null']), defaultSource: typed('string'),
-            models: { type: 'array', items: open({ id: typed('string'), label: typed('string'), efforts: strings('Efforts this model accepts.'), defaultEffort: typed(['string', 'null']) }, ['id']) },
+            models: { type: 'array', items: open({ id: typed('string'), label: typed('string'), efforts: strings('Efforts this model accepts.'), defaultEffort: typed(['string', 'null']), via: strings('Other routes to the same model.') }, ['id']) },
+            efforts: strings('Efforts most models accept; a model lists its own only when they differ.'),
+            modelCount: typed('integer', 'Coding models not listed inline; pass provider to list them.'),
             error: typed('string', 'Why discovery failed.'),
         }, ['name', 'available']) },
     aliases: open({}),
     aliasConfigErrors: strings(),
     modes: { type: 'array', items: open({ name: typed('string'), description: typed('string'), readOnly: typed('boolean'), runsCommands: typed('boolean') }, ['name']) },
     efforts: typed('string'),
-}, ['providers', 'modes']);
+}, ['providers']);
 const OUTPUT_SCHEMAS = { list_capabilities: CAPABILITIES_OUTPUT, spawn_job: SPAWN_OUTPUT, list_jobs: LIST_JOBS_OUTPUT, status: STATUS_OUTPUT };
 const READ_ONLY = { readOnlyHint: true };
 const LAUNCHES = { readOnlyHint: false, openWorldHint: true };
 const modeDescription = MODES$1.map(m => `${m}: ${MODE_PRESETS[m].description}`).join(' | ');
 const RAW_TOOL_DEFS = [
-    { name: 'list_capabilities', annotations: { title: 'List capabilities', ...READ_ONLY }, description: 'List installed providers with their models, efforts and defaults, plus the valid job modes. Call it before choosing provider, model or effort for spawn_job or run_pipeline.', inputSchema: schema({ refresh: { type: 'boolean', default: false, description: 'Bypass the discovery cache.' } }) },
+    { name: 'list_capabilities', annotations: { title: 'List capabilities', ...READ_ONLY }, description: `List installed providers with their coding models, efforts and defaults. Call it before choosing provider, model or effort for spawn_job or run_pipeline. A provider with no defaultModel uses its CLI's own default when model is omitted. Effort is one of ${EFFORTS.join(', ')}; a model lists the efforts it accepts when the provider reports them. Concise by default: a provider with many models gives a count, and provider lists them all. response_format detailed returns every discovered model, including non-coding ones, with labels and job modes.`, inputSchema: schema({ refresh: { type: 'boolean', default: false, description: 'Bypass the discovery cache.' }, provider: { type: 'string', enum: PROVIDERS, description: 'Only this provider, with its full model list.' }, response_format: responseFormat }) },
     { name: 'spawn_job', annotations: { title: 'Spawn job', ...LAUNCHES }, description: 'Delegate one task to an external coding agent; returns a job ID at once while the worker runs in the background. Name the worker so resume_job can follow up. provider defaults to a configured alias or role default, else agy when installed; list_capabilities lists valid providers, models and efforts. Pass checks when the result must be verified: the worker sees them as its definition of done, they run after the job succeeds, and status reports acceptance (accepted, rejected or unchecked) apart from execution. Only agy runs unrestricted by default; unrestricted: true for another provider asks the user to confirm when the client supports it.', inputSchema: schema({
             mode: { type: 'string', enum: [...MODES$1], description: modeDescription }, prompt: string, context: contextSchema, name: { ...string, description: 'Worker name for resume_job follow-ups.' }, task: { ...string, description: 'Short label; defaults to the first prompt line.' }, cwd: { ...string, description: 'Absolute existing working directory. Defaults to the server repository.' },
             provider: { type: 'string', enum: PROVIDERS }, model: string, effort: { type: 'string', enum: EFFORTS },
@@ -33041,8 +33140,8 @@ async function confirmUnrestricted(ctx, req) {
 }
 function json(value) { return { content: [{ type: 'text', text: JSON.stringify(value, null, 2) }] }; }
 /** json plus structuredContent (arrays wrapped as {items}). */
-function structured(value) {
-    const out = json(value);
+function structured(value, { compact = false } = {}) {
+    const out = compact ? { content: [{ type: 'text', text: JSON.stringify(value) }] } : json(value);
     const sc = Array.isArray(value) ? { items: value } : value;
     return sc !== null && typeof sc === 'object' ? { ...out, structuredContent: sc } : out;
 }
@@ -33161,7 +33260,11 @@ async function callTool(ctx, name, rawArgs) {
         const args = record(rawArgs ?? {}, 'arguments');
         keys(args, Object.keys(def.inputSchema.properties));
         switch (name) {
-            case 'list_capabilities': return structured(await listCapabilities(ctx, boolean(args, 'refresh') ?? false));
+            case 'list_capabilities': {
+                const fmt = format(args);
+                // Read before nearly every spawn, so its concise text is sent unindented.
+                return structured(await listCapabilities(ctx, boolean(args, 'refresh') ?? false, fmt, allowed(args, 'provider', PROVIDERS)), { compact: fmt === 'concise' });
+            }
             case 'spawn_job': {
                 const mode = allowed(args, 'mode', MODES$1);
                 if (mode === undefined)
@@ -33305,18 +33408,27 @@ async function callTool(ctx, name, rawArgs) {
         return failure(err instanceof Error ? err.message : String(err));
     }
 }
-async function listCapabilities(ctx, refresh) {
+async function listCapabilities(ctx, refresh, fmt, only) {
     const cats = ctx.catalogs ? await installedCatalogs(ctx) : await installedCatalogs({ catalogs: () => getCatalogs({ refresh }) });
     const installed = new Set(cats.map(c => c.provider));
-    const providers = [
+    const all = [
         ...cats.map(c => ({ name: c.provider, available: true, defaultModel: c.defaultModel, defaultEffort: c.defaultEffort, defaultSource: c.defaultSource,
             models: c.models.map(m => ({ id: m.id, label: m.label, efforts: m.efforts, defaultEffort: m.defaultEffort })), source: c.source, stale: c.stale, verified: c.verified, ...(c.error ? { error: c.error } : {}) })),
         ...providerNames().filter(n => !installed.has(n)).map(name => ({ name, available: false, models: [], defaultSource: 'unknown' })),
     ];
+    const providers = only === undefined ? all : all.filter(p => p.name === only);
     const modelConfig = loadModelConfig({ repo: ctx.service.repo });
+    const aliases = describeAliases(modelConfig);
+    if (fmt === 'concise') {
+        return {
+            providers: conciseCapabilities(providers, only),
+            ...(aliases.aliases.length || Object.keys(aliases.roleDefaults).length ? { aliases } : {}),
+            ...(modelConfig.errors.length ? { aliasConfigErrors: modelConfig.errors } : {}),
+        };
+    }
     return {
         providers,
-        aliases: describeAliases(modelConfig),
+        aliases,
         ...(modelConfig.errors.length ? { aliasConfigErrors: modelConfig.errors } : {}),
         modes: MODES$1.map(name => ({ name, description: MODE_PRESETS[name].description, readOnly: MODE_PRESETS[name].readOnly, runsCommands: MODE_PRESETS[name].runsCommands })),
         efforts: `Effort is one of ${EFFORTS.join(', ')}; each model lists the efforts it actually accepts (providers may use native names). Omit model/effort to use the harness's own configured default.`,

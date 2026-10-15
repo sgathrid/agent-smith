@@ -56,9 +56,10 @@ export function reconcileOrphan(repo: string, jobId: string, now = Date.now()): 
         conversation: recoveredConversation(result) ?? manifest.conversation,
         error: verdict.reason === null ? result.error ?? null
           : appendBounded(`${verdict.reason} — `, result.error ?? '', 1_200),
-        deniedActions: (result.deniedActions ?? []).map(({ action, displayName }) => ({
+        deniedActions: (result.deniedActions ?? []).map(({ action, displayName, nonfatal }) => ({
           ...(action === undefined ? {} : { action }),
           ...(displayName === undefined ? {} : { displayName }),
+          ...(nonfatal === true ? { nonfatal: true } : {}),
         })),
         usage: result.usage === undefined ? null : Object.fromEntries(
           Object.entries(result.usage).filter((entry) => typeof entry[1] === 'number')),

@@ -47,7 +47,7 @@ test('mode enum rejects unknown modes', async () => {
 });
 
 test('list_capabilities reports catalogs, errors and modes without throwing', async () => {
-  const r = body(await callTool(ctxWith([cat('codex'), cat('claude', { models: [], error: 'boom', defaultSource: 'unknown', defaultModel: undefined })]), 'list_capabilities', {}));
+  const r = body(await callTool(ctxWith([cat('codex'), cat('claude', { models: [], error: 'boom', defaultSource: 'unknown', defaultModel: undefined })]), 'list_capabilities', { response_format: 'detailed' }));
   const codex = r.providers.find((p: any) => p.name === 'codex'); const claude = r.providers.find((p: any) => p.name === 'claude');
   assert.equal(codex.available, true); assert.equal(codex.models[0].id, 'codex-m'); assert.equal(codex.defaultSource, 'harness-config');
   assert.equal(claude.error, 'boom');
@@ -362,4 +362,56 @@ test('a failed job preparation never leaves checks pending', async () => {
   assert.equal(result.isError, true);
   const acceptance = readAcceptance(repo, 'job-prep');
   assert.equal('pending' in acceptance && acceptance.pending, false);
+});
+
+const ROUTES = ['console-google', 'google', 'opencode', 'opencode-go'];
+const NAMES = ['gemini-4-argon', 'gemini-embedding-2', 'gemini-2.5-flash-preview-tts', 'gemini-3.1-flash-image', 'veo-3.1-generate-preview',
+  'lyria-3-pro-preview', 'gemini-3.1-flash-live-preview', 'gemini-2.5-computer-use-preview-10-2025', 'deep-research-preview-04-2026',
+  ...Array.from({ length: 30 }, (_, i) => `coder-${i}`)];
+const opencode = cat('opencode', { defaultModel: undefined, defaultSource: 'unknown', verified: false,
+  models: ROUTES.flatMap(route => NAMES.map(name => ({ id: `${route}/${name}`, label: `${route}/${name}`, efforts: [] }))) });
+const codex = cat('codex', { models: [
+  { id: 'sol', label: 'Sol', efforts: ['low', 'high'], defaultEffort: 'high' },
+  { id: 'luna', label: 'Luna', efforts: ['low', 'high'], defaultEffort: 'low' },
+  { id: 'mini', label: 'Mini', efforts: ['low'], defaultEffort: 'low' },
+] });
+
+test('concise list_capabilities drops non-coding models, duplicate routes and repeated defaults', async () => {
+  const ctx = ctxWith([codex, opencode]);
+  const r = await callTool(ctx, 'list_capabilities', {});
+  const text = (r.content as { text: string }[])[0]!.text;
+  assert.equal(text.includes('\n'), false, 'concise text is unindented');
+  const caps = JSON.parse(text);
+  assert.equal(caps.modes, undefined); assert.equal(caps.efforts, undefined); assert.equal(caps.aliases, undefined);
+
+  const cx = caps.providers.find((p: any) => p.name === 'codex');
+  assert.deepEqual(cx.efforts, ['low', 'high'], 'the shared effort list is stated once');
+  assert.deepEqual(cx.models, [{ id: 'sol' }, { id: 'luna', defaultEffort: 'low' }, { id: 'mini', efforts: ['low'], defaultEffort: 'low' }]);
+  assert.equal(cx.stale, undefined); assert.equal(cx.verified, undefined); assert.equal(cx.defaultSource, undefined);
+
+  const oc = caps.providers.find((p: any) => p.name === 'opencode');
+  assert.equal(oc.models, undefined, 'over the cap: a count, not a list');
+  assert.equal(oc.modelCount, 31); assert.match(oc.more, /provider: "opencode"/); assert.equal(typeof oc.unverified, 'string');
+  assert.equal(oc.defaultModel, undefined);
+  assert.equal(caps.providers.find((p: any) => p.name === 'agy').models, undefined, 'uninstalled providers carry no models');
+  assert.ok(text.length < 1_500, `concise output stays small (${text.length} chars)`);
+});
+
+test('naming a provider lists all its coding models, preferring the opencode route', async () => {
+  const caps = body(await callTool(ctxWith([codex, opencode]), 'list_capabilities', { provider: 'opencode' }));
+  assert.deepEqual(caps.providers.map((p: any) => p.name), ['opencode']);
+  const models = caps.providers[0].models;
+  assert.equal(models.length, 31);
+  assert.deepEqual(models[0], { id: 'opencode/gemini-4-argon', via: ['console-google', 'google', 'opencode-go'] });
+  for (const dropped of ['embedding', 'tts', 'image', 'veo', 'lyria', 'live', 'computer-use', 'deep-research']) {
+    assert.equal(models.some((m: any) => m.id.includes(dropped)), false, dropped);
+  }
+});
+
+test('detailed list_capabilities keeps every discovered model, label, mode and the efforts text', async () => {
+  const caps = body(await callTool(ctxWith([codex, opencode]), 'list_capabilities', { response_format: 'detailed' }));
+  assert.equal(caps.providers.find((p: any) => p.name === 'opencode').models.length, ROUTES.length * NAMES.length);
+  assert.equal(caps.providers.find((p: any) => p.name === 'codex').models[0].label, 'Sol');
+  assert.deepEqual(caps.modes.map((m: any) => m.name), ['implement', 'review', 'moderate', 'verify']);
+  assert.equal(typeof caps.efforts, 'string');
 });

@@ -50,8 +50,10 @@
  * each fails in a different situation:
  *
  *   (1) result.denied_actions is non-empty  -> JobStatus 'denied'.  [primary]
+ *       Unless agy still finished with SUCCESS, exit 0 and a non-empty report:
+ *       then 'success' with the denials marked nonfatal, as claude does.
  *   (2) tool_info.error.type === 'TOOL_ERROR' whose message mentions a
- *       permission/denial                             -> 'denied'.  [early signal]
+ *       permission check failure or denial            -> 'denied'.  [early signal]
  *   (3) status !== 'SUCCESS'                        -> 'error'.
  *   (4) status === 'SUCCESS' AND response.trim() === '' AND no usage beyond the
  *       preamble -> still 'denied'/'error', never 'success'. [last-resort net]
@@ -333,10 +335,12 @@ function toTokenUsage(u: AgyUsage | undefined): TokenUsage | undefined {
 export function isDenialError(toolError: { type?: string; message?: string } | undefined): boolean {
   if (toolError === undefined) return false;
   const hay = `${toolError.type ?? ''} ${toolError.message ?? ''}`.toLowerCase();
+  // Not a bare "permission": agy prefixes ordinary tool failures with its
+  // permission-declaration phase ("declaring permissions: ... no such file or
+  // directory"), and a missing file must not fail a finished job as denied.
   return (
-    hay.includes('permission') ||
+    hay.includes('permission check failed') ||
     hay.includes('denied') ||
-    hay.includes('user denied') ||
     hay.includes('not permitted')
   );
 }
@@ -517,7 +521,7 @@ interface ExitInfo {
   stderr: string;
 }
 
-function buildResult(args: {
+export function buildResult(args: {
   jobId: string;
   resultEvent: AgyResultEvent | undefined;
   exit: ExitInfo;
@@ -565,9 +569,15 @@ function buildResult(args: {
   } else if (exit.killReason === 'timeout') {
     status = 'timeout';
     error = `exceeded the ${durationMs} ms budget and was killed`;
+  } else if (distinctDenials.length > 0 && reportedStatus === 'SUCCESS' && exit.code === 0 && response.trim() !== '') {
+    // Denied calls, but agy finished and delivered a report: a success with a
+    // warning, exactly as claude reports it. The forge verdict keeps the
+    // denials visible as a note; an empty report still falls to THE TRAP.
+    status = 'success';
+    for (const d of distinctDenials) d.nonfatal = true;
   } else if (distinctDenials.length > 0) {
-    // THE TRAP. exit code 0, status "SUCCESS", empty response — and yet the job
-    // did nothing. Reported as a failure, loudly.
+    // THE TRAP. exit code 0, status "SUCCESS", empty response — and yet the
+    // job did nothing. Reported as a failure, loudly.
     status = 'denied';
     const names = distinctDenials
       .map((d) => d.displayName ?? d.action)
@@ -576,9 +586,11 @@ function buildResult(args: {
     error =
       `agy soft-denied ${distinctDenials.length} tool action(s)` +
       `${names !== '' ? ` (${names})` : ''}. ` +
-      'agy exited 0 with status "SUCCESS" and an empty response — this is NOT a success. ' +
-      'The usual cause is running without --dangerously-skip-permissions in headless ' +
-      'mode, where agy cannot prompt and auto-denies instead. ' +
+      (response.trim() === ''
+        ? 'agy exited with an empty response — this is NOT a success. '
+        : `agy did not finish cleanly (status "${reportedStatus ?? 'none'}", exit ${exit.code ?? 'signal'}). `) +
+      'Headless agy auto-denies tools it cannot prompt for unless run with ' +
+      '--dangerously-skip-permissions; an explicit deny rule overrides that flag. ' +
       'stderr tail: ' + (exit.stderr.slice(0, 400) || '(empty)');
   } else if (resultEvent === undefined) {
     // Process ended with no result event at all: a crash, an OOM kill, or a CLI

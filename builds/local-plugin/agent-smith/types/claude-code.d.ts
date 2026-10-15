@@ -246,6 +246,8 @@ declare module 'claude-code' {
       readonly text?: string;
       readonly isExpanded?: boolean;
       readonly origin?: { readonly kind: string; readonly name?: string; readonly asUser?: boolean };
+      /** The same origin, under the name Claude Code 2.1.300 uses for the UserMessage site. */
+      readonly stored?: { readonly kind: string; readonly name?: string; readonly asUser?: boolean };
     };
   }
 

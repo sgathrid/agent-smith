@@ -73,7 +73,8 @@ names. No live steering.
 
 `deriveStatus` (`forge/format.ts`) is the one place a terminal verdict is computed.
 Precedence: already terminal (a cancel verdict is final) > successful nonempty report with
-only non-fatal `tool` denials = success with warning > other `deniedActions` non-empty =
+only `nonfatal` denials (any provider; legacy claude `action: 'tool'` counts) = success
+with warning > other `deniedActions` non-empty =
 `failed` + suspicious > `ok === false` = `failed` > `ok === true` with empty report
 (empty after trim, `MIN_USEFUL_CHARS = 1`) = `failed` + suspicious > `ok === true` =
 `succeeded` > no verdict = `running`. A job that exited 0 and delivered nothing is

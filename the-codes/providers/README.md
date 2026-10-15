@@ -115,6 +115,11 @@ Four independent detectors, because each fails in a different situation:
 4. `status === 'SUCCESS'` **and** empty response **and** tool calls were made →
    `'denied'`, never `'success'` (last-resort net)
 
+Detections 1 and 2 fail the job only when the denied work is missing. If agy still
+finishes with `SUCCESS`, exit 0 and a non-empty report, the result is `'success'`
+with each denial marked `nonfatal`, and the forge reports it as a warning, the same
+as a claude worker whose report arrived despite denied tools.
+
 Detection 4 is deliberately paranoid: a model that burned tokens and made tool
 calls but produced no final text, with no explicit denial, is a failure shaped
 like a success. The genuinely-empty case (no tool calls) is allowed to pass.

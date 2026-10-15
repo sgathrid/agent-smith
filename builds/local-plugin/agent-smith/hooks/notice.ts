@@ -172,9 +172,21 @@ export function claudeText(jobs: readonly NoticeJob[]): string {
  * before acting."), the redundant "Agent Smith · " prefix (already in the host's
  * "Prompt from the agent-smith plugin" label), and the inline Job/Run ID clause.
  */
+/**
+ * The host frames every plugin prompt for Claude: a header naming the plugin and
+ * a footer saying how the prompt arrived. Claude keeps them (they mark the text
+ * as not the user's); the transcript row does not need them.
+ */
+const HOST_FRAME = [
+  /^The \S+ plugin sent a message(?: while you were working)?:$/,
+  /^This is how Claude Code surfaces (?:a prompt|prompts) a plugin submits\b/,
+];
+
 export function displayNoticeText(text: string): string {
   const lines = text
     .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => !HOST_FRAME.some((re) => re.test(line)))
     .filter((line) => !/^Read (?:it|them) with (?:pipeline_status \(runs\) or )?status/.test(line))
     .map((line) =>
       line

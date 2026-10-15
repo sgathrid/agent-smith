@@ -453,6 +453,7 @@ export class JobWriter {
       deniedActions: (result.deniedActions ?? []).map((d) => ({
         ...(d.action === undefined ? {} : { action: d.action }),
         ...(d.displayName === undefined ? {} : { displayName: d.displayName }),
+        ...(d.nonfatal === true ? { nonfatal: true } : {}),
       })),
       usage,
       toolCalls: this.toolCalls,

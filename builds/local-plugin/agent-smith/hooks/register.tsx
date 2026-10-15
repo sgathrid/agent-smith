@@ -498,7 +498,8 @@ export function registerBand(on: Parameters<Register>[0]): void {
   // Render our completion notices in the transcript as a single clean status
   // line, while leaving the stored prompt (and ctrl+o expanded view) intact.
   on('ui.render', { component: 'UserMessage' }, async (_$, e, next) => {
-    const origin = e.props.origin;
+    // Claude Code 2.1.300 passes the prompt's origin as `stored`; older hosts as `origin`.
+    const origin = e.props.origin ?? e.props.stored;
     if (
       origin?.kind === 'plugin' &&
       origin.name === 'agent-smith' &&

@@ -235,6 +235,18 @@ test('displayNoticeText strips the Agent Smith prefix, inline Job ID, and instru
   ].join('\n'));
 });
 
+test('displayNoticeText drops the host frame Claude Code wraps around a plugin prompt', () => {
+  const body = claudeText([notice({ id: 'implement-smith-eaf379dd', name: 'pp-docs', provider: 'agy', role: 'implement', durationMs: 300_000 })]);
+  for (const [header, footer] of [
+    ['The agent-smith plugin sent a message:', "This is how Claude Code surfaces a prompt a plugin submits between turns — it starts this turn in the user's place. Address the message above."],
+    ['The agent-smith plugin sent a message while you were working:', 'This is how Claude Code surfaces prompts a plugin submits mid-turn — within the running turn, often alongside the next tool result. Address the message above as you continue this turn.'],
+  ]) {
+    const framed = `${header}\n${body.split('\n').map((l) => `  ${l}`).join('\n')}\n\n  ${footer}`;
+    assert.equal(displayNoticeText(framed), displayNoticeText(body));
+  }
+  assert.equal(displayNoticeText(body), '✓ pp-docs (agy implement) succeeded in 5m · no checks');
+});
+
 test('parseSettledRead and unclaim retire a notice once status reads a settled job or run', () => {
   assert.ok(STATUS_TOOL.test(`${PLUGIN}status`));
   assert.ok(STATUS_TOOL.test(`${PLUGIN}pipeline_status`));

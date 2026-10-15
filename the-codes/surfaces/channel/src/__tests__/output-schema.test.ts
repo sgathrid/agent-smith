@@ -119,6 +119,7 @@ test('list_capabilities validates with installed, errored and uninstalled provid
   const caps = assertValid('list_capabilities', await callTool(ctx, 'list_capabilities', {}), 'list_capabilities');
   assert.ok((caps.providers as { available: boolean }[]).some(p => !p.available));
   assertValid('list_capabilities', await callTool({ ...ctx, catalogs: async () => [] }, 'list_capabilities', {}), 'list_capabilities none installed');
+  assertValid('list_capabilities', await callTool(ctx, 'list_capabilities', { response_format: 'detailed' }), 'list_capabilities detailed');
 });
 
 test('a schema violation is caught (the harness can fail)', () => {

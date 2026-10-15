@@ -217,6 +217,12 @@ export interface DeniedAction {
   action?: string;
   /** agy display name, e.g. "RunCommand". */
   displayName?: string;
+  /**
+   * The worker still delivered its report: the denial is a warning, not a
+   * failure. Set by the adapter, for any provider, when the run otherwise
+   * succeeded with real output.
+   */
+  nonfatal?: boolean;
   /** Raw entry, in case a future CLI adds fields we have not modelled. */
   raw?: unknown;
 }
