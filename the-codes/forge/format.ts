@@ -215,6 +215,12 @@ export interface ForgeManifest {
   /** The provider adapter's JobStatus. Diagnostic; `status` is the verdict. */
   readonly jobStatus: string | null;
   readonly error: string | null;
+  /**
+   * Why it failed, in two to four words (surfaces/mod/hooks/reasons.ts): what
+   * notices, the band and `status` show. `error` keeps the full detail. Absent on
+   * jobs recorded before it existed; readers derive it with reasonFromText.
+   */
+  readonly reason?: string | null;
   readonly deniedActions: readonly ForgeDenial[];
   readonly usage: Readonly<Record<string, number>> | null;
   readonly toolCalls: number;
