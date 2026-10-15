@@ -125,3 +125,10 @@ test('an edit whose file is not named still counts as an edit', () => {
   assert.match(progressPhrase(d, 'editing files'), /1 file edited/);
   assert.ok(progressLines(d, 1).includes('Edited: 1 file'));
 });
+
+test('shell setup steps do not stand in for the command', () => {
+  assert.deepEqual([classify('run_command', J({ CommandLine: 'unset VIRTUAL_ENV; uv run pytest -q' })).kind, classify('run_command', J({ CommandLine: 'unset VIRTUAL_ENV; uv run pytest -q' })).label], ['test', 'running tests']);
+  assert.equal(classify('run_command', J({ CommandLine: 'unset VIRTUAL_ENV; uv run ruff check .' })).label, 'uv run');
+  assert.equal(classify('Bash', J({ command: 'cd pkg && rg needle' })).kind, 'search');
+  assert.equal(classify('Bash', J({ command: 'export A=1 && cat README.md' })).kind, 'read');
+});

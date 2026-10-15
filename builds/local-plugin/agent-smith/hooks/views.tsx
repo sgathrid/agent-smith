@@ -4,7 +4,7 @@ import type { RadarJob } from '../types/index.d.ts';
 import type { ForgeDetail } from './canonical.ts';
 import { checksLabel, forgeList, isLive, needsAttention, scopeLine, statusLine, workerHeading, workerStatus } from './dashboard.ts';
 import { elapsed, isTerminal, oneLine, pickColor, pickGlyph } from './format.ts';
-import { progressLines } from './progress.ts';
+import { classify, progressLines } from './progress.ts';
 
 /** A running worker this long without a new event is called out as quiet. */
 const QUIET_MS = 60_000;
@@ -113,7 +113,7 @@ function toolRow(W: UiComponents,key:string,tool:string,input:string,output:stri
   const {Box,Text,Button}=W;
   const expanded=o.tools.includes(key)||state==='error';
   return <Box key={`row-${key}`} flexDirection="column">
-    <Button key={key} plain label={`${state==='active'?'›':state==='error'?'✗':'✓'} ${oneLine(`${tool} ${input}`,Math.max(1,o.width-3))}`} onPress={() => a.tool(key)} />
-    {expanded&&<Text dimColor wrap="wrap">{`${input}${output?`\n${output}`:''}`}</Text>}
+    <Button key={key} plain label={`${state==='active'?'›':state==='error'?'✗':'✓'} ${oneLine(classify(tool,input).label,Math.max(1,o.width-3))}`} onPress={() => a.tool(key)} />
+    {expanded&&<Text dimColor wrap="wrap">{`${tool} ${input}${output?`\n${output}`:''}`}</Text>}
   </Box>;
 }

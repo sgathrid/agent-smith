@@ -148,6 +148,6 @@ export async function readForgeDetail(fs: FsLike, repo: string, id: string, now:
     return [];
   }) : null;
   return { job: { ...job, report, prompt: text(view?.prompt), preamble: text(view?.preamble),
-    warnings: [...job.warnings, ...(view === null ? [{code:'detail_unavailable',message:'This older job has no detail snapshot; summary and report are shown.'}] :
-      view.truncated ? [{code:'detail_truncated',message:'Detail previews are bounded; earlier output or long fields were truncated.'}] : [])] }, history, transcript, timeline };
+    // A bounded preview is normal for a long job, not a warning.
+    warnings: [...job.warnings, ...(view === null ? [{code:'detail_unavailable',message:'This older job has no detail snapshot; summary and report are shown.'}] : [])] }, history, transcript, timeline };
 }
