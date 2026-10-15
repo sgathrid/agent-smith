@@ -4,6 +4,10 @@ import type { RadarJob } from '../types/index.d.ts';
 import type { ForgeDetail } from './canonical.ts';
 import { checksLabel, forgeList, isLive, needsAttention, scopeLine, statusLine, workerHeading, workerStatus } from './dashboard.ts';
 import { elapsed, isTerminal, oneLine, pickColor, pickGlyph } from './format.ts';
+import { progressLines } from './progress.ts';
+
+/** A running worker this long without a new event is called out as quiet. */
+const QUIET_MS = 60_000;
 
 export interface ViewActions {
   pick(job: RadarJob): Promise<void>;
@@ -67,6 +71,11 @@ export function renderWorker(W: UiComponents, d: ForgeDetail, o: ViewOptions, a:
     <Text bold color={o.colour?pickColor(job.status):undefined} wrap="truncate-end">{`${pickGlyph(job.status)} ${workerHeading(job)}`}</Text>
     {meta!=='' && <Text dimColor wrap="truncate-end">{meta}</Text>}
     <Text wrap="truncate-end">{workerStatus(job)}</Text>
+    {job.progress && <Box flexDirection="column">
+      {progressLines(job.progress, job.toolCount).map((line,i) => <Text key={`progress-${i}`} dimColor={i>0} wrap="truncate-end">{line}</Text>)}
+      {job.status==='running' && job.lastEventAt!=null && o.now-job.lastEventAt>QUIET_MS &&
+        <Text color={o.colour?'yellow':undefined} wrap="truncate-end">{`No new activity for ${elapsed(o.now-job.lastEventAt)}`}</Text>}
+    </Box>}
     {job.warnings.map((warning,i) => <Text key={`warning-${i}`} color={o.colour?'yellow':undefined} wrap="wrap">{warning.message}</Text>)}
     <Button key="task" plain hotkey="t" label={o.taskOpen?'Task (as sent)':`Task: ${oneLine(prompt,Math.max(1,o.width-12))}`} onPress={a.task} />
     {o.taskOpen && <Markdown text={job.preamble?`${job.preamble}\n\n${prompt}`:prompt} />}

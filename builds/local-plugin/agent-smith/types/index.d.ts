@@ -132,6 +132,9 @@ export interface RadarJob {
   /** Current reasoning text, or null when the job has not produced any yet. */
   readonly reasoning: string | null;
 
+  /** What the worker has done so far, from its tool calls (progress.json `digest`). Absent for older and agy-staff jobs. */
+  readonly progress?: ProgressDigest | null;
+
   /** Raw provider payload, for the pane's debug view only. Never parsed by a surface. */
   readonly raw: Record<string, unknown>;
 }
@@ -232,4 +235,22 @@ declare module 'claude-code' {
       listScope: 'session' | 'all';
     };
   }
+}
+
+/** progress.json `digest`, written by the forge from every tool call (hooks/progress.ts). */
+export type ProgressPhase = 'starting' | 'exploring' | 'editing' | 'testing' | 'running';
+export interface ProgressDigest {
+  readonly phase: ProgressPhase;
+  /** Distinct files read. */
+  readonly filesRead: number;
+  readonly searches: number;
+  /** Distinct files edited through a visible edit tool, most recent last (at most 8). */
+  readonly edited: readonly string[];
+  readonly editedCount: number;
+  readonly commands: number;
+  readonly testRuns: number;
+  /** True only when the provider ended the latest test run as an explicit error. */
+  readonly lastTestFailed: boolean;
+  /** The same call made several times in a row: often a loop. */
+  readonly repeat: { readonly label: string; readonly count: number } | null;
 }

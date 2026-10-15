@@ -552,6 +552,24 @@ test('a band row is a digit Button that opens the focused sidebar on that worker
   expect(await pane.find({key:'event-1'})).toBeDefined();
 });
 
+test('a running worker with a progress digest shows what it is doing and what it has changed', async ($, on) => {
+  const digest = {phase:'editing',filesRead:21,searches:14,edited:['src/config.py','src/loader.py','tests/test_config.py'],editedCount:3,
+    commands:2,testRuns:2,lastTestFailed:true,repeat:null};
+  const progress = JSON.stringify({jobId:'job-ada',lastEventAt:iso(RUNNING_NOW),recentActivities:[],toolCalls:59,warnings:[],latestText:null,
+    lastActivity:{stepIndex:58,tool:'replace_file_content',status:'active',input:JSON.stringify({TargetFile:'/work/src/loader.py'})},digest});
+  forgeHost(on, canonicalJob('job-ada', {status:'running',name:'pp-engine',workerId:'ada',role:'implement',provider:'agy'}, {'progress.json':progress,'view.json':ADA_VIEW}), ['job-ada']);
+  await start($);
+  await launch($, 'job-ada');
+  const band = await $.ui.mount({plugin:'agent-smith',surface:'terminal',...BAND} as never);
+  const row = await band.find({key:'band-job-ada'}) as { props?: Record<string,unknown> } | undefined;
+  expect(String(row?.props?.label)).toMatch(/pp-engine\s+editing loader\.py · 3 files edited · last test run failed/);
+  await band.press({key:'band-job-ada'});
+  const pane = await $.ui.mount(PANE_TARGET);
+  expect(await pane.find({type:'Text',text:/^Editing · 21 files read · 14 searches · 2 commands · 59 tool calls$/})).toBeDefined();
+  expect(await pane.find({type:'Text',text:/^Edited: config\.py, loader\.py, test_config\.py$/})).toBeDefined();
+  expect(await pane.find({type:'Text',text:/^Tests: ran 2 times · last run failed$/})).toBeDefined();
+});
+
 test('/forge opens the focused session list; /forge pane is the same list; /forge all adds the repository', async ($, on) => {
   const { host } = forgeHost(on, { ...ada(), ...failedJob('job-failed', RUNNING_NOW) }, ['job-ada','job-failed']);
   await start($);

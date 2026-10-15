@@ -602,6 +602,21 @@ export function paneColumns(bodyColumns: number): { label: number; detail: numbe
   return { label, detail };
 }
 
+/** Widest the band's detail cell is worth once the label column has shrunk to fit. */
+const BAND_DETAIL_MAX = 64;
+
+/**
+ * The band's cells when every shown label is short: the label column shrinks to
+ * the longest label (never under 12), and the detail cell takes what it frees.
+ * Rows still align, because every row on screen gets the same widths.
+ */
+export function fitBandColumns(bodyColumns: number, longestLabel: number): { label: number; detail: number } {
+  const base = paneColumns(bodyColumns);
+  const label = Math.min(base.label, Math.max(12, longestLabel));
+  const detail = Math.max(base.detail, Math.min(BAND_DETAIL_MAX, Math.floor(bodyColumns) - label - ROW_OVERHEAD));
+  return { label, detail };
+}
+
 /** The same budget with the tool count suppressed: the band's row. */
 export function bandColumns(): { label: number; detail: number; tools: boolean } {
   return { label: BAND_LABEL_WIDTH, detail: BAND_DETAIL_WIDTH, tools: false };

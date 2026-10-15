@@ -32,6 +32,8 @@
  * append-only event log. Those are the ones a reader is waiting on.
  */
 
+// Shared with the mod, which renders the digest; the mod loader cannot import forge, so it lives there.
+import { ProgressTracker } from '../surfaces/mod/hooks/progress.ts';
 import { execFile } from 'node:child_process';
 import { readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
@@ -124,6 +126,7 @@ export class JobWriter {
   private toolCalls = 0;
   private toolSteps = new Set<number>();
   private latestText: string | null = null;
+  private readonly tracker = new ProgressTracker();
   private view: ForgeView = { schema: 1, prompt: '', preamble: null, transcript: [], tools: [], timeline: [], truncated: false };
   private deltaOpen = false;
   private viewSequence = 0;
@@ -320,6 +323,8 @@ export class JobWriter {
         status,
         ...(input === undefined ? {} : { input }),
       };
+      if (event.kind === 'activity-start') this.tracker.start(ref.stepIndex, row.tool, input);
+      else this.tracker.end(ref.stepIndex, row.tool, input, status);
       this.lastActivity = row;
       if (idx >= 0) this.recent[idx] = row;
       else this.recent.push(row);
@@ -560,6 +565,7 @@ export class JobWriter {
       latestText: this.latestText,
       toolCalls: this.toolCalls,
       warnings: this.progress?.warnings ?? [],
+      digest: this.tracker.digest(this.cwd),
     };
     const nowMs = Date.parse(at);
     const clock = Number.isNaN(nowMs) ? Date.now() : nowMs;
