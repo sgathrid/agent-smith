@@ -7,13 +7,23 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
-  ACCEPTANCE_HOLD_MS, LAUNCH_TOOL, type NoticeJob, type NoticeRow, type Owned, type RunRecord,
-  claim, claudeText, due, headline, noticeFromRadar, parseLaunch,
+  ACCEPTANCE_HOLD_MS, LAUNCH_TOOL, STATUS_TOOL, type NoticeJob, type NoticeRow, type Owned, type RunRecord,
+  claim, claudeText, displayNoticeText, due, headline, noticeFromRadar, parseLaunch, parseSettledRead, unclaim,
 } from '../hooks/notice.ts';
 import { buildBatch } from '../../channel/src/policy.ts';
 
 const NOW = Date.parse('2026-10-11T12:00:00Z');
 const PLUGIN = 'mcp__plugin_agent-smith_agent-smith__';
+
+test('MCP Tasks handles and final results do not claim legacy completion notices', () => {
+  const tool = `${PLUGIN}spawn_job`;
+  assert.equal(parseLaunch(tool, { resultType: 'task', taskId: 't', status: 'working' }), null);
+  assert.equal(parseLaunch(tool, {
+    _meta: { 'io.agent-smith/task-result': true }, structuredContent: { jobId: 'j', status: 'succeeded' },
+  }), null);
+  assert.equal(parseLaunch(tool, { jobId: 'j', status: 'succeeded', report: 'done' }), null);
+  assert.equal(parseLaunch(tool, { jobId: 'j', status: 'running' })?.id, 'j');
+});
 
 function row(over: Partial<NoticeRow> & { id: string }): NoticeRow {
   return { status: 'running', startedAt: NOW - 60_000, endedAt: null, lastEventAt: NOW - 1000, ...over };
@@ -208,4 +218,33 @@ test('the hook (policy) and the mod render the same job in the same words', () =
   }), 'finished', NOW)]);
   assert.equal(hook, mod);
   assert.match(mod, /^Agent Smith · ✓ Ada \(codex review\) succeeded in 43s · 2 files changed · checks 2\/2\. Job ID job-ada\./);
+});
+
+test('displayNoticeText strips the Agent Smith prefix, inline Job ID, and instruction footer for the transcript row', () => {
+  const single = claudeText([notice({ id: 'implement-smith-6729d530', name: 'smoke-agy', provider: 'agy', role: 'implement', durationMs: 7000, checks: { passed: 1, total: 1 } })]);
+  assert.equal(displayNoticeText(single), '✓ smoke-agy (agy implement) succeeded in 7s · checks 1/1');
+
+  const batch = claudeText([
+    notice({ id: 'a', name: 'Ada', provider: 'codex' }),
+    notice({ id: 'b', name: 'Bo', provider: 'agy', kind: 'failed', reason: 'exit 1' }),
+  ]);
+  assert.equal(displayNoticeText(batch), [
+    '2 jobs: 1 succeeded, 1 failed',
+    '✓ Ada (codex) succeeded · no checks',
+    '✗ Bo (agy) failed: exit 1',
+  ].join('\n'));
+});
+
+test('parseSettledRead and unclaim retire a notice once status reads a settled job or run', () => {
+  assert.ok(STATUS_TOOL.test(`${PLUGIN}status`));
+  assert.ok(STATUS_TOOL.test(`${PLUGIN}pipeline_status`));
+  assert.ok(!STATUS_TOOL.test(`${PLUGIN}spawn_job`));
+
+  assert.equal(parseSettledRead(`${PLUGIN}status`, { jobId: 'j1', status: 'running' }), null);
+  assert.equal(parseSettledRead(`${PLUGIN}status`, { jobId: 'j1', status: 'succeeded', acceptance: { pending: true } }), null);
+  assert.deepEqual(parseSettledRead(`${PLUGIN}status`, { jobId: 'j1', status: 'succeeded', acceptance: { state: 'accepted', pending: false } }), { kind: 'job', id: 'j1' });
+  assert.deepEqual(parseSettledRead(`${PLUGIN}pipeline_status`, { runId: 'r1', status: 'passed' }), { kind: 'run', id: 'r1' });
+
+  const owned = claim(claim([], launch('j1'), NOW), launch('j2'), NOW);
+  assert.deepEqual(unclaim(owned, { kind: 'job', id: 'j1' }).map((o) => o.id), ['j2']);
 });

@@ -89,17 +89,12 @@
 // The mod above stays dependency-free because a terminal surface should not drag a
 // library into the user's session.
 
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-} from '@modelcontextprotocol/sdk/types.js';
-
+import type { Server } from '@modelcontextprotocol/server';
+import { serveStdio } from '@modelcontextprotocol/server/stdio';
+import { createSmithServer } from './mcp.ts';
 import { ForgeService } from '../../../forge/service.ts';
 import { type Batch } from './policy.ts';
 import { POLL_MS, pollOnce, scheduleLoop } from './poller.ts';
-import { TOOL_DEFS, callTool } from './tools.ts';
 
 /**
  * The source name Claude sees in the `<channel source="...">` wrapper.
@@ -111,7 +106,6 @@ import { TOOL_DEFS, callTool } from './tools.ts';
  * The name is an artefact of where this surface came from, and it is load-bearing
  * for that reason alone.
  */
-const SOURCE = 'agent-smith';
 
 /**
  * Instructions handed to Claude at session start.
@@ -159,59 +153,15 @@ const INSTRUCTIONS =
 // The native plugin announces completion through its mod (hooks/notice.ts), falling back to a
 // job-scoped asyncRewake hook (watch-hook.ts) without it; not through this channel.
 const CHANNEL_ENABLED = process.env['AGENT_SMITH_CHANNEL'] !== '0';
-const CAPABILITIES = {
-  // REQUIRED for the inbound direction. Without it Claude Code does not surface
-  // the channel and every notification we send is discarded with no error
-  // anywhere.
-  ...(CHANNEL_ENABLED ? { experimental: { 'claude/channel': {} } } : {}),
-  // The outbound direction. `tools: {}` is the declaration that this server
-  // answers `tools/list` and `tools/call`; the empty object is correct and is
-  // NOT a placeholder, because we register no `tools/list_changed` capability —
-  // the tool set is fixed for the process's lifetime, so there is nothing to
-  // announce a change to.
-  tools: {},
-} as const;
-
-const mcp = new Server(
-  { name: SOURCE, version: '0.2.0' },
-  {
-    capabilities: CAPABILITIES,
-    instructions: INSTRUCTIONS,
-  },
-);
-
-/**
- * The service the tools act on.
- *
- * ONE per process, and that is load-bearing rather than incidental: it owns the
- * live-worker map, which is what makes `cancel` able to signal a worker instead
- * of only marking it. The channel's poll loop reads the SAME directory through
- * harness/, so a job this service spawns and a notification the channel pushes
- * can never be about two different jobs — the one claim this file has to make
- * about both halves of itself.
- */
+// The SDK selects the protocol era from the opening request. Only legacy
+// connections can carry Claude's channel extension.
+let channelServer: Server | undefined;
 const forge = new ForgeService({ repo: resolveCwd() });
 
-/**
- * Register the outbound direction: Claude calls us.
- *
- * Handlers are `callTool`'s switch, not five closures, because five closures is
- * five places for a validation rule to drift. Every argument is coerced
- * defensively there (`./tools.ts` explains why) and every handled failure comes
- * back as a flagged result carrying a sentence the model can act on — never a
- * JSON-RPC error, which surfaces as a stack trace and teaches the model nothing.
- */
-mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOL_DEFS }));
-
-// `server: mcp` lets a tool ask the user mid-call (elicitation), e.g. to confirm unrestricted access.
-mcp.setRequestHandler(CallToolRequestSchema, async (request) =>
-  callTool({ service: forge, server: mcp }, request.params.name, request.params.arguments ?? {}),
-);
-
-/** The transport call. The only place in the repo that touches the SDK. */
+/** Send legacy Claude channel notifications through the selected SDK instance. */
 async function sendBatch(batch: Batch): Promise<void> {
-  if (batch.content === null) return;
-  await mcp.notification({
+  if (batch.content === null || !channelServer) return;
+  await channelServer.notification({
     method: 'notifications/claude/channel',
     params: {
       content: batch.content,
@@ -243,7 +193,13 @@ const CWD = resolveCwd();
 // Establish the historical baseline before accepting spawn calls. Otherwise a
 // fast new worker could finish during the first poll and be mistaken for history.
 if (CHANNEL_ENABLED) await pollOnce(CWD, Date.now(), sendBatch);
-await mcp.connect(new StdioServerTransport());
+serveStdio(({ era }) => {
+  const server = createSmithServer({ service: forge }, {
+    era, channel: CHANNEL_ENABLED, instructions: INSTRUCTIONS,
+  });
+  if (era === 'legacy' && CHANNEL_ENABLED) channelServer = server;
+  return server;
+}, { onerror: err => process.stderr.write(`agent-smith MCP: ${String(err)}\n`) });
 
 // Poll only AFTER the transport is live, so no notification is ever written into a
 // stream Claude Code is not yet reading. (On stdio that would be a malformed

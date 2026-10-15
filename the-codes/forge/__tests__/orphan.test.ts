@@ -119,7 +119,7 @@ test('a finished job whose supervisor is gone keeps its real verdict', async () 
   assert.equal((await observe(repo, id)).status, 'succeeded');
 });
 
-test('service does not reconcile a live supervisor or a terminal result', async () => {
+test('service preserves live supervisors and terminal anchors; partial results do not block recovery', async () => {
   const repo = mkdtempSync(path.join(tmpdir(), 'orphan-'));
   const service = new ForgeService({ repo, mirror: false });
   const id = 'implement-smith-aaaa0004';
@@ -131,9 +131,9 @@ test('service does not reconcile a live supervisor or a terminal result', async 
   const m = JSON.parse(before);
   writeFileSync(file, JSON.stringify({ ...m, ownerPid: deadPid() }));
   writeFileSync(jobFile(repo, id, FILES.result), JSON.stringify({ ok: true }));
-  const pending = readFileSync(file, 'utf8');
   await service.list();
-  assert.equal(readFileSync(file, 'utf8'), pending);
+  assert.equal(JSON.parse(readFileSync(file, 'utf8')).status, 'failed');
+  assert.equal(JSON.parse(readFileSync(file, 'utf8')).jobStatus, 'orphaned');
   writeFileSync(file, JSON.stringify({ ...m, status: 'succeeded', finishedAt: iso(NOW) }));
   const finished = readFileSync(file, 'utf8');
   await service.list();

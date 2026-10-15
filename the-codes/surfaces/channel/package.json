@@ -5,10 +5,18 @@
   "description": "Claude Code channel that pushes agy job state CHANGES into Claude's context.",
   "license": "MIT",
   "type": "module",
-  "engines": { "node": ">=22" },
-  "bin": { "agy-watch": "./dist/server.js" },
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "agy-watch": "./dist/server.js"
+  },
   "main": "./dist/server.js",
-  "files": ["dist", "src", "README.md"],
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
   "scripts": {
     "start": "node --experimental-strip-types src/server.ts",
     "test": "node --test --experimental-strip-types \"src/**/*.test.ts\"",
@@ -16,6 +24,12 @@
     "build": "tsc -p tsconfig.build.json && node scripts/stamp-entrypoint.mjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.32.1"
+    "@modelcontextprotocol/core": "2.3.1",
+    "@modelcontextprotocol/ext-tasks": "^0.2.2",
+    "@modelcontextprotocol/server": "2.3.1"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.3.1",
+    "@modelcontextprotocol/sdk": "1.32.1"
   }
 }

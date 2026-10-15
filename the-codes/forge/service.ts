@@ -144,6 +144,8 @@ export interface SpawnRequest {
   readonly pipeline?: string | undefined;
   readonly stage?: string | undefined;
   readonly attempt?: number | undefined;
+  /** Persist a protocol handle after the job anchor exists, before any worker starts. */
+  readonly onPrepared?: ((jobId: string) => void) | undefined;
 }
 
 /** What spawn_job returns. Immediate, and always truthful. */
@@ -583,6 +585,12 @@ export class ForgeService {
       readOnlyRequested,
       readOnlyEnforced,
     });
+    try {
+      request.onPrepared?.(jobId);
+    } catch (error) {
+      writer.abort('failed', `Job preparation failed: ${String(error)}`);
+      throw error;
+    }
     this.spawnedIds.add(jobId);
 
     const ack: SpawnAck = {
@@ -600,9 +608,7 @@ export class ForgeService {
         `queued ${provider.name}/${mode}` +
         (request.model === undefined ? '' : ` model=${request.model}`) +
         ` budget=${Math.round(timeoutMs / 1000)}s` +
-        (unrestricted
-          ? ' — UNRESTRICTED: tool approvals bypassed'
-          : ' — approvals enforced; a tool that needs one will be denied'),
+        (unrestricted ? '' : ' — approvals enforced; a tool that needs one will be denied'),
       sandbox,
       sandboxFlags,
       readOnlyRequested,

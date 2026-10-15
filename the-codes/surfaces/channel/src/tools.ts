@@ -2,8 +2,8 @@
 import path from 'node:path';
 import { statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
-import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import type { CallToolResult } from '@modelcontextprotocol/server';
+import type { Server } from '@modelcontextprotocol/server';
 import type { ForgeStatus } from '../../../forge/format.ts';
 import { DEFAULT_TIMEOUT_MS, type ForgeService } from '../../../forge/service.ts';
 import { startPipeline, readPipeline, cancelPipeline } from '../../../forge/execute.ts';
@@ -83,19 +83,6 @@ const TASK_SCHEMA = open({
   pollIntervalMs: { type: 'integer', minimum: 1, description: "The server's own polling cadence; checking more often gains nothing." },
 }, ['taskId', 'status', 'pollIntervalMs']);
 const NOTIFY_SCHEMA = open({ mode: typed('string'), note: typed('string'), monitorCommand: typed('string'), monitorTimeoutMs: typed('integer') }, ['mode']);
-const SPAWN_OUTPUT = open({
-  jobId: jobFields.jobId, name: jobFields.name, workerId: typed('string'), provider: typed('string'),
-  status: { type: 'string', enum: JOB_STATUSES, description: 'running on a fresh ack.' },
-  taskHandle: { ...TASK_SCHEMA, description: 'MCP Tasks-shaped handle for this job.' },
-  timeoutMs: typed('integer'), unrestricted: typed('boolean', 'Whether worker approval prompts are bypassed.'),
-  sandbox: typed('string', "The provider's sandbox posture for this job."), sandboxFlags: strings(),
-  readOnlyRequested: typed('boolean'), readOnlyEnforced: typed('boolean'),
-  modelResolved: typed(['string', 'null']), modelSource: typed('string'),
-  warnings: strings('Problems with the request that did not stop the launch.'),
-  notify: { ...NOTIFY_SCHEMA, description: 'How completion is announced, with a fallback if no notice arrives.' },
-  checks: strings('Names of the acceptance checks attached to this job.'),
-  aliasApplied: typed('string'), aliasSource: typed('string'),
-}, ['jobId', 'name', 'status', 'taskHandle']);
 const STATUS_OUTPUT = open({
   ...jobFields,
   acceptance: open({
@@ -114,6 +101,18 @@ const STATUS_OUTPUT = open({
   waited: typed('boolean', 'Present with wait_ms.'), stillRunning: typed('boolean', 'Present with wait_ms: the wait elapsed first.'),
   diff: typed(['string', 'null'], 'Present with include_diff.'), diffNote: typed('string'),
 }, ['jobId', 'status', 'taskStatus']);
+const SPAWN_OUTPUT = open({
+  ...(STATUS_OUTPUT.properties as Record<string, unknown>),
+  workerId: typed('string'),
+  taskHandle: { ...TASK_SCHEMA, description: 'MCP Tasks-shaped handle for this job.' },
+  timeoutMs: typed('integer'), unrestricted: typed('boolean', 'Whether worker approval prompts are bypassed.'),
+  sandbox: typed('string', "The provider's sandbox posture for this job."), sandboxFlags: strings(),
+  readOnlyRequested: typed('boolean'), readOnlyEnforced: typed('boolean'),
+  modelResolved: typed(['string', 'null']), modelSource: typed('string'),
+  notify: { ...NOTIFY_SCHEMA, description: 'How completion is announced, with a fallback if no notice arrives.' },
+  checks: strings('Names of the acceptance checks attached to this job.'),
+  aliasApplied: typed('string'), aliasSource: typed('string'),
+}, ['jobId', 'name', 'status']);
 const LIST_JOBS_OUTPUT = open({
   items: { type: 'array', items: open({ ...jobFields, summary: typed('string', 'Worker-written, trimmed (concise).'), latestSummary: typed(['string', 'null'], 'Worker-written (detailed).'), warningCount: typed('integer') }, ['jobId', 'status', 'taskStatus']) },
   more: typed('string', 'Present when more jobs match than were returned.'),
@@ -214,10 +213,15 @@ const MONITOR_CAP_MS = 1_800_000;
 const NOTIFY_NOTE = 'Completion is announced automatically by the plugin (a turn from Agent Smith, or a hook notice); if you did not receive a completion notice (hook unavailable, e.g. headless -p or other clients), run this under the Monitor tool, re-arm on expiry, or use status wait_ms.';
 
 /** monitor.js sits at dist/monitor.js; resolvable only when running from the built dist/. */
-function builtMonitorPath(moduleFile = fileURLToPath(import.meta.url)): string | undefined {
+export function builtMonitorPath(moduleFile = fileURLToPath(import.meta.url)): string | undefined {
   const marker = `${path.sep}dist${path.sep}surfaces${path.sep}channel${path.sep}src${path.sep}`;
   const at = moduleFile.lastIndexOf(marker);
-  return at < 0 ? undefined : path.join(moduleFile.slice(0, at), 'dist', 'monitor.js');
+  if (at >= 0) return path.join(moduleFile.slice(0, at), 'dist', 'monitor.js');
+  const dir = path.dirname(moduleFile);
+  if (path.basename(dir) === 'dist' && path.basename(moduleFile) === 'server.js') {
+    return path.join(dir, 'monitor.js');
+  }
+  return undefined;
 }
 
 /** The `notify` hint attached to spawn/resume/pipeline acks. Exported for tests. */
@@ -263,6 +267,8 @@ async function confirmUnrestricted(ctx: HandlerContext, req: { unrestricted?: bo
 export type ToolOutcome = CallToolResult;
 export interface HandlerContext {
   readonly service: ForgeService; readonly pollMs?: number; readonly onStageSpawned?: (stage: string, jobId: string) => void; readonly catalogs?: CatalogSource;
+  /** Persist an external task link after validation/approval and before the worker starts. */
+  readonly onJobPrepared?: (jobId: string) => void;
   /** The MCP server, to ask the user mid-call (elicitation). Absent outside the server: no prompt is possible. */
   readonly server?: Pick<Server, 'getClientCapabilities' | 'elicitInput'>;
 }
@@ -364,14 +370,24 @@ export async function callTool(ctx: HandlerContext, name: string, rawArgs: unkno
         const notes = [...resolved.warnings, ...cfg.errors.map(e => `models.json: ${e}`)];
         const withNotes = <T extends { warnings?: readonly string[]; jobId?: string; timeoutMs?: number }>(ack: T) => ({ ...ack, ...(ack.jobId ? { taskHandle: launchTask(ack.jobId), notify: notifyHint({ job: ack.jobId }, ctx.service.repo, ack.timeoutMs) } : {}), ...(resolved.appliedAlias ? { aliasApplied: resolved.appliedAlias, aliasSource: resolved.source } : {}), ...(notes.length ? { warnings: [...(ack.warnings ?? []), ...notes] } : {}) });
         const checks = parseChecks(args.checks);
-        const request = { mode, prompt: text(args, 'prompt', true)!, context: contextText(args), checks, cwd: workingDirectory(args), name: text(args, 'name'), task: text(args, 'task'), provider, model: resolved.model, effort: resolved.effort, timeoutMs: number(args, 'timeoutMs'), conversation: text(args, 'conversation'), unrestricted: boolean(args, 'unrestricted') };
+        let prepared = false;
+        const onPrepared = (jobId: string) => {
+          prepared = true;
+          if (checks?.length) {
+            try { writeAcceptance(ctx.service.repo, jobId, { state: 'unchecked', checks: [], pending: true }); } catch (err) { process.stderr.write(`agent-smith acceptance ${jobId}: ${String(err)}\n`); }
+          }
+          ctx.onJobPrepared?.(jobId);
+        };
+        const request = { mode, prompt: text(args, 'prompt', true)!, context: contextText(args), checks, cwd: workingDirectory(args), name: text(args, 'name'), task: text(args, 'task'), provider, model: resolved.model, effort: resolved.effort, timeoutMs: number(args, 'timeoutMs'), conversation: text(args, 'conversation'), unrestricted: boolean(args, 'unrestricted'), onPrepared };
         // After every argument is validated, so the user is never asked about a call that then fails.
         const gate = await confirmUnrestricted(ctx, { unrestricted: request.unrestricted, provider, worker: request.name, cwd: request.cwd ?? ctx.service.repo });
         if (gate.refused) return gate.refused;
         if (gate.warning) notes.push(gate.warning);
         if (!checks?.length) return structured({ ...withNotes(await ctx.service.spawnJob(request)), provider });
         const { ack, done } = await ctx.service.spawnTracked(request);
-        try { writeAcceptance(ctx.service.repo, ack.jobId, { state: 'unchecked', checks: [], pending: true }); } catch (err) { process.stderr.write(`agent-smith acceptance ${ack.jobId}: ${String(err)}\n`); }
+        if (!prepared) {
+          try { writeAcceptance(ctx.service.repo, ack.jobId, { state: 'unchecked', checks: [], pending: true }); } catch (err) { process.stderr.write(`agent-smith acceptance ${ack.jobId}: ${String(err)}\n`); }
+        }
         gateAcceptance(ctx, ack.jobId, done, checks);
         return structured({ ...withNotes(ack), provider, checks: checks.map(c => c.name) });
       }
@@ -394,7 +410,7 @@ export async function callTool(ctx: HandlerContext, name: string, rawArgs: unkno
         // Only an explicit unrestricted:true asks; an inherited setting was the original job's.
         const gate = await confirmUnrestricted(ctx, { unrestricted, provider: detail.provider ?? '', worker: detail.name, cwd });
         if (gate.refused) return gate.refused;
-        const resumed = await ctx.service.spawnJob({ mode: detail.mode ?? 'task', prompt, provider: detail.provider ?? undefined, model: resumeModel.model ?? detail.model ?? undefined, effort: resumeModel.effort ?? detail.effort ?? undefined, name: detail.name, workerId: detail.workerId, task: detail.task ?? undefined, cwd, conversation: detail.conversation, timeoutMs, unrestricted: unrestricted ?? detail.unrestricted });
+        const resumed = await ctx.service.spawnJob({ mode: detail.mode ?? 'task', prompt, provider: detail.provider ?? undefined, model: resumeModel.model ?? detail.model ?? undefined, effort: resumeModel.effort ?? detail.effort ?? undefined, name: detail.name, workerId: detail.workerId, task: detail.task ?? undefined, cwd, conversation: detail.conversation, timeoutMs, unrestricted: unrestricted ?? detail.unrestricted, onPrepared: ctx.onJobPrepared });
         return json({ ...resumed, taskHandle: launchTask(resumed.jobId), notify: notifyHint({ job: resumed.jobId }, ctx.service.repo, resumed.timeoutMs), ...(gate.warning ? { warnings: [...(resumed.warnings ?? []), gate.warning] } : {}) });
       }
       case 'list_jobs': {

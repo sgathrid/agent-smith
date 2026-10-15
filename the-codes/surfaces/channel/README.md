@@ -32,6 +32,14 @@ Tools: `list_capabilities`, `spawn_job`, `resume_job`, `list_jobs`, `status`, `c
 `run_pipeline`, `pipeline_status`. All launch tools return immediately. Errors use MCP `isError`.
 Schema validation rejects malformed settings before execution.
 
+The runtime uses the official MCP TypeScript SDK v2 (`server` and `core` 2.3.1).
+Its stdio dispatcher serves the 2026-07-28 protocol and legacy clients through
+the same Forge handlers. Claude channel capability is advertised only on the
+legacy connection. Setting `AGENT_SMITH_TASKS=1` enables the opt-in 2026-07-28
+MCP Tasks (`io.modelcontextprotocol/tasks`) receiver for `spawn_job` and
+`resume_job` when a modern request advertises client Tasks support; otherwise
+launch `taskHandle` fields remain ordinary tool-result data.
+
 Custom development channels require
 `--dangerously-load-development-channels server:agent-smith`. Organization policy
 may disable channel delivery; MCP execution and status tools remain useful without

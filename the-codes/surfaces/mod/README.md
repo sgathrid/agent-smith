@@ -66,6 +66,14 @@ number:
 
 ## Install
 
+Install the full plugin in Claude Code:
+
+```text
+/plugin install agent-smith --marketplace sgathrid/agent-smith
+```
+
+Or load the mod directory on its own for a single session:
+
 ```bash
 claude plugin validate the-codes/surfaces/mod    # must pass
 claude --plugin-dir the-codes/surfaces/mod       # or install it

@@ -347,7 +347,7 @@ interface CodexTranslator {
  * numbering. Our ProviderEvent.activity.stepIndex must be monotonic within a
  * job because core/ uses it as the activity key. So we mint our own.
  */
-function createCodexTranslator(maxChars: number): CodexTranslator {
+export function createCodexTranslator(maxChars: number): CodexTranslator {
   let step = 0;
   const state: CodexTranslator = {
     sawTurnCompleted: false,
@@ -476,8 +476,13 @@ function createCodexTranslator(maxChars: number): CodexTranslator {
       // spellings and fall back to "done", because a completed item that
       // carries an explicit failure must not render as green.
       const itemStatus = str(item, 'status') ?? str(item, 'state');
+      const exitCode = itemType === 'command_execution' ? num(item, 'exit_code') : undefined;
+      const itemResult = obj(item, 'result');
       const explicitError =
-        itemType === 'error' || itemStatus === 'failed' || itemStatus === 'error' || num(item, 'exit_code') !== 0;
+        itemType === 'error' || itemStatus === 'failed' || itemStatus === 'error' ||
+        item['isError'] === true || item['is_error'] === true || item['error'] != null ||
+        itemResult?.['isError'] === true || itemResult?.['is_error'] === true ||
+        (exitCode !== undefined && exitCode !== 0);
       let status: ActivityStatus = explicitError ? 'error' : 'done';
 
       // A codex tool call that needs approval it cannot get is the same failure
@@ -485,8 +490,13 @@ function createCodexTranslator(maxChars: number): CodexTranslator {
       // have a verified codex denial field, but the message text is stable
       // enough to detect, and mis-rendering this as success is the expensive
       // error. UNVERIFIED — see README.
-      const deniedText = `${str(item, 'message') ?? ''} ${JSON.stringify(item)}`.toLowerCase();
-      const denied = deniedText.includes('denied') || deniedText.includes('rejected by the user');
+      const error = obj(item, 'error');
+      const denialReason = str(item, 'decision') ?? str(item, 'approval_status') ?? str(error, 'type');
+      const errorMessage = str(error, 'message')?.toLowerCase();
+      const denied = item['permission_denied'] === true || item['denied'] === true ||
+        itemStatus === 'denied' || itemStatus === 'rejected' ||
+        (denialReason !== undefined && /^(?:denied|rejected|declined|approval_denied|permission_denied)$/i.test(denialReason)) ||
+        (errorMessage !== undefined && /(?:permission|approval).{0,50}(?:denied|rejected)|(?:denied|rejected).{0,50}(?:permission|approval)/.test(errorMessage));
       if (denied) status = 'denied';
 
       const ref: ActivityRef = { stepIndex: idx, tool };

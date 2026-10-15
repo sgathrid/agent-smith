@@ -329,7 +329,7 @@ interface ClaudeTranslator {
   deniedTools: string[];
 }
 
-function createClaudeTranslator(maxChars: number): ClaudeTranslator {
+export function createClaudeTranslator(maxChars: number): ClaudeTranslator {
   const tx: ClaudeTranslator = {
     finalText: '',
     sawResult: false,
@@ -339,7 +339,23 @@ function createClaudeTranslator(maxChars: number): ClaudeTranslator {
   };
   /** tool_use_id -> stepIndex */
   const toolStep = new Map<string, number>();
+  const deniedIds = new Set<string>();
   let step = 0;
+
+  const recordDenial = (id: string): boolean => {
+    if (deniedIds.has(id)) return false;
+    deniedIds.add(id);
+    tx.deniedTools.push(id);
+    return true;
+  };
+
+  const denialActivity = (id: string, tool: string, at: string): ProviderEvent | undefined => {
+    if (!recordDenial(id)) return undefined;
+    const idx = toolStep.get(id) ?? step++;
+    toolStep.set(id, idx);
+    const activity: ActivityRef = { stepIndex: idx, tool, toolCallId: id, denied: true };
+    return { kind: 'activity-end', at, activity, status: 'denied' };
+  };
 
   tx.onEvent = (raw: Record<string, unknown>): ProviderEvent[] => {
     const out: ProviderEvent[] = [];
@@ -352,6 +368,14 @@ function createClaudeTranslator(maxChars: number): ClaudeTranslator {
     // ---- system / init ------------------------------------------------------
     if (type === 'system') {
       const subtype = str(raw, 'subtype');
+      if (subtype === 'permission_denied') {
+        const toolUseId = str(raw, 'tool_use_id') ?? str(raw, 'id');
+        const toolName = str(raw, 'tool_name') ?? str(raw, 'tool') ?? 'unknown';
+        const key = toolUseId ?? `tool:${toolName}`;
+        const evidence = denialActivity(key, toolName, at);
+        if (evidence !== undefined) out.push(evidence);
+        return out;
+      }
       if (subtype === 'init') {
         const ev: ProviderEvent = { kind: 'started', at, raw };
         if (sessionId !== undefined) ev.conversationId = sessionId;
@@ -486,7 +510,10 @@ function createClaudeTranslator(maxChars: number): ClaudeTranslator {
         if (denied) ref.denied = true;
 
         out.push({ kind: 'activity-end', at, activity: ref, status });
-        if (denied) tx.deniedTools.push(toolUseId);
+        if (denied) {
+          const key = toolUseId !== '' ? toolUseId : `tool:${str(b, 'name') ?? 'unknown'}`;
+          recordDenial(key);
+        }
       }
       return out;
     }
@@ -494,6 +521,15 @@ function createClaudeTranslator(maxChars: number): ClaudeTranslator {
     // ---- result --------------------------------------------------------------
     if (type === 'result') {
       tx.sawResult = true;
+      const permissionDenials = Array.isArray(raw['permission_denials']) ? raw['permission_denials'] : [];
+      for (const denial of permissionDenials) {
+        if (denial === null || typeof denial !== 'object') continue;
+        const d = denial as Record<string, unknown>;
+        const toolName = str(d, 'tool_name') ?? str(d, 'tool') ?? 'unknown';
+        const id = str(d, 'tool_use_id') ?? str(d, 'id') ?? `tool:${toolName}`;
+        const evidence = denialActivity(id, toolName, at);
+        if (evidence !== undefined) out.push(evidence);
+      }
       const subtype = str(raw, 'subtype');
       const isError = raw['is_error'] === true || (subtype !== undefined && subtype !== 'success');
       if (isError) tx.sawErrorResult = true;
@@ -551,7 +587,7 @@ interface ExitInfo {
   stderr: string;
 }
 
-function buildResult(args: {
+export function buildResult(args: {
   jobId: string;
   startedAtMs: number;
   stateDir: string;
@@ -617,7 +653,7 @@ function buildResult(args: {
   // A report was delivered despite denied calls: the job succeeded, but the
   // orchestrator must know some checks did not run (normalize.ts turns this
   // into a warning).
-  if (status === 'success' && tx.deniedTools.length > 0) {
+  if (tx.deniedTools.length > 0) {
     out.deniedActions = tx.deniedTools.map((id) => ({ action: 'tool', displayName: id }));
   }
   if (tx.usage !== undefined) out.usage = tx.usage;
