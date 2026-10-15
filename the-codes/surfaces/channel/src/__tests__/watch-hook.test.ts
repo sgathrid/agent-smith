@@ -37,7 +37,7 @@ test('already-terminal job is reported once and watch exits', async () => {
   const { p, lines } = watch({ a: [job('a', 'succeeded')] }, { jobIds: ['a'] });
   assert.equal(await p, 'done');
   assert.equal(lines.length, 1);
-  assert.match(lines[0]!, /^Agent Smith · ✓ .*succeeded/);
+  assert.match(lines[0]!, /^Agent Smith · ✓ .*done/);
 });
 
 test('running then succeeded', async () => {
@@ -70,7 +70,7 @@ test('run mode finishes with the pipeline record', async () => {
 test('timeout prints still running', async () => {
   const { p, lines } = watch({ a: [job('a', 'running')] }, { jobIds: ['a'], timeoutMs: 3000 });
   assert.equal(await p, 'timeout');
-  assert.match(lines.at(-1)!, /still running; check status a/);
+  assert.match(lines.at(-1)!, /Agent Smith · still running: a/);
 });
 
 const ack = { jobId: 'j1', repo: '/some/repo', dir: '/some/repo/.agent-smith/jobs/j1' };
@@ -115,8 +115,8 @@ test('runHook exits 2 with the line for a finished job', async () => {
     readJob: async () => job('j1', 'succeeded'), intervalMs: 50,
   });
   assert.equal(code, 2);
-  assert.match(out, /^Agent Smith · ✓ W-j1 \(implementer\) succeeded · no checks\. Job ID j1\.\n/);
-  assert.match(out, /not an error\.\)\n$/);
+  assert.match(out, /^Agent Smith · ✓ W-j1 \(implementer\) · done\nstatus j1\n/);
+  assert.match(out, /\(notice, not an error\)\n$/);
 });
 
 test('runHook stays silent for a launch the mod claimed', async () => {

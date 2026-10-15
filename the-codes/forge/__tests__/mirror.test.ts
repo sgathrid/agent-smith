@@ -185,7 +185,7 @@ test('a suspicious success gets a reason even when the manifest has none', () =>
   // The one case where the wording must not be left blank: `done` with no
   // explanation is exactly the confusing state the downgrade exists to prevent.
   const out = mirrorStatus(manifest({ status: 'failed', error: null }), true);
-  assert.match(String(out['reason']), /no usable output/);
+  assert.match(String(out['reason']), /no output/);
 });
 
 test('the dispatch line carries the only start time in the layout', () => {

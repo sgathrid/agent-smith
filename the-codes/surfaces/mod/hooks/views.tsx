@@ -35,10 +35,10 @@ export function renderList(W: UiComponents, jobs: readonly RadarJob[], o: ViewOp
   const page = Math.min(o.page,pages-1);
   const start = page*PAGE_SIZE;
   return <Box flexDirection="column">
-    <Text bold wrap="truncate-end">{`Forge · ${scopeLine(jobs,o.scope)}`}</Text>
+    <Text bold wrap="truncate-end">{`Workers · ${scopeLine(jobs,o.scope)}`}</Text>
     {all.length===0 && <Text dimColor wrap="wrap">{o.scope==='session'
-      ? 'Agents you start here appear in this list. /forge all shows the repository\'s history.'
-      : 'No workers yet. Running workers appear here and above the prompt.'}</Text>}
+      ? 'Workers you start here appear in this list. /forge all shows the repository\'s history.'
+      : 'No workers yet.'}</Text>}
     {all.slice(start,start+PAGE_SIZE).map((job,i) => <Box key={`worker-${job.id}`} flexDirection="column">
       {start+i===live && <Text bold wrap="truncate-end">Recent</Text>}
       <Button key={`job-${job.id}`} plain hotkey={String(i+1)} label={workerHeading(job)} onPress={() => a.pick(job)}>
@@ -74,7 +74,7 @@ export function renderWorker(W: UiComponents, d: ForgeDetail, o: ViewOptions, a:
     {job.progress && <Box flexDirection="column">
       {progressLines(job.progress, job.toolCount).map((line,i) => <Text key={`progress-${i}`} dimColor={i>0} wrap="truncate-end">{line}</Text>)}
       {job.status==='running' && job.lastEventAt!=null && o.now-job.lastEventAt>QUIET_MS &&
-        <Text color={o.colour?'yellow':undefined} wrap="truncate-end">{`No new activity for ${elapsed(o.now-job.lastEventAt)}`}</Text>}
+        <Text color={o.colour?'yellow':undefined} wrap="truncate-end">{`Stalled ${elapsed(o.now-job.lastEventAt)}`}</Text>}
     </Box>}
     {job.warnings.map((warning,i) => <Text key={`warning-${i}`} color={o.colour?'yellow':undefined} wrap="wrap">{warning.message}</Text>)}
     <Button key="task" plain hotkey="t" label={o.taskOpen?'Task (as sent)':`Task: ${oneLine(prompt,Math.max(1,o.width-12))}`} onPress={a.task} />

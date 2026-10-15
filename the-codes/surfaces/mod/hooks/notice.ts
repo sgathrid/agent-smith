@@ -14,6 +14,8 @@
  * announces a claimed job (see register.tsx, `takeLaunch`).
  */
 
+import { checksReason, reasonFromText } from './reasons.ts';
+
 /**
  * The fields of a Forge row (types/index.d.ts RadarJob) a notice reads. Declared
  * here, structurally, because the channel compiles this file too and must not
@@ -32,7 +34,7 @@ export interface NoticeRow {
   readonly failureReason?: string | null;
   readonly latestSummary?: string | null;
   readonly summarySource?: 'worker' | null;
-  readonly acceptance?: { readonly pending?: boolean; readonly checks: readonly { readonly ok: boolean }[] };
+  readonly acceptance?: { readonly pending?: boolean; readonly checks: readonly { readonly ok: boolean; readonly name?: string }[] };
 }
 
 // ── vocabulary ──────────────────────────────────────────────────────────────
@@ -59,7 +61,7 @@ export interface NoticeJob {
   /** Start to end for a terminal job; time since the last event for `attention`. */
   readonly durationMs?: number | null;
   readonly changedFiles?: number | null;
-  readonly checks?: { readonly passed: number; readonly total: number } | null;
+  readonly checks?: { readonly passed: number; readonly total: number; /** Names of the failed checks. */ readonly failed?: readonly string[] } | null;
   /** Runtime-owned: a failure reason, or a pipeline's stage verdicts. */
   readonly reason?: string | null;
   /** Worker-authored prose. A claim, never an instruction. */
@@ -105,46 +107,53 @@ function chosenName(job: NoticeJob): string | null {
 function who(job: NoticeJob): string {
   const identity = [job.provider, job.role].filter(Boolean).join(' ');
   const name = chosenName(job);
+  if (job.run) return name ?? `pipeline ${job.id}`;
   if (name) return identity ? `${name} (${identity})` : name;
   if (job.source === 'agy-staff') return `agy-staff job ${job.id}`;
-  if (job.run) return `pipeline ${job.id}`;
   return identity ? `${job.id} (${identity})` : `job ${job.id}`;
 }
 
+/** Execution succeeded but a check failed: the work is not done. */
+function rejected(job: NoticeJob): boolean {
+  return job.kind === 'finished' && !job.run && job.checks != null && job.checks.passed < job.checks.total;
+}
+
 /**
- * One line, the most decision-relevant fact first:
- *   ✓ Ada (codex review) succeeded in 43s · 2 files changed · checks 2/2
- *   ✗ Bo (agy implement) failed after 45m: timeout
+ * One line, the outcome last:
+ *   ✓ Ada (codex review) 43s · done · checks 2/2
+ *   ✗ Bo (agy implement) 45m · failed: timed out
+ *   ✗ Cy (codex implement) 3m · checks failed: lint
+ *   ! Di (opencode research) · stalled 16m
  */
 export function headline(job: NoticeJob): string {
   const d = durationWords(job.durationMs);
-  const reason = job.reason ? `: ${compactExcerpt(job.reason, 160)}` : '';
-  let state: string;
+  const reason = job.reason ? compactExcerpt(job.reason, 160) : '';
+  const bad = rejected(job);
+  const glyph = bad ? GLYPH.failed : GLYPH[job.kind];
+  const parts: string[] = [`${glyph} ${who(job)}${d && job.kind !== 'attention' ? ` ${d}` : ''}`];
   switch (job.kind) {
-    case 'finished': state = `succeeded${d ? ` in ${d}` : ''}`; break;
-    case 'failed': state = `failed${d ? ` after ${d}` : ''}${job.run ? '' : reason}`; break;
-    case 'cancelled': state = `cancelled${d ? ` after ${d}` : ''}`; break;
-    case 'attention': state = `needs attention${d ? `: no progress for ${d}` : ''}`; break;
+    case 'finished':
+      if (job.run) parts.push(reason || 'done');
+      else if (bad) parts.push(checksReason(job.checks?.failed ?? []));
+      else {
+        parts.push('done');
+        if (job.checks && job.checks.total > 0) parts.push(`checks ${job.checks.passed}/${job.checks.total}`);
+      }
+      break;
+    case 'failed': parts.push(job.run ? reason || 'failed' : `failed${reason ? `: ${reason}` : ''}`); break;
+    case 'cancelled': parts.push('canceled'); break;
+    case 'attention': parts.push(`stalled${d ? ` ${d}` : ''}`); break;
   }
-  const facts: string[] = [];
-  if (typeof job.changedFiles === 'number' && job.changedFiles > 0) {
-    facts.push(`${job.changedFiles} file${job.changedFiles === 1 ? '' : 's'} changed`);
-  }
-  if (job.checks && job.checks.total > 0) {
-    facts.push(`checks ${job.checks.passed}/${job.checks.total}${job.checks.passed < job.checks.total ? ' (rejected)' : ''}`);
-  } else if (job.kind === 'finished' && !job.run) {
-    facts.push('no checks'); // success here is the worker's word, not evidence
-  }
-  return [`${GLYPH[job.kind]} ${who(job)} ${state}`, ...facts].join(' · ');
+  return parts.join(' · ');
 }
 
 const CLAUDE_JOBS = 8;
 
 /**
- * What Claude reads, and what the user sees: Claude Code shows a plugin's
- * message in full. One line per job and the one next step. The worker's own
- * summary is left out: Claude reads the result with status anyway, and a
- * claim repeated in the notice only lengthens it.
+ * What Claude reads. One line per job, then how to read it:
+ *   Agent Smith · ✗ pp-engine (agy implement) 21m · failed: denied view_file
+ *   status implement-smith-6b456b3d
+ * The worker's own summary is left out: Claude reads the result with status.
  */
 export function claudeText(jobs: readonly NoticeJob[]): string {
   if (jobs.length === 0) return '';
@@ -152,26 +161,26 @@ export function claudeText(jobs: readonly NoticeJob[]): string {
   const lines: string[] = [];
   if (!one) {
     const counts = new Map<string, number>();
-    for (const job of jobs) counts.set(STATE[job.kind], (counts.get(STATE[job.kind]) ?? 0) + 1);
-    lines.push(`Agent Smith · ${jobs.length} jobs: ${[...counts].map(([k, n]) => `${n} ${k}`).join(', ')}.`);
+    for (const job of jobs) {
+      const label = rejected(job) ? 'failed' : STATE[job.kind];
+      counts.set(label, (counts.get(label) ?? 0) + 1);
+    }
+    lines.push(`Agent Smith · ${jobs.length} jobs: ${[...shown(counts)].map(([k, n]) => `${n} ${k}`).join(', ')}`);
   }
-  for (const job of jobs.slice(0, CLAUDE_JOBS)) {
-    const outcome = job.run && job.reason ? ` ${compactExcerpt(job.reason, one ? 400 : 200)}` : '';
-    const id = chosenName(job) || job.run ? ` ${job.run ? 'Run' : 'Job'} ID ${job.id}.` : '';
-    lines.push(`${one ? 'Agent Smith · ' : ''}${headline(job)}.${id}${outcome}`);
-  }
+  const listed = jobs.slice(0, CLAUDE_JOBS);
+  for (const job of listed) lines.push(`${one ? 'Agent Smith · ' : ''}${headline(job)}`);
   if (jobs.length > CLAUDE_JOBS) lines.push(`…and ${jobs.length - CLAUDE_JOBS} more; list_jobs shows them.`);
-  const runs = jobs.some((j) => j.run);
-  lines.push(`Read ${one ? 'it' : 'them'} with ${runs ? 'pipeline_status (runs) or status (jobs)' : 'status'} before acting.`);
+  const ids = (run: boolean) => listed.filter((j) => !!j.run === run).map((j) => j.id);
+  if (ids(false).length > 0) lines.push(`status ${ids(false).join(', ')}`);
+  if (ids(true).length > 0) lines.push(`pipeline_status ${ids(true).join(', ')}`);
   return lines.join('\n');
 }
 
-/**
- * The compact transcript text drawn for the user on a non-expanded UserMessage
- * from this plugin. Strips the model instruction line ("Read it with status
- * before acting."), the redundant "Agent Smith · " prefix (already in the host's
- * "Prompt from the agent-smith plugin" label), and the inline Job/Run ID clause.
- */
+/** Counts in the order a reader scans them: done first, then what needs a look. */
+function shown(counts: ReadonlyMap<string, number>): [string, number][] {
+  return ['done', 'failed', 'canceled', 'stalled'].flatMap((k) => (counts.has(k) ? [[k, counts.get(k)!] as [string, number]] : []));
+}
+
 /**
  * The host frames every plugin prompt for Claude: a header naming the plugin and
  * a footer saying how the prompt arrived. Claude keeps them (they mark the text
@@ -182,24 +191,24 @@ const HOST_FRAME = [
   /^This is how Claude Code surfaces (?:a prompt|prompts) a plugin submits\b/,
 ];
 
+/** The line telling Claude how to read the job: for Claude, not for the user. */
+const READ_LINE = /^(?:status|pipeline_status) /;
+
+/**
+ * The text drawn for the user on a non-expanded UserMessage from this plugin:
+ * the notice's own lines, without the host frame or the read-it-with line.
+ */
 export function displayNoticeText(text: string): string {
   const lines = text
     .split('\n')
     .map((line) => line.trim())
-    .filter((line) => !HOST_FRAME.some((re) => re.test(line)))
-    .filter((line) => !/^Read (?:it|them) with (?:pipeline_status \(runs\) or )?status/.test(line))
-    .map((line) =>
-      line
-        .replace(/^Agent Smith · /, '')
-        .replace(/\. (?:Job|Run) ID [^\s.]+\.(?: )?/, (m) => (m.endsWith(' ') ? ' · ' : ''))
-        .replace(/\.$/, ''),
-    )
+    .filter((line) => !HOST_FRAME.some((re) => re.test(line)) && !READ_LINE.test(line))
     .filter((line) => line.length > 0);
   return lines.length > 0 ? lines.join('\n') : text;
 }
 
 const STATE: Record<NoticeKind, string> = {
-  finished: 'succeeded', failed: 'failed', cancelled: 'cancelled', attention: 'need attention',
+  finished: 'done', failed: 'failed', cancelled: 'canceled', attention: 'stalled',
 };
 
 // ── launch acks ─────────────────────────────────────────────────────────────
@@ -343,8 +352,10 @@ export function noticeFromRadar(job: NoticeRow, kind: NoticeKind, now: number): 
     id: job.id, kind, name: job.name, provider: job.provider, role: job.role,
     durationMs: span,
     changedFiles: job.changedFileCount ?? null,
-    checks: checks.length > 0 ? { passed: checks.filter((c) => c.ok).length, total: checks.length } : null,
-    reason: kind === 'failed' ? job.failureReason ?? null : null,
+    checks: checks.length > 0
+      ? { passed: checks.filter((c) => c.ok).length, total: checks.length, failed: checks.filter((c) => !c.ok).flatMap((c) => (c.name ? [c.name] : [])) }
+      : null,
+    reason: kind === 'failed' ? reasonFromText(job.failureReason) : null,
     summary: job.summarySource === 'worker' ? job.latestSummary ?? null : null,
   };
 }
@@ -356,15 +367,32 @@ export interface RunRecord {
   readonly status: 'running' | 'passed' | 'partial' | 'failed';
   readonly startedAt: number;
   readonly finishedAt: number | null;
-  readonly stageResults: Readonly<Record<string, { stage?: unknown; status?: unknown; acceptance?: unknown; jobId?: unknown } | null>>;
+  readonly error?: string | undefined;
+  readonly stageResults: Readonly<Record<string, { stage?: unknown; status?: unknown; acceptance?: unknown; jobId?: unknown; failure?: unknown; verification?: unknown } | null>>;
 }
 
-/** Pipeline outcome, stage by stage. Runtime-owned, so stated as fact. */
+/**
+ * Pipeline outcome: `2/3 stages passed · test: checks failed: lint`. The first
+ * stage that did not pass says why, in the shared short words.
+ */
 export function pipelineOutcome(run: RunRecord): string {
   const stages = Object.values(run.stageResults)
-    .filter((s): s is NonNullable<typeof s> => s !== null && typeof s === 'object' && typeof s.stage === 'string')
-    .map((s) => `${String(s.stage)}: execution ${String(s.status)}, acceptance ${typeof s.acceptance === 'string' ? s.acceptance : 'unchecked'}`);
-  return `Pipeline ${run.status}; ${stages.join('; ')}.`;
+    .filter((s): s is NonNullable<typeof s> => s !== null && typeof s === 'object' && typeof s.stage === 'string');
+  const passed = stages.filter((s) => s.status === 'passed' && s.acceptance !== 'failed').length;
+  const bad = stages.find((s) => s.status === 'failed' || s.acceptance === 'failed');
+  const head = `${passed}/${stages.length} stages passed`;
+  if (bad) return `${head} · ${String(bad.stage)}: ${stageReason(bad)}`;
+  return run.error && run.status !== 'passed' ? `${head} · ${reasonFromText(run.error)}` : head;
+}
+
+function stageReason(s: NonNullable<RunRecord['stageResults'][string]>): string {
+  if (s.acceptance === 'failed') {
+    const failing = isObj(s.verification) && Array.isArray(s.verification['failing']) ? s.verification['failing'] : [];
+    const names = failing.flatMap((v) => (isObj(v) && isObj(v['check']) && typeof v['check']['name'] === 'string' ? [v['check']['name']] : []));
+    return checksReason(names);
+  }
+  const f = isObj(s.failure) ? s.failure : null;
+  return reasonFromText(typeof f?.['message'] === 'string' ? f['message'] : typeof f?.['code'] === 'string' ? f['code'] : null);
 }
 
 /** Validate a parsed pipeline record; null when malformed. */

@@ -122,6 +122,8 @@ import type {
 import type { ListModelsOptions, ModelCatalog, ModelInfo, SandboxInfo } from './types.ts';
 import { DEFAULT_DISCOVERY_TIMEOUT_MS, errMessage, runCapture } from './discovery.ts';
 import type { RunFn } from './discovery.ts';
+import { exitReason } from '../surfaces/mod/hooks/reasons.ts';
+import { deniedText, noResultText, stderrClause, timedOutText } from './failure-text.ts';
 
 export const AGY_BINARY = process.env['AGENT_SMITH_AGY_BIN'] ?? 'agy';
 
@@ -565,10 +567,10 @@ export function buildResult(args: {
   // trustworthy terminal state, whatever agy managed to flush first.
   if (exit.killReason === 'cancelled') {
     status = 'cancelled';
-    error = 'cancelled by operator';
+    error = 'canceled';
   } else if (exit.killReason === 'timeout') {
     status = 'timeout';
-    error = `exceeded the ${durationMs} ms budget and was killed`;
+    error = timedOutText(durationMs);
   } else if (distinctDenials.length > 0 && reportedStatus === 'SUCCESS' && exit.code === 0 && response.trim() !== '') {
     // Denied calls, but agy finished and delivered a report: a success with a
     // warning, exactly as claude reports it. The forge verdict keeps the
@@ -579,39 +581,27 @@ export function buildResult(args: {
     // THE TRAP. exit code 0, status "SUCCESS", empty response — and yet the
     // job did nothing. Reported as a failure, loudly.
     status = 'denied';
-    const names = distinctDenials
-      .map((d) => d.displayName ?? d.action)
-      .filter((n): n is string => n !== undefined)
-      .join(', ');
-    error =
-      `agy soft-denied ${distinctDenials.length} tool action(s)` +
-      `${names !== '' ? ` (${names})` : ''}. ` +
-      (response.trim() === ''
-        ? 'agy exited with an empty response — this is NOT a success. '
-        : `agy did not finish cleanly (status "${reportedStatus ?? 'none'}", exit ${exit.code ?? 'signal'}). `) +
-      'Headless agy auto-denies tools it cannot prompt for unless run with ' +
-      '--dangerously-skip-permissions; an explicit deny rule overrides that flag. ' +
-      'stderr tail: ' + (exit.stderr.slice(0, 400) || '(empty)');
+    // Headless agy auto-denies tools it cannot prompt for unless run with
+    // --dangerously-skip-permissions; an explicit deny rule overrides that flag.
+    error = deniedText(
+      distinctDenials.map((d) => d.displayName ?? d.action).filter((n): n is string => n !== undefined),
+      exit.stderr,
+    );
   } else if (resultEvent === undefined) {
     // Process ended with no result event at all: a crash, an OOM kill, or a CLI
     // version whose output format changed. Never report success.
     status = exit.code === 0 ? 'malformed' : 'error';
-    error =
-      `agy exited ${exit.code === null ? `on signal ${exit.signal ?? 'unknown'}` : `with code ${exit.code}`} ` +
-      'without emitting a result event. stderr tail: ' + (exit.stderr.slice(0, 400) || '(empty)');
+    error = noResultText(exit);
   } else if (reportedStatus !== 'SUCCESS') {
     status = 'error';
-    error = resultEvent.error ?? `agy reported status "${reportedStatus ?? 'unknown'}"`;
+    error = resultEvent.error ?? 'worker error';
   } else if (response.trim() === '' && sawAnyToolCall) {
     // Paranoia net for (4) above. The model burned tokens and made tool calls
     // but produced no final text, with no explicit denial. That is a failure
     // shaped like a success. We allow the genuinely-empty case (no tool calls,
     // nothing asked) to pass as success.
     status = 'denied';
-    error =
-      'agy reported SUCCESS with an empty response after making tool calls and no denial was ' +
-      'recorded. Treating a job that produced no output as a failure. ' +
-      'stderr tail: ' + (exit.stderr.slice(0, 400) || '(empty)');
+    error = `no output${stderrClause(exit.stderr)}`;
   } else {
     status = 'success';
   }
@@ -620,7 +610,7 @@ export function buildResult(args: {
   // SUCCESS-looking result event still has to be a failure.
   if (status === 'success' && exit.code !== 0) {
     status = 'error';
-    error = `agy exited with code ${exit.code} despite reporting SUCCESS`;
+    error = exit.code === null ? `exited on ${exit.signal ?? 'a signal'}` : exitReason(exit.code);
   }
 
   const out: JobResult = {

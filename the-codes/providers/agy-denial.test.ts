@@ -49,17 +49,17 @@ test('agy: a real denial with a delivered report succeeds with a warning, like c
   assert.ok(result.deniedActions?.length && result.deniedActions.every((d) => d.nonfatal === true));
   const verdict = deriveStatus({ ok: result.ok, jobStatus: result.status, deniedActions: result.deniedActions, report: result.response });
   assert.equal(verdict.status, 'succeeded');
-  assert.match(verdict.note ?? '', /denied by the permission policy/);
+  assert.match(verdict.note ?? '', /call denied/);
 });
 
 test('agy: a real denial with an empty report, or an unclean finish, still fails', () => {
   const empty = deniedRun('');
   assert.equal(empty.status, 'denied');
-  assert.match(empty.error ?? '', /empty response/);
+  assert.match(empty.error ?? '', /^denied /);
   assert.equal(empty.deniedActions?.some((d) => d.nonfatal), false);
   assert.equal(deriveStatus({ ok: empty.ok, jobStatus: empty.status, deniedActions: empty.deniedActions, report: '' }).status, 'failed');
 
   const crashed = deniedRun('partial notes', 'ERROR', 1);
   assert.equal(crashed.status, 'denied');
-  assert.match(crashed.error ?? '', /did not finish cleanly/);
+  assert.match(crashed.error ?? '', /^denied /);
 });

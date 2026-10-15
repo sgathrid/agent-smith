@@ -111,6 +111,7 @@ import type {
 import type { ListModelsOptions, ModelCatalog, ModelInfo, SandboxInfo } from './types.ts';
 import { DEFAULT_DISCOVERY_TIMEOUT_MS, errMessage, runCapture } from './discovery.ts';
 import type { RunFn } from './discovery.ts';
+import { deniedText, stderrClause, timedOutText } from './failure-text.ts';
 
 
 export const OPENCODE_BINARY = process.env['AGENT_SMITH_OPENCODE_BIN'] ?? 'opencode';
@@ -491,63 +492,38 @@ function buildResult(args: {
   const finishedAt = nowIso();
   const durationMs = Date.now() - startedAtMs;
 
-  const unrecognisedNote =
-    tx.unrecognised.size > 0
-      ? ` Unrecognised event types seen: ${[...tx.unrecognised].join(', ')}. See events.jsonl.`
-      : '';
-
   let status: JobStatus;
   let error: string | undefined;
 
   if (exit.killReason === 'cancelled') {
     status = 'cancelled';
-    error = 'cancelled by operator';
+    error = 'canceled';
   } else if (exit.killReason === 'timeout') {
     status = 'timeout';
-    error = `exceeded the ${durationMs} ms budget and was killed`;
+    error = timedOutText(durationMs);
   } else if (tx.sawError) {
     // An `error` event or an error-state tool part. opencode's provider.quota
     // 402 exits 1 with an error event and no text, so this is the common path
     // for a misconfigured account.
     status = 'error';
-    error =
-      `opencode reported an error event during the run${unrecognisedNote} ` +
-      `stderr tail: ${exit.stderr.slice(0, 400) || '(empty)'}`;
+    error = `worker error${stderrClause(exit.stderr)}`;
   } else if (tx.deniedNotices.length > 0) {
     // Same reasoning as agy: a denied tool means the work did not happen, and
     // opencode may well exit 0. Do not report that as a success.
     status = 'denied';
-    error =
-      `opencode reported ${tx.deniedNotices.length} denied tool call(s): ${tx.deniedNotices.join(', ')}. ` +
-      'The work did not happen. Check the agent permission config; --auto only ' +
-      'auto-approves permissions that are not explicitly denied.' +
-      unrecognisedNote;
+    error = deniedText(tx.deniedNotices, '');
   } else if (exit.code !== 0) {
     status = 'error';
-    error =
-      `opencode exited with code ${exit.code}${unrecognisedNote} ` +
-      `stderr tail: ${exit.stderr.slice(0, 400) || '(empty)'}`;
+    error = `exited ${exit.code}${stderrClause(exit.stderr)}`;
   } else if (tx.finalText.trim() === '') {
     // Exited 0 with no text and no error event. Do not call that a success.
     // Be honest about why: with an unverified parser this is the shape most
     // likely to mean "we did not understand the output", not "the model said
     // nothing", and the two demand different fixes.
+    // Most likely an event-shape gap in the adapter, not an empty model reply:
+    // check events.jsonl and extend the parser.
     status = 'malformed';
-    const stderrTail = exit.stderr !== '' ? ` stderr tail: ${exit.stderr.slice(0, 400)}` : '';
-    if (tx.unrecognised.size > 0) {
-      error =
-        'opencode exited 0 but the adapter extracted no assistant text. ' +
-        `Unrecognised event types: ${[...tx.unrecognised].join(', ')}. ` +
-        'This is most likely an event-shape gap in the adapter, not an empty model ' +
-        'response — check events.jsonl and extend the parser.' +
-        stderrTail;
-    } else {
-      error =
-        'opencode exited 0 but the adapter extracted no assistant text. This is most ' +
-        'likely an event-shape gap in the adapter rather than an empty model response ' +
-        '— check events.jsonl.' +
-        stderrTail;
-    }
+    error = `no output${stderrClause(exit.stderr)}`;
   } else {
     status = 'success';
   }

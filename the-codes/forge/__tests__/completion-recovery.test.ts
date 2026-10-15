@@ -54,7 +54,7 @@ for (const [name, patch, expected] of [
     assert.equal(readFileSync(jobFile(repo, jobId, FILES.report), 'utf8'),
       completed.response.trim() === '' ? '' : completed.response);
     assert.deepEqual(readAcceptance(repo, jobId), { state: 'rejected', checks: [],
-      at: completed.finishedAt, pending: false, reason: 'supervisor exited; acceptance checks not run' });
+      at: completed.finishedAt, pending: false, reason: 'server stopped; checks not run' });
     const anchor = readFileSync(file, 'utf8');
     assert.equal(reconcileOrphan(repo, jobId), false);
     assert.equal(readFileSync(file, 'utf8'), anchor);

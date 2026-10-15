@@ -86,30 +86,29 @@ function subjectFor(job: NativeJob): string {
     ? `${job.name}: ${task}`
     : job.name ?? (task !== '' ? task : null) ?? job.role ?? job.id;
   const outcome = job.status === 'failed' || job.status === 'canceled' ? `[${job.status}] ` :
-    job.acceptance?.state === 'rejected' && !job.acceptance.pending ? '[checks rejected] ' : '';
+    job.acceptance?.state === 'rejected' && !job.acceptance.pending ? '[checks failed] ' : '';
   return (outcome + subject).slice(0, 120) || job.id;
 }
 
 function descriptionFor(job: NativeJob): string {
   const lines = [
-    'Agent Smith worker',
     `Job ID: ${job.id}`,
     `Worker ID: ${job.workerId}`,
     ...(job.role === null ? [] : [`Role: ${job.role}`]),
     ...(job.provider === null ? [] : [`Provider: ${job.provider}`]),
     ...(job.model === null ? [] : [`Model: ${job.model}`]),
     `Outcome: ${job.status}`,
-    `Acceptance: ${acceptanceLabel(job.acceptance)}`,
+    `Checks: ${acceptanceLabel(job.acceptance)}`,
     ...(job.task === '' ? [] : [`Task: ${job.task}`]),
   ];
   if (job.summarySource === 'worker' && job.latestSummary !== null) {
-    lines.push('', 'Latest worker output:', job.latestSummary.slice(0, 1_000));
+    lines.push('', 'Worker said:', job.latestSummary.slice(0, 1_000));
   }
   return lines.join('\n');
 }
 
 function activeForm(job: NativeJob): string {
-  if (job.acceptance?.pending && job.status !== 'running' && job.status !== 'attention') return 'Waiting for acceptance checks';
+  if (job.acceptance?.pending && job.status !== 'running' && job.status !== 'attention') return 'Running checks';
   if (job.status === 'attention') return `Checking ${job.role ?? 'worker'} progress`;
   return `Running ${job.role ?? 'worker'}`;
 }

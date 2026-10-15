@@ -151,7 +151,7 @@ test('notifyHint: hook note always, monitorCommand only when the built monitor p
   assert.equal(builtMonitorPath('/plugin/runtime/dist/server.js'), '/plugin/runtime/dist/monitor.js');
   const none = notifyHint({ job: 'j1' }, '/repo', 60_000, undefined);
   assert.equal(none.mode, 'hook');
-  assert.match(none.note, /announced automatically by the plugin/);
+  assert.match(none.note, /Completion is announced/);
   assert.equal('monitorCommand' in none, false);
   const job = notifyHint({ job: 'j1' }, '/repo', 2_700_000, '/rt/dist/monitor.js') as { monitorCommand: string; monitorTimeoutMs: number };
   assert.equal(job.monitorCommand, 'node "/rt/dist/monitor.js" --job j1 --cwd "/repo"');
@@ -220,7 +220,7 @@ test('list_jobs: since parses ISO and relative times; session restricts to jobs 
   await callTool(ctx, 'list_jobs', { since: '2026-10-01T00:00:00Z' });
   assert.equal(seen[1]!.sinceMs, Date.parse('2026-10-01T00:00:00Z')); assert.equal(seen[1]!.ids, undefined);
   const bad = await callTool(ctx, 'list_jobs', { since: 'yesterday' });
-  assert.equal(bad.isError, true); assert.match(text(bad), /ISO time.*relative like 30m, 2h, 1d/);
+  assert.equal(bad.isError, true); assert.match(text(bad), /ISO time or 30m, 2h, 1d/);
 });
 
 test('status: concise merges identity, verdicts, timing and one report; detailed is the full record', async () => {
@@ -292,7 +292,7 @@ test('status include_diff: returns the diff of changedFiles against the baseline
   const ctx = withService({ detail: async () => detail({ cwd, gitBaseline: { head, dirty: [] }, changedFiles: ['a.txt', 'new.txt'] }) });
   const b = body(await callTool(ctx, 'status', { jobId: 'j', include_diff: true }));
   assert.match(b.diff, /^diff --git a\/a\.txt b\/a\.txt[\s\S]*\+two/);
-  assert.match(b.diffNote, /untracked files not shown.*new\.txt/);
+  assert.match(b.diffNote, /Untracked, not in diff.*new\.txt/);
   assert.equal('diff' in body(await callTool(ctx, 'status', { jobId: 'j' })), false, 'off by default');
   assert.equal(body(await callTool(ctx, 'status', { jobId: 'j', include_diff: true, response_format: 'detailed' })).diff, b.diff);
 });
@@ -301,7 +301,7 @@ test('status include_diff: flags changed files that were already dirty at spawn'
   const { cwd, head } = gitRepo();
   writeFileSync(path.join(cwd, 'a.txt'), 'one\nmine\njob\n');
   const ctx = withService({ detail: async () => detail({ cwd, gitBaseline: { head, dirty: ['a.txt'] }, changedFiles: ['a.txt'] }) });
-  assert.match(body(await callTool(ctx, 'status', { jobId: 'j', include_diff: true })).diffNote, /Already uncommitted when the job started.*a\.txt/);
+  assert.match(body(await callTool(ctx, 'status', { jobId: 'j', include_diff: true })).diffNote, /Dirty before the job.*a\.txt/);
 });
 
 test('status include_diff: bounded at 40000 chars on a line boundary, with a note saying how to see the rest', async () => {
@@ -310,18 +310,18 @@ test('status include_diff: bounded at 40000 chars on a line boundary, with a not
   const ctx = withService({ detail: async () => detail({ cwd, gitBaseline: { head, dirty: [] }, changedFiles: ['a.txt'] }) });
   const b = body(await callTool(ctx, 'status', { jobId: 'j', include_diff: true }));
   assert.ok(b.diff.length <= 40_000 && b.diff.endsWith('\n'));
-  assert.ok(b.diffNote.includes(`Diff truncated at 40000 chars. See the rest with: git diff ${head} -- <file>`), b.diffNote);
+  assert.ok(b.diffNote.includes(`Diff cut at 40000 chars. Rest: git diff ${head} -- <file>`), b.diffNote);
 });
 
 test('status include_diff: says so without a baseline, while running, or with no changes, instead of failing', async () => {
   const none = await callTool(withService({ detail: async () => detail({ changedFiles: ['a'] }) }), 'status', { jobId: 'j', include_diff: true });
   assert.equal(none.isError, undefined); assert.equal(body(none).diff, null);
-  assert.match(body(none).diffNote, /No git baseline was recorded/);
+  assert.match(body(none).diffNote, /No diff: no git commit at spawn/);
   const running = body(await callTool(withService({ detail: async () => detail({ status: 'running', gitBaseline: { head: 'abc', dirty: [] }, cwd: '/x' }) }), 'status', { jobId: 'j', include_diff: true }));
-  assert.match(running.diffNote, /computed when the job finishes/);
+  assert.match(running.diffNote, /No diff yet/);
   const { cwd, head } = gitRepo();
   const empty = body(await callTool(withService({ detail: async () => detail({ cwd, gitBaseline: { head, dirty: [] }, changedFiles: [] }) }), 'status', { jobId: 'j', include_diff: true }));
-  assert.equal(empty.diff, ''); assert.match(empty.diffNote, /changed no files/);
+  assert.equal(empty.diff, ''); assert.match(empty.diffNote, /No files changed/);
 });
 
 test('tool failures are isError results that say what to do next', async () => {
@@ -333,17 +333,17 @@ test('tool failures are isError results that say what to do next', async () => {
   const fail = async (tool: string, args: Record<string, unknown>, expected: RegExp) => {
     const r = await callTool(ctx, tool, args); assert.equal(r.isError, true, `${tool} ${JSON.stringify(args)}`); assert.match(text(r), expected); assert.ok(text(r).length < 200, text(r));
   };
-  await fail('spawn_job', { mode: 'review', prompt: 'x', cwd: 'rel' }, /absolute path.*omit cwd/);
-  await fail('spawn_job', { mode: 'review', prompt: 'x', cwd: path.join(cwd, 'nope') }, /does not exist.*omit cwd/);
-  await fail('resume_job', { worker: 'ghost', prompt: 'x' }, /No worker named "ghost"; call list_jobs/);
-  await fail('resume_job', { worker: 'Ada', prompt: 'x' }, /matches 2 different workers; pass one job ID from list_jobs/);
+  await fail('spawn_job', { mode: 'review', prompt: 'x', cwd: 'rel' }, /absolute path/);
+  await fail('spawn_job', { mode: 'review', prompt: 'x', cwd: path.join(cwd, 'nope') }, /is not a directory/);
+  await fail('resume_job', { worker: 'ghost', prompt: 'x' }, /No worker "ghost"; see list_jobs/);
+  await fail('resume_job', { worker: 'Ada', prompt: 'x' }, /matches 2 workers; pass a job ID from list_jobs/);
   current = detail({ name: 'Ada', status: 'running' });
-  await fail('resume_job', { worker: 'job-1', prompt: 'x' }, /^Worker "Ada" is still running; wait for its completion notice or call cancel\.$/);
+  await fail('resume_job', { worker: 'job-1', prompt: 'x' }, /^"Ada" is still running; wait or cancel\.$/);
   current = detail({ name: 'Ada', conversation: null });
-  await fail('resume_job', { worker: 'job-1', prompt: 'x' }, /no resumable conversation.*spawn_job/);
+  await fail('resume_job', { worker: 'job-1', prompt: 'x' }, /no conversation to resume.*spawn_job/);
   await fail('status', {}, /jobId is required: get one from spawn_job or list_jobs/);
   await fail('cancel', {}, /jobId is required/);
-  await fail('pipeline_status', { runId: 'nope' }, /No pipeline run "nope"; use the runId returned by run_pipeline/);
+  await fail('pipeline_status', { runId: 'nope' }, /No pipeline run "nope"/);
   await fail('pipeline_status', {}, /runId is required/);
   await fail('status', { jobId: 'j', bogus: 1 }, /Unknown field bogus; valid fields: jobId, wait_ms, include_diff, response_format/);
   await fail('nope', {}, /Unknown tool nope; available: list_capabilities/);
@@ -414,4 +414,17 @@ test('detailed list_capabilities keeps every discovered model, label, mode and t
   assert.equal(caps.providers.find((p: any) => p.name === 'codex').models[0].label, 'Sol');
   assert.deepEqual(caps.modes.map((m: any) => m.name), ['implement', 'review', 'moderate', 'verify']);
   assert.equal(typeof caps.efforts, 'string');
+});
+
+test('status: a failed job carries a short reason (derived from old errors, stored ones pass through) and warnings do not repeat the error', async () => {
+  const longError = 'agy soft-denied 2 tool action(s) (run_command, RunCommand). agy exited with an empty response.';
+  const old = body(await callTool(withService({ detail: async () => detail({ status: 'failed', error: longError, warnings: [{ code: 'x', message: longError }, { code: 'y', message: 'other note' }] }) }), 'status', { jobId: 'j' }));
+  assert.match(old.reason, /^denied/);
+  assert.ok(old.reason.length < 40);
+  assert.equal(old.error, longError);
+  assert.deepEqual(old.warnings, ['other note']);
+  const fresh = body(await callTool(withService({ detail: async () => detail({ status: 'failed', error: longError, reason: 'exit 1' }) }), 'status', { jobId: 'j' }));
+  assert.equal(fresh.reason, 'exit 1');
+  const ok = body(await callTool(withService({ detail: async () => detail() }), 'status', { jobId: 'j' }));
+  assert.equal(ok.reason, undefined);
 });

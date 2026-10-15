@@ -164,7 +164,7 @@ export async function runJobWatch(options: JobWatchOptions): Promise<JobWatchEnd
     }
     if (now() - startedAt >= timeoutMs) {
       const ids = [...jobIds, ...runIds].filter((id) => !done.has(id));
-      try { await emit(`Agent Smith · still running; check status ${ids.join(', ')}`, null); } catch (error) { onError(error); }
+      try { await emit(`Agent Smith · still running: ${ids.join(', ')}`, null); } catch (error) { onError(error); }
       return 'timeout';
     }
     await delay(intervalMs, options.signal);

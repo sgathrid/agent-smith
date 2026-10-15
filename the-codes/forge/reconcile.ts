@@ -1,9 +1,10 @@
 /** Service-owned recovery of abandoned jobs. Readers never write job records. */
 import { existsSync, readFileSync } from 'node:fs';
-import { FILES, SCHEMA_VERSION, deriveOrphan, deriveStatus, isPidAlive, jobFile, type ForgeManifest } from './format.ts';
+import { REASONS } from '../surfaces/mod/hooks/reasons.ts';
+import { FILES, SCHEMA_VERSION, deriveOrphan, failureFields, deriveStatus, isPidAlive, jobFile, type ForgeManifest } from './format.ts';
 import { writeAtomic, writeJsonAtomic } from './atomic.ts';
 import { readAcceptance, writeAcceptance } from './checks.ts';
-import { appendBounded, reportFor } from './writer.ts';
+import { reportFor } from './writer.ts';
 import type { JobResult } from '../providers/types.ts';
 
 /**
@@ -54,8 +55,7 @@ export function reconcileOrphan(repo: string, jobId: string, now = Date.now()): 
         updatedAt: result.finishedAt, finishedAt: result.finishedAt,
         startedAt: manifest.startedAt ?? result.startedAt, exitCode: result.exitCode,
         conversation: recoveredConversation(result) ?? manifest.conversation,
-        error: verdict.reason === null ? result.error ?? null
-          : appendBounded(`${verdict.reason} — `, result.error ?? '', 1_200),
+        ...failureFields(verdict, result),
         deniedActions: (result.deniedActions ?? []).map(({ action, displayName, nonfatal }) => ({
           ...(action === undefined ? {} : { action }),
           ...(displayName === undefined ? {} : { displayName }),
@@ -71,7 +71,8 @@ export function reconcileOrphan(repo: string, jobId: string, now = Date.now()): 
     }
     const at = new Date(now).toISOString();
     writeJsonAtomic(file, {
-      ...manifest, status: verdict.status, error: verdict.reason, jobStatus: 'orphaned',
+      ...manifest, status: verdict.status, error: verdict.reason,
+      reason: verdict.status === 'failed' ? REASONS.serverStopped : null, jobStatus: 'orphaned',
       updatedAt: at, finishedAt: at,
     });
     settleAcceptance(repo, jobId, at);
@@ -84,7 +85,7 @@ function settleAcceptance(repo: string, jobId: string, at: string): void {
   if ('pending' in acceptance && acceptance.pending === true) {
     writeAcceptance(repo, jobId, {
       state: 'rejected', checks: [], at, pending: false,
-      reason: 'supervisor exited; acceptance checks not run',
+      reason: 'server stopped; checks not run',
     });
   }
 }

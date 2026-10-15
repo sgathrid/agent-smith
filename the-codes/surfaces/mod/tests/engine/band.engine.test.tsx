@@ -292,7 +292,7 @@ describe('HAZARD A, as drawn', () => {
     await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
     const band = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', ...BAND } as never);
 
-    expect(await band.find({ type: 'Text', text: /✓ open an agent-built dashboard.*finished/ })).toBeDefined();
+    expect(await band.find({ type: 'Text', text: /✓ open an agent-built dashboard.*done/ })).toBeDefined();
     // No tool count, because there is genuinely none on disk — omitted, not 0.
     expect(await band.find({ type: 'Text', text: /0 tools/ })).toBeUndefined();
     // And it does NOT read as still running.
@@ -479,7 +479,7 @@ describe('native task-list projection', () => {
     expect(update?.input.taskId).toBe('native-task-1');
     expect(update?.input.status).toBe('in_progress');
     expect(update?.input.description).toContain('Outcome: running');
-    expect(update?.input.description).toContain('Latest worker output:\nFound a retry loop');
+    expect(update?.input.description).toContain('Worker said:\nFound a retry loop');
   });
 });
 
@@ -577,7 +577,7 @@ test('/forge opens the focused session list; /forge pane is the same list; /forg
   expect(await $.command.run({command:'forge',args:''})).toMatchObject({text:'1 running'});
   expect(host.opens.at(-1)).toMatchObject({id:'agent-smith',focus:true});
   const pane = await $.ui.mount(PANE_TARGET);
-  expect(await pane.find({type:'Text',text:'Forge · 1 running'})).toBeDefined();
+  expect(await pane.find({type:'Text',text:'Workers · 1 running'})).toBeDefined();
   expect(await pane.find({key:'job-job-ada'})).toBeDefined();
   expect(await pane.find({key:'job-job-failed'})).toBeUndefined();
   await pane.press({key:'job-job-ada'});
@@ -586,11 +586,11 @@ test('/forge opens the focused session list; /forge pane is the same list; /forg
   expect(await pane.find({key:'job-job-failed'})).toBeUndefined();
 
   expect(await $.command.run({command:'forge',args:'all'})).toMatchObject({text:'repository: 1 running · 1 failed'});
-  expect(await pane.find({type:'Text',text:'Forge · repository: 1 running · 1 failed'})).toBeDefined();
+  expect(await pane.find({type:'Text',text:'Workers · repository: 1 running · 1 failed'})).toBeDefined();
   expect(await pane.find({key:'job-job-ada'})).toBeDefined();
   expect(await pane.find({type:'Text',text:'Recent'})).toBeDefined();
   // A recent failure stays marked: red, with its failure label.
-  expect((await pane.find({type:'Text',text:/failed · orphaned/}) as { props?: Record<string,unknown> })?.props?.color).toBe('red');
+  expect((await pane.find({type:'Text',text:/failed · server stopped/}) as { props?: Record<string,unknown> })?.props?.color).toBe('red');
   expect((await pane.find({type:'Text',text:'✗'}) as { props?: Record<string,unknown> })?.props?.color).toBe('red');
   // `s` returns to this session; `a` shows the repository again.
   await pane.press({key:'scope-session'});
@@ -607,10 +607,10 @@ test('a fresh session over old jobs: an empty band, an empty session list, no li
   expect(await band.find({key:'band-job-ada'})).toBeUndefined();
   expect(await band.find({type:'Text',text:'REST-OF-BAND'})).toBeDefined();
   const reply = await $.command.run({command:'forge',args:''}) as { text?: string };
-  expect(reply.text).toBe('No agents in this session');
-  expect(reply.text).not.toMatch(/failed|finished/);
+  expect(reply.text).toBe('No workers in this session');
+  expect(reply.text).not.toMatch(/failed|done/);
   const pane = await $.ui.mount(PANE_TARGET);
-  expect(await pane.find({type:'Text',text:'Forge · No agents in this session'})).toBeDefined();
+  expect(await pane.find({type:'Text',text:'Workers · No workers in this session'})).toBeDefined();
   expect(await pane.find({type:'Text',text:/\/forge all shows the repository's history/})).toBeDefined();
   expect(await pane.find({key:'job-job-ada'})).toBeUndefined();
   await pane.press({key:'scope-all'});
@@ -645,7 +645,7 @@ test('/forge <name> searches the whole repository, so an older worker still open
   const pane = await $.ui.mount(PANE_TARGET);
   expect(await pane.find({key:'back'})).toBeDefined();
   expect(await pane.find({type:'Text',text:/Grace/})).toBeDefined();
-  expect(await pane.find({type:'Text',text:/failed · orphaned/})).toBeDefined();
+  expect(await pane.find({type:'Text',text:/failed · server stopped/})).toBeDefined();
   expect(host.toasts).toHaveLength(0);
 });
 
@@ -727,7 +727,7 @@ test('canonical acceptance refreshes in an open worker view; a read failure keep
   await launch($, 'job-native-1');
   await $.command.run({command:'forge',args:'job-native-1'});
   const pane = await $.ui.mount(PANE_TARGET);
-  expect(await pane.find({type:'Text',text:/checks pending/})).toBeDefined();
+  expect(await pane.find({type:'Text',text:/checking/})).toBeDefined();
   files['/work/.agent-smith/jobs/job-native-1/acceptance.json']=JSON.stringify({state:'rejected',pending:false,checks:[
     {name:'tests',ok:false,outputTail:'',timedOut:true,signal:'SIGTERM',reason:'command timed out'}]});
   await clock.advance(3000);
@@ -735,7 +735,7 @@ test('canonical acceptance refreshes in an open worker view; a read failure keep
   await pane.press({key:'back'});
   files['/work/.agent-smith/jobs/job-native-1/job.json']='{broken';
   await clock.advance(3000);
-  expect(await pane.find({type:'Text',text:/Unable to read Forge state/})).toBeDefined();
+  expect(await pane.find({type:'Text',text:/Can't read job state/})).toBeDefined();
   expect(await pane.find({key:'job-job-native-1'})).toBeDefined();
 });
 
@@ -744,7 +744,7 @@ test('a failure older than 24 h stays in Recent but is no longer drawn as one ne
   await start($);
   await $.command.run({command:'forge',args:'all'});
   const pane = await $.ui.mount(PANE_TARGET);
-  const rows = await pane.findAll({type:'Text',text:/failed · orphaned/}) as { props?: Record<string,unknown> }[];
+  const rows = await pane.findAll({type:'Text',text:/failed · server stopped/}) as { props?: Record<string,unknown> }[];
   expect(rows.map(row => row.props?.color)).toEqual(['red', undefined]);
   expect(await pane.find({key:'job-job-old'})).toBeDefined();
 });
@@ -799,7 +799,7 @@ describe('completion notices', () => {
     expect(said.prompts).toHaveLength(1);
     // Keeps the host's plugin wrapper: the notice quotes worker-controlled text.
     expect(said.origins[0]?.asUser).not.toBe(true);
-    expect(said.prompts[0]).toMatch(/^Agent Smith · ✓ Ada \(codex review\) succeeded in 44s · 2 files changed · checks 2\/2\. Job ID job-ada\.\nRead it with status before acting\.$/);
+    expect(said.prompts[0]).toMatch(/^Agent Smith · ✓ Ada \(codex review\) 44s · done · checks 2\/2\nstatus job-ada$/);
   });
 
   const settledRead = (id: string, more: Record<string, unknown> = {}) => ({

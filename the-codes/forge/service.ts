@@ -54,6 +54,7 @@
  * implementation.
  */
 
+import { humanDuration } from '../providers/failure-text.ts';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 
@@ -229,6 +230,8 @@ export interface JobSummary {
 export interface JobDetail extends JobSummary {
   readonly report: string | null;
   readonly error: string | null;
+  /** Why it failed, in two to four words; null unless failed. */
+  readonly reason?: string | null;
   readonly exitCode: number | null;
   readonly unrestricted: boolean;
   readonly pipeline: string | null;
@@ -537,15 +540,15 @@ export class ForgeService {
     const workerId = request.workerId ?? jobId;
     const canonicalConflict = findActiveIdentity(this.repo, name, workerId);
     if (canonicalConflict !== null) {
-      throw new Error(`worker identity already has an active job (${canonicalConflict.jobId}); wait for it to finish or call cancel.`);
+      throw new Error(`"${name}" is busy (${canonicalConflict.jobId}); wait, cancel, or use another name.`);
     }
     for (const { writer } of this.live.values()) {
       const active = writer.snapshot();
       if (active?.workerId === workerId) {
-        throw new Error(`worker "${workerId}" already has an active job (${active.jobId}); wait for it to finish or call cancel.`);
+        throw new Error(`"${name}" is busy (${active.jobId}); wait, cancel, or use another name.`);
       }
       if (active?.name === name) {
-        throw new Error(`worker name "${name}" already has an active job (${active.jobId}); wait for it, call cancel, or pick another name.`);
+        throw new Error(`"${name}" is busy (${active.jobId}); wait, cancel, or use another name.`);
       }
     }
 
@@ -588,7 +591,7 @@ export class ForgeService {
     try {
       request.onPrepared?.(jobId);
     } catch (error) {
-      writer.abort('failed', `Job preparation failed: ${String(error)}`);
+      writer.abort('failed', `setup failed · ${String(error)}`);
       throw error;
     }
     this.spawnedIds.add(jobId);
@@ -605,10 +608,7 @@ export class ForgeService {
       timeoutMs,
       unrestricted,
       note:
-        `queued ${provider.name}/${mode}` +
-        (request.model === undefined ? '' : ` model=${request.model}`) +
-        ` budget=${Math.round(timeoutMs / 1000)}s` +
-        (unrestricted ? '' : ' — approvals enforced; a tool that needs one will be denied'),
+        `queued · ${humanDuration(timeoutMs)} limit · ${unrestricted ? 'unrestricted' : 'approvals on'}`,
       sandbox,
       sandboxFlags,
       readOnlyRequested,
@@ -684,7 +684,7 @@ export class ForgeService {
       // is now `failed`, which is a fact the pane can draw — as opposed to a
       // rejected promise, which is a fact nothing can draw.
       return (
-        writer.abort('failed', `could not start ${provider.name}: ${describe(err)}`) ??
+        writer.abort('failed', `couldn't start · ${describe(err)}`) ??
         writer.snapshot() ??
         ({ jobId: spec.jobId } as unknown as ForgeManifest)
       );
@@ -720,7 +720,7 @@ export class ForgeService {
       return manifest;
     } catch (err) {
       return (
-        writer.abort('failed', `worker ended without a result: ${describe(err)}`) ??
+        writer.abort('failed', `crashed · ${describe(err)}`) ??
         writer.snapshot() ??
         ({ jobId: spec.jobId } as unknown as ForgeManifest)
       );
@@ -767,10 +767,7 @@ export class ForgeService {
         jobId,
         requested: true,
         signalled: false,
-        note:
-          'cancel recorded, but this process has no live worker handle (the server ' +
-          'restarted, or another process owns it). Only the running owner can signal ' +
-          'the worker; without that owner, the job may remain marked running.',
+        note: 'Cancel recorded; no live worker here, so the job may stay running.',
       };
     }
 
@@ -779,7 +776,7 @@ export class ForgeService {
       jobId,
       requested: true,
       signalled: true,
-      note: 'cancel recorded and the worker process was signalled.',
+      note: 'Canceled.',
     };
   }
 
@@ -856,6 +853,7 @@ export class ForgeService {
       conversation: typeof raw['conversation'] === 'string' ? raw['conversation'] : null,
       effort: typeof raw['effort'] === 'string' ? raw['effort'] : null,
       cwd: manifest?.cwd ?? null,
+      ...(manifest?.reason ? { reason: manifest.reason } : {}),
       ...(manifest === null
         ? {}
         : {
@@ -1037,3 +1035,5 @@ export function pipelineRecordPath(repo: string, name: string): string {
 export function writePipelineRecord(repo: string, name: string, value: unknown): void {
   writeJsonAtomic(pipelineRecordPath(repo, name), value);
 }
+
+export { humanDuration };

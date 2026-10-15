@@ -119,6 +119,7 @@ import type { ListModelsOptions, ModelCatalog, ModelInfo, SandboxInfo } from './
 import { DEFAULT_DISCOVERY_TIMEOUT_MS, configDir, errMessage, readTextSafe, runCapture } from './discovery.ts';
 import type { RunFn } from './discovery.ts';
 import path from 'node:path';
+import { deniedText, noResultText, stderrClause, timedOutText } from './failure-text.ts';
 
 export const CLAUDE_BINARY = process.env['AGENT_SMITH_CLAUDE_BIN'] ?? 'claude';
 
@@ -603,35 +604,27 @@ export function buildResult(args: {
 
   if (exit.killReason === 'cancelled') {
     status = 'cancelled';
-    error = 'cancelled by operator';
+    error = 'canceled';
   } else if (exit.killReason === 'timeout') {
     status = 'timeout';
     // NOTE: claude has no --print-timeout. This kill is entirely ours, which is
     // why we must never infer success from "it produced a lot of output".
-    error = `exceeded the ${durationMs} ms budget and was killed (claude has no internal timeout, so this is our SIGTERM)`;
+    error = timedOutText(durationMs);
   } else if (tx.deniedTools.length > 0 && !(tx.sawResult && !tx.sawErrorResult && exit.code === 0 && tx.finalText.trim() !== '')) {
     // Same discipline as agy. A moderator whose tools were denied has not
     // moderated anything, and claude may still report subtype "success".
     status = 'denied';
-    error =
-      `claude had ${tx.deniedTools.length} tool call(s) denied by the permission policy, ` +
-      'so the moderation did not actually happen. A prober/moderator with no tools ' +
-      'cannot probe. Consider unrestricted:true, or --allowedTools. ' +
-      `stderr tail: ${exit.stderr.slice(0, 400) || '(empty)'}`;
+    error = deniedText(tx.deniedTools, exit.stderr);
   } else if (!tx.sawResult) {
     // No result event: killed early, crashed, or a CLI output change.
     status = exit.code === 0 ? 'malformed' : 'error';
-    error =
-      `claude exited ${exit.code === null ? `on signal ${exit.signal ?? 'unknown'}` : `with code ${exit.code}`} ` +
-      'without a result event. stderr tail: ' + (exit.stderr.slice(0, 400) || '(empty)');
+    error = noResultText(exit);
   } else if (tx.sawErrorResult) {
     status = 'error';
-    error = tx.resultError ?? 'claude reported a non-success result';
+    error = tx.resultError ?? 'worker error';
   } else if (exit.code !== 0) {
     status = 'error';
-    error = `claude reported success but exited with code ${exit.code}. stderr tail: ${
-      exit.stderr.slice(0, 400) || '(empty)'
-    }`;
+    error = `exited ${exit.code}${stderrClause(exit.stderr)}`;
   } else {
     status = 'success';
   }

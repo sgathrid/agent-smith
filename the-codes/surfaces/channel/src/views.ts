@@ -3,6 +3,7 @@ import { execFile } from 'node:child_process';
 import type { JobDetail, JobSummary } from '../../../forge/service.ts';
 import type { Acceptance } from '../../../forge/checks.ts';
 import type { PipelineRecord } from '../../../forge/execute.ts';
+import { reasonFromText } from '../../mod/hooks/reasons.ts';
 
 export type ResponseFormat = 'concise' | 'detailed';
 export const CONCISE_LIST_LIMIT = 20;
@@ -45,7 +46,7 @@ export function parseSince(value: string, now = Date.now()): number {
   const rel = /^(\d+)\s*([smhd])$/i.exec(value.trim());
   if (rel) return now - Number(rel[1]) * { s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000 }[rel[2]!.toLowerCase() as 's' | 'm' | 'h' | 'd'];
   const at = Date.parse(value);
-  if (Number.isNaN(at)) throw new Error(`since must be an ISO time (2026-10-11T09:00:00Z) or relative like 30m, 2h, 1d; got "${value}".`);
+  if (Number.isNaN(at)) throw new Error(`since: use an ISO time or 30m, 2h, 1d; got "${value}".`);
   return at;
 }
 
@@ -56,7 +57,17 @@ function lastActivity(a: JobSummary['lastActivity']): string | undefined {
 function compact<T extends Record<string, unknown>>(o: T): Partial<T> {
   return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== null && v !== undefined)) as Partial<T>;
 }
-const warningTexts = (ws: JobSummary['warnings']): string[] => [...new Set(ws.map(w => trimWords(w.message, 200)))];
+/** Warning texts, minus any that only repeat the error. */
+const warningTexts = (ws: JobSummary['warnings'], error: string | null): string[] => {
+  const e = error ? flat(error) : '';
+  return [...new Set(ws.map(w => flat(w.message)).filter(m => e === '' || !(e.includes(m) || m.includes(e))).map(m => trimWords(m, 200)))];
+};
+/** The short failure reason: the stored one, else derived from the long error. Failed jobs only. */
+function failedReason(d: JobDetail): string | null {
+  if (d.status !== 'failed') return null;
+  const stored = d.reason;
+  return stored ? stored : reasonFromText(d.error);
+}
 
 /** One compact row for list_jobs. */
 export function conciseRow(j: JobSummary) {
@@ -86,15 +97,16 @@ export function conciseStatus(d: JobDetail, acceptance: AcceptanceView | null, e
   const started = d.startedAt ? Date.parse(d.startedAt) : NaN;
   const ended = d.finishedAt ? Date.parse(d.finishedAt) : Date.now();
   const files = d.changedFiles ?? [];
+  const warnings = d.warnings.length ? warningTexts(d.warnings, d.error) : [];
   return compact({
     jobId: d.jobId, name: d.name, provider: d.provider, model: d.model, mode: d.mode, status: d.status, taskStatus: taskStatus(d.status),
     acceptance: checkVerdicts(acceptance),
     startedAt: d.startedAt, finishedAt: d.finishedAt, durationMs: Number.isNaN(started) ? null : Math.max(0, ended - started),
     toolCalls: d.toolCalls, lastActivity: lastActivity(d.lastActivity),
     changedFileCount: d.changedFiles ? files.length : null, changedFiles: files.length ? files.slice(0, CONCISE_FILES_CAP) : null,
-    changedFilesNote: files.length > CONCISE_FILES_CAP || d.changedFilesTruncated ? `Only the first ${Math.min(files.length, CONCISE_FILES_CAP)} listed; ${DETAIL_HINT} or include_diff for the rest.` : null,
-    nextAction: d.nextAction, error: d.error ? trimWords(d.error, 500) : null,
-    warnings: d.warnings.length ? warningTexts(d.warnings) : null,
+    changedFilesNote: files.length > CONCISE_FILES_CAP || d.changedFilesTruncated ? `First ${Math.min(files.length, CONCISE_FILES_CAP)} shown; ${DETAIL_HINT} or include_diff for all.` : null,
+    nextAction: d.nextAction, reason: failedReason(d), error: d.error ? trimWords(d.error, 500) : null,
+    warnings: warnings.length ? warnings : null,
     summary: summary && !report.includes(summary) ? trimWords(summary, 300) : null,
     report: report ? (cut ? `${report.slice(0, CONCISE_REPORT_CHARS)}\n…[truncated: ${CONCISE_REPORT_CHARS} of ${report.length} chars; ${DETAIL_HINT} for more]` : report) : null,
     reportTruncated: cut, ...extra,
@@ -129,9 +141,9 @@ function git(cwd: string, args: string[]): Promise<{ out: string; clipped: boole
 /** Unified diff of the job's changedFiles against its spawn-time HEAD. Evidence, not attribution. Never throws. */
 export async function jobDiff(d: JobDetail): Promise<{ diff: string | null; diffNote?: string }> {
   const head = d.gitBaseline?.head;
-  if (!d.gitBaseline || !head || !d.cwd) return { diff: null, diffNote: 'No git baseline was recorded for this job (its cwd was not a git repository with a commit at spawn), so no diff is available; inspect the files directly.' };
-  if (!d.changedFiles) return { diff: null, diffNote: d.status === 'running' ? 'changedFiles is computed when the job finishes; call status again after it completes.' : 'No changedFiles were recorded for this job, so there is nothing to diff.' };
-  if (d.changedFiles.length === 0) return { diff: '', diffNote: 'The job changed no files.' };
+  if (!d.gitBaseline || !head || !d.cwd) return { diff: null, diffNote: 'No diff: no git commit at spawn.' };
+  if (!d.changedFiles) return { diff: null, diffNote: d.status === 'running' ? 'No diff yet: files are listed when the job finishes.' : 'No diff: no changed files recorded.' };
+  if (d.changedFiles.length === 0) return { diff: '', diffNote: 'No files changed.' };
   try {
     const [tracked, untracked] = await Promise.all([
       git(d.cwd, ['diff', '--no-color', head, '--', ...d.changedFiles]),
@@ -141,16 +153,16 @@ export async function jobDiff(d: JobDetail): Promise<{ diff: string | null; diff
     let diff = tracked.out;
     if (diff.length > DIFF_MAX_CHARS || tracked.clipped) {
       diff = diff.slice(0, DIFF_MAX_CHARS); diff = diff.slice(0, diff.lastIndexOf('\n') + 1);
-      notes.push(`Diff truncated at ${DIFF_MAX_CHARS} chars. See the rest with: git diff ${head} -- <file> (run in ${d.cwd}).`);
+      notes.push(`Diff cut at ${DIFF_MAX_CHARS} chars. Rest: git diff ${head} -- <file> in ${d.cwd}.`);
     }
     const added = untracked.out.split('\n').filter(Boolean);
-    if (added.length) notes.push(`New untracked files not shown in the diff: ${added.join(', ')}.`);
+    if (added.length) notes.push(`Untracked, not in diff: ${added.join(', ')}.`);
     // The diff is against HEAD, so a file already dirty at spawn carries edits the job did not make.
     const preDirty = d.changedFiles.filter(f => d.gitBaseline!.dirty.includes(f));
-    if (preDirty.length) notes.push(`Already uncommitted when the job started, so their diff includes earlier edits: ${preDirty.join(', ')}.`);
+    if (preDirty.length) notes.push(`Dirty before the job, so the diff includes earlier edits: ${preDirty.join(', ')}.`);
     return { diff, ...(notes.length ? { diffNote: notes.join(' ') } : {}) };
   } catch (err) {
-    return { diff: null, diffNote: `git diff failed in ${d.cwd}: ${trimWords(String(err), 200)}. Run git diff ${head} -- <file> yourself.` };
+    return { diff: null, diffNote: `git diff failed: ${trimWords(String(err), 200)}. Run git diff ${head} -- <file> yourself.` };
   }
 }
 
@@ -217,7 +229,7 @@ export function conciseCapabilities(providers: readonly CapabilityProvider[], on
       ...(p.defaultEffort ? { defaultEffort: p.defaultEffort } : {}),
       ...(efforts ? { efforts } : {}),
       ...(listed ? { models: rows } : { modelCount: rows.length, more: `pass provider: "${p.name}" to list its ${rows.length} models` }),
-      ...(p.verified === false ? { unverified: 'model list parsed from unconfirmed CLI output; prefer an explicit, known model' } : {}),
+      ...(p.verified === false ? { unverified: 'model list unconfirmed; prefer a known model' } : {}),
       ...(p.stale ? { stale: true } : {}),
       ...(p.error ? { error: p.error } : {}),
     };

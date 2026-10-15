@@ -8,7 +8,7 @@ import { test } from 'node:test';
 
 import {
   ACCEPTANCE_HOLD_MS, LAUNCH_TOOL, STATUS_TOOL, type NoticeJob, type NoticeRow, type Owned, type RunRecord,
-  claim, claudeText, displayNoticeText, due, headline, noticeFromRadar, parseLaunch, parseSettledRead, unclaim,
+  claim, claudeText, displayNoticeText, due, headline, noticeFromRadar, parseLaunch, pipelineOutcome, parseSettledRead, unclaim,
 } from '../hooks/notice.ts';
 import { buildBatch } from '../../channel/src/policy.ts';
 
@@ -34,48 +34,73 @@ function notice(over: Partial<NoticeJob>): NoticeJob {
 
 // ── the words ───────────────────────────────────────────────────────────────
 
-test('success names worker, provider and role, duration, files and checks', () => {
+test('done names worker, provider, role and duration; checks only when they ran', () => {
   assert.equal(
     headline(notice({ name: 'Ada', provider: 'codex', role: 'review', durationMs: 43_000, changedFiles: 2, checks: { passed: 2, total: 2 } })),
-    '✓ Ada (codex review) succeeded in 43s · 2 files changed · checks 2/2',
+    '✓ Ada (codex review) 43s · done · checks 2/2',
   );
+  assert.equal(headline(notice({ name: 'Ada', provider: 'codex', role: 'review' })), '✓ Ada (codex review) · done');
 });
 
-test('failure leads with the runtime reason after the duration', () => {
+test('failure says failed and the short reason', () => {
   assert.equal(
-    headline(notice({ kind: 'failed', name: 'Bo', provider: 'agy', role: 'implement', durationMs: 45 * 60_000, reason: 'timeout' })),
-    '✗ Bo (agy implement) failed after 45m: timeout',
+    headline(notice({ kind: 'failed', name: 'Bo', provider: 'agy', role: 'implement', durationMs: 45 * 60_000, reason: 'timed out' })),
+    '✗ Bo (agy implement) 45m · failed: timed out',
   );
 });
 
-test('cancel and attention read as what they are', () => {
+test('canceled and stalled read as what they are', () => {
   assert.equal(headline(notice({ kind: 'cancelled', name: 'Cy', provider: 'claude', role: 'implement', durationMs: 125_000 })),
-    '■ Cy (claude implement) cancelled after 2m');
+    '■ Cy (claude implement) 2m · canceled');
   assert.equal(headline(notice({ kind: 'attention', name: 'Di', provider: 'opencode', role: 'research', durationMs: 16 * 60_000 })),
-    '! Di (opencode research) needs attention: no progress for 16m');
+    '! Di (opencode research) · stalled 16m');
 });
 
-test('rejected checks say so; one file is singular; long runs show hours', () => {
-  assert.equal(headline(notice({ name: 'E', provider: 'codex', changedFiles: 1, checks: { passed: 1, total: 2 }, durationMs: 65 * 60_000 })),
-    '✓ E (codex) succeeded in 1h05m · 1 file changed · checks 1/2 (rejected)');
+test('rejected checks are a failure, not done: glyph x and the failed check names', () => {
+  assert.equal(headline(notice({ name: 'E', provider: 'codex', checks: { passed: 1, total: 2, failed: ['lint'] }, durationMs: 65 * 60_000 })),
+    '✗ E (codex) 1h05m · checks failed: lint');
+  assert.equal(headline(notice({ name: 'E', provider: 'codex', checks: { passed: 0, total: 2, failed: ['lint', 'tests'] } })),
+    '✗ E (codex) · checks failed: lint +1');
 });
 
 test('every provider is named as itself; agy is not the default', () => {
   for (const provider of ['codex', 'claude', 'agy', 'opencode']) {
     const text = claudeText([notice({ name: 'W', provider, role: 'review' })]);
-    assert.match(text, new RegExp(`^Agent Smith · ✓ W \\(${provider} review\\) succeeded`));
+    assert.match(text, new RegExp(`^Agent Smith · ✓ W \\(${provider} review\\) · done`));
     assert.doesNotMatch(text, /agy-radar/);
   }
-  assert.match(headline(notice({ id: 'x-1' })), /^✓ job x-1 succeeded/);
-  assert.match(headline(notice({ id: 'implement-1', source: 'agy-staff' })), /^✓ agy-staff job implement-1 succeeded/);
+  assert.match(headline(notice({ id: 'x-1' })), /^✓ job x-1 · done/);
+  assert.match(headline(notice({ id: 'implement-1', source: 'agy-staff' })), /^✓ agy-staff job implement-1 · done/);
 });
 
-test("Claude's text: one job carries its id and the next step, never the worker's summary", () => {
-  const text = claudeText([notice({ name: 'Ada', provider: 'codex', role: 'review', summary: 'Found two bugs in parser.ts.' })]);
+test("Claude's text: the user's failed job is one short line, then how to read it", () => {
+  const job = noticeFromRadar(row({
+    id: 'implement-smith-6b456b3d', name: 'pp-engine', provider: 'agy', role: 'implement', status: 'failed',
+    startedAt: NOW - 21 * 60_000, endedAt: NOW, changedFileCount: 8,
+    failureReason: 'worker soft-denied 1 tool action(s) (view_file) — it exited 0 and reported success while doing nothing. This is NOT a clean success.',
+  }), 'failed', NOW);
+  const text = claudeText([job]);
   assert.equal(text, [
-    'Agent Smith · ✓ Ada (codex review) succeeded · no checks. Job ID job-1.',
-    'Read it with status before acting.',
+    'Agent Smith · ✗ pp-engine (agy implement) 21m · failed: denied view_file',
+    'status implement-smith-6b456b3d',
   ].join('\n'));
+  assert.equal(displayNoticeText(text), 'Agent Smith · ✗ pp-engine (agy implement) 21m · failed: denied view_file');
+});
+
+test('an old job with only the long error text gets the same short reason', () => {
+  const old = (failureReason: string) => noticeFromRadar(row({ id: 'j', name: 'A', provider: 'codex', status: 'failed', endedAt: NOW, failureReason }), 'failed', NOW);
+  assert.equal(old('supervisor process exited before the job finished (orphaned)').reason, 'server stopped');
+  assert.equal(old('The worker exceeded the 30m budget').reason, 'timed out');
+  assert.equal(old('exited with code 2').reason, 'exit 2');
+  assert.equal(old('exit 1').reason, 'exit 1');
+});
+
+test('checks rejected after a clean execution: failed glyph, failed check names', () => {
+  const job = noticeFromRadar(row({
+    id: 'job-9', name: 'Ada', provider: 'codex', role: 'implement', status: 'succeeded', endedAt: NOW, startedAt: NOW - 120_000,
+    acceptance: { checks: [{ ok: true, name: 'tests' }, { ok: false, name: 'lint' }] },
+  }), 'finished', NOW);
+  assert.equal(claudeText([job]), 'Agent Smith · ✗ Ada (codex implement) 2m · checks failed: lint\nstatus job-9');
 });
 
 test("Claude's text: a batch is one block, counted by outcome, one line per job", () => {
@@ -84,36 +109,43 @@ test("Claude's text: a batch is one block, counted by outcome, one line per job"
     notice({ id: 'b', name: 'Bo', provider: 'agy', kind: 'failed', reason: 'exit 1' }),
     notice({ id: 'c', name: 'Cy', provider: 'claude', kind: 'cancelled' }),
   ]);
-  const lines = text.split('\n');
-  assert.equal(lines[0], 'Agent Smith · 3 jobs: 1 succeeded, 1 failed, 1 cancelled.');
-  assert.equal(lines[2], '✗ Bo (agy) failed: exit 1. Job ID b.');
-  assert.equal(lines.length, 5);
-  assert.equal(lines[4], 'Read them with status before acting.');
+  assert.equal(text, [
+    'Agent Smith · 3 jobs: 1 done, 1 failed, 1 canceled',
+    '✓ Ada (codex) · done',
+    '✗ Bo (agy) · failed: exit 1',
+    '■ Cy (claude) · canceled',
+    'status a, b, c',
+  ].join('\n'));
 });
 
-test('a finished job without checks says so; a pipeline run does not', () => {
-  assert.equal(headline(notice({ name: 'Ada', provider: 'codex', role: 'review' })), '✓ Ada (codex review) succeeded · no checks');
-  assert.doesNotMatch(headline(notice({ name: 'ship', run: true })), /no checks/);
-});
-
-test('a generated name is shown as the job id, with no Job ID sentence', () => {
+test('a generated name is shown as the job id', () => {
   const text = claudeText([notice({ id: 'review-smith-1a2b3c4d', name: 'review-1a2b3c4d', provider: 'agy', role: 'review' })]);
   assert.equal(text, [
-    'Agent Smith · ✓ review-smith-1a2b3c4d (agy review) succeeded · no checks.',
-    'Read it with status before acting.',
+    'Agent Smith · ✓ review-smith-1a2b3c4d (agy review) · done',
+    'status review-smith-1a2b3c4d',
   ].join('\n'));
-  assert.doesNotMatch(text, /Job ID/);
 });
 
-test('a chosen name keeps its identity and the Job ID sentence', () => {
-  const text = claudeText([notice({ id: 'review-smith-1a2b3c4d', name: 'Ada', provider: 'agy', role: 'review' })]);
-  assert.match(text, /^Agent Smith · ✓ Ada \(agy review\) succeeded · no checks\. Job ID review-smith-1a2b3c4d\.\n/);
+test('a pipeline run points at pipeline_status and states its stages', () => {
+  const text = claudeText([notice({ id: 'run-1', name: 'ship', role: 'pipeline', run: true, kind: 'failed', durationMs: 120_000, reason: '1/2 stages passed · test: checks failed: lint' })]);
+  assert.equal(text, [
+    'Agent Smith · ✗ ship 2m · 1/2 stages passed · test: checks failed: lint',
+    'pipeline_status run-1',
+  ].join('\n'));
 });
 
-test('a pipeline run points at pipeline_status and states its stage verdicts', () => {
-  const text = claudeText([notice({ id: 'run-1', name: 'ship', role: 'pipeline', run: true, kind: 'failed', reason: 'Pipeline partial; test: execution failed, acceptance rejected.' })]);
-  assert.match(text, /^Agent Smith · ✗ ship \(pipeline\) failed\. Run ID run-1\. Pipeline partial/);
-  assert.match(text, /pipeline_status/);
+test('pipelineOutcome names the first stage that did not pass, in the short words', () => {
+  const record = (stageResults: RunRecord['stageResults']): RunRecord => ({
+    runId: 'r', pipeline: 'ship', status: 'partial', startedAt: 0, finishedAt: 1, stageResults,
+  });
+  assert.equal(pipelineOutcome(record({
+    plan: { stage: 'plan', status: 'passed', acceptance: 'passed' },
+    test: { stage: 'test', status: 'passed', acceptance: 'failed', verification: { failing: [{ check: { name: 'lint' } }] } },
+  })), '1/2 stages passed · test: checks failed: lint');
+  assert.equal(pipelineOutcome(record({
+    build: { stage: 'build', status: 'failed', failure: { code: 'exit-1', message: 'worker soft-denied 1 tool action(s) (view_file)' } },
+  })), '0/1 stages passed · build: denied view_file');
+  assert.equal(pipelineOutcome(record({ a: { stage: 'a', status: 'passed' } })), '1/1 stages passed');
 });
 
 // ── launch acks ─────────────────────────────────────────────────────────────
@@ -186,13 +218,13 @@ test('a claimed run is announced with its stage jobs when it ends, not before', 
   const owned = claim([], launch('run-1', 'run'), NOW);
   const record = (status: RunRecord['status'], finishedAt: number | null): RunRecord => ({
     runId: 'run-1', pipeline: 'ship', status, startedAt: NOW - 120_000, finishedAt,
-    stageResults: { test: { stage: 'test', status: 'succeeded', acceptance: 'accepted', jobId: 'stage-1' } },
+    stageResults: { test: { stage: 'test', status: 'passed', acceptance: 'passed', jobId: 'stage-1' } },
   });
   const stage = row({ id: 'stage-1', status: 'succeeded', endedAt: NOW, name: 'T', provider: 'codex' });
   assert.deepEqual(due(owned, [stage], new Map([['run-1', record('running', null)]]), NOW).notices, [], 'a finished stage waits for its run');
   const r = due(owned, [stage], new Map([['run-1', record('passed', NOW)]]), NOW);
   assert.deepEqual(r.notices.map((n) => n.id), ['run-1', 'stage-1']);
-  assert.match(claudeText(r.notices), /✓ ship \(pipeline\) succeeded in 2m\. Run ID run-1\. Pipeline passed; test: execution succeeded, acceptance accepted\./);
+  assert.match(claudeText(r.notices), /✓ ship 2m · 1\/1 stages passed/);
 });
 
 test('a claim that never shows up expires silently', () => {
@@ -217,21 +249,21 @@ test('the hook (policy) and the mod render the same job in the same words', () =
     acceptance: { checks: [{ ok: true }, { ok: true }] }, summarySource: 'worker', latestSummary: 'Two findings.',
   }), 'finished', NOW)]);
   assert.equal(hook, mod);
-  assert.match(mod, /^Agent Smith · ✓ Ada \(codex review\) succeeded in 43s · 2 files changed · checks 2\/2\. Job ID job-ada\./);
+  assert.match(mod, /^Agent Smith · ✓ Ada \(codex review\) 43s · done · checks 2\/2\nstatus job-ada$/);
 });
 
-test('displayNoticeText strips the Agent Smith prefix, inline Job ID, and instruction footer for the transcript row', () => {
+test('displayNoticeText keeps the notice lines and drops the line for Claude', () => {
   const single = claudeText([notice({ id: 'implement-smith-6729d530', name: 'smoke-agy', provider: 'agy', role: 'implement', durationMs: 7000, checks: { passed: 1, total: 1 } })]);
-  assert.equal(displayNoticeText(single), '✓ smoke-agy (agy implement) succeeded in 7s · checks 1/1');
+  assert.equal(displayNoticeText(single), 'Agent Smith · ✓ smoke-agy (agy implement) 7s · done · checks 1/1');
 
   const batch = claudeText([
     notice({ id: 'a', name: 'Ada', provider: 'codex' }),
     notice({ id: 'b', name: 'Bo', provider: 'agy', kind: 'failed', reason: 'exit 1' }),
   ]);
   assert.equal(displayNoticeText(batch), [
-    '2 jobs: 1 succeeded, 1 failed',
-    '✓ Ada (codex) succeeded · no checks',
-    '✗ Bo (agy) failed: exit 1',
+    'Agent Smith · 2 jobs: 1 done, 1 failed',
+    '✓ Ada (codex) · done',
+    '✗ Bo (agy) · failed: exit 1',
   ].join('\n'));
 });
 
@@ -244,7 +276,7 @@ test('displayNoticeText drops the host frame Claude Code wraps around a plugin p
     const framed = `${header}\n${body.split('\n').map((l) => `  ${l}`).join('\n')}\n\n  ${footer}`;
     assert.equal(displayNoticeText(framed), displayNoticeText(body));
   }
-  assert.equal(displayNoticeText(body), '✓ pp-docs (agy implement) succeeded in 5m · no checks');
+  assert.equal(displayNoticeText(body), 'Agent Smith · ✓ pp-docs (agy implement) 5m · done');
 });
 
 test('parseSettledRead and unclaim retire a notice once status reads a settled job or run', () => {

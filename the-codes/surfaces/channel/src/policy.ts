@@ -38,6 +38,7 @@
 // The words live in the mod (hooks/notice.ts), which announces the same jobs
 // when it is loaded: one renderer, so the hook and the mod cannot drift apart.
 import { type NoticeJob, claudeText, compactExcerpt } from '../../mod/hooks/notice.ts';
+import { reasonFromText } from '../../mod/hooks/reasons.ts';
 
 export { compactExcerpt };
 
@@ -64,7 +65,7 @@ export interface WatchableJob {
   /** Runtime-owned failure reason (job.json error), when recorded. */
   readonly failureReason?: string | null;
   /** Acceptance check tally, when checks ran. */
-  readonly checks?: { readonly passed: number; readonly total: number } | null;
+  readonly checks?: { readonly passed: number; readonly total: number; readonly failed?: readonly string[] } | null;
   /** `agy-staff` for a legacy interop job; absent for Forge jobs and runs. */
   readonly source?: 'agy-staff';
   readonly status: WatchStatus;
@@ -262,7 +263,7 @@ export function toNotice(job: WatchableJob, kind: PushKind, now: number): Notice
     durationMs: Number.isFinite(span) ? span : null,
     changedFiles: job.changedFileCount ?? null,
     checks: job.checks ?? null,
-    reason: run ? job.outcome! : kind === 'failed' ? job.failureReason ?? null : null,
+    reason: run ? job.outcome! : kind === 'failed' ? reasonFromText(job.failureReason) : null,
     summary: job.summarySource === 'worker' ? job.latestSummary ?? null : null,
   };
 }

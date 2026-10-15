@@ -48,10 +48,10 @@ function firstPlus(names: readonly string[]): string {
   return clean.length === 1 ? clean[0]! : `${clean[0]} +${clean.length - 1}`;
 }
 
-/** `denied: view_file`, `denied: view_file +2`, or `denied`. */
+/** `denied view_file`, `denied view_file +2`, or `denied`. */
 export function deniedReason(names: readonly string[]): string {
   const list = firstPlus(names);
-  return list === '' ? 'denied' : `denied: ${list}`;
+  return list === '' ? 'denied' : `denied ${list}`;
 }
 
 /** `checks failed: lint`, `checks failed: lint +1`, or `checks failed`. */
@@ -76,8 +76,8 @@ export function reasonFromText(text: string | null | undefined): string {
   if (t === '') return REASONS.workerError;
   if (ORPHAN_RE.test(t)) return REASONS.serverStopped;
   if (DENIED_RE.test(t)) {
-    // "soft-denied 2 tool action(s) (view_file, RunCommand)" and "denied: view_file"
-    const named = /\(([^()]{2,})\)/.exec(t)?.[1] ?? /denied: ([^·\n]+)/i.exec(t)?.[1] ?? '';
+    // "soft-denied 2 tool action(s) (view_file, RunCommand)", "denied view_file", "denied: view_file"
+    const named = /\(([^()]{2,})\)/.exec(t)?.[1] ?? /\bdenied:? ([A-Za-z_][^·\n]*)/i.exec(t)?.[1] ?? '';
     return deniedReason(named.split(',').map((n) => n.replace(/\s*\+\d+$/, '')));
   }
   if (NO_OUTPUT_RE.test(t)) return REASONS.noOutput;

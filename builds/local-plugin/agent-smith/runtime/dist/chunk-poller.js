@@ -1,4 +1,111 @@
 import path from'node:path';import {constants,existsSync,readFileSync,mkdirSync,writeFileSync,renameSync}from'node:fs';import {readdir,open,access}from'node:fs/promises';import {randomBytes}from'node:crypto';import os from'node:os';import {spawn}from'node:child_process';/**
+ * reasons.ts — every failure, in two to four words.
+ *
+ * One vocabulary for every surface: the completion notice, the band, the pane,
+ * `status`, and the hints Claude reads. The forge stores `reason` (from these
+ * helpers) on the job when it fails; readers of older jobs, which have only the
+ * long `error` text, derive the same words with `reasonFromText`. The full error
+ * always stays one step away (status, the pane), so nothing here needs to
+ * explain itself.
+ *
+ * Lives in the mod for the same reason as progress.ts: the mod loader only
+ * admits files inside the plugin folder; the forge imports it from here. Pure:
+ * no `claude-code` import, no filesystem.
+ */
+const NETWORK_RE = /network issue|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|fetch failed|connection (?:reset|refused|closed|error)|temporarily unavailable|overloaded/i;
+const TIMEOUT_RE = /timed? ?out|exceeded the .*budget|\btimeout\b/i;
+const AUTH_RE = /\b(?:unauthorized|unauthenticated)\b|authentication (?:failed|required)|invalid (?:api[ _-]?key|access token)|(?:access |auth |refresh )token (?:has )?expired|not (?:logged|signed) in|please (?:log|sign) in/i;
+const RATE_LIMIT_RE = /\brate[ _-]?limit(?:ed|ing)?\b|too many requests|\b429\b/i;
+const QUOTA_RE = /insufficient[_ ]quota|quota exceeded|exceeded.{0,30}quota|credit balance.{0,30}(?:low|exhausted)|billing.{0,30}(?:limit|exhausted)|out of credits/i;
+const COMPATIBILITY_RE = /unknown (?:option|argument|flag)|unrecognized (?:option|argument|flag|subcommand)|unexpected argument|unsupported (?:option|flag)|invalid value.{0,80}(?:--model|--effort|reasoning_effort)|unknown model|does not support effort|bad flag or model/i;
+const START_RE = /\bENOENT\b|spawn.{0,100}(?:not found|no such file)|couldn't start|could not start/i;
+/** The orphan reason, old and new wording: the process that owned the job is gone. */
+const ORPHAN_RE = /orphaned|supervisor process exited|server stopped/i;
+const DENIED_RE = /\bdenied\b|soft-denied/i;
+const NO_OUTPUT_RE = /no usable output|empty response|\bno output\b/i;
+/** The words for the cases the forge decides itself. */
+const REASONS = {
+    serverStopped: 'server stopped',
+    noOutput: 'no output',
+    timedOut: 'timed out',
+    notLoggedIn: 'not logged in',
+    outOfCredits: 'out of credits',
+    rateLimited: 'rate limited',
+    badFlagOrModel: 'bad flag or model',
+    couldntStart: "couldn't start",
+    networkError: 'network error',
+    crashed: 'crashed',
+    setupFailed: 'setup failed',
+    workerError: 'worker error',
+};
+/** `first +N`: one name and a count, so a long list never widens a line. */
+function firstPlus(names) {
+    const clean = [...new Set(names.map((n) => n.trim()).filter((n) => n !== ''))];
+    if (clean.length === 0)
+        return '';
+    return clean.length === 1 ? clean[0] : `${clean[0]} +${clean.length - 1}`;
+}
+/** `denied view_file`, `denied view_file +2`, or `denied`. */
+function deniedReason(names) {
+    const list = firstPlus(names);
+    return list === '' ? 'denied' : `denied ${list}`;
+}
+/** `checks failed: lint`, `checks failed: lint +1`, or `checks failed`. */
+function checksReason(failed) {
+    const list = firstPlus(failed);
+    return list === '' ? 'checks failed' : `checks failed: ${list}`;
+}
+/** `exit 1`. */
+function exitReason(code) {
+    return `exit ${code}`;
+}
+/**
+ * Any failure text → the short reason. For jobs recorded before `reason` was
+ * stored, and for errors that only exist as prose. Order matters: the most
+ * specific cause wins, and an orphan or a denial outranks whatever else the
+ * text happens to mention.
+ */
+function reasonFromText(text) {
+    const t = (text ?? '').trim();
+    if (t === '')
+        return REASONS.workerError;
+    if (ORPHAN_RE.test(t))
+        return REASONS.serverStopped;
+    if (DENIED_RE.test(t)) {
+        // "soft-denied 2 tool action(s) (view_file, RunCommand)", "denied view_file", "denied: view_file"
+        const named = /\(([^()]{2,})\)/.exec(t)?.[1] ?? /\bdenied:? ([A-Za-z_][^·\n]*)/i.exec(t)?.[1] ?? '';
+        return deniedReason(named.split(',').map((n) => n.replace(/\s*\+\d+$/, '')));
+    }
+    if (NO_OUTPUT_RE.test(t))
+        return REASONS.noOutput;
+    if (TIMEOUT_RE.test(t))
+        return REASONS.timedOut;
+    if (AUTH_RE.test(t))
+        return REASONS.notLoggedIn;
+    if (QUOTA_RE.test(t))
+        return REASONS.outOfCredits;
+    if (RATE_LIMIT_RE.test(t))
+        return REASONS.rateLimited;
+    if (COMPATIBILITY_RE.test(t))
+        return REASONS.badFlagOrModel;
+    if (START_RE.test(t))
+        return REASONS.couldntStart;
+    if (NETWORK_RE.test(t))
+        return REASONS.networkError;
+    if (/without (?:emitting )?a result|no result event|\bcrashed\b/i.test(t))
+        return REASONS.crashed;
+    if (/preparation failed|setup failed/i.test(t))
+        return REASONS.setupFailed;
+    if (/checks failed/i.test(t))
+        return t.split('\n')[0].slice(0, 48);
+    const exit = /\bexit(?:ed)?(?: with)?(?: code)? (\d+)\b/i.exec(t);
+    if (exit)
+        return exitReason(Number(exit[1]));
+    // Already short and plain: keep it as the worker or provider put it.
+    if (t.length <= 32 && !t.includes('\n') && !t.includes(' — '))
+        return t;
+    return REASONS.workerError;
+}/**
  * notice.ts: the words Agent Smith uses to say a job finished, and which jobs
  * this session may announce. Pure; no host API, no `node:` imports.
  *
@@ -56,55 +163,61 @@ function chosenName(job) {
 function who(job) {
     const identity = [job.provider, job.role].filter(Boolean).join(' ');
     const name = chosenName(job);
+    if (job.run)
+        return name ?? `pipeline ${job.id}`;
     if (name)
         return identity ? `${name} (${identity})` : name;
     if (job.source === 'agy-staff')
         return `agy-staff job ${job.id}`;
-    if (job.run)
-        return `pipeline ${job.id}`;
     return identity ? `${job.id} (${identity})` : `job ${job.id}`;
 }
+/** Execution succeeded but a check failed: the work is not done. */
+function rejected(job) {
+    return job.kind === 'finished' && !job.run && job.checks != null && job.checks.passed < job.checks.total;
+}
 /**
- * One line, the most decision-relevant fact first:
- *   ✓ Ada (codex review) succeeded in 43s · 2 files changed · checks 2/2
- *   ✗ Bo (agy implement) failed after 45m: timeout
+ * One line, the outcome last:
+ *   ✓ Ada (codex review) 43s · done · checks 2/2
+ *   ✗ Bo (agy implement) 45m · failed: timed out
+ *   ✗ Cy (codex implement) 3m · checks failed: lint
+ *   ! Di (opencode research) · stalled 16m
  */
 function headline(job) {
     const d = durationWords(job.durationMs);
-    const reason = job.reason ? `: ${compactExcerpt(job.reason, 160)}` : '';
-    let state;
+    const reason = job.reason ? compactExcerpt(job.reason, 160) : '';
+    const bad = rejected(job);
+    const glyph = bad ? GLYPH.failed : GLYPH[job.kind];
+    const parts = [`${glyph} ${who(job)}${d && job.kind !== 'attention' ? ` ${d}` : ''}`];
     switch (job.kind) {
         case 'finished':
-            state = `succeeded${d ? ` in ${d}` : ''}`;
+            if (job.run)
+                parts.push(reason || 'done');
+            else if (bad)
+                parts.push(checksReason(job.checks?.failed ?? []));
+            else {
+                parts.push('done');
+                if (job.checks && job.checks.total > 0)
+                    parts.push(`checks ${job.checks.passed}/${job.checks.total}`);
+            }
             break;
         case 'failed':
-            state = `failed${d ? ` after ${d}` : ''}${job.run ? '' : reason}`;
+            parts.push(job.run ? reason || 'failed' : `failed${reason ? `: ${reason}` : ''}`);
             break;
         case 'cancelled':
-            state = `cancelled${d ? ` after ${d}` : ''}`;
+            parts.push('canceled');
             break;
         case 'attention':
-            state = `needs attention${d ? `: no progress for ${d}` : ''}`;
+            parts.push(`stalled${d ? ` ${d}` : ''}`);
             break;
     }
-    const facts = [];
-    if (typeof job.changedFiles === 'number' && job.changedFiles > 0) {
-        facts.push(`${job.changedFiles} file${job.changedFiles === 1 ? '' : 's'} changed`);
-    }
-    if (job.checks && job.checks.total > 0) {
-        facts.push(`checks ${job.checks.passed}/${job.checks.total}${job.checks.passed < job.checks.total ? ' (rejected)' : ''}`);
-    }
-    else if (job.kind === 'finished' && !job.run) {
-        facts.push('no checks'); // success here is the worker's word, not evidence
-    }
-    return [`${GLYPH[job.kind]} ${who(job)} ${state}`, ...facts].join(' · ');
+    return parts.join(' · ');
 }
 const CLAUDE_JOBS = 8;
 /**
- * What Claude reads, and what the user sees: Claude Code shows a plugin's
- * message in full. One line per job and the one next step. The worker's own
- * summary is left out: Claude reads the result with status anyway, and a
- * claim repeated in the notice only lengthens it.
+ * What Claude reads. One line per job, then how to read it:
+ *   Agent Smith · ✗ pp-engine (agy implement) 21m · failed: denied view_file
+ *   status implement-smith-6b456b3d
+ * The worker's own summary is left out: Claude reads the result with status.
  */
 function claudeText(jobs) {
     if (jobs.length === 0)
@@ -113,23 +226,30 @@ function claudeText(jobs) {
     const lines = [];
     if (!one) {
         const counts = new Map();
-        for (const job of jobs)
-            counts.set(STATE[job.kind], (counts.get(STATE[job.kind]) ?? 0) + 1);
-        lines.push(`Agent Smith · ${jobs.length} jobs: ${[...counts].map(([k, n]) => `${n} ${k}`).join(', ')}.`);
+        for (const job of jobs) {
+            const label = rejected(job) ? 'failed' : STATE[job.kind];
+            counts.set(label, (counts.get(label) ?? 0) + 1);
+        }
+        lines.push(`Agent Smith · ${jobs.length} jobs: ${[...shown(counts)].map(([k, n]) => `${n} ${k}`).join(', ')}`);
     }
-    for (const job of jobs.slice(0, CLAUDE_JOBS)) {
-        const outcome = job.run && job.reason ? ` ${compactExcerpt(job.reason, one ? 400 : 200)}` : '';
-        const id = chosenName(job) || job.run ? ` ${job.run ? 'Run' : 'Job'} ID ${job.id}.` : '';
-        lines.push(`${one ? 'Agent Smith · ' : ''}${headline(job)}.${id}${outcome}`);
-    }
+    const listed = jobs.slice(0, CLAUDE_JOBS);
+    for (const job of listed)
+        lines.push(`${one ? 'Agent Smith · ' : ''}${headline(job)}`);
     if (jobs.length > CLAUDE_JOBS)
         lines.push(`…and ${jobs.length - CLAUDE_JOBS} more; list_jobs shows them.`);
-    const runs = jobs.some((j) => j.run);
-    lines.push(`Read ${one ? 'it' : 'them'} with ${runs ? 'pipeline_status (runs) or status (jobs)' : 'status'} before acting.`);
+    const ids = (run) => listed.filter((j) => !!j.run === run).map((j) => j.id);
+    if (ids(false).length > 0)
+        lines.push(`status ${ids(false).join(', ')}`);
+    if (ids(true).length > 0)
+        lines.push(`pipeline_status ${ids(true).join(', ')}`);
     return lines.join('\n');
 }
+/** Counts in the order a reader scans them: done first, then what needs a look. */
+function shown(counts) {
+    return ['done', 'failed', 'canceled', 'stalled'].flatMap((k) => (counts.has(k) ? [[k, counts.get(k)]] : []));
+}
 const STATE = {
-    finished: 'succeeded', failed: 'failed', cancelled: 'cancelled', attention: 'need attention',
+    finished: 'done', failed: 'failed', cancelled: 'canceled', attention: 'stalled',
 };
 // ── launch acks ─────────────────────────────────────────────────────────────
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -214,12 +334,28 @@ function parseLaunch(toolName, response) {
     const t = payload['timeoutMs'];
     return { kind, id, repo, timeoutMs: typeof t === 'number' && Number.isFinite(t) && t > 0 ? t : null };
 }
-/** Pipeline outcome, stage by stage. Runtime-owned, so stated as fact. */
+/**
+ * Pipeline outcome: `2/3 stages passed · test: checks failed: lint`. The first
+ * stage that did not pass says why, in the shared short words.
+ */
 function pipelineOutcome(run) {
     const stages = Object.values(run.stageResults)
-        .filter((s) => s !== null && typeof s === 'object' && typeof s.stage === 'string')
-        .map((s) => `${String(s.stage)}: execution ${String(s.status)}, acceptance ${typeof s.acceptance === 'string' ? s.acceptance : 'unchecked'}`);
-    return `Pipeline ${run.status}; ${stages.join('; ')}.`;
+        .filter((s) => s !== null && typeof s === 'object' && typeof s.stage === 'string');
+    const passed = stages.filter((s) => s.status === 'passed' && s.acceptance !== 'failed').length;
+    const bad = stages.find((s) => s.status === 'failed' || s.acceptance === 'failed');
+    const head = `${passed}/${stages.length} stages passed`;
+    if (bad)
+        return `${head} · ${String(bad.stage)}: ${stageReason(bad)}`;
+    return run.error && run.status !== 'passed' ? `${head} · ${reasonFromText(run.error)}` : head;
+}
+function stageReason(s) {
+    if (s.acceptance === 'failed') {
+        const failing = isObj(s.verification) && Array.isArray(s.verification['failing']) ? s.verification['failing'] : [];
+        const names = failing.flatMap((v) => (isObj(v) && isObj(v['check']) && typeof v['check']['name'] === 'string' ? [v['check']['name']] : []));
+        return checksReason(names);
+    }
+    const f = isObj(s.failure) ? s.failure : null;
+    return reasonFromText(typeof f?.['message'] === 'string' ? f['message'] : typeof f?.['code'] === 'string' ? f['code'] : null);
 }/**
  * policy.ts — when the channel is allowed to speak into Claude's context.
  *
@@ -394,7 +530,7 @@ function toNotice(job, kind, now) {
         durationMs: Number.isFinite(span) ? span : null,
         changedFiles: job.changedFileCount ?? null,
         checks: job.checks ?? null,
-        reason: run ? job.outcome : kind === 'failed' ? job.failureReason ?? null : null,
+        reason: run ? job.outcome : kind === 'failed' ? reasonFromText(job.failureReason) : null,
         summary: job.summarySource === 'worker' ? job.latestSummary ?? null : null,
     };
 }
@@ -836,14 +972,48 @@ function looksEmpty$1(text) {
  * not the provider was kind enough to mention it, and a warning flag that gates
  * this is a warning flag that can be forgotten.
  */
+function denialNames(denials) {
+    return denials
+        .map((x) => x.displayName ?? x.action)
+        .filter((n) => typeof n === 'string' && n.length > 0);
+}
+/** `view_file` or `view_file +2`; empty when no denial has a name. */
+function deniedNames(denials) {
+    const names = [...new Set(denialNames(denials))];
+    if (names.length === 0)
+        return '';
+    return names.length === 1 ? names[0] : `${names[0]} +${names.length - 1}`;
+}
+/**
+ * What a failed finish stores: the full `error` (the adapter's own text, else the
+ * verdict's reason; never both) and the short `reason`. Not failed: both null-ish.
+ */
+function failureFields(verdict, result, maxError = 1_200) {
+    const adapterError = (result.error ?? '').trim();
+    const error = adapterError !== '' ? adapterError.slice(0, maxError) : verdict.reason;
+    if (verdict.status !== 'failed')
+        return { error, reason: null };
+    const denials = result.deniedActions ?? [];
+    const fatal = denials.length > 0 && verdict.reason !== null && DENIED_RE.test(verdict.reason);
+    let reason;
+    if (fatal)
+        reason = deniedReason(denialNames(denials));
+    else if (result.status === 'timeout')
+        reason = REASONS.timedOut;
+    else if (verdict.reason === REASONS.noOutput)
+        reason = REASONS.noOutput;
+    else
+        reason = reasonFromText(adapterError !== '' ? adapterError : verdict.reason);
+    return { error, reason };
+}
 function deriveStatus(d) {
     const terminal = d.alreadyTerminal ?? null;
     if (terminal === 'canceled')
-        return { status: 'canceled', suspicious: false, reason: 'cancelled by operator' };
+        return { status: 'canceled', suspicious: false, reason: 'canceled' };
     if (terminal === 'succeeded')
         return { status: 'succeeded', suspicious: false, reason: null };
     if (terminal === 'failed') {
-        return { status: 'failed', suspicious: false, reason: `worker reported failure (${d.jobStatus ?? 'unknown'})` };
+        return { status: 'failed', suspicious: false, reason: REASONS.workerError };
     }
     if (d.ok === null || d.ok === undefined) {
         return { status: 'running', suspicious: false, reason: null };
@@ -857,36 +1027,24 @@ function deriveStatus(d) {
             status: 'succeeded',
             suspicious: false,
             reason: null,
-            note: `${denials.length} tool call(s) were denied by the permission policy; the report was delivered but some checks may not have run.`,
+            note: `${denials.length} ${denials.length === 1 ? 'call' : 'calls'} denied` + (deniedNames(denials) === '' ? '' : `: ${deniedNames(denials)}`),
         };
     }
     if (denials.length > 0) {
-        const names = denials
-            .map((x) => x.displayName ?? x.action)
-            .filter((n) => typeof n === 'string' && n.length > 0)
-            .join(', ');
-        return {
-            status: 'failed',
-            suspicious: true,
-            reason: `worker soft-denied ${denials.length} tool action(s)` +
-                (names === '' ? '' : ` (${names})`) +
-                ' — it exited 0 and reported success while doing nothing. ' +
-                'This is NOT a clean success.',
-        };
+        return { status: 'failed', suspicious: true, reason: deniedReason(denialNames(denials)) };
     }
     if (d.ok === false) {
         return {
             status: 'failed',
             suspicious: false,
-            reason: `worker reported failure (${d.jobStatus ?? 'unknown'})`,
+            reason: d.jobStatus === 'timeout' ? REASONS.timedOut : REASONS.workerError,
         };
     }
     if (looksEmpty$1(d.report)) {
         return {
             status: 'failed',
             suspicious: true,
-            reason: 'worker reported success but delivered no usable output — ' +
-                'treating as failed, not as a clean success.',
+            reason: REASONS.noOutput,
         };
     }
     return { status: 'succeeded', suspicious: false, reason: null };
@@ -909,8 +1067,8 @@ function shouldFlush(lastFlushMs, nowMs, minMs = PROGRESS_FLUSH_MS) {
 const DEFAULT_TIMEOUT_MS = 45 * 60_000;
 /** A legacy manifest (no ownerPid) is orphaned only when silent this long. */
 const LEGACY_ORPHAN_AFTER_MS = 2 * DEFAULT_TIMEOUT_MS;
-const ORPHAN_REASON = 'supervisor process exited before the job finished (orphaned)';
-const CANCEL_ORPHAN_REASON = 'cancel requested and the supervisor exited before confirming it';
+const ORPHAN_REASON = REASONS.serverStopped;
+const CANCEL_ORPHAN_REASON = 'canceled; server stopped before confirming';
 /** `kill(pid, 0)`: ESRCH means gone; EPERM means it exists but is not ours. */
 function isPidAlive(pid) {
     if (!Number.isInteger(pid) || pid <= 0)
@@ -948,12 +1106,6 @@ function deriveOrphan(m, lastSeenMs, nowMs, alive = isPidAlive, cancelRequested 
     const ref = Math.max(...times);
     return nowMs - ref > LEGACY_ORPHAN_AFTER_MS ? verdict : null;
 }
-const NETWORK_RE = /network issue|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|fetch failed|connection (?:reset|refused|closed|error)|temporarily unavailable|overloaded/i;
-const TIMEOUT_RE = /timed? ?out|exceeded the .*budget|\btimeout\b/i;
-const AUTH_RE = /\b(?:unauthorized|unauthenticated)\b|authentication (?:failed|required)|invalid (?:api[ _-]?key|access token)|(?:access |auth |refresh )token (?:has )?expired|not (?:logged|signed) in|please (?:log|sign) in/i;
-const RATE_LIMIT_RE = /\brate[ _-]?limit(?:ed|ing)?\b|too many requests|\b429\b/i;
-const QUOTA_RE = /insufficient[_ ]quota|quota exceeded|exceeded.{0,30}quota|credit balance.{0,30}(?:low|exhausted)|billing.{0,30}(?:limit|exhausted)/i;
-const COMPATIBILITY_RE = /unknown (?:option|argument|flag)|unrecognized (?:option|argument|flag|subcommand)|unexpected argument|unsupported (?:option|flag)|invalid value.{0,80}(?:--model|--effort|reasoning_effort)|unknown model|does not support effort/i;
 /**
  * THE one place a next step is derived. Derived on read, never stored in
  * job.json. Null for running/succeeded jobs. A short imperative for the
@@ -961,39 +1113,35 @@ const COMPATIBILITY_RE = /unknown (?:option|argument|flag)|unrecognized (?:optio
  */
 function nextActionFor(i) {
     const status = i.status ?? null;
-    if (status === 'canceled')
-        return 'Canceled by operator; nothing to do.';
     if (status !== 'failed')
         return null;
     const err = i.error ?? '';
-    if (err.includes('orphaned') || err.includes(ORPHAN_REASON)) {
-        return 'Supervisor exited; resume_job if it has a conversation handle, else rerun.';
-    }
-    if (i.jobStatus === 'denied' || (i.deniedCount ?? 0) > 0 || /soft-denied/i.test(err)) {
+    if (ORPHAN_RE.test(err))
+        return 'Server stopped: resume_job if it has a conversation, else rerun.';
+    if (i.jobStatus === 'denied' || (i.deniedCount ?? 0) > 0 || DENIED_RE.test(err)) {
         return i.unrestricted === true
-            ? 'Worker was denied actions even with unrestricted:true; give it an approved path or narrow the task.'
-            : 'Worker permissions blocked the task; use an approved path or ask for authorization before retrying with unrestricted:true.';
+            ? 'Denied even with unrestricted:true: narrow the task or give an approved path.'
+            : 'Ask the user before retrying with unrestricted:true.';
     }
     if (AUTH_RE.test(err))
-        return 'Provider authentication failed; restore the provider login or credentials before retrying.';
+        return 'Not logged in: fix the provider login, then retry.';
     if (QUOTA_RE.test(err))
-        return 'Provider quota or credits are exhausted; resolve the account limit or choose another available provider.';
+        return 'Out of credits: top up, or use another provider.';
     if (RATE_LIMIT_RE.test(err))
-        return 'Provider rate limit reached; wait for its retry window or reduce concurrent workers before retrying.';
+        return 'Rate limited: wait, or run fewer workers.';
     if (COMPATIBILITY_RE.test(err))
-        return 'Provider rejected its arguments or model; run agent-smith doctor and list_capabilities, then correct the request or update the provider CLI.';
-    if (/\bENOENT\b|spawn.{0,100}(?:not found|no such file)/i.test(err)) {
-        return 'Worker could not start; check the provider executable and working directory with agent-smith doctor before retrying.';
-    }
+        return 'Bad flag or model: run agent-smith doctor, then fix the request.';
+    if (START_RE.test(err))
+        return "Couldn't start: run agent-smith doctor.";
     if (i.jobStatus === 'timeout' || TIMEOUT_RE.test(err)) {
-        return 'Raise timeoutMs or split the task; resume_job keeps the conversation.';
+        return 'Raise timeoutMs or split the task; resume_job keeps context.';
     }
     if (NETWORK_RE.test(err))
-        return 'Transient: retry the same job once; resume_job or spawn again.';
-    if (/no usable output/i.test(err) || (i.exitCode === 0 && looksEmpty$1(i.report))) {
-        return 'Worker returned no usable output; ask for a final answer via resume_job or rerun.';
+        return 'Network error: retry once with resume_job or a new spawn.';
+    if (NO_OUTPUT_RE.test(err) || (i.exitCode === 0 && looksEmpty$1(i.report))) {
+        return 'No output: ask for a final answer via resume_job, or rerun.';
     }
-    return 'Worker failed; read status.error and warnings before retrying.';
+    return 'Read status.error and warnings before retrying.';
 }/**
  * agent-smith.ts — reads OUR OWN job state from `<repo>/.agent-smith/jobs/`.
  *
@@ -2011,7 +2159,7 @@ const agyNormalizer = (raw) => {
     if (strippedCount > 0) {
         warnings.push({
             code: "polluted_result",
-            message: `Removed ${strippedCount} <system_notification> block(s) from the result text.`,
+            message: `Removed ${strippedCount} <system_notification> block${strippedCount === 1 ? '' : 's'} from the result text.`,
         });
     }
     // -- warning: tool errors observed during the run --------------------------
@@ -2019,11 +2167,11 @@ const agyNormalizer = (raw) => {
     if (sawAgyError || progressWarnings.length > 0) {
         const detail = asString(telemetry["agy_error_reason"]) ??
             (progressWarnings[0] ?? "provider reported warnings");
-        warnings.push({ code: "tool_error", message: `Job reported warnings: ${detail}` });
+        warnings.push({ code: "tool_error", message: detail });
     }
     // -- warning: cancellation --------------------------------------------------
     if (canceled || terminalStatus === "canceled") {
-        warnings.push({ code: "canceled", message: "Job was cancelled." });
+        warnings.push({ code: "canceled", message: "canceled" });
     }
     // -- status resolution ------------------------------------------------------
     const emptyOutput = looksEmpty(output);
@@ -2044,19 +2192,18 @@ const agyNormalizer = (raw) => {
             status = "failed";
             warnings.push({
                 code: "empty_output",
-                message: "Job reported 'done' but produced no usable output.",
+                message: "no output",
             });
             if (statusWarnings === true || progressWarnings.length > 0) {
                 warnings.push({
                     code: "suspicious_success",
-                    message: "Provider reported success with warnings AND an empty response — " +
-                        "treating as failed, not clean success.",
+                    message: "success with warnings and no output",
                 });
             }
             else {
                 warnings.push({
                     code: "suspicious_success",
-                    message: "Provider reported 'done' with an empty response — treating as failed.",
+                    message: "success with no output",
                 });
             }
         }
@@ -2071,8 +2218,7 @@ const agyNormalizer = (raw) => {
             if (statusWarnings === true) {
                 warnings.push({
                     code: "suspicious_success",
-                    message: "Provider set warnings:true on a 'done' job. Output is non-empty, " +
-                        "so status stays succeeded, but review before trusting it.",
+                    message: "done with warnings; review it",
                 });
             }
         }
@@ -2087,7 +2233,7 @@ const agyNormalizer = (raw) => {
         status = "unknown";
         warnings.push({
             code: "incomplete_state",
-            message: "No terminal status and no progress evidence found.",
+            message: "no status or progress found",
         });
     }
     // A canceled job that also has an empty output is expected; don't double-flag.
@@ -2172,18 +2318,18 @@ const claudeNormalizer = (raw) => {
     const output = handback ?? finalText;
     // -- warnings ---------------------------------------------------------------
     if (stoppedByUser) {
-        warnings.push({ code: "canceled", message: "Subagent was stopped by the user." });
+        warnings.push({ code: "canceled", message: "stopped by the user" });
     }
     if (errorRecords > 0) {
         warnings.push({
             code: "tool_error",
-            message: `Transcript contains ${errorRecords} API-error record(s).`,
+            message: `${errorRecords} API ${errorRecords === 1 ? 'error' : 'errors'}`,
         });
     }
     if (malformed > 0) {
         warnings.push({
             code: "incomplete_state",
-            message: `Skipped ${malformed} malformed transcript line(s); format may have changed.`,
+            message: `skipped ${malformed} unreadable transcript ${malformed === 1 ? 'line' : 'lines'}`,
         });
     }
     // Same headline rule as agy: no deliverable + warnings ⇒ not a clean success.
@@ -2191,7 +2337,7 @@ const claudeNormalizer = (raw) => {
     if (emptyOutput && !stoppedByUser) {
         warnings.push({
             code: "empty_output",
-            message: "Subagent produced no handback message and no final text.",
+            message: "no output",
         });
     }
     // -- status -----------------------------------------------------------------
@@ -2278,12 +2424,10 @@ const smithNormalizer = (raw) => {
         const failedWithoutOutput = status === "failed" && (output === null || output.trim() === '');
         warnings.push({
             code: failedWithoutOutput ? "suspicious_success" : "tool_error",
-            message: failedWithoutOutput
-                ? `${deniedCount} tool action(s) were soft-denied and no report was delivered; the job was recorded FAILED.`
-                : `${deniedCount} tool action(s) were denied by the permission policy; some requested actions may not have run.`,
+            message: `${deniedCount} ${deniedCount === 1 ? 'call' : 'calls'} denied`,
         });
     }
-    if (errorText !== null) {
+    if (errorText !== null && deniedCount === 0) {
         warnings.push({ code: "tool_error", message: errorText });
     }
     for (const w of progressWarnings) {
@@ -2292,7 +2436,7 @@ const smithNormalizer = (raw) => {
     let resolved;
     if (canceled) {
         resolved = "canceled";
-        warnings.push({ code: "canceled", message: "Cancelled by the operator." });
+        warnings.push({ code: "canceled", message: "canceled" });
     }
     else if (schema !== null && schema > SCHEMA_VERSION) {
         // A newer writer's file. `unknown`, and NOT `running`: "we cannot read this"
@@ -2301,7 +2445,7 @@ const smithNormalizer = (raw) => {
         resolved = "unknown";
         warnings.push({
             code: "incomplete_state",
-            message: `on-disk schema v${schema} is newer than this reader (v${SCHEMA_VERSION}); state unknown.`,
+            message: `schema v${schema} is newer than this reader (v${SCHEMA_VERSION})`,
         });
     }
     else if (status === "succeeded") {
@@ -2313,7 +2457,7 @@ const smithNormalizer = (raw) => {
             // not silently upgrade a job with no output to a success.
             warnings.push({
                 code: "empty_output",
-                message: "Status says succeeded but no usable output is on disk; verify before trusting.",
+                message: "done, but no output on disk",
             });
         }
     }
@@ -2332,14 +2476,14 @@ const smithNormalizer = (raw) => {
         resolved = "unknown";
         warnings.push({
             code: "incomplete_state",
-            message: "job.json is missing or unreadable; state is unknown, not running.",
+            message: "job.json missing or unreadable",
         });
     }
     else {
         resolved = "unknown";
         warnings.push({
             code: "incomplete_state",
-            message: "No status in the anchor and no cancel marker.",
+            message: "no status in job.json",
         });
     }
     // A cancelled job's empty output is expected, not a defect.
@@ -3138,7 +3282,10 @@ async function readOne(reader, source, cwd, jobId, now) {
     const raw = observed.raw;
     const acceptance = source === 'agent-smith' ? readAcceptance(cwd, observed.jobId) : {};
     const checks = Array.isArray(acceptance.checks) && acceptance.checks.length > 0
-        ? { passed: acceptance.checks.filter((c) => c?.ok === true).length, total: acceptance.checks.length } : null;
+        ? {
+            passed: acceptance.checks.filter((c) => c?.ok === true).length, total: acceptance.checks.length,
+            failed: acceptance.checks.flatMap((c) => (c?.ok !== true && typeof c?.name === 'string' ? [c.name] : [])),
+        } : null;
     return {
         id: observed.jobId,
         name: typeof observed.raw['name'] === 'string' ? observed.raw['name'] : undefined,
@@ -3147,7 +3294,7 @@ async function readOne(reader, source, cwd, jobId, now) {
         startedAt: observed.startedAt,
         changedFileCount: Array.isArray(observed.raw['changed_files']) ? observed.raw['changed_files'].length : undefined,
         latestSummary: typeof raw['latestSummary'] === 'string' ? raw['latestSummary'] : null,
-        failureReason: typeof raw['error'] === 'string' && raw['error'] !== '' ? raw['error'] : null,
+        failureReason: [raw['reason'], raw['error']].find((v) => typeof v === 'string' && v !== '') ?? null,
         checks,
         ...(source === 'agy-staff' ? { source } : {}),
         summarySource: observed.raw['summarySource'] === 'worker' ? 'worker' : null,
@@ -3341,4 +3488,4 @@ function scheduleLoop(cwd, intervalMs, send, onError) {
         timer.unref?.();
     };
     tick();
-}export{AgentSmithReader as A,evaluateAcceptance as B,ClaudeCodeReader as C,DEFAULT_TIMEOUT_MS as D,pollOnce as E,FILES as F,scheduleLoop as G,parseLaunch as H,claimMarkerPath as I,readJob as J,readPipelineRecord as K,buildBatch as L,dedupeKey as M,resetPoller as N,readAll as O,PROGRESS_FLUSH_MS as P,SCHEMA_VERSION as S,AgyStaffReader as a,attributeChanged as b,deriveStatus as c,diffChangedFiles as d,isPidAlive as e,deriveOrphan as f,jobsDir as g,newJobId as h,isForgeStatePath as i,jobFile as j,jobDir as k,looksEmpty$1 as l,isForgeJobId as m,normalize as n,SMITH_PAYLOAD as o,nextActionFor as p,toVerifyChecks as q,readAcceptance as r,shouldFlush as s,taskTitle as t,normalizeAcceptanceReport as u,runChecks as v,writeAcceptance as w,acceptanceChecksFromReport as x,acceptanceState as y,POLL_MS as z};
+}export{AgentSmithReader as A,acceptanceState as B,ClaudeCodeReader as C,DEFAULT_TIMEOUT_MS as D,reasonFromText as E,FILES as F,POLL_MS as G,evaluateAcceptance as H,pollOnce as I,scheduleLoop as J,parseLaunch as K,claimMarkerPath as L,readJob as M,readPipelineRecord as N,buildBatch as O,PROGRESS_FLUSH_MS as P,dedupeKey as Q,REASONS as R,SCHEMA_VERSION as S,resetPoller as T,readAll as U,AgyStaffReader as a,attributeChanged as b,deriveStatus as c,diffChangedFiles as d,exitReason as e,failureFields as f,isPidAlive as g,deriveOrphan as h,isForgeStatePath as i,jobFile as j,jobsDir as k,looksEmpty$1 as l,newJobId as m,normalize as n,jobDir as o,isForgeJobId as p,SMITH_PAYLOAD as q,readAcceptance as r,shouldFlush as s,taskTitle as t,nextActionFor as u,toVerifyChecks as v,writeAcceptance as w,normalizeAcceptanceReport as x,runChecks as y,acceptanceChecksFromReport as z};

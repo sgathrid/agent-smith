@@ -670,3 +670,40 @@ test('progress.json carries a digest of what the worker has done', () => {
   assert.equal(p.digest.testRuns, 1);
   assert.equal(p.digest.lastTestFailed, true);
 });
+
+/* ── failure reason ────────────────────────────────────────────────────────── */
+
+function failedManifest(over: Partial<JobResult>, report = ''): ForgeManifest {
+  const r = repo();
+  const w = start(r, 'implement-smith-abcd1234', false);
+  w.finish(result(over), report);
+  return JSON.parse(readFileSync(jobFile(r, 'implement-smith-abcd1234', FILES.job), 'utf8')) as ForgeManifest;
+}
+
+test('a fatal denial stores the short reason and keeps the adapter error as is', () => {
+  const m = failedManifest({
+    ok: false, status: 'denied', response: '', error: 'denied view_file · stderr: nope',
+    deniedActions: [{ action: 'view', displayName: 'view_file' }],
+  });
+  assert.equal(m.status, 'failed');
+  assert.equal(m.reason, 'denied view_file');
+  assert.equal(m.error, 'denied view_file · stderr: nope', 'no verdict prefix, no repetition');
+});
+
+test('timeout, empty report and success set reason from the cause', () => {
+  assert.equal(failedManifest({ ok: false, status: 'timeout', error: 'timed out after 45m' }).reason, 'timed out');
+  const empty = failedManifest({ ok: true, response: '' }, '');
+  assert.equal(empty.reason, 'no output');
+  assert.equal(empty.error, 'no output');
+  const ok = failedManifest({}, 'delivered');
+  assert.equal(ok.reason, null);
+});
+
+test('abort stores the short reason before the detail', () => {
+  const r = repo();
+  const w = start(r, 'implement-smith-abcd1234', false);
+  w.abort('failed', "couldn't start · ENOENT");
+  const m = JSON.parse(readFileSync(jobFile(r, 'implement-smith-abcd1234', FILES.job), 'utf8')) as ForgeManifest;
+  assert.equal(m.reason, "couldn't start");
+  assert.equal(m.error, "couldn't start · ENOENT");
+});

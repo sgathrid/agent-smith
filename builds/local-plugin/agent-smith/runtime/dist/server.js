@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import process$1 from'node:process';import {randomUUID,randomBytes}from'node:crypto';import path from'node:path';import {mkdirSync,writeFileSync,createWriteStream,readFileSync,renameSync,unlinkSync,openSync,fsyncSync,closeSync,appendFileSync,statSync,existsSync,readdirSync,copyFileSync,linkSync}from'node:fs';import {fileURLToPath}from'node:url';import {access,constants}from'node:fs/promises';import {A as AgentSmithReader,a as AgyStaffReader,C as ClaudeCodeReader,n as normalize,P as PROGRESS_FLUSH_MS,t as taskTitle,S as SCHEMA_VERSION,d as diffChangedFiles,b as attributeChanged,c as deriveStatus,j as jobFile,F as FILES,s as shouldFlush,l as looksEmpty,i as isForgeStatePath,e as isPidAlive,f as deriveOrphan,r as readAcceptance,w as writeAcceptance,g as jobsDir,h as newJobId$1,k as jobDir,m as isForgeJobId,o as SMITH_PAYLOAD,D as DEFAULT_TIMEOUT_MS$1,p as nextActionFor,q as toVerifyChecks,u as normalizeAcceptanceReport,v as runChecks,x as acceptanceChecksFromReport,y as acceptanceState,z as POLL_MS,B as evaluateAcceptance,E as pollOnce,G as scheduleLoop}from'./chunk-poller.js';import {spawn,execFile}from'node:child_process';import os from'node:os';import readline from'node:readline';//#region rolldown:runtime
+import process$1 from'node:process';import {randomUUID,randomBytes}from'node:crypto';import path from'node:path';import {mkdirSync,writeFileSync,createWriteStream,readFileSync,renameSync,unlinkSync,openSync,fsyncSync,closeSync,appendFileSync,statSync,existsSync,readdirSync,copyFileSync,linkSync}from'node:fs';import {fileURLToPath}from'node:url';import {access,constants}from'node:fs/promises';import {A as AgentSmithReader,a as AgyStaffReader,C as ClaudeCodeReader,n as normalize,e as exitReason,P as PROGRESS_FLUSH_MS,t as taskTitle,S as SCHEMA_VERSION,d as diffChangedFiles,b as attributeChanged,c as deriveStatus,f as failureFields,j as jobFile,F as FILES,s as shouldFlush,l as looksEmpty,i as isForgeStatePath,g as isPidAlive,h as deriveOrphan,R as REASONS,r as readAcceptance,w as writeAcceptance,k as jobsDir,m as newJobId$1,o as jobDir,p as isForgeJobId,q as SMITH_PAYLOAD,D as DEFAULT_TIMEOUT_MS$1,u as nextActionFor,v as toVerifyChecks,x as normalizeAcceptanceReport,y as runChecks,z as acceptanceChecksFromReport,B as acceptanceState,E as reasonFromText,G as POLL_MS,H as evaluateAcceptance,I as pollOnce,J as scheduleLoop}from'./chunk-poller.js';import {spawn,execFile}from'node:child_process';import os from'node:os';import readline from'node:readline';//#region rolldown:runtime
 var __create = Object.create;
 var __defProp = Object.defineProperty;
 var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
@@ -25068,6 +25068,45 @@ function createRequestStateCodec(options) {
 		}
 	};
 }/**
+ * failure-text.ts — the short error strings the adapters share.
+ *
+ * One spelling per case, so every provider fails in the same words. Detail that
+ * only a developer needs (event-shape gaps, flag advice) belongs in code
+ * comments; advice for the orchestrator is nextActionFor's job (forge/format.ts).
+ */
+const STDERR_TAIL_CHARS = 300;
+/** `45m`, `1h05m`, `30s`, `2m10s`. Whole units, never raw milliseconds. */
+function humanDuration(ms) {
+    const total = Math.max(0, Math.round(ms / 1000));
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    if (h > 0)
+        return m === 0 ? `${h}h` : `${h}h${String(m).padStart(2, '0')}m`;
+    if (m > 0)
+        return s === 0 ? `${m}m` : `${m}m${String(s).padStart(2, '0')}s`;
+    return `${s}s`;
+}
+function timedOutText(durationMs) {
+    return `timed out after ${humanDuration(durationMs)}`;
+}
+/** ` · stderr: <tail>`, or '' when stderr is empty. The last bounded part: errors come last. */
+function stderrClause(stderr) {
+    const t = stderr.trim();
+    if (t === '')
+        return '';
+    return ` · stderr: ${t.length > STDERR_TAIL_CHARS ? `…${t.slice(-STDERR_TAIL_CHARS)}` : t}`;
+}
+/** `exited 1, no result` or `exited on SIGTERM, no result`, plus the stderr clause. */
+function noResultText(exit) {
+    const how = exit.code === null ? `on ${exit.signal ?? 'a signal'}` : String(exit.code);
+    return `exited ${how}, no result${stderrClause(exit.stderr)}`;
+}
+/** `denied view_file, RunCommand · stderr: …` */
+function deniedText(names, stderr) {
+    const list = [...new Set(names.filter((n) => n !== ''))].join(', ');
+    return `${list === '' ? 'denied' : `denied ${list}`}${stderrClause(stderr)}`;
+}/**
  * registry.ts — name → reader map, and `discoverAll()`.
  *
  * The registry is intentionally tiny. Its whole job is:
@@ -26049,11 +26088,11 @@ function buildResult$3(args) {
     // trustworthy terminal state, whatever agy managed to flush first.
     if (exit.killReason === 'cancelled') {
         status = 'cancelled';
-        error = 'cancelled by operator';
+        error = 'canceled';
     }
     else if (exit.killReason === 'timeout') {
         status = 'timeout';
-        error = `exceeded the ${durationMs} ms budget and was killed`;
+        error = timedOutText(durationMs);
     }
     else if (distinctDenials.length > 0 && reportedStatus === 'SUCCESS' && exit.code === 0 && response.trim() !== '') {
         // Denied calls, but agy finished and delivered a report: a success with a
@@ -26067,31 +26106,19 @@ function buildResult$3(args) {
         // THE TRAP. exit code 0, status "SUCCESS", empty response — and yet the
         // job did nothing. Reported as a failure, loudly.
         status = 'denied';
-        const names = distinctDenials
-            .map((d) => d.displayName ?? d.action)
-            .filter((n) => n !== undefined)
-            .join(', ');
-        error =
-            `agy soft-denied ${distinctDenials.length} tool action(s)` +
-                `${names !== '' ? ` (${names})` : ''}. ` +
-                (response.trim() === ''
-                    ? 'agy exited with an empty response — this is NOT a success. '
-                    : `agy did not finish cleanly (status "${reportedStatus ?? 'none'}", exit ${exit.code ?? 'signal'}). `) +
-                'Headless agy auto-denies tools it cannot prompt for unless run with ' +
-                '--dangerously-skip-permissions; an explicit deny rule overrides that flag. ' +
-                'stderr tail: ' + (exit.stderr.slice(0, 400) || '(empty)');
+        // Headless agy auto-denies tools it cannot prompt for unless run with
+        // --dangerously-skip-permissions; an explicit deny rule overrides that flag.
+        error = deniedText(distinctDenials.map((d) => d.displayName ?? d.action).filter((n) => n !== undefined), exit.stderr);
     }
     else if (resultEvent === undefined) {
         // Process ended with no result event at all: a crash, an OOM kill, or a CLI
         // version whose output format changed. Never report success.
         status = exit.code === 0 ? 'malformed' : 'error';
-        error =
-            `agy exited ${exit.code === null ? `on signal ${exit.signal ?? 'unknown'}` : `with code ${exit.code}`} ` +
-                'without emitting a result event. stderr tail: ' + (exit.stderr.slice(0, 400) || '(empty)');
+        error = noResultText(exit);
     }
     else if (reportedStatus !== 'SUCCESS') {
         status = 'error';
-        error = resultEvent.error ?? `agy reported status "${reportedStatus ?? 'unknown'}"`;
+        error = resultEvent.error ?? 'worker error';
     }
     else if (response.trim() === '' && sawAnyToolCall) {
         // Paranoia net for (4) above. The model burned tokens and made tool calls
@@ -26099,10 +26126,7 @@ function buildResult$3(args) {
         // shaped like a success. We allow the genuinely-empty case (no tool calls,
         // nothing asked) to pass as success.
         status = 'denied';
-        error =
-            'agy reported SUCCESS with an empty response after making tool calls and no denial was ' +
-                'recorded. Treating a job that produced no output as a failure. ' +
-                'stderr tail: ' + (exit.stderr.slice(0, 400) || '(empty)');
+        error = `no output${stderrClause(exit.stderr)}`;
     }
     else {
         status = 'success';
@@ -26111,7 +26135,7 @@ function buildResult$3(args) {
     // SUCCESS-looking result event still has to be a failure.
     if (status === 'success' && exit.code !== 0) {
         status = 'error';
-        error = `agy exited with code ${exit.code} despite reporting SUCCESS`;
+        error = exit.code === null ? `exited on ${exit.signal ?? 'a signal'}` : exitReason(exit.code);
     }
     const out = {
         jobId,
@@ -26821,38 +26845,32 @@ function buildResult$2(args) {
     let error;
     if (exit.killReason === 'cancelled') {
         status = 'cancelled';
-        error = 'cancelled by operator';
+        error = 'canceled';
     }
     else if (exit.killReason === 'timeout') {
         status = 'timeout';
         // NOTE: claude has no --print-timeout. This kill is entirely ours, which is
         // why we must never infer success from "it produced a lot of output".
-        error = `exceeded the ${durationMs} ms budget and was killed (claude has no internal timeout, so this is our SIGTERM)`;
+        error = timedOutText(durationMs);
     }
     else if (tx.deniedTools.length > 0 && !(tx.sawResult && !tx.sawErrorResult && exit.code === 0 && tx.finalText.trim() !== '')) {
         // Same discipline as agy. A moderator whose tools were denied has not
         // moderated anything, and claude may still report subtype "success".
         status = 'denied';
-        error =
-            `claude had ${tx.deniedTools.length} tool call(s) denied by the permission policy, ` +
-                'so the moderation did not actually happen. A prober/moderator with no tools ' +
-                'cannot probe. Consider unrestricted:true, or --allowedTools. ' +
-                `stderr tail: ${exit.stderr.slice(0, 400) || '(empty)'}`;
+        error = deniedText(tx.deniedTools, exit.stderr);
     }
     else if (!tx.sawResult) {
         // No result event: killed early, crashed, or a CLI output change.
         status = exit.code === 0 ? 'malformed' : 'error';
-        error =
-            `claude exited ${exit.code === null ? `on signal ${exit.signal ?? 'unknown'}` : `with code ${exit.code}`} ` +
-                'without a result event. stderr tail: ' + (exit.stderr.slice(0, 400) || '(empty)');
+        error = noResultText(exit);
     }
     else if (tx.sawErrorResult) {
         status = 'error';
-        error = tx.resultError ?? 'claude reported a non-success result';
+        error = tx.resultError ?? 'worker error';
     }
     else if (exit.code !== 0) {
         status = 'error';
-        error = `claude reported success but exited with code ${exit.code}. stderr tail: ${exit.stderr.slice(0, 400) || '(empty)'}`;
+        error = `exited ${exit.code}${stderrClause(exit.stderr)}`;
     }
     else {
         status = 'success';
@@ -27518,28 +27536,24 @@ function buildResult$1(args) {
     let error;
     if (exit.killReason === 'cancelled') {
         status = 'cancelled';
-        error = 'cancelled by operator';
+        error = 'canceled';
     }
     else if (exit.killReason === 'timeout') {
         status = 'timeout';
-        error = `exceeded the ${durationMs} ms budget and was killed`;
+        error = timedOutText(durationMs);
     }
     else if (!tx.sawTurnCompleted) {
         // The reachable case in practice is the untrusted-directory refusal, which
         // writes NOTHING to stdout and prints only to stderr. Guessing 'success'
         // here would be a lie.
         status = exit.code === 0 ? 'malformed' : 'error';
-        error =
-            `codex exited ${exit.code === null ? `on signal ${exit.signal ?? 'unknown'}` : `with code ${exit.code}`} ` +
-                'without a turn.completed event. Common causes: not a git repository ' +
-                '(we pass --skip-git-repo-check, so this usually means an older codex), ' +
-                'auth failure, or a codex output-format change. stderr tail: ' +
-                (exit.stderr.slice(0, 400) || '(empty)');
+        // Usual causes: an untrusted directory, an auth failure, or an output-format change.
+        error = noResultText(exit);
     }
     else if (exit.code !== 0) {
         // turn.completed arrived but the process still failed. Corroboration wins.
         status = 'error';
-        error = `codex reported turn.completed but exited with code ${exit.code}. stderr tail: ${exit.stderr.slice(0, 400) || '(empty)'}`;
+        error = `exited ${exit.code}${stderrClause(exit.stderr)}`;
     }
     else {
         status = 'success';
@@ -28213,66 +28227,42 @@ function buildResult(args) {
     const { jobId, startedAtMs, stateDir, exit, tx } = args;
     const finishedAt = nowIso();
     const durationMs = Date.now() - startedAtMs;
-    const unrecognisedNote = tx.unrecognised.size > 0
-        ? ` Unrecognised event types seen: ${[...tx.unrecognised].join(', ')}. See events.jsonl.`
-        : '';
     let status;
     let error;
     if (exit.killReason === 'cancelled') {
         status = 'cancelled';
-        error = 'cancelled by operator';
+        error = 'canceled';
     }
     else if (exit.killReason === 'timeout') {
         status = 'timeout';
-        error = `exceeded the ${durationMs} ms budget and was killed`;
+        error = timedOutText(durationMs);
     }
     else if (tx.sawError) {
         // An `error` event or an error-state tool part. opencode's provider.quota
         // 402 exits 1 with an error event and no text, so this is the common path
         // for a misconfigured account.
         status = 'error';
-        error =
-            `opencode reported an error event during the run${unrecognisedNote} ` +
-                `stderr tail: ${exit.stderr.slice(0, 400) || '(empty)'}`;
+        error = `worker error${stderrClause(exit.stderr)}`;
     }
     else if (tx.deniedNotices.length > 0) {
         // Same reasoning as agy: a denied tool means the work did not happen, and
         // opencode may well exit 0. Do not report that as a success.
         status = 'denied';
-        error =
-            `opencode reported ${tx.deniedNotices.length} denied tool call(s): ${tx.deniedNotices.join(', ')}. ` +
-                'The work did not happen. Check the agent permission config; --auto only ' +
-                'auto-approves permissions that are not explicitly denied.' +
-                unrecognisedNote;
+        error = deniedText(tx.deniedNotices, '');
     }
     else if (exit.code !== 0) {
         status = 'error';
-        error =
-            `opencode exited with code ${exit.code}${unrecognisedNote} ` +
-                `stderr tail: ${exit.stderr.slice(0, 400) || '(empty)'}`;
+        error = `exited ${exit.code}${stderrClause(exit.stderr)}`;
     }
     else if (tx.finalText.trim() === '') {
         // Exited 0 with no text and no error event. Do not call that a success.
         // Be honest about why: with an unverified parser this is the shape most
         // likely to mean "we did not understand the output", not "the model said
         // nothing", and the two demand different fixes.
+        // Most likely an event-shape gap in the adapter, not an empty model reply:
+        // check events.jsonl and extend the parser.
         status = 'malformed';
-        const stderrTail = exit.stderr !== '' ? ` stderr tail: ${exit.stderr.slice(0, 400)}` : '';
-        if (tx.unrecognised.size > 0) {
-            error =
-                'opencode exited 0 but the adapter extracted no assistant text. ' +
-                    `Unrecognised event types: ${[...tx.unrecognised].join(', ')}. ` +
-                    'This is most likely an event-shape gap in the adapter, not an empty model ' +
-                    'response — check events.jsonl and extend the parser.' +
-                    stderrTail;
-        }
-        else {
-            error =
-                'opencode exited 0 but the adapter extracted no assistant text. This is most ' +
-                    'likely an event-shape gap in the adapter rather than an empty model response ' +
-                    '— check events.jsonl.' +
-                    stderrTail;
-        }
+        error = `no output${stderrClause(exit.stderr)}`;
     }
     else {
         status = 'success';
@@ -28815,36 +28805,6 @@ function createMarker(filePath, body) {
  * the band already did the latter. Both surfaces now agree, so there is no
  * band/pane ordering deviation left to document.
  */
-// ── glyphs ──────────────────────────────────────────────────────────────────
-/**
- * Status → glyph. Single-width ONLY, and never an emoji.
- *
- * TERMINAL-UI.md §Glyphs blesses exactly this set, and every member is
- * EAW=Neutral (one column in every locale, which is a correctness property and
- * not a taste question):
- *
- *     running    ⏺  (U+23FA)    succeeded  ✓  (U+2713)
- *     failed     ✗  (U+2717)    attention  ⚠  (U+26A0)
- *     neutral    ∙  (U+2219)
- *
- * The set this file used to draw — `●` `✓` `✗` `!` `·` `?` — had two defects,
- * both of them the ones TERMINAL-UI.md calls out by name:
- *
- *   1. `●` (U+25CF) and `·` (U+00B7) are East Asian Width **Ambiguous**: one
- *      column in a Western terminal, two in a CJK-locale one. That is the silent
- *      column drift the whole glyph section exists to prevent, and it is why
- *      Claude Code itself ships `U+23FA ⏺` on macOS and `U+25CF ●` everywhere
- *      else — even Anthropic treats the choice as a per-platform negotiation.
- *      `⏺` and `∙` are genuinely neutral.
- *   2. `!` for attention is ASCII punctuation rather than a glyph, and `·` for
- *      canceled collided with the separator the rows used between fields, so a
- *      monochrome reader could not tell a cancelled job from a separator.
- *
- * `canceled` is deliberately NOT `✗`. A cancelled job is not a bug —
- * core/types.ts says so explicitly, and adds that alerting on one trains people
- * to ignore alerts. `unknown` keeps ASCII `?`: neutral width, distinct from all
- * five, and honest about the fact that we do not know.
- */
 // ── activity, from real agy tool shapes ─────────────────────────────────────
 /**
  * agy tool name + parameters → a short "what is it doing" phrase.
@@ -29352,10 +29312,11 @@ function mirrorStatus(m, suspicious) {
         warnings: suspicious,
         finished_at: m.finishedAt ?? m.updatedAt,
     };
-    if (m.error !== null && m.error !== '')
-        out['reason'] = m.error;
+    const reason = m.reason ?? m.error;
+    if (reason !== null && reason !== undefined && reason !== '')
+        out['reason'] = reason;
     else if (suspicious)
-        out['reason'] = 'reported success with no usable output';
+        out['reason'] = 'no output';
     return out;
 }
 /**
@@ -29960,6 +29921,7 @@ class JobWriter {
             deniedActions: result.deniedActions ?? [],
             report,
         });
+        const failure = failureFields(verdict, result);
         const usage = result.usage === undefined
             ? null
             : Object.fromEntries(Object.entries(result.usage).filter((e) => typeof e[1] === 'number'));
@@ -29971,14 +29933,9 @@ class JobWriter {
             startedAt: this.manifest.startedAt ?? result.startedAt,
             exitCode: result.exitCode,
             jobStatus: result.status,
-            // BOTH strings, verdict first. The verdict leads because it is this repo's
-            // own vocabulary and reads identically for every provider. The adapter's
-            // message follows because it is the SPECIFIC one — `agy exited without
-            // emitting a result event` on its own does not say ENOENT, and dropping it
-            // would turn a diagnosable spawn failure into an unexplained `error`.
-            error: verdict.reason === null
-                ? (result.error ?? null)
-                : appendBounded(`${verdict.reason} — `, result.error ?? '', 1_200),
+            // The adapter's own text when it has one, else the verdict's reason; never both.
+            error: failure.error,
+            reason: failure.reason,
             deniedActions: (result.deniedActions ?? []).map((d) => ({
                 ...(d.action === undefined ? {} : { action: d.action }),
                 ...(d.displayName === undefined ? {} : { displayName: d.displayName }),
@@ -30021,6 +29978,7 @@ class JobWriter {
             updatedAt: now,
             finishedAt: now,
             error: reason,
+            reason: status === 'failed' ? reason.split(' · ')[0] : null,
             jobStatus: status === 'canceled' ? 'cancelled' : 'malformed',
         };
         this.manifest = manifest;
@@ -30322,8 +30280,7 @@ function reconcileOrphan(repo, jobId, now = Date.now()) {
                 updatedAt: result.finishedAt, finishedAt: result.finishedAt,
                 startedAt: manifest.startedAt ?? result.startedAt, exitCode: result.exitCode,
                 conversation: recoveredConversation(result) ?? manifest.conversation,
-                error: verdict.reason === null ? result.error ?? null
-                    : appendBounded(`${verdict.reason} — `, result.error ?? '', 1_200),
+                ...failureFields(verdict, result),
                 deniedActions: (result.deniedActions ?? []).map(({ action, displayName, nonfatal }) => ({
                     ...(action === undefined ? {} : { action }),
                     ...(displayName === undefined ? {} : { displayName }),
@@ -30338,7 +30295,8 @@ function reconcileOrphan(repo, jobId, now = Date.now()) {
         }
         const at = new Date(now).toISOString();
         writeJsonAtomic(file, {
-            ...manifest, status: verdict.status, error: verdict.reason, jobStatus: 'orphaned',
+            ...manifest, status: verdict.status, error: verdict.reason,
+            reason: verdict.status === 'failed' ? REASONS.serverStopped : null, jobStatus: 'orphaned',
             updatedAt: at, finishedAt: at,
         });
         settleAcceptance(repo, jobId, at);
@@ -30353,7 +30311,7 @@ function settleAcceptance(repo, jobId, at) {
     if ('pending' in acceptance && acceptance.pending === true) {
         writeAcceptance(repo, jobId, {
             state: 'rejected', checks: [], at, pending: false,
-            reason: 'supervisor exited; acceptance checks not run',
+            reason: 'server stopped; checks not run',
         });
     }
 }
@@ -30690,15 +30648,15 @@ class ForgeService {
         const workerId = request.workerId ?? jobId;
         const canonicalConflict = findActiveIdentity(this.repo, name, workerId);
         if (canonicalConflict !== null) {
-            throw new Error(`worker identity already has an active job (${canonicalConflict.jobId}); wait for it to finish or call cancel.`);
+            throw new Error(`"${name}" is busy (${canonicalConflict.jobId}); wait, cancel, or use another name.`);
         }
         for (const { writer } of this.live.values()) {
             const active = writer.snapshot();
             if (active?.workerId === workerId) {
-                throw new Error(`worker "${workerId}" already has an active job (${active.jobId}); wait for it to finish or call cancel.`);
+                throw new Error(`"${name}" is busy (${active.jobId}); wait, cancel, or use another name.`);
             }
             if (active?.name === name) {
-                throw new Error(`worker name "${name}" already has an active job (${active.jobId}); wait for it, call cancel, or pick another name.`);
+                throw new Error(`"${name}" is busy (${active.jobId}); wait, cancel, or use another name.`);
             }
         }
         const writer = new JobWriter({
@@ -30740,7 +30698,7 @@ class ForgeService {
             request.onPrepared?.(jobId);
         }
         catch (error) {
-            writer.abort('failed', `Job preparation failed: ${String(error)}`);
+            writer.abort('failed', `setup failed · ${String(error)}`);
             throw error;
         }
         this.spawnedIds.add(jobId);
@@ -30755,10 +30713,7 @@ class ForgeService {
             repo: this.repo,
             timeoutMs,
             unrestricted,
-            note: `queued ${provider.name}/${mode}` +
-                (request.model === undefined ? '' : ` model=${request.model}`) +
-                ` budget=${Math.round(timeoutMs / 1000)}s` +
-                (unrestricted ? '' : ' — approvals enforced; a tool that needs one will be denied'),
+            note: `queued · ${humanDuration(timeoutMs)} limit · ${unrestricted ? 'unrestricted' : 'approvals on'}`,
             sandbox,
             sandboxFlags,
             readOnlyRequested,
@@ -30816,7 +30771,7 @@ class ForgeService {
             // ENOENT, a bad cwd, a provider that refuses to spawn. The job exists and
             // is now `failed`, which is a fact the pane can draw — as opposed to a
             // rejected promise, which is a fact nothing can draw.
-            return (writer.abort('failed', `could not start ${provider.name}: ${describe(err)}`) ??
+            return (writer.abort('failed', `couldn't start · ${describe(err)}`) ??
                 writer.snapshot() ??
                 { jobId: spec.jobId });
         }
@@ -30848,7 +30803,7 @@ class ForgeService {
             return manifest;
         }
         catch (err) {
-            return (writer.abort('failed', `worker ended without a result: ${describe(err)}`) ??
+            return (writer.abort('failed', `crashed · ${describe(err)}`) ??
                 writer.snapshot() ??
                 { jobId: spec.jobId });
         }
@@ -30890,9 +30845,7 @@ class ForgeService {
                 jobId,
                 requested: true,
                 signalled: false,
-                note: 'cancel recorded, but this process has no live worker handle (the server ' +
-                    'restarted, or another process owns it). Only the running owner can signal ' +
-                    'the worker; without that owner, the job may remain marked running.',
+                note: 'Cancel recorded; no live worker here, so the job may stay running.',
             };
         }
         live.handle.cancel();
@@ -30900,7 +30853,7 @@ class ForgeService {
             jobId,
             requested: true,
             signalled: true,
-            note: 'cancel recorded and the worker process was signalled.',
+            note: 'Canceled.',
         };
     }
     /** Jobs the pane would draw. Ours by default; interop history on request. */
@@ -30975,6 +30928,7 @@ class ForgeService {
             conversation: typeof raw['conversation'] === 'string' ? raw['conversation'] : null,
             effort: typeof raw['effort'] === 'string' ? raw['effort'] : null,
             cwd: manifest?.cwd ?? null,
+            ...(manifest?.reason ? { reason: manifest.reason } : {}),
             ...(manifest === null
                 ? {}
                 : {
@@ -33128,7 +33082,7 @@ function parseSince(value, now = Date.now()) {
         return now - Number(rel[1]) * { s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000 }[rel[2].toLowerCase()];
     const at = Date.parse(value);
     if (Number.isNaN(at))
-        throw new Error(`since must be an ISO time (2026-10-11T09:00:00Z) or relative like 30m, 2h, 1d; got "${value}".`);
+        throw new Error(`since: use an ISO time or 30m, 2h, 1d; got "${value}".`);
     return at;
 }
 function lastActivity(a) {
@@ -33138,7 +33092,18 @@ function lastActivity(a) {
 function compact(o) {
     return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== null && v !== undefined));
 }
-const warningTexts = (ws) => [...new Set(ws.map(w => trimWords(w.message, 200)))];
+/** Warning texts, minus any that only repeat the error. */
+const warningTexts = (ws, error) => {
+    const e = error ? flat(error) : '';
+    return [...new Set(ws.map(w => flat(w.message)).filter(m => e === '' || !(e.includes(m) || m.includes(e))).map(m => trimWords(m, 200)))];
+};
+/** The short failure reason: the stored one, else derived from the long error. Failed jobs only. */
+function failedReason(d) {
+    if (d.status !== 'failed')
+        return null;
+    const stored = d.reason;
+    return stored ? stored : reasonFromText(d.error);
+}
 /** One compact row for list_jobs. */
 function conciseRow(j) {
     return compact({
@@ -33165,15 +33130,16 @@ function conciseStatus(d, acceptance, extra = {}) {
     const started = d.startedAt ? Date.parse(d.startedAt) : NaN;
     const ended = d.finishedAt ? Date.parse(d.finishedAt) : Date.now();
     const files = d.changedFiles ?? [];
+    const warnings = d.warnings.length ? warningTexts(d.warnings, d.error) : [];
     return compact({
         jobId: d.jobId, name: d.name, provider: d.provider, model: d.model, mode: d.mode, status: d.status, taskStatus: taskStatus(d.status),
         acceptance: checkVerdicts(acceptance),
         startedAt: d.startedAt, finishedAt: d.finishedAt, durationMs: Number.isNaN(started) ? null : Math.max(0, ended - started),
         toolCalls: d.toolCalls, lastActivity: lastActivity(d.lastActivity),
         changedFileCount: d.changedFiles ? files.length : null, changedFiles: files.length ? files.slice(0, CONCISE_FILES_CAP) : null,
-        changedFilesNote: files.length > CONCISE_FILES_CAP || d.changedFilesTruncated ? `Only the first ${Math.min(files.length, CONCISE_FILES_CAP)} listed; ${DETAIL_HINT} or include_diff for the rest.` : null,
-        nextAction: d.nextAction, error: d.error ? trimWords(d.error, 500) : null,
-        warnings: d.warnings.length ? warningTexts(d.warnings) : null,
+        changedFilesNote: files.length > CONCISE_FILES_CAP || d.changedFilesTruncated ? `First ${Math.min(files.length, CONCISE_FILES_CAP)} shown; ${DETAIL_HINT} or include_diff for all.` : null,
+        nextAction: d.nextAction, reason: failedReason(d), error: d.error ? trimWords(d.error, 500) : null,
+        warnings: warnings.length ? warnings : null,
         summary: summary && !report.includes(summary) ? trimWords(summary, 300) : null,
         report: report ? (cut ? `${report.slice(0, CONCISE_REPORT_CHARS)}\n…[truncated: ${CONCISE_REPORT_CHARS} of ${report.length} chars; ${DETAIL_HINT} for more]` : report) : null,
         reportTruncated: cut, ...extra,
@@ -33208,11 +33174,11 @@ function git(cwd, args) {
 async function jobDiff(d) {
     const head = d.gitBaseline?.head;
     if (!d.gitBaseline || !head || !d.cwd)
-        return { diff: null, diffNote: 'No git baseline was recorded for this job (its cwd was not a git repository with a commit at spawn), so no diff is available; inspect the files directly.' };
+        return { diff: null, diffNote: 'No diff: no git commit at spawn.' };
     if (!d.changedFiles)
-        return { diff: null, diffNote: d.status === 'running' ? 'changedFiles is computed when the job finishes; call status again after it completes.' : 'No changedFiles were recorded for this job, so there is nothing to diff.' };
+        return { diff: null, diffNote: d.status === 'running' ? 'No diff yet: files are listed when the job finishes.' : 'No diff: no changed files recorded.' };
     if (d.changedFiles.length === 0)
-        return { diff: '', diffNote: 'The job changed no files.' };
+        return { diff: '', diffNote: 'No files changed.' };
     try {
         const [tracked, untracked] = await Promise.all([
             git(d.cwd, ['diff', '--no-color', head, '--', ...d.changedFiles]),
@@ -33223,19 +33189,19 @@ async function jobDiff(d) {
         if (diff.length > DIFF_MAX_CHARS || tracked.clipped) {
             diff = diff.slice(0, DIFF_MAX_CHARS);
             diff = diff.slice(0, diff.lastIndexOf('\n') + 1);
-            notes.push(`Diff truncated at ${DIFF_MAX_CHARS} chars. See the rest with: git diff ${head} -- <file> (run in ${d.cwd}).`);
+            notes.push(`Diff cut at ${DIFF_MAX_CHARS} chars. Rest: git diff ${head} -- <file> in ${d.cwd}.`);
         }
         const added = untracked.out.split('\n').filter(Boolean);
         if (added.length)
-            notes.push(`New untracked files not shown in the diff: ${added.join(', ')}.`);
+            notes.push(`Untracked, not in diff: ${added.join(', ')}.`);
         // The diff is against HEAD, so a file already dirty at spawn carries edits the job did not make.
         const preDirty = d.changedFiles.filter(f => d.gitBaseline.dirty.includes(f));
         if (preDirty.length)
-            notes.push(`Already uncommitted when the job started, so their diff includes earlier edits: ${preDirty.join(', ')}.`);
+            notes.push(`Dirty before the job, so the diff includes earlier edits: ${preDirty.join(', ')}.`);
         return { diff, ...(notes.length ? { diffNote: notes.join(' ') } : {}) };
     }
     catch (err) {
-        return { diff: null, diffNote: `git diff failed in ${d.cwd}: ${trimWords(String(err), 200)}. Run git diff ${head} -- <file> yourself.` };
+        return { diff: null, diffNote: `git diff failed: ${trimWords(String(err), 200)}. Run git diff ${head} -- <file> yourself.` };
     }
 }
 // ── capabilities ─────────────────────────────────────────────────────────────
@@ -33296,7 +33262,7 @@ function conciseCapabilities(providers, only) {
             ...(p.defaultEffort ? { defaultEffort: p.defaultEffort } : {}),
             ...(efforts ? { efforts } : {}),
             ...(listed ? { models: rows } : { modelCount: rows.length, more: `pass provider: "${p.name}" to list its ${rows.length} models` }),
-            ...(p.verified === false ? { unverified: 'model list parsed from unconfirmed CLI output; prefer an explicit, known model' } : {}),
+            ...(p.verified === false ? { unverified: 'model list unconfirmed; prefer a known model' } : {}),
             ...(p.stale ? { stale: true } : {}),
             ...(p.error ? { error: p.error } : {}),
         };
@@ -33324,7 +33290,7 @@ const PROVIDERS = ['agy', 'codex', 'opencode', 'claude'];
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
 const string = { type: 'string', minLength: 1 };
 const FORMATS = ['concise', 'detailed'];
-const responseFormat = { type: 'string', enum: FORMATS, default: 'concise', description: 'concise (default): short, high-signal fields. detailed: the full record.' };
+const responseFormat = { type: 'string', enum: FORMATS, default: 'concise', description: 'concise (default) or detailed (full record).' };
 /** Long enough for a paragraph of why; short enough that the pane can show the whole brief. */
 const MAX_CONTEXT_CHARS = 2_000;
 const contextSchema = { type: 'string', minLength: 1, maxLength: MAX_CONTEXT_CHARS, description: 'Why the work matters and who it is for. The worker sees it in its brief.' };
@@ -33510,7 +33476,7 @@ async function defaultMixedPipeline(input, catalogs) {
 }
 // ── completion notice hint ───────────────────────────────────────────────────
 const MONITOR_CAP_MS = 1_800_000;
-const NOTIFY_NOTE = 'Completion is announced automatically by the plugin (a turn from Agent Smith, or a hook notice); if you did not receive a completion notice (hook unavailable, e.g. headless -p or other clients), run this under the Monitor tool, re-arm on expiry, or use status wait_ms.';
+const NOTIFY_NOTE = 'Completion is announced. No notice? Run monitorCommand under Monitor, or status wait_ms.';
 /** monitor.js sits at dist/monitor.js; resolvable only when running from the built dist/. */
 function builtMonitorPath(moduleFile = fileURLToPath(import.meta.url)) {
     const marker = `${path.sep}dist${path.sep}surfaces${path.sep}channel${path.sep}src${path.sep}`;
@@ -33607,13 +33573,13 @@ function workingDirectory(args) {
     if (cwd === undefined)
         return undefined;
     if (!path.isAbsolute(cwd))
-        throw new Error(`cwd must be an absolute path (got "${cwd}"); pass a full path or omit cwd to use the default.`);
+        throw new Error(`cwd must be an absolute path (got "${cwd}").`);
     try {
         if (statSync(cwd).isDirectory())
             return cwd;
     }
     catch { /* report the same validation error for absent/inaccessible paths */ }
-    throw new Error(`cwd "${cwd}" does not exist or is not a directory; create it, pass another, or omit cwd to use the default.`);
+    throw new Error(`cwd "${cwd}" is not a directory.`);
 }
 function number(args, key, max = Number.MAX_SAFE_INTEGER) {
     const v = args[key];
@@ -33745,16 +33711,16 @@ async function callTool(ctx, name, rawArgs) {
                     const candidates = (await ctx.service.list({ limit: 500 })).filter(j => j.name === worker);
                     const identities = new Set(candidates.map(j => j.workerId));
                     if (candidates.length === 0)
-                        throw new Error(`No worker named "${worker}"; call list_jobs for names and job IDs.`);
+                        throw new Error(`No worker "${worker}"; see list_jobs.`);
                     if (identities.size !== 1)
-                        throw new Error(`Worker name "${worker}" matches ${identities.size} different workers; pass one job ID from list_jobs.`);
+                        throw new Error(`"${worker}" matches ${identities.size} workers; pass a job ID from list_jobs.`);
                     candidates.sort((a, b) => Date.parse(b.startedAt ?? b.updatedAt ?? '') - Date.parse(a.startedAt ?? a.updatedAt ?? ''));
                     detail = await ctx.service.detail(candidates[0].jobId);
                 }
                 if (detail.status === 'running')
-                    throw new Error(`Worker "${detail.name}" is still running; wait for its completion notice or call cancel.`);
+                    throw new Error(`"${detail.name}" is still running; wait or cancel.`);
                 if (!detail.conversation)
-                    throw new Error(`Worker "${detail.name}" has no resumable conversation (it may have failed before starting); start a fresh worker with spawn_job.`);
+                    throw new Error(`"${detail.name}" has no conversation to resume; use spawn_job.`);
                 const resumeModel = resolveRequest({ provider: detail.provider ?? undefined, model: text(args, 'model'), effort: allowed(args, 'effort', EFFORTS) }, loadModelConfig({ repo: ctx.service.repo }));
                 const prompt = text(args, 'prompt', true);
                 const cwd = workingDirectory(args) ?? detail.cwd ?? ctx.service.repo;
@@ -33808,7 +33774,7 @@ async function callTool(ctx, name, rawArgs) {
                 const runId = text(args, 'runId', true);
                 const r = readPipeline(ctx.service.repo, runId);
                 if (!r)
-                    throw new Error(`No pipeline run "${runId}"; use the runId returned by run_pipeline.`);
+                    throw new Error(`No pipeline run "${runId}".`);
                 return json(format(args) === 'concise' ? concisePipeline(r) : r);
             }
             case 'cancel': {

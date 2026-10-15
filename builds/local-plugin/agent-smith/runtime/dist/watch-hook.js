@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import path from'node:path';import {fileURLToPath}from'node:url';import {existsSync,realpathSync}from'node:fs';import {H as parseLaunch,I as claimMarkerPath}from'./chunk-poller.js';import {r as runJobWatch}from'./chunk-monitor.js';import'node:fs/promises';import'node:crypto';import'node:os';import'node:child_process';/**
+import path from'node:path';import {fileURLToPath}from'node:url';import {existsSync,realpathSync}from'node:fs';import {K as parseLaunch,L as claimMarkerPath}from'./chunk-poller.js';import {r as runJobWatch}from'./chunk-monitor.js';import'node:fs/promises';import'node:crypto';import'node:os';import'node:child_process';/**
  * PostToolUse (asyncRewake) hook entrypoint.
  *
  * Reads the hook JSON from stdin; for spawn_job / resume_job / run_pipeline it
@@ -54,7 +54,7 @@ async function runHook(stdin, write, options = {}, env = process.env) {
         // Exit 2 is the wake protocol, and the host labels it "Stop hook feedback".
         // This path runs only without the mod (which claims the job and announces it
         // itself), so say plainly that it is a notice, not an error.
-        write(lines.join('\n') + '\n(Agent Smith completion notice, delivered by hook: not an error.)\n');
+        write(lines.join('\n') + '\n(notice, not an error)\n');
         return 2;
     }
     catch {

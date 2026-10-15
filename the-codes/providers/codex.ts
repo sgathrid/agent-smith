@@ -115,6 +115,7 @@ import type { ListModelsOptions, ModelCatalog, ModelInfo, SandboxInfo } from './
 import { DEFAULT_DISCOVERY_TIMEOUT_MS, configDir, errMessage, readTextSafe, runCapture } from './discovery.ts';
 import type { RunFn } from './discovery.ts';
 import path from 'node:path';
+import { noResultText, stderrClause, timedOutText } from './failure-text.ts';
 
 export const CODEX_BINARY = process.env['AGENT_SMITH_CODEX_BIN'] ?? 'codex';
 
@@ -588,27 +589,21 @@ function buildResult(args: {
 
   if (exit.killReason === 'cancelled') {
     status = 'cancelled';
-    error = 'cancelled by operator';
+    error = 'canceled';
   } else if (exit.killReason === 'timeout') {
     status = 'timeout';
-    error = `exceeded the ${durationMs} ms budget and was killed`;
+    error = timedOutText(durationMs);
   } else if (!tx.sawTurnCompleted) {
     // The reachable case in practice is the untrusted-directory refusal, which
     // writes NOTHING to stdout and prints only to stderr. Guessing 'success'
     // here would be a lie.
     status = exit.code === 0 ? 'malformed' : 'error';
-    error =
-      `codex exited ${exit.code === null ? `on signal ${exit.signal ?? 'unknown'}` : `with code ${exit.code}`} ` +
-      'without a turn.completed event. Common causes: not a git repository ' +
-      '(we pass --skip-git-repo-check, so this usually means an older codex), ' +
-      'auth failure, or a codex output-format change. stderr tail: ' +
-      (exit.stderr.slice(0, 400) || '(empty)');
+    // Usual causes: an untrusted directory, an auth failure, or an output-format change.
+    error = noResultText(exit);
   } else if (exit.code !== 0) {
     // turn.completed arrived but the process still failed. Corroboration wins.
     status = 'error';
-    error = `codex reported turn.completed but exited with code ${exit.code}. stderr tail: ${
-      exit.stderr.slice(0, 400) || '(empty)'
-    }`;
+    error = `exited ${exit.code}${stderrClause(exit.stderr)}`;
   } else {
     status = 'success';
   }

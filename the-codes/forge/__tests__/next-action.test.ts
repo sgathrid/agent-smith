@@ -13,14 +13,14 @@ import type { JobResult } from '../../providers/types.js';
 const F = { status: 'failed' } as const;
 
 test('nextAction taxonomy', () => {
-  assert.match(nextActionFor({ ...F, error: 'x — network issue connecting to the server' }) ?? '', /^Transient/);
+  assert.match(nextActionFor({ ...F, error: 'x — network issue connecting to the server' }) ?? '', /^Network error/);
   assert.match(nextActionFor({ ...F, deniedCount: 1 }) ?? '', /unrestricted:true/);
   assert.match(nextActionFor({ ...F, jobStatus: 'timeout' }) ?? '', /timeoutMs/);
-  assert.match(nextActionFor({ ...F, error: 'worker reported success but delivered no usable output' }) ?? '', /no usable output/);
-  assert.match(nextActionFor({ ...F, exitCode: 0, report: '   ' }) ?? '', /no usable output/);
-  assert.doesNotMatch(nextActionFor({ ...F, exitCode: 0, report: 'hi' }) ?? '', /no usable output/);
-  assert.match(nextActionFor({ ...F, error: ORPHAN_REASON }) ?? '', /Supervisor exited/);
-  assert.match(nextActionFor({ status: 'canceled' }) ?? '', /Canceled by operator/);
+  assert.match(nextActionFor({ ...F, error: 'no output' }) ?? '', /^No output/);
+  assert.match(nextActionFor({ ...F, exitCode: 0, report: '   ' }) ?? '', /^No output/);
+  assert.doesNotMatch(nextActionFor({ ...F, exitCode: 0, report: 'hi' }) ?? '', /^No output/);
+  assert.match(nextActionFor({ ...F, error: ORPHAN_REASON }) ?? '', /^Server stopped/);
+  assert.equal(nextActionFor({ status: 'canceled' }), null);
   assert.match(nextActionFor({ ...F, error: 'boom', exitCode: 1 }) ?? '', /status\.error/);
   assert.equal(nextActionFor({ status: 'succeeded' }), null);
   assert.equal(nextActionFor({ status: 'running' }), null);
@@ -28,17 +28,17 @@ test('nextAction taxonomy', () => {
 
 test('provider setup and account failures do not suggest blind retries or broader permissions', () => {
   for (const error of ['authentication failed', '401 Unauthorized', 'invalid API key', 'refresh token expired']) {
-    assert.match(nextActionFor({ ...F, error })!, /restore the provider login or credentials/);
+    assert.match(nextActionFor({ ...F, error })!, /^Not logged in/);
   }
   for (const error of ['429 Too Many Requests', 'rate_limit exceeded']) {
-    assert.match(nextActionFor({ ...F, error })!, /retry window|reduce concurrent/);
+    assert.match(nextActionFor({ ...F, error })!, /^Rate limited/);
   }
-  assert.match(nextActionFor({ ...F, error: '429 insufficient_quota' })!, /quota or credits/);
+  assert.match(nextActionFor({ ...F, error: '429 insufficient_quota' })!, /^Out of credits/);
   for (const error of ["unknown option '--permission-prompts'", "unexpected argument '--standalone'", 'unknown model "old-model"']) {
-    assert.match(nextActionFor({ ...F, error })!, /doctor and list_capabilities/);
+    assert.match(nextActionFor({ ...F, error })!, /^Bad flag or model/);
   }
-  assert.match(nextActionFor({ ...F, error: 'spawn codex ENOENT' })!, /executable and working directory/);
-  assert.match(nextActionFor({ ...F, jobStatus: 'denied' })!, /authorization before retrying/);
+  assert.match(nextActionFor({ ...F, error: 'spawn codex ENOENT' })!, /^Couldn.t start/);
+  assert.match(nextActionFor({ ...F, jobStatus: 'denied' })!, /^Ask the user/);
   // Successful prose is not an execution diagnostic.
   assert.equal(nextActionFor({ status: 'succeeded', error: 'unauthorized rate limit' }), null);
 });

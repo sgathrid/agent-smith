@@ -49,6 +49,7 @@
  */
 
 import type { RadarJob, RadarStatus } from '../types/index.d.ts';
+import { REASONS, checksReason, reasonFromText } from './reasons.ts';
 
 // ── glyphs ──────────────────────────────────────────────────────────────────
 
@@ -364,36 +365,39 @@ export function ellipsis(s: string, max: number): string {
 }
 
 /**
- * A warning code → the shortest phrase that still says which failure it was.
- *
- * The code is the stable grouping key, so it is what a row shows. But the codes
- * are long: `suspicious_success` is 18 characters, and inside a 22-column band
- * detail cell `failed ∙ suspicious success` gets word-cut to `failed ∙ suspicious`,
- * which names a DIFFERENT thing than the code does — a truncated reason is worse
- * than no reason, because it reads as a reason.
- *
- * So the codes that appear on a status row get a short, exact form. Everything
- * else falls through to underscores-to-spaces, which is honest if long. Measured
- * against the corpus's three real codes (see ./jobs.ts's headline rule and the
- * agy_exit rows) plus the ones harness/types.ts documents.
+ * Why a job failed, in two to four words (reasons.ts is the one classifier).
+ * The recorded failure text wins; the first warning is the fallback, and its
+ * code names the legacy cases whose message is prose. '' when nothing is known.
  */
-function reason(code: string): string {
-  switch (code) {
-    // agy exited 0, delivered an empty result.md, and flagged it. THE headline
-    // rule: this is a failure wearing a success's clothes.
+export function failureWords(job: RadarJob): string {
+  const first = job.warnings[0];
+  const text = job.failureReason ?? first?.message ?? null;
+  if (text !== null && text.trim() !== '') {
+    const words = reasonFromText(text);
+    if (words !== REASONS.workerError) return words;
+  }
+  switch (first?.code ?? '') {
     case 'suspicious_success':
     case 'empty_output':
-      return 'no output';
-    // agy reported ERROR or a non-zero exit.
-    case 'tool_error':
-      return 'worker error';
-    case 'canceled':
-      return 'cancelled';
+      return REASONS.noOutput;
     case 'timeout':
-      return 'timed out';
+      return REASONS.timedOut;
+    case 'canceled':
+      return 'canceled';
+    case 'tool_error':
+      return REASONS.workerError;
+    case '':
+      break;
     default:
-      return code.replace(/_/g, ' ');
+      return (first?.code ?? '').replace(/_/g, ' ');
   }
+  if (job.acceptance?.state === 'rejected' && job.acceptance.checks.length > 0) return failedChecks(job);
+  return text !== null && text.trim() !== '' ? REASONS.workerError : '';
+}
+
+/** `checks failed: lint` from the failing check names. */
+export function failedChecks(job: RadarJob): string {
+  return checksReason((job.acceptance?.checks ?? []).filter((c) => !c.ok).map((c) => c.name));
 }
 
 // ── the detail cell ─────────────────────────────────────────────────────────
@@ -418,7 +422,7 @@ export function jobDetail(job: RadarJob, options: { tools?: boolean } = {}): str
     return outcome(job);
   }
   const parts: string[] = [];
-  if (job.status === 'attention') parts.push('needs you');
+  if (job.status === 'attention') parts.push('stalled');
   if (job.activity !== '') parts.push(job.activity);
   // Tool count is a liveness signal ONLY while the job is live, so `isTerminal`
   // has already excluded it above. HAZARD A still applies on top: agy-staff
@@ -429,33 +433,31 @@ export function jobDetail(job: RadarJob, options: { tools?: boolean } = {}): str
 }
 
 /**
- * The outcome word for a job that has stopped.
+ * The outcome for a job that has stopped: `done`, `done · warnings`,
+ * `failed · denied view_file`, `checks failed: lint`, `canceled`.
  *
- * `warnings: true` on a `succeeded` job becomes words ("finished, warnings"),
- * not a different glyph or a different colour. harness/normalize.ts is explicit
- * that a non-empty result with a warnings flag stays `succeeded`, and
- * TERMINAL-UI.md reserves red for real failures.
+ * Warnings on a `succeeded` job stay words, not a different glyph or colour:
+ * harness/normalize.ts is explicit that a non-empty result with a warnings flag
+ * stays `succeeded`, and TERMINAL-UI.md reserves red for real failures. A job
+ * whose checks failed is not done, whatever the worker said.
  */
 export function outcome(job: RadarJob): string {
   switch (job.status) {
     case 'running':
+      return '';
     case 'attention':
-      return job.status === 'attention' ? 'needs you' : '';
+      return 'stalled';
     case 'succeeded':
-      return job.warnings.length > 0 ? 'finished, warnings' : 'finished';
+      if (job.acceptance?.state === 'rejected' && !job.acceptance.pending && job.acceptance.checks.length > 0) return failedChecks(job);
+      return job.warnings.length > 0 ? `done ${SEP} warnings` : 'done';
     case 'failed': {
-      // The first warning code is the useful one and it is a stable string
-      // (suspicious_success, empty_output, tool_error, ...). Its MESSAGE is prose
-      // and is deliberately not used here.
-      const code = job.warnings[0]?.code;
-      return code === undefined || code === ''
-        ? 'failed'
-        : `failed ${SEP} ${reason(code)}`;
+      const why = failureWords(job);
+      return why === '' ? 'failed' : `failed ${SEP} ${why}`;
     }
     case 'canceled':
       return 'canceled';
     case 'unknown':
-      return 'no state yet';
+      return 'unknown';
   }
 }
 
@@ -639,14 +641,14 @@ export function formatHeaderLine(summary: {
   const shown = [
     { label: 'running', n: summary.running },
     { label: 'failed', n: summary.failed },
-    { label: 'finished', n: summary.finished },
-  ].filter((c) => c.n > 0 || c.label === 'finished');
+    { label: 'done', n: summary.finished },
+  ].filter((c) => c.n > 0 || c.label === 'done');
   const width = Math.max(2, ...shown.map((c) => String(c.n).length));
   return shown.map((c) => `${String(c.n).padStart(width)} ${c.label}`).join(` ${SEP} `);
 }
 
 /** The literal empty state. One line, no box, no spinner, no second line. */
-export const EMPTY_STATE = 'No jobs yet';
+export const EMPTY_STATE = 'No workers yet';
 
 // ── list ordering, and the header counts ─────────────────────────────────────
 //
@@ -660,7 +662,7 @@ export const EMPTY_STATE = 'No jobs yet';
  * The order the PANE draws its list:
  *
  *   0  running            live
- *   1  needs you          live, but gone quiet — directly under the working ones
+ *   1  stalled            live, but gone quiet — directly under the working ones
  *   2  failed             terminal, and the one terminal state to act on
  *   3  everything else    succeeded, canceled, unknown — newest first
  *

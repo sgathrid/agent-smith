@@ -37,7 +37,7 @@ test('canonical silence and orphan markers have distinct truthful outcomes', asy
   const orphan = (await readForgeJobs(memoryFs({ ...files, [`${base}/orphaned`]: '',
     [`${base}/acceptance.json`]: JSON.stringify({state:'unchecked',pending:true,checks:[]}) }), '/repo', now))[0];
   assert.equal(orphan?.status, 'failed');
-  assert.match(orphan?.failureReason ?? '', /orphaned/);
+  assert.equal(orphan?.failureReason, 'server stopped');
   assert.equal(orphan?.acceptance?.pending, false, 'an exited supervisor cannot run its pending checks');
   assert.equal(orphan?.acceptance?.state, 'unchecked');
 });
@@ -118,4 +118,13 @@ test('unreadable or malformed canonical state is not reported as an empty projec
   const fs = memoryFs({ [`${base}/job.json`]: '{}' });
   fs.list = async () => { throw new Error('permission denied'); };
   await assert.rejects(readForgeJobs(fs, '/repo', now), /permission denied/);
+});
+
+test('canonical: a job with a recorded short reason uses it; an old long error is classified on read', async () => {
+  const base = '/repo/.agent-smith/jobs/j1';
+  const read = async (extra: Record<string, unknown>) => (await readForgeJobs(memoryFs({
+    [`${base}/job.json`]: JSON.stringify({ status: 'failed', startedAt: '2026-01-01T00:00:00Z', ...extra }),
+  }), '/repo', Date.parse('2026-01-01T01:00:00Z')))[0];
+  assert.equal((await read({ reason: 'denied view_file', error: 'a very long text' }))?.failureReason, 'denied view_file');
+  assert.equal((await read({ error: 'worker soft-denied 1 tool action(s) (view_file) — exited 0' }))?.failureReason, 'worker soft-denied 1 tool action(s) (view_file) — exited 0');
 });

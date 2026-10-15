@@ -143,8 +143,8 @@ export async function cmdRun(args: RunArgs): Promise<number> {
     return EXIT.spawnFailed;
   }
   process.stdout.write(`${runId}\n`);
-  process.stderr.write(`agent-smith: ${spec.stages.length} stage(s) started in the background.\n  repo   ${repo}\n  state  ${path.dirname(recordPath)}\n  cancel agent-smith cancel ${runId}\n  status agent-smith status ${runId}\n`);
-  if (args.unrestricted === true) process.stderr.write('  safety --unrestricted: worker approval prompts are bypassed.\n');
+  process.stderr.write(`agent-smith: ${spec.stages.length} stages started.\n  repo   ${repo}\n  state  ${path.dirname(recordPath)}\n  cancel agent-smith cancel ${runId}\n  status agent-smith status ${runId}\n`);
+  if (args.unrestricted === true) process.stderr.write('  unrestricted: no approval prompts.\n');
   return EXIT.ok;
 }
 
@@ -444,7 +444,7 @@ export async function cmdSetup(args: SetupArgs = {}): Promise<number> {
     const targetRepo = path.resolve(args.repo ?? process.cwd());
     if (!existsSync(targetRepo)) throw new UsageError(`repository path does not exist: ${targetRepo}`);
     const settingsFile = configureLocalClaudeSettings(targetRepo);
-    process.stdout.write(`Agent Smith enabled in ${settingsFile}\nStart Claude from ${targetRepo} with: claude\n\n`);
+    process.stdout.write(`Agent Smith enabled in ${settingsFile}\nRun claude from ${targetRepo}.\n\n`);
     return cmdDoctor();
   }
   // Never default to this checkout: a project-scope install would commit an
@@ -701,14 +701,14 @@ export async function cmdUninstall(args: UninstallArgs = {}): Promise<number> {
   const stillLive = await settleLiveWork(targetRepo, args.settleMs ?? UNINSTALL_SETTLE_MS);
   if (stillLive.jobs.length > 0) {
     process.stderr.write(
-      `agent-smith: ${stillLive.jobs.length} job(s) still running after cancel: ${stillLive.jobs.join(', ')}.\n` +
-      'Their owning Claude session must be open to stop them. Close that session or wait, then run uninstall again. Nothing was removed.\n');
+      `agent-smith: still running after cancel: ${stillLive.jobs.join(', ')}.\n` +
+      'Close their Claude session or wait, then run uninstall again. Nothing was removed.\n');
     return EXIT.failed;
   }
   // With no live worker left, a run still marked running is most likely an
   // orphan whose owner exited; it cannot be told apart from one between stages.
   if (stillLive.pipelines.length > 0) {
-    process.stderr.write(`agent-smith: pipeline run(s) still marked running, treated as orphaned: ${stillLive.pipelines.join(', ')}.\n`);
+    process.stderr.write(`agent-smith: runs still marked running, treated as orphaned: ${stillLive.pipelines.join(', ')}.\n`);
   }
 
   if (!localOnly) {
@@ -748,16 +748,16 @@ export async function cmdUninstall(args: UninstallArgs = {}): Promise<number> {
   }
 
   if (actions.length === 0) {
-    process.stdout.write('Agent Smith: nothing to remove (already clean).\n');
+    process.stdout.write('Nothing to remove.\n');
   } else {
     for (const line of actions) process.stdout.write(`✓ ${line}\n`);
-    process.stdout.write('Agent Smith uninstalled cleanly.\n');
+    process.stdout.write('Agent Smith removed.\n');
   }
   return EXIT.ok;
 }
 
 export async function cmdDoctor(): Promise<number> {
-  process.stdout.write('agent-smith doctor — adapter feature compatibility\n\n');
+  process.stdout.write('agent-smith doctor\n\n');
   const rows = await detectAvailable();
   const compatibility = await Promise.all(rows.map(row => row.available
     ? checkCompatibility(row.name, row.binary) : Promise.resolve(null)));
@@ -773,7 +773,7 @@ export async function cmdDoctor(): Promise<number> {
   return any ? EXIT.ok : EXIT.failed;
 }
 
-export const USAGE = `agent-smith — forge for coding agents\n\n  agent-smith setup [--scope user|project|local] [--local] [--repo path] [--marketplace source]\n  agent-smith uninstall [--local] [--repo path] [--keep-jobs]\n  agent-smith run implement --prompt "…" [--name worker] [--repo path] [--cwd path]\n                            [--provider agy] [--model …] [--effort low] [--check "npm test"]\n  agent-smith run ./pipeline.yaml [--foreground]\n  agent-smith resume <jobId|worker-name> --prompt "…" [--repo path] [--cwd path]\n  agent-smith ls [--status running]\n  agent-smith status <runId|jobId>\n  agent-smith cancel <runId|jobId>\n  agent-smith gc [--older-than 14d] [--delete] [--dry-run] [--repo path]\n  agent-smith doctor\n\nWorkers run on this machine. They are restricted by default; --unrestricted bypasses provider approval prompts.\n`;
+export const USAGE = `agent-smith — run coding agents from Claude\n\n  agent-smith setup [--scope user|project|local] [--local] [--repo path] [--marketplace source]\n  agent-smith uninstall [--local] [--repo path] [--keep-jobs]\n  agent-smith run implement --prompt "…" [--name worker] [--repo path] [--cwd path]\n                            [--provider agy] [--model …] [--effort low] [--check "npm test"]\n  agent-smith run ./pipeline.yaml [--foreground]\n  agent-smith resume <jobId|worker-name> --prompt "…" [--repo path] [--cwd path]\n  agent-smith ls [--status running]\n  agent-smith status <runId|jobId>\n  agent-smith cancel <runId|jobId>\n  agent-smith gc [--older-than 14d] [--delete] [--dry-run] [--repo path]\n  agent-smith doctor\n\nWorkers run on this machine. They are restricted by default; --unrestricted bypasses provider approval prompts.\n`;
 
 class UsageError extends Error {}
 
