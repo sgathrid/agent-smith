@@ -345,7 +345,11 @@ test('a job with no status, no progress and no error log is unknown — honestly
 
 // ── the log ────────────────────────────────────────────────────────────────
 
-test('parseLog prefers worker-started over dispatch-registered', async () => {
+test('parseLog prefers worker-started over dispatch-registered', async (t) => {
+  if (!existsSync(CORPUS)) {
+    t.skip(`corpus not present at ${CORPUS}`);
+    return;
+  }
   // Dispatch is registration; worker start is the process coming up. The gap
   // between them is real time the job spent not working, so it is not elapsed.
   const real = readFileSync(path.join(CORPUS, 'implement-musm82da-f1dc1fe4.log'), 'utf8');
@@ -383,7 +387,11 @@ test('toolCountFromEvents takes the highest step_index, not a record count', () 
   assert.equal(toolCountFromEvents('{"event":"init"}'), null);
 });
 
-test('toolCountFromEvents reads a real events.jsonl', () => {
+test('toolCountFromEvents reads a real events.jsonl', (t) => {
+  if (!existsSync(CORPUS)) {
+    t.skip(`corpus not present at ${CORPUS}`);
+    return;
+  }
   const real = readFileSync(path.join(CORPUS, 'implement-musm82da-f1dc1fe4.events.jsonl'), 'utf8');
   const count = toolCountFromEvents(real);
   assert.ok(count !== null && count > 100, `expected a real count, got ${count}`);
@@ -411,7 +419,11 @@ test('activity comes from the newest step, not the last array position', async (
   assert.equal(job?.activity, 'editing new.rs');
 });
 
-test('activity reads a REAL progress.json input_preview', () => {
+test('activity reads a REAL progress.json input_preview', (t) => {
+  if (!existsSync(CORPUS)) {
+    t.skip(`corpus not present at ${CORPUS}`);
+    return;
+  }
   // Verbatim shapes from the corpus, so a change in agy-staff's tool vocabulary
   // shows up here rather than as a band full of `using run_command`.
   const fs = fsFromDir(path.join(FIXTURES, 'agy-running'));
@@ -587,6 +599,10 @@ test('the tool history keeps DONE records only, and the newest N', async () => {
 });
 
 test('tool history is capped at 200 and read from a real events.jsonl', async (t) => {
+  if (!existsSync(CORPUS)) {
+    t.skip(`corpus not present at ${CORPUS}`);
+    return;
+  }
   const fs = fsFromCorpus(CORPUS, '/corpus');
   const id = 'implement-muro9n3j-56a13226';
   if (!fs.files.has(`${jobsDir('/corpus')}/${id}.events.jsonl`)) {
