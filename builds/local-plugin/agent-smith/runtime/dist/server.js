@@ -29019,23 +29019,28 @@ function unwrapShell(command) {
 }
 const TEST_RE = /\b(?:pytest|jest|vitest|mocha|tox|nox|rspec|phpunit|ctest|unittest)\b|\b(?:cargo|go|npm|pnpm|yarn|bun|deno|dotnet|mvn|gradle|swift|mix)\s+(?:run\s+)?(?:test|nextest|verify)\b|\bmake\s+(?:test|check)\b|\bnode\s+--test\b/;
 const SEARCH_PROGS = new Set(['grep', 'rg', 'ag', 'ack', 'find', 'fd']);
+/** Steps that prepare a shell rather than do the work. */
+const SETUP_PROGS = new Set(['cd', 'pushd', 'popd', 'export', 'unset', 'source', '.', 'set', 'ulimit']);
 const READ_PROGS = new Set(['cat', 'sed', 'head', 'tail', 'nl', 'less', 'ls', 'tree', 'wc']);
 function classifyCommand(raw) {
     // A leading `!` negates the exit status; it is not the program.
     const command = unwrapShell(raw).replace(/\s+/g, ' ').trim().replace(/^!\s*/, '');
-    const first = command.split(/\s*(?:&&|\|\||;|\|)\s*/)[0] ?? command;
-    const words = first.split(' ').filter((w) => w !== '' && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(w));
+    const segments = command.split(/\s*(?:&&|\|\||;|\|)\s*/).filter((s) => s !== '');
+    const program = (segment) => segment.split(' ').filter((w) => w !== '' && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(w));
+    // `unset VIRTUAL_ENV; uv run pytest`: the setup step is not what the command does.
+    const first = segments.find((s) => !SETUP_PROGS.has(basename(program(s)[0] ?? ''))) ?? segments[0] ?? command;
+    const words = program(first);
     const prog = basename(words[0] ?? '');
     const sub = subcommand(words);
     if (prog === 'git' && sub === 'grep')
         return { kind: 'search', label: 'git grep' };
     if (SEARCH_PROGS.has(prog))
-        return { kind: 'search', label: humanCommand(command) };
+        return { kind: 'search', label: humanCommand(first) };
     if (READ_PROGS.has(prog))
-        return { kind: 'read', label: humanCommand(command) };
+        return { kind: 'read', label: humanCommand(first) };
     if (TEST_RE.test(command))
         return { kind: 'test', label: 'running tests' };
-    return { kind: 'command', label: humanCommand(command) };
+    return { kind: 'command', label: humanCommand(first) };
 }
 /** Global options that take a value, so `git -C dir grep` finds `grep`, not `dir`. */
 const VALUE_OPTIONS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace']);

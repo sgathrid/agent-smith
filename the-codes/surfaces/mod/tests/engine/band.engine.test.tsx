@@ -579,6 +579,9 @@ test('a running worker with a progress digest shows what it is doing and what it
   expect(await pane.find({type:'Text',text:/^Editing · 21 files read · 14 searches · 2 commands · 59 tool calls$/})).toBeDefined();
   expect(await pane.find({type:'Text',text:/^Edited: config\.py, loader\.py, test_config\.py$/})).toBeDefined();
   expect(await pane.find({type:'Text',text:/^Tests: ran 2 times · last run failed$/})).toBeDefined();
+  // Tool rows read as plain actions, not the tool name and its raw JSON input.
+  const toolRow = await pane.find({key:'event-1'}) as { props?: Record<string,unknown> } | undefined;
+  expect(String(toolRow?.props?.label)).toBe('› reading');
 });
 
 test('/forge opens the focused session list; /forge pane is the same list; /forge all adds the repository', async ($, on) => {
