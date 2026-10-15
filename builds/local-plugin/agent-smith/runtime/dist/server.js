@@ -29018,16 +29018,32 @@ function classifyCommand(raw) {
     // A leading `!` negates the exit status; it is not the program.
     const command = unwrapShell(raw).replace(/\s+/g, ' ').trim().replace(/^!\s*/, '');
     const first = command.split(/\s*(?:&&|\|\||;|\|)\s*/)[0] ?? command;
-    const words = first.split(' ').filter((w) => w !== '' && !/^[A-Z_]+=/.test(w));
+    const words = first.split(' ').filter((w) => w !== '' && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(w));
     const prog = basename(words[0] ?? '');
-    const sub = words.find((w, i) => i > 0 && !w.startsWith('-')) ?? '';
-    if (SEARCH_PROGS.has(prog) || (prog === 'git' && sub === 'grep'))
+    const sub = subcommand(words);
+    if (prog === 'git' && sub === 'grep')
+        return { kind: 'search', label: 'git grep' };
+    if (SEARCH_PROGS.has(prog))
         return { kind: 'search', label: humanCommand(command) };
     if (READ_PROGS.has(prog))
         return { kind: 'read', label: humanCommand(command) };
     if (TEST_RE.test(command))
         return { kind: 'test', label: 'running tests' };
     return { kind: 'command', label: humanCommand(command) };
+}
+/** Global options that take a value, so `git -C dir grep` finds `grep`, not `dir`. */
+const VALUE_OPTIONS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace']);
+function subcommand(words) {
+    for (let i = 1; i < words.length; i += 1) {
+        const w = words[i];
+        if (VALUE_OPTIONS.has(w)) {
+            i += 1;
+            continue;
+        }
+        if (!w.startsWith('-'))
+            return w;
+    }
+    return '';
 }
 function firstString(params, keys, raw = '') {
     for (const k of keys) {
@@ -29094,6 +29110,8 @@ class ProgressTracker {
     read = new Set();
     editedSet = new Set();
     edited = [];
+    /** Edits whose file the tool did not name (codex file_change's shape is unverified): still edits. */
+    unnamedEdits = 0;
     searches = 0;
     commands = 0;
     testRuns = 0;
@@ -29124,6 +29142,8 @@ class ProgressTracker {
                     this.editedSet.add(c.path);
                     this.edited.push(c.path);
                 }
+                else
+                    this.unnamedEdits += 1;
                 break;
             case 'test':
                 this.testRuns += 1;
@@ -29164,7 +29184,7 @@ class ProgressTracker {
             filesRead: this.read.size,
             searches: this.searches,
             edited: this.edited.slice(-8).map(relative),
-            editedCount: this.editedSet.size,
+            editedCount: this.editedSet.size + this.unnamedEdits,
             commands: this.commands,
             testRuns: this.testRuns,
             lastTestFailed: this.lastTestFailed,

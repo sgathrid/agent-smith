@@ -109,3 +109,19 @@ test('the band label column shrinks to the names on screen and the detail takes 
   assert.ok(fit.label + fit.detail + 10 <= 117);
   assert.deepEqual(fitBandColumns(117, 200).label, base.label);
 });
+
+test('git global options and lowercase env prefixes do not hide the subcommand', () => {
+  assert.deepEqual([classify('run_command', J({ CommandLine: 'git -C pkg grep -n load_config' })).kind, classify('run_command', J({ CommandLine: 'git -C pkg grep -n x' })).label], ['search', 'git grep']);
+  assert.equal(classify('Bash', J({ command: 'node_env=test pytest -q' })).kind, 'test');
+  assert.equal(classify('Bash', J({ command: 'FOO=1 rg needle' })).kind, 'search');
+});
+
+test('an edit whose file is not named still counts as an edit', () => {
+  const t = new ProgressTracker();
+  run(t, 1, 'file_change', { items: [{ file: '/w/a.rs' }] });
+  const d = t.digest('/w');
+  assert.equal(d.editedCount, 1);
+  assert.deepEqual(d.edited, []);
+  assert.match(progressPhrase(d, 'editing files'), /1 file edited/);
+  assert.ok(progressLines(d, 1).includes('Edited: 1 file'));
+});
