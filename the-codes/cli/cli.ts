@@ -220,7 +220,11 @@ function printRunSummary(run: PipelineRun): void {
   process.stdout.write(`\npipeline ${run.status}\n`);
   for (const [name, result] of Object.entries(run.outcomes)) {
     process.stdout.write(`  ${result.status === 'passed' ? '✓' : result.status === 'skipped' ? '·' : '✗'} ${name}: ${result.status} (${Math.round(result.durationMs / 1000)}s)\n`);
-    if (result.failure !== undefined) process.stdout.write(`    ${result.failure.code}: ${result.failure.message}\n`);
+    if (result.failure !== undefined) {
+      const { code, message } = result.failure;
+      // Short reasons already lead with the code ("denied RunCommand"); don't say it twice.
+      process.stdout.write(`    ${message.toLowerCase().startsWith(code.toLowerCase()) ? message : `${code}: ${message}`}\n`);
+    }
   }
 }
 

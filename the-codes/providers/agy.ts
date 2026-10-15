@@ -55,6 +55,9 @@
  *   (2) tool_info.error.type === 'TOOL_ERROR' whose message mentions a
  *       permission check failure or denial            -> 'denied'.  [early signal]
  *   (3) status !== 'SUCCESS'                        -> 'error'.
+ *       Unless agy delivered a non-empty response and the error is stale
+ *       (no error_message step in this run, or later steps succeeded):
+ *       then 'success' with a warning notice.
  *   (4) status === 'SUCCESS' AND response.trim() === '' AND no usage beyond the
  *       preamble -> still 'denied'/'error', never 'success'. [last-resort net]
  *
@@ -154,6 +157,8 @@ interface AgyStepUpdate {
   tool_name?: string;
   tool_info?: AgyToolInfo;
   text_delta?: string;
+  error?: string;
+  message?: string;
   duration_seconds?: number;
   usage?: AgyUsage;
 }
@@ -363,10 +368,57 @@ interface StepMemory {
   startedAt?: string;
 }
 
+const ERROR_STEP_MESSAGE_MAX_CHARS = 200;
+
+function boundErrorText(text: string): string {
+  if (text.length <= ERROR_STEP_MESSAGE_MAX_CHARS) return text;
+  return truncate(text, ERROR_STEP_MESSAGE_MAX_CHARS - 1).text;
+}
+
+/** An agy error on one line, without a leading "Error:", bounded to ~200 chars. */
+export function formatErrorStepMessage(raw: string): string {
+  const cleaned = raw.replace(/\s+/g, ' ').trim().replace(/^error:\s*/i, '');
+  return cleaned === '' ? 'agy error' : boundErrorText(cleaned);
+}
+
+/**
+ * Format a recovered/stale result.error into a short, plain, lowercase warning.
+ * Example: "Error: API error (attempt 3): RESOURCE_EXHAUSTED (code 429): ..."
+ *       -> "recovered: 429 resource exhausted"
+ */
+export function formatRecoveredWarning(rawError: string | undefined): string {
+  if (rawError === undefined || rawError.trim() === '') {
+    return 'recovered: worker error';
+  }
+  const codeMatch = rawError.match(/\b([A-Z][A-Z0-9_]+)\s*\(code\s+(\d+)\)/i);
+  if (codeMatch !== null) {
+    const status = codeMatch[1]!.toLowerCase().replace(/_/g, ' ');
+    const code = codeMatch[2]!;
+    return boundErrorText(`recovered: ${code} ${status}`);
+  }
+  const cleaned = rawError
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^error:\s*/i, '')
+    .replace(/\.\s+(?:this can happen|please try again)\b.*$/i, '')
+    .replace(/\.$/, '')
+    .replace(/\b([A-Z0-9]+(?:_[A-Z0-9]+)+)\b/g, (m) => m.toLowerCase().replace(/_/g, ' '))
+    .toLowerCase()
+    .trim();
+  if (cleaned === '') return 'recovered: worker error';
+  return boundErrorText(`recovered: ${cleaned}`);
+}
+
 export function createAgyTranslator(maxChars: number) {
   const steps = new Map<number, StepMemory>();
   /** Set by any denial signal; carried into JobResult. */
   const denials: DeniedAction[] = [];
+  // agy's final status repeats the conversation's last error, even one it
+  // recovered from or one from an earlier run. Stale: none this run, or work
+  // succeeded after it.
+  let sawErrorStep = false;
+  let progressedAfterError = false;
+  const errorIsStale = (): boolean => !sawErrorStep || progressedAfterError;
 
   function noteDenial(raw: unknown): void {
     denials.push(raw as DeniedAction);
@@ -407,6 +459,9 @@ export function createAgyTranslator(maxChars: number) {
       // --- agent prose / thinking --------------------------------------------
       if (stepType === 'agent_response') {
         const delta = su.text_delta;
+        if (state !== 'ERROR' && ((delta !== undefined && delta !== '') || state === 'DONE')) {
+          progressedAfterError = true;
+        }
         if (delta !== undefined && delta !== '') {
           // agy streams prose as many small text_delta slices. We forward each
           // one rather than buffering: the mod surface renders incrementally and
@@ -447,6 +502,8 @@ export function createAgyTranslator(maxChars: number) {
             displayName: toolName,
             raw: { stepIndex, error: info?.error },
           });
+        } else if (state === 'DONE') {
+          progressedAfterError = true;
         }
         const output = preview(info?.output ?? info?.error?.message, maxChars);
         const ref: ActivityRef = { stepIndex, tool: toolName };
@@ -469,13 +526,11 @@ export function createAgyTranslator(maxChars: number) {
 
       // --- error_message: agy's own API/transport errors ----------------------
       if (stepType === 'error_message') {
-        out.push({
-          kind: 'notice',
-          at,
-          level: 'error',
-          message: 'agy reported an error_message step (see events.jsonl for the record)',
-          raw: su,
-        });
+        sawErrorStep = true;
+        progressedAfterError = false;
+        // agy's stream carries no error text here; the final result does.
+        const text = su.error ?? su.message;
+        out.push({ kind: 'notice', at, level: 'error', message: formatErrorStepMessage(text ?? ''), raw: su });
         return out;
       }
 
@@ -495,8 +550,26 @@ export function createAgyTranslator(maxChars: number) {
     }
 
     if (event === 'result') {
-      // The result event itself is not a ProviderEvent. It becomes JobResult,
-      // which is built in the exit handler. Nothing to emit here.
+      const r = obj(raw, 'result') as AgyResultEvent | undefined;
+      if (r !== undefined) {
+        const hasDenials = denials.length > 0 || (r.denied_actions?.length ?? 0) > 0;
+        const response = r.response ?? '';
+        if (
+          r.status !== undefined &&
+          r.status !== 'SUCCESS' &&
+          !hasDenials &&
+          response.trim() !== '' &&
+          errorIsStale()
+        ) {
+          out.push({
+            kind: 'notice',
+            at,
+            level: 'warn',
+            message: formatRecoveredWarning(r.error),
+            raw: r,
+          });
+        }
+      }
       return out;
     }
 
@@ -509,6 +582,7 @@ export function createAgyTranslator(maxChars: number) {
     denials,
     toolCallCount: () => steps.size,
     stepsWereTools: (): boolean => [...steps.values()].some((m) => m.tool !== undefined),
+    errorIsStale,
   };
 }
 
@@ -531,8 +605,10 @@ export function buildResult(args: {
   stateDir: string;
   denials: DeniedAction[];
   sawAnyToolCall: boolean;
+  errorIsStale?: boolean;
 }): JobResult {
   const { jobId, resultEvent, exit, startedAtMs, stateDir, denials, sawAnyToolCall } = args;
+  const errorIsStale = args.errorIsStale ?? false;
   const finishedAt = nowIso();
   const durationMs = Date.now() - startedAtMs;
 
@@ -593,8 +669,12 @@ export function buildResult(args: {
     status = exit.code === 0 ? 'malformed' : 'error';
     error = noResultText(exit);
   } else if (reportedStatus !== 'SUCCESS') {
-    status = 'error';
-    error = resultEvent.error ?? 'worker error';
+    if (response.trim() !== '' && errorIsStale) {
+      status = 'success';
+    } else {
+      status = 'error';
+      error = resultEvent.error ?? 'worker error';
+    }
   } else if (response.trim() === '' && sawAnyToolCall) {
     // Paranoia net for (4) above. The model burned tokens and made tool calls
     // but produced no final text, with no explicit denial. That is a failure
@@ -750,7 +830,6 @@ export const agyProvider: Provider = {
         if (raw['event'] === 'result') {
           const r = obj(raw, 'result');
           if (r !== undefined) resultEvent = r as AgyResultEvent;
-          return;
         }
         publish(translator.onEvent(raw));
       },
@@ -792,6 +871,7 @@ export const agyProvider: Provider = {
         stateDir,
         denials: translator.denials,
         sawAnyToolCall: translator.stepsWereTools(),
+        errorIsStale: translator.errorIsStale(),
       });
       bus.close();
       writeResultFile(stateDir, final);

@@ -30,10 +30,19 @@ test('provider setup and account failures do not suggest blind retries or broade
   for (const error of ['authentication failed', '401 Unauthorized', 'invalid API key', 'refresh token expired']) {
     assert.match(nextActionFor({ ...F, error })!, /^Not logged in/);
   }
+  for (const error of [
+    'RESOURCE_EXHAUSTED: TPM quota exhausted. No spare capacity is currently available… Resource exhausted. Please try again later.',
+    '503 Service Unavailable',
+    '14 UNAVAILABLE: Service unavailable',
+    'overloaded',
+  ]) {
+    assert.equal(nextActionFor({ ...F, error }), 'Provider busy (temporary); resume_job to continue.');
+  }
   for (const error of ['429 Too Many Requests', 'rate_limit exceeded']) {
-    assert.match(nextActionFor({ ...F, error })!, /^Rate limited/);
+    assert.equal(nextActionFor({ ...F, error }), 'Rate limited; resume_job after a short wait.');
   }
   assert.match(nextActionFor({ ...F, error: '429 insufficient_quota' })!, /^Out of credits/);
+  assert.match(nextActionFor({ ...F, error: 'quota exhausted' })!, /^Out of credits/);
   for (const error of ["unknown option '--permission-prompts'", "unexpected argument '--standalone'", 'unknown model "old-model"']) {
     assert.match(nextActionFor({ ...F, error })!, /^Bad flag or model/);
   }

@@ -27,6 +27,10 @@ claude plugin install agent-smith --marketplace sgathrid/agent-smith
 
 Restart Claude Code after installing so the live UI band, native task projection, and completion hooks load.
 
+**Updating:** `claude plugin marketplace update agent-smith`, then `claude plugin update agent-smith@agent-smith`, then restart Claude Code.
+
+**Releasing (maintainers):** bump `version` in `the-codes/surfaces/mod/.claude-plugin/plugin.json` and `package.json` in every release, then `npm run build:plugin`. Claude Code caches the plugin by version, so an unchanged version is not picked up by `update`. Patch for fixes only (0.2.1), minor for new features or changed output (0.3.0).
+
 <details>
 <summary><strong>Local clone & single-repo setup</strong></summary>
 
