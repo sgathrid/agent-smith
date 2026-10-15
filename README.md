@@ -1,4 +1,4 @@
-# Agent Smith <picture><source media="(prefers-color-scheme: dark)" srcset="docs/logo-options/hairline-icon-shades-dark.svg" /><source media="(prefers-color-scheme: light)" srcset="docs/logo-options/smith-shades-opencode-shadow.svg" /><img alt="" src="docs/logo-options/smith-shades-opencode-shadow.svg" height="45" align="center" /></picture>
+# Agent Smith <picture><source media="(prefers-color-scheme: dark)" srcset="docs/logo-options/smith-shades-opencode-shadow.svg" /><source media="(prefers-color-scheme: light)" srcset="docs/logo-options/smith-shades-opencode-shadow.svg" /><img alt="" src="docs/logo-options/smith-shades-opencode-shadow.svg" height="45" align="center" /></picture>
 
 **Run `codex`, `agy`, and `opencode` as native sub-agents inside Claude Code.**
 
