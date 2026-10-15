@@ -253,25 +253,41 @@ test('gc rejects an --older-than value that is not an age', async () => {
   assert.match(err, /--older-than: '2 weeks' is not an age/);
 });
 
-test('setup --repo writes local Claude settings, migrates agent-smith-dev, and runs doctor', async () => {
-  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-setup-local-'));
-  const claudeDir = path.join(repo, '.claude');
-  mkdirSync(claudeDir, { recursive: true });
-  writeFileSync(path.join(claudeDir, 'settings.local.json'), JSON.stringify({
-    extraKnownMarketplaces: { 'agent-smith-dev': { source: { source: 'directory', path: '/old' } } },
-    enabledPlugins: { 'agent-smith@agent-smith-dev': true, 'other@mkt': true },
-  }));
+/** Setup ends with doctor, which needs one compatible worker CLI; CI runners have none. */
+function fakeWorkerOnPath(): () => void {
+  const dir = mkdtempSync(path.join(tmpdir(), 'agent-smith-fake-worker-'));
+  const bin = path.join(dir, 'opencode');
+  writeFileSync(bin, `#!${process.execPath}\nconsole.log(process.argv[2] === '--version' ? 'opencode 1.0.0' : '--standalone --format --model --auto --session');\n`);
+  chmodSync(bin, 0o755);
+  const previous = process.env['PATH'];
+  process.env['PATH'] = `${dir}${path.delimiter}${previous ?? ''}`;
+  return () => { process.env['PATH'] = previous; };
+}
 
-  const { code, out, err } = await captureMain(['setup', '--repo', repo]);
-  assert.equal(code, 0, err);
-  assert.match(out, /Agent Smith enabled in /);
-  assert.match(out, /agent-smith doctor/);
-  const settings = JSON.parse(readFileSync(path.join(claudeDir, 'settings.local.json'), 'utf8'));
-  assert.equal('agent-smith-dev' in settings.extraKnownMarketplaces, false);
-  assert.equal(settings.extraKnownMarketplaces['agent-smith'].source.source, 'directory');
-  assert.equal('agent-smith@agent-smith-dev' in settings.enabledPlugins, false);
-  assert.equal(settings.enabledPlugins['agent-smith@agent-smith'], true);
-  assert.equal(settings.enabledPlugins['other@mkt'], true);
+test('setup --repo writes local Claude settings, migrates agent-smith-dev, and runs doctor', async () => {
+  const restorePath = fakeWorkerOnPath();
+  try {
+    const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-setup-local-'));
+    const claudeDir = path.join(repo, '.claude');
+    mkdirSync(claudeDir, { recursive: true });
+    writeFileSync(path.join(claudeDir, 'settings.local.json'), JSON.stringify({
+      extraKnownMarketplaces: { 'agent-smith-dev': { source: { source: 'directory', path: '/old' } } },
+      enabledPlugins: { 'agent-smith@agent-smith-dev': true, 'other@mkt': true },
+    }));
+
+    const { code, out, err } = await captureMain(['setup', '--repo', repo]);
+    assert.equal(code, 0, err);
+    assert.match(out, /Agent Smith enabled in /);
+    assert.match(out, /agent-smith doctor/);
+    const settings = JSON.parse(readFileSync(path.join(claudeDir, 'settings.local.json'), 'utf8'));
+    assert.equal('agent-smith-dev' in settings.extraKnownMarketplaces, false);
+    assert.equal(settings.extraKnownMarketplaces['agent-smith'].source.source, 'directory');
+    assert.equal('agent-smith@agent-smith-dev' in settings.enabledPlugins, false);
+    assert.equal(settings.enabledPlugins['agent-smith@agent-smith'], true);
+    assert.equal(settings.enabledPlugins['other@mkt'], true);
+  } finally {
+    restorePath();
+  }
 });
 
 test('setup installs via claude plugin install at user scope by default and rejects bad scopes', async () => {
@@ -282,6 +298,7 @@ test('setup installs via claude plugin install at user scope by default and reje
   chmodSync(fakeClaude, 0o755);
   const prevClaude = process.env['AGENT_SMITH_CLAUDE_BIN'];
   process.env['AGENT_SMITH_CLAUDE_BIN'] = fakeClaude;
+  const restorePath = fakeWorkerOnPath();
   try {
     const { code, out, err } = await captureMain(['setup', '--marketplace', 'sgathrid/agent-smith']);
     assert.equal(code, 0, err);
@@ -300,6 +317,7 @@ test('setup installs via claude plugin install at user scope by default and reje
     assert.equal(bad.code, 1);
     assert.match(bad.err, /--scope must be user, project, or local/);
   } finally {
+    restorePath();
     if (prevClaude === undefined) delete process.env['AGENT_SMITH_CLAUDE_BIN'];
     else process.env['AGENT_SMITH_CLAUDE_BIN'] = prevClaude;
   }

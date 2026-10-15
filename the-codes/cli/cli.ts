@@ -567,29 +567,36 @@ function liveJobs(repo: string): string[] {
  * A cancel from this process is only a marker; the owning process must see it
  * and stop the worker. Removing state first would delete the marker unseen.
  */
-async function settleLiveWork(repo: string, timeoutMs: number): Promise<string[]> {
+async function settleLiveWork(repo: string, timeoutMs: number): Promise<{ jobs: string[]; pipelines: string[] }> {
   const deadline = Date.now() + timeoutMs;
-  let live = liveJobs(repo);
-  while (live.length > 0 && Date.now() < deadline) {
+  let jobs = liveJobs(repo);
+  let pipelines = runningPipelines(repo);
+  while ((jobs.length > 0 || pipelines.length > 0) && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 200));
-    live = liveJobs(repo);
+    jobs = liveJobs(repo);
+    pipelines = runningPipelines(repo);
   }
-  return live;
+  return { jobs, pipelines };
+}
+
+/** Pipeline runs still marked running. Records carry no owner PID, so an orphan looks the same. */
+function runningPipelines(repo: string): string[] {
+  const running: string[] = [];
+  try {
+    for (const name of readdirSync(path.join(repo, '.agent-smith', 'pipelines'))) {
+      if (!name.endsWith('.json')) continue;
+      const runId = name.slice(0, -'.json'.length);
+      try { if (readPipeline(repo, runId)?.status === 'running') running.push(runId); } catch { /* unreadable */ }
+    }
+  } catch { /* no pipelines dir */ }
+  return running;
 }
 
 /** Request cancellation of any live pipelines or jobs in `repo`. */
 function cancelLiveWorkInRepo(repo: string): void {
-  const pipelinesDir = path.join(repo, '.agent-smith', 'pipelines');
-  try {
-    for (const name of readdirSync(pipelinesDir)) {
-      if (!name.endsWith('.json')) continue;
-      const runId = name.slice(0, -'.json'.length);
-      try {
-        const rec = readPipeline(repo, runId);
-        if (rec?.status === 'running') cancelPipeline(repo, runId);
-      } catch { /* ignore */ }
-    }
-  } catch { /* no pipelines dir */ }
+  for (const runId of runningPipelines(repo)) {
+    try { cancelPipeline(repo, runId); } catch { /* ignore */ }
+  }
   try {
     const service = new ForgeService({ repo });
     for (const entry of readdirSync(jobsDir(repo), { withFileTypes: true })) {
@@ -692,11 +699,16 @@ export async function cmdUninstall(args: UninstallArgs = {}): Promise<number> {
 
   cancelLiveWorkInRepo(targetRepo);
   const stillLive = await settleLiveWork(targetRepo, args.settleMs ?? UNINSTALL_SETTLE_MS);
-  if (stillLive.length > 0) {
+  if (stillLive.jobs.length > 0) {
     process.stderr.write(
-      `agent-smith: ${stillLive.length} job(s) still running after cancel: ${stillLive.join(', ')}.\n` +
+      `agent-smith: ${stillLive.jobs.length} job(s) still running after cancel: ${stillLive.jobs.join(', ')}.\n` +
       'Their owning Claude session must be open to stop them. Close that session or wait, then run uninstall again. Nothing was removed.\n');
     return EXIT.failed;
+  }
+  // With no live worker left, a run still marked running is most likely an
+  // orphan whose owner exited; it cannot be told apart from one between stages.
+  if (stillLive.pipelines.length > 0) {
+    process.stderr.write(`agent-smith: pipeline run(s) still marked running, treated as orphaned: ${stillLive.pipelines.join(', ')}.\n`);
   }
 
   if (!localOnly) {
