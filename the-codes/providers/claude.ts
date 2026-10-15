@@ -654,7 +654,7 @@ export function buildResult(args: {
   // orchestrator must know some checks did not run (normalize.ts turns this
   // into a warning).
   if (tx.deniedTools.length > 0) {
-    out.deniedActions = tx.deniedTools.map((id) => ({ action: 'tool', displayName: id }));
+    out.deniedActions = tx.deniedTools.map((id) => ({ action: 'tool', displayName: id, nonfatal: true }));
   }
   if (tx.usage !== undefined) out.usage = tx.usage;
   const raw: Record<string, unknown> = {};

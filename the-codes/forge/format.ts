@@ -155,6 +155,8 @@ export interface ForgeActivity {
 export interface ForgeDenial {
   readonly action?: string | undefined;
   readonly displayName?: string | undefined;
+  /** The adapter judged the run delivered its report despite this denial. */
+  readonly nonfatal?: boolean | undefined;
 }
 
 /**
@@ -446,7 +448,8 @@ export interface StatusVerdict {
  *      state of its own — whatever the CLI managed to flush on the way down is
  *      not what happened to the task.
  *   2. deniedActions non-empty    ⇒ failed, suspicious. agy exited 0, said
- *      "SUCCESS", returned "" and did nothing. THE TRAP.
+ *      "SUCCESS", returned "" and did nothing. THE TRAP. Unless every denial
+ *      is nonfatal and a report was delivered: then succeeded, with a note.
  *   3. ok === false               ⇒ failed. The adapter already weighed exit
  *      code against the result event; we do not second-guess it.
  *   4. ok === true, report empty  ⇒ failed, suspicious. The net for every
@@ -474,10 +477,10 @@ export function deriveStatus(d: StatusDerivation): StatusVerdict {
   }
 
   const denials = d.deniedActions ?? [];
-  // Denials the provider itself marked non-fatal (action 'tool': a delivered report
-  // plus denied calls, e.g. a read-only reviewer that wanted a shell) do not fail
-  // the job. agy's soft-denials carry other actions and keep failing below.
-  if (denials.length > 0 && d.ok === true && !looksEmpty(d.report) && denials.every((x) => x.action === 'tool')) {
+  // Denials the adapter marked non-fatal (a delivered report plus denied calls,
+  // e.g. a reviewer that wanted a shell) do not fail the job, whatever the
+  // provider. `action: 'tool'` is the pre-flag claude encoding, still on disk.
+  if (denials.length > 0 && d.ok === true && !looksEmpty(d.report) && denials.every((x) => x.nonfatal === true || x.action === 'tool')) {
     return {
       status: 'succeeded',
       suspicious: false,

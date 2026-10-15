@@ -50,6 +50,8 @@
  * each fails in a different situation:
  *
  *   (1) result.denied_actions is non-empty  -> JobStatus 'denied'.  [primary]
+ *       Unless agy still finished with SUCCESS, exit 0 and a non-empty report:
+ *       then 'success' with the denials marked nonfatal, as claude does.
  *   (2) tool_info.error.type === 'TOOL_ERROR' whose message mentions a
  *       permission check failure or denial            -> 'denied'.  [early signal]
  *   (3) status !== 'SUCCESS'                        -> 'error'.
@@ -519,7 +521,7 @@ interface ExitInfo {
   stderr: string;
 }
 
-function buildResult(args: {
+export function buildResult(args: {
   jobId: string;
   resultEvent: AgyResultEvent | undefined;
   exit: ExitInfo;
@@ -567,9 +569,15 @@ function buildResult(args: {
   } else if (exit.killReason === 'timeout') {
     status = 'timeout';
     error = `exceeded the ${durationMs} ms budget and was killed`;
+  } else if (distinctDenials.length > 0 && reportedStatus === 'SUCCESS' && exit.code === 0 && response.trim() !== '') {
+    // Denied calls, but agy finished and delivered a report: a success with a
+    // warning, exactly as claude reports it. The forge verdict keeps the
+    // denials visible as a note; an empty report still falls to THE TRAP.
+    status = 'success';
+    for (const d of distinctDenials) d.nonfatal = true;
   } else if (distinctDenials.length > 0) {
-    // THE TRAP. exit code 0, status "SUCCESS" — and yet denied work is missing,
-    // usually with an empty response. Reported as a failure, loudly.
+    // THE TRAP. exit code 0, status "SUCCESS", empty response — and yet the
+    // job did nothing. Reported as a failure, loudly.
     status = 'denied';
     const names = distinctDenials
       .map((d) => d.displayName ?? d.action)
@@ -579,8 +587,8 @@ function buildResult(args: {
       `agy soft-denied ${distinctDenials.length} tool action(s)` +
       `${names !== '' ? ` (${names})` : ''}. ` +
       (response.trim() === ''
-        ? 'agy exited 0 with status "SUCCESS" and an empty response — this is NOT a success. '
-        : `agy exited 0 with a ${response.length}-char response, but the denied work may be missing from it. `) +
+        ? 'agy exited with an empty response — this is NOT a success. '
+        : `agy did not finish cleanly (status "${reportedStatus ?? 'none'}", exit ${exit.code ?? 'signal'}). `) +
       'Headless agy auto-denies tools it cannot prompt for unless run with ' +
       '--dangerously-skip-permissions; an explicit deny rule overrides that flag. ' +
       'stderr tail: ' + (exit.stderr.slice(0, 400) || '(empty)');
