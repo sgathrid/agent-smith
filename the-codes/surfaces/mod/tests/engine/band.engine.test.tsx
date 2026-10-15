@@ -538,6 +538,17 @@ const start = ($: any) => $.session.start({surface:'terminal',isInteractive:true
 /** Launch through the ack this session's Claude would get back. */
 const launch = ($: any, id: string, kind: 'job' | 'run' = 'job') => $.classic.PostToolUse(launched(id, '/work', kind));
 
+test('the band shows on the main thread only, not while viewing a subagent', async ($, on) => {
+  forgeHost(on, ada(), ['job-ada']);
+  await start($);
+  await launch($, 'job-ada');
+  const main = await $.ui.mount({plugin:'agent-smith',surface:'terminal',...BAND,props:{...BAND.props,view:{}}} as never);
+  expect(await main.find({key:'band-job-ada'})).toBeDefined();
+  const sub = await $.ui.mount({plugin:'agent-smith',surface:'terminal',...BAND,requestId:'forge-band-sub',props:{...BAND.props,view:{agentId:'agent-1'}}} as never);
+  expect(await sub.find({key:'band-job-ada'})).toBeUndefined();
+  expect(await sub.find({type:'Text',text:/REST-OF-BAND/})).toBeDefined();
+});
+
 test('a band row is a digit Button that opens the focused sidebar on that worker', async ($, on) => {
   const { host } = forgeHost(on, ada(), ['job-ada']);
   await start($);
