@@ -71,6 +71,9 @@ function reasonFromText(text) {
         return REASONS.workerError;
     if (ORPHAN_RE.test(t))
         return REASONS.serverStopped;
+    // Already a stored reason ("denied view_file +2"): keep it whole, count included.
+    if (/^denied(?: [^\n·]+)?$/.test(t) && t.length <= 64)
+        return t;
     if (DENIED_RE.test(t)) {
         // "soft-denied 2 tool action(s) (view_file, RunCommand)", "denied view_file", "denied: view_file"
         const named = /\(([^()]{2,})\)/.exec(t)?.[1] ?? /\bdenied:? ([A-Za-z_][^·\n]*)/i.exec(t)?.[1] ?? '';
@@ -988,9 +991,16 @@ function deniedNames(denials) {
  * What a failed finish stores: the full `error` (the adapter's own text, else the
  * verdict's reason; never both) and the short `reason`. Not failed: both null-ish.
  */
+/** Keep both ends of a long error: the cause leads, the stderr tail closes. */
+function elide(text, max) {
+    if (text.length <= max)
+        return text;
+    const head = Math.floor(max / 3);
+    return `${text.slice(0, head)} … ${text.slice(text.length - (max - head - 3))}`;
+}
 function failureFields(verdict, result, maxError = 1_200) {
     const adapterError = (result.error ?? '').trim();
-    const error = adapterError !== '' ? adapterError.slice(0, maxError) : verdict.reason;
+    const error = adapterError !== '' ? elide(adapterError, maxError) : verdict.reason;
     if (verdict.status !== 'failed')
         return { error, reason: null };
     const denials = result.deniedActions ?? [];
@@ -2427,7 +2437,8 @@ const smithNormalizer = (raw) => {
             message: `${deniedCount} ${deniedCount === 1 ? 'call' : 'calls'} denied`,
         });
     }
-    if (errorText !== null && deniedCount === 0) {
+    // The forge's error for a denial restates it ("denied view_file · …"); any other error still shows.
+    if (errorText !== null && !(deniedCount > 0 && /^denied\b/.test(errorText))) {
         warnings.push({ code: "tool_error", message: errorText });
     }
     for (const w of progressWarnings) {

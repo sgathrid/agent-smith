@@ -33,3 +33,8 @@ test('old prose maps to the same short reasons', () => {
   ];
   for (const [text, want] of cases) assert.equal(reasonFromText(text), want, text);
 });
+
+test('a stored reason keeps its count when read back', () => {
+  for (const stored of ['denied view_file +2', 'denied view_file', 'denied']) assert.equal(reasonFromText(stored), stored);
+  assert.equal(reasonFromText(deniedReason(['a', 'b', 'c'])), 'denied a +2');
+});

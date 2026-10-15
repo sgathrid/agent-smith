@@ -494,13 +494,20 @@ function deniedNames(denials: readonly ForgeDenial[]): string {
  * What a failed finish stores: the full `error` (the adapter's own text, else the
  * verdict's reason; never both) and the short `reason`. Not failed: both null-ish.
  */
+/** Keep both ends of a long error: the cause leads, the stderr tail closes. */
+function elide(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const head = Math.floor(max / 3);
+  return `${text.slice(0, head)} … ${text.slice(text.length - (max - head - 3))}`;
+}
+
 export function failureFields(
   verdict: StatusVerdict,
   result: { readonly status: string; readonly error?: string | undefined; readonly deniedActions?: readonly ForgeDenial[] | undefined },
   maxError = 1_200,
 ): { error: string | null; reason: string | null } {
   const adapterError = (result.error ?? '').trim();
-  const error = adapterError !== '' ? adapterError.slice(0, maxError) : verdict.reason;
+  const error = adapterError !== '' ? elide(adapterError, maxError) : verdict.reason;
   if (verdict.status !== 'failed') return { error, reason: null };
   const denials = result.deniedActions ?? [];
   const fatal = denials.length > 0 && verdict.reason !== null && DENIED_RE.test(verdict.reason);

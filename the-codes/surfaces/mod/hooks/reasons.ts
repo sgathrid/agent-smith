@@ -75,6 +75,8 @@ export function reasonFromText(text: string | null | undefined): string {
   const t = (text ?? '').trim();
   if (t === '') return REASONS.workerError;
   if (ORPHAN_RE.test(t)) return REASONS.serverStopped;
+  // Already a stored reason ("denied view_file +2"): keep it whole, count included.
+  if (/^denied(?: [^\n·]+)?$/.test(t) && t.length <= 64) return t;
   if (DENIED_RE.test(t)) {
     // "soft-denied 2 tool action(s) (view_file, RunCommand)", "denied view_file", "denied: view_file"
     const named = /\(([^()]{2,})\)/.exec(t)?.[1] ?? /\bdenied:? ([A-Za-z_][^·\n]*)/i.exec(t)?.[1] ?? '';

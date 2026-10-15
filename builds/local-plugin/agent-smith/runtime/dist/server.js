@@ -28229,6 +28229,8 @@ function buildResult(args) {
     const durationMs = Date.now() - startedAtMs;
     let status;
     let error;
+    // Event types the parser did not know: the clue when a run looks empty or broken.
+    const unrecognised = tx.unrecognised.size > 0 ? ` · unrecognised events: ${[...tx.unrecognised].join(', ')}` : '';
     if (exit.killReason === 'cancelled') {
         status = 'cancelled';
         error = 'canceled';
@@ -28242,7 +28244,7 @@ function buildResult(args) {
         // 402 exits 1 with an error event and no text, so this is the common path
         // for a misconfigured account.
         status = 'error';
-        error = `worker error${stderrClause(exit.stderr)}`;
+        error = `worker error${unrecognised}${stderrClause(exit.stderr)}`;
     }
     else if (tx.deniedNotices.length > 0) {
         // Same reasoning as agy: a denied tool means the work did not happen, and
@@ -28252,7 +28254,7 @@ function buildResult(args) {
     }
     else if (exit.code !== 0) {
         status = 'error';
-        error = `exited ${exit.code}${stderrClause(exit.stderr)}`;
+        error = `exited ${exit.code}${unrecognised}${stderrClause(exit.stderr)}`;
     }
     else if (tx.finalText.trim() === '') {
         // Exited 0 with no text and no error event. Do not call that a success.
@@ -28262,7 +28264,7 @@ function buildResult(args) {
         // Most likely an event-shape gap in the adapter, not an empty model reply:
         // check events.jsonl and extend the parser.
         status = 'malformed';
-        error = `no output${stderrClause(exit.stderr)}`;
+        error = `no output${unrecognised}${stderrClause(exit.stderr)}`;
     }
     else {
         status = 'success';

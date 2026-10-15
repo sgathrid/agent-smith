@@ -707,3 +707,23 @@ test('abort stores the short reason before the detail', () => {
   assert.equal(m.reason, "couldn't start");
   assert.equal(m.error, "couldn't start · ENOENT");
 });
+
+test('a long error keeps its cause and its stderr tail', async () => {
+  const { failureFields } = await import('../format.ts');
+  const error = `denied view_file · stderr: ${'x'.repeat(2_000)}THE-END`;
+  const { error: kept, reason } = failureFields({ status: 'failed', suspicious: true, reason: 'denied view_file' },
+    { status: 'denied', error, deniedActions: [{ action: 'view_file' }] });
+  assert.equal(reason, 'denied view_file');
+  assert.ok(kept!.length <= 1_200);
+  assert.ok(kept!.startsWith('denied view_file'));
+  assert.ok(kept!.endsWith('THE-END'));
+});
+
+test('an unrelated error still shows beside a denial warning', async () => {
+  const r = repo(); const w = start(r);
+  w.finish(result({ ok: false, status: 'error', error: 'exited 3, no result', deniedActions: [{ action: 'command', displayName: 'RunCommand' }] }), '');
+  const observed = normalize((await new AgentSmithReader().read(r, w.jobId))!);
+  const messages = observed.warnings.map((x) => x.message);
+  assert.ok(messages.some((m) => /denied/.test(m)), messages.join(' | '));
+  assert.ok(messages.includes('exited 3, no result'), messages.join(' | '));
+});

@@ -371,7 +371,8 @@ const smithNormalizer: JobNormalizer = (raw: RawJobState): ObservedJob => {
     });
   }
 
-  if (errorText !== null && deniedCount === 0) {
+  // The forge's error for a denial restates it ("denied view_file · …"); any other error still shows.
+  if (errorText !== null && !(deniedCount > 0 && /^denied\b/.test(errorText))) {
     warnings.push({ code: "tool_error", message: errorText });
   }
 
