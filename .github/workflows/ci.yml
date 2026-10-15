@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            the-codes/surfaces/channel/package-lock.json
+      - run: npm ci
+      - run: npm --prefix the-codes/surfaces/channel ci
+      - run: npm run typecheck
+      - run: npm --prefix the-codes/surfaces/channel run typecheck
+      - run: npm test
+
+  plugin-build-fresh:
+    # The committed builds/local-plugin is what marketplace users install.
+    # Rebuild it and fail if it differs from the source.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            the-codes/surfaces/channel/package-lock.json
+      - run: npm ci
+      - run: npm --prefix the-codes/surfaces/channel ci
+      - run: npm run build:plugin
+      - name: Committed plugin build matches source
+        run: |
+          git add -N builds/
+          if ! git diff --exit-code --stat builds/; then
+            echo "::error::builds/local-plugin is stale. Run 'npm run build:plugin' and commit the result."
+            exit 1
+          fi

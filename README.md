@@ -37,7 +37,7 @@ npm install
 npm run build:plugin
 ```
 
-- **Install user-wide + run `doctor`:** `npx . setup` (or `node scripts/agent-smith.mjs setup`)
+- **Install user-wide + run `doctor`:** `npx . setup` (or `node scripts/agent-smith.mjs setup`). This installs from the published `sgathrid/agent-smith` marketplace; add `--marketplace .` to install this checkout's build instead.
 - **Enable for this checkout only** (writes `.claude/settings.local.json` with `agent-smith@agent-smith`, cleans up legacy `agent-smith-dev` entries, and never touches `~/.claude`):
   ```sh
   npm run setup:claude
@@ -49,7 +49,7 @@ npm run build:plugin
 - **Verify detected worker CLIs:** `node scripts/agent-smith.mjs doctor`
 - **Uninstall (leave zero trace):**
   - Inside Claude Code: `/plugin marketplace remove agent-smith` (removes the marketplace and uninstalls the plugin, mod, hooks, and MCP server)
-  - Full zero-trace cleanup (also purges `.agent-smith/`, mirrored `.agy-staff/jobs/` entries, `.claude/settings.local.json`, and cached plugin folders):
+  - Full zero-trace cleanup (also purges `.agent-smith/`, mirrored `.agy-staff/jobs/` entries, `.claude/settings.local.json`, and cached plugin folders). It cancels running workers first and removes nothing if they have not stopped within 15 seconds:
     ```sh
     node scripts/agent-smith.mjs uninstall
     ```

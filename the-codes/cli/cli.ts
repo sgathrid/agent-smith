@@ -10,12 +10,12 @@ import { fileURLToPath } from 'node:url';
 
 import { ForgeService, pipelineRecordPath } from '../forge/service.ts';
 import { writeJsonAtomic } from '../forge/atomic.ts';
-import { archivedJobsDir, FILES, isForgeJobId, jobFile, jobsDir } from '../forge/format.ts';
+import { archivedJobsDir, FILES, isForgeJobId, isPidAlive, jobFile, jobsDir } from '../forge/format.ts';
 import { MIRROR_MARKER, mirrorDir } from '../forge/mirror.ts';
 import { startPipeline, cancelPipeline, readPipeline } from '../forge/execute.ts';
 import type { PipelineRun, PipelineSpec, Stage } from '../pipeline/types.ts';
 import { checkCompatibility } from '../providers/compatibility.ts';
-import { detectAvailable, missingProviders } from '../providers/registry.ts';
+import { detectAvailable, missingProviders, providerNames } from '../providers/registry.ts';
 import { allLadders } from './ladders.ts';
 import { loadSpec, parseDuration, parseYaml, specFrom } from './spec.ts';
 
@@ -447,9 +447,9 @@ export async function cmdSetup(args: SetupArgs = {}): Promise<number> {
     process.stdout.write(`Agent Smith enabled in ${settingsFile}\nStart Claude from ${targetRepo} with: claude\n\n`);
     return cmdDoctor();
   }
-  const localBuilt = existsSync(path.join(CHECKOUT_ROOT, '.claude-plugin', 'marketplace.json')) &&
-    existsSync(path.join(CHECKOUT_ROOT, 'builds', 'local-plugin', 'agent-smith', '.claude-plugin', 'plugin.json'));
-  const marketplace = args.marketplace ?? (localBuilt ? CHECKOUT_ROOT : DEFAULT_MARKETPLACE);
+  // Never default to this checkout: a project-scope install would commit an
+  // absolute local path that no teammate can resolve. Use --local for dev.
+  const marketplace = args.marketplace ?? DEFAULT_MARKETPLACE;
   const claudeBin = process.env['AGENT_SMITH_CLAUDE_BIN'] || 'claude';
   const cwd = args.repo === undefined ? process.cwd() : path.resolve(args.repo);
   const result = spawnSync(claudeBin, ['plugin', 'install', 'agent-smith', '--marketplace', marketplace, '--scope', scope], {
@@ -473,7 +473,11 @@ export interface UninstallArgs {
   readonly repo?: string;
   readonly keepJobs?: boolean;
   readonly homeDir?: string;
+  /** How long to wait for cancelled workers to stop before giving up. */
+  readonly settleMs?: number;
 }
+
+const UNINSTALL_SETTLE_MS = 15_000;
 
 const MARKETPLACE_KEYS = ['agent-smith', 'agent-smith-dev'] as const;
 const PLUGIN_IDS = ['agent-smith@agent-smith', 'agent-smith@agent-smith-dev', 'agent-smith@inline'] as const;
@@ -500,11 +504,9 @@ function scrubClaudeSettingsFile(settingsFile: string): boolean {
     ['pluginConfigs', PLUGIN_IDS],
   ] as const) {
     const raw = settings[sectionKey];
-    if (typeof raw === 'object' && raw !== null && !Array.isArray(raw)) {
-      const copy = { ...(raw as Record<string, unknown>) };
-      for (const k of targetKeys) {
-        if (k in copy) { delete copy[k]; changed = true; }
-      }
+    if (isRecord(raw)) {
+      const copy = { ...raw };
+      if (deleteKeys(copy, targetKeys)) changed = true;
       if (Object.keys(copy).length === 0) delete settings[sectionKey];
       else settings[sectionKey] = copy;
     }
@@ -547,19 +549,54 @@ function scrubMirrorDir(repo: string): number {
   return removedJobs;
 }
 
-/** Cancel any live pipelines or jobs in `repo` before removing state. */
-function cancelLiveWorkInRepo(repo: string): void {
-  const pipelinesDir = path.join(repo, '.agent-smith', 'pipelines');
+/** Running jobs in `repo` whose owning process is still alive. */
+function liveJobs(repo: string): string[] {
+  const live: string[] = [];
   try {
-    for (const name of readdirSync(pipelinesDir)) {
+    for (const entry of readdirSync(jobsDir(repo), { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const job = readJobRecord(repo, entry.name);
+      const owner = job?.['ownerPid'];
+      if (job?.['status'] === 'running' && typeof owner === 'number' && isPidAlive(owner)) live.push(entry.name);
+    }
+  } catch { /* no jobs dir */ }
+  return live;
+}
+
+/**
+ * A cancel from this process is only a marker; the owning process must see it
+ * and stop the worker. Removing state first would delete the marker unseen.
+ */
+async function settleLiveWork(repo: string, timeoutMs: number): Promise<{ jobs: string[]; pipelines: string[] }> {
+  const deadline = Date.now() + timeoutMs;
+  let jobs = liveJobs(repo);
+  let pipelines = runningPipelines(repo);
+  while ((jobs.length > 0 || pipelines.length > 0) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    jobs = liveJobs(repo);
+    pipelines = runningPipelines(repo);
+  }
+  return { jobs, pipelines };
+}
+
+/** Pipeline runs still marked running. Records carry no owner PID, so an orphan looks the same. */
+function runningPipelines(repo: string): string[] {
+  const running: string[] = [];
+  try {
+    for (const name of readdirSync(path.join(repo, '.agent-smith', 'pipelines'))) {
       if (!name.endsWith('.json')) continue;
       const runId = name.slice(0, -'.json'.length);
-      try {
-        const rec = readPipeline(repo, runId);
-        if (rec?.status === 'running') cancelPipeline(repo, runId);
-      } catch { /* ignore */ }
+      try { if (readPipeline(repo, runId)?.status === 'running') running.push(runId); } catch { /* unreadable */ }
     }
   } catch { /* no pipelines dir */ }
+  return running;
+}
+
+/** Request cancellation of any live pipelines or jobs in `repo`. */
+function cancelLiveWorkInRepo(repo: string): void {
+  for (const runId of runningPipelines(repo)) {
+    try { cancelPipeline(repo, runId); } catch { /* ignore */ }
+  }
   try {
     const service = new ForgeService({ repo });
     for (const entry of readdirSync(jobsDir(repo), { withFileTypes: true })) {
@@ -591,37 +628,60 @@ function scrubClaudePluginsRoot(pluginsRoot: string): string[] {
       removed.push(target);
     }
   }
-  const knownFile = path.join(pluginsRoot, 'known_marketplaces.json');
-  if (existsSync(knownFile)) {
-    try {
-      const parsed = JSON.parse(readFileSync(knownFile, 'utf8')) as Record<string, unknown>;
-      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
-        let changed = false;
-        for (const key of MARKETPLACE_KEYS) {
-          if (key in parsed) { delete parsed[key]; changed = true; }
-        }
-        if (changed) writeFileSync(knownFile, `${JSON.stringify(parsed, null, 2)}\n`);
-      }
-    } catch { /* leave unreadable file alone */ }
+  scrubJsonKeys(path.join(pluginsRoot, 'known_marketplaces.json'), (json) => deleteKeys(json, MARKETPLACE_KEYS));
+  scrubJsonKeys(path.join(pluginsRoot, 'installed_plugins.json'), (json) => {
+    const plugins = json['plugins'];
+    const nested = isRecord(plugins) && deleteKeys(plugins, PLUGIN_IDS);
+    return deleteKeys(json, PLUGIN_IDS) || nested;
+  });
+  return removed;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Delete `keys` from `target` in place; true when any was present. */
+function deleteKeys(target: Record<string, unknown>, keys: readonly string[]): boolean {
+  let changed = false;
+  for (const key of keys) {
+    if (key in target) { delete target[key]; changed = true; }
   }
-  const installedFile = path.join(pluginsRoot, 'installed_plugins.json');
-  if (existsSync(installedFile)) {
-    try {
-      const parsed = JSON.parse(readFileSync(installedFile, 'utf8')) as Record<string, unknown>;
-      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
-        let changed = false;
-        for (const key of PLUGIN_IDS) {
-          if (key in parsed) { delete parsed[key]; changed = true; }
-        }
-        if (typeof parsed['plugins'] === 'object' && parsed['plugins'] !== null && !Array.isArray(parsed['plugins'])) {
-          const pluginsMap = parsed['plugins'] as Record<string, unknown>;
-          for (const key of PLUGIN_IDS) {
-            if (key in pluginsMap) { delete pluginsMap[key]; changed = true; }
-          }
-        }
-        if (changed) writeFileSync(installedFile, `${JSON.stringify(parsed, null, 2)}\n`);
+  return changed;
+}
+
+/** Rewrite a JSON object file when `mutate` reports a change; leave unreadable files alone. */
+function scrubJsonKeys(file: string, mutate: (json: Record<string, unknown>) => boolean): void {
+  if (!existsSync(file)) return;
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'));
+    if (isRecord(parsed) && mutate(parsed)) writeFileSync(file, `${JSON.stringify(parsed, null, 2)}\n`);
+  } catch { /* leave unreadable file alone */ }
+}
+
+/**
+ * Agent Smith's own state outside the repo. `~/.agent-smith` (or
+ * `$AGENT_SMITH_HOME/.agent-smith`) is ours entirely. AGENT_SMITH_STATE_DIR may
+ * point anywhere, so only the provider directories we write there are removed.
+ */
+function removeUserState(home: string): string[] {
+  const removed: string[] = [];
+  const userRoot = path.join(home, '.agent-smith');
+  if (existsSync(userRoot)) {
+    rmSync(userRoot, { recursive: true, force: true });
+    removed.push(userRoot);
+  }
+  const stateDir = process.env['AGENT_SMITH_STATE_DIR'];
+  if (stateDir) {
+    const root = path.resolve(stateDir);
+    for (const provider of providerNames()) {
+      const dir = path.join(root, provider);
+      if (existsSync(dir)) {
+        rmSync(dir, { recursive: true, force: true });
+        removed.push(dir);
       }
-    } catch { /* leave unreadable file alone */ }
+    }
+    removeEmptyDirIfPossible(root);
   }
   return removed;
 }
@@ -638,11 +698,23 @@ export async function cmdUninstall(args: UninstallArgs = {}): Promise<number> {
   const actions: string[] = [];
 
   cancelLiveWorkInRepo(targetRepo);
+  const stillLive = await settleLiveWork(targetRepo, args.settleMs ?? UNINSTALL_SETTLE_MS);
+  if (stillLive.jobs.length > 0) {
+    process.stderr.write(
+      `agent-smith: ${stillLive.jobs.length} job(s) still running after cancel: ${stillLive.jobs.join(', ')}.\n` +
+      'Their owning Claude session must be open to stop them. Close that session or wait, then run uninstall again. Nothing was removed.\n');
+    return EXIT.failed;
+  }
+  // With no live worker left, a run still marked running is most likely an
+  // orphan whose owner exited; it cannot be told apart from one between stages.
+  if (stillLive.pipelines.length > 0) {
+    process.stderr.write(`agent-smith: pipeline run(s) still marked running, treated as orphaned: ${stillLive.pipelines.join(', ')}.\n`);
+  }
 
   if (!localOnly) {
     const claudeBin = process.env['AGENT_SMITH_CLAUDE_BIN'] || 'claude';
     for (const mkt of MARKETPLACE_KEYS) {
-      spawnSync(claudeBin, ['plugin', ' uninstall', `agent-smith@${mkt}`].map((s) => s.trim()), { cwd: targetRepo, encoding: 'utf8', env: process.env });
+      spawnSync(claudeBin, ['plugin', 'uninstall', `agent-smith@${mkt}`], { cwd: targetRepo, encoding: 'utf8', env: process.env });
       spawnSync(claudeBin, ['plugin', 'marketplace', 'remove', mkt], { cwd: targetRepo, encoding: 'utf8', env: process.env });
     }
   }
@@ -670,13 +742,8 @@ export async function cmdUninstall(args: UninstallArgs = {}): Promise<number> {
     if (mirrored > 0) actions.push(`removed ${mirrored} mirrored job(s) from ${mirrorDir(targetRepo)}`);
 
     if (!localOnly) {
-      const userState = process.env['AGENT_SMITH_STATE_DIR']
-        ? path.resolve(process.env['AGENT_SMITH_STATE_DIR'])
-        : path.join(home, '.agent-smith');
-      if (existsSync(userState)) {
-        rmSync(userState, { recursive: true, force: true });
-        actions.push(`removed ${userState}`);
-      }
+      const agentHome = args.homeDir ?? process.env['AGENT_SMITH_HOME'] ?? home;
+      for (const dir of removeUserState(agentHome)) actions.push(`removed ${dir}`);
     }
   }
 
@@ -706,7 +773,7 @@ export async function cmdDoctor(): Promise<number> {
   return any ? EXIT.ok : EXIT.failed;
 }
 
-export const USAGE = `agent-smith — forge for coding agents\n\n  agent-smith setup [--scope user|project|local] [--local] [--repo path]\n  agent-smith uninstall [--local] [--repo path] [--keep-jobs]\n  agent-smith run implement --prompt "…" [--name worker] [--repo path] [--cwd path]\n                            [--provider agy] [--model …] [--effort low] [--check "npm test"]\n  agent-smith run ./pipeline.yaml [--foreground]\n  agent-smith resume <jobId|worker-name> --prompt "…" [--repo path] [--cwd path]\n  agent-smith ls [--status running]\n  agent-smith status <runId|jobId>\n  agent-smith cancel <runId|jobId>\n  agent-smith gc [--older-than 14d] [--delete] [--dry-run] [--repo path]\n  agent-smith doctor\n\nWorkers run on this machine. They are restricted by default; --unrestricted bypasses provider approval prompts.\n`;
+export const USAGE = `agent-smith — forge for coding agents\n\n  agent-smith setup [--scope user|project|local] [--local] [--repo path] [--marketplace source]\n  agent-smith uninstall [--local] [--repo path] [--keep-jobs]\n  agent-smith run implement --prompt "…" [--name worker] [--repo path] [--cwd path]\n                            [--provider agy] [--model …] [--effort low] [--check "npm test"]\n  agent-smith run ./pipeline.yaml [--foreground]\n  agent-smith resume <jobId|worker-name> --prompt "…" [--repo path] [--cwd path]\n  agent-smith ls [--status running]\n  agent-smith status <runId|jobId>\n  agent-smith cancel <runId|jobId>\n  agent-smith gc [--older-than 14d] [--delete] [--dry-run] [--repo path]\n  agent-smith doctor\n\nWorkers run on this machine. They are restricted by default; --unrestricted bypasses provider approval prompts.\n`;
 
 class UsageError extends Error {}
 

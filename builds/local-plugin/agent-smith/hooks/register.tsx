@@ -317,10 +317,10 @@ async function announce($: EngineInterface, repo: string, jobs: readonly RadarJo
     await update($, notices, (current) => [...result.owned, ...current.filter((c) => !seen.has(`${c.kind}:${c.id}`))]);
     if (result.notices.length === 0) return;
     // Resolves when the turn starts, which waits for the session to be idle.
-    // `asUser: true` omits the host's "The agent-smith plugin sent a message …
-    // This is how Claude Code surfaces a prompt a plugin submits between turns"
-    // wrapper while keeping `{ kind: 'plugin', name: 'agent-smith' }` origin.
-    void $.prompt.submit({ text: claudeText(result.notices), asUser: true }).catch(() => {});
+    // No `asUser`: the notice quotes worker-controlled text (reasons, errors),
+    // and the host's plugin wrapper is what tells Claude it is not the user's.
+    // The UserMessage render hook below keeps the transcript line short.
+    void $.prompt.submit({ text: claudeText(result.notices) }).catch(() => {});
   } finally {
     announcing = false;
   }
@@ -484,20 +484,15 @@ export function registerBand(on: Parameters<Register>[0]): void {
     return r;
   });
 
-  // When Claude reads a job or pipeline that has already settled via status /
-  // pipeline_status, retire its pending notice so we don't wake Claude a second time.
+  // When the main agent reads a job or pipeline that has already settled via
+  // status / pipeline_status, retire its pending notice so we don't wake Claude
+  // a second time. A subagent's read (agent_id set) is not seen by the main
+  // agent, so it keeps the notice. tool.call carries no agent identity, so it
+  // never retires: a duplicate notice is cheap, a lost one is not.
   on('classic.PostToolUse', { tool_name: STATUS_TOOL }, async ($, e, next) => {
-    const settled = parseSettledRead(e.tool_name, e.tool_response);
+    const settled = e.agent_id === undefined ? parseSettledRead(e.tool_name, e.tool_response) : null;
     if (settled !== null) await update($, notices, (owned) => unclaim(owned, settled)).catch(() => {});
     return next(e);
-  });
-  on('tool.call', { tool: STATUS_TOOL }, async ($, e, next) => {
-    const r = await next(e) as { result?: unknown; text?: unknown; deny?: string; isError?: boolean } | undefined;
-    if (r && r.deny === undefined && r.isError !== true) {
-      const settled = parseSettledRead(e.tool, r.result) ?? parseSettledRead(e.tool, r.text);
-      if (settled !== null) await update($, notices, (owned) => unclaim(owned, settled)).catch(() => {});
-    }
-    return r;
   });
 
   // Render our completion notices in the transcript as a single clean status

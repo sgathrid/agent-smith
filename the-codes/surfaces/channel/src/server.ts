@@ -160,7 +160,9 @@ const forge = new ForgeService({ repo: resolveCwd() });
 
 /** Send legacy Claude channel notifications through the selected SDK instance. */
 async function sendBatch(batch: Batch): Promise<void> {
-  if (batch.content === null || !channelServer) return;
+  if (batch.content === null) return;
+  // Throw rather than return: the poller remembers only batches whose send resolved.
+  if (!channelServer) throw new Error('channel server not ready');
   await channelServer.notification({
     method: 'notifications/claude/channel',
     params: {
@@ -197,18 +199,17 @@ serveStdio(({ era }) => {
   const server = createSmithServer({ service: forge }, {
     era, channel: CHANNEL_ENABLED, instructions: INSTRUCTIONS,
   });
-  if (era === 'legacy' && CHANNEL_ENABLED) channelServer = server;
+  if (era === 'legacy' && CHANNEL_ENABLED && !channelServer) {
+    channelServer = server;
+    // Poll only once a channel server exists. A batch polled before then has
+    // nowhere to go, yet the poller would remember it as announced. Deferred a
+    // tick so the opening response is written before any notification.
+    setImmediate(() => scheduleLoop(CWD, POLL_MS, sendBatch, (err) => {
+      process.stderr.write(`agy-watch: ${String(err)}\n`);
+    }));
+  }
   return server;
 }, { onerror: err => process.stderr.write(`agent-smith MCP: ${String(err)}\n`) });
-
-// Poll only AFTER the transport is live, so no notification is ever written into a
-// stream Claude Code is not yet reading. (On stdio that would be a malformed
-// frame, not merely a lost message.)
-if (CHANNEL_ENABLED) {
-  scheduleLoop(CWD, POLL_MS, sendBatch, (err) => {
-    process.stderr.write(`agy-watch: ${String(err)}\n`);
-  });
-}
 
 /**
  * Test seams.

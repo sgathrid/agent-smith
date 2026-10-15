@@ -27430,11 +27430,11 @@ function createCodexTranslator(maxChars) {
             // error. UNVERIFIED — see README.
             const error = obj(item, 'error');
             const denialReason = str(item, 'decision') ?? str(item, 'approval_status') ?? str(error, 'type');
-            const errorMessage = str(error, 'message')?.toLowerCase();
+            const messages = [str(error, 'message'), str(item, 'message')].filter((m) => m !== undefined).map((m) => m.toLowerCase());
             const denied = item['permission_denied'] === true || item['denied'] === true ||
-                itemStatus === 'denied' || itemStatus === 'rejected' ||
+                itemStatus === 'denied' || itemStatus === 'rejected' || itemStatus === 'declined' ||
                 (denialReason !== undefined && /^(?:denied|rejected|declined|approval_denied|permission_denied)$/i.test(denialReason)) ||
-                (errorMessage !== undefined && /(?:permission|approval).{0,50}(?:denied|rejected)|(?:denied|rejected).{0,50}(?:permission|approval)/.test(errorMessage));
+                messages.some((m) => /(?:permission|approval).{0,50}(?:denied|rejected)|(?:denied|rejected).{0,50}(?:permission|approval)|(?:rejected|declined) by (?:the )?user/.test(m));
             if (denied)
                 status = 'denied';
             const ref = { stepIndex: idx, tool };
@@ -33149,6 +33149,10 @@ function parseStages(raw) {
         return { name: text(s, 'name', true), agentName: text(s, 'agentName'), workerId: text(s, 'workerId'), conversation: text(s, 'conversation'), continues: text(s, 'continues'), provider: allowed(s, 'provider', PROVIDERS), model: text(s, 'model'), effort: allowed(s, 'effort', EFFORTS), prompt: text(s, 'prompt'), context: contextText(s), title: text(s, 'title'), role: text(s, 'role'), dependsOn, consumes, workDir: text(s, 'workDir'), resultPath: text(s, 'resultPath'), timeoutMs: number(s, 'timeoutMs'), routingPinned: boolean(s, 'routingPinned'), checks: parseChecks(s.checks) };
     }));
 }
+/** The full `status` view of one job; Tasks results reuse it. */
+function fullStatus(detail, acceptance) {
+    return { ...detail, taskStatus: taskStatus(detail.status), report: detail.report?.slice(0, REPORT_HEAD_CHARS) ?? null, reportTruncated: (detail.report?.length ?? 0) > REPORT_HEAD_CHARS, acceptance };
+}
 async function callTool(ctx, name, rawArgs) {
     try {
         const def = TOOL_DEFS.find(t => t.name === name);
@@ -33170,6 +33174,8 @@ async function callTool(ctx, name, rawArgs) {
                 const checks = parseChecks(args.checks);
                 let prepared = false;
                 const onPrepared = (jobId) => {
+                    // First: if it throws, the job is aborted and must not be left with checks pending.
+                    ctx.onJobPrepared?.(jobId);
                     prepared = true;
                     if (checks?.length) {
                         try {
@@ -33179,7 +33185,6 @@ async function callTool(ctx, name, rawArgs) {
                             process.stderr.write(`agent-smith acceptance ${jobId}: ${String(err)}\n`);
                         }
                     }
-                    ctx.onJobPrepared?.(jobId);
                 };
                 const request = { mode, prompt: text(args, 'prompt', true), context: contextText(args), checks, cwd: workingDirectory(args), name: text(args, 'name'), task: text(args, 'task'), provider, model: resolved.model, effort: resolved.effort, timeoutMs: number(args, 'timeoutMs'), conversation: text(args, 'conversation'), unrestricted: boolean(args, 'unrestricted'), onPrepared };
                 // After every argument is validated, so the user is never asked about a call that then fails.
@@ -33269,7 +33274,7 @@ async function callTool(ctx, name, rawArgs) {
                 const diff = wantDiff ? await jobDiff(detail) : {};
                 if (fmt === 'concise')
                     return structured({ ...conciseStatus(detail, acceptance, wait), ...diff });
-                return structured({ ...detail, taskStatus: taskStatus(detail.status), report: detail.report?.slice(0, REPORT_HEAD_CHARS) ?? null, reportTruncated: (detail.report?.length ?? 0) > REPORT_HEAD_CHARS, acceptance, ...wait, ...diff });
+                return structured({ ...fullStatus(detail, acceptance), ...wait, ...diff });
             }
             case 'pipeline_status': {
                 const runId = text(args, 'runId', true);
@@ -34038,13 +34043,7 @@ class ForgeTasks {
                         if (detail.status === 'canceled')
                             task = this.store.cancel(taskId);
                         else {
-                            const result = structured({
-                                ...detail,
-                                taskStatus: taskStatus(detail.status),
-                                report: detail.report?.slice(0, REPORT_HEAD_CHARS) ?? null,
-                                reportTruncated: (detail.report?.length ?? 0) > REPORT_HEAD_CHARS,
-                                acceptance,
-                            });
+                            const result = structured(fullStatus(detail, acceptance));
                             task = this.store.complete(taskId, { ...result, resultType: 'complete',
                                 isError: detail.status !== 'succeeded' || acceptance.state === 'rejected',
                                 _meta: { [TASK_RESULT_META]: true } });
@@ -34082,6 +34081,10 @@ class ForgeTasks {
         });
     }
 }/** Shared tool handlers, served by the SDK's modern/legacy stdio dispatcher. */
+// The SDK adds `content: []` to every tools/call result after our handler
+// returns, so a task handle can only be stripped here. `_wrapHandler` is
+// protected API: the SDK is pinned exactly, and tasks.test.ts fails if a bump
+// stops this override from running.
 class SmithServer extends Server {
     _wrapHandler(method, handler) {
         const wrapped = super._wrapHandler(method, handler);
@@ -34286,8 +34289,11 @@ let channelServer;
 const forge = new ForgeService({ repo: resolveCwd() });
 /** Send legacy Claude channel notifications through the selected SDK instance. */
 async function sendBatch(batch) {
-    if (batch.content === null || !channelServer)
+    if (batch.content === null)
         return;
+    // Throw rather than return: the poller remembers only batches whose send resolved.
+    if (!channelServer)
+        throw new Error('channel server not ready');
     await channelServer.notification({
         method: 'notifications/claude/channel',
         params: {
@@ -34324,15 +34330,14 @@ serveStdio(({ era }) => {
     const server = createSmithServer({ service: forge }, {
         era, channel: CHANNEL_ENABLED, instructions: INSTRUCTIONS,
     });
-    if (era === 'legacy' && CHANNEL_ENABLED)
+    if (era === 'legacy' && CHANNEL_ENABLED && !channelServer) {
         channelServer = server;
+        // Poll only once a channel server exists. A batch polled before then has
+        // nowhere to go, yet the poller would remember it as announced. Deferred a
+        // tick so the opening response is written before any notification.
+        setImmediate(() => scheduleLoop(CWD, POLL_MS, sendBatch, (err) => {
+            process.stderr.write(`agy-watch: ${String(err)}\n`);
+        }));
+    }
     return server;
 }, { onerror: err => process.stderr.write(`agent-smith MCP: ${String(err)}\n`) });
-// Poll only AFTER the transport is live, so no notification is ever written into a
-// stream Claude Code is not yet reading. (On stdio that would be a malformed
-// frame, not merely a lost message.)
-if (CHANNEL_ENABLED) {
-    scheduleLoop(CWD, POLL_MS, sendBatch, (err) => {
-        process.stderr.write(`agy-watch: ${String(err)}\n`);
-    });
-}

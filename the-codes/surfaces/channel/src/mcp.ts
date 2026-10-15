@@ -9,6 +9,10 @@ import { TOOL_DEFS, callTool, type HandlerContext } from './tools.ts';
 import { ForgeTasks, TASKS_EXTENSION_ID_V2 } from './tasks.ts';
 import { hasTaskClientCapabilityV2 } from '@modelcontextprotocol/ext-tasks/core/v2';
 
+// The SDK adds `content: []` to every tools/call result after our handler
+// returns, so a task handle can only be stripped here. `_wrapHandler` is
+// protected API: the SDK is pinned exactly, and tasks.test.ts fails if a bump
+// stops this override from running.
 class SmithServer extends Server {
   protected override _wrapHandler(
     method: string,
