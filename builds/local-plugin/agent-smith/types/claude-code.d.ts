@@ -242,6 +242,11 @@ declare module 'claude-code' {
        * (TERMINAL-UI.md §Timing: cap at 4, then `+N more`).
        */
       readonly maxRows?: number;
+      /**
+       * AbovePrompt: which transcript is on screen. `{}` on the main thread;
+       * `{ agentId }` while the person is viewing a subagent (Claude Code 2.1.300).
+       */
+      readonly view?: { readonly agentId?: string };
       readonly scroll?: { readonly offset: number; readonly bodyRows: number };
       readonly text?: string;
       readonly isExpanded?: boolean;

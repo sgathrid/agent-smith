@@ -527,6 +527,9 @@ export function registerBand(on: Parameters<Register>[0]): void {
     // A survey holds the band. Standing aside is not politeness: a survey is a
     // question being asked, and the band would push it off screen.
     if (e.props.hasSurvey) return rest;
+    // Viewing a subagent's transcript: the band belongs to the main thread.
+    // Claude Code sets `view.agentId` only then; switching back re-renders.
+    if (e.props.view?.agentId !== undefined) return rest;
 
     const error = await read($, readError);
     if (error) {
