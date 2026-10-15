@@ -4,7 +4,8 @@
  */
 import type { RadarJob, RadarStatus, ToolEntry, RadarAcceptance, ActivityEvent } from '../types/index.d.ts';
 import { toEpoch, type FsLike } from './jobs.ts';
-import { describeActivity } from './format.ts';
+import type { ProgressDigest } from '../types/index.d.ts';
+import { classify, progressPhrase } from './progress.ts';
 import { STALL_GRACE_MS } from './stale.ts';
 
 type RecordValue = Record<string, unknown>;
@@ -77,6 +78,8 @@ export async function readForgeJob(fs: FsLike, repo: string, id: string, now: nu
   const latest = latestActivity && typeof latestActivity.tool === 'string' ? latestActivity : recent;
   const resolved = record(m.resolved);
   const latestSummary = text(p?.latestSummary, m.latestSummary);
+  const progress = digest(p?.digest);
+  const now0 = latest ? classify(text(latest.tool) ?? '', text(latest.input)).label : '';
   return {
     id, name: text(m.name, resolved?.name, p?.name), workerId: text(m.workerId, resolved?.workerId, p?.workerId) ?? id,
     role: text(m.role, resolved?.role, p?.role, resolved?.mode, m.mode),
@@ -84,7 +87,8 @@ export async function readForgeJob(fs: FsLike, repo: string, id: string, now: nu
     lastEventAt: lastSeen, pipeline: text(m.pipeline), stage: text(m.stage), attempt: number(m.attempt),
     status, startedAt: toEpoch(text(m.startedAt, m.createdAt)), endedAt: toEpoch(text(m.finishedAt)) ?? (status === 'failed' && live ? lastSeen : null),
     toolCount: number(p?.toolCalls) ?? number(m.toolCalls),
-    activity: latest ? describeActivity(text(latest.tool) ?? '', text(latest.input) ?? '') : '',
+    activity: progress && (status === 'running' || status === 'attention') ? progressPhrase(progress, now0) : now0,
+    progress,
     task: text(m.task) ?? '', latestSummary,
     summarySource: (p?.summarySource ?? m.summarySource) === 'worker' && latestSummary !== null ? 'worker' : null,
     changedFileCount: Array.isArray(m.changedFiles) && m.changedFilesTruncated !== true ? m.changedFiles.length : null,
@@ -92,6 +96,21 @@ export async function readForgeJob(fs: FsLike, repo: string, id: string, now: nu
     warnings, report: null, reasoning: text(p?.latestText), raw: {},
   };
 }
+/** progress.json `digest`, accepted only when it has the shape the writer produces. */
+function digest(v: unknown): ProgressDigest | null {
+  const d = record(v);
+  if (d === null || typeof d.phase !== 'string' || !Array.isArray(d.edited)) return null;
+  const n = (k: string) => number(d[k]) ?? 0;
+  const repeat = record(d.repeat);
+  return {
+    phase: (['starting', 'exploring', 'editing', 'testing', 'running'].includes(d.phase) ? d.phase : 'running') as ProgressDigest['phase'],
+    filesRead: n('filesRead'), searches: n('searches'), commands: n('commands'), testRuns: n('testRuns'),
+    edited: d.edited.filter((e): e is string => typeof e === 'string'), editedCount: n('editedCount'),
+    lastTestFailed: d.lastTestFailed === true,
+    repeat: repeat && typeof repeat.label === 'string' && number(repeat.count) !== null ? { label: repeat.label, count: number(repeat.count)! } : null,
+  };
+}
+
 export async function readForgeJobs(fs: FsLike, repo: string, now: number): Promise<RadarJob[]> {
   const dir = `${repo.replace(/\/+$/, '')}/.agent-smith/jobs`;
   if (!await fs.exists(dir)) return [];

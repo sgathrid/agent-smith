@@ -3,7 +3,7 @@ import { atom, read, update } from 'claude-code';
 import type { EngineInterface, PostToolUseEvent, Register, UiRenderEvent } from 'claude-code';
 
 import type { RadarJob } from '../types/index.d.ts';
-import { isTerminal } from './format.ts';
+import { isTerminal, jobLabel } from './format.ts';
 import { findWorker, recordLaunch, scopeLine, sessionJobs, type Launched } from './dashboard.ts';
 import { renderList, renderWorker, type ViewActions, type ViewOptions } from './views.tsx';
 import type { ForgeDetail } from './canonical.ts';
@@ -547,11 +547,13 @@ export function registerBand(on: Parameters<Register>[0]): void {
     const { Box, Text, Button } = $.ui.resolve(e);
     // A plain Button draws `1: ` before its children, so the row is sized to the rest.
     const width = Math.max(1, e.props.bodyColumns - 3);
+    // Shrink the label column to the names on screen so the activity gets the room.
+    const longestLabel = Math.max(0, ...budget.rows.map((job) => jobLabel(job).length));
 
     return (
       <Box flexDirection="column">
         {budget.rows.map((job, i) => {
-          const line = buildLine(job, at, { colour: cfg.colour, width });
+          const line = buildLine(job, at, { colour: cfg.colour, width, longestLabel });
           const detail = job.acceptance?.pending && isTerminal(job.status) ? 'checks pending' :
             job.acceptance?.state === 'rejected' ? 'checks rejected' : line.detail;
           // A bare digit in an empty prompt presses a band Button without focusing

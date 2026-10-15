@@ -651,3 +651,22 @@ test('started conversation survives inside the progress coalescing window', () =
   w.onEvent({ kind: 'started', at: now(), conversationId: 'durable-conversation' });
   assert.equal(JSON.parse(readFileSync(jobFile(r, w.jobId, FILES.job), 'utf8')).conversation, 'durable-conversation');
 });
+
+test('progress.json carries a digest of what the worker has done', () => {
+  const r = repo();
+  const w = start(r);
+  const call = (step: number, tool: string, input: string, status: 'done' | 'error' = 'done') => {
+    w.onEvent({ kind: 'activity-start', at: now(), activity: { stepIndex: step, tool, input } } satisfies ProviderEvent);
+    w.onEvent({ kind: 'activity-end', at: now(), activity: { stepIndex: step, tool }, status } satisfies ProviderEvent);
+  };
+  call(1, 'view_file', JSON.stringify({ AbsolutePath: path.join(r, 'src', 'a.py') }));
+  call(2, 'replace_file_content', JSON.stringify({ TargetFile: path.join(r, 'src', 'a.py') }));
+  call(3, 'run_command', JSON.stringify({ CommandLine: 'pytest -q' }), 'error');
+  w.finish({ jobId: w.jobId, provider: 'fake', ok: true, status: 'success', exitCode: 0, signal: null, response: 'done',
+    durationMs: 1, startedAt: now(), finishedAt: now(), stateDir: r } as JobResult, 'done');
+  const p = JSON.parse(readFileSync(jobFile(r, w.jobId, FILES.progress), 'utf8')) as { digest: Record<string, unknown> };
+  assert.equal(p.digest.filesRead, 1);
+  assert.deepEqual(p.digest.edited, ['src/a.py'], 'paths are relative to the job cwd');
+  assert.equal(p.digest.testRuns, 1);
+  assert.equal(p.digest.lastTestFailed, true);
+});

@@ -91,6 +91,7 @@
  *     provider that does not report denials at all)
  */
 
+import type { ProgressDigest } from '../surfaces/mod/types/index.d.ts';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 
@@ -318,6 +319,8 @@ export interface ForgeProgress {
   readonly latestText: string | null;
   readonly toolCalls: number;
   readonly warnings: readonly string[];
+  /** What the worker has done so far, from its tool calls. */
+  readonly digest?: ProgressDigest;
 }
 
 export type ForgeViewEvent =
