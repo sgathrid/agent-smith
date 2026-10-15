@@ -25676,7 +25676,7 @@ function errMessage(e) {
  *
  *   (1) result.denied_actions is non-empty  -> JobStatus 'denied'.  [primary]
  *   (2) tool_info.error.type === 'TOOL_ERROR' whose message mentions a
- *       permission/denial                             -> 'denied'.  [early signal]
+ *       permission check failure or denial            -> 'denied'.  [early signal]
  *   (3) status !== 'SUCCESS'                        -> 'error'.
  *   (4) status === 'SUCCESS' AND response.trim() === '' AND no usage beyond the
  *       preamble -> still 'denied'/'error', never 'success'. [last-resort net]
@@ -25860,9 +25860,11 @@ function isDenialError(toolError) {
     if (toolError === undefined)
         return false;
     const hay = `${toolError.type ?? ''} ${toolError.message ?? ''}`.toLowerCase();
-    return (hay.includes('permission') ||
+    // Not a bare "permission": agy prefixes ordinary tool failures with its
+    // permission-declaration phase ("declaring permissions: ... no such file or
+    // directory"), and a missing file must not fail a finished job as denied.
+    return (hay.includes('permission check failed') ||
         hay.includes('denied') ||
-        hay.includes('user denied') ||
         hay.includes('not permitted'));
 }
 function createAgyTranslator(maxChars) {
@@ -26052,8 +26054,8 @@ function buildResult$3(args) {
         error = `exceeded the ${durationMs} ms budget and was killed`;
     }
     else if (distinctDenials.length > 0) {
-        // THE TRAP. exit code 0, status "SUCCESS", empty response — and yet the job
-        // did nothing. Reported as a failure, loudly.
+        // THE TRAP. exit code 0, status "SUCCESS" — and yet denied work is missing,
+        // usually with an empty response. Reported as a failure, loudly.
         status = 'denied';
         const names = distinctDenials
             .map((d) => d.displayName ?? d.action)
@@ -26062,9 +26064,11 @@ function buildResult$3(args) {
         error =
             `agy soft-denied ${distinctDenials.length} tool action(s)` +
                 `${names !== '' ? ` (${names})` : ''}. ` +
-                'agy exited 0 with status "SUCCESS" and an empty response — this is NOT a success. ' +
-                'The usual cause is running without --dangerously-skip-permissions in headless ' +
-                'mode, where agy cannot prompt and auto-denies instead. ' +
+                (response.trim() === ''
+                    ? 'agy exited 0 with status "SUCCESS" and an empty response — this is NOT a success. '
+                    : `agy exited 0 with a ${response.length}-char response, but the denied work may be missing from it. `) +
+                'Headless agy auto-denies tools it cannot prompt for unless run with ' +
+                '--dangerously-skip-permissions; an explicit deny rule overrides that flag. ' +
                 'stderr tail: ' + (exit.stderr.slice(0, 400) || '(empty)');
     }
     else if (resultEvent === undefined) {
