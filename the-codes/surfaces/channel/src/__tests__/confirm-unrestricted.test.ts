@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import type { ClientCapabilities, ElicitResult } from '@modelcontextprotocol/sdk/types.js';
+import type { ClientCapabilities, ElicitResult } from '@modelcontextprotocol/server';
 import { DECLINED_UNRESTRICTED, UNCONFIRMED_UNRESTRICTED, callTool, type HandlerContext } from '../tools.ts';
 
 // The prompt is the behaviour under test; an outer AGENT_SMITH_CONFIRM_UNRESTRICTED=0 would hide it (each test file runs in its own process).

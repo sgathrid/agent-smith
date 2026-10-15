@@ -88,8 +88,9 @@ manifest with no `result.json`, not canceled:
   2 x `DEFAULT_TIMEOUT_MS` = 90 minutes. Result: `failed`, suspicious, reason
   "supervisor process exited before the job finished (orphaned)". Readers are read-only.
   The service reconciles jobs at startup and before list/detail/state reads: a recorded
-  dead owner permits an atomic failed manifest with reason and finishedAt, and pending
-  acceptance settles as rejected. Live owners, terminal anchors and published results win.
+  dead owner permits recovery from a valid persisted result, including its report and
+  conversation handle. Missing or invalid results become failed orphan records; pending
+  acceptance settles as rejected without replaying checks. Live owners and terminal anchors win.
   PID-less legacy jobs retain the read-only fallback; their writer's death cannot be proven.
 - **Stale cancel**: if no orphan verdict, a `cancel` marker older than 60 s and no live
   `ownerPid` (in practice a manifest without `ownerPid`, since a dead pid is already an
@@ -103,10 +104,58 @@ The channel adds `attention` (a `running` job whose `updatedAt` is older than
 
 `nextActionFor` derives (never stores) an imperative for the orchestrator on
 `failed`/`canceled` jobs: canceled -> nothing to do; orphaned -> `resume_job` if it has a
-conversation handle else rerun; denied -> retry with `unrestricted:true` (or narrow the task
-if it already was); timeout -> raise `timeoutMs`/split; network-ish error -> retry once;
+conversation handle else rerun; denied -> use an approved path or ask authorization before
+retrying unrestricted; authentication/quota -> resolve the account problem; rate limit ->
+wait or reduce concurrency; incompatible arguments -> run `doctor` and check capabilities;
+timeout -> raise `timeoutMs`/split; network-ish error -> retry once;
 empty output -> ask via `resume_job`; otherwise read `error` and `warnings`. `null` for
 running/succeeded. Surfaced in `list_jobs` and `status`.
+
+## MCP Tasks (`io.modelcontextprotocol/tasks`)
+
+The MCP server (`surfaces/channel/src/mcp.ts`, `tasks.ts`, `task-store.ts`) provides an
+opt-in 2026-07-28 Tasks receiver (`AGENT_SMITH_TASKS=1`) over `ForgeService` for
+`spawn_job` and `resume_job`:
+
+1. **Negotiation and per-request gating**: `extensions['io.modelcontextprotocol/tasks']`
+   is advertised only on modern (`2026-07-28`) connections when `AGENT_SMITH_TASKS=1`
+   (or `options.tasks: true`). `spawn_job` and `resume_job` return a task handle
+   (`resultType: 'task'`) only when the incoming `tools/call` request also advertises
+   `extensions['io.modelcontextprotocol/tasks']` in `_meta['io.modelcontextprotocol/clientCapabilities']`.
+   Requests without that capability (and all other tools, including `run_pipeline`) use
+   the immediate tool-result path.
+2. **Pre-launch validation and MRTR approval**: argument validation and unrestricted
+   approval (`resultType: 'input_required'` with HMAC-bound `call` + resolved `prompt`)
+   settle before `ForgeService` prepares the job or allocates a task record. Declined or
+   invalid calls return ordinary `isError` tool results and never create a task.
+3. **Atomic persistence and crash recovery**: `ForgeService.spawnTracked` invokes
+   `onPrepared(jobId)` immediately after writing `job.json` (and `tools.ts` writes any
+   pending `acceptance.json` placeholder) before spawning the worker process.
+   `TaskStore` (`<repo>/.agent-smith/tasks/<taskId>.json`, 24 h default TTL, 1 000 record
+   cap) atomically links `taskId` -> `jobId` via hard-link publication. Terminal outcomes
+   are frozen once via `<taskId>.terminal` hard-link publication so concurrent writers,
+   repeated `tasks/get` polls, and server restarts return the identical terminal snapshot.
+4. **Completion, acceptance, and cancellation**: `tasks/get` reconciles through
+   `ForgeService.detail(jobId)` and `readAcceptance`. A task stays `working` until both
+   the worker exits and any acceptance checks finish (`pending !== true`). Completed tasks
+   return a `CallToolResult` (`resultType: 'complete'`, `_meta['io.agent-smith/task-result']: true`)
+   whose `structuredContent` carries the full `JobDetail` (including `report`, `acceptance`,
+   and `taskStatus`), with `isError: true` when the worker failed or acceptance was
+   rejected. `tasks/cancel` reconciles completion first (a finished worker wins the race),
+   records `cancellationRequestedAt`, and requests `ForgeService.cancel(jobId)`, keeping
+   task status `working` until the Forge job reaches `canceled`. Protocol-level `failed`
+   (`-32603`) is reserved for tasks whose linked Forge job is missing or unreadable.
+5. **Claude Code orchestrator status**: Claude Code 2.1.300 negotiates `2026-07-28` via
+   `server/discover` over stdio and ships a built-in 2026-07-28 Tasks client driver
+   (`CreateTaskResultSchema`, `driveMcpTask` polling `tasks/get`, `tasks/update`,
+   `tasks/cancel`), but gates advertising `extensions['io.modelcontextprotocol/tasks']`
+   behind its remote feature flag `tengu_glowing_lark` (default `false` in 2.1.300).
+   While that host flag is off, Claude Code strips `io.modelcontextprotocol/tasks` from
+   per-request `_meta['io.modelcontextprotocol/clientCapabilities']`, and Agent Smith
+   cleanly serves the immediate `SpawnAck` fallback.
+
+Track the [Tasks specification](https://tasks.extensions.modelcontextprotocol.io/specification/2026-07-28/tasks)
+and [official extension implementation](https://github.com/modelcontextprotocol/ext-tasks).
 
 ## Modes
 
@@ -273,10 +322,13 @@ Claude                MCP server (dist/server.js)      Claude Code hooks        
   the job's own `timeoutMs` + 60 s (from the ack; pipelines get the 6 h cap + 60 s); standalone
   `monitor.js` defaults to `DEFAULT_WATCH_TIMEOUT_MS` = 46 min. On timeout it emits "still
   running; check status <ids>" (exit 2 from the hook).
-- **Tasks-shaped handle**: acks also carry `taskHandle {taskId, status:'working', pollIntervalMs}` and
+- **Tasks-shaped handle and opt-in MCP Tasks**: acks carry `taskHandle {taskId, status:'working', pollIntervalMs}` and
   `status`/`list_jobs` add `taskStatus` (`views.ts` `taskStatus`), the MCP Tasks extension's
-  vocabulary, so a future Tasks adapter (once the SDK and Claude Code support it) is a
-  translation. `pollIntervalMs` is `poller.ts` `POLL_MS`.
+  vocabulary (`pollIntervalMs` is `poller.ts` `POLL_MS`). When `AGENT_SMITH_TASKS=1` is enabled and a
+  modern (`2026-07-28`) `spawn_job` or `resume_job` request advertises `io.modelcontextprotocol/tasks`,
+  the server returns a protocol `resultType: 'task'` handle (`tasks.ts`) and stamps
+  `_meta['io.agent-smith/task-result']: true` on the terminal result so `notice.ts` (`parseLaunch`)
+  never double-announces a Tasks-managed job.
 - **Fallback**: acks carry `notify {mode:'hook', note, monitorCommand?, monitorTimeoutMs?}`;
   `monitorCommand` (only when running from the built `dist/`) is `node .../monitor.js
   --job <id>|--run <id> --cwd <repo>`, to run under Claude's Monitor tool

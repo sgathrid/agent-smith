@@ -83,6 +83,21 @@ test('closed mode: blank and unknown modes throw a teaching error', async () => 
   }
 });
 
+test('protocol preparation persists after anchor and before worker launch; failure prevents execution', async () => {
+  const f = fakeProvider('fake');
+  const { service, repo } = svc(f);
+  let preparedId = '';
+  await assert.rejects(service.spawnJob({ mode: 'review', prompt: 'x', onPrepared(jobId) {
+    preparedId = jobId;
+    assert.equal(f.specs.length, 0);
+    const anchor = JSON.parse(readFileSync(path.join(repo, '.agent-smith/jobs', jobId, 'job.json'), 'utf8'));
+    assert.equal(anchor.jobId, jobId);
+    throw new Error('task store unavailable');
+  } }), /task store unavailable/);
+  assert.equal(f.specs.length, 0);
+  assert.equal((await service.detail(preparedId)).status, 'failed');
+});
+
 test('pipeline stages and resumes keep arbitrary modes, with no preset', async () => {
   const f = fakeProvider('fake');
   const { service } = svc(f);

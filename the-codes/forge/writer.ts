@@ -267,7 +267,13 @@ export class JobWriter {
     const at = event.at;
 
     if (event.kind === 'started') {
-      if (typeof event.conversationId === 'string') this.conversation = event.conversationId;
+      if (typeof event.conversationId === 'string' && event.conversationId.trim() !== '') {
+        this.conversation = event.conversationId;
+        this.manifest = { ...this.manifest, conversation: this.conversation };
+        // Resume identity must survive a supervisor crash even inside the
+        // progress coalescing window, before finish() can publish it.
+        this.writeManifest();
+      }
       if (typeof event.model === 'string' && this.manifest.model === null) {
         // Provider-reported (structured event, never worker text) beats "unknown"/harness-config guesses.
         this.manifest = {

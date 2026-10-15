@@ -91,8 +91,8 @@ export async function buildPlugin({ repoRoot = DEFAULT_ROOT, outputRoot = path.j
 
   const manifest = JSON.parse(readFileSync(sourceManifest, 'utf8'));
   const runtimePackage = JSON.parse(readFileSync(channelPackagePath, 'utf8'));
-  if (typeof runtimePackage.dependencies?.['@modelcontextprotocol/sdk'] !== 'string') {
-    throw new Error(`Channel package is missing @modelcontextprotocol/sdk: ${channelPackagePath}`);
+  if (typeof runtimePackage.dependencies?.['@modelcontextprotocol/server'] !== 'string') {
+    throw new Error(`Channel package is missing @modelcontextprotocol/server: ${channelPackagePath}`);
   }
 
   mkdirSync(outputRoot, { recursive: true });

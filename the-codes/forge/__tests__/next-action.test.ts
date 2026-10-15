@@ -26,6 +26,23 @@ test('nextAction taxonomy', () => {
   assert.equal(nextActionFor({ status: 'running' }), null);
 });
 
+test('provider setup and account failures do not suggest blind retries or broader permissions', () => {
+  for (const error of ['authentication failed', '401 Unauthorized', 'invalid API key', 'refresh token expired']) {
+    assert.match(nextActionFor({ ...F, error })!, /restore the provider login or credentials/);
+  }
+  for (const error of ['429 Too Many Requests', 'rate_limit exceeded']) {
+    assert.match(nextActionFor({ ...F, error })!, /retry window|reduce concurrent/);
+  }
+  assert.match(nextActionFor({ ...F, error: '429 insufficient_quota' })!, /quota or credits/);
+  for (const error of ["unknown option '--permission-prompts'", "unexpected argument '--standalone'", 'unknown model "old-model"']) {
+    assert.match(nextActionFor({ ...F, error })!, /doctor and list_capabilities/);
+  }
+  assert.match(nextActionFor({ ...F, error: 'spawn codex ENOENT' })!, /executable and working directory/);
+  assert.match(nextActionFor({ ...F, jobStatus: 'denied' })!, /authorization before retrying/);
+  // Successful prose is not an execution diagnostic.
+  assert.equal(nextActionFor({ status: 'succeeded', error: 'unauthorized rate limit' }), null);
+});
+
 test('diffChangedFiles excludes dirty-and-unchanged, caps at 200', () => {
   const d = diffChangedFiles({ head: 'a', dirty: ['keep.ts', 'gone.ts'] }, ['keep.ts', 'new.ts', '.agent-smith/x']);
   assert.deepEqual(d.files, ['gone.ts', 'new.ts']);

@@ -262,6 +262,8 @@ test('the conversation id from the started event is captured for resume', () => 
   const r = repo();
   const w = start(r);
   w.onEvent({ kind: 'started', at: now(), conversationId: 'conv-xyz' } satisfies ProviderEvent);
+  assert.equal(JSON.parse(readFileSync(jobFile(r, w.jobId, FILES.job), 'utf8')).conversation, 'conv-xyz',
+    'resume identity is durable before finish');
   w.finish(result({}), '# Report\n\ntext');
   const m = JSON.parse(readFileSync(jobFile(r, w.jobId, FILES.job), 'utf8')) as ForgeManifest;
   assert.equal(m.conversation, 'conv-xyz');
@@ -638,4 +640,14 @@ test('changed file counts are available only from complete recorded evidence', a
   assert.deepEqual((await read())?.changed_files, ['source.ts']);
   writeFileSync(file, JSON.stringify({ ...m, changedFiles: ['source.ts'], changedFilesTruncated: true }));
   assert.equal((await read())?.changed_files, undefined);
+});
+
+test('started conversation survives inside the progress coalescing window', () => {
+  const r = repo();
+  const w = new JobWriter({ repo: r, jobId: 'implement-smith-abcd1234', mirror: false, flushMs: 60_000 });
+  w.start({ provider: 'agy', mode: 'implement', model: null, effort: null,
+    cwd: r, prompt: 'work', timeoutMs: 1000, unrestricted: false, conversation: null,
+    pipeline: null, stage: null, attempt: null });
+  w.onEvent({ kind: 'started', at: now(), conversationId: 'durable-conversation' });
+  assert.equal(JSON.parse(readFileSync(jobFile(r, w.jobId, FILES.job), 'utf8')).conversation, 'durable-conversation');
 });

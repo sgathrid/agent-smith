@@ -64,6 +64,7 @@ Only variables the code reads.
 | `AGENT_SMITH_HOME` | `providers/aliases.ts` | `os.homedir()` | Where the user-level `.agent-smith/models.json` is looked up. |
 | `AGENT_SMITH_STATE_DIR` | `providers/ndjson.ts` | `~/.agent-smith/state` | Provider state root used only when a spawn gives no `stateDir`. The forge always passes the job directory, so MCP/CLI jobs do not use it. |
 | `AGENT_SMITH_CHANNEL` | `surfaces/channel/src/server.ts` | enabled | `0` disables the `claude/channel` capability, the startup baseline and the 5 s poll loop. The built plugin sets it to `0`; `dev.sh --channels` leaves it unset. |
+| `AGENT_SMITH_TASKS` | `surfaces/channel/src/mcp.ts` | unset (`0`) | `1` advertises `extensions['io.modelcontextprotocol/tasks']` on modern (`2026-07-28`) connections and registers `tasks/get`, `tasks/update` and `tasks/cancel`, returning `resultType: 'task'` for `spawn_job`/`resume_job` requests that advertise client Tasks support. |
 | `AGENT_SMITH_CONFIRM_UNRESTRICTED` | `surfaces/channel/src/tools.ts` | enabled | `0` stops `spawn_job`/`resume_job` asking the user to confirm an explicit `unrestricted: true` for codex, claude or opencode, and drops the "not confirmed" ack warning. For automation with no one to answer. |
 | `AGY_WATCH_CWD` | `server.ts`, `monitor.ts`, `watch-hook.ts` | `process.cwd()` | Repo to operate on. MCP server order: positional argv path, then this, then cwd. `monitor.js`: `--cwd`, positional first arg, then this. Hook: last resort after payload `repo`/`dir`/`recordPath` and hook `cwd`. `dev.sh` sets it to `--repo`. |
 | `HOME`, `PATH` | `discovery.ts`, `ndjson.ts` | process env | `HOME` roots the default config dirs; `PATH` is probed for provider binaries (cached per binary+PATH). |
@@ -118,18 +119,26 @@ default = `--permission-mode dontAsk --permission-prompts none` (no read-only en
 
 ## MCP tools
 
+The server uses MCP TypeScript SDK `server`/`core` 2.3.1 and supports the
+2026-07-28 protocol plus legacy clients through the SDK's stdio dispatcher.
+Modern approval uses `input_required`; legacy clients use form elicitation.
+Claude channel notifications are available on legacy connections only.
+
 All tools reject unknown fields. Failures return `isError` with a sentence to act on.
 Efforts (`EFFORTS`): `low|medium|high|xhigh|max|ultra`; each model lists the efforts it
 accepts. Providers: `agy|codex|opencode|claude`. Tools marked structured also return
 `structuredContent` (arrays wrapped as `{items}`) and declare a per-tool `outputSchema` that types the
 fields below and allows extra ones (`additionalProperties: true`); clients validate against it.
 
-Tasks vocabulary: launch acks (`spawn_job`, `resume_job`, `run_pipeline`) carry `taskHandle {taskId, status:
+Tasks vocabulary and opt-in extension: launch acks (`spawn_job`, `resume_job`, `run_pipeline`) carry `taskHandle {taskId, status:
 'working', pollIntervalMs: 5000}` (`taskId` is the job or run ID; `pollIntervalMs` is the server's poll
 cadence), and `status`/`list_jobs` rows carry `taskStatus` beside `status`: `running`/`unknown` ->
-`working`, `succeeded` -> `completed`, `failed` -> `failed`, `canceled` -> `cancelled`. These are the
-MCP Tasks extension's (2026-07-28) names; the extension itself is not implemented. No `ttlMs`: jobs
-are kept until `agent-smith gc` is run.
+`working`, `succeeded` -> `completed`, `failed` -> `failed`, `canceled` -> `cancelled`. Jobs in
+`.agent-smith/jobs/` are kept until `agent-smith gc` is run. When `AGENT_SMITH_TASKS=1` is set on a
+2026-07-28 connection and the request's `_meta['io.modelcontextprotocol/clientCapabilities'].extensions`
+includes `io.modelcontextprotocol/tasks`, `spawn_job` and `resume_job` return a protocol task handle
+(`resultType: 'task'`, 24 h `ttlMs`) backed by `<repo>/.agent-smith/tasks/` and served via `tasks/get`,
+`tasks/update` and `tasks/cancel`.
 
 Confirming `unrestricted`: an explicit `unrestricted: true` on `spawn_job` or `resume_job` for codex,
 claude or opencode asks the user first via MCP form elicitation ("Allow codex worker "Ada" to run
@@ -274,6 +283,7 @@ completion notice or call cancel.`).
 | Path | Content | Git |
 |---|---|---|
 | `<repo>/.agent-smith/jobs/<jobId>/` | job directory (see ARCHITECTURE.md) | ignored (`.agent-smith/`) |
+| `<repo>/.agent-smith/tasks/` | durable MCP Tasks records (`<taskId>.json`, `<taskId>.terminal`; 24 h TTL, max 1 000) | ignored |
 | `<repo>/.agent-smith/pipelines/` | run records, `.cancel` markers, `<runId>/artifacts/` | ignored |
 | `<repo>/.agent-smith/models.json` | project aliases | ignored by this repo's `.gitignore`; in a consuming repo, commit it or ignore it as you prefer |
 | `<repo>/.agy-staff/jobs/` | compat mirror for the mod | ignored (`.agy-staff/`) |
@@ -287,10 +297,15 @@ completion notice or call cancel.`).
 
 - `/plugin install agent-smith --marketplace sgathrid/agent-smith` (or `claude plugin install agent-smith --marketplace sgathrid/agent-smith`): installs the self-contained plugin directly from the repository marketplace.
 - `npm run build` builds the channel (`dist/server.js`, `monitor.js`, `watch-hook.js`), installing channel dependencies first if missing.
-- `npm run build:plugin`: builds the channel and bundles the self-contained plugin (`builds/local-plugin/agent-smith`, with `@modelcontextprotocol/sdk` bundled into `runtime/dist/` and no `node_modules`).
+- `npm run build:plugin`: builds the channel and bundles the self-contained plugin (`builds/local-plugin/agent-smith`, with the MCP v2 runtime bundled into `runtime/dist/` and no `node_modules`).
 - `npm run setup:claude`: runs `build:plugin`, validates `builds/local-plugin/agent-smith`, and enables it in `.claude/settings.local.json` via a directory marketplace. No global config is touched.
 - `dev.sh [--repo DIR] [--channels] [claude flags]`: session-scoped launch with
   `--plugin-dir the-codes/surfaces/mod` and an inline MCP config (`AGY_WATCH_CWD=<repo>`);
   `--channels` adds `--dangerously-load-development-channels server:agent-smith`.
 - CLI: `agent-smith setup|run|resume|ls|status|cancel|gc|doctor` (`scripts/agent-smith.mjs`; Node
   >= 22.18 with native TypeScript stripping).
+
+`doctor` probes installed providers with bounded version/help commands and checks
+the flags their adapters use. It reports compatible, incompatible, or unknown,
+with a reason. This checks CLI features; it does not verify authentication,
+account quota, model access, or a real model invocation.

@@ -53,6 +53,7 @@ export function reconcileOrphan(repo: string, jobId: string, now = Date.now()): 
         ...manifest, status: verdict.status, jobStatus: result.status,
         updatedAt: result.finishedAt, finishedAt: result.finishedAt,
         startedAt: manifest.startedAt ?? result.startedAt, exitCode: result.exitCode,
+        conversation: recoveredConversation(result) ?? manifest.conversation,
         error: verdict.reason === null ? result.error ?? null
           : appendBounded(`${verdict.reason} — `, result.error ?? '', 1_200),
         deniedActions: (result.deniedActions ?? []).map(({ action, displayName }) => ({
@@ -113,4 +114,15 @@ function recoverableResult(body: string | null, manifest: ForgeManifest): JobRes
           || Array.isArray(result.usage)))) return null;
     return result;
   } catch { return null; }
+}
+
+/** Older running anchors did not persist the provider's started-event identity. */
+function recoveredConversation(result: JobResult): string | null {
+  if (result.raw === null || typeof result.raw !== 'object') return null;
+  const raw = result.raw as Record<string, unknown>;
+  const key = result.provider === 'agy' ? 'conversation_id'
+    : result.provider === 'codex' ? 'threadId'
+      : result.provider === 'claude' || result.provider === 'opencode' ? 'sessionId' : null;
+  const value = key === null ? null : raw[key];
+  return typeof value === 'string' && value.trim() !== '' ? value : null;
 }

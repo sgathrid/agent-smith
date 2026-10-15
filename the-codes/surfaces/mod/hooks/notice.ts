@@ -211,6 +211,8 @@ export function unwrapResponse(response: unknown, depth = 0): Record<string, unk
   }
   if (!isObj(response)) return null;
   if (response['isError'] === true) return null;
+  // Tasks clients deliver this result themselves; neither notice path owns it.
+  if (isObj(response['_meta']) && response['_meta']['io.agent-smith/task-result'] === true) return null;
   if (isObj(response['structuredContent'])) return response['structuredContent'];
   if (Array.isArray(response['content'])) return unwrapResponse(response['content'], depth + 1);
   return response;
@@ -295,6 +297,8 @@ export function parseLaunch(toolName: unknown, response: unknown): Launch | null
   const payload = unwrapResponse(response);
   if (payload === null || typeof payload['error'] === 'string') return null;
   const id = kind === 'job' ? payload['jobId'] : payload['runId'];
+  // Hosts may expose only structuredContent and omit the outer MCP metadata.
+  if (kind === 'job' && ['succeeded', 'failed', 'canceled'].includes(String(payload['status']))) return null;
   if (typeof id !== 'string' || id.length === 0) return null;
   let repo: string | null = null;
   if (typeof payload['repo'] === 'string' && payload['repo'].length > 0) repo = trimSlash(payload['repo']);

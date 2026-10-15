@@ -15,6 +15,16 @@ import { buildBatch } from '../../channel/src/policy.ts';
 const NOW = Date.parse('2026-10-11T12:00:00Z');
 const PLUGIN = 'mcp__plugin_agent-smith_agent-smith__';
 
+test('MCP Tasks handles and final results do not claim legacy completion notices', () => {
+  const tool = `${PLUGIN}spawn_job`;
+  assert.equal(parseLaunch(tool, { resultType: 'task', taskId: 't', status: 'working' }), null);
+  assert.equal(parseLaunch(tool, {
+    _meta: { 'io.agent-smith/task-result': true }, structuredContent: { jobId: 'j', status: 'succeeded' },
+  }), null);
+  assert.equal(parseLaunch(tool, { jobId: 'j', status: 'succeeded', report: 'done' }), null);
+  assert.equal(parseLaunch(tool, { jobId: 'j', status: 'running' })?.id, 'j');
+});
+
 function row(over: Partial<NoticeRow> & { id: string }): NoticeRow {
   return { status: 'running', startedAt: NOW - 60_000, endedAt: null, lastEventAt: NOW - 1000, ...over };
 }

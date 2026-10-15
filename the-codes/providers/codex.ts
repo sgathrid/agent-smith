@@ -477,8 +477,11 @@ export function createCodexTranslator(maxChars: number): CodexTranslator {
       // carries an explicit failure must not render as green.
       const itemStatus = str(item, 'status') ?? str(item, 'state');
       const exitCode = itemType === 'command_execution' ? num(item, 'exit_code') : undefined;
+      const itemResult = obj(item, 'result');
       const explicitError =
         itemType === 'error' || itemStatus === 'failed' || itemStatus === 'error' ||
+        item['isError'] === true || item['is_error'] === true || item['error'] != null ||
+        itemResult?.['isError'] === true || itemResult?.['is_error'] === true ||
         (exitCode !== undefined && exitCode !== 0);
       let status: ActivityStatus = explicitError ? 'error' : 'done';
 
@@ -569,7 +572,7 @@ interface ExitInfo {
   stderr: string;
 }
 
-export function buildResult(args: {
+function buildResult(args: {
   jobId: string;
   startedAtMs: number;
   stateDir: string;

@@ -86,6 +86,20 @@ test('Codex output mentioning denied requests does not mark the activity denied'
   assert.equal(end.status, 'done');
 });
 
+test('Codex MCP errors use structured results, including a null error on success', () => {
+  for (const [fields, expected] of [
+    [{ error: null, result: { content: [] } }, 'done'],
+    [{ error: { message: 'server disconnected' } }, 'error'],
+    [{ result: { isError: true, content: [] } }, 'error'],
+    [{ status: 'failed', error: { message: 'permission denied' } }, 'denied'],
+  ] as const) {
+    const tx = createCodexTranslator(200);
+    const end = tx.onEvent({ type: 'item.completed', item: { id: 'mcp', type: 'mcp_tool_call', ...fields } }).at(-1);
+    assert.ok(end?.kind === 'activity-end');
+    assert.equal(end.status, expected);
+  }
+});
+
 test('Claude structured permission denials are deduplicated and retained on successful reports', () => {
   const tx = createClaudeTranslator(200);
   tx.onEvent({ type: 'system', subtype: 'permission_denied', tool_name: 'Write', tool_use_id: 'toolu-1' });
@@ -110,6 +124,19 @@ test('Claude structured permission denials block a failed report', () => {
     exit: { code: 1, signal: null, killReason: undefined, stderr: '' }, tx,
   });
   assert.equal(result.status, 'denied');
+});
+
+test('Claude final-only denials produce activity evidence once per call, not once per tool', () => {
+  const tx = createClaudeTranslator(200);
+  const result = { type: 'result', subtype: 'success', result: 'Report', permission_denials: [
+    { tool_name: 'Bash', tool_use_id: 'one' }, { tool_name: 'Bash', tool_use_id: 'two' },
+  ] };
+  const events = tx.onEvent(result).filter(e => e.kind === 'activity-end');
+  assert.equal(events.length, 2);
+  assert.deepEqual(events.map(e => e.activity.toolCallId), ['one', 'two']);
+  assert.ok(events.every(e => e.status === 'denied'));
+  assert.equal(tx.onEvent(result).filter(e => e.kind === 'activity-end').length, 0);
+  assert.deepEqual(tx.deniedTools, ['one', 'two']);
 });
 
 test('Claude argv applies effort and uses --resume for continuation', () => {

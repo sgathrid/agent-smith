@@ -111,3 +111,23 @@ test('service startup publishes a provider completion already present on disk', 
   assert.equal((await service.list())[0]?.status, 'succeeded');
   assert.equal(readAcceptance(repo, jobId).state, 'accepted', 'published acceptance is preserved');
 });
+
+for (const [provider, key] of [['agy', 'conversation_id'], ['codex', 'threadId'], ['claude', 'sessionId'], ['opencode', 'sessionId']]) {
+  test(`recovers ${provider} resume identity from an older result with no conversation anchor`, () => {
+    const { repo, jobId, file, result } = fixture();
+    const manifest = JSON.parse(readFileSync(file, 'utf8'));
+    writeFileSync(file, JSON.stringify({ ...manifest, provider, conversation: null }));
+    writeResultFile(result.stateDir, { ...result, provider, raw: { [key!]: 'recovered-session' } });
+    assert.equal(reconcileOrphan(repo, jobId), true);
+    assert.equal(JSON.parse(readFileSync(file, 'utf8')).conversation, 'recovered-session');
+  });
+}
+
+test('invalid recovered identity retains the existing conversation', () => {
+  const { repo, jobId, file, result } = fixture();
+  const manifest = JSON.parse(readFileSync(file, 'utf8'));
+  writeFileSync(file, JSON.stringify({ ...manifest, conversation: 'existing-session' }));
+  writeResultFile(result.stateDir, { ...result, raw: { conversation_id: {} } });
+  assert.equal(reconcileOrphan(repo, jobId), true);
+  assert.equal(JSON.parse(readFileSync(file, 'utf8')).conversation, 'existing-session');
+});

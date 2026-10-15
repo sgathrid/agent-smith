@@ -159,6 +159,9 @@ function unwrapResponse(response, depth = 0) {
         return null;
     if (response['isError'] === true)
         return null;
+    // Tasks clients deliver this result themselves; neither notice path owns it.
+    if (isObj(response['_meta']) && response['_meta']['io.agent-smith/task-result'] === true)
+        return null;
     if (isObj(response['structuredContent']))
         return response['structuredContent'];
     if (Array.isArray(response['content']))
@@ -196,6 +199,9 @@ function parseLaunch(toolName, response) {
     if (payload === null || typeof payload['error'] === 'string')
         return null;
     const id = kind === 'job' ? payload['jobId'] : payload['runId'];
+    // Hosts may expose only structuredContent and omit the outer MCP metadata.
+    if (kind === 'job' && ['succeeded', 'failed', 'canceled'].includes(String(payload['status'])))
+        return null;
     if (typeof id !== 'string' || id.length === 0)
         return null;
     let repo = null;
@@ -943,6 +949,10 @@ function deriveOrphan(m, lastSeenMs, nowMs, alive = isPidAlive, cancelRequested 
 }
 const NETWORK_RE = /network issue|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|fetch failed|connection (?:reset|refused|closed|error)|temporarily unavailable|overloaded/i;
 const TIMEOUT_RE = /timed? ?out|exceeded the .*budget|\btimeout\b/i;
+const AUTH_RE = /\b(?:unauthorized|unauthenticated)\b|authentication (?:failed|required)|invalid (?:api[ _-]?key|access token)|(?:access |auth |refresh )token (?:has )?expired|not (?:logged|signed) in|please (?:log|sign) in/i;
+const RATE_LIMIT_RE = /\brate[ _-]?limit(?:ed|ing)?\b|too many requests|\b429\b/i;
+const QUOTA_RE = /insufficient[_ ]quota|quota exceeded|exceeded.{0,30}quota|credit balance.{0,30}(?:low|exhausted)|billing.{0,30}(?:limit|exhausted)/i;
+const COMPATIBILITY_RE = /unknown (?:option|argument|flag)|unrecognized (?:option|argument|flag|subcommand)|unexpected argument|unsupported (?:option|flag)|invalid value.{0,80}(?:--model|--effort|reasoning_effort)|unknown model|does not support effort/i;
 /**
  * THE one place a next step is derived. Derived on read, never stored in
  * job.json. Null for running/succeeded jobs. A short imperative for the
@@ -958,10 +968,21 @@ function nextActionFor(i) {
     if (err.includes('orphaned') || err.includes(ORPHAN_REASON)) {
         return 'Supervisor exited; resume_job if it has a conversation handle, else rerun.';
     }
-    if ((i.deniedCount ?? 0) > 0 || /soft-denied/i.test(err)) {
+    if (i.jobStatus === 'denied' || (i.deniedCount ?? 0) > 0 || /soft-denied/i.test(err)) {
         return i.unrestricted === true
             ? 'Worker was denied actions even with unrestricted:true; give it an approved path or narrow the task.'
-            : 'Retry with unrestricted:true, or give the worker an approved path.';
+            : 'Worker permissions blocked the task; use an approved path or ask for authorization before retrying with unrestricted:true.';
+    }
+    if (AUTH_RE.test(err))
+        return 'Provider authentication failed; restore the provider login or credentials before retrying.';
+    if (QUOTA_RE.test(err))
+        return 'Provider quota or credits are exhausted; resolve the account limit or choose another available provider.';
+    if (RATE_LIMIT_RE.test(err))
+        return 'Provider rate limit reached; wait for its retry window or reduce concurrent workers before retrying.';
+    if (COMPATIBILITY_RE.test(err))
+        return 'Provider rejected its arguments or model; run agent-smith doctor and list_capabilities, then correct the request or update the provider CLI.';
+    if (/\bENOENT\b|spawn.{0,100}(?:not found|no such file)/i.test(err)) {
+        return 'Worker could not start; check the provider executable and working directory with agent-smith doctor before retrying.';
     }
     if (i.jobStatus === 'timeout' || TIMEOUT_RE.test(err)) {
         return 'Raise timeoutMs or split the task; resume_job keeps the conversation.';

@@ -349,6 +349,14 @@ export function createClaudeTranslator(maxChars: number): ClaudeTranslator {
     return true;
   };
 
+  const denialActivity = (id: string, tool: string, at: string): ProviderEvent | undefined => {
+    if (!recordDenial(id)) return undefined;
+    const idx = toolStep.get(id) ?? step++;
+    toolStep.set(id, idx);
+    const activity: ActivityRef = { stepIndex: idx, tool, toolCallId: id, denied: true };
+    return { kind: 'activity-end', at, activity, status: 'denied' };
+  };
+
   tx.onEvent = (raw: Record<string, unknown>): ProviderEvent[] => {
     const out: ProviderEvent[] = [];
     const type = str(raw, 'type');
@@ -363,13 +371,9 @@ export function createClaudeTranslator(maxChars: number): ClaudeTranslator {
       if (subtype === 'permission_denied') {
         const toolUseId = str(raw, 'tool_use_id') ?? str(raw, 'id');
         const toolName = str(raw, 'tool_name') ?? str(raw, 'tool') ?? 'unknown';
-        const key = toolUseId ?? toolName;
-        const idx = toolUseId === undefined ? step++ : (toolStep.get(toolUseId) ?? step++);
-        if (toolUseId !== undefined) toolStep.set(toolUseId, idx);
-        recordDenial(key);
-        const ref: ActivityRef = { stepIndex: idx, tool: toolName, denied: true };
-        if (toolUseId !== undefined) ref.toolCallId = toolUseId;
-        out.push({ kind: 'activity-end', at, activity: ref, status: 'denied' });
+        const key = toolUseId ?? `tool:${toolName}`;
+        const evidence = denialActivity(key, toolName, at);
+        if (evidence !== undefined) out.push(evidence);
         return out;
       }
       if (subtype === 'init') {
@@ -506,7 +510,10 @@ export function createClaudeTranslator(maxChars: number): ClaudeTranslator {
         if (denied) ref.denied = true;
 
         out.push({ kind: 'activity-end', at, activity: ref, status });
-        if (denied) recordDenial(toolUseId);
+        if (denied) {
+          const key = toolUseId !== '' ? toolUseId : `tool:${str(b, 'name') ?? 'unknown'}`;
+          recordDenial(key);
+        }
       }
       return out;
     }
@@ -518,8 +525,10 @@ export function createClaudeTranslator(maxChars: number): ClaudeTranslator {
       for (const denial of permissionDenials) {
         if (denial === null || typeof denial !== 'object') continue;
         const d = denial as Record<string, unknown>;
-        const id = str(d, 'tool_use_id') ?? str(d, 'id') ?? str(d, 'tool_name') ?? str(d, 'tool');
-        if (id !== undefined) recordDenial(id);
+        const toolName = str(d, 'tool_name') ?? str(d, 'tool') ?? 'unknown';
+        const id = str(d, 'tool_use_id') ?? str(d, 'id') ?? `tool:${toolName}`;
+        const evidence = denialActivity(id, toolName, at);
+        if (evidence !== undefined) out.push(evidence);
       }
       const subtype = str(raw, 'subtype');
       const isError = raw['is_error'] === true || (subtype !== undefined && subtype !== 'success');
