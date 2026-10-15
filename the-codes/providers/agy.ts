@@ -157,8 +157,6 @@ interface AgyStepUpdate {
   tool_name?: string;
   tool_info?: AgyToolInfo;
   text_delta?: string;
-  error?: string;
-  message?: string;
   duration_seconds?: number;
   usage?: AgyUsage;
 }
@@ -368,45 +366,27 @@ interface StepMemory {
   startedAt?: string;
 }
 
-const ERROR_STEP_MESSAGE_MAX_CHARS = 200;
-
-function boundErrorText(text: string): string {
-  if (text.length <= ERROR_STEP_MESSAGE_MAX_CHARS) return text;
-  return truncate(text, ERROR_STEP_MESSAGE_MAX_CHARS - 1).text;
-}
-
-/** An agy error on one line, without a leading "Error:", bounded to ~200 chars. */
-export function formatErrorStepMessage(raw: string): string {
-  const cleaned = raw.replace(/\s+/g, ' ').trim().replace(/^error:\s*/i, '');
-  return cleaned === '' ? 'agy error' : boundErrorText(cleaned);
+/**
+ * agy's leftover error, as a short warning:
+ * "API error (attempt 3): RESOURCE_EXHAUSTED (code 429): …" → "recovered: 429 resource exhausted".
+ */
+function recoveredWarning(rawError: string | undefined): string {
+  const raw = (rawError ?? '').replace(/\s+/g, ' ').trim().replace(/^error:\s*/i, '');
+  const coded = /\b([A-Z][A-Z0-9_]+)\s*\(code\s+(\d+)\)/.exec(raw);
+  const words = coded
+    ? `${coded[2]} ${coded[1]!.toLowerCase().replace(/_/g, ' ')}`
+    : raw.replace(/\.\s+(?:this can happen|please try again)\b.*$/i, '').replace(/\.$/, '').toLowerCase();
+  return truncate(`recovered: ${words || 'worker error'}`, 200).text;
 }
 
 /**
- * Format a recovered/stale result.error into a short, plain, lowercase warning.
- * Example: "Error: API error (attempt 3): RESOURCE_EXHAUSTED (code 429): ..."
- *       -> "recovered: 429 resource exhausted"
+ * The warning for a run `buildResult` judged a success although agy reported
+ * an error: the error was stale. Issued only after that verdict, so the
+ * warning and the status can never disagree.
  */
-export function formatRecoveredWarning(rawError: string | undefined): string {
-  if (rawError === undefined || rawError.trim() === '') {
-    return 'recovered: worker error';
-  }
-  const codeMatch = rawError.match(/\b([A-Z][A-Z0-9_]+)\s*\(code\s+(\d+)\)/i);
-  if (codeMatch !== null) {
-    const status = codeMatch[1]!.toLowerCase().replace(/_/g, ' ');
-    const code = codeMatch[2]!;
-    return boundErrorText(`recovered: ${code} ${status}`);
-  }
-  const cleaned = rawError
-    .replace(/\s+/g, ' ')
-    .trim()
-    .replace(/^error:\s*/i, '')
-    .replace(/\.\s+(?:this can happen|please try again)\b.*$/i, '')
-    .replace(/\.$/, '')
-    .replace(/\b([A-Z0-9]+(?:_[A-Z0-9]+)+)\b/g, (m) => m.toLowerCase().replace(/_/g, ' '))
-    .toLowerCase()
-    .trim();
-  if (cleaned === '') return 'recovered: worker error';
-  return boundErrorText(`recovered: ${cleaned}`);
+export function recoveredNotice(final: JobResult, resultEvent: AgyResultEvent | undefined): ProviderEvent | undefined {
+  if (final.status !== 'success' || resultEvent === undefined || resultEvent.status === 'SUCCESS') return undefined;
+  return { kind: 'notice', at: final.finishedAt, level: 'warn', message: recoveredWarning(resultEvent.error), raw: resultEvent };
 }
 
 export function createAgyTranslator(maxChars: number) {
@@ -414,8 +394,10 @@ export function createAgyTranslator(maxChars: number) {
   /** Set by any denial signal; carried into JobResult. */
   const denials: DeniedAction[] = [];
   // agy's final status repeats the conversation's last error, even one it
-  // recovered from or one from an earlier run. Stale: none this run, or work
-  // succeeded after it.
+  // recovered from or one from an earlier run on the same conversation. Stale:
+  // none this run, or a step finished after it. Trade-off: a failure agy
+  // reports only in the result (no error step this run) also reads as stale;
+  // buildResult still requires a response and exit 0 before calling it success.
   let sawErrorStep = false;
   let progressedAfterError = false;
   const errorIsStale = (): boolean => !sawErrorStep || progressedAfterError;
@@ -453,15 +435,15 @@ export function createAgyTranslator(maxChars: number) {
       const state = su.state;
 
       // --- usage, attached to almost every DONE record -----------------------
+      // Any step that finishes, other than an error, is progress past an earlier error.
+      if (state === 'DONE' && stepType !== 'error_message') progressedAfterError = true;
+
       const usage = toTokenUsage(su.usage);
       if (usage !== undefined) out.push({ kind: 'usage', at, usage });
 
       // --- agent prose / thinking --------------------------------------------
       if (stepType === 'agent_response') {
         const delta = su.text_delta;
-        if (state !== 'ERROR' && ((delta !== undefined && delta !== '') || state === 'DONE')) {
-          progressedAfterError = true;
-        }
         if (delta !== undefined && delta !== '') {
           // agy streams prose as many small text_delta slices. We forward each
           // one rather than buffering: the mod surface renders incrementally and
@@ -502,8 +484,6 @@ export function createAgyTranslator(maxChars: number) {
             displayName: toolName,
             raw: { stepIndex, error: info?.error },
           });
-        } else if (state === 'DONE') {
-          progressedAfterError = true;
         }
         const output = preview(info?.output ?? info?.error?.message, maxChars);
         const ref: ActivityRef = { stepIndex, tool: toolName };
@@ -529,8 +509,7 @@ export function createAgyTranslator(maxChars: number) {
         sawErrorStep = true;
         progressedAfterError = false;
         // agy's stream carries no error text here; the final result does.
-        const text = su.error ?? su.message;
-        out.push({ kind: 'notice', at, level: 'error', message: formatErrorStepMessage(text ?? ''), raw: su });
+        out.push({ kind: 'notice', at, level: 'error', message: 'agy error', raw: su });
         return out;
       }
 
@@ -550,26 +529,8 @@ export function createAgyTranslator(maxChars: number) {
     }
 
     if (event === 'result') {
-      const r = obj(raw, 'result') as AgyResultEvent | undefined;
-      if (r !== undefined) {
-        const hasDenials = denials.length > 0 || (r.denied_actions?.length ?? 0) > 0;
-        const response = r.response ?? '';
-        if (
-          r.status !== undefined &&
-          r.status !== 'SUCCESS' &&
-          !hasDenials &&
-          response.trim() !== '' &&
-          errorIsStale()
-        ) {
-          out.push({
-            kind: 'notice',
-            at,
-            level: 'warn',
-            message: formatRecoveredWarning(r.error),
-            raw: r,
-          });
-        }
-      }
+      // The result event itself is not a ProviderEvent. It becomes JobResult,
+      // which is built in the exit handler. Nothing to emit here.
       return out;
     }
 
@@ -605,10 +566,11 @@ export function buildResult(args: {
   stateDir: string;
   denials: DeniedAction[];
   sawAnyToolCall: boolean;
-  errorIsStale?: boolean;
+  /** From the translator: agy's reported error predates this run's last progress. */
+  errorIsStale: boolean;
 }): JobResult {
   const { jobId, resultEvent, exit, startedAtMs, stateDir, denials, sawAnyToolCall } = args;
-  const errorIsStale = args.errorIsStale ?? false;
+  const { errorIsStale } = args;
   const finishedAt = nowIso();
   const durationMs = Date.now() - startedAtMs;
 
@@ -830,6 +792,7 @@ export const agyProvider: Provider = {
         if (raw['event'] === 'result') {
           const r = obj(raw, 'result');
           if (r !== undefined) resultEvent = r as AgyResultEvent;
+          return;
         }
         publish(translator.onEvent(raw));
       },
@@ -873,6 +836,8 @@ export const agyProvider: Provider = {
         sawAnyToolCall: translator.stepsWereTools(),
         errorIsStale: translator.errorIsStale(),
       });
+      const recovered = recoveredNotice(final, resultEvent);
+      if (recovered !== undefined) bus.emit(recovered);
       bus.close();
       writeResultFile(stateDir, final);
       resolveResult(final);

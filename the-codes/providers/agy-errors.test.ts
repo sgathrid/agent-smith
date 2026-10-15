@@ -17,7 +17,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildResult, createAgyTranslator } from './agy.ts';
+import { buildResult, createAgyTranslator, recoveredNotice } from './agy.ts';
 import { JobWriter } from '../forge/writer.ts';
 
 const CONV_ID = 'cb4b43aa-dc46-47e7-98b3-3ebcf6c8219c';
@@ -253,15 +253,8 @@ describe('agy stale and recovered error handling', () => {
       const notices = events.filter(
         (e): e is Extract<(typeof events)[number], { kind: 'notice' }> => e.kind === 'notice',
       );
-      // 3 error_message notices + 1 recovered warning notice on result
-      assert.equal(notices.length, 4);
-
       // agy's stream carries no error text at the step; the result names it.
-      for (const n of notices.slice(0, 3)) assert.equal(n.message, 'agy error');
-
-      const recoveredNotice = notices[3]!;
-      assert.equal(recoveredNotice.level, 'warn');
-      assert.equal(recoveredNotice.message, 'recovered: 429 resource exhausted');
+      assert.deepEqual(notices.map((n) => n.message), ['agy error', 'agy error', 'agy error']);
 
       const res = buildResult({
         jobId: 'implement-smith-615fa42d',
@@ -278,6 +271,10 @@ describe('agy stale and recovered error handling', () => {
       assert.equal(res.ok, true);
       assert.equal(res.error, undefined);
       assert.match(res.response, /956 tests passed/);
+      const recovered = recoveredNotice(res, resultEvent);
+      assert.equal(recovered?.kind === 'notice' && recovered.level, 'warn');
+      assert.equal(recovered?.kind === 'notice' && recovered.message, 'recovered: 429 resource exhausted');
+      events.push(recovered!);
 
       // Verify the notice -> progress.warnings path via JobWriter.
       const writer = new JobWriter({ repo, jobId: 'implement-smith-615fa42d', flushMs: 0, mirror: false });
@@ -320,9 +317,7 @@ describe('agy stale and recovered error handling', () => {
       const notices = events.filter(
         (e): e is Extract<(typeof events)[number], { kind: 'notice' }> => e.kind === 'notice',
       );
-      assert.equal(notices.length, 1);
-      assert.equal(notices[0]!.level, 'warn');
-      assert.equal(notices[0]!.message, 'recovered: the stream was interrupted');
+      assert.equal(notices.length, 0);
 
       const res = buildResult({
         jobId: 'implement-smith-431a1f0e',
@@ -339,6 +334,9 @@ describe('agy stale and recovered error handling', () => {
       assert.equal(res.ok, true);
       assert.equal(res.error, undefined);
       assert.match(res.response, /What Changed/);
+      const recovered = recoveredNotice(res, resultEvent);
+      assert.equal(recovered?.kind === 'notice' && recovered.message, 'recovered: the stream was interrupted');
+      events.push(recovered!);
 
       const writer = new JobWriter({ repo, jobId: 'implement-smith-431a1f0e', flushMs: 0, mirror: false });
       writer.start({
@@ -397,5 +395,31 @@ describe('agy stale and recovered error handling', () => {
     assert.equal(res.status, 'error');
     assert.equal(res.ok, false);
     assert.match(res.error ?? '', /RESOURCE_EXHAUSTED/);
+  });
+
+  it('keeps an error with no later progress as a failure even when there is a response', () => {
+    const tx = createAgyTranslator(2000);
+    tx.onEvent({ event: 'step_update', step_update: { step_index: 1, step_type: 'agent_response', state: 'DONE', text_delta: 'partial notes' } });
+    tx.onEvent({ event: 'step_update', step_update: { step_index: 2, step_type: 'error_message', state: 'DONE' } });
+    assert.equal(tx.errorIsStale(), false);
+    const resultEvent = { status: 'ERROR', response: 'partial notes', error: 'API error: RESOURCE_EXHAUSTED (code 429)' };
+    const res = buildResult({
+      jobId: 'unrecovered', resultEvent: resultEvent as never, exit: { code: 0, signal: null, killReason: undefined, stderr: '' },
+      startedAtMs: Date.now() - 1, stateDir: '/tmp', denials: tx.denials, sawAnyToolCall: false, errorIsStale: tx.errorIsStale(),
+    });
+    assert.equal(res.status, 'error');
+    assert.equal(recoveredNotice(res, resultEvent as never), undefined, 'no warning when the run failed');
+  });
+
+  it('gives no recovered warning when the verdict is not success (non-zero exit, cancel)', () => {
+    const resultEvent = { status: 'ERROR', response: 'done', error: 'The stream was interrupted.' };
+    for (const exit of [{ code: 1, signal: null, killReason: undefined, stderr: '' }, { code: null, signal: 'SIGTERM', killReason: 'cancelled', stderr: '' }]) {
+      const res = buildResult({
+        jobId: 'x', resultEvent: resultEvent as never, exit: exit as never, startedAtMs: Date.now() - 1, stateDir: '/tmp',
+        denials: [], sawAnyToolCall: false, errorIsStale: true,
+      });
+      assert.notEqual(res.status, 'success');
+      assert.equal(recoveredNotice(res, resultEvent as never), undefined);
+    }
   });
 });
