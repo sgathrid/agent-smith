@@ -34488,19 +34488,21 @@ class TaskStore {
     }
     write(record) {
         const file = this.file(record.taskId);
+        const terminal = this.terminalFile(record.taskId);
         const temp = `${file}.tmp-${process.pid}-${this.now()}-${Math.random().toString(36).slice(2)}`;
         try {
             writeFileSync(temp, `${JSON.stringify(record, null, 2)}\n`, { flag: 'wx' });
+            if (existsSync(terminal))
+                return this.read(terminal, record.taskId);
             renameSync(temp, file);
+            return existsSync(terminal) ? this.read(terminal, record.taskId) : record;
         }
-        catch (error) {
+        finally {
             try {
                 unlinkSync(temp);
             }
             catch { /* rename may have consumed it */ }
-            throw error;
         }
-        return record;
     }
     cleanup() {
         mkdirSync(this.directory, { recursive: true });
