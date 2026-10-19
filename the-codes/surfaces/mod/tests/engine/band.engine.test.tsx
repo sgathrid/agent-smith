@@ -148,6 +148,7 @@ function engine(
   if (options.nativeTaskCalls) {
     on('tool.call', (_$: unknown, e: unknown) => {
       const call = e as { tool: string; [key: string]: unknown };
+      if (LAUNCH_TOOL.test(call.tool)) return launchAck(call);
       options.nativeTaskCalls!.push({ tool: call.tool, input: { ...call } });
       if (call.tool === 'TaskCreate') return { result: { task: { id: 'native-task-1', subject: call.subject } } };
       if (call.tool === 'TaskUpdate') return { result: { success: true, taskId: call.taskId } };
@@ -158,12 +159,14 @@ function engine(
   return clock;
 }
 
-/** A `classic.PostToolUse` for a successful launch ack: how this session comes to own a job or run. */
-const launched = (id: string, repo = '/work', kind: 'job' | 'run' = 'job') => ({
-  hook_event_name: 'PostToolUse', session_id: 's', transcript_path: '/t', cwd: '/work',
-  tool_name: `mcp__plugin_agent-smith_agent-smith__${kind === 'job' ? 'spawn_job' : 'run_pipeline'}`, tool_use_id: `tu-${id}`, tool_input: {},
-  tool_response: { structuredContent: { [kind === 'job' ? 'jobId' : 'runId']: id, repo, timeoutMs: 600_000 }, content: [] },
-}) as never;
+/** The three launch tools, under the built plugin's server name. */
+const LAUNCH_TOOL = /__(?:spawn_job|resume_job|run_pipeline)$/;
+/** Core answering a launch tool with its ack, echoing the id and repo the test passed. */
+const launchAck = (e: any) => ({ result: { structuredContent: { [e.runId ? 'runId' : 'jobId']: e.runId ?? e.jobId, repo: e.repo ?? '/work', timeoutMs: 600_000 }, content: [] } });
+/** A successful launch through `tool.call`: how this session comes to own a job or run. */
+const launched = ($: any, id: string, repo = '/work', kind: 'job' | 'run' = 'job') => $.tool.call({
+  tool: `mcp__plugin_agent-smith_agent-smith__${kind === 'job' ? 'spawn_job' : 'run_pipeline'}`, [kind === 'job' ? 'jobId' : 'runId']: id, repo,
+});
 
 // ── pure helpers, re-checked under the engine's own runner ─────────────────
 
@@ -462,7 +465,7 @@ describe('native task-list projection', () => {
     await clock.advance(3000);
     expect(calls).toHaveLength(0);
     // This session's launch does.
-    await ($ as any).classic.PostToolUse(launched('job-native-1'));
+    await launched($, 'job-native-1');
     await clock.advance(3000);
 
     const create = calls.find((call) => call.tool === 'TaskCreate');
@@ -524,8 +527,8 @@ function forgeHost(on: (...args: any[]) => void, files: Record<string,string>, i
   on('ui.close', (_$: unknown, e: any) => { host.closes.push({...e}); return {value:undefined}; });
   on('ui.render', ($: any, e: any) => $.ui.resolve(e).Text({ children: 'REST-OF-BAND' }));
   on('tool.call', (_$: unknown, e: any) => e.tool==='TaskCreate'?{result:{task:{id:'native-task-1'}}}
-    // Core answering a spawn_job call with its ack, for launches seen through tool.call.
-    :/__spawn_job$/.test(e.tool)?{result:{structuredContent:{jobId:e.jobId,repo:'/work',timeoutMs:600_000},content:[]}}
+    // Core answering a launch call with its ack.
+    :LAUNCH_TOOL.test(e.tool)?launchAck(e)
     :/__status$/.test(e.tool)?{result:{structuredContent:{jobId:e.jobId,status:e.status??'succeeded',acceptance:{state:'accepted',pending:false}},content:[]}}
     :{result:{success:true}});
   const clock = mock.clock(on as never,{now:RUNNING_NOW});
@@ -536,7 +539,7 @@ function forgeHost(on: (...args: any[]) => void, files: Record<string,string>, i
 }
 const start = ($: any) => $.session.start({surface:'terminal',isInteractive:true,cwd:'/work'} as never);
 /** Launch through the ack this session's Claude would get back. */
-const launch = ($: any, id: string, kind: 'job' | 'run' = 'job') => $.classic.PostToolUse(launched(id, '/work', kind));
+const launch = ($: any, id: string, kind: 'job' | 'run' = 'job') => launched($, id, '/work', kind);
 
 test('the band shows on the main thread only, not while viewing a subagent', async ($, on) => {
   forgeHost(on, ada(), ['job-ada']);
@@ -798,9 +801,9 @@ describe('completion notices', () => {
     const files = ada('running');
     const { clock, said } = noticeHost(on, files, ['job-ada']);
     await start($);
-    await ($ as any).classic.PostToolUse(launched('job-ada'));
-    expect(said.hookRuns).toBe(0);
-    // The second guard: a hook that starts anyway finds the claim and stays silent.
+    const r = await launched($, 'job-ada');
+    expect(r.result.structuredContent.jobId).toBe('job-ada'); // passed through untouched
+    // The command hook still starts; it finds the claim and stays silent.
     expect(Object.hasOwn(files, '/work/.agent-smith/claims/job-job-ada')).toBe(true);
 
     await clock.advance(3000);
@@ -816,20 +819,17 @@ describe('completion notices', () => {
     expect(said.prompts[0]).toMatch(/^Agent Smith · ✓ Ada \(codex review\) 44s · done · checks 2\/2\nstatus job-ada$/);
   });
 
-  const settledRead = (id: string, more: Record<string, unknown> = {}) => ({
-    hook_event_name: 'PostToolUse', session_id: 's', transcript_path: '/t', cwd: '/work',
-    tool_name: 'mcp__plugin_agent-smith_agent-smith__status', tool_use_id: `tu-read-${id}`, tool_input: { jobId: id },
-    tool_response: { structuredContent: { jobId: id, status: 'succeeded', acceptance: { state: 'accepted', pending: false } }, content: [] },
-    ...more,
-  }) as never;
+  /** Claude reading a settled job through `status`; forgeHost answers it as succeeded. */
+  const settledRead = ($: any, id: string, more: Record<string, unknown> = {}) =>
+    $.tool.call({ tool: 'mcp__plugin_agent-smith_agent-smith__status', jobId: id, ...more });
 
   test('a job whose settled status the main agent already read is not announced again', async ($, on) => {
     const files = ada('running');
     const { clock, said } = noticeHost(on, files, ['job-ada']);
     await start($);
-    await ($ as any).classic.PostToolUse(launched('job-ada'));
+    await launched($, 'job-ada');
     Object.assign(files, ada('succeeded', { finishedAt: iso(RUNNING_NOW + 1000) }));
-    await ($ as any).classic.PostToolUse(settledRead('job-ada'));
+    await settledRead($, 'job-ada');
     await clock.advance(3000);
     await clock.advance(3000);
     expect(said.prompts).toEqual([]);
@@ -839,26 +839,22 @@ describe('completion notices', () => {
     const files = ada('running');
     const { clock, said } = noticeHost(on, files, ['job-ada']);
     await start($);
-    await ($ as any).classic.PostToolUse(launched('job-ada'));
+    await launched($, 'job-ada');
     Object.assign(files, ada('succeeded', { finishedAt: iso(RUNNING_NOW + 1000) }));
-    await ($ as any).classic.PostToolUse(settledRead('job-ada', { agent_id: 'sub-1' }));
+    await settledRead($, 'job-ada', { agentId: 'sub-1' });
     await clock.advance(3000);
     await clock.advance(3000);
     expect(said.prompts).toHaveLength(1);
   });
 
-  test('a launch seen only through tool.call is claimed, marked and announced once', async ($, on) => {
-    const files = ada('running');
-    const { clock, said } = noticeHost(on, files, ['job-ada']);
+  test('the mod leaves classic.PostToolUse to the command hook', async ($, on) => {
+    const { said } = noticeHost(on, ada('running'), ['job-ada']);
     await start($);
-    const r = await ($ as any).tool.call({ tool: 'mcp__plugin_agent-smith_agent-smith__spawn_job', jobId: 'job-ada' });
-    expect(r.result.structuredContent.jobId).toBe('job-ada'); // passed through untouched
-    expect(Object.hasOwn(files, '/work/.agent-smith/claims/job-job-ada')).toBe(true);
-    Object.assign(files, ada('succeeded', {finishedAt:iso(RUNNING_NOW+1000)}));
-    await clock.advance(3000);
-    await clock.advance(3000);
-    expect(said.logs).toEqual([]);
-    expect(said.prompts).toHaveLength(1);
+    await ($ as any).classic.PostToolUse({
+      tool_name: 'mcp__plugin_agent-smith_agent-smith__spawn_job', tool_use_id: 'tu-1', tool_input: {},
+      tool_response: { structuredContent: { jobId: 'job-ada', repo: '/work', timeoutMs: 600_000 }, content: [] },
+    });
+    expect(said.hookRuns).toBe(1);
   });
 
   test("another session's job finishing in the same repo is not announced here", async ($, on) => {
@@ -876,8 +872,8 @@ describe('completion notices', () => {
     const files = ada('running');
     const { clock, said } = noticeHost(on, files, ['job-ada']);
     await start($);
-    await ($ as any).classic.PostToolUse(launched('job-ada', '/elsewhere'));
-    expect(said.hookRuns).toBe(1);
+    await launched($, 'job-ada', '/elsewhere');
+    expect(Object.hasOwn(files, '/work/.agent-smith/claims/job-job-ada')).toBe(false);
     Object.assign(files, ada('succeeded', {finishedAt:iso(RUNNING_NOW+1000)}));
     await clock.advance(3000);
     await clock.advance(3000);

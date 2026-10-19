@@ -67,11 +67,15 @@ worker fails because a tool was denied, ask the user before retrying with
 ## While it runs
 
 `spawn_job` returns at once and the worker runs in the background. Agent Smith announces
-completion itself, so silence in the meantime is normal and polling only spends context.
-`/forge` shows live activity. If no notice arrives (hooks can't run in headless `-p` or
-other clients), run the ack's `notify.monitorCommand` under the Monitor tool, or call
-`status` with `wait_ms`. Live steering isn't supported: wait for the job to finish, then
-follow up with `resume_job` by name or job ID.
+completion itself, so silence in the meantime is normal. Don't poll and don't start your
+own monitor: you would hear about the job twice. `/forge` shows live activity.
+
+The ack's `notify.fallback` says when to wait yourself: no notice by its deadline (hooks
+can't run in headless `-p` or some clients), or you are a subagent that must return the
+result before your turn ends, since the notice goes to the main conversation. Then call
+`status` with `wait_ms`, or run `notify.fallback.monitorCommand` in the background. Live
+steering isn't supported: wait for the job to finish, then follow up with `resume_job` by
+name or job ID.
 
 ## Reading the result
 
