@@ -9,9 +9,10 @@ import { TaskStore } from '../task-store.ts';
 
 function fixture(options: { ttlMs?: number; maxRecords?: number } = {}) {
   const directory = mkdtempSync(path.join(tmpdir(), 'agent-smith-tasks-'));
-  let now = Date.parse('2026-10-14T12:00:00.000Z');
+  const base = Date.parse('2026-10-14T12:00:00.000Z');
+  let now = base;
   const store = () => new TaskStore(directory, { ...options, now: () => now });
-  return { directory, store, advance: (ms: number) => { now += ms; }, cleanup: () => rmSync(directory, { recursive: true, force: true }) };
+  return { directory, store, base, advance: (ms: number) => { now += ms; }, cleanup: () => rmSync(directory, { recursive: true, force: true }) };
 }
 
 test('task identity and terminal result survive store restart unchanged', () => {
@@ -20,7 +21,7 @@ test('task identity and terminal result survive store restart unchanged', () => 
     const original = f.store().create({ taskId: 'task_123', requestFingerprint: 'sha256:abc' });
     f.store().bindJob('task_123', 'job-456');
     const final = f.store().complete('task_123', [{ type: 'text', text: 'done' }]);
-    const restarted = new TaskStore(f.directory);
+    const restarted = new TaskStore(f.directory, { now: () => f.base });
     assert.deepEqual(restarted.get('task_123'), final);
     assert.equal(final.createdAt, original.createdAt);
     assert.equal(final.jobId, 'job-456');
@@ -73,9 +74,9 @@ test('concurrent processes publish one immutable terminal result', async () => {
   try {
     f.store().create({ taskId: 'race', jobId: 'job-race' });
     const moduleUrl = new URL('../task-store.ts', import.meta.url).href;
-    const script = `import { TaskStore } from ${JSON.stringify(moduleUrl)}; const s = new TaskStore(process.argv[1]); const n = Number(process.argv[2]); if (n % 2) s.complete('race', { winner: n }); else s.fail('race', { code: -32000 - n, message: String(n) });`;
+    const script = `import { TaskStore } from ${JSON.stringify(moduleUrl)}; const s = new TaskStore(process.argv[1], { now: () => Number(process.argv[3]) }); const n = Number(process.argv[2]); if (n % 2) s.complete('race', { winner: n }); else s.fail('race', { code: -32000 - n, message: String(n) });`;
     await Promise.all(Array.from({ length: 8 }, (_, index) => new Promise<void>((resolve, reject) => {
-      const child = spawn(process.execPath, ['--experimental-strip-types', '--input-type=module', '-e', script, f.directory, String(index)], { stdio: 'ignore' });
+      const child = spawn(process.execPath, ['--experimental-strip-types', '--input-type=module', '-e', script, f.directory, String(index), String(f.base)], { stdio: 'ignore' });
       child.once('error', reject);
       child.once('exit', (code) => code === 0 ? resolve() : reject(new Error(`terminal writer exited ${code}`)));
     })));
