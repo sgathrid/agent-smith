@@ -857,6 +857,19 @@ describe('completion notices', () => {
     expect(said.hookRuns).toBe(1);
   });
 
+  test('a notice row drops the host frame, even drawn expanded under its speaker label', async ($, on) => {
+    // Beneath the mod: the engine drawing the row's text.
+    on('ui.render', { component: 'UserMessage' }, ($: any, e: any) => $.ui.resolve(e).Text({ children: e.props.text }));
+    const text = 'The agent-smith plugin sent a message:\n  Agent Smith · ✓ hig-codex (codex review) 7m · done\n  status review-smith-7cdfd099\n\n' +
+      "  This is how Claude Code surfaces a prompt a plugin submits between turns — it starts this turn in the user's place. Address the message above.";
+    for (const isExpanded of [false, true]) {
+      const row = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', component: 'UserMessage', requestId: `row-${isExpanded}`,
+        props: { text, origin: { kind: 'plugin', name: 'agent-smith' }, isExpanded } } as never);
+      expect(await row.find({ type: 'Text', text: /^Agent Smith · ✓ hig-codex \(codex review\) 7m · done$/ })).toBeDefined();
+      expect(await row.find({ type: 'Text', text: /This is how Claude Code|sent a message|^status / })).toBeUndefined();
+    }
+  });
+
   test("another session's job finishing in the same repo is not announced here", async ($, on) => {
     const files = ada('running');
     const { clock, said } = noticeHost(on, files, ['job-ada']);

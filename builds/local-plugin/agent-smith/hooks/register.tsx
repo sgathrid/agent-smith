@@ -482,14 +482,15 @@ export function registerBand(on: Parameters<Register>[0]): void {
   });
 
   // Render our completion notices in the transcript as a single clean status
-  // line, while leaving the stored prompt (and ctrl+o expanded view) intact.
+  // line, while leaving the stored prompt Claude reads intact. Expanded rows are
+  // cleaned too: Claude Code draws a short plugin prompt expanded under its
+  // "Prompt from the agent-smith plugin" label, and ctrl+o is indistinguishable.
   on('ui.render', { component: 'UserMessage' }, async (_$, e, next) => {
     // Claude Code 2.1.300 passes the prompt's origin as `stored`; older hosts as `origin`.
     const origin = e.props.origin ?? e.props.stored;
     if (
       origin?.kind === 'plugin' &&
       origin.name === 'agent-smith' &&
-      e.props.isExpanded !== true &&
       typeof e.props.text === 'string'
     ) {
       return next({ ...e, props: { ...e.props, text: displayNoticeText(e.props.text) } });

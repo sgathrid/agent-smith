@@ -194,7 +194,7 @@ const HOST_FRAME = [
 const READ_LINE = /^(?:status|pipeline_status) /;
 
 /**
- * The text drawn for the user on a non-expanded UserMessage from this plugin:
+ * The text drawn for the user on a UserMessage from this plugin:
  * the notice's own lines, without the host frame or the read-it-with line.
  */
 export function displayNoticeText(text: string): string {
