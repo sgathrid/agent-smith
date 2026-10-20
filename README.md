@@ -14,19 +14,22 @@ Agent Smith brings Codex, OpenCode, and agy into Claude Code's delegation workfl
 
 You need **Node.js 22.18+**, a current **Claude Code**, and at least one worker CLI (`codex`, `opencode`, or `agy`) installed and authenticated. Agent Smith uses those CLIs and their configured accounts. It also supports separate `claude` workers.
 
-**Inside Claude Code:**
-
-```text
-/plugin install agent-smith --marketplace sgathrid/agent-smith
-```
-
-**Or one command in your terminal:**
+Install for **all your projects**:
 
 ```sh
 claude plugin install agent-smith --marketplace sgathrid/agent-smith
 ```
 
-Restart Claude Code in the project you want to work on. The plugin bundles its runtime; no clone or npm install is needed.
+Or from inside Claude Code: `/plugin install agent-smith --marketplace sgathrid/agent-smith`.
+
+Restart Claude Code. The plugin bundles its runtime; no clone or npm install is needed.
+
+**Only one repository?** Run the same command from inside it with a scope:
+
+- `--scope local`: just you, in this repository.
+- `--scope project`: everyone who clones it. Commit `.claude/settings.json`.
+
+Pick one scope. Installing in two means two copies to keep updated.
 
 <details>
 <summary>If your Claude Code doesn't recognize <code>--marketplace</code></summary>
@@ -44,13 +47,19 @@ The combined install requires Claude Code v2.1.275+ inside a session or v2.1.292
 
 ### Updates
 
-Claude Code doesn't auto-update third-party marketplaces unless you turn it on. Run `/plugin`, open **Marketplaces**, select `agent-smith` and choose **Enable auto-update**. Or update by hand and restart Claude Code:
+Update the scope you installed in, then restart Claude Code:
 
 ```sh
-claude plugin update agent-smith@agent-smith
+claude plugin update agent-smith@agent-smith --scope user    # all projects
+claude plugin update agent-smith@agent-smith --scope local   # run inside the repository
+claude plugin update agent-smith@agent-smith --scope project # run inside the repository
 ```
 
-Agent Smith checks for a newer release when a session starts and shows `agent-smith update available: v0.2.2 → v0.2.3` when there is one. It skips the check when `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set.
+Always pass `--scope`. Without it, a command run inside a repository can update that repository's install and leave your user-wide one behind.
+
+To update automatically, run `/plugin`, open **Marketplaces**, select `agent-smith` and choose **Enable auto-update**. Otherwise Agent Smith tells you when a session starts: `agent-smith update available: v0.2.2 → v0.2.3`. It skips that check when `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set.
+
+To remove it: `claude plugin uninstall agent-smith@agent-smith --scope <scope>`, run inside the repository for `local` or `project`.
 
 ## Try it
 
