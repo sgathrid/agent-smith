@@ -123,6 +123,7 @@ node scripts/agent-smith.mjs setup --local --repo /absolute/path/to/project
 npm run verify         # Typecheck and tests with fake providers; no model calls
 npm run smoke          # End-to-end MCP smoke test with fake providers
 npm run build:plugin   # Rebuild the plugin after source changes
+npm run bump           # Release: raise the version (patch; -- minor, -- major) and rebuild
 ```
 
 Restart Claude Code to load the rebuilt plugin. For real provider testing, see the [smoke-test guide](docs/SMOKE.md).
