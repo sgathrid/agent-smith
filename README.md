@@ -42,6 +42,16 @@ The combined install requires Claude Code v2.1.275+ inside a session or v2.1.292
 
 </details>
 
+### Updates
+
+Claude Code doesn't auto-update third-party marketplaces unless you turn it on. Run `/plugin`, open **Marketplaces**, select `agent-smith` and choose **Enable auto-update**. Or update by hand and restart Claude Code:
+
+```sh
+claude plugin update agent-smith@agent-smith
+```
+
+Agent Smith checks for a newer release when a session starts and shows `agent-smith update available: v0.2.2 → v0.2.3` when there is one. It skips the check when `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set.
+
 ## Try it
 
 Start with a review in a repository that has changes:

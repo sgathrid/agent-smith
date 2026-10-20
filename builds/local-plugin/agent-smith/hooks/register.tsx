@@ -52,6 +52,7 @@ import {
   type NativeTaskClient,
   type NativeTaskLinks,
 } from './native.ts';
+import { RELEASED_MANIFEST, manifestVersion, updateLine } from './update.ts';
 
 /** Pane id. Must match the `requestId` in the ui.render matcher below. */
 const PANE = 'agent-smith';
@@ -309,6 +310,18 @@ async function announce($: EngineInterface, repo: string, jobs: readonly RadarJo
   } finally {
     announcing = false;
   }
+}
+
+/**
+ * Toast once a session when main has released a newer version than the one
+ * installed. Never throws: offline, rate-limited or refused, it says nothing.
+ */
+async function checkForUpdate($: EngineInterface): Promise<void> {
+  if (await $.env.get('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC').catch(() => undefined)) return;
+  const current = manifestVersion(await $.fs.read(`${$.plugin.root}/.claude-plugin/plugin.json`));
+  const released = await $.http.fetch(RELEASED_MANIFEST);
+  const line = updateLine(current, released.ok ? manifestVersion(released.text) : null);
+  if (line !== null) await $.ui.toast(line);
 }
 
 /**
@@ -620,6 +633,8 @@ export const register: Register = (on) => {
     // Band first, and it never throws: a slow or failing band config must not
     // delay `/forge` appearing or take the session's start with it.
     await startBand($, typeof e.cwd === 'string' ? e.cwd : undefined);
+    // Not awaited: a slow network must not hold the session's start.
+    void checkForUpdate($).catch(() => {});
 
     await $.command
       .register({

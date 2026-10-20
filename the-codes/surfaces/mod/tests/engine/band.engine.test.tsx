@@ -781,6 +781,54 @@ test('pagination makes the tenth worker selectable', async ($, on) => {
 
 // ── completion notices: the mod takes a launch over from the command hook ────
 
+describe('update check', () => {
+  /** A host with an installed manifest at `installed` and `released` on main. */
+  function updateHost(on: (...args: any[]) => void, installed: string, released: { ok: boolean; text: string }, env: Record<string, string> = {}) {
+    const seen = { toasts: [] as string[], fetched: [] as string[] };
+    on('session.start', (_$: unknown, e: any) => ({ sessionId: 's', cwd: e.cwd }));
+    on('command.register', () => ({ value: undefined }));
+    on('env.get', (_$: unknown, e: any) => ({ value: env[e.name] }));
+    on('fs.list', () => ({ value: [] }));
+    on('fs.exists', () => ({ value: false }));
+    on('fs.read', (_$: unknown, e: any) => e.path.endsWith('/.claude-plugin/plugin.json') ? { value: JSON.stringify({ name: 'agent-smith', version: installed }) } : { deny: 'ENOENT' });
+    on('http.fetch', (_$: unknown, e: any) => { seen.fetched.push(e.url); return { value: { status: released.ok ? 200 : 404, ok: released.ok, headers: {}, text: released.text } }; });
+    on('ui.toast', (_$: unknown, e: any) => { seen.toasts.push(e.text); return { value: undefined }; });
+    const clock = mock.clock(on as never, { now: RUNNING_NOW });
+    return { seen, clock };
+  }
+  const released = (version: string) => ({ ok: true, text: JSON.stringify({ name: 'agent-smith', version }) });
+
+  test('a newer release on main is one toast naming both versions', async ($, on) => {
+    const { seen, clock } = updateHost(on, '0.2.1', released('0.2.3'));
+    await start($);
+    await clock.advance(1);
+    expect(seen.fetched).toEqual(['https://raw.githubusercontent.com/sgathrid/agent-smith/main/builds/local-plugin/agent-smith/.claude-plugin/plugin.json']);
+    expect(seen.toasts).toEqual(['agent-smith update available: v0.2.1 → v0.2.3']);
+  });
+
+  test('an installed version that matches main says nothing', async ($, on) => {
+    const { seen, clock } = updateHost(on, '0.2.3', released('0.2.3'));
+    await start($);
+    await clock.advance(1);
+    expect(seen.toasts).toEqual([]);
+  });
+
+  test('a failed fetch says nothing', async ($, on) => {
+    const { seen, clock } = updateHost(on, '0.2.1', { ok: false, text: '404: Not Found' });
+    await start($);
+    await clock.advance(1);
+    expect(seen.toasts).toEqual([]);
+  });
+
+  test('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC skips the request', async ($, on) => {
+    const { seen, clock } = updateHost(on, '0.2.1', released('0.2.3'), { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' });
+    await start($);
+    await clock.advance(1);
+    expect(seen.fetched).toEqual([]);
+    expect(seen.toasts).toEqual([]);
+  });
+});
+
 describe('completion notices', () => {
   /** forgeHost, plus what the mod says and whether the command hook beneath ran. */
   function noticeHost(on: (...args: any[]) => void, files: Record<string,string>, ids: string[]) {

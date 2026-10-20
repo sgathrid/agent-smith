@@ -74,6 +74,10 @@ declare module 'claude-code' {
     readonly env: EnvApi;
     /** Start a turn. Agent Smith uses it to hand Claude a completion notice. */
     readonly prompt: PromptApi;
+    /** This plugin as loaded: its manifest name and its directory (the one holding plugin.json). */
+    readonly plugin: { readonly name: string; readonly root: string };
+    /** Fetches through the host; the update check reads the released manifest with it. */
+    readonly http: { fetch(url: string): Promise<{ status: number; ok: boolean; text: string }> };
   }
 
   /**
