@@ -127,6 +127,8 @@ npm run build:plugin   # Rebuild the plugin after source changes
 
 Restart Claude Code to load the rebuilt plugin. For real provider testing, see the [smoke-test guide](docs/SMOKE.md).
 
+Before you open a pull request that changes the plugin, commit the rebuilt `builds/` and raise the version in `package.json` and `the-codes/surfaces/mod/.claude-plugin/plugin.json`. Users only receive a higher version, and CI checks both. [AGENTS.md](AGENTS.md) explains why, for people and coding agents alike.
+
 ## Reference
 
 - [Configuration](docs/CONFIGURATION.md) — models, permissions, MCP tools, standalone CLI, and environment variables.
