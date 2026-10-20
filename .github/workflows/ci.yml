@@ -49,3 +49,17 @@ jobs:
             echo "::error::builds/local-plugin is stale. Run 'npm run build:plugin' and commit the result."
             exit 1
           fi
+
+  plugin-version-bumped:
+    # Installed copies are keyed by version: a changed build under an unchanged
+    # version never reaches users, and `claude plugin update` says they're current.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Plugin version rises when the build changes
+        env:
+          BASE: origin/${{ github.base_ref }}
+        run: node scripts/check-version.mjs "$BASE"

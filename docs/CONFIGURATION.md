@@ -189,8 +189,8 @@ roleDefaults}`, `aliasConfigErrors?`, `modes[{name,description,readOnly,runsComm
 Result (`SpawnAck`): `jobId, name, workerId, role, provider, status:'running', dir, repo,
 timeoutMs, unrestricted, note, sandbox, sandboxFlags, readOnlyRequested, readOnlyEnforced,
 modelRequested, modelResolved, modelSource` (`requested|harness-config|reported|unknown`),
-`preambleApplied`, `warnings?`; plus `taskHandle {taskId, status, pollIntervalMs}`, `notify {mode:'hook', note, monitorCommand?,
-monitorTimeoutMs?}`, `aliasApplied?`/`aliasSource?`, and `checks` (names) when checks were
+`preambleApplied`, `warnings?`; plus `taskHandle {taskId, status, pollIntervalMs}`, `notify {mode:'hook', note,
+fallback {when, use, monitorCommand?, monitorTimeoutMs?}}`, `aliasApplied?`/`aliasSource?`, and `checks` (names) when checks were
 given.
 
 ### `resume_job`

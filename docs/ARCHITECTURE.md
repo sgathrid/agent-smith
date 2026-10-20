@@ -283,7 +283,7 @@ only (never progress), all worker text treated as untrusted data.
 Claude                MCP server (dist/server.js)      Claude Code hooks           watch-hook.js
   | spawn_job(...)  ------>  validate, write job.json,
   |                          detach pump ----------------------------> provider CLI (events -> job dir)
-  | <---- SpawnAck {jobId, dir, repo, notify{mode:'hook', monitorCommand?}} (ms)
+  | <---- SpawnAck {jobId, dir, repo, notify{mode:'hook', note, fallback}} (ms)
   |
   |   PostToolUse(matcher: mcp__plugin_agent-smith_agent-smith__{spawn_job|resume_job|run_pipeline})
   |         hook stdin JSON {tool_name, tool_response, cwd} --------> parseHookInput -> {job|run, id, repo}
@@ -299,9 +299,10 @@ Claude                MCP server (dist/server.js)      Claude Code hooks        
   `tool.call`, reads the ack from the result, claims the job or run in session
   state (`notices` atom) and writes `.agent-smith/claims/<kind>-<id>`. The hook
   watcher still starts, but at completion it finds the claim and stays silent: one
-  announcer per job. (A `classic.PostToolUse` handler does the same where the host
-  delivers that event; Claude Code 2.1.296 withholds it from user-tier modules,
-  "bypassed by cc-plugin-sec-default".)
+  announcer per job. The mod hooks no `classic.*` event: Claude Code's built-in
+  guard (`cc-plugin-sec-default`) sends `classic.PostToolUse` past user-tier
+  modules, so `tool.call` is the only path. A `status`/`pipeline_status` read of a
+  settled job on the main loop (`tool.call` with no `agentId`) retires its notice.
   It declines (calls `next`) in legacy mode, after a read error, or when the ack's
   repo is not the one it polls. Each 3 s poll announces claimed jobs that ended (or
   stalled, once), holding a pending acceptance verdict up to 5 min, with one
@@ -330,9 +331,14 @@ Claude                MCP server (dist/server.js)      Claude Code hooks        
   the server returns a protocol `resultType: 'task'` handle (`tasks.ts`) and stamps
   `_meta['io.agent-smith/task-result']: true` on the terminal result so `notice.ts` (`parseLaunch`)
   never double-announces a Tasks-managed job.
-- **Fallback**: acks carry `notify {mode:'hook', note, monitorCommand?, monitorTimeoutMs?}`;
+- **Fallback**: acks carry `notify {mode:'hook', note, fallback {when, use, monitorCommand?,
+  monitorTimeoutMs?}}`. `note` says a notice is coming; `fallback.when` names the only cases to
+  wait yourself: no notice by the job's timeout + 2 min (a run: `pipeline_status` shows it
+  ended), a headless session that can't receive messages between turns, or a subagent that
+  must return the result. Nothing runnable sits at the top level:
+  agents handed `monitorCommand` there ran it at once and heard about each job twice.
   `monitorCommand` (only when running from the built `dist/`) is `node .../monitor.js
-  --job <id>|--run <id> --cwd <repo>`, to run under Claude's Monitor tool
+  --job <id>|--run <id> --cwd <repo>`, to run in the background
   (`monitorTimeoutMs` = min(job timeout, 30 min); re-arm on expiry). Or `status wait_ms`.
   `monitor.js` with no `--job/--run` is the legacy full-scan monitor (silent baseline,
   polls every 5 s); the plugin no longer registers it.

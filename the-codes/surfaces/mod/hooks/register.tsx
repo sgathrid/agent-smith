@@ -1,6 +1,6 @@
 /** The band above the prompt and the /forge sidebar share canonical state and views. */
 import { atom, read, update } from 'claude-code';
-import type { EngineInterface, PostToolUseEvent, Register, UiRenderEvent } from 'claude-code';
+import type { EngineInterface, Register, UiRenderEvent } from 'claude-code';
 
 import type { RadarJob } from '../types/index.d.ts';
 import { isTerminal, jobLabel } from './format.ts';
@@ -52,6 +52,7 @@ import {
   type NativeTaskClient,
   type NativeTaskLinks,
 } from './native.ts';
+import { RELEASED_MANIFEST, manifestVersion, updateLine } from './update.ts';
 
 /** Pane id. Must match the `requestId` in the ui.render matcher below. */
 const PANE = 'agent-smith';
@@ -137,7 +138,7 @@ const bandConfig = atom({ plugin: 'agent-smith', key: 'bandConfig' } as const, {
 });
 
 /**
- * Launches this session claimed (see `claimLaunch`), until announced. Session
+ * Launches this session claimed (see `takeLaunch`), until announced. Session
  * state, reset by /clear: a job claimed before a /clear is not announced after
  * it, and leaves this session's view (`/forge all` still lists it).
  */
@@ -234,38 +235,24 @@ async function pollBand($: EngineInterface): Promise<void> {
 //
 // The plugin's PostToolUse command hook (watch-hook.js) can wake Claude, but
 // the host labels its exit-2 wake "Stop hook feedback", which reads as an error.
-// When this mod is loaded it claims the launch (tool.call, or
-// classic.PostToolUse where delivered) and announces it itself, with one
-// `$.prompt.submit` turn credited to this plugin. Claude Code shows that
-// message to the user in full, so it is the only notice.
+// When this mod is loaded it claims the launch (tool.call) and announces it
+// itself, with one `$.prompt.submit` turn credited to this plugin. Claude Code
+// shows that message to the user in full, so it is the only notice.
+//
+// The mod hooks `tool.call` only, never `classic.PostToolUse`: Claude Code's
+// built-in guard (cc-plugin-sec-default) sends classic.* events past user-tier
+// modules, so a classic handler here never runs and the host says so in the
+// transcript on every launch.
 
 /** Repo paths compare without trailing slashes. */
 const sameRepo = (a: string, b: string): boolean => a.replace(/\/+$/, '') === b.replace(/\/+$/, '');
 
 /**
- * Claim a launch for this session, so the mod (and only the mod) announces it.
- *
- * THE ONE DECISION POINT. Modules sit above settings and plugin command hooks
- * in the `classic.*` chain, so answering without `next` means the command hook
- * for this call never starts: there is no second announcer to race. Every case
- * the mod cannot watch calls `next`, and the hook behaves as it does without
- * the mod. The claim is the last fallible step before the answer, and there is
- * deliberately no `.catch`: a hook that throws is skipped, so the command hook
- * runs, which is the safe way to fail.
- *
- * Ownership is per session by construction: this event fires for this
- * session's own tool calls, and `notices` is session state.
- */
-async function claimLaunch($: EngineInterface, e: PostToolUseEvent, next: (e: unknown) => Promise<unknown>): Promise<unknown> {
-  const launch = parseLaunch(e.tool_name, e.tool_response);
-  if (launch === null) return next(e);
-  return await takeLaunch($, launch, typeof e.cwd === 'string' ? e.cwd : '') ? {} : next(e);
-}
-
-/**
  * Record a launch for this session's view and, where the mod can watch it,
- * claim its announcement. True when claimed. Idempotent: `tool.call` and
- * `classic.PostToolUse` may both deliver the same launch.
+ * claim its announcement. True when claimed.
+ *
+ * Ownership is per session by construction: `tool.call` fires for this
+ * session's own tool calls, and `notices` is session state.
  */
 async function takeLaunch($: EngineInterface, launch: Launch, cwd: string): Promise<boolean> {
   const cfg = await read($, bandConfig);
@@ -279,10 +266,9 @@ async function takeLaunch($: EngineInterface, launch: Launch, cwd: string): Prom
   if (!sameRepo(repo, cfg.repo)) return false;
   const at = await $.clock.now();
   await update($, notices, (owned) => claim(owned, launch, at));
-  // The hook finds this marker when the job ends and stays silent. Where the
-  // host skips user-tier modules for classic.PostToolUse (observed: "bypassed by
-  // cc-plugin-sec-default"), this marker is the only thing that stops a second
-  // notice, so the tool.call path below writes it too.
+  // The command hook still starts for every launch; it finds this marker when
+  // the job ends and stays silent. The marker is the only thing that stops a
+  // second notice.
   await $.fs.write(claimMarkerPath(cfg.repo, launch.kind, launch.id), `${new Date(at).toISOString()}\n`).catch(() => {});
   return true;
 }
@@ -324,6 +310,18 @@ async function announce($: EngineInterface, repo: string, jobs: readonly RadarJo
   } finally {
     announcing = false;
   }
+}
+
+/**
+ * Toast once a session when main has released a newer version than the one
+ * installed. Never throws: offline, rate-limited or refused, it says nothing.
+ */
+async function checkForUpdate($: EngineInterface): Promise<void> {
+  if (await $.env.get('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC').catch(() => undefined)) return;
+  const current = manifestVersion(await $.fs.read(`${$.plugin.root}/.claude-plugin/plugin.json`));
+  const released = await $.http.fetch(RELEASED_MANIFEST);
+  const line = updateLine(current, released.ok ? manifestVersion(released.text) : null);
+  if (line !== null) await $.ui.toast(line);
 }
 
 /**
@@ -471,10 +469,8 @@ export function registerBand(on: Parameters<Register>[0]): void {
     return next(e);
   });
 
-  // A launch this session made: claim it for the mod's notices (see claimLaunch).
-  on('classic.PostToolUse', { tool_name: LAUNCH_TOOL }, claimLaunch);
-  // The path that works when classic.PostToolUse is withheld from user-tier
-  // modules: wrap the launch tool, read its result, return it untouched.
+  // A launch this session made: wrap the launch tool, read its result, claim it
+  // for the mod's notices (see takeLaunch), and return the result untouched.
   on('tool.call', { tool: LAUNCH_TOOL }, async ($, e, next) => {
     const r = await next(e) as { result?: unknown; text?: unknown; deny?: string; isError?: boolean } | undefined;
     if (r && r.deny === undefined && r.isError !== true) {
@@ -486,24 +482,28 @@ export function registerBand(on: Parameters<Register>[0]): void {
 
   // When the main agent reads a job or pipeline that has already settled via
   // status / pipeline_status, retire its pending notice so we don't wake Claude
-  // a second time. A subagent's read (agent_id set) is not seen by the main
-  // agent, so it keeps the notice. tool.call carries no agent identity, so it
-  // never retires: a duplicate notice is cheap, a lost one is not.
-  on('classic.PostToolUse', { tool_name: STATUS_TOOL }, async ($, e, next) => {
-    const settled = e.agent_id === undefined ? parseSettledRead(e.tool_name, e.tool_response) : null;
-    if (settled !== null) await update($, notices, (owned) => unclaim(owned, settled)).catch(() => {});
-    return next(e);
+  // a second time. A subagent's read (agentId set) is not seen by the main
+  // agent, so it keeps the notice. A host that sends no agentId reads as the
+  // main agent; tool.call has carried it since Claude Code 2.1.304 at least.
+  on('tool.call', { tool: STATUS_TOOL }, async ($, e, next) => {
+    const r = await next(e) as { result?: unknown; text?: unknown; deny?: string; isError?: boolean } | undefined;
+    if (r && r.deny === undefined && r.isError !== true && e.agentId === undefined) {
+      const settled = parseSettledRead(e.tool, r.result) ?? parseSettledRead(e.tool, r.text);
+      if (settled !== null) await update($, notices, (owned) => unclaim(owned, settled)).catch(() => {});
+    }
+    return r;
   });
 
   // Render our completion notices in the transcript as a single clean status
-  // line, while leaving the stored prompt (and ctrl+o expanded view) intact.
+  // line, while leaving the stored prompt Claude reads intact. Expanded rows are
+  // cleaned too: Claude Code draws a short plugin prompt expanded under its
+  // "Prompt from the agent-smith plugin" label, and ctrl+o is indistinguishable.
   on('ui.render', { component: 'UserMessage' }, async (_$, e, next) => {
     // Claude Code 2.1.300 passes the prompt's origin as `stored`; older hosts as `origin`.
     const origin = e.props.origin ?? e.props.stored;
     if (
       origin?.kind === 'plugin' &&
       origin.name === 'agent-smith' &&
-      e.props.isExpanded !== true &&
       typeof e.props.text === 'string'
     ) {
       return next({ ...e, props: { ...e.props, text: displayNoticeText(e.props.text) } });
@@ -633,6 +633,8 @@ export const register: Register = (on) => {
     // Band first, and it never throws: a slow or failing band config must not
     // delay `/forge` appearing or take the session's start with it.
     await startBand($, typeof e.cwd === 'string' ? e.cwd : undefined);
+    // Not awaited: a slow network must not hold the session's start.
+    void checkForUpdate($).catch(() => {});
 
     await $.command
       .register({

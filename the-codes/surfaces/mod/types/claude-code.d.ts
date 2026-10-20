@@ -74,6 +74,10 @@ declare module 'claude-code' {
     readonly env: EnvApi;
     /** Start a turn. Agent Smith uses it to hand Claude a completion notice. */
     readonly prompt: PromptApi;
+    /** This plugin as loaded: its manifest name and its directory (the one holding plugin.json). */
+    readonly plugin: { readonly name: string; readonly root: string };
+    /** Fetches through the host; the update check reads the released manifest with it. */
+    readonly http: { fetch(url: string): Promise<{ status: number; ok: boolean; text: string }> };
   }
 
   /**
@@ -324,29 +328,10 @@ declare module 'claude-code' {
     readonly tool: string | RegExp;
   }
 
-  /**
-   * `classic.PostToolUse`: the PostToolUse settings-hook event as a module event;
-   * `e` is the hook's stdin JSON. The chain is [managed settings hooks, hooks
-   * modules, every other settings hook as core], so a module that answers
-   * without `next` keeps plugin `hooks.json` command hooks for the call from
-   * running. Every result field is optional, so `{}` is a complete answer.
-   * Only what this mod reads is declared.
-   */
-  export interface PostToolUseEvent {
-    readonly tool_name: string;
-    readonly tool_response: unknown;
-    readonly tool_use_id: string;
-    readonly session_id?: string;
-    readonly cwd?: string;
-    /** Set when the call ran inside a subagent; absent on the main thread. */
-    readonly agent_id?: string;
-  }
-
   export interface Registrar {
     (event: 'ui.render', matcher: Matcher, handler: Handler<UiRenderEvent>): void;
     (event: 'command.run', matcher: { command: string }, handler: CommandHandler): void;
     (event: 'tool.call', matcher: ToolCallMatcher, handler: Handler<ToolCallEvent>): void;
-    (event: 'classic.PostToolUse', matcher: { tool_name: string | RegExp }, handler: Handler<PostToolUseEvent>): void;
     (event: 'session.start', handler: Handler): void;
     (event: 'ui.close', handler: Handler<{ id: string }>): void;
     (event: 'ui.scroll', handler: Handler<{ component: string; requestId: string; origin: { kind: 'person' | 'plugin' }; offset: number; by: number; bodyRows: number; contentRows: number }>): void;
@@ -358,6 +343,8 @@ declare module 'claude-code' {
     readonly tool: string | RegExp;
     /** For Bash: the command line. */
     readonly command?: string;
+    /** The loop the call runs in: set in a subagent, absent on the main loop. */
+    readonly agentId?: string;
     [key: string]: unknown;
   }
 

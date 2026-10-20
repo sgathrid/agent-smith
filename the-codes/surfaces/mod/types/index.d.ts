@@ -220,7 +220,7 @@ declare module 'claude-code' {
        */
       bandConfig: { repo: string; colour: boolean; legacy: boolean };
       /**
-       * Launches this session claimed at `classic.PostToolUse`, until announced.
+       * Launches this session claimed at `tool.call`, until announced.
        * Session state on purpose: another session's jobs are never in it.
        * The shape is hooks/notice.ts `Owned`, spelled out for the validator.
        */

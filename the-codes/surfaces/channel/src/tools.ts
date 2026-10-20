@@ -82,7 +82,8 @@ const TASK_SCHEMA = open({
   status: { type: 'string', enum: TASK_STATUSES, description: 'Always working on a launch ack.' },
   pollIntervalMs: { type: 'integer', minimum: 1, description: "The server's own polling cadence; checking more often gains nothing." },
 }, ['taskId', 'status', 'pollIntervalMs']);
-const NOTIFY_SCHEMA = open({ mode: typed('string'), note: typed('string'), monitorCommand: typed('string'), monitorTimeoutMs: typed('integer') }, ['mode']);
+const NOTIFY_SCHEMA = open({ mode: typed('string'), note: typed('string'),
+  fallback: open({ when: typed('string'), use: typed('string'), monitorCommand: typed('string'), monitorTimeoutMs: typed('integer') }, ['when', 'use']) }, ['mode']);
 const STATUS_OUTPUT = open({
   ...jobFields,
   acceptance: open({
@@ -212,7 +213,8 @@ export async function defaultMixedPipeline(input: MixedSpecInput, catalogs?: Cat
 }
 // ── completion notice hint ───────────────────────────────────────────────────
 const MONITOR_CAP_MS = 1_800_000;
-const NOTIFY_NOTE = 'Completion is announced. No notice? Run monitorCommand under Monitor, or status wait_ms.';
+/** Past the job's own timeout, a missing notice means none is coming (the hook watches timeout + 60 s). */
+const NOTICE_GRACE_MS = 120_000;
 
 /** monitor.js sits at dist/monitor.js; resolvable only when running from the built dist/. */
 export function builtMonitorPath(moduleFile = fileURLToPath(import.meta.url)): string | undefined {
@@ -226,12 +228,27 @@ export function builtMonitorPath(moduleFile = fileURLToPath(import.meta.url)): s
   return undefined;
 }
 
-/** The `notify` hint attached to spawn/resume/pipeline acks. Exported for tests. */
+/**
+ * The `notify` hint attached to spawn/resume/pipeline acks. Exported for tests.
+ *
+ * It states that a notice is coming and keeps the monitor command under
+ * `fallback`, behind the one condition that calls for it: an agent handed a
+ * runnable command at the top level of an ack runs it at once, and then hears
+ * about the job twice.
+ */
 export function notifyHint(target: { job: string } | { run: string }, repo: string, timeoutMs: number | undefined, monitorFile = builtMonitorPath()) {
-  const base = { mode: 'hook' as const, note: NOTIFY_NOTE };
-  if (!monitorFile) return base;
-  const flag = 'job' in target ? `--job ${target.job}` : `--run ${target.run}`;
-  return { ...base, monitorCommand: `node "${monitorFile}" ${flag} --cwd "${repo}"`, monitorTimeoutMs: Math.min(timeoutMs ?? MONITOR_CAP_MS, MONITOR_CAP_MS) };
+  const job = 'job' in target;
+  const note = `You will be notified when this ${job ? 'job' : 'run'} ends. Silence until then is normal: don't poll or start a monitor.`;
+  const noNotice = job
+    ? `no notice has arrived ${Math.ceil(((timeoutMs ?? DEFAULT_TIMEOUT_MS) + NOTICE_GRACE_MS) / 60_000)} min after launch`
+    : 'pipeline_status shows the run ended and no notice arrived';
+  const when = `Only if ${noNotice}, this session can't receive messages between turns (headless), ` +
+    'or you are a subagent that must return this result before your turn ends.';
+  const read = job ? 'Call status with wait_ms until it settles' : 'Call pipeline_status until the run ends';
+  if (!monitorFile) return { mode: 'hook' as const, note, fallback: { when, use: `${read}.` } };
+  const flag = job ? `--job ${target.job}` : `--run ${target.run}`;
+  return { mode: 'hook' as const, note, fallback: { when, use: `${read}, or run monitorCommand in the background (it stops after monitorTimeoutMs; run it again if the ${job ? 'job' : 'run'} has not ended).`,
+    monitorCommand: `node "${monitorFile}" ${flag} --cwd "${repo}"`, monitorTimeoutMs: Math.min(timeoutMs ?? MONITOR_CAP_MS, MONITOR_CAP_MS) } };
 }
 
 /**

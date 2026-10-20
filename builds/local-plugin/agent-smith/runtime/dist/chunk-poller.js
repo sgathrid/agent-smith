@@ -122,9 +122,8 @@ function reasonFromText(text) {
  * with exit 2. Both render here, so the two paths cannot drift apart.
  *
  * Who announces is decided once per launch, when the mod sees the launch
- * (`tool.call`, or `classic.PostToolUse` where the host delivers it): the mod
- * claims the job and writes a claim marker; the command hook, if it starts at
- * all, finds the marker when the job ends and stays silent. Nothing else
+ * (`tool.call`): the mod claims the job and writes a claim marker; the command
+ * hook, which still starts, finds the marker when the job ends and stays silent. Nothing else
  * announces a claimed job (see register.tsx, `takeLaunch`).
  */
 /**
@@ -311,8 +310,7 @@ function repoAbove(file, dir) {
 }
 /**
  * The file the mod writes when it claims a launch. The command hook checks it
- * before waking Claude, so a launch is announced once even if answering
- * `classic.PostToolUse` without `next` fails to stop the hook from starting.
+ * before waking Claude, so a launch the mod claimed is announced once.
  */
 function claimMarkerPath(repo, kind, id) {
     return `${repo.replace(/\/+$/, '')}/.agent-smith/claims/${kind}-${encodeURIComponent(id)}`;
