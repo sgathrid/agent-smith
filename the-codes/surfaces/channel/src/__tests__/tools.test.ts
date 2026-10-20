@@ -155,14 +155,14 @@ test('notifyHint: a notice is promised; the monitor command waits under fallback
   // Nothing runnable at the top level: an agent runs a command it is handed.
   assert.deepEqual(Object.keys(none).sort(), ['fallback', 'mode', 'note']);
   assert.equal('monitorCommand' in none.fallback, false);
-  assert.match(none.fallback.when, /no notice has arrived 3 min after launch, or you are a subagent/);
+  assert.match(none.fallback.when, /no notice has arrived 3 min after launch, this session can't receive messages between turns \(headless\), or you are a subagent/);
   assert.equal(none.fallback.use, 'Call status with wait_ms until it settles.');
   // The deadline defaults to the job default timeout.
   assert.match(notifyHint({ job: 'j1' }, '/repo', undefined, undefined).fallback.when, /47 min/);
   const job = notifyHint({ job: 'j1' }, '/repo', 2_700_000, '/rt/dist/monitor.js') as { fallback: { use: string; monitorCommand: string; monitorTimeoutMs: number } };
   assert.equal(job.fallback.monitorCommand, 'node "/rt/dist/monitor.js" --job j1 --cwd "/repo"');
   assert.equal(job.fallback.monitorTimeoutMs, 1_800_000);
-  assert.match(job.fallback.use, /or run monitorCommand in the background/);
+  assert.match(job.fallback.use, /or run monitorCommand in the background \(it stops after monitorTimeoutMs; run it again if the job has not ended\)/);
   const run = notifyHint({ run: 'r1' }, '/repo', 120_000, '/rt/dist/monitor.js') as { note: string; fallback: { when: string; monitorCommand: string; monitorTimeoutMs: number } };
   assert.match(run.note, /this run ends/);
   assert.match(run.fallback.when, /pipeline_status shows the run ended/);

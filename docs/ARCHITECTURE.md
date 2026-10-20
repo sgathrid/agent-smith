@@ -334,7 +334,8 @@ Claude                MCP server (dist/server.js)      Claude Code hooks        
 - **Fallback**: acks carry `notify {mode:'hook', note, fallback {when, use, monitorCommand?,
   monitorTimeoutMs?}}`. `note` says a notice is coming; `fallback.when` names the only cases to
   wait yourself: no notice by the job's timeout + 2 min (a run: `pipeline_status` shows it
-  ended), or a subagent that must return the result. Nothing runnable sits at the top level:
+  ended), a headless session that can't receive messages between turns, or a subagent that
+  must return the result. Nothing runnable sits at the top level:
   agents handed `monitorCommand` there ran it at once and heard about each job twice.
   `monitorCommand` (only when running from the built `dist/`) is `node .../monitor.js
   --job <id>|--run <id> --cwd <repo>`, to run in the background

@@ -33576,12 +33576,13 @@ function notifyHint(target, repo, timeoutMs, monitorFile = builtMonitorPath()) {
     const noNotice = job
         ? `no notice has arrived ${Math.ceil(((timeoutMs ?? DEFAULT_TIMEOUT_MS$1) + NOTICE_GRACE_MS) / 60_000)} min after launch`
         : 'pipeline_status shows the run ended and no notice arrived';
-    const when = `Only if ${noNotice}, or you are a subagent that must return this result before your turn ends.`;
+    const when = `Only if ${noNotice}, this session can't receive messages between turns (headless), ` +
+        'or you are a subagent that must return this result before your turn ends.';
     const read = job ? 'Call status with wait_ms until it settles' : 'Call pipeline_status until the run ends';
     if (!monitorFile)
         return { mode: 'hook', note, fallback: { when, use: `${read}.` } };
     const flag = job ? `--job ${target.job}` : `--run ${target.run}`;
-    return { mode: 'hook', note, fallback: { when, use: `${read}, or run monitorCommand in the background.`,
+    return { mode: 'hook', note, fallback: { when, use: `${read}, or run monitorCommand in the background (it stops after monitorTimeoutMs; run it again if the ${job ? 'job' : 'run'} has not ended).`,
             monitorCommand: `node "${monitorFile}" ${flag} --cwd "${repo}"`, monitorTimeoutMs: Math.min(timeoutMs ?? MONITOR_CAP_MS, MONITOR_CAP_MS) } };
 }
 /**

@@ -68,8 +68,8 @@ worker fails because a tool was denied, ask the user before retrying with
 
 `spawn_job` returns at once and the worker runs in the background. You get a message when it
 ends, so don't poll or start your own monitor: you would hear about the job twice. A
-subagent doesn't get that message (it goes to the main conversation), so a subagent that
-must return the result follows the ack's `notify.fallback`. Live steering isn't supported:
+subagent doesn't get that message (it goes to the main conversation), and neither does a
+headless session, so in either case follow the ack's `notify.fallback`. Live steering isn't supported:
 wait for the job to finish, then follow up with `resume_job` by name or job ID.
 
 ## Reading the result
