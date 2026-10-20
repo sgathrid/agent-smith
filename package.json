@@ -17,6 +17,7 @@
     "prebuild": "[ -d the-codes/surfaces/channel/node_modules/@modelcontextprotocol/server ] || npm --prefix the-codes/surfaces/channel install --no-audit --no-fund",
     "build": "npm --prefix the-codes/surfaces/channel run build",
     "build:plugin": "npm run build && node scripts/build-plugin.mjs",
+    "bump": "node scripts/bump.mjs",
     "setup:claude": "npm run build:plugin && claude plugin validate builds/local-plugin/agent-smith && node scripts/agent-smith.mjs setup --local",
     "uninstall:claude": "node scripts/agent-smith.mjs uninstall --local",
     "test:plugin": "claude plugin validate the-codes/surfaces/mod && claude plugin test the-codes/surfaces/mod",

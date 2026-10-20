@@ -123,11 +123,12 @@ node scripts/agent-smith.mjs setup --local --repo /absolute/path/to/project
 npm run verify         # Typecheck and tests with fake providers; no model calls
 npm run smoke          # End-to-end MCP smoke test with fake providers
 npm run build:plugin   # Rebuild the plugin after source changes
+npm run bump           # Release: raise the version (patch; -- minor, -- major) and rebuild
 ```
 
 Restart Claude Code to load the rebuilt plugin. For real provider testing, see the [smoke-test guide](docs/SMOKE.md).
 
-Before you open a pull request that changes the plugin, commit the rebuilt `builds/` and raise the version in `package.json` and `the-codes/surfaces/mod/.claude-plugin/plugin.json`. Users only receive a higher version, and CI checks both. [AGENTS.md](AGENTS.md) explains why, for people and coding agents alike.
+Before you open a pull request that changes the plugin, run `npm run bump` (or `npm run bump -- minor`, `-- major`) to raise the version and rebuild, and commit the result. Users only receive a higher version, and CI checks both. [AGENTS.md](AGENTS.md) explains why, for people and coding agents alike.
 
 ## Reference
 
@@ -155,7 +156,7 @@ claude plugin uninstall agent-smith@agent-smith
 
 **No progress UI or completion notice?** Restart Claude Code after installation and check that Agent Smith is enabled in `/plugin`.
 
-**Releasing a change?** Bump the versions in `package.json` and `the-codes/surfaces/mod/.claude-plugin/plugin.json`, then run `npm run build:plugin`. Claude Code caches plugins by version.
+**Releasing a change?** Run `npm run bump` (or `-- minor`, `-- major`) and commit the result. Claude Code caches plugins by version.
 
 </details>
 

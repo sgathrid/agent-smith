@@ -1,0 +1,31 @@
+name: Release tag
+
+# Tags each released plugin version on main as agent-smith--v<version>, the
+# same name `claude plugin tag` uses. A push whose version already has a tag
+# does nothing, so only a merge that raised the version creates one.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Tag the plugin version if it is new
+        run: |
+          version=$(node -p "require('./builds/local-plugin/agent-smith/.claude-plugin/plugin.json').version")
+          tag="agent-smith--v${version}"
+          git fetch --tags --quiet
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "${tag} already exists."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898333+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${tag}" -m "agent-smith ${version}"
+          git push origin "refs/tags/${tag}"
+          echo "Created ${tag}."
