@@ -13,6 +13,8 @@ When you change anything under `the-codes/` that ends up in the build:
 
 Don't get past either check by editing `builds/` by hand or lowering the base version. Fix the source, rebuild and bump.
 
+After the merge, the `Release tag` workflow tags `main` as `agent-smith--v<version>` (the name `claude plugin tag` uses). Don't tag by hand.
+
 ## How users learn about an update
 
 - Claude Code auto-updates a third-party marketplace like this one only if the user turned auto-update on for it (README, "Updates").
