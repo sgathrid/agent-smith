@@ -8,8 +8,8 @@ Users install the committed build in `builds/local-plugin/agent-smith/`, not the
 
 When you change anything under `the-codes/` that ends up in the build:
 
-1. Run `npm run build:plugin` and commit the result. CI rebuilds and fails if `builds/` differs from source.
-2. Raise the version in **both** `package.json` (use `npm version <x.y.z> --no-git-tag-version`, which also updates the lockfile) and `the-codes/surfaces/mod/.claude-plugin/plugin.json`. Use a patch bump unless told otherwise. `scripts/check-version.mjs` fails the PR if the build changed and the version didn't rise, or if the two files disagree.
+1. Run `npm run bump` (patch) or `npm run bump -- minor`, `-- major` or `-- x.y.z`. It raises the version in `package.json`, `package-lock.json` and `the-codes/surfaces/mod/.claude-plugin/plugin.json`, then rebuilds `builds/`. Commit all of it. Use a patch bump unless told otherwise. Versions are plain `x.y.z`: the update check and CI don't understand pre-release suffixes such as `-beta.1`.
+2. CI rebuilds and fails if `builds/` differs from source. `scripts/check-version.mjs` fails the PR if the build changed and the version didn't rise, or if the version files disagree. Bump once per PR; after later source changes, run `npm run build:plugin` again.
 
 Don't get past either check by editing `builds/` by hand or lowering the base version. Fix the source, rebuild and bump.
 
