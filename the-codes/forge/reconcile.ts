@@ -31,7 +31,8 @@ export function reconcileOrphan(repo: string, jobId: string, now = Date.now()): 
     const resultBefore = readOptional(resultFile);
     const result = recoverableResult(resultBefore, manifest);
     const cancelFile = jobFile(repo, jobId, FILES.cancel);
-    const canceled = existsSync(cancelFile);
+    const cancelSteerFile = jobFile(repo, jobId, FILES.cancelSteer);
+    const canceled = existsSync(cancelFile) || existsSync(cancelSteerFile);
     const report = result === null ? null : reportFor(result);
     const verdict = result === null
       ? deriveOrphan(manifest, null, now, undefined, canceled)
@@ -42,14 +43,16 @@ export function reconcileOrphan(repo: string, jobId: string, now = Date.now()): 
       });
     if (verdict === null) return false;
     if (readFileSync(file, 'utf8') !== before || isPidAlive(manifest.ownerPid)
-        || readOptional(resultFile) !== resultBefore || existsSync(cancelFile) !== canceled) return false;
+        || readOptional(resultFile) !== resultBefore
+        || (existsSync(cancelFile) || existsSync(cancelSteerFile)) !== canceled) return false;
     if (result !== null) {
       // The provider persisted completion before the supervisor published its
       // anchor. Restore the same report/verdict, without replaying checks or
       // claiming that finish-time git attribution was captured.
       writeAtomic(jobFile(repo, jobId, FILES.report), report ?? '');
       if (readFileSync(file, 'utf8') !== before || isPidAlive(manifest.ownerPid)
-          || readOptional(resultFile) !== resultBefore || existsSync(cancelFile) !== canceled) return false;
+          || readOptional(resultFile) !== resultBefore
+          || (existsSync(cancelFile) || existsSync(cancelSteerFile)) !== canceled) return false;
       writeJsonAtomic(file, {
         ...manifest, status: verdict.status, jobStatus: result.status,
         updatedAt: result.finishedAt, finishedAt: result.finishedAt,

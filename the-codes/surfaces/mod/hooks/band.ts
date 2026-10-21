@@ -194,6 +194,7 @@ export function buildLine(
  * serves as the honest bound on "I missed the finish, and that is fine".
  */
 export function isShown(job: RadarJob, now: number): boolean {
+  if (job.supersededBy && isTerminal(job.status)) return false;
   if (!isTerminal(job.status) || job.acceptance?.pending) return true;
   if (job.endedAt === null) return false;
   return now - job.endedAt < LINGER_MS;

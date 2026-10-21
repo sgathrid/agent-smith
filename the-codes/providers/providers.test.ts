@@ -6,7 +6,7 @@ import test from 'node:test';
 import { buildArgv as buildClaudeArgv, buildResult as buildClaudeResult, createClaudeTranslator } from './claude.ts';
 import { buildArgv as buildCodexArgv, codexStderrLevel, createCodexTranslator } from './codex.ts';
 import { buildArgv as buildAgyArgv } from './agy.ts';
-import { buildArgv as buildOpencodeArgv } from './opencode.ts';
+import { buildArgv as buildOpencodeArgv, createOpencodeTranslator } from './opencode.ts';
 import { spawnWorker } from './ndjson.ts';
 import type { SpawnSpec } from './types.ts';
 
@@ -266,4 +266,21 @@ test('opencode: addDirs must NOT emit --dir, which the CLI rejects', () => {
   assert.equal(argv.includes('--dir'), false, `argv must not contain --dir: ${argv.join(' ')}`);
   assert.equal(argv.includes('/tmp/extra-a'), false);
   assert.equal(argv.includes('/tmp/extra-b'), false);
+});
+
+test('opencode translator emits a started event with conversationId on first sessionID', () => {
+  const tx = createOpencodeTranslator(10_000);
+  const first = tx.onEvent({ type: 'step_start', sessionID: 'ses_opencode_123' });
+  assert.equal(first[0]?.kind, 'started');
+  if (first[0]?.kind === 'started') {
+    assert.equal(first[0].conversationId, 'ses_opencode_123');
+  }
+
+  // Subsequent events with the same sessionID do not emit duplicate started events.
+  const second = tx.onEvent({
+    type: 'text',
+    sessionID: 'ses_opencode_123',
+    part: { type: 'text', text: 'hello' },
+  });
+  assert.equal(second.some((ev) => ev.kind === 'started'), false);
 });

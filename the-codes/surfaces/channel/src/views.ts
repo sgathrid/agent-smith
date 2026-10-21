@@ -75,6 +75,8 @@ export function conciseRow(j: JobSummary) {
     jobId: j.jobId, name: j.name, status: j.status, taskStatus: taskStatus(j.status), provider: j.provider, model: j.model, mode: j.mode,
     summary: j.latestSummary ? trimWords(j.latestSummary, CONCISE_SUMMARY_CHARS) : null,
     toolCalls: j.toolCalls, lastActivity: lastActivity(j.lastActivity), startedAt: j.startedAt, finishedAt: j.finishedAt,
+    supersededBy: j.supersededBy ?? null, steeredFrom: j.steeredFrom ?? null,
+    pendingSteers: j.pendingSteers ? j.pendingSteers : null,
     nextAction: j.nextAction, warningCount: j.warnings.length || null,
   });
 }
@@ -103,8 +105,11 @@ export function conciseStatus(d: JobDetail, acceptance: AcceptanceView | null, e
     acceptance: checkVerdicts(acceptance),
     startedAt: d.startedAt, finishedAt: d.finishedAt, durationMs: Number.isNaN(started) ? null : Math.max(0, ended - started),
     toolCalls: d.toolCalls, lastActivity: lastActivity(d.lastActivity),
+    supersededBy: d.supersededBy ?? null, steeredFrom: d.steeredFrom ?? null,
+    pendingSteers: d.pendingSteers ? d.pendingSteers : null,
     changedFileCount: d.changedFiles ? files.length : null, changedFiles: files.length ? files.slice(0, CONCISE_FILES_CAP) : null,
     changedFilesNote: files.length > CONCISE_FILES_CAP || d.changedFilesTruncated ? `First ${Math.min(files.length, CONCISE_FILES_CAP)} shown; ${DETAIL_HINT} or include_diff for all.` : null,
+    staleReads: d.staleReads?.length ? d.staleReads : null,
     nextAction: d.nextAction, reason: failedReason(d), error: d.error ? trimWords(d.error, 500) : null,
     warnings: warnings.length ? warnings : null,
     summary: summary && !report.includes(summary) ? trimWords(summary, 300) : null,

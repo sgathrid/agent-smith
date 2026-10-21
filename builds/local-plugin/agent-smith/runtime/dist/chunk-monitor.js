@@ -87,16 +87,32 @@ async function runJobWatch(options) {
     const runIds = [...new Set(options.runIds ?? [])];
     const seen = new Map();
     const done = new Set();
-    const startedAt = now();
+    let startedAt = now();
     while (!options.signal?.aborted) {
         try {
             const t = now();
             const jobs = new Map();
             const want = new Set(jobIds);
-            for (const id of jobIds) {
+            for (let i = 0; i < jobIds.length; i++) {
+                const id = jobIds[i];
                 const job = await rj(options.cwd, id, t);
-                if (job)
-                    jobs.set(job.id, job);
+                if (!job)
+                    continue;
+                jobs.set(job.id, job);
+                if (job.supersededBy && job.supersededBy !== job.id) {
+                    if (jobIds.includes(job.supersededBy)) {
+                        done.add(job.id);
+                    }
+                    else {
+                        const childJob = await rj(options.cwd, job.supersededBy, t);
+                        if (childJob) {
+                            done.add(job.id);
+                            jobIds.push(job.supersededBy);
+                            want.add(job.supersededBy);
+                            startedAt = t;
+                        }
+                    }
+                }
             }
             for (const id of runIds) {
                 const rec = await rr(options.cwd, id);
@@ -126,6 +142,11 @@ async function runJobWatch(options) {
             }
             for (const id of want) {
                 const job = jobs.get(id);
+                if (job?.supersededBy) {
+                    if (want.has(job.supersededBy))
+                        done.add(id);
+                    continue;
+                }
                 if (job && TERMINAL.has(job.status) && (seen.get(id)?.has(dedupeKey(job)) ?? false))
                     done.add(id);
             }

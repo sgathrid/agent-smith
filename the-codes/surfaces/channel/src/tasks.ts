@@ -28,7 +28,7 @@ export class ForgeTasks {
     const taskId = randomUUID();
     let task: TaskRecord | undefined;
     const result = await callTool({ ...context, onJobPrepared: jobId => {
-      task = this.store.create({ taskId, jobId });
+      task = task ? this.store.rebindJob(taskId, jobId) : this.store.create({ taskId, jobId });
       context.onJobPrepared?.(jobId);
     } }, name, args);
     // Validation and MRTR approval both happen before onPrepared. Ordinary tool
@@ -62,13 +62,17 @@ export class ForgeTasks {
       else {
         let detail;
         try {
-          detail = await this.context.service.detail(jobId);
+          const headId = typeof this.context.service.resolveHead === 'function'
+            ? this.context.service.resolveHead(jobId)
+            : jobId;
+          if (headId !== jobId) task = this.store.rebindJob(taskId, headId);
+          detail = await this.context.service.detail(headId);
         } catch (err) {
           task = this.store.fail(taskId, { code: ProtocolErrorCode.InternalError, message: `Linked Forge job is unreadable: ${err instanceof Error ? err.message : String(err)}` });
         }
         if (detail) {
-          const acceptance = readAcceptance(this.context.service.repo, jobId);
-          if (['succeeded', 'failed', 'canceled'].includes(detail.status) && !('pending' in acceptance && acceptance.pending)) {
+          const acceptance = readAcceptance(this.context.service.repo, detail.jobId);
+          if (['succeeded', 'failed', 'canceled'].includes(detail.status) && !detail.supersededBy && !('pending' in acceptance && acceptance.pending)) {
             if (detail.status === 'canceled') task = this.store.cancel(taskId);
             else {
               const result = structured(fullStatus(detail, acceptance));

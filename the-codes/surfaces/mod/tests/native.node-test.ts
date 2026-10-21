@@ -154,3 +154,29 @@ test('a job this session does not own gets no new task, but an existing link sti
   assert.equal(closed['job-x']?.status, 'deleted');
   assert.equal(calls.filter((c) => c.method === 'create').length, 0);
 });
+
+test('syncNativeTasks transfers an in_progress native task across supersededBy without closing the parent task', async () => {
+  const calls: Array<{ method: string; input: Record<string, unknown> }> = [];
+  const client: NativeTaskClient = {
+    async create(input) { calls.push({ method: 'create', input }); return { result: { task: { id: 'native-1' } } }; },
+    async update(input) { calls.push({ method: 'update', input }); return { result: { success: true } }; },
+  };
+  const parent = {
+    id: 'turn-1', status: 'running' as const, task: 'Build nav', name: 'shell', workerId: 'shell', role: 'implement',
+    provider: 'codex', model: null, latestSummary: null, summarySource: null,
+  };
+  const linked = await syncNativeTasks([parent], {}, client, 1000);
+  assert.equal(linked['turn-1']?.taskId, 'native-1');
+
+  const supersededParent = { ...parent, status: 'canceled' as const, supersededBy: 'turn-2' };
+  const child = {
+    ...parent, id: 'turn-2', status: 'running' as const, steeredFrom: 'turn-1',
+    latestSummary: 'Pivoting to profile menu.', summarySource: 'worker' as const,
+  };
+  const transferred = await syncNativeTasks([supersededParent, child], linked, client, 2000);
+  assert.equal(transferred['turn-1'], undefined, 'parent link moved to child');
+  assert.equal(transferred['turn-2']?.taskId, 'native-1');
+  assert.equal(transferred['turn-2']?.status, 'in_progress');
+  assert.equal(calls.filter((c) => c.method === 'create').length, 1, 'did not create a second native task');
+  assert.equal(calls.some((c) => c.input.status === 'completed'), false, 'did not mark parent completed');
+});

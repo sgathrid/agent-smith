@@ -216,6 +216,11 @@ function headline(job) {
             parts.push(`stalled${d ? ` ${d}` : ''}`);
             break;
     }
+    if (job.staleReads && job.staleReads.length > 0) {
+        const first = job.staleReads[0];
+        const extra = job.staleReads.length > 1 ? ` +${job.staleReads.length - 1}` : '';
+        parts.push(`stale brief: ${first}${extra}`);
+    }
     return parts.join(' · ');
 }
 const CLAUDE_JOBS = 8;
@@ -294,8 +299,8 @@ function unwrapResponse(response, depth = 0) {
         return unwrapResponse(response['content'], depth + 1);
     return response;
 }
-/** The three launch tools, by bare name. */
-const LAUNCH = { spawn_job: 'job', resume_job: 'job', run_pipeline: 'run' };
+/** The launch tools, by bare name. */
+const LAUNCH = { spawn_job: 'job', resume_job: 'job', steer_job: 'job', run_pipeline: 'run' };
 function launchKind(toolName) {
     if (typeof toolName !== 'string')
         return null;
@@ -466,6 +471,10 @@ function dedupeKey(job, epoch = 0) {
  */
 function shouldPush(candidate, now) {
     const { job, seen } = candidate;
+    // A superseded turn is an intermediate step in a steered worker chain; its
+    // continuation owns the terminal announcement.
+    if (job.supersededBy)
+        return false;
     // Gate 1 — is this state speakable at all?
     const kind = pushKindFor(job);
     if (kind === null)
@@ -537,6 +546,7 @@ function toNotice(job, kind, now) {
         checks: job.checks ?? null,
         reason: run ? job.outcome : kind === 'failed' ? reasonFromText(job.failureReason) : null,
         summary: job.summarySource === 'worker' ? job.latestSummary ?? null : null,
+        ...(job.staleReads && job.staleReads.length > 0 ? { staleReads: job.staleReads } : {}),
     };
 }
 // ── meta ────────────────────────────────────────────────────────────────────
@@ -835,6 +845,16 @@ const FILES = {
     result: 'result.json',
     report: 'result.md',
     cancel: 'cancel',
+    /** Marker written when a steer interrupts a running turn across or within processes. */
+    cancelSteer: 'cancel.steer',
+    /** Append-only NDJSON log of SteerEntry records for this job. */
+    steer: 'steer.jsonl',
+    /**
+     * Child job ID, written after the continuation anchor exists but before the
+     * parent's terminal manifest stamps `supersededBy`. Closes the finish window
+     * for `resolveHead` readers (cancel/status) during a chained turn.
+     */
+    steerHead: 'steer.head',
     /** Written by the first reader to prove the owner is dead. Never edits job.json. */
     orphaned: 'orphaned',
 };
@@ -1380,6 +1400,14 @@ class AgentSmithReader {
             [SMITH_PAYLOAD.lastActivity]: progress?.lastActivity ?? null,
             [SMITH_PAYLOAD.latestText]: progress?.latestText ?? null,
             [SMITH_PAYLOAD.progressWarnings]: progress?.warnings ?? [],
+            ...(manifest?.supersededBy !== undefined ? { supersededBy: manifest.supersededBy } : {}),
+            ...(manifest?.steeredFrom !== undefined ? { steeredFrom: manifest.steeredFrom } : {}),
+            ...(typeof (progress?.pendingSteers ?? manifest?.pendingSteers) === 'number'
+                ? { pendingSteers: progress?.pendingSteers ?? manifest?.pendingSteers }
+                : {}),
+            ...(Array.isArray(manifest?.staleReads) && manifest.staleReads.length > 0
+                ? { staleReads: manifest.staleReads }
+                : {}),
         };
         // partial=true when the anchor is missing: something is on disk for this
         // job but we could not read the file that says what state it is in. The
@@ -3317,6 +3345,11 @@ async function readOne(reader, source, cwd, jobId, now) {
         lastEventAt: observed.updatedAt,
         finishedAt: observed.finishedAt,
         warned,
+        supersededBy: typeof raw['supersededBy'] === 'string' && raw['supersededBy'] !== '' ? raw['supersededBy'] : null,
+        steeredFrom: typeof raw['steeredFrom'] === 'string' && raw['steeredFrom'] !== '' ? raw['steeredFrom'] : null,
+        ...(Array.isArray(raw['staleReads']) && raw['staleReads'].length > 0
+            ? { staleReads: raw['staleReads'].filter((f) => typeof f === 'string' && f.trim() !== '') }
+            : {}),
     };
 }
 /**

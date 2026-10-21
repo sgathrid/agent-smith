@@ -26,13 +26,14 @@ judge it and what its mode asks of it. You supply the rest in `spawn_job`:
 - `context`: why the work matters and who it's for. A worker that knows the purpose makes
   better calls on the details you didn't specify.
 - `cwd`: the absolute directory to work in. It defaults to the server's repository.
+- `files`: relative paths of shared brief or spec files in the repository. When `cwd` is a worktree, Agent Smith syncs them into `cwd` before the worker runs (and re-syncs them on `steer_job` or `resume_job`), and `status` reports `staleReads` if you edit them in the repository while the worker is running.
 - `checks`: commands that decide acceptance, such as tests or a build. The worker sees them
   as its definition of done, and they run after it finishes. Prefer them to asking the
   worker to verify its own work.
 - `mode`: `implement`, `review`, `moderate` or `verify`. Review and moderate request
   read-only access. The ack's `readOnlyEnforced` says whether the provider actually enforces
   that, so don't assume a reviewer can't write.
-- `name`: a readable worker name, so you and the user can follow up with `resume_job`.
+- `name`: a readable worker name, so you and the user can steer it while running (`steer_job`) or follow up after it finishes (`resume_job`).
 
 For an implement, review and moderate chain, `run_pipeline` runs the stages for you, and
 each stage takes `context` and `checks` the same way.
@@ -69,8 +70,15 @@ worker fails because a tool was denied, ask the user before retrying with
 `spawn_job` returns at once and the worker runs in the background. You get a message when it
 ends, so don't poll or start your own monitor: you would hear about the job twice. A
 subagent doesn't get that message (it goes to the main conversation), and neither does a
-headless session, so in either case follow the ack's `notify.fallback`. Live steering isn't supported:
-wait for the job to finish, then follow up with `resume_job` by name or job ID.
+headless session, so in either case follow the ack's `notify.fallback`. To send new
+instructions or a course correction while a worker is still running, call `steer_job` with
+`delivery: "queue"` (chaining a follow-up turn as soon as the current turn finishes) or
+`delivery: "interrupt"` (stopping the current turn and immediately resuming with your
+instructions; the in-flight tool call is lost). If the provider has not reported a
+conversation handle before the turn ends, the continuation starts fresh; the ack's
+`resumable` says whether one was known, and a delivery warning on the terminal job means a
+queued steer was not applied. Once a worker has finished, follow up with `resume_job` by
+name or job ID.
 
 ## Reading the result
 

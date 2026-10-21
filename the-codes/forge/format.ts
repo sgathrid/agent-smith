@@ -125,9 +125,35 @@ export const FILES = {
   result: 'result.json',
   report: 'result.md',
   cancel: 'cancel',
+  /** Marker written when a steer interrupts a running turn across or within processes. */
+  cancelSteer: 'cancel.steer',
+  /** Append-only NDJSON log of SteerEntry records for this job. */
+  steer: 'steer.jsonl',
+  /**
+   * Child job ID, written after the continuation anchor exists but before the
+   * parent's terminal manifest stamps `supersededBy`. Closes the finish window
+   * for `resolveHead` readers (cancel/status) during a chained turn.
+   */
+  steerHead: 'steer.head',
   /** Written by the first reader to prove the owner is dead. Never edits job.json. */
   orphaned: 'orphaned',
 } as const;
+
+export type SteerDelivery = 'queue' | 'interrupt';
+
+export interface WatchedFileSigs {
+  readonly repoSig: string;
+  readonly cwdSig: string;
+}
+
+export interface SteerEntry {
+  readonly id: string;
+  readonly createdAt: string;
+  readonly prompt: string;
+  readonly context?: string | undefined;
+  readonly files?: readonly string[] | undefined;
+  readonly delivery: SteerDelivery;
+}
 
 /**
  * The id segment that marks a job as OURS.
@@ -256,6 +282,16 @@ export interface ForgeManifest {
    * Present only when the job's tool inputs were captured.
    */
   readonly unattributedFiles?: readonly string[];
+  /** Continuation job ID when this turn was superseded by a steered turn. */
+  readonly supersededBy?: string | null;
+  /** Parent job ID when this turn was created by steering an earlier turn. */
+  readonly steeredFrom?: string | null;
+  /** Number of unconsumed queued steers in steer.jsonl. */
+  readonly pendingSteers?: number;
+  /** Declared brief/spec files synced at turn start, mapped to their repo + cwd signatures. */
+  readonly watchedFiles?: Readonly<Record<string, WatchedFileSigs>>;
+  /** Watched brief/spec files that diverged in repo (or externally in cwd) while the turn ran. */
+  readonly staleReads?: readonly string[];
 }
 
 export interface GitBaseline {
@@ -331,6 +367,8 @@ export interface ForgeProgress {
   readonly warnings: readonly string[];
   /** What the worker has done so far, from its tool calls. */
   readonly digest?: ProgressDigest;
+  /** Number of unconsumed queued steers in steer.jsonl. */
+  readonly pendingSteers?: number;
 }
 
 export type ForgeViewEvent =

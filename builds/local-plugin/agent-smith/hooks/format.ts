@@ -442,6 +442,7 @@ export function jobDetail(job: RadarJob, options: { tools?: boolean } = {}): str
  * whose checks failed is not done, whatever the worker said.
  */
 export function outcome(job: RadarJob): string {
+  if (job.supersededBy && isTerminal(job.status)) return 'steered';
   switch (job.status) {
     case 'running':
       return '';

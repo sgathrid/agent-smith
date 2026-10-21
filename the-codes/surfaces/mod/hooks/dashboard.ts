@@ -18,8 +18,9 @@ function expired(job: RadarJob, now?: number): boolean {
 export function needsAttention(job: RadarJob, now?: number): boolean {
   return !expired(job, now) && (job.status === 'attention' || job.status === 'failed' || job.acceptance?.state === 'rejected');
 }
-/** Still executing, or finished with checks still running. */
+/** Still executing, or finished with checks still running (unless superseded by a steered turn). */
 export function isLive(job: RadarJob): boolean {
+  if (job.supersededBy && isTerminal(job.status)) return false;
   return !isTerminal(job.status) || job.acceptance?.pending === true;
 }
 /** The sidebar list: one row per worker, running first, then settled work, most recent first. */
@@ -39,6 +40,7 @@ export function workerHeading(job: RadarJob): string {
   return `${jobLabel(job)}${role ? ` · ${role}` : ''}`;
 }
 export function workerStatus(job: RadarJob): string {
+  if (job.supersededBy && isTerminal(job.status)) return 'steered';
   if (job.acceptance?.pending && isTerminal(job.status)) return `${job.status === 'succeeded' ? 'done' : job.status} · checking`;
   if (job.status === 'failed') {
     const why = failureWords(job);
@@ -86,9 +88,24 @@ export function recordLaunch(prev: Launched, launch: { readonly kind: 'job' | 'r
   const key = launch.kind === 'job' ? 'jobs' : 'runs';
   return prev[key].includes(launch.id) ? prev : { ...prev, [key]: [...prev[key], launch.id] };
 }
-/** The jobs this session launched, and the stage jobs of the pipeline runs it launched. */
+/** The jobs this session launched (including steered continuations), and the stage jobs of the pipeline runs it launched. */
 export function sessionJobs(jobs: readonly RadarJob[], launched: Launched): RadarJob[] {
-  return jobs.filter((job) => launched.jobs.includes(job.id) || (job.pipeline != null && launched.runs.includes(job.pipeline)));
+  const ownedIds = new Set(launched.jobs);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const job of jobs) {
+      if (ownedIds.has(job.id) && job.supersededBy && !ownedIds.has(job.supersededBy)) {
+        ownedIds.add(job.supersededBy);
+        changed = true;
+      }
+      if (job.steeredFrom && ownedIds.has(job.steeredFrom) && !ownedIds.has(job.id)) {
+        ownedIds.add(job.id);
+        changed = true;
+      }
+    }
+  }
+  return jobs.filter((job) => ownedIds.has(job.id) || (job.pipeline != null && launched.runs.includes(job.pipeline)));
 }
 /** `2 running · 1 failed · 3 finished`: one count per listed worker, zeros left out; '' for none. */
 export function countLine(jobs: readonly RadarJob[]): string {

@@ -295,11 +295,22 @@ async function announce($: EngineInterface, repo: string, jobs: readonly RadarJo
       }
     }
     const result = due(owned, jobs, runs, at);
-    const changed = result.notices.length > 0 || result.owned.length !== owned.length;
+    const ownedChanged =
+      result.owned.length !== owned.length ||
+      result.owned.some((o, i) => o.id !== owned[i]?.id || o.kind !== owned[i]?.kind || o.saidAttention !== owned[i]?.saidAttention);
+    const changed = result.notices.length > 0 || ownedChanged;
     if (!changed) return;
+    for (const o of result.owned) {
+      if (!owned.some((prev) => prev.kind === o.kind && prev.id === o.id)) {
+        await $.fs.write(claimMarkerPath(repo, o.kind, o.id), `${new Date(at).toISOString()}\n`).catch(() => {});
+      }
+    }
     // Record before speaking, so a notice is said once even if the turn it
     // asks for never starts. Claims made since the read above are kept.
-    const seen = new Set(owned.map((o) => `${o.kind}:${o.id}`));
+    const seen = new Set([
+      ...owned.map((o) => `${o.kind}:${o.id}`),
+      ...result.owned.map((o) => `${o.kind}:${o.id}`),
+    ]);
     await update($, notices, (current) => [...result.owned, ...current.filter((c) => !seen.has(`${c.kind}:${c.id}`))]);
     if (result.notices.length === 0) return;
     // Resolves when the turn starts, which waits for the session to be idle.
