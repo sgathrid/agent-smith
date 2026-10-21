@@ -287,10 +287,10 @@ export interface CancelResult {
   /** The chain head that was asked to stop (the given id when it was already the head). */
   readonly jobId: string;
   /**
-   * When a superseded parent id was given, the continuation that was actually
-   * cancelled. Absent when the given id was already the head.
+   * The superseded parent id the caller passed, when it differs from `jobId`.
+   * Absent when the given id was already the head.
    */
-  readonly supersededBy?: string | null;
+  readonly resolvedFrom?: string;
   readonly requested: boolean;
   /** True when a live worker in THIS process was actually signalled. */
   readonly signalled: boolean;
@@ -1118,12 +1118,12 @@ export class ForgeService {
       }
     }
 
-    const supersededBy = headId !== jobId ? headId : null;
+    const resolvedFrom = headId !== jobId ? jobId : null;
     const headLive = this.live.get(headId);
     if (headLive === undefined) {
       return {
         jobId: headId,
-        ...(supersededBy === null ? {} : { supersededBy }),
+        ...(resolvedFrom === null ? {} : { resolvedFrom }),
         requested: true,
         signalled: false,
         note: 'Cancel recorded; no live worker here to signal directly. A live owning supervisor will stop it.',
@@ -1132,7 +1132,7 @@ export class ForgeService {
 
     return {
       jobId: headId,
-      ...(supersededBy === null ? {} : { supersededBy }),
+      ...(resolvedFrom === null ? {} : { resolvedFrom }),
       requested: true,
       signalled: headLive.handle !== null,
       note: headLive.handle === null
@@ -1248,7 +1248,7 @@ export class ForgeService {
       resumable,
       repo: this.repo,
       dir: jobDir(this.repo, target.jobId),
-      timeoutMs: live?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      timeoutMs: live?.timeoutMs ?? latestManifest.timeoutMs ?? DEFAULT_TIMEOUT_MS,
       note,
     };
   }
@@ -1553,6 +1553,7 @@ export function toSummary(observed: ObservedJob, source: 'agent-smith' | 'agy-st
       exitCode: typeof raw['exit_code'] === 'number' ? raw['exit_code'] : null,
       deniedCount: Array.isArray(raw['denied_actions']) ? raw['denied_actions'].length : 0,
       unrestricted: raw['unrestricted'] === true,
+      steerNotApplied: observed.warnings.some((w) => w.code === 'steer_not_applied'),
     }),
     mode: observed.mode,
     model: observed.model,

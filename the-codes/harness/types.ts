@@ -156,6 +156,8 @@ export type ObservedWarningCode =
   | "suspicious_success"
   /** Provider reported a tool/API error somewhere during the run. */
   | "tool_error"
+  /** A queued steer was dropped because the turn it waited on did not succeed. */
+  | "steer_not_applied"
   /** The job was cancelled. */
   | "canceled"
   /** The result text was found polluted and had to be cleaned. */

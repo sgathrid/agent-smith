@@ -38,8 +38,8 @@ judge it and what its mode asks of it. You supply the rest in `spawn_job`:
 For an implement, review and moderate chain, `run_pipeline` runs the stages for you, and
 each stage takes `context` and `checks` the same way.
 
-Call `list_capabilities` before choosing provider, model or effort; it lists what is
-installed and what each model accepts. A provider with many models shows a count; pass
+`list_capabilities` lists what is installed and what each model accepts, and an invalid
+choice is rejected with the valid ones. A provider with many models shows a count; pass
 `provider` to list them. Use the model the user asked for.
 
 ## Choosing a provider
@@ -70,15 +70,14 @@ worker fails because a tool was denied, ask the user before retrying with
 `spawn_job` returns at once and the worker runs in the background. You get a message when it
 ends, so don't poll or start your own monitor: you would hear about the job twice. A
 subagent doesn't get that message (it goes to the main conversation), and neither does a
-headless session, so in either case follow the ack's `notify.fallback`. To send new
-instructions or a course correction while a worker is still running, call `steer_job` with
-`delivery: "queue"` (chaining a follow-up turn as soon as the current turn finishes) or
-`delivery: "interrupt"` (stopping the current turn and immediately resuming with your
-instructions; the in-flight tool call is lost). If the provider has not reported a
-conversation handle before the turn ends, the continuation starts fresh; the ack's
-`resumable` says whether one was known, and a delivery warning on the terminal job means a
-queued steer was not applied. Once a worker has finished, follow up with `resume_job` by
-name or job ID.
+headless session, so in either case follow the ack's `notify.fallback`.
+
+To redirect a worker that is still running, use `steer_job`. `queue` suits an addition: the
+worker finishes its current turn first, but the steer is dropped if that turn fails.
+`interrupt` suits a worker heading the wrong way: it stops now, at the cost of the tool call
+in flight. Each steer starts a new turn with its own job ID, so refer to the worker by name;
+`status` lists the earlier turns' reports in `earlierTurns`. Once a worker has finished,
+follow up with `resume_job`.
 
 ## Reading the result
 

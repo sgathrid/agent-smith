@@ -269,6 +269,7 @@ async function readOne(
     warned,
     supersededBy: typeof raw['supersededBy'] === 'string' && raw['supersededBy'] !== '' ? raw['supersededBy'] : null,
     steeredFrom: typeof raw['steeredFrom'] === 'string' && raw['steeredFrom'] !== '' ? raw['steeredFrom'] : null,
+    ...(observed.warnings.some((w) => w.code === 'steer_not_applied') ? { steerNotApplied: true } : {}),
     ...(Array.isArray(raw['staleReads']) && raw['staleReads'].length > 0
       ? { staleReads: raw['staleReads'].filter((f): f is string => typeof f === 'string' && f.trim() !== '') }
       : {}),

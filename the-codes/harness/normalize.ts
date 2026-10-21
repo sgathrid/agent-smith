@@ -19,6 +19,7 @@
  */
 
 import { SCHEMA_VERSION } from "../forge/format.ts";
+import { STEER_NOT_APPLIED_RE } from "../surfaces/mod/hooks/reasons.ts";
 import { AGY_PAYLOAD } from "./agy-staff.ts";
 import { SMITH_PAYLOAD } from "./agent-smith.ts";
 import { CLAUDE_PAYLOAD } from "./claude-code.ts";
@@ -377,7 +378,7 @@ const smithNormalizer: JobNormalizer = (raw: RawJobState): ObservedJob => {
   }
 
   for (const w of progressWarnings) {
-    warnings.push({ code: "tool_error", message: w });
+    warnings.push({ code: STEER_NOT_APPLIED_RE.test(w) ? "steer_not_applied" : "tool_error", message: w });
   }
 
   let resolved: ObservedStatus;

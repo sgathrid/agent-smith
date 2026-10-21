@@ -36,6 +36,7 @@ export interface NoticeRow {
   readonly summarySource?: 'worker' | null;
   readonly supersededBy?: string | null;
   readonly steeredFrom?: string | null;
+  readonly warnings?: readonly { readonly code: string }[] | null;
   readonly staleReads?: readonly string[] | null;
   readonly acceptance?: { readonly pending?: boolean; readonly checks: readonly { readonly ok: boolean; readonly name?: string }[] };
 }
@@ -71,6 +72,10 @@ export interface NoticeJob {
   readonly summary?: string | null;
   /** Watched brief files that changed in the repository while the job ran. */
   readonly staleReads?: readonly string[] | null;
+  /** This turn came after a steer, so its report covers only this turn. */
+  readonly steered?: boolean;
+  /** A queued steer was dropped because this turn did not succeed. */
+  readonly steerNotApplied?: boolean;
   /** A pipeline run: the id is a runId and Claude reads it with pipeline_status. */
   readonly run?: boolean;
 }
@@ -128,6 +133,8 @@ function rejected(job: NoticeJob): boolean {
  *   ✓ Ada (codex review) 43s · done · checks 2/2
  *   ✗ Bo (agy implement) 45m · failed: timed out
  *   ✗ Cy (codex implement) 3m · checks failed: lint
+ *   ✓ Ed (codex review) 6s · done · after steer
+ *   ✗ Flo (codex review) 4s · failed: timed out · queued steer not applied
  *   ! Di (opencode research) · stalled 16m
  */
 export function headline(job: NoticeJob): string {
@@ -149,6 +156,8 @@ export function headline(job: NoticeJob): string {
     case 'cancelled': parts.push('canceled'); break;
     case 'attention': parts.push(`stalled${d ? ` ${d}` : ''}`); break;
   }
+  if (job.steered) parts.push('after steer');
+  if (job.steerNotApplied) parts.push('queued steer not applied');
   if (job.staleReads && job.staleReads.length > 0) {
     const first = job.staleReads[0]!;
     const extra = job.staleReads.length > 1 ? ` +${job.staleReads.length - 1}` : '';
@@ -368,6 +377,8 @@ export function noticeFromRadar(job: NoticeRow, kind: NoticeKind, now: number): 
     reason: kind === 'failed' ? job.failureDetail || reasonFromText(job.failureReason) : null,
     summary: job.summarySource === 'worker' ? job.latestSummary ?? null : null,
     ...(job.staleReads && job.staleReads.length > 0 ? { staleReads: job.staleReads } : {}),
+    ...(job.steeredFrom ? { steered: true } : {}),
+    ...(job.warnings?.some((w) => w.code === 'steer_not_applied') ? { steerNotApplied: true } : {}),
   };
 }
 

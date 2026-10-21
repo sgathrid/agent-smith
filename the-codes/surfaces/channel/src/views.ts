@@ -11,6 +11,8 @@ export const CONCISE_LIST_LIMIT = 20;
 export const CONCISE_SUMMARY_CHARS = 200;
 export const CONCISE_REPORT_CHARS = 2_000;
 export const CONCISE_FILES_CAP = 20;
+export const EARLIER_TURNS_CAP = 5;
+export const EARLIER_REPORT_CHARS = 600;
 export const OUTPUT_TAIL_CHARS = 500;
 export const DIFF_MAX_CHARS = 40_000;
 const DETAIL_HINT = 'use response_format: "detailed"';
@@ -118,6 +120,19 @@ export function conciseStatus(d: JobDetail, acceptance: AcceptanceView | null, e
     summary: summary && !report.includes(summary) ? trimWords(summary, 300) : null,
     report: report ? (cut ? `${report.slice(0, CONCISE_REPORT_CHARS)}\n…[truncated: ${CONCISE_REPORT_CHARS} of ${report.length} chars; ${DETAIL_HINT} for more]` : report) : null,
     reportTruncated: cut, ...extra,
+  });
+}
+
+/**
+ * One earlier turn of a steered worker. The head's report covers only its own
+ * turn, so status lists the turns before it rather than leaving them to a walk
+ * Claude cannot make: status on an earlier ID resolves back to the head.
+ */
+export function earlierTurn(d: JobDetail, reportPath: string, fmt: ResponseFormat) {
+  const report = d.report ?? '';
+  return compact({
+    jobId: d.jobId, status: d.status, finishedAt: d.finishedAt,
+    report: report ? (fmt === 'concise' ? trimWords(report, EARLIER_REPORT_CHARS) : report) : null, reportPath,
   });
 }
 

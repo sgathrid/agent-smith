@@ -72,6 +72,8 @@ function rejected(job) {
  *   ✓ Ada (codex review) 43s · done · checks 2/2
  *   ✗ Bo (agy implement) 45m · failed: timed out
  *   ✗ Cy (codex implement) 3m · checks failed: lint
+ *   ✓ Ed (codex review) 6s · done · after steer
+ *   ✗ Flo (codex review) 4s · failed: timed out · queued steer not applied
  *   ! Di (opencode research) · stalled 16m
  */
 function headline(job) {
@@ -102,6 +104,10 @@ function headline(job) {
             parts.push(`stalled${d ? ` ${d}` : ''}`);
             break;
     }
+    if (job.steered)
+        parts.push('after steer');
+    if (job.steerNotApplied)
+        parts.push('queued steer not applied');
     if (job.staleReads && job.staleReads.length > 0) {
         const first = job.staleReads[0];
         const extra = job.staleReads.length > 1 ? ` +${job.staleReads.length - 1}` : '';
@@ -433,6 +439,8 @@ function toNotice(job, kind, now) {
         reason: run ? job.outcome : kind === 'failed' ? job.failureDetail || reasonFromText(job.failureReason) : null,
         summary: job.summarySource === 'worker' ? job.latestSummary ?? null : null,
         ...(job.staleReads && job.staleReads.length > 0 ? { staleReads: job.staleReads } : {}),
+        ...(job.steeredFrom ? { steered: true } : {}),
+        ...(job.steerNotApplied ? { steerNotApplied: true } : {}),
     };
 }
 // ── meta ────────────────────────────────────────────────────────────────────
@@ -721,6 +729,7 @@ async function readOne(reader, source, cwd, jobId, now) {
         warned,
         supersededBy: typeof raw['supersededBy'] === 'string' && raw['supersededBy'] !== '' ? raw['supersededBy'] : null,
         steeredFrom: typeof raw['steeredFrom'] === 'string' && raw['steeredFrom'] !== '' ? raw['steeredFrom'] : null,
+        ...(observed.warnings.some((w) => w.code === 'steer_not_applied') ? { steerNotApplied: true } : {}),
         ...(Array.isArray(raw['staleReads']) && raw['staleReads'].length > 0
             ? { staleReads: raw['staleReads'].filter((f) => typeof f === 'string' && f.trim() !== '') }
             : {}),
