@@ -88,8 +88,14 @@ function controlledProvider(name = 'codex') {
   } as unknown as Provider;
 
   function nextTurn(): Promise<ControlledTurn> {
-    return new Promise<ControlledTurn>((resolve) => {
-      waiters.push(resolve);
+    return new Promise<ControlledTurn>((resolve, reject) => {
+      // The fake has no child-process handles. Keep this awaited transition
+      // alive on Node 22 and report a missing turn instead of canceling the file.
+      const deadline = setTimeout(() => reject(new Error('controlled provider did not start the next turn within 10s')), 10_000);
+      waiters.push((turn) => {
+        clearTimeout(deadline);
+        resolve(turn);
+      });
     });
   }
 
