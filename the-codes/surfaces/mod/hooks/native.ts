@@ -161,10 +161,21 @@ export async function syncNativeTasks(
   owned: (id: string) => boolean = () => true,
 ): Promise<NativeTaskLinks> {
   const next: NativeTaskLinks = { ...previous };
+  const byId = new Map(jobs.map((j) => [j.id, j]));
   for (const job of jobs) {
-    if (job.supersededBy && next[job.id] && !next[job.supersededBy]) {
-      next[job.supersededBy] = next[job.id]!;
-      delete next[job.id];
+    if (!job.supersededBy || !next[job.id]) continue;
+    const seen = new Set<string>([job.id]);
+    let targetId = job.supersededBy;
+    let cur = byId.get(targetId);
+    while (cur?.supersededBy && !seen.has(targetId)) {
+      seen.add(targetId);
+      targetId = cur.supersededBy;
+      cur = byId.get(targetId);
+    }
+    const link = next[job.id]!;
+    delete next[job.id];
+    if (link.status !== 'deleted' && !next[targetId]) {
+      next[targetId] = link;
     }
   }
   for (const job of jobs) {

@@ -135,12 +135,17 @@ export async function runJobWatch(options: JobWatchOptions): Promise<JobWatchEnd
         const job = await rj(options.cwd, id, t);
         if (!job) continue;
         jobs.set(job.id, job);
-        if (job.supersededBy) {
-          done.add(job.id);
-          if (!jobIds.includes(job.supersededBy)) {
-            jobIds.push(job.supersededBy);
-            want.add(job.supersededBy);
-            startedAt = t;
+        if (job.supersededBy && job.supersededBy !== job.id) {
+          if (jobIds.includes(job.supersededBy)) {
+            done.add(job.id);
+          } else {
+            const childJob = await rj(options.cwd, job.supersededBy, t);
+            if (childJob) {
+              done.add(job.id);
+              jobIds.push(job.supersededBy);
+              want.add(job.supersededBy);
+              startedAt = t;
+            }
           }
         }
       }
@@ -167,7 +172,7 @@ export async function runJobWatch(options: JobWatchOptions): Promise<JobWatchEnd
       for (const id of want) {
         const job = jobs.get(id);
         if (job?.supersededBy) {
-          done.add(id);
+          if (want.has(job.supersededBy)) done.add(id);
           continue;
         }
         if (job && TERMINAL.has(job.status) && (seen.get(id)?.has(dedupeKey(job)) ?? false)) done.add(id);

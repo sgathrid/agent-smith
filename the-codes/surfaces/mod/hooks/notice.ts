@@ -270,7 +270,9 @@ export function parseSettledRead(toolName: unknown, response: unknown): { readon
   }
   const jobId = payload['jobId'];
   const status = payload['status'];
+  if (typeof jobId !== 'string' && jobId !== undefined) return null;
   if (typeof jobId !== 'string' || jobId.length === 0) return null;
+  if (typeof payload['supersededBy'] === 'string' && payload['supersededBy'].length > 0) return null;
   if (status !== 'succeeded' && status !== 'failed' && status !== 'canceled') return null;
   const acceptance = payload['acceptance'];
   if (isObj(acceptance) && acceptance['pending'] === true) return null;
@@ -467,6 +469,14 @@ export function due(
 ): { notices: NoticeJob[]; owned: Owned[] } {
   const byId = new Map(jobs.map((j) => [j.id, j]));
   const notices: NoticeJob[] = [];
+  const seenNotices = new Set<string>();
+  const pushNotice = (notice: NoticeJob) => {
+    const key = `${notice.run ? 'run' : 'job'}:${notice.id}:${notice.kind}`;
+    if (!seenNotices.has(key)) {
+      seenNotices.add(key);
+      notices.push(notice);
+    }
+  };
   const keep: Owned[] = [];
   const pushKeep = (entry: Owned) => {
     const existingIdx = keep.findIndex((k) => k.kind === entry.kind && k.id === entry.id);
@@ -486,11 +496,11 @@ export function due(
       const run = runs.get(o.id);
       const notice = run ? noticeFromRun(run) : null;
       if (run && notice) {
-        notices.push(notice);
+        pushNotice(notice);
         for (const sid of stageJobIds(run)) {
           const stage = byId.get(sid);
           const kind = stage ? kindOf(stage.status) : null;
-          if (stage && kind && kind !== 'attention') notices.push(noticeFromRadar(stage, kind, now));
+          if (stage && kind && kind !== 'attention') pushNotice(noticeFromRadar(stage, kind, now));
         }
         continue;
       }
@@ -507,8 +517,8 @@ export function due(
       currentOwned = {
         kind: 'job',
         id: nextId,
-        at: now,
-        until: Math.max(currentOwned.until, now + MAX_JOB_MS + 60 * 60_000),
+        at: child ? now : currentOwned.at,
+        until: child ? Math.max(currentOwned.until, now + MAX_JOB_MS + 60 * 60_000) : currentOwned.until,
       };
       job = child;
     }
@@ -519,7 +529,7 @@ export function due(
     const kind = job ? kindOf(job.status) : null;
     if (job && kind === 'attention') {
       if (!currentOwned.saidAttention) {
-        notices.push(noticeFromRadar(job, kind, now));
+        pushNotice(noticeFromRadar(job, kind, now));
         pushKeep({ ...currentOwned, saidAttention: true });
       } else {
         pushKeep(currentOwned);
@@ -527,7 +537,7 @@ export function due(
       continue;
     }
     if (job && kind && !held(job, now)) {
-      notices.push(noticeFromRadar(job, kind, now));
+      pushNotice(noticeFromRadar(job, kind, now));
       continue;
     }
     if (now <= currentOwned.until) pushKeep(currentOwned);

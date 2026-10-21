@@ -297,7 +297,7 @@ interface OpencodeTranslator {
  * did not anticipate. Verified failure modes already handled: `error` events
  * (observed live) and totally unknown types (spec'd above).
  */
-function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
+export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
   const tx: OpencodeTranslator = {
     finalText: '',
     sawTerminal: false,
@@ -316,7 +316,12 @@ function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
     const type = str(raw, 'type') ?? 'unknown';
 
     const sessionId = str(raw, 'sessionID') ?? str(raw, 'session_id');
-    if (sessionId !== undefined) tx.sessionId = sessionId;
+    if (sessionId !== undefined) {
+      if (tx.sessionId === undefined) {
+        out.push({ kind: 'started', at, conversationId: sessionId, raw });
+      }
+      tx.sessionId = sessionId;
+    }
 
     // ---- errors: the one shape we verified live -----------------------------
     if (type === 'error') {

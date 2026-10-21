@@ -8,8 +8,14 @@ import path from 'node:path';
 import { test } from 'node:test';
 
 import type { JobResult, Provider, ProviderEvent, SpawnSpec } from '../../providers/types.ts';
+import { readAcceptance } from '../checks.ts';
 import { FILES, jobFile } from '../format.ts';
 import { ForgeService } from '../service.ts';
+import { ForgeTasks } from '../../surfaces/channel/src/tasks.ts';
+import { callTool } from '../../surfaces/channel/src/tools.ts';
+import { isLive } from '../../surfaces/mod/hooks/dashboard.ts';
+import { syncNativeTasks, type NativeJob } from '../../surfaces/mod/hooks/native.ts';
+import { claim, due, parseSettledRead } from '../../surfaces/mod/hooks/notice.ts';
 
 interface ControlledTurn {
   spec: SpawnSpec;
@@ -312,4 +318,339 @@ test('steer rejects finished workers, pipeline stages, and orphaned jobs with ac
     service.steer({ worker: orphanSpawn.ack.jobId, prompt: 'Steer orphan.', delivery: 'queue' }),
     /is already failed|has no live owner process/,
   );
+});
+
+test('user cancel() after steer(interrupt) wins and prevents chaining', async () => {
+  const ctrl = controlledProvider();
+  const { service } = makeService(ctrl.provider);
+
+  let releaseCancel = false;
+  const baseSpawn = ctrl.provider.spawn.bind(ctrl.provider);
+  ctrl.provider.spawn = async (spec: SpawnSpec) => {
+    const h = await baseSpawn(spec);
+    return {
+      ...h,
+      cancel() {
+        // Delay exit until after user cancel() arrives while interruptFired is already true.
+        if (releaseCancel) h.cancel();
+      },
+    };
+  };
+
+  const turn1Ready = ctrl.nextTurn();
+  const { ack, done } = await service.spawnTracked({
+    mode: 'implement',
+    name: 'race-cancel',
+    prompt: 'Start work.',
+  });
+  const turn1 = await turn1Ready;
+  turn1.emit({ kind: 'started', at: new Date().toISOString(), conversationId: 'thread-race' });
+
+  await service.steer({
+    worker: ack.jobId,
+    prompt: 'Redirect before user cancel.',
+    delivery: 'interrupt',
+  });
+
+  // Now the user calls cancel() after steer(interrupt) already set interruptFired = true.
+  service.cancel(ack.jobId);
+  turn1.finish({ status: 'cancelled', exitCode: null, response: '' });
+
+  const finalManifest = await done;
+  assert.equal(finalManifest.jobId, ack.jobId);
+  assert.equal(finalManifest.status, 'canceled');
+  assert.equal(finalManifest.supersededBy, undefined);
+  assert.equal(ctrl.turns.length, 1);
+});
+
+test('cancel(parentId) and status(parentId, { wait_ms }) follow supersededBy to the chain head', async () => {
+  const ctrl = controlledProvider();
+  const { service } = makeService(ctrl.provider);
+
+  const t1Ready = ctrl.nextTurn();
+  const { ack, done } = await service.spawnTracked({
+    mode: 'implement',
+    name: 'chain-worker',
+    prompt: 'Turn 1.',
+  });
+  const t1 = await t1Ready;
+  t1.emit({ kind: 'started', at: new Date().toISOString(), conversationId: 'thread-chain' });
+
+  const t2Ready = ctrl.nextTurn();
+  await service.steer({
+    worker: ack.jobId,
+    prompt: 'Turn 2.',
+    delivery: 'interrupt',
+  });
+  const t2 = await t2Ready;
+
+  // status(parentId, { wait_ms }) while child is still running must wait on child, not return settled parent
+  const waitingStatus = callTool(
+    { service, pollMs: 10 },
+    'status',
+    { jobId: ack.jobId, wait_ms: 40 },
+  );
+  const stillRunningRes = JSON.parse(((await waitingStatus).content[0] as { text: string }).text);
+  assert.equal(stillRunningRes.jobId, t2.spec.jobId);
+  assert.equal(stillRunningRes.stillRunning, true);
+
+  // cancel(parentId) must cancel the running child turn
+  const cancelRes = service.cancel(ack.jobId);
+  assert.equal(cancelRes.jobId, t2.spec.jobId);
+  assert.equal(cancelRes.signalled, true);
+  assert.equal(t2.cancelled, true);
+
+  const finalManifest = await done;
+  assert.equal(finalManifest.jobId, t2.spec.jobId);
+  assert.equal(finalManifest.status, 'canceled');
+});
+
+test('parseSettledRead ignores superseded parent and due() deduplicates notices across steered turns', () => {
+  const supersededParentStatus = {
+    jobId: 'implement-parent',
+    status: 'canceled',
+    supersededBy: 'implement-child',
+  };
+  assert.equal(
+    parseSettledRead('mcp__agent-smith__status', supersededParentStatus),
+    null,
+    'reading a superseded parent must not unclaim the live chain',
+  );
+
+  const settledChildStatus = {
+    jobId: 'implement-child',
+    status: 'succeeded',
+  };
+  assert.deepEqual(parseSettledRead('mcp__agent-smith__status', settledChildStatus), {
+    kind: 'job',
+    id: 'implement-child',
+  });
+
+  // Claim both parent and child (e.g. if both were recorded) and verify due() emits exactly 1 notice.
+  const now = 1_000_000;
+  let owned = claim([], { kind: 'job', id: 'implement-parent', repo: '/repo', timeoutMs: 60_000 }, now);
+  owned = claim(owned, { kind: 'job', id: 'implement-child', repo: '/repo', timeoutMs: 60_000 }, now);
+  const res = due(
+    owned,
+    [
+      {
+        id: 'implement-parent',
+        status: 'canceled',
+        supersededBy: 'implement-child',
+        startedAt: now - 2000,
+        endedAt: now - 1000,
+      },
+      {
+        id: 'implement-child',
+        status: 'succeeded',
+        steeredFrom: 'implement-parent',
+        startedAt: now - 1000,
+        endedAt: now,
+      },
+    ],
+    new Map(),
+    now,
+  );
+  assert.equal(res.notices.length, 1);
+  assert.equal(res.notices[0]?.id, 'implement-child');
+  assert.equal(res.owned.length, 0);
+});
+
+test('checks on a steered worker mark child accepted and leave superseded parent unchecked (not live or accepted)', async () => {
+  const ctrl = controlledProvider();
+  const { service, repo } = makeService(ctrl.provider);
+
+  const t1Ready = ctrl.nextTurn();
+  const spawnOut = await callTool(
+    { service, catalogs: async () => [] },
+    'spawn_job',
+    {
+      mode: 'implement',
+      provider: 'codex',
+      name: 'checked-worker',
+      prompt: 'Turn 1.',
+      checks: [{ name: 'ok', command: 'true' }],
+    },
+  );
+  const ack = JSON.parse((spawnOut.content[0] as { text: string }).text);
+  const t1 = await t1Ready;
+  t1.emit({ kind: 'started', at: new Date().toISOString(), conversationId: 'thread-checks' });
+
+  const t2Ready = ctrl.nextTurn();
+  await callTool(
+    { service, catalogs: async () => [] },
+    'steer_job',
+    {
+      worker: ack.jobId,
+      prompt: 'Turn 2.',
+      delivery: 'interrupt',
+    },
+  );
+  const t2 = await t2Ready;
+  const childJobId = t2.spec.jobId!;
+
+  // While turn 2 is running, parent's pending acceptance is cleared so isLive(parent) is false.
+  const parentAccDuring = readAcceptance(repo, ack.jobId);
+  assert.equal(parentAccDuring.state, 'unchecked');
+  assert.equal('pending' in parentAccDuring && parentAccDuring.pending, false);
+  assert.equal(
+    isLive({
+      id: ack.jobId,
+      status: 'canceled',
+      supersededBy: childJobId,
+      acceptance: { state: 'unchecked', checks: [], pending: true },
+    } as never),
+    false,
+  );
+
+  t2.finish({ status: 'success', response: 'Completed turn 2 and verified checks.' });
+
+  // Wait for gateAcceptance to settle on childJobId
+  for (let i = 0; i < 50; i++) {
+    const childAcc = readAcceptance(repo, childJobId);
+    if (childAcc.state === 'accepted') break;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+
+  const childAcc = readAcceptance(repo, childJobId);
+  assert.equal(childAcc.state, 'accepted');
+  const parentAccFinal = readAcceptance(repo, ack.jobId);
+  assert.equal(parentAccFinal.state, 'unchecked');
+});
+
+test('ForgeTasks tracks steered continuation turns through to completion', async () => {
+  const ctrl = controlledProvider();
+  const { service } = makeService(ctrl.provider);
+  const tasks = new ForgeTasks({ service, catalogs: async () => [], pollMs: 10 });
+
+  const t1Ready = ctrl.nextTurn();
+  const created = await tasks.launch(
+    { service, catalogs: async () => [], pollMs: 10 },
+    'spawn_job',
+    { mode: 'implement', provider: 'codex', name: 'task-steered', prompt: 'Turn 1.' },
+  );
+  assert.ok('taskId' in created && typeof created.taskId === 'string');
+  const taskId: string = created.taskId;
+
+  const t1 = await t1Ready;
+  t1.emit({ kind: 'started', at: new Date().toISOString(), conversationId: 'thread-tasks' });
+
+  const t2Ready = ctrl.nextTurn();
+  await service.steer({
+    worker: 'task-steered',
+    prompt: 'Turn 2.',
+    delivery: 'interrupt',
+  });
+  const t2 = await t2Ready;
+
+  // While child turn is running, tasks.get(taskId) must still report working (not canceled from parent!)
+  const mid = await tasks.get(taskId);
+  assert.equal(mid.status, 'working');
+
+  t2.finish({ status: 'success', response: 'Completed turn 2 cleanly via MCP Tasks.' });
+  // Wait for pump to finish writing child manifest
+  for (let i = 0; i < 50; i++) {
+    const cur = await tasks.get(taskId);
+    if (cur.status !== 'working') break;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  const doneTask = await tasks.get(taskId);
+  assert.equal(doneTask.status, 'completed');
+});
+
+test('queue steer when provider reports no conversation ID chains a fresh continuation instead of dropping', async () => {
+  const ctrl = controlledProvider();
+  const { service } = makeService(ctrl.provider);
+
+  const t1Ready = ctrl.nextTurn();
+  const { ack, done } = await service.spawnTracked({
+    mode: 'implement',
+    name: 'no-conv-queue',
+    prompt: 'Turn 1.',
+  });
+  const t1 = await t1Ready;
+
+  await service.steer({
+    worker: ack.jobId,
+    prompt: 'Queued follow-up without conversation ID.',
+    delivery: 'queue',
+  });
+
+  const t2Ready = ctrl.nextTurn();
+  t1.finish({ status: 'success', response: 'Finished turn 1 without conversation ID.' });
+
+  const t2 = await t2Ready;
+  assert.equal(t2.spec.conversation, undefined);
+  assert.match(t2.spec.prompt, /\[FRESH CONTINUATION\]/);
+  assert.match(t2.spec.prompt, /Queued follow-up without conversation ID\./);
+
+  t2.finish({ status: 'success', response: 'Finished fresh continuation turn 2.' });
+  const finalManifest = await done;
+  assert.equal(finalManifest.steeredFrom, ack.jobId);
+  assert.equal(finalManifest.status, 'succeeded');
+});
+
+test('syncNativeTasks walks multi-hop supersededBy chains in one poll', async () => {
+  const updates: string[] = [];
+  const client = {
+    async create() {
+      return { result: { task: { id: 'native-1' } } };
+    },
+    async update(input: { taskId: string; subject: string }) {
+      updates.push(`${input.taskId}:${input.subject}`);
+      return { result: { success: true } };
+    },
+  };
+  const jobs: NativeJob[] = [
+    {
+      id: 'job-a',
+      status: 'canceled',
+      task: 'Original task',
+      name: 'shell',
+      workerId: 'w1',
+      role: 'implement',
+      provider: 'codex',
+      model: null,
+      latestSummary: null,
+      summarySource: null,
+      supersededBy: 'job-b',
+      steeredFrom: null,
+    },
+    {
+      id: 'job-b',
+      status: 'canceled',
+      task: 'Original task',
+      name: 'shell',
+      workerId: 'w1',
+      role: 'implement',
+      provider: 'codex',
+      model: null,
+      latestSummary: null,
+      summarySource: null,
+      supersededBy: 'job-c',
+      steeredFrom: 'job-a',
+    },
+    {
+      id: 'job-c',
+      status: 'running',
+      task: 'Original task',
+      name: 'shell',
+      workerId: 'w1',
+      role: 'implement',
+      provider: 'codex',
+      model: null,
+      latestSummary: null,
+      summarySource: null,
+      supersededBy: null,
+      steeredFrom: 'job-b',
+    },
+  ];
+  const next = await syncNativeTasks(
+    jobs,
+    { 'job-a': { taskId: 'native-1', status: 'in_progress', fingerprint: 'old' } },
+    client,
+  );
+  assert.equal(next['job-a'], undefined);
+  assert.equal(next['job-b'], undefined);
+  assert.equal(next['job-c']?.taskId, 'native-1');
 });

@@ -18,8 +18,9 @@ function expired(job: RadarJob, now?: number): boolean {
 export function needsAttention(job: RadarJob, now?: number): boolean {
   return !expired(job, now) && (job.status === 'attention' || job.status === 'failed' || job.acceptance?.state === 'rejected');
 }
-/** Still executing, or finished with checks still running. */
+/** Still executing, or finished with checks still running (unless superseded by a steered turn). */
 export function isLive(job: RadarJob): boolean {
+  if (job.supersededBy && isTerminal(job.status)) return false;
   return !isTerminal(job.status) || job.acceptance?.pending === true;
 }
 /** The sidebar list: one row per worker, running first, then settled work, most recent first. */

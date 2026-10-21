@@ -135,7 +135,23 @@ const CAPABILITIES_OUTPUT = open({
   modes: { type: 'array', items: open({ name: typed('string'), description: typed('string'), readOnly: typed('boolean'), runsCommands: typed('boolean') }, ['name']) },
   efforts: typed('string'),
 }, ['providers']);
-const OUTPUT_SCHEMAS: Readonly<Record<string, Record<string, unknown>>> = { list_capabilities: CAPABILITIES_OUTPUT, spawn_job: SPAWN_OUTPUT, list_jobs: LIST_JOBS_OUTPUT, status: STATUS_OUTPUT };
+const STEER_OUTPUT = open({
+  jobId: typed('string'),
+  name: typed('string'),
+  workerId: typed('string'),
+  provider: typed(['string', 'null']),
+  delivery: { type: 'string', enum: ['queue', 'interrupt'] },
+  status: { type: 'string', enum: ['queued', 'interrupting'] },
+  pendingSteers: typed('integer'),
+  signalled: typed('boolean'),
+  repo: typed('string'),
+  dir: typed('string'),
+  timeoutMs: typed('integer'),
+  note: typed('string'),
+  taskHandle: { ...TASK_SCHEMA, description: 'MCP Tasks-shaped handle for this job.' },
+  notify: { ...NOTIFY_SCHEMA, description: 'How completion is announced, with a fallback if no notice arrives.' },
+}, ['jobId', 'name', 'delivery', 'status', 'pendingSteers', 'signalled']);
+const OUTPUT_SCHEMAS: Readonly<Record<string, Record<string, unknown>>> = { list_capabilities: CAPABILITIES_OUTPUT, spawn_job: SPAWN_OUTPUT, resume_job: SPAWN_OUTPUT, steer_job: STEER_OUTPUT, list_jobs: LIST_JOBS_OUTPUT, status: STATUS_OUTPUT };
 const READ_ONLY: ToolAnnotations = { readOnlyHint: true };
 const LAUNCHES: ToolAnnotations = { readOnlyHint: false, openWorldHint: true };
 const modeDescription = MODES.map(m => `${m}: ${MODE_PRESETS[m].description}`).join(' | ');
@@ -304,13 +320,16 @@ export function structured(value: unknown, { compact = false }: { compact?: bool
 }
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 /** Detached, tools-layer-owned: await terminal state, run checks, write acceptance.json. Never throws. */
-function gateAcceptance(ctx: HandlerContext, jobId: string, done: Promise<{ jobId?: string; status: string; cwd?: string | null }>, checks: StageCheck[]): void {
+function gateAcceptance(ctx: HandlerContext, jobId: string, done: Promise<{ jobId?: string; status: string; cwd?: string | null }>, checks: StageCheck[], preparedJobIds: readonly string[]): void {
   void (async () => {
     const manifest = await done;
+    const finalJobId = manifest.jobId ?? jobId;
     const acceptance = await evaluateAcceptance({ succeeded: manifest.status === 'succeeded', checks, baseDir: manifest.cwd ?? ctx.service.repo });
-    writeAcceptance(ctx.service.repo, manifest.jobId ?? jobId, acceptance);
-    if (manifest.jobId && manifest.jobId !== jobId) {
-      writeAcceptance(ctx.service.repo, jobId, acceptance);
+    writeAcceptance(ctx.service.repo, finalJobId, acceptance);
+    for (const id of preparedJobIds) {
+      if (id !== finalJobId) {
+        writeAcceptance(ctx.service.repo, id, { state: 'unchecked', checks: [], reason: 'superseded by steered turn' });
+      }
     }
   })().catch(err => process.stderr.write(`agent-smith acceptance ${jobId}: ${String(err)}\n`));
 }
@@ -405,12 +424,20 @@ export async function callTool(ctx: HandlerContext, name: string, rawArgs: unkno
         const notes = [...resolved.warnings, ...cfg.errors.map(e => `models.json: ${e}`)];
         const withNotes = <T extends { warnings?: readonly string[]; jobId?: string; timeoutMs?: number }>(ack: T) => ({ ...ack, ...(ack.jobId ? { taskHandle: launchTask(ack.jobId), notify: notifyHint({ job: ack.jobId }, ctx.service.repo, ack.timeoutMs) } : {}), ...(resolved.appliedAlias ? { aliasApplied: resolved.appliedAlias, aliasSource: resolved.source } : {}), ...(notes.length ? { warnings: [...(ack.warnings ?? []), ...notes] } : {}) });
         const checks = parseChecks(args.checks);
-        let prepared = false;
+        const preparedJobIds: string[] = [];
         const onPrepared = (jobId: string) => {
-          // First: if it throws, the job is aborted and must not be left with checks pending.
-          ctx.onJobPrepared?.(jobId);
-          prepared = true;
+          if (preparedJobIds.length === 0) {
+            // First: if it throws, the job is aborted and must not be left with checks pending.
+            ctx.onJobPrepared?.(jobId);
+          } else {
+            try { ctx.onJobPrepared?.(jobId); } catch { /* best-effort rebind on continuation turn */ }
+          }
+          const prevId = preparedJobIds.at(-1);
+          preparedJobIds.push(jobId);
           if (checks?.length) {
+            if (prevId) {
+              try { writeAcceptance(ctx.service.repo, prevId, { state: 'unchecked', checks: [], reason: 'superseded by steered turn' }); } catch { /* ignore */ }
+            }
             try { writeAcceptance(ctx.service.repo, jobId, { state: 'unchecked', checks: [], pending: true }); } catch (err) { process.stderr.write(`agent-smith acceptance ${jobId}: ${String(err)}\n`); }
           }
         };
@@ -421,22 +448,24 @@ export async function callTool(ctx: HandlerContext, name: string, rawArgs: unkno
         if (gate.warning) notes.push(gate.warning);
         if (!checks?.length) return structured({ ...withNotes(await ctx.service.spawnJob(request)), provider });
         const { ack, done } = await ctx.service.spawnTracked(request);
-        if (!prepared) {
+        if (!preparedJobIds.includes(ack.jobId)) {
+          preparedJobIds.push(ack.jobId);
           try { writeAcceptance(ctx.service.repo, ack.jobId, { state: 'unchecked', checks: [], pending: true }); } catch (err) { process.stderr.write(`agent-smith acceptance ${ack.jobId}: ${String(err)}\n`); }
         }
-        gateAcceptance(ctx, ack.jobId, done, checks);
+        gateAcceptance(ctx, ack.jobId, done, checks, preparedJobIds);
         return structured({ ...withNotes(ack), provider, checks: checks.map(c => c.name) });
       }
       case 'resume_job': {
         const worker = text(args, 'worker', true)!;
+        const resolveHead = (id: string) => typeof ctx.service.resolveHead === 'function' ? ctx.service.resolveHead(id) : id;
         let detail;
-        try { detail = await ctx.service.detail(worker); } catch {
+        try { detail = await ctx.service.detail(resolveHead(worker)); } catch {
           const candidates = (await ctx.service.list({ limit: 500 })).filter(j => j.name === worker);
           const identities = new Set(candidates.map(j => j.workerId));
           if (candidates.length === 0) throw new Error(`No worker "${worker}"; see list_jobs.`);
           if (identities.size !== 1) throw new Error(`"${worker}" matches ${identities.size} workers; pass a job ID from list_jobs.`);
           candidates.sort((a, b) => Date.parse(b.startedAt ?? b.updatedAt ?? '') - Date.parse(a.startedAt ?? a.updatedAt ?? ''));
-          detail = await ctx.service.detail(candidates[0]!.jobId);
+          detail = await ctx.service.detail(resolveHead(candidates[0]!.jobId));
         }
         if (detail.status === 'running') throw new Error(`"${detail.name}" is still running; use steer_job with delivery: "queue" or "interrupt", or wait.`);
         if (!detail.conversation) throw new Error(`"${detail.name}" has no conversation to resume; use spawn_job.`);
@@ -447,7 +476,7 @@ export async function callTool(ctx: HandlerContext, name: string, rawArgs: unkno
         const gate = await confirmUnrestricted(ctx, { unrestricted, provider: detail.provider ?? '', worker: detail.name, cwd });
         if (gate.refused) return gate.refused;
         const resumed = await ctx.service.spawnJob({ mode: detail.mode ?? 'task', prompt, provider: detail.provider ?? undefined, model: resumeModel.model ?? detail.model ?? undefined, effort: resumeModel.effort ?? detail.effort ?? undefined, name: detail.name, workerId: detail.workerId, task: detail.task ?? undefined, cwd, conversation: detail.conversation, timeoutMs, unrestricted: unrestricted ?? detail.unrestricted, onPrepared: ctx.onJobPrepared });
-        return json({ ...resumed, taskHandle: launchTask(resumed.jobId), notify: notifyHint({ job: resumed.jobId }, ctx.service.repo, resumed.timeoutMs), ...(gate.warning ? { warnings: [...(resumed.warnings ?? []), gate.warning] } : {}) });
+        return structured({ ...resumed, taskHandle: launchTask(resumed.jobId), notify: notifyHint({ job: resumed.jobId }, ctx.service.repo, resumed.timeoutMs), ...(gate.warning ? { warnings: [...(resumed.warnings ?? []), gate.warning] } : {}) });
       }
       case 'steer_job': {
         const worker = text(args, 'worker', true)!;
@@ -456,7 +485,7 @@ export async function callTool(ctx: HandlerContext, name: string, rawArgs: unkno
         const delivery = allowed(args, 'delivery', ['queue', 'interrupt']) as 'queue' | 'interrupt' | undefined;
         if (delivery === undefined) throw new Error('delivery is required: choose "queue" (after current turn) or "interrupt" (stop current turn now).');
         const ack = await ctx.service.steer({ worker, prompt, context, delivery });
-        return json({ ...ack, taskHandle: launchTask(ack.jobId), notify: notifyHint({ job: ack.jobId }, ctx.service.repo, ack.timeoutMs) });
+        return structured({ ...ack, taskHandle: launchTask(ack.jobId), notify: notifyHint({ job: ack.jobId }, ctx.service.repo, ack.timeoutMs) });
       }
       case 'list_jobs': {
         const fmt = format(args); const since = text(args, 'since');
@@ -472,12 +501,16 @@ export async function callTool(ctx: HandlerContext, name: string, rawArgs: unkno
       }
       case 'status': {
         const jobId = text(args, 'jobId', true)!; const waitMs = number(args, 'wait_ms', MAX_WAIT_MS); const fmt = format(args); const wantDiff = boolean(args, 'include_diff') ?? false;
-        let detail = await ctx.service.detail(jobId); let waited = false;
+        const resolveHead = (id: string) => typeof ctx.service.resolveHead === 'function' ? ctx.service.resolveHead(id) : id;
+        let detail = await ctx.service.detail(waitMs !== undefined ? resolveHead(jobId) : jobId); let waited = false;
         if (waitMs !== undefined) {
           waited = true; const deadline = Date.now() + waitMs; const step = ctx.pollMs ?? WAIT_POLL_MS;
-          while (detail.status === 'running' && Date.now() < deadline) { await sleep(Math.min(step, Math.max(0, deadline - Date.now()))); detail = await ctx.service.detail(jobId); }
+          while ((detail.status === 'running' || Boolean(detail.supersededBy)) && Date.now() < deadline) {
+            await sleep(Math.min(step, Math.max(0, deadline - Date.now())));
+            detail = await ctx.service.detail(resolveHead(detail.jobId));
+          }
         }
-        const acceptance = readAcceptance(ctx.service.repo, jobId); const wait = waited ? { waited: true, stillRunning: detail.status === 'running' } : {};
+        const acceptance = readAcceptance(ctx.service.repo, detail.jobId); const wait = waited ? { waited: true, stillRunning: detail.status === 'running' || Boolean(detail.supersededBy) } : {};
         const diff = wantDiff ? await jobDiff(detail) : {};
         if (fmt === 'concise') return structured({ ...conciseStatus(detail, acceptance, wait), ...diff });
         return structured({ ...fullStatus(detail, acceptance), ...wait, ...diff });

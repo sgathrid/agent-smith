@@ -80,7 +80,7 @@ When Ada finishes, Claude receives a completion notice and can read the report. 
 
 > Ask Ada for a minimal reproducer for her top finding.
 
-Follow-ups resume a finished worker; steering a worker mid-run isn't supported yet.
+Follow-ups resume a finished worker, or steer a running one mid-run.
 
 ## Put different models to work
 

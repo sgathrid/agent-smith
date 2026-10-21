@@ -791,16 +791,12 @@ export class ForgeService {
       let lastPendingSteers = 0;
 
       const syncSteerAndCancel = (): void => {
-        if ( !liveEntry.interruptFired && existsSync(jobFile(this.repo, currentJobId, FILES.cancel))
-          && !existsSync(jobFile(this.repo, currentJobId, FILES.cancelSteer)) ) {
+        if (existsSync(jobFile(this.repo, currentJobId, FILES.cancel))) {
           liveEntry.userCanceled = true;
         }
         if (liveEntry.userCanceled) {
-          if (!liveEntry.interruptFired) {
-            liveEntry.interruptFired = true;
-            currentWriter.requestCancel();
-            handle.cancel();
-          }
+          currentWriter.requestCancel();
+          handle.cancel();
           return;
         }
         const entries = readSteerEntries(this.repo, currentJobId);
@@ -818,7 +814,6 @@ export class ForgeService {
           const waitElapsed = Date.now() - interruptDetectedAt >= STEER_CONVERSATION_WAIT_MS;
           if (hasConversation || waitElapsed) {
             liveEntry.interruptFired = true;
-            currentWriter.requestCancel();
             handle.cancel();
           }
         }
@@ -864,94 +859,96 @@ export class ForgeService {
           const conversation = currentWriter.currentConversation();
           const wasInterrupted = liveEntry.interruptRequested && verdict.status !== 'succeeded';
           if (conversation === null && !wasInterrupted) {
-            currentWriter.warn('could not steer: provider did not report a resumable conversation ID');
-          } else {
-            liveEntry.consumedSteers = entries.length;
-            const nextJobId = newJobId(spec.mode);
-            const nextWriter = new JobWriter({
-              repo: this.repo,
-              jobId: nextJobId,
-              mirror: this.mirrorOn,
-              ...(this.flushMs === undefined ? {} : { flushMs: this.flushMs }),
-            });
-            const latestContext = [...unconsumed].reverse().find((e) => e.context !== undefined)?.context ?? spec.context;
-            const resuming = conversation !== null;
-            const nextBrief = buildBrief({
-              preset: spec.preset,
-              cwd: spec.cwd,
-              context: latestContext,
-              checks: spec.checks,
-              pipelineStage: spec.pipeline !== null,
-              resuming,
-            });
-            const { rawPrompt, sentPrompt, prependBrief } = buildSteeredPrompt({
-              parentJobId: currentJobId,
-              wasInterrupted,
-              freshContinuation: !resuming,
-              toolCalls: currentWriter.snapshot()?.toolCalls ?? 0,
-              responseTail: result.response.trim().slice(-600),
-              entries: unconsumed,
-              brief: nextBrief,
-            });
-            const nextLiveEntry: LiveJob = {
-              writer: nextWriter,
-              handle: null,
-              timeoutMs: spec.timeoutMs,
-              consumedSteers: 0,
-              interruptRequested: false,
-              interruptFired: false,
-              userCanceled: false,
-            };
-
-            // 1. Open child anchor on disk BEFORE finishing the parent so any reader
-            //    following `supersededBy` finds the child anchor immediately.
-            nextWriter.start({
-              name: spec.name,
-              workerId: spec.workerId,
-              task: spec.task,
-              provider: provider.name,
-              mode: spec.mode,
-              model: spec.model ?? null,
-              effort: spec.effort ?? null,
-              cwd: spec.cwd,
-              prompt: rawPrompt,
-              ...(prependBrief ? { preamble: nextBrief } : {}),
-              unrestricted: spec.unrestricted,
-              conversation,
-              timeoutMs: spec.timeoutMs,
-              pipeline: spec.pipeline,
-              stage: spec.stage,
-              attempt: spec.attempt,
-              modelRequested: spec.modelRequested,
-              modelResolved: spec.modelResolved,
-              modelSource: spec.modelSource,
-              preambleApplied: nextBrief !== '',
-              sandbox: spec.sandbox,
-              sandboxFlags: [...spec.sandboxFlags],
-              readOnlyRequested: spec.readOnlyRequested,
-              readOnlyEnforced: spec.readOnlyEnforced,
-              steeredFrom: currentJobId,
-            });
-
-            // 2. Register child in spawnedIds and live map before removing parent.
-            this.spawnedIds.add(nextJobId);
-            this.live.set(nextJobId, nextLiveEntry);
-            try {
-              spec.onPrepared?.(nextJobId);
-            } catch { /* best-effort callback for continuation turn */ }
-
-            // 3. Stamp supersededBy on parent and write parent's terminal manifest atomically.
-            currentWriter.markSuperseded(nextJobId);
-            currentWriter.finish(result, report === '' ? null : report);
-            this.live.delete(currentJobId);
-
-            currentWriter = nextWriter;
-            currentJobId = nextJobId;
-            currentPrompt = sentPrompt;
-            currentConversation = conversation ?? undefined;
-            liveEntry = nextLiveEntry;
-            continue;
+            currentWriter.warn('provider did not report a resumable conversation ID; continuing in a fresh session');
           }
+          liveEntry.consumedSteers = entries.length;
+          try {
+            unlinkSync(jobFile(this.repo, currentJobId, FILES.cancelSteer));
+          } catch { /* no steer marker present */ }
+          const nextJobId = newJobId(spec.mode);
+          const nextWriter = new JobWriter({
+            repo: this.repo,
+            jobId: nextJobId,
+            mirror: this.mirrorOn,
+            ...(this.flushMs === undefined ? {} : { flushMs: this.flushMs }),
+          });
+          const latestContext = [...unconsumed].reverse().find((e) => e.context !== undefined)?.context ?? spec.context;
+          const resuming = conversation !== null;
+          const nextBrief = buildBrief({
+            preset: spec.preset,
+            cwd: spec.cwd,
+            context: latestContext,
+            checks: spec.checks,
+            pipelineStage: spec.pipeline !== null,
+            resuming,
+          });
+          const { rawPrompt, sentPrompt, prependBrief } = buildSteeredPrompt({
+            parentJobId: currentJobId,
+            wasInterrupted,
+            freshContinuation: !resuming,
+            toolCalls: currentWriter.snapshot()?.toolCalls ?? 0,
+            responseTail: result.response.trim().slice(-600),
+            entries: unconsumed,
+            brief: nextBrief,
+          });
+          const nextLiveEntry: LiveJob = {
+            writer: nextWriter,
+            handle: null,
+            timeoutMs: spec.timeoutMs,
+            consumedSteers: 0,
+            interruptRequested: false,
+            interruptFired: false,
+            userCanceled: false,
+          };
+
+          // 1. Open child anchor on disk BEFORE finishing the parent so any reader
+          //    following `supersededBy` finds the child anchor immediately.
+          nextWriter.start({
+            name: spec.name,
+            workerId: spec.workerId,
+            task: currentWriter.snapshot()?.task ?? spec.task,
+            provider: provider.name,
+            mode: spec.mode,
+            model: spec.model ?? null,
+            effort: spec.effort ?? null,
+            cwd: spec.cwd,
+            prompt: rawPrompt,
+            ...(prependBrief ? { preamble: nextBrief } : {}),
+            unrestricted: spec.unrestricted,
+            conversation,
+            timeoutMs: spec.timeoutMs,
+            pipeline: spec.pipeline,
+            stage: spec.stage,
+            attempt: spec.attempt,
+            modelRequested: spec.modelRequested,
+            modelResolved: spec.modelResolved,
+            modelSource: spec.modelSource,
+            preambleApplied: nextBrief !== '',
+            sandbox: spec.sandbox,
+            sandboxFlags: [...spec.sandboxFlags],
+            readOnlyRequested: spec.readOnlyRequested,
+            readOnlyEnforced: spec.readOnlyEnforced,
+            steeredFrom: currentJobId,
+          });
+
+          // 2. Register child in spawnedIds and live map before removing parent.
+          this.spawnedIds.add(nextJobId);
+          this.live.set(nextJobId, nextLiveEntry);
+          try {
+            spec.onPrepared?.(nextJobId);
+          } catch { /* best-effort callback for continuation turn */ }
+
+          // 3. Stamp supersededBy on parent and write parent's terminal manifest atomically.
+          currentWriter.markSuperseded(nextJobId);
+          currentWriter.finish(result, report === '' ? null : report);
+          this.live.delete(currentJobId);
+
+          currentWriter = nextWriter;
+          currentJobId = nextJobId;
+          currentPrompt = sentPrompt;
+          currentConversation = conversation ?? undefined;
+          liveEntry = nextLiveEntry;
+          continue;
         }
 
         const manifest = currentWriter.finish(result, report === '' ? null : report);
@@ -985,39 +982,44 @@ export class ForgeService {
    *     verified adapters for one cosmetic gain is not worth it.
    */
   cancel(jobId: string): CancelResult {
-    const live = this.live.get(jobId);
-    const writer =
-      live?.writer ??
-      new JobWriter({
-        repo: this.repo,
-        jobId,
-        mirror: this.mirrorOn,
-        ...(this.flushMs === undefined ? {} : { flushMs: this.flushMs }),
-      });
-
-    const known = live !== undefined || existsSync(jobDir(this.repo, jobId));
+    const known = this.live.has(jobId) || existsSync(jobDir(this.repo, jobId));
     if (!known) {
       throw new Error(`no job "${jobId}" in ${jobsDir(this.repo)}; call list_jobs for valid job IDs.`);
     }
 
-    try {
-      unlinkSync(jobFile(this.repo, jobId, FILES.cancelSteer));
-    } catch { /* no steer marker present */ }
-    writer.requestCancel();
+    const headId = this.resolveHead(jobId);
+    for (const id of new Set([jobId, headId])) {
+      try {
+        unlinkSync(jobFile(this.repo, id, FILES.cancelSteer));
+      } catch { /* no steer marker present */ }
+      const live = this.live.get(id);
+      const writer =
+        live?.writer ??
+        new JobWriter({
+          repo: this.repo,
+          jobId: id,
+          mirror: this.mirrorOn,
+          ...(this.flushMs === undefined ? {} : { flushMs: this.flushMs }),
+        });
+      writer.requestCancel();
+      if (live !== undefined) {
+        live.userCanceled = true;
+        live.handle?.cancel();
+      }
+    }
 
-    if (live === undefined) {
+    const headLive = this.live.get(headId);
+    if (headLive === undefined) {
       return {
-        jobId,
+        jobId: headId,
         requested: true,
         signalled: false,
         note: 'Cancel recorded; no live worker here, so the job may stay running.',
       };
     }
 
-    live.userCanceled = true;
-    live.handle?.cancel();
     return {
-      jobId,
+      jobId: headId,
       requested: true,
       signalled: true,
       note: 'Canceled.',
@@ -1038,20 +1040,26 @@ export class ForgeService {
       throw new Error('delivery is required; must be "queue" or "interrupt".');
     }
     const target = await this.resolveSteerTarget(request.worker);
-    if (target.manifest.pipeline !== null && target.manifest.pipeline !== undefined) {
+    const latestManifest = this.readManifestSync(target.jobId) ?? target.manifest;
+    if (latestManifest.pipeline !== null && latestManifest.pipeline !== undefined) {
       throw new Error(
-        `Cannot steer pipeline stage "${target.manifest.name}" (${target.jobId}); pipeline stages are managed by run_pipeline.`,
+        `Cannot steer pipeline stage "${latestManifest.name}" (${target.jobId}); pipeline stages are managed by run_pipeline.`,
       );
     }
-    if (target.manifest.status !== 'running') {
+    if (latestManifest.status !== 'running') {
       throw new Error(
-        `"${target.manifest.name}" (${target.jobId}) is already ${target.manifest.status}; use resume_job to continue a finished worker.`,
+        `"${latestManifest.name}" (${target.jobId}) is already ${latestManifest.status}; use resume_job to continue a finished worker.`,
       );
     }
 
     const live = this.live.get(target.jobId);
+    if (live?.userCanceled || existsSync(jobFile(this.repo, target.jobId, FILES.cancel))) {
+      throw new Error(
+        `"${latestManifest.name}" (${target.jobId}) is already canceling; use resume_job after it stops.`,
+      );
+    }
     if (live === undefined) {
-      const ownerPid = target.manifest.ownerPid;
+      const ownerPid = latestManifest.ownerPid;
       const ownerAlive =
         typeof ownerPid === 'number' &&
         Number.isInteger(ownerPid) &&
@@ -1060,7 +1068,7 @@ export class ForgeService {
       if (!ownerAlive) {
         reconcileOrphan(this.repo, target.jobId);
         throw new Error(
-          `"${target.manifest.name}" (${target.jobId}) has no live owner process; it cannot be steered. Use resume_job to continue it.`,
+          `"${latestManifest.name}" (${target.jobId}) has no live owner process; it cannot be steered. Use resume_job to continue it.`,
         );
       }
     }
@@ -1087,26 +1095,25 @@ export class ForgeService {
         live.interruptRequested = true;
         if (live.handle !== null && live.writer.currentConversation() !== null && !live.interruptFired) {
           live.interruptFired = true;
-          live.writer.requestCancel(at);
           live.handle.cancel();
         }
       }
     }
 
-    const signalled = live !== undefined;
+    const signalled = Boolean(live?.handle);
     const status = request.delivery === 'interrupt' ? 'interrupting' : 'queued';
     const note =
       request.delivery === 'interrupt'
-        ? signalled
+        ? live !== undefined
           ? 'Interrupting current turn; continuation turn will start automatically.'
           : 'Interrupt recorded for owner process; continuation turn will start after current turn stops.'
         : `Queued behind current turn (${pendingSteers} pending).`;
 
     return {
       jobId: target.jobId,
-      name: target.manifest.name ?? target.jobId,
-      workerId: target.manifest.workerId ?? target.jobId,
-      provider: target.manifest.provider,
+      name: latestManifest.name ?? target.jobId,
+      workerId: latestManifest.workerId ?? target.jobId,
+      provider: latestManifest.provider,
       delivery: request.delivery,
       status,
       pendingSteers,
@@ -1118,36 +1125,44 @@ export class ForgeService {
     };
   }
 
+  private readManifestSync(id: string): ForgeManifest | null {
+    const inMem = this.live.get(id)?.writer.snapshot();
+    if (inMem !== null && inMem !== undefined) return inMem;
+    reconcileOrphan(this.repo, id);
+    try {
+      return JSON.parse(readFileSync(jobFile(this.repo, id, FILES.job), 'utf8')) as ForgeManifest;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Follow `supersededBy` links to the latest turn in a steered chain. */
+  resolveHead(jobId: string): string {
+    const trimmed = jobId.trim();
+    const seen = new Set<string>();
+    let curId = trimmed;
+    let curManifest = this.readManifestSync(curId);
+    if (curManifest === null) return trimmed;
+    while (curManifest.supersededBy && !seen.has(curId)) {
+      seen.add(curId);
+      const nextManifest = this.readManifestSync(curManifest.supersededBy);
+      if (nextManifest === null) break;
+      curId = curManifest.supersededBy;
+      curManifest = nextManifest;
+    }
+    return curId;
+  }
+
   private async resolveSteerTarget(worker: string): Promise<{ jobId: string; manifest: ForgeManifest }> {
     const trimmed = worker.trim();
     if (existsSync(pipelineRecordPath(this.repo, trimmed))) {
       throw new Error(`Cannot steer pipeline run "${trimmed}"; steer_job only applies to solo workers.`);
     }
 
-    const readManifest = (id: string): ForgeManifest | null => {
-      const inMem = this.live.get(id)?.writer.snapshot();
-      if (inMem !== null && inMem !== undefined) return inMem;
-      reconcileOrphan(this.repo, id);
-      try {
-        return JSON.parse(readFileSync(jobFile(this.repo, id, FILES.job), 'utf8')) as ForgeManifest;
-      } catch {
-        return null;
-      }
-    };
-
     const followChain = (startId: string): { jobId: string; manifest: ForgeManifest } | null => {
-      const seen = new Set<string>();
-      let curId = startId;
-      let curManifest = readManifest(curId);
-      if (curManifest === null) return null;
-      while (curManifest.supersededBy && !seen.has(curId)) {
-        seen.add(curId);
-        const nextManifest = readManifest(curManifest.supersededBy);
-        if (nextManifest === null) break;
-        curId = curManifest.supersededBy;
-        curManifest = nextManifest;
-      }
-      return { jobId: curId, manifest: curManifest };
+      const headId = this.resolveHead(startId);
+      const manifest = this.readManifestSync(headId);
+      return manifest === null ? null : { jobId: headId, manifest };
     };
 
     if (this.live.has(trimmed) || existsSync(jobDir(this.repo, trimmed))) {
@@ -1410,6 +1425,7 @@ function readSteerEntries(repo: string, jobId: string): SteerEntry[] {
     return [];
   }
   const out: SteerEntry[] = [];
+  const seenIds = new Set<string>();
   for (const line of text.split('\n')) {
     const trimmed = line.trim();
     if (trimmed === '') continue;
@@ -1419,8 +1435,10 @@ function readSteerEntries(repo: string, jobId: string): SteerEntry[] {
         typeof parsed.id === 'string' &&
         typeof parsed.createdAt === 'string' &&
         typeof parsed.prompt === 'string' &&
-        (parsed.delivery === 'queue' || parsed.delivery === 'interrupt')
+        (parsed.delivery === 'queue' || parsed.delivery === 'interrupt') &&
+        !seenIds.has(parsed.id)
       ) {
+        seenIds.add(parsed.id);
         out.push(parsed as SteerEntry);
       }
     } catch { /* ignore truncated line */ }

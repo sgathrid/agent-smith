@@ -106,6 +106,13 @@ export class TaskStore {
     return this.write({ ...record, jobId: id, lastUpdatedAt: this.stamp() });
   }
 
+  rebindJob(taskId: string, jobId: string): TaskRecord {
+    const record = this.requireWorking(taskId);
+    const id = this.requireId(jobId);
+    if (record.jobId === id) return record;
+    return this.write({ ...record, jobId: id, lastUpdatedAt: this.stamp() });
+  }
+
   /** Store cancellation intent; terminal outcome still comes from the worker. */
   requestCancel(taskId: string): TaskRecord {
     const record = this.get(taskId);

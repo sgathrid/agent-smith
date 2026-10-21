@@ -62,7 +62,15 @@ const details = [detail, running, unknown, interop];
 const service = {
   repo, spawnedIds: new Set(['job-1']),
   spawnJob: async () => ack,
-  spawnTracked: async () => ({ ack, done: new Promise(() => {}) }),
+  spawnTracked: async (spec: { continuedFrom?: string }) => ({
+    ack: { ...ack, ...(spec?.continuedFrom ? { continuedFrom: spec.continuedFrom } : {}) },
+    done: new Promise(() => {}),
+  }),
+  steer: async () => ({
+    jobId: 'job-2', name: 'Bo', workerId: 'Bo', provider: 'codex', delivery: 'interrupt' as const,
+    status: 'interrupting' as const, pendingSteers: 1, signalled: true, repo,
+    dir: path.join(repo, '.agent-smith', 'jobs', 'job-2'), timeoutMs: 2_700_000, note: 'Interrupting.',
+  }),
   detail: async (id: string) => { const d = details.find(x => x.jobId === id); if (!d) throw new Error('no job'); return d; },
   list: async ({ limit }: { limit?: number }) => (details as JobSummary[]).slice(0, limit),
 } as never;
@@ -74,7 +82,7 @@ const ctx: HandlerContext = { service, catalogs: async () => [cat('codex'), cat(
 
 test('exactly the structured tools declare an outputSchema, all open to new fields', () => {
   const declared = TOOL_DEFS.filter(t => t.outputSchema).map(t => t.name).sort();
-  assert.deepEqual(declared, ['list_capabilities', 'list_jobs', 'spawn_job', 'status']);
+  assert.deepEqual(declared, ['list_capabilities', 'list_jobs', 'resume_job', 'spawn_job', 'status', 'steer_job']);
   for (const t of TOOL_DEFS.filter(d => d.outputSchema)) assert.equal(t.outputSchema!.additionalProperties, true, t.name);
 });
 
@@ -120,6 +128,13 @@ test('list_capabilities validates with installed, errored and uninstalled provid
   assert.ok((caps.providers as { available: boolean }[]).some(p => !p.available));
   assertValid('list_capabilities', await callTool({ ...ctx, catalogs: async () => [] }, 'list_capabilities', {}), 'list_capabilities none installed');
   assertValid('list_capabilities', await callTool(ctx, 'list_capabilities', { response_format: 'detailed' }), 'list_capabilities detailed');
+});
+
+test('resume_job and steer_job acks validate against their outputSchemas', async () => {
+  const resumed = assertValid('resume_job', await callTool(ctx, 'resume_job', { worker: 'job-1', prompt: 'Continue.' }), 'resume_job');
+  assert.equal(resumed.jobId, 'job-1');
+  const steered = assertValid('steer_job', await callTool(ctx, 'steer_job', { worker: 'job-2', prompt: 'Pivot.', delivery: 'interrupt' }), 'steer_job');
+  assert.equal(steered.status, 'interrupting');
 });
 
 test('a schema violation is caught (the harness can fail)', () => {
