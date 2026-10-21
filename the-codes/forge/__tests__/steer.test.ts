@@ -1013,3 +1013,55 @@ test('watched brief files: rejects symlink escaping repo, enforces 32-file cap, 
   const t2 = await t2Ready;
   t2.finish({ status: 'success', response: 'Done turn 2.' });
 });
+
+test('watched destinations reject escaped file and parent symlinks before any copy', async () => {
+  const { syncWatchedFiles } = await import('../service.ts');
+  for (const parent of [false, true]) {
+    const repo = mkdtempSync(path.join(tmpdir(), 'smith-src-'));
+    const cwd = mkdtempSync(path.join(tmpdir(), 'smith-dst-'));
+    const outside = mkdtempSync(path.join(tmpdir(), 'smith-out-'));
+    mkdirSync(path.join(repo, 'docs'));
+    writeFileSync(path.join(repo, 'docs/brief.md'), 'brief');
+    writeFileSync(path.join(outside, 'brief.md'), 'private');
+    if (parent) symlinkSync(outside, path.join(cwd, 'docs'));
+    else { mkdirSync(path.join(cwd, 'docs')); symlinkSync(path.join(outside, 'brief.md'), path.join(cwd, 'docs/brief.md')); }
+    assert.throws(() => syncWatchedFiles(repo, cwd, ['docs/brief.md']), /destination resolves outside/);
+    assert.equal(readFileSync(path.join(outside, 'brief.md'), 'utf8'), 'private');
+  }
+});
+
+test('unresolved worker edits survive repeated syncs until explicitly reconciled', async () => {
+  const { syncWatchedFiles } = await import('../service.ts');
+  const repo = mkdtempSync(path.join(tmpdir(), 'smith-src-'));
+  const cwd = mkdtempSync(path.join(tmpdir(), 'smith-dst-'));
+  const writeRepo = (s: string) => writeFileSync(path.join(repo, 'brief.md'), s);
+  writeRepo('v1');
+  let baseline = syncWatchedFiles(repo, cwd, ['brief.md']);
+  writeFileSync(path.join(cwd, 'brief.md'), 'worker edits');
+  baseline = syncWatchedFiles(repo, cwd, ['brief.md'], baseline);
+  for (const revision of ['v2', 'v3', 'v4']) {
+    writeRepo(revision);
+    const warnings: string[] = [];
+    baseline = syncWatchedFiles(repo, cwd, ['brief.md'], baseline, w => warnings.push(w));
+    assert.equal(readFileSync(path.join(cwd, 'brief.md'), 'utf8'), 'worker edits');
+    assert.equal(warnings.length, 1);
+  }
+  writeFileSync(path.join(cwd, 'brief.md'), 'v4');
+  baseline = syncWatchedFiles(repo, cwd, ['brief.md'], baseline);
+  writeRepo('v5');
+  syncWatchedFiles(repo, cwd, ['brief.md'], baseline);
+  assert.equal(readFileSync(path.join(cwd, 'brief.md'), 'utf8'), 'v5');
+});
+
+test('finished staleReads do not change when a brief is edited after completion', async () => {
+  const ctrl = controlledProvider();
+  const { service, repo } = makeService(ctrl.provider);
+  writeFileSync(path.join(repo, 'brief.md'), 'original');
+  const ready = ctrl.nextTurn();
+  const tracked = await service.spawnTracked({ mode: 'review', prompt: 'review', files: ['brief.md'] });
+  const turn = await ready;
+  turn.finish({});
+  await tracked.done;
+  writeFileSync(path.join(repo, 'brief.md'), 'edited only after finish');
+  assert.equal((await service.detail(tracked.ack.jobId)).staleReads, undefined);
+});

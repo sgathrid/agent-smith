@@ -68,6 +68,7 @@ export interface RadarJob {
   readonly changedFileCount?: number | null;
   /** Canonical failure detail from the manifest, when available. */
   readonly failureReason?: string | null;
+  readonly failureDetail?: string | null;
   readonly lastEventAt?: number | null;
   readonly pipeline?: string | null;
   readonly stage?: string | null;

@@ -156,7 +156,7 @@ const CHANNEL_ENABLED = process.env['AGENT_SMITH_CHANNEL'] !== '0';
 // The SDK selects the protocol era from the opening request. Only legacy
 // connections can carry Claude's channel extension.
 let channelServer: Server | undefined;
-const forge = new ForgeService({ repo: resolveCwd() });
+const forge = new ForgeService({ repo: resolveCwd(), supervisorUrl: new URL(import.meta.url.endsWith('.ts') ? './supervisor.ts' : './supervisor.js', import.meta.url) });
 
 /** Send legacy Claude channel notifications through the selected SDK instance. */
 async function sendBatch(batch: Batch): Promise<void> {

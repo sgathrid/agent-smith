@@ -282,6 +282,7 @@ interface OpencodeTranslator {
   finalText: string;
   sawTerminal: boolean;
   sawError: boolean;
+  error?: string;
   usage?: TokenUsage;
   sessionId?: string;
   unrecognised: Set<string>;
@@ -327,7 +328,10 @@ export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
     if (type === 'error') {
       tx.sawError = true;
       const e = obj(raw, 'error');
-      const message = str(e, 'message') ?? str(raw, 'message') ?? 'opencode error';
+      const data = obj(e ?? {}, 'data');
+      const message = str(e, 'message') ?? str(data, 'message') ?? str(raw, 'message') ?? 'opencode error';
+      const statusCode = data?.['statusCode'];
+      tx.error = typeof statusCode === 'number' ? `HTTP ${statusCode}: ${message}` : message;
       const errorType = str(e, 'type');
       // Quota / no-route failures are the two I actually hit. They are
       // environment failures (no money, no route) rather than the worker doing
@@ -428,7 +432,8 @@ export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
     }
     if (type === 'session.error') {
       tx.sawError = true;
-      out.push({ kind: 'notice', at, level: 'error', message: 'opencode session.error', raw });
+      tx.error = str(obj(raw, 'error'), 'message') ?? str(raw, 'message') ?? 'opencode session.error';
+      out.push({ kind: 'notice', at, level: 'error', message: tx.error, raw });
       return out;
     }
 
@@ -513,7 +518,7 @@ function buildResult(args: {
     // 402 exits 1 with an error event and no text, so this is the common path
     // for a misconfigured account.
     status = 'error';
-    error = `worker error${unrecognised}${stderrClause(exit.stderr)}`;
+    error = `${tx.error ?? 'worker error'}${unrecognised}${stderrClause(exit.stderr)}`;
   } else if (tx.deniedNotices.length > 0) {
     // Same reasoning as agy: a denied tool means the work did not happen, and
     // opencode may well exit 0. Do not report that as a success.

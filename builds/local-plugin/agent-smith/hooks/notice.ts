@@ -31,6 +31,7 @@ export interface NoticeRow {
   readonly lastEventAt?: number | null;
   readonly changedFileCount?: number | null;
   readonly failureReason?: string | null;
+  readonly failureDetail?: string | null;
   readonly latestSummary?: string | null;
   readonly summarySource?: 'worker' | null;
   readonly supersededBy?: string | null;
@@ -364,7 +365,7 @@ export function noticeFromRadar(job: NoticeRow, kind: NoticeKind, now: number): 
     checks: checks.length > 0
       ? { passed: checks.filter((c) => c.ok).length, total: checks.length, failed: checks.filter((c) => !c.ok).flatMap((c) => (c.name ? [c.name] : [])) }
       : null,
-    reason: kind === 'failed' ? reasonFromText(job.failureReason) : null,
+    reason: kind === 'failed' ? job.failureDetail || reasonFromText(job.failureReason) : null,
     summary: job.summarySource === 'worker' ? job.latestSummary ?? null : null,
     ...(job.staleReads && job.staleReads.length > 0 ? { staleReads: job.staleReads } : {}),
   };
@@ -445,6 +446,7 @@ export interface Owned {
   readonly until: number;
   /** True once its stall was announced; a stall is said once. */
   readonly saidAttention?: boolean;
+  readonly saidStageAttention?: readonly string[];
 }
 
 /** Longest job a spawn may request (forge MAX_TIMEOUT_MS = 6h). */
@@ -512,7 +514,15 @@ export function due(
         }
         continue;
       }
-      if (now <= o.until) pushKeep(o);
+      const said = new Set(o.saidStageAttention ?? []);
+      for (const sid of run ? stageJobIds(run) : []) {
+        const stage = byId.get(sid);
+        if (stage && kindOf(stage.status) === 'attention' && !said.has(sid)) {
+          pushNotice(noticeFromRadar(stage, 'attention', now));
+          said.add(sid);
+        }
+      }
+      if (now <= o.until) pushKeep({ ...o, saidStageAttention: [...said] });
       continue;
     }
     let currentOwned = o;

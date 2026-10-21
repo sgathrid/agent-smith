@@ -11,7 +11,7 @@ function fixture() {
   let workerName = 'Ada';
   const service = {
     repo: '/private/tmp',
-    detail: async () => ({ status: 'succeeded', provider: 'codex', mode: 'review', name: workerName, workerId: 'worker', conversation: 'thread', cwd: '/private/tmp', unrestricted: false }),
+    detail: async () => ({ jobId: 'fixture-job', status: 'succeeded', provider: 'codex', mode: 'review', name: workerName, workerId: 'worker', conversation: 'thread', cwd: '/private/tmp', unrestricted: false }),
     spawnJob: async () => { launches++; return { jobId: 'fixture-job', name: 'Ada', status: 'running', timeoutMs: 1_000, warnings: [] }; },
   } as never;
   const handle = serveStdio(({ era }) => createSmithServer({ service, catalogs: async () => [] }, { era, channel: true }), { transport: serverTransport });

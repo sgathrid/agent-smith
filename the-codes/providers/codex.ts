@@ -337,6 +337,7 @@ interface CodexTranslator {
   onEvent(raw: Record<string, unknown>): ProviderEvent[];
   threadId?: string;
   sawTurnCompleted: boolean;
+  error?: string;
   finalText: string;
   usage?: TokenUsage;
 }
@@ -530,11 +531,12 @@ export function createCodexTranslator(maxChars: number): CodexTranslator {
       // UNVERIFIED: not observed locally, but it is the shape codex's docs
       // describe for a failed turn. Handled so a failure is not mistaken for
       // "the stream just ended".
+      state.error = str(obj(raw, 'error'), 'message') ?? 'codex turn failed';
       out.push({
         kind: 'notice',
         at,
         level: 'error',
-        message: str(obj(raw, 'error'), 'message') ?? 'codex turn failed',
+        message: state.error,
         raw,
       });
       return out;
@@ -546,6 +548,7 @@ export function createCodexTranslator(maxChars: number): CodexTranslator {
       const e = obj(raw, 'error');
       const eString = typeof raw['error'] === 'string' ? (raw['error'] as string) : undefined;
       const message = str(e, 'message') ?? eString ?? str(raw, 'message') ?? 'codex reported an error';
+      state.error = message;
       out.push({
         kind: 'notice',
         at,
@@ -599,11 +602,11 @@ function buildResult(args: {
     // here would be a lie.
     status = exit.code === 0 ? 'malformed' : 'error';
     // Usual causes: an untrusted directory, an auth failure, or an output-format change.
-    error = noResultText(exit);
+    error = tx.error ?? noResultText(exit);
   } else if (exit.code !== 0) {
     // turn.completed arrived but the process still failed. Corroboration wins.
     status = 'error';
-    error = `exited ${exit.code}${stderrClause(exit.stderr)}`;
+    error = tx.error ?? `exited ${exit.code}${stderrClause(exit.stderr)}`;
   } else {
     status = 'success';
   }

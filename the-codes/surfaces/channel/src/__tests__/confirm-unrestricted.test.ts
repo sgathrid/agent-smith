@@ -19,7 +19,7 @@ function harness(opts: { caps?: ClientCapabilities; action?: ElicitResult['actio
   const service = {
     repo,
     spawnJob: async (r: Record<string, unknown>) => { spawned.push(r); return { jobId: `job-${spawned.length}`, name: r.name ?? 'w', timeoutMs: 1_000, warnings: [] }; },
-    detail: async () => ({ status: 'succeeded', provider: 'codex', mode: 'review', name: 'Ada', workerId: 'Ada', conversation: 'thread', cwd: repo, unrestricted: false }),
+    detail: async () => ({ jobId: 'fixture-job', status: 'succeeded', provider: 'codex', mode: 'review', name: 'Ada', workerId: 'Ada', conversation: 'thread', cwd: repo, unrestricted: false }),
   } as never;
   const server: HandlerContext['server'] = {
     getClientCapabilities: () => opts.caps,
