@@ -5527,6 +5527,7 @@ class JobWriter {
             unrestricted: input.unrestricted,
             conversation: input.conversation,
             ownerPid: process.pid,
+            timeoutMs: input.timeoutMs,
             status: 'running',
             createdAt: now,
             updatedAt: now,
@@ -8108,12 +8109,12 @@ class ForgeService {
                 live.handle?.cancel();
             }
         }
-        const supersededBy = headId !== jobId ? headId : null;
+        const resolvedFrom = headId !== jobId ? jobId : null;
         const headLive = this.live.get(headId);
         if (headLive === undefined) {
             return {
                 jobId: headId,
-                ...(supersededBy === null ? {} : { supersededBy }),
+                ...(resolvedFrom === null ? {} : { resolvedFrom }),
                 requested: true,
                 signalled: false,
                 note: 'Cancel recorded; no live worker here to signal directly. A live owning supervisor will stop it.',
@@ -8121,7 +8122,7 @@ class ForgeService {
         }
         return {
             jobId: headId,
-            ...(supersededBy === null ? {} : { supersededBy }),
+            ...(resolvedFrom === null ? {} : { resolvedFrom }),
             requested: true,
             signalled: headLive.handle !== null,
             note: headLive.handle === null
@@ -8217,7 +8218,7 @@ class ForgeService {
             resumable,
             repo: this.repo,
             dir: jobDir(this.repo, target.jobId),
-            timeoutMs: live?.timeoutMs ?? DEFAULT_TIMEOUT_MS$1,
+            timeoutMs: live?.timeoutMs ?? latestManifest.timeoutMs ?? DEFAULT_TIMEOUT_MS$1,
             note,
         };
     }
@@ -8515,6 +8516,7 @@ function toSummary(observed, source) {
             exitCode: typeof raw['exit_code'] === 'number' ? raw['exit_code'] : null,
             deniedCount: Array.isArray(raw['denied_actions']) ? raw['denied_actions'].length : 0,
             unrestricted: raw['unrestricted'] === true,
+            steerNotApplied: observed.warnings.some((w) => w.code === 'steer_not_applied'),
         }),
         mode: observed.mode,
         model: observed.model,

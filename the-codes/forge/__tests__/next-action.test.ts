@@ -50,6 +50,11 @@ test('provider setup and account failures do not suggest blind retries or broade
   assert.match(nextActionFor({ ...F, jobStatus: 'denied' })!, /^Ask the user/);
   // Successful prose is not an execution diagnostic.
   assert.equal(nextActionFor({ status: 'succeeded', error: 'unauthorized rate limit' }), null);
+  const steer = nextActionFor({ ...F, jobStatus: 'timeout', steerNotApplied: true })!;
+  assert.match(steer, /timeoutMs/);
+  assert.match(steer, /queued steer was not applied.*resume_job prompt/);
+  assert.doesNotMatch(nextActionFor({ ...F, jobStatus: 'timeout' })!, /steer/);
+  assert.equal(nextActionFor({ status: 'canceled', steerNotApplied: true }), null);
 });
 
 test('diffChangedFiles excludes dirty-and-unchanged, caps at 200', () => {

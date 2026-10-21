@@ -23,6 +23,8 @@ const START_RE = /\bENOENT\b|spawn.{0,100}(?:not found|no such file)|couldn't st
 /** The orphan reason, old and new wording: the process that owned the job is gone. */
 const ORPHAN_RE = /orphaned|supervisor process exited|server stopped/i;
 const DENIED_RE = /\bdenied\b|soft-denied/i;
+/** The warning the forge writes when a queued steer is dropped because its turn did not succeed (forge/service.ts). */
+const STEER_NOT_APPLIED_RE = /^\d+ queued steers? not applied\b/;
 const NO_OUTPUT_RE = /no usable output|empty response|\bno output\b/i;
 /** The words for the cases the forge decides itself. */
 const REASONS = {
@@ -668,6 +670,12 @@ function deriveOrphan(m, lastSeenMs, nowMs, alive = isPidAlive, cancelRequested 
  * orchestrating agent, not for a human.
  */
 function nextActionFor(i) {
+    const base = baseNextAction(i);
+    return base !== null && i.steerNotApplied === true
+        ? `${base} A queued steer was not applied: include it in your resume_job prompt.`
+        : base;
+}
+function baseNextAction(i) {
     const status = i.status ?? null;
     if (status !== 'failed')
         return null;
@@ -1998,7 +2006,7 @@ const smithNormalizer = (raw) => {
         warnings.push({ code: "tool_error", message: errorText });
     }
     for (const w of progressWarnings) {
-        warnings.push({ code: "tool_error", message: w });
+        warnings.push({ code: STEER_NOT_APPLIED_RE.test(w) ? "steer_not_applied" : "tool_error", message: w });
     }
     let resolved;
     if (canceled) {

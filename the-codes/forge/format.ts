@@ -282,6 +282,8 @@ export interface ForgeManifest {
    * Present only when the job's tool inputs were captured.
    */
   readonly unattributedFiles?: readonly string[];
+  /** Wall-clock limit this job was spawned with (0 = no timer); lets a non-owning process report it. */
+  readonly timeoutMs?: number;
   /** Continuation job ID when this turn was superseded by a steered turn. */
   readonly supersededBy?: string | null;
   /** Parent job ID when this turn was created by steering an earlier turn. */
@@ -697,6 +699,8 @@ export interface NextActionInput {
   readonly exitCode?: number | null | undefined;
   readonly deniedCount?: number | undefined;
   readonly unrestricted?: boolean | undefined;
+  /** A queued steer was dropped because this turn failed. */
+  readonly steerNotApplied?: boolean | undefined;
 }
 
 /**
@@ -705,6 +709,13 @@ export interface NextActionInput {
  * orchestrating agent, not for a human.
  */
 export function nextActionFor(i: NextActionInput): string | null {
+  const base = baseNextAction(i);
+  return base !== null && i.steerNotApplied === true
+    ? `${base} A queued steer was not applied: include it in your resume_job prompt.`
+    : base;
+}
+
+function baseNextAction(i: NextActionInput): string | null {
   const status = i.status ?? null;
   if (status !== 'failed') return null;
   const err = i.error ?? '';

@@ -5,9 +5,9 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { runJobWatch } from '../monitor.ts';
-import type { WatchableJob } from '../policy.ts';
+import { toNotice, type WatchableJob } from '../policy.ts';
 import { parseHookInput, runHook } from '../watch-hook.ts';
-import { claimMarkerPath } from '../../../mod/hooks/notice.ts';
+import { claimMarkerPath, headline } from '../../../mod/hooks/notice.ts';
 import { clearReadCache, readAll } from '../watch-source.ts';
 
 const T0 = Date.parse('2026-10-07T12:00:00.000Z');
@@ -145,6 +145,28 @@ test('runHook finds the claim through a symlinked repo path', async () => {
   });
   assert.equal(code, 0);
   fs.rmSync(link); fs.rmSync(real, { recursive: true, force: true });
+});
+
+test('the watch-hook notice carries after-steer and dropped-steer markers', async () => {
+  clearReadCache();
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'steer-notice-'));
+  const dir = path.join(repo, '.agent-smith', 'jobs', 'turn-2');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({
+    schema: 1, jobId: 'turn-2', status: 'failed', provider: 'codex', name: 'Ada', steeredFrom: 'turn-1', error: 'timed out after 4s',
+    startedAt: new Date(T0).toISOString(), finishedAt: new Date(T0 + 4000).toISOString(),
+  }));
+  fs.writeFileSync(path.join(dir, 'progress.json'), JSON.stringify({
+    warnings: ['1 queued steer not applied: the turn ended failed. Use resume_job or steer_job again.'],
+  }));
+  const found = (await readAll(repo)).find((j) => j.id === 'turn-2');
+  assert.ok(found, 'job is read');
+  assert.equal(found.steerNotApplied, true);
+  const text = toNotice(found, 'failed', T0 + 5000);
+  assert.equal(text.steered, true);
+  assert.equal(text.steerNotApplied, true);
+  assert.match(headline(text), /· after steer · queued steer not applied/);
+  fs.rmSync(repo, { recursive: true, force: true });
 });
 
 test('full scan caches terminal jobs instead of re-reading them', async () => {

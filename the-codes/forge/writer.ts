@@ -194,6 +194,7 @@ export class JobWriter {
       unrestricted: input.unrestricted,
       conversation: input.conversation,
       ownerPid: process.pid,
+      timeoutMs: input.timeoutMs,
       status: 'running',
       createdAt: now,
       updatedAt: now,

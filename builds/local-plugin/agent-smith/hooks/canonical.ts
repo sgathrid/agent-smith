@@ -7,7 +7,7 @@ import { toEpoch, type FsLike } from './jobs.ts';
 import type { ProgressDigest } from '../types/index.d.ts';
 import { classify, progressPhrase } from './progress.ts';
 import { STALL_GRACE_MS } from './stale.ts';
-import { REASONS, reasonFromText } from './reasons.ts';
+import { REASONS, STEER_NOT_APPLIED_RE, reasonFromText } from './reasons.ts';
 
 type RecordValue = Record<string, unknown>;
 const STATUSES = new Set(['running', 'attention', 'succeeded', 'failed', 'canceled']);
@@ -61,7 +61,7 @@ export async function readForgeJob(fs: FsLike, repo: string, id: string, now: nu
   const live = status === 'running' || status === 'attention';
   const lastSeen = toEpoch(text(p?.lastEventAt, m.updatedAt));
   const warnings = (Array.isArray(p?.warnings) ? p.warnings : []).filter((w): w is string => typeof w === 'string')
-    .map(message => ({ code: 'tool_error', message }));
+    .map(message => ({ code: STEER_NOT_APPLIED_RE.test(message) ? 'steer_not_applied' : 'tool_error', message }));
   if (live && await fs.exists(`${dir}/orphaned`) && !await fs.exists(`${dir}/result.json`)) {
     // The marker proves the supervisor is gone, so a cancel request it never
     // confirmed is a cancellation, not a failure (mirrors forge deriveOrphan).

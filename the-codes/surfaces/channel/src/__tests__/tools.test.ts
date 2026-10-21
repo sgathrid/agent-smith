@@ -226,6 +226,30 @@ test('list_jobs: a concise list cut by its limit says so; an uncut one stays a p
   assert.equal(body(whole).length, 3);
 });
 
+test('list_jobs: a turn a steer replaced is left out; its continuation stands for the worker', async () => {
+  const ctx = withService({ list: async () => [summary(2, { steeredFrom: 'implement-smith-1' }), summary(1, { supersededBy: 'implement-smith-2' })] });
+  assert.deepEqual(body(await callTool(ctx, 'list_jobs', {})).map((r: any) => r.jobId), ['implement-smith-2']);
+  assert.deepEqual(body(await callTool(ctx, 'list_jobs', { response_format: 'detailed' })).map((r: any) => r.jobId), ['implement-smith-2']);
+});
+
+test('status: a steered head lists its earlier turns oldest first, each with its own report', async () => {
+  const turns: Record<string, Record<string, unknown>> = {
+    'implement-smith-3': detail({ jobId: 'implement-smith-3', steeredFrom: 'implement-smith-2', report: 'Third.' }),
+    'implement-smith-2': detail({ jobId: 'implement-smith-2', steeredFrom: 'implement-smith-1', supersededBy: 'implement-smith-3', report: 'Second.' }),
+    'implement-smith-1': detail({ jobId: 'implement-smith-1', supersededBy: 'implement-smith-2', report: LONG }),
+  };
+  const ctx = withService({ resolveHead: () => 'implement-smith-3', detail: async (id: string) => turns[id] });
+  const st = body(await callTool(ctx, 'status', { jobId: 'implement-smith-1' }));
+  assert.equal(st.jobId, 'implement-smith-3'); assert.equal(st.report, 'Third.');
+  assert.deepEqual(st.earlierTurns.map((t: any) => t.jobId), ['implement-smith-1', 'implement-smith-2']);
+  assert.ok(st.earlierTurns[0].report.length <= 600 && st.earlierTurns[0].report.endsWith('…'));
+  assert.match(st.earlierTurns[1].reportPath, /implement-smith-2/);
+  const full = body(await callTool(ctx, 'status', { jobId: 'implement-smith-3', response_format: 'detailed' }));
+  assert.equal(full.earlierTurns[0].report, LONG);
+  const plain = body(await callTool(withService({ detail: async () => detail() }), 'status', { jobId: 'implement-smith-1' }));
+  assert.equal('earlierTurns' in plain, false);
+});
+
 test('list_jobs: since parses ISO and relative times; session restricts to jobs this process spawned', async () => {
   const seen: Array<Record<string, unknown>> = [];
   const spawned = new Set(['implement-smith-1']);
@@ -518,6 +542,7 @@ test('steer_job forwards worker, prompt, context, files and delivery, and status
     delivery: 'interrupt',
   });
   assert.equal(body(res).status, 'interrupting');
+  assert.match(body(res).note, /^queued The continuation gets a new job ID; status and cancel on .+ follow it\.$/);
   assert.equal(body(res).resumable, true);
 
   // resume_job merges inherited watchedFiles with new files

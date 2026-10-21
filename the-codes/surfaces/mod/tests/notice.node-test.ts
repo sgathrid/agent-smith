@@ -42,6 +42,19 @@ test('done names worker, provider, role and duration; checks only when they ran'
   assert.equal(headline(notice({ name: 'Ada', provider: 'codex', role: 'review' })), '✓ Ada (codex review) · done');
 });
 
+test('a steered continuation says so, and a dropped queued steer is named', () => {
+  assert.equal(headline(notice({ name: 'Ada', provider: 'codex', role: 'review', durationMs: 6000, steered: true })), '✓ Ada (codex review) 6s · done · after steer');
+  assert.equal(
+    headline(notice({ name: 'Ada', provider: 'codex', role: 'review', durationMs: 4000, kind: 'failed', reason: 'timed out', steerNotApplied: true })),
+    '✗ Ada (codex review) 4s · failed: timed out · queued steer not applied',
+  );
+  const steered = noticeFromRadar(row({ id: 'j2', name: 'Ada', status: 'succeeded', endedAt: NOW, steeredFrom: 'j1' }), 'finished', NOW);
+  assert.match(headline(steered), /· done · after steer$/);
+  const dropped = noticeFromRadar(row({ id: 'j3', name: 'Ada', status: 'failed', endedAt: NOW, failureReason: 'timed out', warnings: [{ code: 'steer_not_applied' }] }), 'failed', NOW);
+  assert.match(headline(dropped), /· queued steer not applied$/);
+  assert.doesNotMatch(headline(noticeFromRadar(row({ id: 'j4', status: 'succeeded', endedAt: NOW }), 'finished', NOW)), /steer/);
+});
+
 test('failure says failed and the short reason', () => {
   assert.equal(
     headline(notice({ kind: 'failed', name: 'Bo', provider: 'agy', role: 'implement', durationMs: 45 * 60_000, reason: 'timed out' })),

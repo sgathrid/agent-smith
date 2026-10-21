@@ -405,6 +405,9 @@ test('cancel(parentId) and status(parentId, { wait_ms }) follow supersededBy to 
   // cancel(parentId) must cancel the running child turn
   const cancelRes = service.cancel(ack.jobId);
   assert.equal(cancelRes.jobId, t2.spec.jobId);
+  assert.equal(cancelRes.resolvedFrom, ack.jobId);
+  assert.equal('supersededBy' in cancelRes, false);
+  assert.equal(service.cancel(cancelRes.jobId).resolvedFrom, undefined);
   assert.equal(cancelRes.signalled, true);
   assert.equal(t2.cancelled, true);
 
@@ -1070,4 +1073,35 @@ test('finished staleReads do not change when a brief is edited after completion'
   await tracked.done;
   writeFileSync(path.join(repo, 'brief.md'), 'edited only after finish');
   assert.equal((await service.detail(tracked.ack.jobId)).staleReads, undefined);
+});
+
+test('steer ack reports the job timeoutMs from the manifest when another process owns the job', async () => {
+  const ctrl = controlledProvider();
+  const { service, repo } = makeService(ctrl.provider);
+
+  const t1Ready = ctrl.nextTurn();
+  const { ack, done } = await service.spawnTracked({
+    mode: 'implement',
+    name: 'supervised',
+    prompt: 'Work.',
+    timeoutMs: 4000,
+  });
+  const t1 = await t1Ready;
+
+  // A second service on the same repo has no live entry for the job: it is owned elsewhere (ownerPid is this process, alive).
+  const other = new ForgeService({
+    repo,
+    mirror: false,
+    flushMs: 5,
+    providerSource: () => ctrl.provider,
+    catalogSource: async () => [],
+  });
+  const steered = await other.steer({ worker: ack.jobId, prompt: 'Adjust.', delivery: 'queue' });
+  assert.equal(steered.signalled, false);
+  assert.equal(steered.timeoutMs, 4000);
+
+  const t2Ready = ctrl.nextTurn();
+  t1.finish({ status: 'success', response: 'Done.' });
+  (await t2Ready).finish({ status: 'success', response: 'Done.' });
+  await done;
 });
