@@ -208,6 +208,12 @@ export class ProgressTracker {
     };
   }
 
+  /** All file paths named by edit tool calls so far, relative to `cwd` when inside it. */
+  editedPaths(cwd = ''): string[] {
+    const base = cwd.replace(/\/+$/, '');
+    return this.edited.map((p) => (base !== '' && p.startsWith(`${base}/`) ? p.slice(base.length + 1) : p));
+  }
+
   /** From a window of recent calls, not the last one alone, so the phase does not flicker. */
   private phase(): ProgressPhase {
     const last = this.recent.at(-1);

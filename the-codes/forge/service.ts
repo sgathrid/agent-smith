@@ -55,7 +55,7 @@
  */
 
 import { humanDuration } from '../providers/failure-text.ts';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync } from 'node:fs';
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 
 import { AgentSmithReader, SMITH_PAYLOAD } from '../harness/agent-smith.ts';
@@ -89,11 +89,14 @@ import {
   type ForgeStatus,
   type SteerDelivery,
   type SteerEntry,
+  type WatchedFileSigs,
   nextActionFor,
 } from './format.ts';
 import { reconcileOrphan } from './reconcile.ts';
-import { JobWriter, pipeEvents, reportFor } from './writer.ts';
+import { computeStaleReads, fileSig, JobWriter, pipeEvents, reportFor } from './writer.ts';
 import { writeAtomic, writeJsonAtomic } from './atomic.ts';
+
+export { computeStaleReads };
 
 /**
  * Default wall-clock budget for one job.
@@ -146,6 +149,10 @@ export interface SpawnRequest {
    * acceptance themselves. This is only so the worker knows its bar.
    */
   readonly checks?: readonly BriefCheck[] | undefined;
+  /** Relative paths of brief/spec files in the repository to sync into cwd and monitor for stale reads. */
+  readonly files?: readonly string[] | undefined;
+  /** Prior watched file signatures when resuming a worker, so unchanged repo files do not overwrite worktree edits. */
+  readonly previousWatchedFiles?: Readonly<Record<string, WatchedFileSigs>> | undefined;
   readonly pipeline?: string | undefined;
   readonly stage?: string | undefined;
   readonly attempt?: number | undefined;
@@ -269,6 +276,9 @@ export interface JobDetail extends JobSummary {
   readonly changedFiles?: readonly string[];
   readonly changedFilesTruncated?: boolean;
   readonly unattributedFiles?: readonly string[];
+  readonly watchedFiles?: Readonly<Record<string, WatchedFileSigs>>;
+  /** Watched brief files whose repository or external cwd copy changed after the turn started. */
+  readonly staleReads?: readonly string[];
 }
 
 export interface CancelResult {
@@ -290,6 +300,8 @@ export interface SteerRequest {
   readonly worker: string;
   readonly prompt: string;
   readonly context?: string | undefined;
+  /** Relative paths of brief/spec files in the repository to sync into cwd on the steered turn. */
+  readonly files?: readonly string[] | undefined;
   /** Required delivery mode: 'queue' (run after current turn) or 'interrupt' (stop current turn now and continue). */
   readonly delivery: SteerDelivery;
 }
@@ -613,6 +625,19 @@ export class ForgeService {
       ...(this.flushMs === undefined ? {} : { flushMs: this.flushMs }),
     });
 
+    const requestedFiles =
+      request.files !== undefined && request.previousWatchedFiles !== undefined
+        ? request.files.filter((f) => {
+            if (!(f in request.previousWatchedFiles!) || existsSync(path.resolve(this.repo, f))) return true;
+            warnings.push(`dropped deleted watched file "${f}" from previous turn`);
+            return false;
+          })
+        : request.files;
+    const watchedFiles =
+      requestedFiles !== undefined && requestedFiles.length > 0
+        ? syncWatchedFiles(this.repo, cwd, requestedFiles, request.previousWatchedFiles, (w) => warnings.push(w))
+        : undefined;
+
     // Anchor first. Everything after this point can fail loudly; nothing after
     // this point can make the job invisible.
     writer.start({
@@ -641,6 +666,7 @@ export class ForgeService {
       sandboxFlags: [...sandboxFlags],
       readOnlyRequested,
       readOnlyEnforced,
+      ...(watchedFiles === undefined ? {} : { watchedFiles }),
     });
     try {
       request.onPrepared?.(jobId);
@@ -906,6 +932,41 @@ export class ForgeService {
           });
           const latestContext = [...unconsumed].reverse().find((e) => e.context !== undefined)?.context ?? spec.context;
           const resuming = conversation !== null;
+          const parentWatched = currentWriter.snapshot()?.watchedFiles;
+          const explicitSteerFiles = new Set(unconsumed.flatMap((e) => e.files ?? []));
+          const inheritedWatchedPaths = Object.keys(parentWatched ?? {}).filter((f) => {
+            if (existsSync(path.resolve(this.repo, f))) return true;
+            currentWriter.warn(`dropped deleted watched file "${f}" from continuation turn`);
+            return false;
+          });
+          const mergedWatchedPaths = [
+            ...new Set([
+              ...inheritedWatchedPaths,
+              ...explicitSteerFiles,
+            ]),
+          ];
+          let nextWatchedFiles: Record<string, WatchedFileSigs> | undefined;
+          const syncedFiles: string[] = [];
+          const syncWarnings: string[] = [];
+          if (mergedWatchedPaths.length > 0) {
+            try {
+              nextWatchedFiles = syncWatchedFiles(
+                this.repo,
+                spec.cwd,
+                mergedWatchedPaths,
+                parentWatched,
+                (w) => syncWarnings.push(w),
+              );
+              for (const [rel, sigs] of Object.entries(nextWatchedFiles)) {
+                const prev = parentWatched?.[rel];
+                if (prev === undefined || (prev.repoSig !== sigs.repoSig && sigs.cwdSig === sigs.repoSig)) {
+                  syncedFiles.push(rel);
+                }
+              }
+            } catch (err) {
+              currentWriter.warn(`watched file sync warning: ${describe(err)}`);
+            }
+          }
           const nextBrief = buildBrief({
             preset: spec.preset,
             cwd: spec.cwd,
@@ -921,6 +982,7 @@ export class ForgeService {
             toolCalls: currentWriter.snapshot()?.toolCalls ?? 0,
             responseTail: result.response.trim().slice(-600),
             entries: unconsumed,
+            syncedFiles,
             brief: nextBrief,
           });
           const nextLiveEntry: LiveJob = {
@@ -961,7 +1023,9 @@ export class ForgeService {
             readOnlyRequested: spec.readOnlyRequested,
             readOnlyEnforced: spec.readOnlyEnforced,
             steeredFrom: currentJobId,
+            ...(nextWatchedFiles === undefined ? {} : { watchedFiles: nextWatchedFiles }),
           });
+          for (const w of syncWarnings) nextWriter.warn(w);
 
           // The child anchor exists; publish its id before the parent's terminal
           // write so resolveHead can cross the finish window.
@@ -1120,6 +1184,10 @@ export class ForgeService {
     const resumableNote = resumable
       ? ''
       : ' No conversation handle is known yet; if none arrives before this turn ends, the continuation starts fresh.';
+    const validFiles =
+      request.files !== undefined && request.files.length > 0
+        ? validateWatchedFiles(this.repo, request.files)
+        : undefined;
 
     const at = new Date().toISOString();
     const entry: SteerEntry = {
@@ -1127,6 +1195,7 @@ export class ForgeService {
       createdAt: at,
       prompt,
       ...(request.context === undefined ? {} : { context: request.context }),
+      ...(validFiles === undefined ? {} : { files: validFiles }),
       delivery: request.delivery,
     };
     appendSteerEntry(this.repo, target.jobId, entry);
@@ -1330,6 +1399,16 @@ export class ForgeService {
     const raw = observed.raw;
     let manifest: ForgeManifest | null = null;
     try { manifest = JSON.parse(readFileSync(jobFile(this.repo, jobId, FILES.job), 'utf8')) as ForgeManifest; } catch { /* partial state */ }
+    const liveStale =
+      manifest !== null && manifest.watchedFiles !== undefined
+        ? computeStaleReads(
+            this.repo,
+            manifest.cwd,
+            manifest.watchedFiles,
+            this.live.get(jobId)?.writer.editedFiles(Object.keys(manifest.watchedFiles)) ?? manifest.changedFiles,
+          )
+        : [];
+    const staleReads = [...new Set([...(manifest?.staleReads ?? []), ...liveStale])].sort();
     return {
       ...toSummary(observed, 'agent-smith'),
       report,
@@ -1358,6 +1437,8 @@ export class ForgeService {
             ...(manifest.changedFiles === undefined ? {} : { changedFiles: manifest.changedFiles }),
             ...(manifest.changedFilesTruncated === undefined ? {} : { changedFilesTruncated: manifest.changedFilesTruncated }),
             ...(manifest.unattributedFiles === undefined ? {} : { unattributedFiles: manifest.unattributedFiles }),
+            ...(manifest.watchedFiles === undefined ? {} : { watchedFiles: manifest.watchedFiles }),
+            ...(staleReads.length === 0 ? {} : { staleReads }),
           }),
       cancellable: this.live.has(jobId),
     };
@@ -1523,6 +1604,7 @@ function buildSteeredPrompt(input: {
   toolCalls: number;
   responseTail: string;
   entries: readonly SteerEntry[];
+  syncedFiles?: readonly string[];
   brief: string;
 }): { rawPrompt: string; sentPrompt: string; prependBrief: boolean } {
   const steerBody =
@@ -1537,13 +1619,114 @@ function buildSteeredPrompt(input: {
   const statusLine = input.wasInterrupted
     ? `Your previous turn (${input.parentJobId}) was interrupted after ${input.toolCalls} tool call(s) with updated instructions from the orchestrator. Inspect your working tree before repeating any completed steps.`
     : `Your previous turn (${input.parentJobId}) completed after ${input.toolCalls} tool call(s), and the orchestrator queued follow-up instructions for you.`;
+  const syncedLine =
+    input.syncedFiles !== undefined && input.syncedFiles.length > 0
+      ? `\nSynced brief file(s) in your working tree: ${input.syncedFiles.join(', ')} (re-read before continuing).`
+      : '';
   const tailBlock = input.responseTail
     ? `\nLast response excerpt from previous turn:\n${input.responseTail}\n`
     : '';
-  const header = `[STEERED TURN CONTINUITY] ${tag}\n${statusLine}${tailBlock}\n[ORCHESTRATOR UPDATE]\n${steerBody}`;
+  const header = `[STEERED TURN CONTINUITY] ${tag}\n${statusLine}${syncedLine}${tailBlock}\n[ORCHESTRATOR UPDATE]\n${steerBody}`;
   const prependBrief = input.brief !== '' && !header.startsWith(input.brief);
   const sentPrompt = prependBrief ? `${input.brief}\n\n${header}` : header;
   return { rawPrompt: header, sentPrompt, prependBrief };
+}
+
+export const MAX_WATCHED_FILES = 32;
+export const MAX_WATCHED_BYTES = 4 * 1024 * 1024;
+
+export function validateWatchedFiles(repo: string, files: readonly string[]): string[] {
+  const repoRoot = path.resolve(repo);
+  let realRepoRoot = repoRoot;
+  try {
+    realRepoRoot = realpathSync(repoRoot);
+  } catch { /* non-existent repo root caught by per-file stat below */ }
+  const seen = new Set<string>();
+  const out: string[] = [];
+  let totalBytes = 0;
+  for (const raw of files) {
+    const trimmed = raw.trim();
+    if (trimmed === '') {
+      throw new Error('files entry must be a non-empty relative path inside the repository.');
+    }
+    if (path.isAbsolute(trimmed)) {
+      throw new Error(`watched file "${trimmed}" must be a relative path inside the repository.`);
+    }
+    const abs = path.resolve(repoRoot, trimmed);
+    const rel = path.relative(repoRoot, abs);
+    if (rel === '' || rel === '.' || rel.startsWith('..') || path.isAbsolute(rel)) {
+      throw new Error(`watched file "${trimmed}" escapes repository root ${repoRoot}.`);
+    }
+    const normalized = rel.split(path.sep).join('/');
+    let st;
+    try {
+      st = statSync(abs);
+    } catch {
+      throw new Error(`watched file "${normalized}" does not exist in ${repoRoot}.`);
+    }
+    if (!st.isFile()) {
+      throw new Error(`watched file "${normalized}" is not a regular file.`);
+    }
+    let realAbs: string;
+    try {
+      realAbs = realpathSync(abs);
+    } catch {
+      throw new Error(`watched file "${normalized}" does not exist in ${repoRoot}.`);
+    }
+    const realRel = path.relative(realRepoRoot, realAbs);
+    if (realRel === '' || realRel === '.' || realRel.startsWith('..') || path.isAbsolute(realRel)) {
+      throw new Error(`watched file "${normalized}" resolves outside repository root ${repoRoot}.`);
+    }
+    if (!seen.has(normalized)) {
+      if (out.length >= MAX_WATCHED_FILES) {
+        throw new Error(`files exceeds maximum of ${MAX_WATCHED_FILES} watched files (${files.length} requested).`);
+      }
+      totalBytes += st.size;
+      if (totalBytes > MAX_WATCHED_BYTES) {
+        throw new Error(`watched files exceed maximum total size of ${MAX_WATCHED_BYTES} bytes.`);
+      }
+      seen.add(normalized);
+      out.push(normalized);
+    }
+  }
+  return out;
+}
+
+export function syncWatchedFiles(
+  repo: string,
+  cwd: string,
+  files: readonly string[],
+  previousWatched?: Readonly<Record<string, WatchedFileSigs>> | null,
+  onWarning?: (message: string) => void,
+): Record<string, WatchedFileSigs> {
+  const normalized = validateWatchedFiles(repo, files);
+  const repoRoot = path.resolve(repo);
+  const cwdRoot = path.resolve(cwd);
+  const sameRoot = repoRoot === cwdRoot;
+  const out: Record<string, WatchedFileSigs> = {};
+  for (const rel of normalized) {
+    const repoSig = fileSig(repoRoot, rel);
+    if (!sameRoot) {
+      const src = path.join(repoRoot, rel);
+      const dst = path.join(cwdRoot, rel);
+      const prev = previousWatched?.[rel];
+      const currentCwdSig = fileSig(cwdRoot, rel);
+      if (prev === undefined || currentCwdSig === 'gone') {
+        mkdirSync(path.dirname(dst), { recursive: true });
+        copyFileSync(src, dst);
+      } else if (prev.repoSig !== repoSig) {
+        if (currentCwdSig !== prev.cwdSig) {
+          onWarning?.(`watched file "${rel}" changed in both repo and worktree; kept worktree copy`);
+        } else {
+          mkdirSync(path.dirname(dst), { recursive: true });
+          copyFileSync(src, dst);
+        }
+      }
+    }
+    const cwdSig = sameRoot ? repoSig : fileSig(cwdRoot, rel);
+    out[rel] = { repoSig, cwdSig };
+  }
+  return out;
 }
 
 function isForgeActivity(value: unknown): value is ForgeActivity {

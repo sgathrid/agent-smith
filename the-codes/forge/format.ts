@@ -141,11 +141,17 @@ export const FILES = {
 
 export type SteerDelivery = 'queue' | 'interrupt';
 
+export interface WatchedFileSigs {
+  readonly repoSig: string;
+  readonly cwdSig: string;
+}
+
 export interface SteerEntry {
   readonly id: string;
   readonly createdAt: string;
   readonly prompt: string;
   readonly context?: string | undefined;
+  readonly files?: readonly string[] | undefined;
   readonly delivery: SteerDelivery;
 }
 
@@ -282,6 +288,10 @@ export interface ForgeManifest {
   readonly steeredFrom?: string | null;
   /** Number of unconsumed queued steers in steer.jsonl. */
   readonly pendingSteers?: number;
+  /** Declared brief/spec files synced at turn start, mapped to their repo + cwd signatures. */
+  readonly watchedFiles?: Readonly<Record<string, WatchedFileSigs>>;
+  /** Watched brief/spec files that diverged in repo (or externally in cwd) while the turn ran. */
+  readonly staleReads?: readonly string[];
 }
 
 export interface GitBaseline {

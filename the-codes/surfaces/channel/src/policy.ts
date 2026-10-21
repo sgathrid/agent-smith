@@ -79,6 +79,8 @@ export interface WatchableJob {
   readonly supersededBy?: string | null;
   /** Parent job ID when this turn was spawned by pump() consuming steer.jsonl. */
   readonly steeredFrom?: string | null;
+  /** Watched brief files that changed in the repository while the job ran. */
+  readonly staleReads?: readonly string[] | null;
 }
 
 /**
@@ -273,6 +275,7 @@ export function toNotice(job: WatchableJob, kind: PushKind, now: number): Notice
     checks: job.checks ?? null,
     reason: run ? job.outcome! : kind === 'failed' ? reasonFromText(job.failureReason) : null,
     summary: job.summarySource === 'worker' ? job.latestSummary ?? null : null,
+    ...(job.staleReads && job.staleReads.length > 0 ? { staleReads: job.staleReads } : {}),
   };
 }
 

@@ -263,6 +263,9 @@ export class AgentSmithReader implements JobStateReader {
       ...(typeof (progress?.pendingSteers ?? manifest?.pendingSteers) === 'number'
         ? { pendingSteers: progress?.pendingSteers ?? manifest?.pendingSteers }
         : {}),
+      ...(Array.isArray(manifest?.staleReads) && manifest.staleReads.length > 0
+        ? { staleReads: manifest.staleReads }
+        : {}),
     };
 
     // partial=true when the anchor is missing: something is on disk for this

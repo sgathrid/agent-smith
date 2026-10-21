@@ -33,8 +33,9 @@
  */
 
 // Shared with the mod, which renders the digest; the mod loader cannot import forge, so it lives there.
-import { ProgressTracker } from '../surfaces/mod/hooks/progress.ts';
+import { classify, ProgressTracker } from '../surfaces/mod/hooks/progress.ts';
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 
@@ -59,6 +60,7 @@ import {
   type ForgeStatus,
   type ForgeView,
   type ForgeViewEvent,
+  type WatchedFileSigs,
 } from './format.ts';
 import { MirrorWriter } from './mirror.ts';
 import type { JobResult, ProviderEvent, WorkerHandle } from '../providers/types.ts';
@@ -105,6 +107,7 @@ export interface StartInput {
   readonly readOnlyRequested?: boolean;
   readonly readOnlyEnforced?: boolean;
   readonly steeredFrom?: string | null;
+  readonly watchedFiles?: Readonly<Record<string, WatchedFileSigs>>;
 }
 
 /**
@@ -141,8 +144,11 @@ export class JobWriter {
   private baselineSigs = new Map<string, string>();
   private changed: { files: string[]; truncated: boolean } | null = null;
   private unattributed: string[] = [];
+  private staleReads: string[] = [];
   /** Concatenated tool inputs of this job, used to attribute changed files to it. */
   private toolInputs = '';
+  /** Concatenated inputs of edit tool calls only, so read calls never attribute an external edit to the worker. */
+  private editToolInputs = '';
 
   constructor(options: JobWriterOptions) {
     this.repo = options.repo;
@@ -211,6 +217,9 @@ export class JobWriter {
       ...(input.readOnlyRequested === undefined ? {} : { readOnlyRequested: input.readOnlyRequested }),
       ...(input.readOnlyEnforced === undefined ? {} : { readOnlyEnforced: input.readOnlyEnforced }),
       ...(input.steeredFrom ? { steeredFrom: input.steeredFrom } : {}),
+      ...(input.watchedFiles !== undefined && Object.keys(input.watchedFiles).length > 0
+        ? { watchedFiles: input.watchedFiles }
+        : {}),
     };
     this.manifest = manifest;
     this.progress = {
@@ -243,6 +252,15 @@ export class JobWriter {
     } catch { /* best effort */ }
   }
 
+  /** Candidate paths that this worker's own edit tool calls touched. */
+  editedFiles(candidates?: readonly string[]): string[] {
+    const fromTracker = this.tracker.editedPaths(this.cwd);
+    if (candidates === undefined) return fromTracker;
+    const fromEditInputs =
+      this.editToolInputs !== '' ? attributeChanged(candidates, this.editToolInputs).mine : [];
+    return [...new Set([...fromTracker.filter((p) => candidates.includes(p)), ...fromEditInputs])];
+  }
+
   /**
    * Compute `changedFiles` against the baseline. Call (awaited) just before
    * `finish()`; finish stays synchronous. Bounded by the git ~2s cap, never throws.
@@ -250,20 +268,55 @@ export class JobWriter {
   async prepareFinish(): Promise<void> {
     try {
       if (this.baselinePending !== null) await this.baselinePending;
-      const base = this.manifest?.gitBaseline;
-      if (base === undefined || this.manifest === null) return;
-      const now = await gitSnapshot(this.cwd);
-      if (now === null) return;
-      const modified = base.dirty.filter(
-        (p) => now.dirty.includes(p) && this.baselineSigs.has(p) && this.baselineSigs.get(p) !== fileSig(this.cwd, p),
-      );
-      const committed = base.head !== null && now.head !== null && base.head !== now.head
-        ? await gitCommittedPaths(this.cwd, base.head, now.head)
-        : [];
-      const diff = diffChangedFiles(base, now.dirty, modified, committed);
-      const split = attributeChanged(diff.files, this.toolInputs);
-      this.changed = { files: split.mine, truncated: diff.truncated };
-      this.unattributed = split.other;
+      if (this.manifest === null) return;
+      const watched = this.manifest.watchedFiles;
+      const watchedKeys = watched !== undefined ? Object.keys(watched) : [];
+      const editedWatchedSet = new Set(this.editedFiles(watchedKeys));
+      const sameRoot = path.resolve(this.repo) === path.resolve(this.cwd);
+      const base = this.manifest.gitBaseline;
+      if (base !== undefined) {
+        const now = await gitSnapshot(this.cwd);
+        if (now !== null) {
+          const modified = base.dirty.filter(
+            (p) => now.dirty.includes(p) && this.baselineSigs.has(p) && this.baselineSigs.get(p) !== fileSig(this.cwd, p),
+          );
+          const committed = base.head !== null && now.head !== null && base.head !== now.head
+            ? await gitCommittedPaths(this.cwd, base.head, now.head)
+            : [];
+          let baseForDiff = base;
+          let nowDirty = now.dirty;
+          let modifiedFiltered = modified;
+          let committedFiltered = committed;
+          if (watched !== undefined) {
+            const unmodifiedWatched = new Set<string>();
+            const modifiedWatched = new Set<string>();
+            for (const [p, sigs] of Object.entries(watched)) {
+              const sigChanged = fileSig(this.cwd, p) !== sigs.cwdSig;
+              const workerModified = sameRoot ? sigChanged && editedWatchedSet.has(p) : sigChanged;
+              if (!workerModified) unmodifiedWatched.add(p);
+              else modifiedWatched.add(p);
+            }
+            if (unmodifiedWatched.size > 0) {
+              baseForDiff = { ...base, dirty: base.dirty.filter((p) => !unmodifiedWatched.has(p)) };
+              nowDirty = now.dirty.filter((p) => !unmodifiedWatched.has(p));
+              modifiedFiltered = modified.filter((p) => !unmodifiedWatched.has(p));
+              committedFiltered = committed.filter((p) => !unmodifiedWatched.has(p));
+            }
+            if (modifiedWatched.size > 0) {
+              const nextMod = new Set(modifiedFiltered);
+              for (const p of modifiedWatched) nextMod.add(p);
+              modifiedFiltered = [...nextMod];
+            }
+          }
+          const diff = diffChangedFiles(baseForDiff, nowDirty, modifiedFiltered, committedFiltered);
+          const split = attributeChanged(diff.files, this.toolInputs);
+          this.changed = { files: split.mine, truncated: diff.truncated };
+          this.unattributed = split.other;
+        }
+      }
+      if (watched !== undefined) {
+        this.staleReads = computeStaleReads(this.repo, this.cwd, watched, [...editedWatchedSet]);
+      }
     } catch { /* best effort */ }
   }
 
@@ -317,15 +370,18 @@ export class JobWriter {
       // what keeps the pane's activity phrase readable on a finished job.
       const idx = this.recent.findIndex((a) => a.stepIndex === ref.stepIndex);
       const input = ref.input ?? (idx >= 0 ? this.recent[idx]?.input : undefined);
-      if (event.kind === 'activity-start' && ref.input !== undefined && this.toolInputs.length < TOOL_INPUTS_CAP) {
-        this.toolInputs += ref.input + '\n';
-      }
       const row: ForgeActivity = {
         stepIndex: ref.stepIndex,
         tool: ref.tool === 'tool_result' ? this.recent[idx]?.tool ?? ref.tool : ref.tool,
         status,
         ...(input === undefined ? {} : { input }),
       };
+      if (event.kind === 'activity-start' && ref.input !== undefined) {
+        if (this.toolInputs.length < TOOL_INPUTS_CAP) this.toolInputs += ref.input + '\n';
+        if (classify(row.tool, input).kind === 'edit' && this.editToolInputs.length < TOOL_INPUTS_CAP) {
+          this.editToolInputs += ref.input + '\n';
+        }
+      }
       if (event.kind === 'activity-start') this.tracker.start(ref.stepIndex, row.tool, input);
       else this.tracker.end(ref.stepIndex, row.tool, input, status);
       this.lastActivity = row;
@@ -468,6 +524,7 @@ export class JobWriter {
         ? {}
         : { changedFiles: this.changed.files, changedFilesTruncated: this.changed.truncated }),
       ...(this.unattributed.length === 0 ? {} : { unattributedFiles: this.unattributed }),
+      ...(this.staleReads.length === 0 ? {} : { staleReads: this.staleReads }),
       ...(this.manifest.pendingSteers !== undefined ? { pendingSteers: 0 } : {}),
     };
     this.manifest = manifest;
@@ -696,13 +753,49 @@ async function gitCommittedPaths(cwd: string, from: string, to: string): Promise
   }
 }
 
-function fileSig(cwd: string, rel: string): string {
+export function fileSig(cwd: string, rel: string): string {
   try {
-    const st = statSync(path.join(cwd, rel));
+    const full = path.join(cwd, rel);
+    const st = statSync(full);
+    if (!st.isFile()) return 'gone';
+    if (st.size <= 4 * 1024 * 1024) {
+      const hash = createHash('sha256').update(readFileSync(full)).digest('hex').slice(0, 16);
+      return `${st.size}:${hash}`;
+    }
     return `${st.size}:${st.mtimeMs}`;
   } catch {
     return 'gone';
   }
+}
+
+export function computeStaleReads(
+  repo: string,
+  cwd: string,
+  watchedFiles?: Readonly<Record<string, WatchedFileSigs>>,
+  changedFiles?: readonly string[],
+): string[] {
+  if (!watchedFiles) return [];
+  const entries = Object.entries(watchedFiles);
+  if (entries.length === 0) return [];
+  const repoRoot = path.resolve(repo);
+  const cwdRoot = path.resolve(cwd);
+  const sameRoot = repoRoot === cwdRoot;
+  const workerChanged = new Set(changedFiles ?? []);
+  const stale: string[] = [];
+  for (const [rel, sigs] of entries) {
+    const currentRepoSig = fileSig(repoRoot, rel);
+    if (!sameRoot) {
+      const currentCwdSig = fileSig(cwdRoot, rel);
+      const externallyEditedInCwd =
+        changedFiles !== undefined && currentCwdSig !== sigs.cwdSig && !workerChanged.has(rel);
+      if (currentRepoSig !== sigs.repoSig || externallyEditedInCwd) {
+        stale.push(rel);
+      }
+    } else if (currentRepoSig !== sigs.repoSig && !workerChanged.has(rel)) {
+      stale.push(rel);
+    }
+  }
+  return stale.sort();
 }
 
 /** Append `add` to `base`, bounded. Pure, so the bounding rule is testable. */

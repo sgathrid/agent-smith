@@ -81,6 +81,7 @@ export async function readForgeJob(fs: FsLike, repo: string, id: string, now: nu
   const latestSummary = text(p?.latestSummary, m.latestSummary);
   const progress = digest(p?.digest);
   const now0 = latest ? classify(text(latest.tool) ?? '', text(latest.input)).label : '';
+  const staleReads = (Array.isArray(m.staleReads) ? m.staleReads : []).filter((f): f is string => typeof f === 'string' && f.trim() !== '');
   return {
     id, name: text(m.name, resolved?.name, p?.name), workerId: text(m.workerId, resolved?.workerId, p?.workerId) ?? id,
     role: text(m.role, resolved?.role, p?.role, resolved?.mode, m.mode),
@@ -96,6 +97,7 @@ export async function readForgeJob(fs: FsLike, repo: string, id: string, now: nu
     acceptance: a, failureReason: text(m.reason, m.failureReason, m.error, status === 'failed' ? warnings[0]?.message : null),
     supersededBy: text(m.supersededBy), steeredFrom: text(m.steeredFrom),
     pendingSteers: number(p?.pendingSteers) ?? number(m.pendingSteers),
+    ...(staleReads.length > 0 ? { staleReads } : {}),
     warnings, report: null, reasoning: text(p?.latestText), raw: {},
   };
 }
