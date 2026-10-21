@@ -3,7 +3,7 @@
  */
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -16,7 +16,7 @@ import { ForgeTasks } from '../../surfaces/channel/src/tasks.ts';
 import { callTool } from '../../surfaces/channel/src/tools.ts';
 import { isLive } from '../../surfaces/mod/hooks/dashboard.ts';
 import { syncNativeTasks, type NativeJob } from '../../surfaces/mod/hooks/native.ts';
-import { claim, due, parseSettledRead } from '../../surfaces/mod/hooks/notice.ts';
+import { claim, claudeText, due, parseSettledRead } from '../../surfaces/mod/hooks/notice.ts';
 
 interface ControlledTurn {
   spec: SpawnSpec;
@@ -819,4 +819,197 @@ test('watched brief files: rejects path traversal, absolute paths, and missing f
     service.spawnTracked({ mode: 'implement', prompt: 'x', files: ['nonexistent.md'] }),
     /does not exist in/,
   );
+});
+
+test('watched brief files in same-root cwd (cwd === repo): reading ARCHITECTURE.md does not suppress finish-time staleReads when orchestrator edits it', async () => {
+  const ctrl = controlledProvider();
+  const { service, repo } = makeService(ctrl.provider);
+  initGitRepo(repo);
+
+  const turnReady = ctrl.nextTurn();
+  const { ack, done } = await service.spawnTracked({
+    mode: 'implement',
+    name: 'same-root-worker',
+    files: ['ARCHITECTURE.md', 'docs/brief.md'],
+    prompt: 'Implement according to ARCHITECTURE.md.',
+  });
+
+  const turn = await turnReady;
+  while (!JSON.parse(readFileSync(jobFile(repo, ack.jobId, FILES.job), 'utf8')).gitBaseline) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  turn.emit({ kind: 'started', at: new Date().toISOString(), conversationId: 'thread-same-root' });
+  // Worker reads ARCHITECTURE.md and edits src.ts in the same repository root (cwd === repo).
+  turn.emit({
+    kind: 'activity-start',
+    at: new Date().toISOString(),
+    activity: { stepIndex: 1, tool: 'Read', input: 'Read ARCHITECTURE.md' },
+  });
+  writeFileSync(path.join(repo, 'src.ts'), 'export const v = 1;\n');
+  turn.emit({
+    kind: 'activity-start',
+    at: new Date().toISOString(),
+    activity: { stepIndex: 2, tool: 'Write', input: 'src.ts' },
+  });
+
+  // Orchestrator edits ARCHITECTURE.md in repo while worker is running.
+  writeFileSync(path.join(repo, 'ARCHITECTURE.md'), '# Architecture v2\nOrchestrator update.\n');
+
+  const liveDetail = await service.detail(ack.jobId);
+  assert.deepEqual(liveDetail.staleReads, ['ARCHITECTURE.md']);
+
+  turn.finish({ status: 'success', response: 'Implemented based on ARCHITECTURE.md v1.' });
+  await done;
+
+  const finalDetail = await service.detail(ack.jobId);
+  assert.deepEqual(finalDetail.changedFiles, ['src.ts']);
+  assert.deepEqual(finalDetail.staleReads, ['ARCHITECTURE.md']);
+
+  // Completion notice also surfaces staleReads at finish time.
+  const now = Date.now();
+  const owned = claim([], { kind: 'job', id: ack.jobId, repo, timeoutMs: 60_000 }, now);
+  const noticeRes = due(
+    owned,
+    [
+      {
+        id: ack.jobId,
+        status: 'succeeded',
+        startedAt: now - 1000,
+        endedAt: now,
+        staleReads: finalDetail.staleReads,
+      },
+    ],
+    new Map(),
+    now,
+  );
+  assert.equal(noticeRes.notices.length, 1);
+  assert.match(claudeText(noticeRes.notices), /stale brief: ARCHITECTURE\.md/);
+});
+
+test('watched brief files: re-sync on steer preserves worker edits in worktree when repo copy did not change, and does not clobber on both-changed', async () => {
+  const ctrl = controlledProvider();
+  const { service, repo } = makeService(ctrl.provider);
+  initGitRepo(repo);
+
+  const worktree = mkdtempSync(path.join(tmpdir(), 'agent-smith-wt-preserve-'));
+  initGitRepo(worktree);
+
+  const turn1Ready = ctrl.nextTurn();
+  const { ack, done } = await service.spawnTracked({
+    mode: 'implement',
+    name: 'worker-preserve',
+    cwd: worktree,
+    files: ['ARCHITECTURE.md', 'docs/brief.md'],
+    prompt: 'Turn 1.',
+  });
+  const turn1 = await turn1Ready;
+  turn1.emit({ kind: 'started', at: new Date().toISOString(), conversationId: 'thread-preserve' });
+
+  // Worker edits docs/brief.md in its worktree; repo copy of docs/brief.md stays unchanged.
+  writeFileSync(path.join(worktree, 'docs', 'brief.md'), '# worker edit\n');
+  turn1.emit({
+    kind: 'activity-start',
+    at: new Date().toISOString(),
+    activity: { stepIndex: 1, tool: 'Write', input: 'docs/brief.md' },
+  });
+
+  // Steer the worker without changing repo/docs/brief.md.
+  await service.steer({
+    worker: ack.jobId,
+    prompt: 'Continue turn 2.',
+    delivery: 'queue',
+  });
+
+  const turn2Ready = ctrl.nextTurn();
+  turn1.finish({ status: 'success', response: 'Edited docs/brief.md in worktree.' });
+
+  const turn2 = await turn2Ready;
+  assert.equal(
+    readFileSync(path.join(worktree, 'docs', 'brief.md'), 'utf8'),
+    '# worker edit\n',
+    'worker edit in worktree must not be overwritten by unchanged repo copy',
+  );
+  assert.doesNotMatch(turn2.spec.prompt, /Synced brief file\(s\) in your working tree/);
+
+  // Now modify ARCHITECTURE.md in BOTH repo and worktree before turn 3 steer: worktree copy must not be clobbered.
+  writeFileSync(path.join(repo, 'ARCHITECTURE.md'), '# repo conflicting edit\n');
+  writeFileSync(path.join(worktree, 'ARCHITECTURE.md'), '# worktree conflicting edit\n');
+  await service.steer({
+    worker: ack.jobId,
+    prompt: 'Continue turn 3.',
+    delivery: 'queue',
+  });
+
+  const turn3Ready = ctrl.nextTurn();
+  turn2.finish({ status: 'success', response: 'Finished turn 2.' });
+  const turn3 = await turn3Ready;
+  assert.equal(
+    readFileSync(path.join(worktree, 'ARCHITECTURE.md'), 'utf8'),
+    '# worktree conflicting edit\n',
+    'conflicting worktree edit must not be clobbered',
+  );
+  turn3.finish({ status: 'success', response: 'Finished turn 3.' });
+  const finalManifest = await done;
+  const finalDetail = await service.detail(finalManifest.jobId);
+  assert.ok(
+    finalDetail.warnings.some((w) => w.message.includes('changed in both repo and worktree')),
+    'expected warning when watched file changed in both repo and worktree',
+  );
+});
+
+test('watched brief files: rejects symlink escaping repo, enforces 32-file cap, and drops deleted inherited file on resume_job with warning', async () => {
+  const ctrl = controlledProvider();
+  const { service, repo } = makeService(ctrl.provider);
+  initGitRepo(repo);
+
+  const outsideDir = mkdtempSync(path.join(tmpdir(), 'agent-smith-outside-'));
+  const outsideFile = path.join(outsideDir, 'secret.md');
+  writeFileSync(outsideFile, 'secret\n');
+  symlinkSync(outsideFile, path.join(repo, 'escape-link.md'));
+
+  await assert.rejects(
+    service.spawnTracked({ mode: 'implement', prompt: 'x', files: ['escape-link.md'] }),
+    /resolves outside repository root/,
+  );
+
+  const tooMany: string[] = [];
+  for (let i = 0; i < 33; i++) {
+    const rel = `docs/f-${i}.md`;
+    writeFileSync(path.join(repo, rel), `file ${i}\n`);
+    tooMany.push(rel);
+  }
+  await assert.rejects(
+    service.spawnTracked({ mode: 'implement', prompt: 'x', files: tooMany }),
+    /exceeds maximum of 32 watched files/,
+  );
+
+  // Spawn a job with docs/brief.md, finish it, delete docs/brief.md from repo, then resume_job:
+  const t1Ready = ctrl.nextTurn();
+  const { ack, done } = await service.spawnTracked({
+    mode: 'implement',
+    name: 'resume-deleted-watched',
+    files: ['ARCHITECTURE.md', 'docs/brief.md'],
+    prompt: 'Turn 1.',
+  });
+  const t1 = await t1Ready;
+  t1.emit({ kind: 'started', at: new Date().toISOString(), conversationId: 'thread-resume-del' });
+  t1.finish({ status: 'success', response: 'Done turn 1.' });
+  await done;
+
+  unlinkSync(path.join(repo, 'docs', 'brief.md'));
+
+  const t2Ready = ctrl.nextTurn();
+  const resumeOut = await callTool(
+    { service, catalogs: async () => [] },
+    'resume_job',
+    { worker: ack.jobId, prompt: 'Resume after docs/brief.md was deleted.' },
+  );
+  assert.notEqual(resumeOut.isError, true);
+  const resumeAck = JSON.parse((resumeOut.content[0] as { text: string }).text);
+  assert.ok(
+    Array.isArray(resumeAck.warnings) &&
+      resumeAck.warnings.some((w: string) => w.includes('dropped deleted watched file "docs/brief.md"')),
+  );
+  const t2 = await t2Ready;
+  t2.finish({ status: 'success', response: 'Done turn 2.' });
 });

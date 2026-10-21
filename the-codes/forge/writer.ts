@@ -33,7 +33,7 @@
  */
 
 // Shared with the mod, which renders the digest; the mod loader cannot import forge, so it lives there.
-import { ProgressTracker } from '../surfaces/mod/hooks/progress.ts';
+import { classify, ProgressTracker } from '../surfaces/mod/hooks/progress.ts';
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { readFileSync, statSync } from 'node:fs';
@@ -147,6 +147,8 @@ export class JobWriter {
   private staleReads: string[] = [];
   /** Concatenated tool inputs of this job, used to attribute changed files to it. */
   private toolInputs = '';
+  /** Concatenated inputs of edit tool calls only, so read calls never attribute an external edit to the worker. */
+  private editToolInputs = '';
 
   constructor(options: JobWriterOptions) {
     this.repo = options.repo;
@@ -250,6 +252,15 @@ export class JobWriter {
     } catch { /* best effort */ }
   }
 
+  /** Candidate paths that this worker's own edit tool calls touched. */
+  editedFiles(candidates?: readonly string[]): string[] {
+    const fromTracker = this.tracker.editedPaths(this.cwd);
+    if (candidates === undefined) return fromTracker;
+    const fromEditInputs =
+      this.editToolInputs !== '' ? attributeChanged(candidates, this.editToolInputs).mine : [];
+    return [...new Set([...fromTracker.filter((p) => candidates.includes(p)), ...fromEditInputs])];
+  }
+
   /**
    * Compute `changedFiles` against the baseline. Call (awaited) just before
    * `finish()`; finish stays synchronous. Bounded by the git ~2s cap, never throws.
@@ -259,6 +270,9 @@ export class JobWriter {
       if (this.baselinePending !== null) await this.baselinePending;
       if (this.manifest === null) return;
       const watched = this.manifest.watchedFiles;
+      const watchedKeys = watched !== undefined ? Object.keys(watched) : [];
+      const editedWatchedSet = new Set(this.editedFiles(watchedKeys));
+      const sameRoot = path.resolve(this.repo) === path.resolve(this.cwd);
       const base = this.manifest.gitBaseline;
       if (base !== undefined) {
         const now = await gitSnapshot(this.cwd);
@@ -277,7 +291,9 @@ export class JobWriter {
             const unmodifiedWatched = new Set<string>();
             const modifiedWatched = new Set<string>();
             for (const [p, sigs] of Object.entries(watched)) {
-              if (fileSig(this.cwd, p) === sigs.cwdSig) unmodifiedWatched.add(p);
+              const sigChanged = fileSig(this.cwd, p) !== sigs.cwdSig;
+              const workerModified = sameRoot ? sigChanged && editedWatchedSet.has(p) : sigChanged;
+              if (!workerModified) unmodifiedWatched.add(p);
               else modifiedWatched.add(p);
             }
             if (unmodifiedWatched.size > 0) {
@@ -299,13 +315,7 @@ export class JobWriter {
         }
       }
       if (watched !== undefined) {
-        const attributedWatched =
-          this.changed !== null
-            ? this.changed.files
-            : this.toolInputs !== ''
-              ? attributeChanged(Object.keys(watched), this.toolInputs).mine
-              : undefined;
-        this.staleReads = computeStaleReads(this.repo, this.cwd, watched, attributedWatched);
+        this.staleReads = computeStaleReads(this.repo, this.cwd, watched, [...editedWatchedSet]);
       }
     } catch { /* best effort */ }
   }
@@ -360,15 +370,18 @@ export class JobWriter {
       // what keeps the pane's activity phrase readable on a finished job.
       const idx = this.recent.findIndex((a) => a.stepIndex === ref.stepIndex);
       const input = ref.input ?? (idx >= 0 ? this.recent[idx]?.input : undefined);
-      if (event.kind === 'activity-start' && ref.input !== undefined && this.toolInputs.length < TOOL_INPUTS_CAP) {
-        this.toolInputs += ref.input + '\n';
-      }
       const row: ForgeActivity = {
         stepIndex: ref.stepIndex,
         tool: ref.tool === 'tool_result' ? this.recent[idx]?.tool ?? ref.tool : ref.tool,
         status,
         ...(input === undefined ? {} : { input }),
       };
+      if (event.kind === 'activity-start' && ref.input !== undefined) {
+        if (this.toolInputs.length < TOOL_INPUTS_CAP) this.toolInputs += ref.input + '\n';
+        if (classify(row.tool, input).kind === 'edit' && this.editToolInputs.length < TOOL_INPUTS_CAP) {
+          this.editToolInputs += ref.input + '\n';
+        }
+      }
       if (event.kind === 'activity-start') this.tracker.start(ref.stepIndex, row.tool, input);
       else this.tracker.end(ref.stepIndex, row.tool, input, status);
       this.lastActivity = row;

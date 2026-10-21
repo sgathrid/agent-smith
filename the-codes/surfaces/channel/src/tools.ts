@@ -486,8 +486,9 @@ export async function callTool(ctx: HandlerContext, name: string, rawArgs: unkno
         // Only an explicit unrestricted:true asks; an inherited setting was the original job's.
         const gate = await confirmUnrestricted(ctx, { unrestricted, provider: detail.provider ?? '', worker: detail.name, cwd });
         if (gate.refused) return gate.refused;
-        const resumed = await ctx.service.spawnJob({ mode: detail.mode ?? 'task', prompt, files: mergedFiles.length > 0 ? mergedFiles : undefined, provider: detail.provider ?? undefined, model: resumeModel.model ?? detail.model ?? undefined, effort: resumeModel.effort ?? detail.effort ?? undefined, name: detail.name, workerId: detail.workerId, task: detail.task ?? undefined, cwd, conversation: detail.conversation, timeoutMs, unrestricted: unrestricted ?? detail.unrestricted, onPrepared: ctx.onJobPrepared });
-        return structured({ ...resumed, taskHandle: launchTask(resumed.jobId), notify: notifyHint({ job: resumed.jobId }, ctx.service.repo, resumed.timeoutMs), ...(gate.warning ? { warnings: [...(resumed.warnings ?? []), gate.warning] } : {}) });
+        const resumed = await ctx.service.spawnJob({ mode: detail.mode ?? 'task', prompt, files: mergedFiles.length > 0 ? mergedFiles : undefined, ...(detail.watchedFiles ? { previousWatchedFiles: detail.watchedFiles } : {}), provider: detail.provider ?? undefined, model: resumeModel.model ?? detail.model ?? undefined, effort: resumeModel.effort ?? detail.effort ?? undefined, name: detail.name, workerId: detail.workerId, task: detail.task ?? undefined, cwd, conversation: detail.conversation, timeoutMs, unrestricted: unrestricted ?? detail.unrestricted, onPrepared: ctx.onJobPrepared });
+        const allWarnings = [...(resumed.warnings ?? []), ...(gate.warning ? [gate.warning] : [])];
+        return structured({ ...resumed, taskHandle: launchTask(resumed.jobId), notify: notifyHint({ job: resumed.jobId }, ctx.service.repo, resumed.timeoutMs), ...(allWarnings.length > 0 ? { warnings: allWarnings } : {}) });
       }
       case 'steer_job': {
         const worker = text(args, 'worker', true)!;
@@ -514,7 +515,7 @@ export async function callTool(ctx: HandlerContext, name: string, rawArgs: unkno
       case 'status': {
         const jobId = text(args, 'jobId', true)!; const waitMs = number(args, 'wait_ms', MAX_WAIT_MS); const fmt = format(args); const wantDiff = boolean(args, 'include_diff') ?? false;
         const resolveHead = (id: string) => typeof ctx.service.resolveHead === 'function' ? ctx.service.resolveHead(id) : id;
-        let detail = await ctx.service.detail(waitMs !== undefined ? resolveHead(jobId) : jobId); let waited = false;
+        let detail = await ctx.service.detail(resolveHead(jobId)); let waited = false;
         if (waitMs !== undefined) {
           waited = true; const deadline = Date.now() + waitMs; const step = ctx.pollMs ?? WAIT_POLL_MS;
           while ((detail.status === 'running' || Boolean(detail.supersededBy)) && Date.now() < deadline) {
