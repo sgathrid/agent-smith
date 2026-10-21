@@ -3,6 +3,7 @@ import { execFile } from 'node:child_process';
 import type { JobDetail, JobSummary } from '../../../forge/service.ts';
 import type { Acceptance } from '../../../forge/checks.ts';
 import type { PipelineRecord } from '../../../forge/execute.ts';
+import { STALL_GRACE_MS } from '../../mod/hooks/stale.ts';
 import { reasonFromText } from '../../mod/hooks/reasons.ts';
 
 export type ResponseFormat = 'concise' | 'detailed';
@@ -102,6 +103,8 @@ export function conciseStatus(d: JobDetail, acceptance: AcceptanceView | null, e
   const warnings = d.warnings.length ? warningTexts(d.warnings, d.error) : [];
   return compact({
     jobId: d.jobId, name: d.name, provider: d.provider, model: d.model, mode: d.mode, status: d.status, taskStatus: taskStatus(d.status),
+    resumable: Boolean(d.conversation),
+    stalled: d.status === 'running' && d.updatedAt !== null && Date.now() - Date.parse(d.updatedAt) > STALL_GRACE_MS,
     acceptance: checkVerdicts(acceptance),
     startedAt: d.startedAt, finishedAt: d.finishedAt, durationMs: Number.isNaN(started) ? null : Math.max(0, ended - started),
     toolCalls: d.toolCalls, lastActivity: lastActivity(d.lastActivity),
@@ -177,9 +180,6 @@ export async function jobDiff(d: JobDetail): Promise<{ diff: string | null; diff
 export const CONCISE_MODELS_CAP = 15;
 /** Models that cannot run a coding job: embeddings, speech, image, video, music, live audio, computer use, research. */
 const NON_CODING_MODEL = /embedding|(?:^|[-/])tts(?:$|-)|-tts\b|image|(?:^|\/)veo-|(?:^|\/)lyria-|-live-|computer-use|deep-research|translate/i;
-/** When one model is reachable through several opencode routes, concise shows this route and lists the others under `via`. */
-const PREFERRED_ROUTE = 'opencode';
-
 export interface CapabilityModel { readonly id: string; readonly label?: string; readonly efforts?: readonly string[]; readonly defaultEffort?: string | null }
 export interface CapabilityProvider {
   readonly name: string; readonly available: boolean;
@@ -188,44 +188,21 @@ export interface CapabilityProvider {
   readonly stale?: boolean; readonly verified?: boolean; readonly error?: string;
 }
 
-/** `route/name` → [route, name]; an id without a route is its own name. */
-function splitRoute(id: string): [string | null, string] {
-  const i = id.indexOf('/');
-  return i === -1 ? [null, id] : [id.slice(0, i), id.slice(i + 1)];
-}
-
-/** One row per model name: the preferred route's id, the other routes under `via`. */
-function collapseRoutes(models: readonly CapabilityModel[]): Array<{ model: CapabilityModel; via: string[] }> {
-  const byName = new Map<string, { model: CapabilityModel; via: string[] }>();
-  for (const model of models) {
-    const [route, name] = splitRoute(model.id);
-    const seen = byName.get(name);
-    if (seen === undefined) { byName.set(name, { model, via: [] }); continue; }
-    if (route === PREFERRED_ROUTE) {
-      const [kept] = splitRoute(seen.model.id);
-      if (kept !== null) seen.via.push(kept);
-      seen.model = model;
-    } else if (route !== null) seen.via.push(route);
-  }
-  return [...byName.values()].map(({ model, via }) => ({ model, via: via.sort() }));
-}
-
 /**
  * The orchestrator needs enough to pick a provider, model and effort, and no
  * more. Drop fields that repeat a default or say nothing, models that cannot
- * code, and duplicate routes to one model. A provider with more models than the
+ * code, while retaining every exact route ID. A provider with more models than the
  * cap reports a count; naming it in `provider` lists them all.
  */
 export function conciseCapabilities(providers: readonly CapabilityProvider[], only: string | undefined) {
   return providers.map((p) => {
     if (!p.available) return { name: p.name, available: false };
-    const coding = collapseRoutes(p.models.filter((m) => !NON_CODING_MODEL.test(m.id)));
-    const efforts = commonEfforts(coding.map(({ model }) => model.efforts ?? []));
-    const rows = coding.map(({ model, via }) => ({
+    const coding = p.models.filter((m) => !NON_CODING_MODEL.test(m.id));
+    const efforts = commonEfforts(coding.map(model => model.efforts ?? []));
+    const rows = coding.map(model => ({
       id: model.id,
       ...(model.efforts?.length && model.efforts.join() !== efforts?.join() ? { efforts: model.efforts } : {}),
       ...(model.defaultEffort && model.defaultEffort !== p.defaultEffort ? { defaultEffort: model.defaultEffort } : {}),
-      ...(via.length ? { via } : {}),
     }));
     const listed = only !== undefined || rows.length <= CONCISE_MODELS_CAP;
     return {

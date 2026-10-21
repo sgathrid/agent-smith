@@ -95,6 +95,7 @@ export async function readForgeJob(fs: FsLike, repo: string, id: string, now: nu
     summarySource: (p?.summarySource ?? m.summarySource) === 'worker' && latestSummary !== null ? 'worker' : null,
     changedFileCount: Array.isArray(m.changedFiles) && m.changedFilesTruncated !== true ? m.changedFiles.length : null,
     acceptance: a, failureReason: text(m.reason, m.failureReason, m.error, status === 'failed' ? warnings[0]?.message : null),
+    failureDetail: text(m.error),
     supersededBy: text(m.supersededBy), steeredFrom: text(m.steeredFrom),
     pendingSteers: number(p?.pendingSteers) ?? number(m.pendingSteers),
     ...(staleReads.length > 0 ? { staleReads } : {}),

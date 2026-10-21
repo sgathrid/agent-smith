@@ -22,7 +22,7 @@ test('spawn and resume validate and forward absolute working directories', async
   const seen: Array<Record<string, unknown>> = [];
   const service = { repo, spawnJob: async (request: Record<string, unknown>) => {
     seen.push(request); return { jobId: 'job-cwd' };
-  }, detail: async () => ({ status: 'succeeded', provider: 'codex', mode: 'review',
+  }, detail: async () => ({ jobId: 'fixture-job', status: 'succeeded', provider: 'codex', mode: 'review',
     name: 'Ada', workerId: 'Ada', conversation: 'thread', cwd }) } as never;
   const ctx = { service, catalogs: async () => [cat('codex')] } as HandlerContext;
   assert.equal((await callTool(ctx, 'spawn_job', { mode: 'review', provider: 'codex', prompt: 'review', cwd })).isError, undefined);
@@ -397,7 +397,7 @@ const codex = cat('codex', { models: [
   { id: 'mini', label: 'Mini', efforts: ['low'], defaultEffort: 'low' },
 ] });
 
-test('concise list_capabilities drops non-coding models, duplicate routes and repeated defaults', async () => {
+test('concise list_capabilities drops non-coding models and repeated defaults, preserving exact route IDs', async () => {
   const ctx = ctxWith([codex, opencode]);
   const r = await callTool(ctx, 'list_capabilities', {});
   const text = (r.content as { text: string }[])[0]!.text;
@@ -412,18 +412,19 @@ test('concise list_capabilities drops non-coding models, duplicate routes and re
 
   const oc = caps.providers.find((p: any) => p.name === 'opencode');
   assert.equal(oc.models, undefined, 'over the cap: a count, not a list');
-  assert.equal(oc.modelCount, 31); assert.match(oc.more, /provider: "opencode"/); assert.equal(typeof oc.unverified, 'string');
+  assert.equal(oc.modelCount, 124); assert.match(oc.more, /provider: "opencode"/); assert.equal(typeof oc.unverified, 'string');
   assert.equal(oc.defaultModel, undefined);
   assert.equal(caps.providers.find((p: any) => p.name === 'agy').models, undefined, 'uninstalled providers carry no models');
   assert.ok(text.length < 1_500, `concise output stays small (${text.length} chars)`);
 });
 
-test('naming a provider lists all its coding models, preferring the opencode route', async () => {
+test('naming a provider lists every exact coding model route', async () => {
   const caps = body(await callTool(ctxWith([codex, opencode]), 'list_capabilities', { provider: 'opencode' }));
   assert.deepEqual(caps.providers.map((p: any) => p.name), ['opencode']);
   const models = caps.providers[0].models;
-  assert.equal(models.length, 31);
-  assert.deepEqual(models[0], { id: 'opencode/gemini-4-argon', via: ['console-google', 'google', 'opencode-go'] });
+  assert.equal(models.length, 124);
+  for (const route of ROUTES) assert.ok(models.some((m: any) => m.id === `${route}/gemini-4-argon`));
+  assert.ok(models.every((m: any) => m.via === undefined));
   for (const dropped of ['embedding', 'tts', 'image', 'veo', 'lyria', 'live', 'computer-use', 'deep-research']) {
     assert.equal(models.some((m: any) => m.id.includes(dropped)), false, dropped);
   }

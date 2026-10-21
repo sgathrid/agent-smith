@@ -259,6 +259,7 @@ async function readOne(
     changedFileCount: Array.isArray(observed.raw['changed_files']) ? observed.raw['changed_files'].length : undefined,
     latestSummary: typeof raw['latestSummary'] === 'string' ? raw['latestSummary'] : null,
     failureReason: [raw['reason'], raw['error']].find((v): v is string => typeof v === 'string' && v !== '') ?? null,
+    failureDetail: typeof raw['error'] === 'string' ? raw['error'] : null,
     checks,
     ...(source === 'agy-staff' ? { source } : {}),
     summarySource: observed.raw['summarySource'] === 'worker' ? 'worker' : null,

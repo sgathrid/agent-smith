@@ -54,8 +54,10 @@
  * implementation.
  */
 
+import { readPipeline } from './execute.ts';
+import { launchJob } from './supervisor.ts';
 import { humanDuration } from '../providers/failure-text.ts';
-import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, unlinkSync } from 'node:fs';
+import { appendFileSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 
 import { AgentSmithReader, SMITH_PAYLOAD } from '../harness/agent-smith.ts';
@@ -157,7 +159,7 @@ export interface SpawnRequest {
   readonly stage?: string | undefined;
   readonly attempt?: number | undefined;
   /** Persist a protocol handle after the job anchor exists, before any worker starts. */
-  readonly onPrepared?: ((jobId: string) => void) | undefined;
+  readonly onPrepared?: ((jobId: string) => void | Promise<void>) | undefined;
 }
 
 /** What spawn_job returns. Immediate, and always truthful. */
@@ -377,6 +379,8 @@ interface LiveJob {
 const STEER_CONVERSATION_WAIT_MS = 2_000;
 
 export interface ForgeOptions {
+  /** Packaged execution entrypoint; omitted inside a supervisor and in unit tests. */
+  readonly supervisorUrl?: URL;
   /** Repo whose `.agent-smith/jobs/` this service owns. */
   readonly repo: string;
   /** Write the agy-staff-shaped compat mirror. Default true. */
@@ -477,9 +481,11 @@ export function checkAgainstCatalog(
  */
 export class ForgeService {
   readonly repo: string;
+  readonly supervisorUrl?: URL;
   private readonly live = new Map<string, LiveJob>();
   /** Job IDs spawned by this process, for `list_jobs session`. */
   readonly spawnedIds = new Set<string>();
+  readonly spawnedRuns = new Set<string>();
   private readonly mirrorOn: boolean;
   private readonly flushMs: number | undefined;
   private readonly catalogSource: (providers: string[]) => Promise<ModelCatalog[]>;
@@ -489,6 +495,7 @@ export class ForgeService {
 
   constructor(options: ForgeOptions) {
     this.repo = options.repo;
+    this.supervisorUrl = options.supervisorUrl;
     this.mirrorOn = options.mirror ?? true;
     this.flushMs = options.flushMs;
     this.providerSource = options.providerSource ?? requireProvider;
@@ -541,6 +548,7 @@ export class ForgeService {
    * stage and must wait for it. Everything else wants the ack and the channel.
    */
   async spawnTracked(request: SpawnRequest): Promise<TrackedSpawn> {
+    if (this.supervisorUrl) return launchJob(this, request);
     const provider = this.providerSource(request.provider ?? 'agy');
     const rawMode = request.mode.trim();
     const resuming = request.conversation !== undefined && request.conversation !== null;
@@ -669,7 +677,8 @@ export class ForgeService {
       ...(watchedFiles === undefined ? {} : { watchedFiles }),
     });
     try {
-      request.onPrepared?.(jobId);
+      if (request.checks !== undefined) writeJsonAtomic(jobFile(this.repo, jobId, 'checks-spec.json'), request.checks);
+      await request.onPrepared?.(jobId);
     } catch (error) {
       writer.abort('failed', `setup failed · ${String(error)}`);
       throw error;
@@ -1025,6 +1034,7 @@ export class ForgeService {
             steeredFrom: currentJobId,
             ...(nextWatchedFiles === undefined ? {} : { watchedFiles: nextWatchedFiles }),
           });
+          if (spec.checks !== undefined) writeJsonAtomic(jobFile(this.repo, nextJobId, 'checks-spec.json'), spec.checks);
           for (const w of syncWarnings) nextWriter.warn(w);
 
           // The child anchor exists; publish its id before the parent's terminal
@@ -1035,7 +1045,7 @@ export class ForgeService {
           this.spawnedIds.add(nextJobId);
           this.live.set(nextJobId, nextLiveEntry);
           try {
-            spec.onPrepared?.(nextJobId);
+            await spec.onPrepared?.(nextJobId);
           } catch { /* best-effort callback for continuation turn */ }
 
           // 3. Stamp supersededBy on parent and write parent's terminal manifest atomically.
@@ -1116,7 +1126,7 @@ export class ForgeService {
         ...(supersededBy === null ? {} : { supersededBy }),
         requested: true,
         signalled: false,
-        note: 'Cancel recorded; no live worker here, so the job may stay running.',
+        note: 'Cancel recorded; no live worker here to signal directly. A live owning supervisor will stop it.',
       };
     }
 
@@ -1340,6 +1350,12 @@ export class ForgeService {
 
   /** Jobs the pane would draw. Ours by default; interop history on request. */
   async list(filter: ListFilter = {}): Promise<JobSummary[]> {
+    for (const id of this.spawnedRuns) {
+      for (const stage of Object.values(readPipeline(this.repo, id)?.stageResults ?? {})) {
+        if (stage.jobId) this.spawnedIds.add(stage.jobId);
+      }
+    }
+    for (const id of this.spawnedIds) this.spawnedIds.add(this.resolveHead(id));
     const source = filter.provider ?? 'agent-smith';
     const out: JobSummary[] = [];
 
@@ -1400,7 +1416,7 @@ export class ForgeService {
     let manifest: ForgeManifest | null = null;
     try { manifest = JSON.parse(readFileSync(jobFile(this.repo, jobId, FILES.job), 'utf8')) as ForgeManifest; } catch { /* partial state */ }
     const liveStale =
-      manifest !== null && manifest.watchedFiles !== undefined
+      manifest?.status === 'running' && manifest.watchedFiles !== undefined
         ? computeStaleReads(
             this.repo,
             manifest.cwd,
@@ -1440,7 +1456,7 @@ export class ForgeService {
             ...(manifest.watchedFiles === undefined ? {} : { watchedFiles: manifest.watchedFiles }),
             ...(staleReads.length === 0 ? {} : { staleReads }),
           }),
-      cancellable: this.live.has(jobId),
+      cancellable: this.live.has(jobId) || (manifest?.status === 'running' && typeof manifest.ownerPid === 'number' && isPidAlive(manifest.ownerPid)),
     };
   }
 
@@ -1709,6 +1725,22 @@ export function syncWatchedFiles(
     if (!sameRoot) {
       const src = path.join(repoRoot, rel);
       const dst = path.join(cwdRoot, rel);
+      // Resolve every existing component, including a symlink at the file itself.
+      // Missing suffixes are safe only after their nearest existing parent passed.
+      const realRoot = realpathSync(cwdRoot);
+      let component = cwdRoot;
+      for (const part of rel.split('/')) {
+        component = path.join(component, part);
+        try { lstatSync(component); } catch (err) {
+          if ((err as NodeJS.ErrnoException).code === 'ENOENT') break;
+          throw err;
+        }
+        const resolved = realpathSync(component);
+        const relative = path.relative(realRoot, resolved);
+        if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+          throw new Error(`watched file "${rel}" destination resolves outside worker cwd ${cwdRoot}.`);
+        }
+      }
       const prev = previousWatched?.[rel];
       const currentCwdSig = fileSig(cwdRoot, rel);
       if (prev === undefined || currentCwdSig === 'gone') {
@@ -1724,7 +1756,11 @@ export function syncWatchedFiles(
       }
     }
     const cwdSig = sameRoot ? repoSig : fileSig(cwdRoot, rel);
-    out[rel] = { repoSig, cwdSig };
+    const prev = previousWatched?.[rel];
+    // Keep the last shared baseline until worker edits are reconciled. Retaining
+    // a divergent copy must never make it replaceable on the following sync.
+    out[rel] = prev !== undefined && cwdSig !== repoSig && cwdSig !== prev.cwdSig
+      ? prev : { repoSig, cwdSig };
   }
   return out;
 }

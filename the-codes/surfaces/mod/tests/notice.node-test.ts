@@ -317,3 +317,20 @@ test('due follows supersededBy across turns without announcing the superseded pa
   assert.deepEqual(step3.notices.map((n) => n.id), ['turn-2']);
   assert.deepEqual(step3.owned, []);
 });
+
+test('owned pipeline reports a stalled stage once while the pipeline keeps running', () => {
+  const owned: Owned[] = [{ kind: 'run', id: 'run', at: NOW - 1000, until: NOW + 100000 }];
+  const runs = new Map<string, RunRecord>([['run', { runId: 'run', pipeline: 'ship', status: 'running', startedAt: NOW - 1000,
+    finishedAt: null, stageResults: { build: { stage: 'build', status: 'running', jobId: 'stage' } } }]]);
+  const jobs = [row({ id: 'stage', status: 'attention', lastEventAt: NOW - 16 * 60_000 })];
+  const first = due(owned, jobs, runs, NOW);
+  assert.equal(first.notices[0]?.kind, 'attention');
+  assert.equal(first.notices[0]?.id, 'stage');
+  assert.equal(first.owned[0]?.kind, 'run');
+  assert.deepEqual(due(first.owned, jobs, runs, NOW + 1).notices, []);
+});
+
+test('failure notice includes the provider diagnostic rather than only its category', () => {
+  const n = noticeFromRadar(row({ id: 'quota', status: 'failed', failureReason: 'out of credits', failureDetail: 'HTTP 402: payment required for opencode/deepseek' }), 'failed', NOW);
+  assert.match(claudeText([n]), /402: payment required/);
+});

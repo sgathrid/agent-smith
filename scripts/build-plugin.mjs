@@ -38,6 +38,7 @@ async function bundleRuntime({ channelRoot, serverSource, monitorSource, watchHo
   const bundle = await rollup({
     input: {
       server: serverSource,
+      supervisor: path.join(path.dirname(serverSource), 'surfaces/channel/src/supervisor.js'),
       monitor: monitorSource,
       'watch-hook': watchHookSource,
     },
