@@ -181,6 +181,7 @@ export class AgentSmithReader implements JobStateReader {
       warnings?: string[];
       latestSummary?: string | null;
       summarySource?: 'worker' | null;
+      pendingSteers?: number;
     }>(jobFile(cwd, jobId, FILES.progress));
 
     // "Does this job exist?" is asked LAST, and includes the marker: a job
@@ -257,6 +258,11 @@ export class AgentSmithReader implements JobStateReader {
       [SMITH_PAYLOAD.lastActivity]: progress?.lastActivity ?? null,
       [SMITH_PAYLOAD.latestText]: progress?.latestText ?? null,
       [SMITH_PAYLOAD.progressWarnings]: progress?.warnings ?? [],
+      ...(manifest?.supersededBy !== undefined ? { supersededBy: manifest.supersededBy } : {}),
+      ...(manifest?.steeredFrom !== undefined ? { steeredFrom: manifest.steeredFrom } : {}),
+      ...(typeof (progress?.pendingSteers ?? manifest?.pendingSteers) === 'number'
+        ? { pendingSteers: progress?.pendingSteers ?? manifest?.pendingSteers }
+        : {}),
     };
 
     // partial=true when the anchor is missing: something is on disk for this

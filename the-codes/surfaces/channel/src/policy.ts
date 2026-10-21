@@ -75,6 +75,10 @@ export interface WatchableJob {
   readonly finishedAt: string | null;
   /** Whether the provider flagged warnings. Meaningful only once terminal; not rendered. */
   readonly warned: boolean;
+  /** Child job ID when this turn was superseded by a steered continuation turn. */
+  readonly supersededBy?: string | null;
+  /** Parent job ID when this turn was spawned by pump() consuming steer.jsonl. */
+  readonly steeredFrom?: string | null;
 }
 
 /**
@@ -169,6 +173,10 @@ export interface Candidate {
  */
 export function shouldPush(candidate: Candidate, now: number): boolean {
   const { job, seen } = candidate;
+
+  // A superseded turn is an intermediate step in a steered worker chain; its
+  // continuation owns the terminal announcement.
+  if (job.supersededBy) return false;
 
   // Gate 1 — is this state speakable at all?
   const kind = pushKindFor(job);

@@ -104,6 +104,7 @@ export interface StartInput {
   readonly sandboxFlags?: readonly string[];
   readonly readOnlyRequested?: boolean;
   readonly readOnlyEnforced?: boolean;
+  readonly steeredFrom?: string | null;
 }
 
 /**
@@ -209,6 +210,7 @@ export class JobWriter {
       ...(input.sandboxFlags === undefined ? {} : { sandboxFlags: input.sandboxFlags }),
       ...(input.readOnlyRequested === undefined ? {} : { readOnlyRequested: input.readOnlyRequested }),
       ...(input.readOnlyEnforced === undefined ? {} : { readOnlyEnforced: input.readOnlyEnforced }),
+      ...(input.steeredFrom ? { steeredFrom: input.steeredFrom } : {}),
     };
     this.manifest = manifest;
     this.progress = {
@@ -466,8 +468,12 @@ export class JobWriter {
         ? {}
         : { changedFiles: this.changed.files, changedFilesTruncated: this.changed.truncated }),
       ...(this.unattributed.length === 0 ? {} : { unattributedFiles: this.unattributed }),
+      ...(this.manifest.pendingSteers !== undefined ? { pendingSteers: 0 } : {}),
     };
     this.manifest = manifest;
+    if (this.progress !== null && this.progress.pendingSteers !== undefined) {
+      this.progress = { ...this.progress, pendingSteers: 0 };
+    }
 
     const body = report ?? '';
     writeAtomic(jobFile(this.repo, this.jobId, FILES.report), body);
@@ -497,8 +503,12 @@ export class JobWriter {
       error: reason,
       reason: status === 'failed' ? reason.split(' · ')[0]! : null,
       jobStatus: status === 'canceled' ? 'cancelled' : 'malformed',
+      ...(this.manifest.pendingSteers !== undefined ? { pendingSteers: 0 } : {}),
     };
     this.manifest = manifest;
+    if (this.progress !== null && this.progress.pendingSteers !== undefined) {
+      this.progress = { ...this.progress, pendingSteers: 0 };
+    }
     this.addWarning(reason);
     this.writeManifest();
     this.flushProgress(now);
@@ -527,6 +537,39 @@ export class JobWriter {
   /** Did this job get cancelled? True once a marker exists, terminal or not. */
   get cancelled(): boolean {
     return this.cancelRequestedAt !== null;
+  }
+
+  /** Latest conversation ID known to this writer (from start() or the provider's init event). */
+  currentConversation(): string | null {
+    return this.conversation;
+  }
+
+  /**
+   * Stamp `supersededBy` in memory before `finish()` or `abort()` so the
+   * terminal anchor write includes `supersededBy` atomically.
+   */
+  markSuperseded(nextJobId: string): void {
+    if (this.manifest === null) return;
+    this.manifest = { ...this.manifest, supersededBy: nextJobId, pendingSteers: 0 };
+    if (this.progress !== null) {
+      this.progress = { ...this.progress, pendingSteers: 0 };
+    }
+  }
+
+  /** Update the published count of unconsumed queued steers in the writer-owned files. */
+  setPendingSteers(count: number, at: string = new Date().toISOString()): void {
+    if (this.finished || this.manifest === null) return;
+    const next = Math.max(0, count);
+    this.manifest = { ...this.manifest, pendingSteers: next, updatedAt: at };
+    if (this.progress !== null) {
+      this.progress = { ...this.progress, pendingSteers: next };
+    }
+    this.flushProgress(at);
+  }
+
+  /** Record a supervisor-level warning on this job's progress. */
+  warn(message: string): void {
+    this.addWarning(message);
   }
 
   /**
@@ -564,6 +607,7 @@ export class JobWriter {
       toolCalls: this.toolCalls,
       warnings: this.progress?.warnings ?? [],
       digest: this.tracker.digest(this.cwd),
+      ...(this.progress?.pendingSteers !== undefined ? { pendingSteers: this.progress.pendingSteers } : {}),
     };
     const nowMs = Date.parse(at);
     const clock = Number.isNaN(nowMs) ? Date.now() : nowMs;

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import process$1 from'node:process';import {randomUUID,randomBytes}from'node:crypto';import path from'node:path';import {mkdirSync,writeFileSync,createWriteStream,readFileSync,renameSync,unlinkSync,openSync,fsyncSync,closeSync,appendFileSync,statSync,existsSync,readdirSync,copyFileSync,linkSync}from'node:fs';import {fileURLToPath}from'node:url';import {access,constants}from'node:fs/promises';import {A as AgentSmithReader,a as AgyStaffReader,C as ClaudeCodeReader,n as normalize,e as exitReason,P as PROGRESS_FLUSH_MS,t as taskTitle,S as SCHEMA_VERSION,d as diffChangedFiles,b as attributeChanged,c as deriveStatus,f as failureFields,j as jobFile,F as FILES,s as shouldFlush,l as looksEmpty,i as isForgeStatePath,g as isPidAlive,h as deriveOrphan,R as REASONS,r as readAcceptance,w as writeAcceptance,k as jobsDir,m as newJobId$1,o as jobDir,p as isForgeJobId,q as SMITH_PAYLOAD,D as DEFAULT_TIMEOUT_MS$1,u as nextActionFor,v as toVerifyChecks,x as normalizeAcceptanceReport,y as runChecks,z as acceptanceChecksFromReport,B as acceptanceState,E as reasonFromText,G as POLL_MS,H as evaluateAcceptance,I as pollOnce,J as scheduleLoop}from'./chunk-poller.js';import {spawn,execFile}from'node:child_process';import os from'node:os';import readline from'node:readline';//#region rolldown:runtime
+import process$1 from'node:process';import {randomUUID,randomBytes}from'node:crypto';import path from'node:path';import {mkdirSync,writeFileSync,createWriteStream,readFileSync,renameSync,unlinkSync,openSync,fsyncSync,closeSync,appendFileSync,statSync,existsSync,readdirSync,copyFileSync,linkSync}from'node:fs';import {fileURLToPath}from'node:url';import {access,constants}from'node:fs/promises';import {A as AgentSmithReader,a as AgyStaffReader,C as ClaudeCodeReader,n as normalize,e as exitReason,P as PROGRESS_FLUSH_MS,t as taskTitle,S as SCHEMA_VERSION,d as diffChangedFiles,b as attributeChanged,c as deriveStatus,f as failureFields,j as jobFile,F as FILES,s as shouldFlush,l as looksEmpty,i as isForgeStatePath,g as isPidAlive,h as deriveOrphan,R as REASONS,r as readAcceptance,w as writeAcceptance,k as jobsDir,m as newJobId$1,o as jobDir,D as DEFAULT_TIMEOUT_MS$1,p as isForgeJobId,q as SMITH_PAYLOAD,u as nextActionFor,v as toVerifyChecks,x as normalizeAcceptanceReport,y as runChecks,z as acceptanceChecksFromReport,B as acceptanceState,E as reasonFromText,G as POLL_MS,H as evaluateAcceptance,I as pollOnce,J as scheduleLoop}from'./chunk-poller.js';import {spawn,execFile}from'node:child_process';import os from'node:os';import readline from'node:readline';//#region rolldown:runtime
 var __create = Object.create;
 var __defProp = Object.defineProperty;
 var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
@@ -29765,6 +29765,7 @@ class JobWriter {
             ...(input.sandboxFlags === undefined ? {} : { sandboxFlags: input.sandboxFlags }),
             ...(input.readOnlyRequested === undefined ? {} : { readOnlyRequested: input.readOnlyRequested }),
             ...(input.readOnlyEnforced === undefined ? {} : { readOnlyEnforced: input.readOnlyEnforced }),
+            ...(input.steeredFrom ? { steeredFrom: input.steeredFrom } : {}),
         };
         this.manifest = manifest;
         this.progress = {
@@ -30021,8 +30022,12 @@ class JobWriter {
                 ? {}
                 : { changedFiles: this.changed.files, changedFilesTruncated: this.changed.truncated }),
             ...(this.unattributed.length === 0 ? {} : { unattributedFiles: this.unattributed }),
+            ...(this.manifest.pendingSteers !== undefined ? { pendingSteers: 0 } : {}),
         };
         this.manifest = manifest;
+        if (this.progress !== null && this.progress.pendingSteers !== undefined) {
+            this.progress = { ...this.progress, pendingSteers: 0 };
+        }
         const body = report ?? '';
         writeAtomic(jobFile(this.repo, this.jobId, FILES.report), body);
         this.writeManifest();
@@ -30051,8 +30056,12 @@ class JobWriter {
             error: reason,
             reason: status === 'failed' ? reason.split(' · ')[0] : null,
             jobStatus: status === 'canceled' ? 'cancelled' : 'malformed',
+            ...(this.manifest.pendingSteers !== undefined ? { pendingSteers: 0 } : {}),
         };
         this.manifest = manifest;
+        if (this.progress !== null && this.progress.pendingSteers !== undefined) {
+            this.progress = { ...this.progress, pendingSteers: 0 };
+        }
         this.addWarning(reason);
         this.writeManifest();
         this.flushProgress(now);
@@ -30080,6 +30089,37 @@ class JobWriter {
     /** Did this job get cancelled? True once a marker exists, terminal or not. */
     get cancelled() {
         return this.cancelRequestedAt !== null;
+    }
+    /** Latest conversation ID known to this writer (from start() or the provider's init event). */
+    currentConversation() {
+        return this.conversation;
+    }
+    /**
+     * Stamp `supersededBy` in memory before `finish()` or `abort()` so the
+     * terminal anchor write includes `supersededBy` atomically.
+     */
+    markSuperseded(nextJobId) {
+        if (this.manifest === null)
+            return;
+        this.manifest = { ...this.manifest, supersededBy: nextJobId, pendingSteers: 0 };
+        if (this.progress !== null) {
+            this.progress = { ...this.progress, pendingSteers: 0 };
+        }
+    }
+    /** Update the published count of unconsumed queued steers in the writer-owned files. */
+    setPendingSteers(count, at = new Date().toISOString()) {
+        if (this.finished || this.manifest === null)
+            return;
+        const next = Math.max(0, count);
+        this.manifest = { ...this.manifest, pendingSteers: next, updatedAt: at };
+        if (this.progress !== null) {
+            this.progress = { ...this.progress, pendingSteers: next };
+        }
+        this.flushProgress(at);
+    }
+    /** Record a supervisor-level warning on this job's progress. */
+    warn(message) {
+        this.addWarning(message);
     }
     /**
      * The recent tool rows, in step order.
@@ -30114,6 +30154,7 @@ class JobWriter {
             toolCalls: this.toolCalls,
             warnings: this.progress?.warnings ?? [],
             digest: this.tracker.digest(this.cwd),
+            ...(this.progress?.pendingSteers !== undefined ? { pendingSteers: this.progress.pendingSteers } : {}),
         };
         const nowMs = Date.parse(at);
         const clock = Number.isNaN(nowMs) ? Date.now() : nowMs;
@@ -30523,6 +30564,7 @@ function requireProvider(name) {
     }
     return getProvider(name);
 }
+const STEER_CONVERSATION_WAIT_MS = 2_000;
 /** The teaching error for a mode outside the closed set. */
 function modeError(mode) {
     const lines = MODES$1.map((m) => `  ${m}: ${MODE_PRESETS[m].description}`).join('\n');
@@ -30797,91 +30839,260 @@ class ForgeService {
         };
         const done = this.pump(writer, provider, {
             jobId,
+            name,
+            workerId,
+            task: request.task,
+            mode,
+            preset,
+            context: request.context,
+            checks: request.checks,
             prompt: sentPrompt,
-            readOnly: readOnlyRequested,
+            readOnlyRequested,
+            readOnlyEnforced,
+            sandbox,
+            sandboxFlags: [...sandboxFlags],
             artifactPath,
             cwd,
             model: request.model,
+            modelRequested: request.model ?? null,
+            modelResolved,
+            modelSource,
             effort: request.effort,
             timeoutMs,
             unrestricted,
             conversation: request.conversation,
+            pipeline: request.pipeline ?? null,
+            stage: request.stage ?? null,
+            attempt: request.attempt ?? null,
+            onPrepared: request.onPrepared,
         });
         return { ack, done };
     }
     /**
-     * The detached pump: spawn, stream, record, resolve.
+     * The detached pump: spawn, stream, record, chain steered turns, resolve.
      *
      * Never rejects. Every exit path lands on writer.finish() or writer.abort(),
      * because a job that stops being `running` is the only promise this function
-     * makes to every reader on the other side of the filesystem.
+     * makes to every reader on the other side of the filesystem. When a steer is
+     * queued or interrupts the turn, this loop is the sole owner that opens the
+     * child anchor and marks the parent superseded.
      */
-    async pump(writer, provider, spec) {
-        let handle;
-        try {
-            handle = await provider.spawn({
-                mode: spec.jobId,
-                prompt: spec.prompt,
-                cwd: spec.cwd,
-                timeoutMs: spec.timeoutMs,
-                unrestricted: spec.unrestricted,
-                ...(spec.readOnly ? { readOnly: true } : {}),
-                ...(spec.artifactPath === undefined ? {} : { artifactPath: spec.artifactPath }),
-                ...(spec.model === undefined ? {} : { model: spec.model }),
-                ...(spec.effort === undefined ? {} : { effort: spec.effort }),
-                ...(spec.conversation === undefined ? {} : { conversation: spec.conversation }),
-                // THE KEY LINE. Handing the provider adapter OUR job directory as its
-                // stateDir means events.jsonl / argv.json / stderr.log / result.json are
-                // written by the already-verified plumbing in providers/ndjson.ts, for
-                // all four providers, instead of being copied across afterwards by us.
-                stateDir: writerDir(this.repo, spec.jobId),
-                jobId: spec.jobId,
-            });
-        }
-        catch (err) {
-            // ENOENT, a bad cwd, a provider that refuses to spawn. The job exists and
-            // is now `failed`, which is a fact the pane can draw — as opposed to a
-            // rejected promise, which is a fact nothing can draw.
-            return (writer.abort('failed', `couldn't start · ${describe(err)}`) ??
-                writer.snapshot() ??
-                { jobId: spec.jobId });
-        }
-        this.live.set(spec.jobId, { writer, handle });
-        const unsubscribe = pipeEvents(writer, handle);
-        // The cancel marker is written by `cancel()`; if it arrived while we were
-        // spawning, apply it now or the worker runs to completion for nothing.
-        if (existsSync(jobFile(this.repo, spec.jobId, FILES.cancel))) {
-            writer.requestCancel();
-            handle.cancel();
-        }
-        // A different ForgeService instance can request cancellation by creating the
-        // shared marker. The process that owns the handle must acknowledge it and
-        // signal the worker; a marker alone cannot stop a child process.
-        let observedCancel = existsSync(jobFile(this.repo, spec.jobId, FILES.cancel));
-        const cancelPoll = setInterval(() => {
-            if (!observedCancel && existsSync(jobFile(this.repo, spec.jobId, FILES.cancel))) {
-                observedCancel = true;
-                writer.requestCancel();
-                handle.cancel();
+    async pump(initialWriter, provider, spec) {
+        let currentWriter = initialWriter;
+        let currentJobId = spec.jobId;
+        let currentPrompt = spec.prompt;
+        let currentConversation = spec.conversation;
+        let liveEntry = {
+            writer: currentWriter,
+            handle: null,
+            timeoutMs: spec.timeoutMs,
+            consumedSteers: 0,
+            interruptRequested: false,
+            interruptFired: false,
+            userCanceled: false,
+        };
+        // Register synchronously before the first await so a steer or cancel arriving
+        // right after spawn_job finds the live entry in this.live.
+        this.live.set(currentJobId, liveEntry);
+        while (true) {
+            let handle;
+            try {
+                handle = await provider.spawn({
+                    mode: currentJobId,
+                    prompt: currentPrompt,
+                    cwd: spec.cwd,
+                    timeoutMs: spec.timeoutMs,
+                    unrestricted: spec.unrestricted,
+                    ...(spec.readOnlyRequested ? { readOnly: true } : {}),
+                    ...(spec.artifactPath === undefined ? {} : { artifactPath: spec.artifactPath }),
+                    ...(spec.model === undefined ? {} : { model: spec.model }),
+                    ...(spec.effort === undefined ? {} : { effort: spec.effort }),
+                    ...(currentConversation === undefined ? {} : { conversation: currentConversation }),
+                    // THE KEY LINE. Handing the provider adapter OUR job directory as its
+                    // stateDir means events.jsonl / argv.json / stderr.log / result.json are
+                    // written by the already-verified plumbing in providers/ndjson.ts, for
+                    // all four providers, instead of being copied across afterwards by us.
+                    stateDir: writerDir(this.repo, currentJobId),
+                    jobId: currentJobId,
+                });
             }
-        }, 200);
-        cancelPoll.unref?.();
-        try {
-            const result = await handle.waitForResult();
-            await writer.prepareFinish();
-            const report = reportFor(result);
-            const manifest = writer.finish(result, report === '' ? null : report);
-            return manifest;
-        }
-        catch (err) {
-            return (writer.abort('failed', `crashed · ${describe(err)}`) ??
-                writer.snapshot() ??
-                { jobId: spec.jobId });
-        }
-        finally {
-            clearInterval(cancelPoll);
-            unsubscribe();
-            this.live.delete(spec.jobId);
+            catch (err) {
+                this.live.delete(currentJobId);
+                return (currentWriter.abort('failed', `couldn't start · ${describe(err)}`) ??
+                    currentWriter.snapshot() ??
+                    { jobId: currentJobId });
+            }
+            liveEntry.handle = handle;
+            const unsubscribe = pipeEvents(currentWriter, handle);
+            let interruptDetectedAt = null;
+            let lastPendingSteers = 0;
+            const syncSteerAndCancel = () => {
+                if (!liveEntry.interruptFired && existsSync(jobFile(this.repo, currentJobId, FILES.cancel))
+                    && !existsSync(jobFile(this.repo, currentJobId, FILES.cancelSteer))) {
+                    liveEntry.userCanceled = true;
+                }
+                if (liveEntry.userCanceled) {
+                    if (!liveEntry.interruptFired) {
+                        liveEntry.interruptFired = true;
+                        currentWriter.requestCancel();
+                        handle.cancel();
+                    }
+                    return;
+                }
+                const entries = readSteerEntries(this.repo, currentJobId);
+                const unconsumed = entries.slice(liveEntry.consumedSteers);
+                if (unconsumed.length !== lastPendingSteers) {
+                    lastPendingSteers = unconsumed.length;
+                    currentWriter.setPendingSteers(unconsumed.length);
+                }
+                if (unconsumed.some((e) => e.delivery === 'interrupt') || existsSync(jobFile(this.repo, currentJobId, FILES.cancelSteer))) {
+                    liveEntry.interruptRequested = true;
+                }
+                if (liveEntry.interruptRequested && !liveEntry.interruptFired) {
+                    if (interruptDetectedAt === null)
+                        interruptDetectedAt = Date.now();
+                    const hasConversation = currentWriter.currentConversation() !== null;
+                    const waitElapsed = Date.now() - interruptDetectedAt >= STEER_CONVERSATION_WAIT_MS;
+                    if (hasConversation || waitElapsed) {
+                        liveEntry.interruptFired = true;
+                        currentWriter.requestCancel();
+                        handle.cancel();
+                    }
+                }
+            };
+            const unsubSteerTap = handle.onEvent((ev) => {
+                if (ev.kind === 'started' && liveEntry.interruptRequested && !liveEntry.interruptFired) {
+                    syncSteerAndCancel();
+                }
+            });
+            syncSteerAndCancel();
+            const cancelPoll = setInterval(syncSteerAndCancel, 100);
+            cancelPoll.unref?.();
+            try {
+                const result = await handle.waitForResult();
+                clearInterval(cancelPoll);
+                unsubSteerTap();
+                unsubscribe();
+                await currentWriter.prepareFinish();
+                const report = reportFor(result);
+                syncSteerAndCancel();
+                const entries = readSteerEntries(this.repo, currentJobId);
+                const unconsumed = entries.slice(liveEntry.consumedSteers);
+                const alreadyTerminal = result.status === 'cancelled' ? 'canceled' : null;
+                const verdict = deriveStatus({
+                    alreadyTerminal,
+                    ok: result.ok,
+                    jobStatus: result.status,
+                    deniedActions: result.deniedActions ?? [],
+                    report: report === '' ? null : report,
+                });
+                const shouldChain = !liveEntry.userCanceled &&
+                    unconsumed.length > 0 &&
+                    (liveEntry.interruptRequested || verdict.status === 'succeeded');
+                if (shouldChain) {
+                    const conversation = currentWriter.currentConversation();
+                    const wasInterrupted = liveEntry.interruptRequested && verdict.status !== 'succeeded';
+                    if (conversation === null && !wasInterrupted) {
+                        currentWriter.warn('could not steer: provider did not report a resumable conversation ID');
+                    }
+                    else {
+                        liveEntry.consumedSteers = entries.length;
+                        const nextJobId = newJobId$1(spec.mode);
+                        const nextWriter = new JobWriter({
+                            repo: this.repo,
+                            jobId: nextJobId,
+                            mirror: this.mirrorOn,
+                            ...(this.flushMs === undefined ? {} : { flushMs: this.flushMs }),
+                        });
+                        const latestContext = [...unconsumed].reverse().find((e) => e.context !== undefined)?.context ?? spec.context;
+                        const resuming = conversation !== null;
+                        const nextBrief = buildBrief({
+                            preset: spec.preset,
+                            cwd: spec.cwd,
+                            context: latestContext,
+                            checks: spec.checks,
+                            pipelineStage: spec.pipeline !== null,
+                            resuming,
+                        });
+                        const { rawPrompt, sentPrompt, prependBrief } = buildSteeredPrompt({
+                            parentJobId: currentJobId,
+                            wasInterrupted,
+                            freshContinuation: !resuming,
+                            toolCalls: currentWriter.snapshot()?.toolCalls ?? 0,
+                            responseTail: result.response.trim().slice(-600),
+                            entries: unconsumed,
+                            brief: nextBrief,
+                        });
+                        const nextLiveEntry = {
+                            writer: nextWriter,
+                            handle: null,
+                            timeoutMs: spec.timeoutMs,
+                            consumedSteers: 0,
+                            interruptRequested: false,
+                            interruptFired: false,
+                            userCanceled: false,
+                        };
+                        // 1. Open child anchor on disk BEFORE finishing the parent so any reader
+                        //    following `supersededBy` finds the child anchor immediately.
+                        nextWriter.start({
+                            name: spec.name,
+                            workerId: spec.workerId,
+                            task: spec.task,
+                            provider: provider.name,
+                            mode: spec.mode,
+                            model: spec.model ?? null,
+                            effort: spec.effort ?? null,
+                            cwd: spec.cwd,
+                            prompt: rawPrompt,
+                            ...(prependBrief ? { preamble: nextBrief } : {}),
+                            unrestricted: spec.unrestricted,
+                            conversation,
+                            timeoutMs: spec.timeoutMs,
+                            pipeline: spec.pipeline,
+                            stage: spec.stage,
+                            attempt: spec.attempt,
+                            modelRequested: spec.modelRequested,
+                            modelResolved: spec.modelResolved,
+                            modelSource: spec.modelSource,
+                            preambleApplied: nextBrief !== '',
+                            sandbox: spec.sandbox,
+                            sandboxFlags: [...spec.sandboxFlags],
+                            readOnlyRequested: spec.readOnlyRequested,
+                            readOnlyEnforced: spec.readOnlyEnforced,
+                            steeredFrom: currentJobId,
+                        });
+                        // 2. Register child in spawnedIds and live map before removing parent.
+                        this.spawnedIds.add(nextJobId);
+                        this.live.set(nextJobId, nextLiveEntry);
+                        try {
+                            spec.onPrepared?.(nextJobId);
+                        }
+                        catch { /* best-effort callback for continuation turn */ }
+                        // 3. Stamp supersededBy on parent and write parent's terminal manifest atomically.
+                        currentWriter.markSuperseded(nextJobId);
+                        currentWriter.finish(result, report === '' ? null : report);
+                        this.live.delete(currentJobId);
+                        currentWriter = nextWriter;
+                        currentJobId = nextJobId;
+                        currentPrompt = sentPrompt;
+                        currentConversation = conversation ?? undefined;
+                        liveEntry = nextLiveEntry;
+                        continue;
+                    }
+                }
+                const manifest = currentWriter.finish(result, report === '' ? null : report);
+                this.live.delete(currentJobId);
+                return manifest;
+            }
+            catch (err) {
+                clearInterval(cancelPoll);
+                unsubSteerTap();
+                unsubscribe();
+                this.live.delete(currentJobId);
+                return (currentWriter.abort('failed', `crashed · ${describe(err)}`) ??
+                    currentWriter.snapshot() ??
+                    { jobId: currentJobId });
+            }
         }
     }
     /**
@@ -30910,6 +31121,10 @@ class ForgeService {
         if (!known) {
             throw new Error(`no job "${jobId}" in ${jobsDir(this.repo)}; call list_jobs for valid job IDs.`);
         }
+        try {
+            unlinkSync(jobFile(this.repo, jobId, FILES.cancelSteer));
+        }
+        catch { /* no steer marker present */ }
         writer.requestCancel();
         if (live === undefined) {
             return {
@@ -30919,13 +31134,160 @@ class ForgeService {
                 note: 'Cancel recorded; no live worker here, so the job may stay running.',
             };
         }
-        live.handle.cancel();
+        live.userCanceled = true;
+        live.handle?.cancel();
         return {
             jobId,
             requested: true,
             signalled: true,
             note: 'Canceled.',
         };
+    }
+    /**
+     * Steer a running worker by recording durable intent (`steer.jsonl`) and,
+     * when `delivery: 'interrupt'`, signalling the running turn to stop so the
+     * pump can open the continuation turn.
+     */
+    async steer(request) {
+        const prompt = request.prompt;
+        if (prompt.trim() === '') {
+            throw new Error('prompt is empty; there is nothing to hand the worker.');
+        }
+        if (request.delivery !== 'queue' && request.delivery !== 'interrupt') {
+            throw new Error('delivery is required; must be "queue" or "interrupt".');
+        }
+        const target = await this.resolveSteerTarget(request.worker);
+        if (target.manifest.pipeline !== null && target.manifest.pipeline !== undefined) {
+            throw new Error(`Cannot steer pipeline stage "${target.manifest.name}" (${target.jobId}); pipeline stages are managed by run_pipeline.`);
+        }
+        if (target.manifest.status !== 'running') {
+            throw new Error(`"${target.manifest.name}" (${target.jobId}) is already ${target.manifest.status}; use resume_job to continue a finished worker.`);
+        }
+        const live = this.live.get(target.jobId);
+        if (live === undefined) {
+            const ownerPid = target.manifest.ownerPid;
+            const ownerAlive = typeof ownerPid === 'number' &&
+                Number.isInteger(ownerPid) &&
+                ownerPid > 0 &&
+                isPidAlive(ownerPid);
+            if (!ownerAlive) {
+                reconcileOrphan(this.repo, target.jobId);
+                throw new Error(`"${target.manifest.name}" (${target.jobId}) has no live owner process; it cannot be steered. Use resume_job to continue it.`);
+            }
+        }
+        const at = new Date().toISOString();
+        const entry = {
+            id: `steer-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            createdAt: at,
+            prompt,
+            ...(request.context === undefined ? {} : { context: request.context }),
+            delivery: request.delivery,
+        };
+        appendSteerEntry(this.repo, target.jobId, entry);
+        const allEntries = readSteerEntries(this.repo, target.jobId);
+        const pendingSteers = Math.max(1, allEntries.length - (live?.consumedSteers ?? 0));
+        if (live !== undefined) {
+            live.writer.setPendingSteers(pendingSteers, at);
+        }
+        if (request.delivery === 'interrupt') {
+            writeAtomic(jobFile(this.repo, target.jobId, FILES.cancelSteer), `${at}\n`);
+            if (live !== undefined) {
+                live.interruptRequested = true;
+                if (live.handle !== null && live.writer.currentConversation() !== null && !live.interruptFired) {
+                    live.interruptFired = true;
+                    live.writer.requestCancel(at);
+                    live.handle.cancel();
+                }
+            }
+        }
+        const signalled = live !== undefined;
+        const status = request.delivery === 'interrupt' ? 'interrupting' : 'queued';
+        const note = request.delivery === 'interrupt'
+            ? signalled
+                ? 'Interrupting current turn; continuation turn will start automatically.'
+                : 'Interrupt recorded for owner process; continuation turn will start after current turn stops.'
+            : `Queued behind current turn (${pendingSteers} pending).`;
+        return {
+            jobId: target.jobId,
+            name: target.manifest.name ?? target.jobId,
+            workerId: target.manifest.workerId ?? target.jobId,
+            provider: target.manifest.provider,
+            delivery: request.delivery,
+            status,
+            pendingSteers,
+            signalled,
+            repo: this.repo,
+            dir: jobDir(this.repo, target.jobId),
+            timeoutMs: live?.timeoutMs ?? DEFAULT_TIMEOUT_MS$1,
+            note,
+        };
+    }
+    async resolveSteerTarget(worker) {
+        const trimmed = worker.trim();
+        if (existsSync(pipelineRecordPath(this.repo, trimmed))) {
+            throw new Error(`Cannot steer pipeline run "${trimmed}"; steer_job only applies to solo workers.`);
+        }
+        const readManifest = (id) => {
+            const inMem = this.live.get(id)?.writer.snapshot();
+            if (inMem !== null && inMem !== undefined)
+                return inMem;
+            reconcileOrphan(this.repo, id);
+            try {
+                return JSON.parse(readFileSync(jobFile(this.repo, id, FILES.job), 'utf8'));
+            }
+            catch {
+                return null;
+            }
+        };
+        const followChain = (startId) => {
+            const seen = new Set();
+            let curId = startId;
+            let curManifest = readManifest(curId);
+            if (curManifest === null)
+                return null;
+            while (curManifest.supersededBy && !seen.has(curId)) {
+                seen.add(curId);
+                const nextManifest = readManifest(curManifest.supersededBy);
+                if (nextManifest === null)
+                    break;
+                curId = curManifest.supersededBy;
+                curManifest = nextManifest;
+            }
+            return { jobId: curId, manifest: curManifest };
+        };
+        if (this.live.has(trimmed) || existsSync(jobDir(this.repo, trimmed))) {
+            const resolved = followChain(trimmed);
+            if (resolved !== null)
+                return resolved;
+        }
+        for (const [id, live] of this.live.entries()) {
+            const snap = live.writer.snapshot();
+            if (snap !== null && snap.name === trimmed && snap.status === 'running') {
+                return { jobId: id, manifest: snap };
+            }
+        }
+        const candidates = (await this.list({ limit: 500 })).filter((j) => j.name === trimmed);
+        if (candidates.length === 0) {
+            throw new Error(`No worker "${trimmed}"; see list_jobs.`);
+        }
+        const running = candidates.filter((j) => j.status === 'running');
+        if (running.length === 1) {
+            const resolved = followChain(running[0].jobId);
+            if (resolved !== null)
+                return resolved;
+        }
+        if (running.length > 1) {
+            throw new Error(`"${trimmed}" matches ${running.length} running workers; pass a job ID from list_jobs.`);
+        }
+        const identities = new Set(candidates.map((j) => j.workerId));
+        if (identities.size !== 1) {
+            throw new Error(`"${trimmed}" matches ${identities.size} workers; pass a job ID from list_jobs.`);
+        }
+        candidates.sort((a, b) => Date.parse(b.startedAt ?? b.updatedAt ?? '') - Date.parse(a.startedAt ?? a.updatedAt ?? ''));
+        const latest = followChain(candidates[0].jobId);
+        if (latest !== null)
+            return latest;
+        throw new Error(`No worker "${trimmed}"; see list_jobs.`);
     }
     /** Jobs the pane would draw. Ours by default; interop history on request. */
     async list(filter = {}) {
@@ -31123,7 +31485,68 @@ function toSummary(observed, source) {
         updatedAt: observed.updatedAt,
         finishedAt: observed.finishedAt,
         warnings: observed.warnings.map((w) => ({ code: w.code, message: w.message })),
+        ...(typeof raw['supersededBy'] === 'string' || raw['supersededBy'] === null
+            ? { supersededBy: raw['supersededBy'] }
+            : {}),
+        ...(typeof raw['steeredFrom'] === 'string' || raw['steeredFrom'] === null
+            ? { steeredFrom: raw['steeredFrom'] }
+            : {}),
+        ...(typeof raw['pendingSteers'] === 'number'
+            ? { pendingSteers: raw['pendingSteers'] }
+            : {}),
     };
+}
+function appendSteerEntry(repo, jobId, entry) {
+    const dir = jobDir(repo, jobId);
+    mkdirSync(dir, { recursive: true });
+    appendFileSync(jobFile(repo, jobId, FILES.steer), `${JSON.stringify(entry)}\n`, 'utf8');
+}
+function readSteerEntries(repo, jobId) {
+    const file = jobFile(repo, jobId, FILES.steer);
+    let text;
+    try {
+        text = readFileSync(file, 'utf8');
+    }
+    catch {
+        return [];
+    }
+    const out = [];
+    for (const line of text.split('\n')) {
+        const trimmed = line.trim();
+        if (trimmed === '')
+            continue;
+        try {
+            const parsed = JSON.parse(trimmed);
+            if (typeof parsed.id === 'string' &&
+                typeof parsed.createdAt === 'string' &&
+                typeof parsed.prompt === 'string' &&
+                (parsed.delivery === 'queue' || parsed.delivery === 'interrupt')) {
+                out.push(parsed);
+            }
+        }
+        catch { /* ignore truncated line */ }
+    }
+    return out;
+}
+function buildSteeredPrompt(input) {
+    const steerBody = input.entries.length === 1
+        ? input.entries[0].prompt
+        : input.entries.map((e, idx) => `[Steer ${idx + 1} (${e.createdAt})]\n${e.prompt}`).join('\n\n');
+    const tag = input.freshContinuation
+        ? '[FRESH CONTINUATION]'
+        : input.wasInterrupted
+            ? '[TURN INTERRUPTED]'
+            : `[FOLLOW-UP STEER · ${input.entries.length} queued update${input.entries.length === 1 ? '' : 's'}]`;
+    const statusLine = input.wasInterrupted
+        ? `Your previous turn (${input.parentJobId}) was interrupted after ${input.toolCalls} tool call(s) with updated instructions from the orchestrator. Inspect your working tree before repeating any completed steps.`
+        : `Your previous turn (${input.parentJobId}) completed after ${input.toolCalls} tool call(s), and the orchestrator queued follow-up instructions for you.`;
+    const tailBlock = input.responseTail
+        ? `\nLast response excerpt from previous turn:\n${input.responseTail}\n`
+        : '';
+    const header = `[STEERED TURN CONTINUITY] ${tag}\n${statusLine}${tailBlock}\n[ORCHESTRATOR UPDATE]\n${steerBody}`;
+    const prependBrief = input.brief !== '' && !header.startsWith(input.brief);
+    const sentPrompt = prependBrief ? `${input.brief}\n\n${header}` : header;
+    return { rawPrompt: header, sentPrompt, prependBrief };
 }
 function isForgeActivity(value) {
     if (typeof value !== 'object' || value === null)
@@ -33181,6 +33604,8 @@ function conciseRow(j) {
         jobId: j.jobId, name: j.name, status: j.status, taskStatus: taskStatus(j.status), provider: j.provider, model: j.model, mode: j.mode,
         summary: j.latestSummary ? trimWords(j.latestSummary, CONCISE_SUMMARY_CHARS) : null,
         toolCalls: j.toolCalls, lastActivity: lastActivity(j.lastActivity), startedAt: j.startedAt, finishedAt: j.finishedAt,
+        supersededBy: j.supersededBy ?? null, steeredFrom: j.steeredFrom ?? null,
+        pendingSteers: j.pendingSteers ? j.pendingSteers : null,
         nextAction: j.nextAction, warningCount: j.warnings.length || null,
     });
 }
@@ -33207,6 +33632,8 @@ function conciseStatus(d, acceptance, extra = {}) {
         acceptance: checkVerdicts(acceptance),
         startedAt: d.startedAt, finishedAt: d.finishedAt, durationMs: Number.isNaN(started) ? null : Math.max(0, ended - started),
         toolCalls: d.toolCalls, lastActivity: lastActivity(d.lastActivity),
+        supersededBy: d.supersededBy ?? null, steeredFrom: d.steeredFrom ?? null,
+        pendingSteers: d.pendingSteers ? d.pendingSteers : null,
         changedFileCount: d.changedFiles ? files.length : null, changedFiles: files.length ? files.slice(0, CONCISE_FILES_CAP) : null,
         changedFilesNote: files.length > CONCISE_FILES_CAP || d.changedFilesTruncated ? `First ${Math.min(files.length, CONCISE_FILES_CAP)} shown; ${DETAIL_HINT} or include_diff for all.` : null,
         nextAction: d.nextAction, reason: failedReason(d), error: d.error ? trimWords(d.error, 500) : null,
@@ -33406,6 +33833,9 @@ const jobFields = {
     toolCalls: typed(['number', 'null']),
     lastActivity: typed(['string', 'object', 'null'], 'Latest worker step: one line when concise, the activity record when detailed.'),
     startedAt: typed(['string', 'null']), finishedAt: typed(['string', 'null']),
+    supersededBy: typed(['string', 'null'], 'Continuation job ID when this turn was superseded by steer_job.'),
+    steeredFrom: typed(['string', 'null'], 'Parent job ID when this turn was started by steer_job.'),
+    pendingSteers: typed('integer', 'Number of queued steers waiting for the current turn to finish.'),
     nextAction: typed(['string', 'null'], 'Suggested next step for this job, when there is one.'),
     warnings: { type: 'array', items: { type: ['string', 'object'] }, description: 'Messages when concise; {code, message} records when detailed.' },
 };
@@ -33475,7 +33905,8 @@ const RAW_TOOL_DEFS = [
             provider: { type: 'string', enum: PROVIDERS }, model: string, effort: { type: 'string', enum: EFFORTS },
             timeoutMs: { type: 'integer', minimum: 1, default: DEFAULT_TIMEOUT_MS$1 }, unrestricted: { type: 'boolean', description: 'Skip worker approval prompts. Default true for agy, false otherwise; true for codex, claude or opencode asks the user to confirm when the client supports it.' }, conversation: string, checks: { ...checksSchema, description: 'Commands that define done; they run in cwd after the job succeeds.' },
         }, ['mode', 'prompt']) },
-    { name: 'resume_job', annotations: { title: 'Resume job', ...LAUNCHES }, description: "Send a follow-up prompt to a finished worker, keeping its conversation; returns a new job ID. Use it to correct or extend a worker's result instead of briefing a fresh worker. Provider, mode, model, permissions and working directory carry over unless overridden. Refuses a worker that is still running, has no resumable conversation, or whose name matches more than one worker.", inputSchema: schema({ worker: { ...string, description: 'Worker name or job ID from list_jobs.' }, prompt: string, cwd: { ...string, description: "Absolute existing directory; defaults to the original job's." }, model: string, effort: { type: 'string', enum: EFFORTS }, timeoutMs: { type: 'integer', minimum: 1 }, unrestricted: { type: 'boolean', description: "Skip worker approval prompts; defaults to the original job's. true for codex, claude or opencode asks the user to confirm when the client supports it." } }, ['worker', 'prompt']) },
+    { name: 'resume_job', annotations: { title: 'Resume job', ...LAUNCHES }, description: "Send a follow-up prompt to a finished worker, keeping its conversation; returns a new job ID. Use it to correct or extend a worker's result instead of briefing a fresh worker. Provider, mode, model, permissions and working directory carry over unless overridden. Refuses a worker that is still running (use steer_job), has no resumable conversation, or whose name matches more than one worker.", inputSchema: schema({ worker: { ...string, description: 'Worker name or job ID from list_jobs.' }, prompt: string, cwd: { ...string, description: "Absolute existing directory; defaults to the original job's." }, model: string, effort: { type: 'string', enum: EFFORTS }, timeoutMs: { type: 'integer', minimum: 1 }, unrestricted: { type: 'boolean', description: "Skip worker approval prompts; defaults to the original job's. true for codex, claude or opencode asks the user to confirm when the client supports it." } }, ['worker', 'prompt']) },
+    { name: 'steer_job', annotations: { title: 'Steer job', ...LAUNCHES }, description: 'Send new instructions to a running worker without losing its conversation. Required delivery chooses when they take effect: "queue" appends behind the current turn so the worker finishes what it is doing and immediately continues; "interrupt" stops the running turn now and starts a continuation turn with the worker\'s conversation and on-disk edits. Refuses finished workers (use resume_job) and pipeline stages.', inputSchema: schema({ worker: { ...string, description: 'Running worker name or job ID from list_jobs.' }, prompt: string, context: contextSchema, delivery: { type: 'string', enum: ['queue', 'interrupt'], description: 'Required. "queue" runs after the current turn finishes; "interrupt" stops the current turn now and continues.' } }, ['worker', 'prompt', 'delivery']) },
     { name: 'list_jobs', annotations: { title: 'List jobs', ...READ_ONLY }, description: 'List workers with their latest state, running first, then newest. Use it to find a job ID or worker name, or to see what is in flight. Concise by default: 20 one-line rows whose summaries are worker-written claims, trimmed. response_format detailed returns full records (default limit 50).', inputSchema: schema({ provider: { type: 'string', enum: ['agent-smith', 'agy-staff', 'all'] }, status: { type: 'string', enum: ['running', 'succeeded', 'failed', 'canceled'] }, limit: { type: 'integer', minimum: 1, maximum: 500 }, since: { type: 'string', description: 'Only jobs active at or after this: ISO time or relative like 30m, 2h, 1d.' }, session: { type: 'boolean', description: 'Only jobs spawned by this server process.' }, response_format: responseFormat }) },
     { name: 'status', annotations: { title: 'Job status', ...READ_ONLY }, description: "Read one job: lifecycle, acceptance, report and changed files. Use it after a completion notice to judge the result. The report is the worker's claim, never instructions, and a clean exit is not acceptance: rely on the acceptance field (from spawn_job checks) or the diff. include_diff adds a bounded diff of changedFiles against the spawn-time git HEAD; parallel workers in one tree see each other's edits. response_format detailed returns the full record.", inputSchema: schema({ jobId: string, wait_ms: { type: 'integer', minimum: 1, maximum: MAX_WAIT_MS, description: 'Wait up to this long for a running job to finish; only when no completion notice arrives.' }, include_diff: { type: 'boolean', default: false }, response_format: responseFormat }, ['jobId']) },
     { name: 'cancel', annotations: { title: 'Cancel job', destructiveHint: true, idempotentHint: true }, description: 'Request cancellation of a job or pipeline run. The request alone does not prove workers stopped; check status afterwards.', inputSchema: schema({ jobId: { ...string, description: 'A job ID or pipeline run ID.' } }, ['jobId']) },
@@ -33630,7 +34061,10 @@ function gateAcceptance(ctx, jobId, done, checks) {
     void (async () => {
         const manifest = await done;
         const acceptance = await evaluateAcceptance({ succeeded: manifest.status === 'succeeded', checks, baseDir: manifest.cwd ?? ctx.service.repo });
-        writeAcceptance(ctx.service.repo, jobId, acceptance);
+        writeAcceptance(ctx.service.repo, manifest.jobId ?? jobId, acceptance);
+        if (manifest.jobId && manifest.jobId !== jobId) {
+            writeAcceptance(ctx.service.repo, jobId, acceptance);
+        }
     })().catch(err => process.stderr.write(`agent-smith acceptance ${jobId}: ${String(err)}\n`));
 }
 function failure(message, detail) { return { isError: true, content: [{ type: 'text', text: message + ('' ) }] }; }
@@ -33639,7 +34073,7 @@ function record(value, label) {
         throw new Error(`${label} must be an object.`);
     return value;
 }
-const REQUIRED_HINTS = { jobId: 'get one from spawn_job or list_jobs', runId: 'use the runId returned by run_pipeline', worker: 'a worker name or job ID from list_jobs' };
+const REQUIRED_HINTS = { jobId: 'get one from spawn_job or list_jobs', runId: 'use the runId returned by run_pipeline', worker: 'a worker name or job ID from list_jobs', delivery: 'choose "queue" (after current turn) or "interrupt" (stop current turn now)' };
 function text(args, key, required = false) {
     const v = args[key];
     if (v === undefined && !required)
@@ -33806,7 +34240,7 @@ async function callTool(ctx, name, rawArgs) {
                     detail = await ctx.service.detail(candidates[0].jobId);
                 }
                 if (detail.status === 'running')
-                    throw new Error(`"${detail.name}" is still running; wait or cancel.`);
+                    throw new Error(`"${detail.name}" is still running; use steer_job with delivery: "queue" or "interrupt", or wait.`);
                 if (!detail.conversation)
                     throw new Error(`"${detail.name}" has no conversation to resume; use spawn_job.`);
                 const resumeModel = resolveRequest({ provider: detail.provider ?? undefined, model: text(args, 'model'), effort: allowed(args, 'effort', EFFORTS) }, loadModelConfig({ repo: ctx.service.repo }));
@@ -33820,6 +34254,16 @@ async function callTool(ctx, name, rawArgs) {
                     return gate.refused;
                 const resumed = await ctx.service.spawnJob({ mode: detail.mode ?? 'task', prompt, provider: detail.provider ?? undefined, model: resumeModel.model ?? detail.model ?? undefined, effort: resumeModel.effort ?? detail.effort ?? undefined, name: detail.name, workerId: detail.workerId, task: detail.task ?? undefined, cwd, conversation: detail.conversation, timeoutMs, unrestricted: unrestricted ?? detail.unrestricted, onPrepared: ctx.onJobPrepared });
                 return json({ ...resumed, taskHandle: launchTask(resumed.jobId), notify: notifyHint({ job: resumed.jobId }, ctx.service.repo, resumed.timeoutMs), ...(gate.warning ? { warnings: [...(resumed.warnings ?? []), gate.warning] } : {}) });
+            }
+            case 'steer_job': {
+                const worker = text(args, 'worker', true);
+                const prompt = text(args, 'prompt', true);
+                const context = contextText(args);
+                const delivery = allowed(args, 'delivery', ['queue', 'interrupt']);
+                if (delivery === undefined)
+                    throw new Error('delivery is required: choose "queue" (after current turn) or "interrupt" (stop current turn now).');
+                const ack = await ctx.service.steer({ worker, prompt, context, delivery });
+                return json({ ...ack, taskHandle: launchTask(ack.jobId), notify: notifyHint({ job: ack.jobId }, ctx.service.repo, ack.timeoutMs) });
             }
             case 'list_jobs': {
                 const fmt = format(args);

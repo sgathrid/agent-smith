@@ -62,7 +62,7 @@ test('annotations are present', () => {
   const by = Object.fromEntries(TOOL_DEFS.map(t => [t.name, t.annotations]));
   for (const n of ['status', 'list_jobs', 'pipeline_status', 'list_capabilities']) assert.equal(by[n]?.readOnlyHint, true, n);
   assert.deepEqual([by.cancel?.destructiveHint, by.cancel?.idempotentHint], [true, true]);
-  for (const n of ['spawn_job', 'run_pipeline', 'resume_job']) assert.deepEqual([by[n]?.readOnlyHint, by[n]?.openWorldHint], [false, true], n);
+  for (const n of ['spawn_job', 'run_pipeline', 'resume_job', 'steer_job']) assert.deepEqual([by[n]?.readOnlyHint, by[n]?.openWorldHint], [false, true], n);
 });
 
 test('default pipeline derives providers from installed catalogs', async () => {
@@ -347,7 +347,11 @@ test('tool failures are isError results that say what to do next', async () => {
   await fail('resume_job', { worker: 'ghost', prompt: 'x' }, /No worker "ghost"; see list_jobs/);
   await fail('resume_job', { worker: 'Ada', prompt: 'x' }, /matches 2 workers; pass a job ID from list_jobs/);
   current = detail({ name: 'Ada', status: 'running' });
-  await fail('resume_job', { worker: 'job-1', prompt: 'x' }, /^"Ada" is still running; wait or cancel\.$/);
+  await fail('resume_job', { worker: 'job-1', prompt: 'x' }, /^"Ada" is still running; use steer_job with delivery: "queue" or "interrupt", or wait\.$/);
+  await fail('steer_job', { prompt: 'x', delivery: 'queue' }, /worker is required/);
+  await fail('steer_job', { worker: 'Ada', delivery: 'queue' }, /prompt is required/);
+  await fail('steer_job', { worker: 'Ada', prompt: 'x' }, /delivery is required: choose "queue"/);
+  await fail('steer_job', { worker: 'Ada', prompt: 'x', delivery: 'soon' }, /delivery must be one of queue, interrupt/);
   current = detail({ name: 'Ada', conversation: null });
   await fail('resume_job', { worker: 'job-1', prompt: 'x' }, /no conversation to resume.*spawn_job/);
   await fail('status', {}, /jobId is required: get one from spawn_job or list_jobs/);
@@ -436,4 +440,46 @@ test('status: a failed job carries a short reason (derived from old errors, stor
   assert.equal(fresh.reason, 'exit 1');
   const ok = body(await callTool(withService({ detail: async () => detail() }), 'status', { jobId: 'j' }));
   assert.equal(ok.reason, undefined);
+});
+
+test('steer_job forwards worker, prompt, context and delivery, and status surfaces supersession fields', async () => {
+  const seen: Array<Record<string, unknown>> = [];
+  const ctx = withService({
+    steer: async (req: Record<string, unknown>) => {
+      seen.push(req);
+      return {
+        jobId: 'implement-smith-1',
+        name: 'Ada',
+        workerId: 'Ada',
+        delivery: req.delivery,
+        status: req.delivery === 'interrupt' ? 'interrupting' : 'queued',
+        pendingSteers: 1,
+        note: 'queued',
+      };
+    },
+    detail: async () => detail({
+      supersededBy: 'implement-smith-2',
+      steeredFrom: 'implement-smith-0',
+      pendingSteers: 2,
+    }),
+  });
+  const res = await callTool(ctx, 'steer_job', {
+    worker: 'Ada',
+    prompt: 'Pivot to profile menu.',
+    context: 'Sidebar dropped.',
+    delivery: 'interrupt',
+  });
+  assert.equal(res.isError, undefined);
+  assert.deepEqual(seen[0], {
+    worker: 'Ada',
+    prompt: 'Pivot to profile menu.',
+    context: 'Sidebar dropped.',
+    delivery: 'interrupt',
+  });
+  assert.equal(body(res).status, 'interrupting');
+
+  const st = body(await callTool(ctx, 'status', { jobId: 'implement-smith-1' }));
+  assert.equal(st.supersededBy, 'implement-smith-2');
+  assert.equal(st.steeredFrom, 'implement-smith-0');
+  assert.equal(st.pendingSteers, 2);
 });

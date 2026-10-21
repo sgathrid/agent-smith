@@ -294,8 +294,8 @@ function unwrapResponse(response, depth = 0) {
         return unwrapResponse(response['content'], depth + 1);
     return response;
 }
-/** The three launch tools, by bare name. */
-const LAUNCH = { spawn_job: 'job', resume_job: 'job', run_pipeline: 'run' };
+/** The launch tools, by bare name. */
+const LAUNCH = { spawn_job: 'job', resume_job: 'job', steer_job: 'job', run_pipeline: 'run' };
 function launchKind(toolName) {
     if (typeof toolName !== 'string')
         return null;
@@ -466,6 +466,10 @@ function dedupeKey(job, epoch = 0) {
  */
 function shouldPush(candidate, now) {
     const { job, seen } = candidate;
+    // A superseded turn is an intermediate step in a steered worker chain; its
+    // continuation owns the terminal announcement.
+    if (job.supersededBy)
+        return false;
     // Gate 1 — is this state speakable at all?
     const kind = pushKindFor(job);
     if (kind === null)
@@ -835,6 +839,10 @@ const FILES = {
     result: 'result.json',
     report: 'result.md',
     cancel: 'cancel',
+    /** Marker written when a steer interrupts a running turn across or within processes. */
+    cancelSteer: 'cancel.steer',
+    /** Append-only NDJSON log of SteerEntry records for this job. */
+    steer: 'steer.jsonl',
     /** Written by the first reader to prove the owner is dead. Never edits job.json. */
     orphaned: 'orphaned',
 };
@@ -1380,6 +1388,11 @@ class AgentSmithReader {
             [SMITH_PAYLOAD.lastActivity]: progress?.lastActivity ?? null,
             [SMITH_PAYLOAD.latestText]: progress?.latestText ?? null,
             [SMITH_PAYLOAD.progressWarnings]: progress?.warnings ?? [],
+            ...(manifest?.supersededBy !== undefined ? { supersededBy: manifest.supersededBy } : {}),
+            ...(manifest?.steeredFrom !== undefined ? { steeredFrom: manifest.steeredFrom } : {}),
+            ...(typeof (progress?.pendingSteers ?? manifest?.pendingSteers) === 'number'
+                ? { pendingSteers: progress?.pendingSteers ?? manifest?.pendingSteers }
+                : {}),
         };
         // partial=true when the anchor is missing: something is on disk for this
         // job but we could not read the file that says what state it is in. The
@@ -3317,6 +3330,8 @@ async function readOne(reader, source, cwd, jobId, now) {
         lastEventAt: observed.updatedAt,
         finishedAt: observed.finishedAt,
         warned,
+        supersededBy: typeof raw['supersededBy'] === 'string' && raw['supersededBy'] !== '' ? raw['supersededBy'] : null,
+        steeredFrom: typeof raw['steeredFrom'] === 'string' && raw['steeredFrom'] !== '' ? raw['steeredFrom'] : null,
     };
 }
 /**

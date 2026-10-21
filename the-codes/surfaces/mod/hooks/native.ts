@@ -24,6 +24,8 @@ export interface NativeJob {
   readonly latestSummary: string | null;
   readonly acceptance?: RadarAcceptance;
   readonly summarySource: 'worker' | null;
+  readonly supersededBy?: string | null;
+  readonly steeredFrom?: string | null;
 }
 
 export interface NativeTaskLink {
@@ -74,6 +76,7 @@ export function nativeJobsFromRadar(jobs: readonly RadarJob[]): NativeJob[] {
     provider: job.provider ?? null, model: job.model ?? null,
     latestSummary: job.latestSummary ?? null, summarySource: job.summarySource ?? null,
     acceptance: job.acceptance,
+    supersededBy: job.supersededBy ?? null, steeredFrom: job.steeredFrom ?? null,
   }));
 }
 export async function readNativeJobs(fs: FsLike, repo: string, now = Date.now()): Promise<NativeJob[]> {
@@ -159,6 +162,13 @@ export async function syncNativeTasks(
 ): Promise<NativeTaskLinks> {
   const next: NativeTaskLinks = { ...previous };
   for (const job of jobs) {
+    if (job.supersededBy && next[job.id] && !next[job.supersededBy]) {
+      next[job.supersededBy] = next[job.id]!;
+      delete next[job.id];
+    }
+  }
+  for (const job of jobs) {
+    if (job.supersededBy) continue;
     const old = next[job.id];
     if (old?.status === 'deleted') continue;
     const live = job.status === 'running' || job.status === 'attention' || job.acceptance?.pending === true;

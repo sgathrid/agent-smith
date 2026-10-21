@@ -170,3 +170,14 @@ test('hook watch budget follows the ack timeout, with a 6h cap fallback for pipe
   const run = parseHookInput({ tool_name: 'mcp__x__run_pipeline', tool_response: { runId: 'r1', repo: '/tmp/r' } });
   assert.equal(run?.timeoutMs, 6 * 60 * 60_000 + 60_000);
 });
+
+test('runJobWatch follows supersededBy without emitting an intermediate parent notice and resets the timeout budget', async () => {
+  const { p, lines } = watch({
+    a: [job('a', 'running'), job('a', 'canceled', { supersededBy: 'b' })],
+    b: [job('b', 'running'), job('b', 'running'), job('b', 'succeeded')],
+  }, { jobIds: ['a'], timeoutMs: 3500 });
+  assert.equal(await p, 'done');
+  assert.equal(lines.length, 1, 'only the final turn emits a notice');
+  assert.match(lines[0]!, /W-b/);
+  assert.match(lines[0]!, /status b/);
+});

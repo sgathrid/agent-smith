@@ -125,9 +125,23 @@ export const FILES = {
   result: 'result.json',
   report: 'result.md',
   cancel: 'cancel',
+  /** Marker written when a steer interrupts a running turn across or within processes. */
+  cancelSteer: 'cancel.steer',
+  /** Append-only NDJSON log of SteerEntry records for this job. */
+  steer: 'steer.jsonl',
   /** Written by the first reader to prove the owner is dead. Never edits job.json. */
   orphaned: 'orphaned',
 } as const;
+
+export type SteerDelivery = 'queue' | 'interrupt';
+
+export interface SteerEntry {
+  readonly id: string;
+  readonly createdAt: string;
+  readonly prompt: string;
+  readonly context?: string | undefined;
+  readonly delivery: SteerDelivery;
+}
 
 /**
  * The id segment that marks a job as OURS.
@@ -256,6 +270,12 @@ export interface ForgeManifest {
    * Present only when the job's tool inputs were captured.
    */
   readonly unattributedFiles?: readonly string[];
+  /** Continuation job ID when this turn was superseded by a steered turn. */
+  readonly supersededBy?: string | null;
+  /** Parent job ID when this turn was created by steering an earlier turn. */
+  readonly steeredFrom?: string | null;
+  /** Number of unconsumed queued steers in steer.jsonl. */
+  readonly pendingSteers?: number;
 }
 
 export interface GitBaseline {
@@ -331,6 +351,8 @@ export interface ForgeProgress {
   readonly warnings: readonly string[];
   /** What the worker has done so far, from its tool calls. */
   readonly digest?: ProgressDigest;
+  /** Number of unconsumed queued steers in steer.jsonl. */
+  readonly pendingSteers?: number;
 }
 
 export type ForgeViewEvent =

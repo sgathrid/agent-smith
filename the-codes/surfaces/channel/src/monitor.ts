@@ -123,16 +123,26 @@ export async function runJobWatch(options: JobWatchOptions): Promise<JobWatchEnd
   const runIds = [...new Set(options.runIds ?? [])];
   const seen = new Map<string, Set<string>>();
   const done = new Set<string>();
-  const startedAt = now();
+  let startedAt = now();
 
   while (!options.signal?.aborted) {
     try {
       const t = now();
       const jobs = new Map<string, WatchableJob>();
       const want = new Set(jobIds);
-      for (const id of jobIds) {
+      for (let i = 0; i < jobIds.length; i++) {
+        const id = jobIds[i]!;
         const job = await rj(options.cwd, id, t);
-        if (job) jobs.set(job.id, job);
+        if (!job) continue;
+        jobs.set(job.id, job);
+        if (job.supersededBy) {
+          done.add(job.id);
+          if (!jobIds.includes(job.supersededBy)) {
+            jobIds.push(job.supersededBy);
+            want.add(job.supersededBy);
+            startedAt = t;
+          }
+        }
       }
       for (const id of runIds) {
         const rec = await rr(options.cwd, id);
@@ -156,6 +166,10 @@ export async function runJobWatch(options: JobWatchOptions): Promise<JobWatchEnd
       }
       for (const id of want) {
         const job = jobs.get(id);
+        if (job?.supersededBy) {
+          done.add(id);
+          continue;
+        }
         if (job && TERMINAL.has(job.status) && (seen.get(id)?.has(dedupeKey(job)) ?? false)) done.add(id);
       }
       if (want.size > 0 && [...want].every((id) => done.has(id))) return 'done';

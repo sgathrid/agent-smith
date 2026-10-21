@@ -33,6 +33,8 @@ export interface NoticeRow {
   readonly failureReason?: string | null;
   readonly latestSummary?: string | null;
   readonly summarySource?: 'worker' | null;
+  readonly supersededBy?: string | null;
+  readonly steeredFrom?: string | null;
   readonly acceptance?: { readonly pending?: boolean; readonly checks: readonly { readonly ok: boolean; readonly name?: string }[] };
 }
 
@@ -238,14 +240,14 @@ export function unwrapResponse(response: unknown, depth = 0): Record<string, unk
   return response;
 }
 
-/** The three launch tools, by bare name. */
-const LAUNCH: Record<string, 'job' | 'run'> = { spawn_job: 'job', resume_job: 'job', run_pipeline: 'run' };
+/** The launch tools, by bare name. */
+const LAUNCH: Record<string, 'job' | 'run'> = { spawn_job: 'job', resume_job: 'job', steer_job: 'job', run_pipeline: 'run' };
 
 /**
  * The launch tools under any server name that ends in `agent-smith`: the built
  * plugin (`mcp__plugin_agent-smith_agent-smith__`) and dev.sh (`mcp__agent-smith__`).
  */
-export const LAUNCH_TOOL = /^mcp__(?:plugin_agent-smith_)?agent-smith__(?:spawn_job|resume_job|run_pipeline)$/;
+export const LAUNCH_TOOL = /^mcp__(?:plugin_agent-smith_)?agent-smith__(?:spawn_job|resume_job|steer_job|run_pipeline)$/;
 export const STATUS_TOOL = /^mcp__(?:plugin_agent-smith_)?agent-smith__(?:status|pipeline_status)$/;
 
 /**
@@ -439,8 +441,13 @@ export interface Owned {
 const MAX_JOB_MS = 6 * 60 * 60_000;
 
 export function claim(owned: readonly Owned[], launch: Launch, now: number): Owned[] {
-  if (owned.some((o) => o.id === launch.id && o.kind === launch.kind)) return [...owned];
   const until = now + (launch.timeoutMs ?? MAX_JOB_MS) + 60 * 60_000;
+  const idx = owned.findIndex((o) => o.id === launch.id && o.kind === launch.kind);
+  if (idx >= 0) {
+    const existing = owned[idx]!;
+    if (until <= existing.until) return [...owned];
+    return owned.map((o, i) => (i === idx ? { ...o, until } : o));
+  }
   return [...owned, { kind: launch.kind, id: launch.id, at: now, until }];
 }
 
@@ -461,6 +468,19 @@ export function due(
   const byId = new Map(jobs.map((j) => [j.id, j]));
   const notices: NoticeJob[] = [];
   const keep: Owned[] = [];
+  const pushKeep = (entry: Owned) => {
+    const existingIdx = keep.findIndex((k) => k.kind === entry.kind && k.id === entry.id);
+    if (existingIdx >= 0) {
+      const prev = keep[existingIdx]!;
+      keep[existingIdx] = {
+        ...prev,
+        until: Math.max(prev.until, entry.until),
+        ...(prev.saidAttention || entry.saidAttention ? { saidAttention: true } : {}),
+      };
+    } else {
+      keep.push(entry);
+    }
+  };
   for (const o of owned) {
     if (o.kind === 'run') {
       const run = runs.get(o.id);
@@ -474,21 +494,43 @@ export function due(
         }
         continue;
       }
-      if (now <= o.until) keep.push(o);
+      if (now <= o.until) pushKeep(o);
       continue;
     }
-    const job = byId.get(o.id);
+    let currentOwned = o;
+    let job = byId.get(currentOwned.id);
+    const visited = new Set<string>([currentOwned.id]);
+    while (job?.supersededBy && !visited.has(job.supersededBy)) {
+      visited.add(job.supersededBy);
+      const nextId = job.supersededBy;
+      const child = byId.get(nextId);
+      currentOwned = {
+        kind: 'job',
+        id: nextId,
+        at: now,
+        until: Math.max(currentOwned.until, now + MAX_JOB_MS + 60 * 60_000),
+      };
+      job = child;
+    }
+    if (currentOwned.id !== o.id && !job) {
+      if (now <= currentOwned.until) pushKeep(currentOwned);
+      continue;
+    }
     const kind = job ? kindOf(job.status) : null;
     if (job && kind === 'attention') {
-      if (!o.saidAttention) { notices.push(noticeFromRadar(job, kind, now)); keep.push({ ...o, saidAttention: true }); }
-      else keep.push(o);
+      if (!currentOwned.saidAttention) {
+        notices.push(noticeFromRadar(job, kind, now));
+        pushKeep({ ...currentOwned, saidAttention: true });
+      } else {
+        pushKeep(currentOwned);
+      }
       continue;
     }
     if (job && kind && !held(job, now)) {
       notices.push(noticeFromRadar(job, kind, now));
       continue;
     }
-    if (now <= o.until) keep.push(o);
+    if (now <= currentOwned.until) pushKeep(currentOwned);
   }
   return { notices, owned: keep };
 }

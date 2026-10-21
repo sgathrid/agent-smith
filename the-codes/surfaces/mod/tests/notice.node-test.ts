@@ -292,3 +292,28 @@ test('parseSettledRead and unclaim retire a notice once status reads a settled j
   const owned = claim(claim([], launch('j1'), NOW), launch('j2'), NOW);
   assert.deepEqual(unclaim(owned, { kind: 'job', id: 'j1' }).map((o) => o.id), ['j2']);
 });
+
+test('due follows supersededBy across turns without announcing the superseded parent or dropping the claim before child appears', () => {
+  let owned: Owned[] = claim([], launch('turn-1'), NOW);
+
+  // Case 1: parent is superseded, child anchor is not visible in rows yet -> claim transfers to child and is held until child appears
+  const step1 = due(owned, [row({ id: 'turn-1', status: 'canceled', endedAt: NOW, supersededBy: 'turn-2' })], new Map(), NOW + 1000);
+  assert.deepEqual(step1.notices, [], 'superseded parent never fires a notice');
+  assert.deepEqual(step1.owned.map((o) => o.id), ['turn-2'], 'transfers and retains child claim even before child row appears');
+
+  // Case 2: child appears running -> claim transfers to child with refreshed budget
+  const step2 = due(step1.owned, [
+    row({ id: 'turn-1', status: 'canceled', endedAt: NOW, supersededBy: 'turn-2' }),
+    row({ id: 'turn-2', status: 'running', steeredFrom: 'turn-1' }),
+  ], new Map(), NOW + 2000);
+  assert.deepEqual(step2.notices, []);
+  assert.deepEqual(step2.owned.map((o) => o.id), ['turn-2']);
+
+  // Case 3: child finishes -> single completion notice fires for turn-2
+  const step3 = due(step2.owned, [
+    row({ id: 'turn-1', status: 'canceled', endedAt: NOW, supersededBy: 'turn-2' }),
+    row({ id: 'turn-2', status: 'succeeded', endedAt: NOW + 5000, steeredFrom: 'turn-1', name: 'Ada', provider: 'codex' }),
+  ], new Map(), NOW + 5000);
+  assert.deepEqual(step3.notices.map((n) => n.id), ['turn-2']);
+  assert.deepEqual(step3.owned, []);
+});

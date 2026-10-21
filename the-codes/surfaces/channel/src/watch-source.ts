@@ -266,6 +266,8 @@ async function readOne(
     lastEventAt: observed.updatedAt,
     finishedAt: observed.finishedAt,
     warned,
+    supersededBy: typeof raw['supersededBy'] === 'string' && raw['supersededBy'] !== '' ? raw['supersededBy'] : null,
+    steeredFrom: typeof raw['steeredFrom'] === 'string' && raw['steeredFrom'] !== '' ? raw['steeredFrom'] : null,
   };
 }
 

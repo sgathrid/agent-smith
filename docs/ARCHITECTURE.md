@@ -8,7 +8,7 @@ same `ForgeService`. Knobs and tool parameters are in [CONFIGURATION.md](CONFIGU
 
 ```text
 providers/  -> forge/ runtime -> surfaces/channel (MCP + hook watcher) -> surfaces/mod (pane)
- argv, NDJSON   job dir, status      8 tools, notifications              band, /forge
+ argv, NDJSON   job dir, status      9 tools, notifications              band, /forge
  model catalogs  derivation, DAG     (dist/server.js, monitor.js,        (read-only view)
                                       watch-hook.js)
 ```
@@ -44,6 +44,8 @@ State lives in `<repo>/.agent-smith/jobs/<jobId>/` (gitignored). `FILES` in `for
 | `result.json` | `providers/ndjson.ts` | Verbatim adapter `JobResult`, written once at completion. Its presence stops orphan derivation. |
 | `result.md` | `JobWriter` | The report (worker output). May be absent/empty for a denied job. |
 | `cancel` | `ForgeService.cancel` | Marker holding the ISO instant of the request. It is a request, not a verdict. |
+| `cancel.steer` | `ForgeService.steer` (`delivery: 'interrupt'`) | Marker telling the owning pump to abort the active turn and immediately chain the queued steer turn. Cleared by `ForgeService.cancel` if user cancellation wins. |
+| `steer.jsonl` | `ForgeService.steer` | Append-only JSONL log of `SteerEntry` records consumed by the owning `pump` loop. |
 | `orphaned` | legacy marker | Existing markers remain readable. New readers do not write markers; service recovery persists terminal state in `job.json`. |
 | `acceptance.json` | `forge/checks.ts` (only when `spawn_job` got `checks`) | Sidecar, see Acceptance. Not in `FILES`. |
 
@@ -67,7 +69,12 @@ name/workerId) rejects.
 Identity: `workerId` is the logical worker across follow-ups, `name` the label, `role` the
 mode. `resume_job` starts a new job id with the same `workerId`/`name` and the provider's
 native `conversation` handle; it refuses running workers, missing handles, and ambiguous
-names. No live steering.
+names. `steer_job` steers a running worker via append-only `steer.jsonl` (`delivery:
+'queue'` chains after the active turn finishes; `delivery: 'interrupt'` writes `cancel.steer`
+to stop the active turn once a `conversation` handle is recorded and immediately chains the
+continuation turn). The pump opens the child job anchor before marking the parent
+`supersededBy: nextJobId` (`steeredFrom: parentJobId` on the child), so watchers and notice
+claims transfer across turn chains without firing intermediate notices.
 
 ## Status derivation
 
@@ -383,4 +390,4 @@ user (up to 10 minutes) before anything launches.
   dies the job is derived `failed (orphaned)`; there is no automatic replay or lease
   reconciliation.
 - Provider auth, permissions and resume capabilities remain provider-owned. Not
-  implemented: live steering, isolated worktrees, native subagent dispatch.
+  implemented: isolated worktrees, native subagent dispatch.

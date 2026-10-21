@@ -55,7 +55,7 @@
  */
 
 import { humanDuration } from '../providers/failure-text.ts';
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 
 import { AgentSmithReader, SMITH_PAYLOAD } from '../harness/agent-smith.ts';
@@ -76,8 +76,10 @@ import { isMode, MODE_PRESETS, MODES, type ModePreset } from './modes.ts';
 import { buildBrief, type BriefCheck } from './brief.ts';
 import {
   DEFAULT_TIMEOUT_MS,
+  deriveStatus,
   FILES,
   isForgeJobId,
+  isPidAlive,
   jobDir,
   jobFile,
   jobsDir,
@@ -85,11 +87,13 @@ import {
   type ForgeActivity,
   type ForgeManifest,
   type ForgeStatus,
+  type SteerDelivery,
+  type SteerEntry,
   nextActionFor,
 } from './format.ts';
 import { reconcileOrphan } from './reconcile.ts';
 import { JobWriter, pipeEvents, reportFor } from './writer.ts';
-import { writeJsonAtomic } from './atomic.ts';
+import { writeAtomic, writeJsonAtomic } from './atomic.ts';
 
 /**
  * Default wall-clock budget for one job.
@@ -225,6 +229,12 @@ export interface JobSummary {
   readonly nextAction: string | null;
   /** True when the job ran with the approval prompt bypassed. */
   readonly unrestricted?: boolean;
+  /** Set when this job turn was superseded by a steered continuation turn. */
+  readonly supersededBy?: string | null;
+  /** Set when this job turn was spawned by steering an earlier turn. */
+  readonly steeredFrom?: string | null;
+  /** Count of unconsumed queued steers waiting for the current turn to finish. */
+  readonly pendingSteers?: number;
 }
 
 export interface JobDetail extends JobSummary {
@@ -269,6 +279,31 @@ export interface CancelResult {
   readonly note: string;
 }
 
+export interface SteerRequest {
+  /** Active worker name or job ID. */
+  readonly worker: string;
+  readonly prompt: string;
+  readonly context?: string | undefined;
+  /** Required delivery mode: 'queue' (run after current turn) or 'interrupt' (stop current turn now and continue). */
+  readonly delivery: SteerDelivery;
+}
+
+export interface SteerAck {
+  /** Currently active job ID that received the steer. */
+  readonly jobId: string;
+  readonly name: string;
+  readonly workerId: string;
+  readonly provider: string;
+  readonly delivery: SteerDelivery;
+  readonly status: 'queued' | 'interrupting';
+  readonly pendingSteers: number;
+  readonly signalled: boolean;
+  readonly repo: string;
+  readonly dir: string;
+  readonly timeoutMs: number;
+  readonly note: string;
+}
+
 /**
  * Clamp a timeout into the range we are willing to enforce. Pure; unit-tested.
  *
@@ -306,9 +341,16 @@ export function requireProvider(name: string): Provider {
 }
 
 interface LiveJob {
-  readonly writer: JobWriter;
-  readonly handle: WorkerHandle;
+  writer: JobWriter;
+  handle: WorkerHandle | null;
+  timeoutMs: number;
+  consumedSteers: number;
+  interruptRequested: boolean;
+  interruptFired: boolean;
+  userCanceled: boolean;
 }
+
+const STEER_CONVERSATION_WAIT_MS = 2_000;
 
 export interface ForgeOptions {
   /** Repo whose `.agent-smith/jobs/` this service owns. */
@@ -622,112 +664,310 @@ export class ForgeService {
 
     const done = this.pump(writer, provider, {
       jobId,
+      name,
+      workerId,
+      task: request.task,
+      mode,
+      preset,
+      context: request.context,
+      checks: request.checks,
       prompt: sentPrompt,
-      readOnly: readOnlyRequested,
+      readOnlyRequested,
+      readOnlyEnforced,
+      sandbox,
+      sandboxFlags: [...sandboxFlags],
       artifactPath,
       cwd,
       model: request.model,
+      modelRequested: request.model ?? null,
+      modelResolved,
+      modelSource,
       effort: request.effort,
       timeoutMs,
       unrestricted,
       conversation: request.conversation,
+      pipeline: request.pipeline ?? null,
+      stage: request.stage ?? null,
+      attempt: request.attempt ?? null,
+      onPrepared: request.onPrepared,
     });
 
     return { ack, done };
   }
 
   /**
-   * The detached pump: spawn, stream, record, resolve.
+   * The detached pump: spawn, stream, record, chain steered turns, resolve.
    *
    * Never rejects. Every exit path lands on writer.finish() or writer.abort(),
    * because a job that stops being `running` is the only promise this function
-   * makes to every reader on the other side of the filesystem.
+   * makes to every reader on the other side of the filesystem. When a steer is
+   * queued or interrupts the turn, this loop is the sole owner that opens the
+   * child anchor and marks the parent superseded.
    */
   private async pump(
-    writer: JobWriter,
+    initialWriter: JobWriter,
     provider: Provider,
     spec: {
       jobId: string;
+      name: string;
+      workerId: string;
+      task: string | undefined;
+      mode: string;
+      preset: ModePreset | undefined;
+      context: string | undefined;
+      checks: readonly BriefCheck[] | undefined;
       prompt: string;
-      readOnly: boolean;
+      readOnlyRequested: boolean;
+      readOnlyEnforced: boolean;
+      sandbox: string;
+      sandboxFlags: readonly string[];
       artifactPath: string | undefined;
       cwd: string;
       model: string | undefined;
+      modelRequested: string | null;
+      modelResolved: string | null;
+      modelSource: SpawnAck['modelSource'];
       effort: string | undefined;
       timeoutMs: number;
       unrestricted: boolean;
       conversation: string | undefined;
+      pipeline: string | null;
+      stage: string | null;
+      attempt: number | null;
+      onPrepared: ((jobId: string) => void) | undefined;
     },
   ): Promise<ForgeManifest> {
-    let handle: WorkerHandle;
-    try {
-      handle = await provider.spawn({
-        mode: spec.jobId,
-        prompt: spec.prompt,
-        cwd: spec.cwd,
-        timeoutMs: spec.timeoutMs,
-        unrestricted: spec.unrestricted,
-        ...(spec.readOnly ? { readOnly: true } : {}),
-        ...(spec.artifactPath === undefined ? {} : { artifactPath: spec.artifactPath }),
-        ...(spec.model === undefined ? {} : { model: spec.model }),
-        ...(spec.effort === undefined ? {} : { effort: spec.effort }),
-        ...(spec.conversation === undefined ? {} : { conversation: spec.conversation }),
-        // THE KEY LINE. Handing the provider adapter OUR job directory as its
-        // stateDir means events.jsonl / argv.json / stderr.log / result.json are
-        // written by the already-verified plumbing in providers/ndjson.ts, for
-        // all four providers, instead of being copied across afterwards by us.
-        stateDir: writerDir(this.repo, spec.jobId),
-        jobId: spec.jobId,
-      });
-    } catch (err) {
-      // ENOENT, a bad cwd, a provider that refuses to spawn. The job exists and
-      // is now `failed`, which is a fact the pane can draw — as opposed to a
-      // rejected promise, which is a fact nothing can draw.
-      return (
-        writer.abort('failed', `couldn't start · ${describe(err)}`) ??
-        writer.snapshot() ??
-        ({ jobId: spec.jobId } as unknown as ForgeManifest)
-      );
-    }
+    let currentWriter = initialWriter;
+    let currentJobId = spec.jobId;
+    let currentPrompt = spec.prompt;
+    let currentConversation = spec.conversation;
+    let liveEntry: LiveJob = {
+      writer: currentWriter,
+      handle: null,
+      timeoutMs: spec.timeoutMs,
+      consumedSteers: 0,
+      interruptRequested: false,
+      interruptFired: false,
+      userCanceled: false,
+    };
+    // Register synchronously before the first await so a steer or cancel arriving
+    // right after spawn_job finds the live entry in this.live.
+    this.live.set(currentJobId, liveEntry);
 
-    this.live.set(spec.jobId, { writer, handle });
-    const unsubscribe = pipeEvents(writer, handle);
-    // The cancel marker is written by `cancel()`; if it arrived while we were
-    // spawning, apply it now or the worker runs to completion for nothing.
-    if (existsSync(jobFile(this.repo, spec.jobId, FILES.cancel))) {
-      writer.requestCancel();
-      handle.cancel();
-    }
-
-    // A different ForgeService instance can request cancellation by creating the
-    // shared marker. The process that owns the handle must acknowledge it and
-    // signal the worker; a marker alone cannot stop a child process.
-    let observedCancel = existsSync(jobFile(this.repo, spec.jobId, FILES.cancel));
-    const cancelPoll = setInterval(() => {
-      if (!observedCancel && existsSync(jobFile(this.repo, spec.jobId, FILES.cancel))) {
-        observedCancel = true;
-        writer.requestCancel();
-        handle.cancel();
+    while (true) {
+      let handle: WorkerHandle;
+      try {
+        handle = await provider.spawn({
+          mode: currentJobId,
+          prompt: currentPrompt,
+          cwd: spec.cwd,
+          timeoutMs: spec.timeoutMs,
+          unrestricted: spec.unrestricted,
+          ...(spec.readOnlyRequested ? { readOnly: true } : {}),
+          ...(spec.artifactPath === undefined ? {} : { artifactPath: spec.artifactPath }),
+          ...(spec.model === undefined ? {} : { model: spec.model }),
+          ...(spec.effort === undefined ? {} : { effort: spec.effort }),
+          ...(currentConversation === undefined ? {} : { conversation: currentConversation }),
+          // THE KEY LINE. Handing the provider adapter OUR job directory as its
+          // stateDir means events.jsonl / argv.json / stderr.log / result.json are
+          // written by the already-verified plumbing in providers/ndjson.ts, for
+          // all four providers, instead of being copied across afterwards by us.
+          stateDir: writerDir(this.repo, currentJobId),
+          jobId: currentJobId,
+        });
+      } catch (err) {
+        this.live.delete(currentJobId);
+        return (
+          currentWriter.abort('failed', `couldn't start · ${describe(err)}`) ??
+          currentWriter.snapshot() ??
+          ({ jobId: currentJobId } as unknown as ForgeManifest)
+        );
       }
-    }, 200);
-    cancelPoll.unref?.();
 
-    try {
-      const result: JobResult = await handle.waitForResult();
-      await writer.prepareFinish();
-      const report = reportFor(result);
-      const manifest = writer.finish(result, report === '' ? null : report);
-      return manifest;
-    } catch (err) {
-      return (
-        writer.abort('failed', `crashed · ${describe(err)}`) ??
-        writer.snapshot() ??
-        ({ jobId: spec.jobId } as unknown as ForgeManifest)
-      );
-    } finally {
-      clearInterval(cancelPoll);
-      unsubscribe();
-      this.live.delete(spec.jobId);
+      liveEntry.handle = handle;
+      const unsubscribe = pipeEvents(currentWriter, handle);
+
+      let interruptDetectedAt: number | null = null;
+      let lastPendingSteers = 0;
+
+      const syncSteerAndCancel = (): void => {
+        if ( !liveEntry.interruptFired && existsSync(jobFile(this.repo, currentJobId, FILES.cancel))
+          && !existsSync(jobFile(this.repo, currentJobId, FILES.cancelSteer)) ) {
+          liveEntry.userCanceled = true;
+        }
+        if (liveEntry.userCanceled) {
+          if (!liveEntry.interruptFired) {
+            liveEntry.interruptFired = true;
+            currentWriter.requestCancel();
+            handle.cancel();
+          }
+          return;
+        }
+        const entries = readSteerEntries(this.repo, currentJobId);
+        const unconsumed = entries.slice(liveEntry.consumedSteers);
+        if (unconsumed.length !== lastPendingSteers) {
+          lastPendingSteers = unconsumed.length;
+          currentWriter.setPendingSteers(unconsumed.length);
+        }
+        if (unconsumed.some((e) => e.delivery === 'interrupt') || existsSync(jobFile(this.repo, currentJobId, FILES.cancelSteer))) {
+          liveEntry.interruptRequested = true;
+        }
+        if (liveEntry.interruptRequested && !liveEntry.interruptFired) {
+          if (interruptDetectedAt === null) interruptDetectedAt = Date.now();
+          const hasConversation = currentWriter.currentConversation() !== null;
+          const waitElapsed = Date.now() - interruptDetectedAt >= STEER_CONVERSATION_WAIT_MS;
+          if (hasConversation || waitElapsed) {
+            liveEntry.interruptFired = true;
+            currentWriter.requestCancel();
+            handle.cancel();
+          }
+        }
+      };
+
+      const unsubSteerTap = handle.onEvent((ev) => {
+        if (ev.kind === 'started' && liveEntry.interruptRequested && !liveEntry.interruptFired) {
+          syncSteerAndCancel();
+        }
+      });
+
+      syncSteerAndCancel();
+      const cancelPoll = setInterval(syncSteerAndCancel, 100);
+      cancelPoll.unref?.();
+
+      try {
+        const result: JobResult = await handle.waitForResult();
+        clearInterval(cancelPoll);
+        unsubSteerTap();
+        unsubscribe();
+
+        await currentWriter.prepareFinish();
+        const report = reportFor(result);
+
+        syncSteerAndCancel();
+        const entries = readSteerEntries(this.repo, currentJobId);
+        const unconsumed = entries.slice(liveEntry.consumedSteers);
+        const alreadyTerminal: ForgeStatus | null = result.status === 'cancelled' ? 'canceled' : null;
+        const verdict = deriveStatus({
+          alreadyTerminal,
+          ok: result.ok,
+          jobStatus: result.status,
+          deniedActions: result.deniedActions ?? [],
+          report: report === '' ? null : report,
+        });
+
+        const shouldChain =
+          !liveEntry.userCanceled &&
+          unconsumed.length > 0 &&
+          (liveEntry.interruptRequested || verdict.status === 'succeeded');
+
+        if (shouldChain) {
+          const conversation = currentWriter.currentConversation();
+          const wasInterrupted = liveEntry.interruptRequested && verdict.status !== 'succeeded';
+          if (conversation === null && !wasInterrupted) {
+            currentWriter.warn('could not steer: provider did not report a resumable conversation ID');
+          } else {
+            liveEntry.consumedSteers = entries.length;
+            const nextJobId = newJobId(spec.mode);
+            const nextWriter = new JobWriter({
+              repo: this.repo,
+              jobId: nextJobId,
+              mirror: this.mirrorOn,
+              ...(this.flushMs === undefined ? {} : { flushMs: this.flushMs }),
+            });
+            const latestContext = [...unconsumed].reverse().find((e) => e.context !== undefined)?.context ?? spec.context;
+            const resuming = conversation !== null;
+            const nextBrief = buildBrief({
+              preset: spec.preset,
+              cwd: spec.cwd,
+              context: latestContext,
+              checks: spec.checks,
+              pipelineStage: spec.pipeline !== null,
+              resuming,
+            });
+            const { rawPrompt, sentPrompt, prependBrief } = buildSteeredPrompt({
+              parentJobId: currentJobId,
+              wasInterrupted,
+              freshContinuation: !resuming,
+              toolCalls: currentWriter.snapshot()?.toolCalls ?? 0,
+              responseTail: result.response.trim().slice(-600),
+              entries: unconsumed,
+              brief: nextBrief,
+            });
+            const nextLiveEntry: LiveJob = {
+              writer: nextWriter,
+              handle: null,
+              timeoutMs: spec.timeoutMs,
+              consumedSteers: 0,
+              interruptRequested: false,
+              interruptFired: false,
+              userCanceled: false,
+            };
+
+            // 1. Open child anchor on disk BEFORE finishing the parent so any reader
+            //    following `supersededBy` finds the child anchor immediately.
+            nextWriter.start({
+              name: spec.name,
+              workerId: spec.workerId,
+              task: spec.task,
+              provider: provider.name,
+              mode: spec.mode,
+              model: spec.model ?? null,
+              effort: spec.effort ?? null,
+              cwd: spec.cwd,
+              prompt: rawPrompt,
+              ...(prependBrief ? { preamble: nextBrief } : {}),
+              unrestricted: spec.unrestricted,
+              conversation,
+              timeoutMs: spec.timeoutMs,
+              pipeline: spec.pipeline,
+              stage: spec.stage,
+              attempt: spec.attempt,
+              modelRequested: spec.modelRequested,
+              modelResolved: spec.modelResolved,
+              modelSource: spec.modelSource,
+              preambleApplied: nextBrief !== '',
+              sandbox: spec.sandbox,
+              sandboxFlags: [...spec.sandboxFlags],
+              readOnlyRequested: spec.readOnlyRequested,
+              readOnlyEnforced: spec.readOnlyEnforced,
+              steeredFrom: currentJobId,
+            });
+
+            // 2. Register child in spawnedIds and live map before removing parent.
+            this.spawnedIds.add(nextJobId);
+            this.live.set(nextJobId, nextLiveEntry);
+            try {
+              spec.onPrepared?.(nextJobId);
+            } catch { /* best-effort callback for continuation turn */ }
+
+            // 3. Stamp supersededBy on parent and write parent's terminal manifest atomically.
+            currentWriter.markSuperseded(nextJobId);
+            currentWriter.finish(result, report === '' ? null : report);
+            this.live.delete(currentJobId);
+
+            currentWriter = nextWriter;
+            currentJobId = nextJobId;
+            currentPrompt = sentPrompt;
+            currentConversation = conversation ?? undefined;
+            liveEntry = nextLiveEntry;
+            continue;
+          }
+        }
+
+        const manifest = currentWriter.finish(result, report === '' ? null : report);
+        this.live.delete(currentJobId);
+        return manifest;
+      } catch (err) {
+        clearInterval(cancelPoll);
+        unsubSteerTap();
+        unsubscribe();
+        this.live.delete(currentJobId);
+        return (
+          currentWriter.abort('failed', `crashed · ${describe(err)}`) ??
+          currentWriter.snapshot() ??
+          ({ jobId: currentJobId } as unknown as ForgeManifest)
+        );
+      }
     }
   }
 
@@ -760,6 +1000,9 @@ export class ForgeService {
       throw new Error(`no job "${jobId}" in ${jobsDir(this.repo)}; call list_jobs for valid job IDs.`);
     }
 
+    try {
+      unlinkSync(jobFile(this.repo, jobId, FILES.cancelSteer));
+    } catch { /* no steer marker present */ }
     writer.requestCancel();
 
     if (live === undefined) {
@@ -771,13 +1014,174 @@ export class ForgeService {
       };
     }
 
-    live.handle.cancel();
+    live.userCanceled = true;
+    live.handle?.cancel();
     return {
       jobId,
       requested: true,
       signalled: true,
       note: 'Canceled.',
     };
+  }
+
+  /**
+   * Steer a running worker by recording durable intent (`steer.jsonl`) and,
+   * when `delivery: 'interrupt'`, signalling the running turn to stop so the
+   * pump can open the continuation turn.
+   */
+  async steer(request: SteerRequest): Promise<SteerAck> {
+    const prompt = request.prompt;
+    if (prompt.trim() === '') {
+      throw new Error('prompt is empty; there is nothing to hand the worker.');
+    }
+    if (request.delivery !== 'queue' && request.delivery !== 'interrupt') {
+      throw new Error('delivery is required; must be "queue" or "interrupt".');
+    }
+    const target = await this.resolveSteerTarget(request.worker);
+    if (target.manifest.pipeline !== null && target.manifest.pipeline !== undefined) {
+      throw new Error(
+        `Cannot steer pipeline stage "${target.manifest.name}" (${target.jobId}); pipeline stages are managed by run_pipeline.`,
+      );
+    }
+    if (target.manifest.status !== 'running') {
+      throw new Error(
+        `"${target.manifest.name}" (${target.jobId}) is already ${target.manifest.status}; use resume_job to continue a finished worker.`,
+      );
+    }
+
+    const live = this.live.get(target.jobId);
+    if (live === undefined) {
+      const ownerPid = target.manifest.ownerPid;
+      const ownerAlive =
+        typeof ownerPid === 'number' &&
+        Number.isInteger(ownerPid) &&
+        ownerPid > 0 &&
+        isPidAlive(ownerPid);
+      if (!ownerAlive) {
+        reconcileOrphan(this.repo, target.jobId);
+        throw new Error(
+          `"${target.manifest.name}" (${target.jobId}) has no live owner process; it cannot be steered. Use resume_job to continue it.`,
+        );
+      }
+    }
+
+    const at = new Date().toISOString();
+    const entry: SteerEntry = {
+      id: `steer-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      createdAt: at,
+      prompt,
+      ...(request.context === undefined ? {} : { context: request.context }),
+      delivery: request.delivery,
+    };
+    appendSteerEntry(this.repo, target.jobId, entry);
+
+    const allEntries = readSteerEntries(this.repo, target.jobId);
+    const pendingSteers = Math.max(1, allEntries.length - (live?.consumedSteers ?? 0));
+    if (live !== undefined) {
+      live.writer.setPendingSteers(pendingSteers, at);
+    }
+
+    if (request.delivery === 'interrupt') {
+      writeAtomic(jobFile(this.repo, target.jobId, FILES.cancelSteer), `${at}\n`);
+      if (live !== undefined) {
+        live.interruptRequested = true;
+        if (live.handle !== null && live.writer.currentConversation() !== null && !live.interruptFired) {
+          live.interruptFired = true;
+          live.writer.requestCancel(at);
+          live.handle.cancel();
+        }
+      }
+    }
+
+    const signalled = live !== undefined;
+    const status = request.delivery === 'interrupt' ? 'interrupting' : 'queued';
+    const note =
+      request.delivery === 'interrupt'
+        ? signalled
+          ? 'Interrupting current turn; continuation turn will start automatically.'
+          : 'Interrupt recorded for owner process; continuation turn will start after current turn stops.'
+        : `Queued behind current turn (${pendingSteers} pending).`;
+
+    return {
+      jobId: target.jobId,
+      name: target.manifest.name ?? target.jobId,
+      workerId: target.manifest.workerId ?? target.jobId,
+      provider: target.manifest.provider,
+      delivery: request.delivery,
+      status,
+      pendingSteers,
+      signalled,
+      repo: this.repo,
+      dir: jobDir(this.repo, target.jobId),
+      timeoutMs: live?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      note,
+    };
+  }
+
+  private async resolveSteerTarget(worker: string): Promise<{ jobId: string; manifest: ForgeManifest }> {
+    const trimmed = worker.trim();
+    if (existsSync(pipelineRecordPath(this.repo, trimmed))) {
+      throw new Error(`Cannot steer pipeline run "${trimmed}"; steer_job only applies to solo workers.`);
+    }
+
+    const readManifest = (id: string): ForgeManifest | null => {
+      const inMem = this.live.get(id)?.writer.snapshot();
+      if (inMem !== null && inMem !== undefined) return inMem;
+      reconcileOrphan(this.repo, id);
+      try {
+        return JSON.parse(readFileSync(jobFile(this.repo, id, FILES.job), 'utf8')) as ForgeManifest;
+      } catch {
+        return null;
+      }
+    };
+
+    const followChain = (startId: string): { jobId: string; manifest: ForgeManifest } | null => {
+      const seen = new Set<string>();
+      let curId = startId;
+      let curManifest = readManifest(curId);
+      if (curManifest === null) return null;
+      while (curManifest.supersededBy && !seen.has(curId)) {
+        seen.add(curId);
+        const nextManifest = readManifest(curManifest.supersededBy);
+        if (nextManifest === null) break;
+        curId = curManifest.supersededBy;
+        curManifest = nextManifest;
+      }
+      return { jobId: curId, manifest: curManifest };
+    };
+
+    if (this.live.has(trimmed) || existsSync(jobDir(this.repo, trimmed))) {
+      const resolved = followChain(trimmed);
+      if (resolved !== null) return resolved;
+    }
+
+    for (const [id, live] of this.live.entries()) {
+      const snap = live.writer.snapshot();
+      if (snap !== null && snap.name === trimmed && snap.status === 'running') {
+        return { jobId: id, manifest: snap };
+      }
+    }
+
+    const candidates = (await this.list({ limit: 500 })).filter((j) => j.name === trimmed);
+    if (candidates.length === 0) {
+      throw new Error(`No worker "${trimmed}"; see list_jobs.`);
+    }
+    const running = candidates.filter((j) => j.status === 'running');
+    if (running.length === 1) {
+      const resolved = followChain(running[0]!.jobId);
+      if (resolved !== null) return resolved;
+    }
+    if (running.length > 1) {
+      throw new Error(`"${trimmed}" matches ${running.length} running workers; pass a job ID from list_jobs.`);
+    }
+    const identities = new Set(candidates.map((j) => j.workerId));
+    if (identities.size !== 1) {
+      throw new Error(`"${trimmed}" matches ${identities.size} workers; pass a job ID from list_jobs.`);
+    }
+    candidates.sort((a, b) => Date.parse(b.startedAt ?? b.updatedAt ?? '') - Date.parse(a.startedAt ?? a.updatedAt ?? ''));
+    const latest = followChain(candidates[0]!.jobId);
+    if (latest !== null) return latest;
+    throw new Error(`No worker "${trimmed}"; see list_jobs.`);
   }
 
   /** Jobs the pane would draw. Ours by default; interop history on request. */
@@ -979,7 +1383,79 @@ export function toSummary(observed: ObservedJob, source: 'agent-smith' | 'agy-st
     updatedAt: observed.updatedAt,
     finishedAt: observed.finishedAt,
     warnings: observed.warnings.map((w) => ({ code: w.code, message: w.message })),
+    ...(typeof raw['supersededBy'] === 'string' || raw['supersededBy'] === null
+      ? { supersededBy: raw['supersededBy'] as string | null }
+      : {}),
+    ...(typeof raw['steeredFrom'] === 'string' || raw['steeredFrom'] === null
+      ? { steeredFrom: raw['steeredFrom'] as string | null }
+      : {}),
+    ...(typeof raw['pendingSteers'] === 'number'
+      ? { pendingSteers: raw['pendingSteers'] }
+      : {}),
   };
+}
+
+function appendSteerEntry(repo: string, jobId: string, entry: SteerEntry): void {
+  const dir = jobDir(repo, jobId);
+  mkdirSync(dir, { recursive: true });
+  appendFileSync(jobFile(repo, jobId, FILES.steer), `${JSON.stringify(entry)}\n`, 'utf8');
+}
+
+function readSteerEntries(repo: string, jobId: string): SteerEntry[] {
+  const file = jobFile(repo, jobId, FILES.steer);
+  let text: string;
+  try {
+    text = readFileSync(file, 'utf8');
+  } catch {
+    return [];
+  }
+  const out: SteerEntry[] = [];
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed === '') continue;
+    try {
+      const parsed = JSON.parse(trimmed) as Partial<SteerEntry>;
+      if (
+        typeof parsed.id === 'string' &&
+        typeof parsed.createdAt === 'string' &&
+        typeof parsed.prompt === 'string' &&
+        (parsed.delivery === 'queue' || parsed.delivery === 'interrupt')
+      ) {
+        out.push(parsed as SteerEntry);
+      }
+    } catch { /* ignore truncated line */ }
+  }
+  return out;
+}
+
+function buildSteeredPrompt(input: {
+  parentJobId: string;
+  wasInterrupted: boolean;
+  freshContinuation?: boolean;
+  toolCalls: number;
+  responseTail: string;
+  entries: readonly SteerEntry[];
+  brief: string;
+}): { rawPrompt: string; sentPrompt: string; prependBrief: boolean } {
+  const steerBody =
+    input.entries.length === 1
+      ? input.entries[0]!.prompt
+      : input.entries.map((e, idx) => `[Steer ${idx + 1} (${e.createdAt})]\n${e.prompt}`).join('\n\n');
+  const tag = input.freshContinuation
+    ? '[FRESH CONTINUATION]'
+    : input.wasInterrupted
+      ? '[TURN INTERRUPTED]'
+      : `[FOLLOW-UP STEER · ${input.entries.length} queued update${input.entries.length === 1 ? '' : 's'}]`;
+  const statusLine = input.wasInterrupted
+    ? `Your previous turn (${input.parentJobId}) was interrupted after ${input.toolCalls} tool call(s) with updated instructions from the orchestrator. Inspect your working tree before repeating any completed steps.`
+    : `Your previous turn (${input.parentJobId}) completed after ${input.toolCalls} tool call(s), and the orchestrator queued follow-up instructions for you.`;
+  const tailBlock = input.responseTail
+    ? `\nLast response excerpt from previous turn:\n${input.responseTail}\n`
+    : '';
+  const header = `[STEERED TURN CONTINUITY] ${tag}\n${statusLine}${tailBlock}\n[ORCHESTRATOR UPDATE]\n${steerBody}`;
+  const prependBrief = input.brief !== '' && !header.startsWith(input.brief);
+  const sentPrompt = prependBrief ? `${input.brief}\n\n${header}` : header;
+  return { rawPrompt: header, sentPrompt, prependBrief };
 }
 
 function isForgeActivity(value: unknown): value is ForgeActivity {

@@ -135,6 +135,15 @@ export interface RadarJob {
   /** What the worker has done so far, from its tool calls (progress.json `digest`). Absent for older and agy-staff jobs. */
   readonly progress?: ProgressDigest | null;
 
+  /** Child job ID when this turn was superseded by a steered continuation turn. */
+  readonly supersededBy?: string | null;
+
+  /** Parent job ID when this turn was spawned by pump() consuming steer.jsonl. */
+  readonly steeredFrom?: string | null;
+
+  /** Unconsumed queued steer count while running. */
+  readonly pendingSteers?: number | null;
+
   /** Raw provider payload, for the pane's debug view only. Never parsed by a surface. */
   readonly raw: Record<string, unknown>;
 }

@@ -199,8 +199,14 @@ Params: `worker` (name or job id, required), `prompt` (required), `model`, `effo
 default: the original job's). An explicit cwd changes the process working directory while
 retaining the prior conversation, which can still mention its previous workspace. Provider, mode, workerId,
 name and conversation come from the finished job; no `provider` or `checks` parameter.
-Refuses running workers, workers without a conversation handle, ambiguous names. Result:
+Refuses running workers (pointing to `steer_job`), workers without a conversation handle, ambiguous names. Result:
 a `SpawnAck` plus `taskHandle` and `notify` (not structured).
+
+### `steer_job` (structured)
+Params: `worker` (name or job id of a running worker, required), `prompt` (required),
+`delivery` enum `queue|interrupt` (required; `queue` appends the steer and chains a continuation turn when the active turn exits; `interrupt` writes `cancel.steer` so the pump stops the active turn once a conversation handle is available and immediately chains the continuation turn), `context` (optional, 1 to 2 000 chars).
+Refuses finished workers (pointing to `resume_job`), pipeline stages, and running workers without a live owner process.
+Result (`SteerAck`): `jobId` (the active turn ID), `name, workerId, provider, delivery, status: 'queued'|'interrupting', pendingSteers, dir, repo, timeoutMs, note`.
 
 ### `list_jobs` (read-only, structured)
 Params: `provider` enum `agent-smith|agy-staff|all` (default `agent-smith`), `status` enum
