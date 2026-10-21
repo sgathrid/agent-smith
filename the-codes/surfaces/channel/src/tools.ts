@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import type { CallToolResult } from '@modelcontextprotocol/server';
 import type { Server } from '@modelcontextprotocol/server';
 import type { ForgeStatus } from '../../../forge/format.ts';
-import { DEFAULT_TIMEOUT_MS, type ForgeService, type JobDetail } from '../../../forge/service.ts';
+import { DEFAULT_TIMEOUT_MS, MAX_WATCHED_FILES, type ForgeService, type JobDetail } from '../../../forge/service.ts';
 import { startPipeline, readPipeline, cancelPipeline } from '../../../forge/execute.ts';
 import { evaluateAcceptance, readAcceptance, writeAcceptance } from '../../../forge/checks.ts';
 import { inheritContinuedProviders, validateSpec } from '../../../pipeline/pipeline.ts';
@@ -28,7 +28,7 @@ const responseFormat = { type: 'string', enum: FORMATS, default: 'concise', desc
 /** Long enough for a paragraph of why; short enough that the pane can show the whole brief. */
 export const MAX_CONTEXT_CHARS = 2_000;
 const contextSchema = { type: 'string', minLength: 1, maxLength: MAX_CONTEXT_CHARS, description: 'Why the work matters and who it is for. The worker sees it in its brief.' };
-const filesSchema = { type: 'array', items: string, description: 'Relative paths of brief or spec files in the repository to sync into cwd (when cwd is a worktree) and watch for stale reads.' };
+const filesSchema = { type: 'array', items: string, maxItems: MAX_WATCHED_FILES, description: `Relative paths of brief or spec files in the repository to sync into cwd (when cwd is a worktree) and watch for stale reads. At most ${MAX_WATCHED_FILES} files, 4 MiB total.` };
 const checksSchema = { type: 'array', items: {
   type: 'object', required: ['name', 'command'], additionalProperties: false,
   properties: { name: string, command: string, cwd: string, timeoutMs: { type: 'integer', minimum: 1 }, blocking: { type: 'boolean' } },

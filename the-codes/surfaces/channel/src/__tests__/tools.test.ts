@@ -66,6 +66,13 @@ test('annotations are present', () => {
   for (const n of ['spawn_job', 'run_pipeline', 'resume_job', 'steer_job']) assert.deepEqual([by[n]?.readOnlyHint, by[n]?.openWorldHint], [false, true], n);
 });
 
+test('files is bounded in the schema, matching the service cap', () => {
+  for (const name of ['spawn_job', 'resume_job', 'steer_job']) {
+    const files = (TOOL_DEFS.find(t => t.name === name)!.inputSchema as any).properties.files;
+    assert.equal(files?.maxItems, 32, name);
+  }
+});
+
 test('default pipeline derives providers from installed catalogs', async () => {
   const all = await defaultMixedPipeline({ name: 'p', task: 't' }, async () => [cat('agy'), cat('codex'), cat('claude', { defaultSource: 'unknown' })]);
   assert.deepEqual(all.stages.map(s => s.provider), ['agy', 'codex', 'claude']);
