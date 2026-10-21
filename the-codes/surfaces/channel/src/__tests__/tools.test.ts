@@ -62,6 +62,7 @@ test('annotations are present', () => {
   const by = Object.fromEntries(TOOL_DEFS.map(t => [t.name, t.annotations]));
   for (const n of ['status', 'list_jobs', 'pipeline_status', 'list_capabilities']) assert.equal(by[n]?.readOnlyHint, true, n);
   assert.deepEqual([by.cancel?.destructiveHint, by.cancel?.idempotentHint], [true, true]);
+  assert.equal(by.steer_job?.destructiveHint, true, 'steer_job can interrupt a running turn');
   for (const n of ['spawn_job', 'run_pipeline', 'resume_job', 'steer_job']) assert.deepEqual([by[n]?.readOnlyHint, by[n]?.openWorldHint], [false, true], n);
 });
 
@@ -454,6 +455,8 @@ test('steer_job forwards worker, prompt, context and delivery, and status surfac
         delivery: req.delivery,
         status: req.delivery === 'interrupt' ? 'interrupting' : 'queued',
         pendingSteers: 1,
+        signalled: true,
+        resumable: true,
         note: 'queued',
       };
     },
@@ -477,6 +480,7 @@ test('steer_job forwards worker, prompt, context and delivery, and status surfac
     delivery: 'interrupt',
   });
   assert.equal(body(res).status, 'interrupting');
+  assert.equal(body(res).resumable, true);
 
   const st = body(await callTool(ctx, 'status', { jobId: 'implement-smith-1' }));
   assert.equal(st.supersededBy, 'implement-smith-2');

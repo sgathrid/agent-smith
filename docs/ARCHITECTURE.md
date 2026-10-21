@@ -46,6 +46,7 @@ State lives in `<repo>/.agent-smith/jobs/<jobId>/` (gitignored). `FILES` in `for
 | `cancel` | `ForgeService.cancel` | Marker holding the ISO instant of the request. It is a request, not a verdict. |
 | `cancel.steer` | `ForgeService.steer` (`delivery: 'interrupt'`) | Marker telling the owning pump to abort the active turn and immediately chain the queued steer turn. Cleared by `ForgeService.cancel` if user cancellation wins. |
 | `steer.jsonl` | `ForgeService.steer` | Append-only JSONL log of `SteerEntry` records consumed by the owning `pump` loop. |
+| `steer.head` | `ForgeService.pump` | Child job ID written after the continuation anchor exists and before the parent stamps `supersededBy`; lets `resolveHead` (cancel/status) cross that finish window. |
 | `orphaned` | legacy marker | Existing markers remain readable. New readers do not write markers; service recovery persists terminal state in `job.json`. |
 | `acceptance.json` | `forge/checks.ts` (only when `spawn_job` got `checks`) | Sidecar, see Acceptance. Not in `FILES`. |
 
@@ -73,8 +74,11 @@ names. `steer_job` steers a running worker via append-only `steer.jsonl` (`deliv
 'queue'` chains after the active turn finishes; `delivery: 'interrupt'` writes `cancel.steer`
 to stop the active turn once a `conversation` handle is recorded and immediately chains the
 continuation turn). The pump opens the child job anchor before marking the parent
-`supersededBy: nextJobId` (`steeredFrom: parentJobId` on the child), so watchers and notice
-claims transfer across turn chains without firing intermediate notices.
+`supersededBy: nextJobId` (`steeredFrom: parentJobId` on the child) and publishes
+`steer.head` between the two, so `resolveHead` readers (cancel/status) cross the finish
+window while watchers and notice claims transfer across turn chains without firing
+intermediate notices. A queued steer the turn cannot deliver is recorded as a warning on
+the terminal job.
 
 ## Status derivation
 

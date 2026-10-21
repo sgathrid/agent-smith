@@ -52,6 +52,7 @@ test('every file name in the format is one the writer and the reader share', () 
     'result.json',
     'result.md',
     'stderr.log',
+    'steer.head',
     'steer.jsonl',
     'view.json',
   ]);

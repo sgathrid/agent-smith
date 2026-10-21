@@ -843,6 +843,12 @@ const FILES = {
     cancelSteer: 'cancel.steer',
     /** Append-only NDJSON log of SteerEntry records for this job. */
     steer: 'steer.jsonl',
+    /**
+     * Child job ID, written after the continuation anchor exists but before the
+     * parent's terminal manifest stamps `supersededBy`. Closes the finish window
+     * for `resolveHead` readers (cancel/status) during a chained turn.
+     */
+    steerHead: 'steer.head',
     /** Written by the first reader to prove the owner is dead. Never edits job.json. */
     orphaned: 'orphaned',
 };

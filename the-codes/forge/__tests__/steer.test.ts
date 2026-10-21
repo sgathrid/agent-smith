@@ -2,7 +2,7 @@
  * steer.test.ts — pump-owned live worker steering (queue and interrupt).
  */
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -130,6 +130,7 @@ test('steer(queue): coalesces multiple queued steers, opens child anchor before 
   assert.equal(steer1.jobId, ack.jobId);
   assert.equal(steer1.status, 'queued');
   assert.equal(steer1.pendingSteers, 1);
+  assert.equal(steer1.resumable, true, 'the started event supplied a conversation handle');
 
   const steer2 = await service.steer({
     worker: ack.jobId,
@@ -570,11 +571,13 @@ test('queue steer when provider reports no conversation ID chains a fresh contin
   });
   const t1 = await t1Ready;
 
-  await service.steer({
+  const steerAck = await service.steer({
     worker: ack.jobId,
     prompt: 'Queued follow-up without conversation ID.',
     delivery: 'queue',
   });
+  assert.equal(steerAck.resumable, false);
+  assert.match(steerAck.note, /continuation starts fresh/);
 
   const t2Ready = ctrl.nextTurn();
   t1.finish({ status: 'success', response: 'Finished turn 1 without conversation ID.' });
@@ -653,4 +656,51 @@ test('syncNativeTasks walks multi-hop supersededBy chains in one poll', async ()
   assert.equal(next['job-a'], undefined);
   assert.equal(next['job-b'], undefined);
   assert.equal(next['job-c']?.taskId, 'native-1');
+});
+
+test('a queued steer on a failed turn is reported, not silently dropped', async () => {
+  const ctrl = controlledProvider();
+  const { service } = makeService(ctrl.provider);
+
+  const t1Ready = ctrl.nextTurn();
+  const { ack, done } = await service.spawnTracked({
+    mode: 'implement',
+    name: 'failed-queue',
+    prompt: 'Work.',
+  });
+  const t1 = await t1Ready;
+  await service.steer({
+    worker: ack.jobId,
+    prompt: 'Follow up after the turn.',
+    delivery: 'queue',
+  });
+
+  t1.finish({ status: 'error', exitCode: 1, response: '' });
+  const finalManifest = await done;
+  assert.equal(finalManifest.jobId, ack.jobId);
+  assert.equal(finalManifest.status, 'failed');
+
+  const detail = await service.detail(ack.jobId);
+  assert.ok(
+    detail.warnings.some((w) => /queued steer not applied/.test(w.message)),
+    `expected a dropped-steer warning, got ${JSON.stringify(detail.warnings)}`,
+  );
+  assert.equal(detail.pendingSteers, 0);
+  assert.equal(ctrl.turns.length, 1, 'a failed turn is not chained');
+});
+
+test('resolveHead crosses the finish window through steer.head before supersededBy is stamped', async () => {
+  const ctrl = controlledProvider();
+  const { service, repo } = makeService(ctrl.provider);
+  const writeManifest = (id: string, extra: Record<string, unknown>) => {
+    const file = jobFile(repo, id, FILES.job);
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, JSON.stringify({ jobId: id, name: 'w', workerId: 'w', status: 'running', ...extra }));
+  };
+
+  writeManifest('parent', {});
+  writeFileSync(jobFile(repo, 'parent', FILES.steerHead), 'child\n');
+  writeManifest('child', { steeredFrom: 'parent' });
+
+  assert.equal(service.resolveHead('parent'), 'child');
 });

@@ -68,7 +68,7 @@ const service = {
   }),
   steer: async () => ({
     jobId: 'job-2', name: 'Bo', workerId: 'Bo', provider: 'codex', delivery: 'interrupt' as const,
-    status: 'interrupting' as const, pendingSteers: 1, signalled: true, repo,
+    status: 'interrupting' as const, pendingSteers: 1, signalled: true, resumable: true, repo,
     dir: path.join(repo, '.agent-smith', 'jobs', 'job-2'), timeoutMs: 2_700_000, note: 'Interrupting.',
   }),
   detail: async (id: string) => { const d = details.find(x => x.jobId === id); if (!d) throw new Error('no job'); return d; },

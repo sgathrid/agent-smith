@@ -272,7 +272,13 @@ export interface JobDetail extends JobSummary {
 }
 
 export interface CancelResult {
+  /** The chain head that was asked to stop (the given id when it was already the head). */
   readonly jobId: string;
+  /**
+   * When a superseded parent id was given, the continuation that was actually
+   * cancelled. Absent when the given id was already the head.
+   */
+  readonly supersededBy?: string | null;
   readonly requested: boolean;
   /** True when a live worker in THIS process was actually signalled. */
   readonly signalled: boolean;
@@ -298,6 +304,12 @@ export interface SteerAck {
   readonly status: 'queued' | 'interrupting';
   readonly pendingSteers: number;
   readonly signalled: boolean;
+  /**
+   * Whether a resumable conversation handle was known when the steer was
+   * accepted. When false, the continuation starts fresh if no handle arrives
+   * before this turn ends.
+   */
+  readonly resumable: boolean;
   readonly repo: string;
   readonly dir: string;
   readonly timeoutMs: number;
@@ -789,6 +801,7 @@ export class ForgeService {
 
       let interruptDetectedAt: number | null = null;
       let lastPendingSteers = 0;
+      let pollWarned = false;
 
       const syncSteerAndCancel = (): void => {
         if (existsSync(jobFile(this.repo, currentJobId, FILES.cancel))) {
@@ -818,15 +831,26 @@ export class ForgeService {
           }
         }
       };
+      // A poll or an event tap must not be able to reject the pump: a disk error
+      // in setPendingSteers is a warning, not the end of the worker.
+      const safeSyncSteerAndCancel = (): void => {
+        try { syncSteerAndCancel(); }
+        catch (err) {
+          if (!pollWarned) {
+            pollWarned = true;
+            process.stderr.write(`agent-smith steer poll ${currentJobId}: ${describe(err)}\n`);
+          }
+        }
+      };
 
       const unsubSteerTap = handle.onEvent((ev) => {
         if (ev.kind === 'started' && liveEntry.interruptRequested && !liveEntry.interruptFired) {
-          syncSteerAndCancel();
+          safeSyncSteerAndCancel();
         }
       });
 
-      syncSteerAndCancel();
-      const cancelPoll = setInterval(syncSteerAndCancel, 100);
+      safeSyncSteerAndCancel();
+      const cancelPoll = setInterval(safeSyncSteerAndCancel, 100);
       cancelPoll.unref?.();
 
       try {
@@ -838,7 +862,7 @@ export class ForgeService {
         await currentWriter.prepareFinish();
         const report = reportFor(result);
 
-        syncSteerAndCancel();
+        safeSyncSteerAndCancel();
         const entries = readSteerEntries(this.repo, currentJobId);
         const unconsumed = entries.slice(liveEntry.consumedSteers);
         const alreadyTerminal: ForgeStatus | null = result.status === 'cancelled' ? 'canceled' : null;
@@ -854,6 +878,14 @@ export class ForgeService {
           !liveEntry.userCanceled &&
           unconsumed.length > 0 &&
           (liveEntry.interruptRequested || verdict.status === 'succeeded');
+
+        if (!shouldChain && !liveEntry.userCanceled && unconsumed.length > 0) {
+          const count = unconsumed.length;
+          currentWriter.warn(
+            `${count} queued steer${count === 1 ? '' : 's'} not applied: the turn ended ${verdict.status}. ` +
+            'Use resume_job or steer_job again.',
+          );
+        }
 
         if (shouldChain) {
           const conversation = currentWriter.currentConversation();
@@ -930,6 +962,10 @@ export class ForgeService {
             readOnlyEnforced: spec.readOnlyEnforced,
             steeredFrom: currentJobId,
           });
+
+          // The child anchor exists; publish its id before the parent's terminal
+          // write so resolveHead can cross the finish window.
+          writeAtomic(jobFile(this.repo, currentJobId, FILES.steerHead), `${nextJobId}\n`);
 
           // 2. Register child in spawnedIds and live map before removing parent.
           this.spawnedIds.add(nextJobId);
@@ -1008,10 +1044,12 @@ export class ForgeService {
       }
     }
 
+    const supersededBy = headId !== jobId ? headId : null;
     const headLive = this.live.get(headId);
     if (headLive === undefined) {
       return {
         jobId: headId,
+        ...(supersededBy === null ? {} : { supersededBy }),
         requested: true,
         signalled: false,
         note: 'Cancel recorded; no live worker here, so the job may stay running.',
@@ -1020,9 +1058,12 @@ export class ForgeService {
 
     return {
       jobId: headId,
+      ...(supersededBy === null ? {} : { supersededBy }),
       requested: true,
-      signalled: true,
-      note: 'Canceled.',
+      signalled: headLive.handle !== null,
+      note: headLive.handle === null
+        ? 'Cancel recorded; the continuation has not started yet and will be cancelled before it runs.'
+        : 'Canceled.',
     };
   }
 
@@ -1073,6 +1114,13 @@ export class ForgeService {
       }
     }
 
+    const resumable =
+      (typeof latestManifest.conversation === 'string' && latestManifest.conversation !== '') ||
+      (live?.writer.currentConversation() ?? null) !== null;
+    const resumableNote = resumable
+      ? ''
+      : ' No conversation handle is known yet; if none arrives before this turn ends, the continuation starts fresh.';
+
     const at = new Date().toISOString();
     const entry: SteerEntry = {
       id: `steer-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -1105,9 +1153,9 @@ export class ForgeService {
     const note =
       request.delivery === 'interrupt'
         ? live !== undefined
-          ? 'Interrupting current turn; continuation turn will start automatically.'
-          : 'Interrupt recorded for owner process; continuation turn will start after current turn stops.'
-        : `Queued behind current turn (${pendingSteers} pending).`;
+          ? `Interrupting current turn; continuation turn will start automatically.${resumableNote}`
+          : `Interrupt recorded for owner process; continuation turn will start after current turn stops.${resumableNote}`
+        : `Queued behind current turn (${pendingSteers} pending).${resumableNote}`;
 
     return {
       jobId: target.jobId,
@@ -1118,6 +1166,7 @@ export class ForgeService {
       status,
       pendingSteers,
       signalled,
+      resumable,
       repo: this.repo,
       dir: jobDir(this.repo, target.jobId),
       timeoutMs: live?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
@@ -1136,21 +1185,42 @@ export class ForgeService {
     }
   }
 
-  /** Follow `supersededBy` links to the latest turn in a steered chain. */
+  /**
+   * Follow a steered chain to its latest turn.
+   *
+   * `supersededBy` is authoritative once the parent's terminal manifest lands,
+   * but the pump writes the child anchor first. `steer.head` covers that
+   * finish window, so a cancel or status arriving between the two resolves to
+   * the child instead of the turn that is already exiting.
+   */
   resolveHead(jobId: string): string {
     const trimmed = jobId.trim();
     const seen = new Set<string>();
     let curId = trimmed;
     let curManifest = this.readManifestSync(curId);
     if (curManifest === null) return trimmed;
-    while (curManifest.supersededBy && !seen.has(curId)) {
+    while (!seen.has(curId)) {
       seen.add(curId);
-      const nextManifest = this.readManifestSync(curManifest.supersededBy);
+      const nextId = curManifest.supersededBy ?? this.readSteerHead(curId);
+      if (nextId === null || nextId === undefined || nextId === '') break;
+      const nextManifest = this.readManifestSync(nextId);
       if (nextManifest === null) break;
-      curId = curManifest.supersededBy;
+      curId = nextId;
       curManifest = nextManifest;
     }
     return curId;
+  }
+
+  private readSteerHead(jobId: string): string | null {
+    try {
+      const line = readFileSync(jobFile(this.repo, jobId, FILES.steerHead), 'utf8')
+        .split('\n')
+        .map((s) => s.trim())
+        .find((s) => s !== '');
+      return line ?? null;
+    } catch {
+      return null;
+    }
   }
 
   private async resolveSteerTarget(worker: string): Promise<{ jobId: string; manifest: ForgeManifest }> {

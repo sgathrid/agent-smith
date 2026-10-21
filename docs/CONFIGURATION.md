@@ -206,7 +206,8 @@ a `SpawnAck` plus `taskHandle` and `notify` (not structured).
 Params: `worker` (name or job id of a running worker, required), `prompt` (required),
 `delivery` enum `queue|interrupt` (required; `queue` appends the steer and chains a continuation turn when the active turn exits; `interrupt` writes `cancel.steer` so the pump stops the active turn once a conversation handle is available and immediately chains the continuation turn), `context` (optional, 1 to 2 000 chars).
 Refuses finished workers (pointing to `resume_job`), pipeline stages, and running workers without a live owner process.
-Result (`SteerAck`): `jobId` (the active turn ID), `name, workerId, provider, delivery, status: 'queued'|'interrupting', pendingSteers, dir, repo, timeoutMs, note`.
+Result (`SteerAck`): `jobId` (the active turn ID), `name, workerId, provider, delivery, status: 'queued'|'interrupting', pendingSteers, signalled, resumable, dir, repo, timeoutMs, note`.
+`resumable` reports whether a conversation handle was known when the steer was accepted; if it is false and no handle arrives before the turn ends, the continuation starts fresh. A queued steer that the turn cannot deliver (for example because it failed) is recorded as a warning on the terminal job rather than being lost silently.
 
 ### `list_jobs` (read-only, structured)
 Params: `provider` enum `agent-smith|agy-staff|all` (default `agent-smith`), `status` enum

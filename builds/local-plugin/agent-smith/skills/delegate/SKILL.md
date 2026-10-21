@@ -73,7 +73,11 @@ headless session, so in either case follow the ack's `notify.fallback`. To send 
 instructions or a course correction while a worker is still running, call `steer_job` with
 `delivery: "queue"` (chaining a follow-up turn as soon as the current turn finishes) or
 `delivery: "interrupt"` (stopping the current turn and immediately resuming with your
-instructions). Once a worker has finished, follow up with `resume_job` by name or job ID.
+instructions; the in-flight tool call is lost). If the provider has not reported a
+conversation handle before the turn ends, the continuation starts fresh; the ack's
+`resumable` says whether one was known, and a delivery warning on the terminal job means a
+queued steer was not applied. Once a worker has finished, follow up with `resume_job` by
+name or job ID.
 
 ## Reading the result
 

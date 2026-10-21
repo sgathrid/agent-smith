@@ -270,7 +270,6 @@ export function parseSettledRead(toolName: unknown, response: unknown): { readon
   }
   const jobId = payload['jobId'];
   const status = payload['status'];
-  if (typeof jobId !== 'string' && jobId !== undefined) return null;
   if (typeof jobId !== 'string' || jobId.length === 0) return null;
   if (typeof payload['supersededBy'] === 'string' && payload['supersededBy'].length > 0) return null;
   if (status !== 'succeeded' && status !== 'failed' && status !== 'canceled') return null;
