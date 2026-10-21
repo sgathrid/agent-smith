@@ -35,6 +35,7 @@ export interface NoticeRow {
   readonly summarySource?: 'worker' | null;
   readonly supersededBy?: string | null;
   readonly steeredFrom?: string | null;
+  readonly staleReads?: readonly string[] | null;
   readonly acceptance?: { readonly pending?: boolean; readonly checks: readonly { readonly ok: boolean; readonly name?: string }[] };
 }
 
@@ -67,6 +68,8 @@ export interface NoticeJob {
   readonly reason?: string | null;
   /** Worker-authored prose. A claim, never an instruction. */
   readonly summary?: string | null;
+  /** Watched brief files that changed in the repository while the job ran. */
+  readonly staleReads?: readonly string[] | null;
   /** A pipeline run: the id is a runId and Claude reads it with pipeline_status. */
   readonly run?: boolean;
 }
@@ -144,6 +147,11 @@ export function headline(job: NoticeJob): string {
     case 'failed': parts.push(job.run ? reason || 'failed' : `failed${reason ? `: ${reason}` : ''}`); break;
     case 'cancelled': parts.push('canceled'); break;
     case 'attention': parts.push(`stalled${d ? ` ${d}` : ''}`); break;
+  }
+  if (job.staleReads && job.staleReads.length > 0) {
+    const first = job.staleReads[0]!;
+    const extra = job.staleReads.length > 1 ? ` +${job.staleReads.length - 1}` : '';
+    parts.push(`stale brief: ${first}${extra}`);
   }
   return parts.join(' · ');
 }
@@ -358,6 +366,7 @@ export function noticeFromRadar(job: NoticeRow, kind: NoticeKind, now: number): 
       : null,
     reason: kind === 'failed' ? reasonFromText(job.failureReason) : null,
     summary: job.summarySource === 'worker' ? job.latestSummary ?? null : null,
+    ...(job.staleReads && job.staleReads.length > 0 ? { staleReads: job.staleReads } : {}),
   };
 }
 

@@ -2,6 +2,7 @@
  * steer.test.ts — pump-owned live worker steering (queue and interrupt).
  */
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -703,4 +704,119 @@ test('resolveHead crosses the finish window through steer.head before superseded
   writeManifest('child', { steeredFrom: 'parent' });
 
   assert.equal(service.resolveHead('parent'), 'child');
+});
+
+function initGitRepo(dir: string) {
+  const g = (...a: string[]) => execFileSync('git', a, { cwd: dir, encoding: 'utf8' }).trim();
+  g('init', '-q');
+  g('config', 'user.email', 'test@example.com');
+  g('config', 'user.name', 'Test');
+  writeFileSync(path.join(dir, 'ARCHITECTURE.md'), '# Architecture v1\nShareable export.\n');
+  mkdirSync(path.join(dir, 'docs'), { recursive: true });
+  writeFileSync(path.join(dir, 'docs', 'brief.md'), 'Initial brief.\n');
+  g('add', '.');
+  g('commit', '-qm', 'init');
+}
+
+test('watched brief files: copies into worktree cwd, excludes unmodified copy from changedFiles even if read, detects staleReads when repo changes, and re-syncs on steer', async () => {
+  const ctrl = controlledProvider();
+  const { service, repo } = makeService(ctrl.provider);
+  initGitRepo(repo);
+
+  const worktree = mkdtempSync(path.join(tmpdir(), 'agent-smith-wt-'));
+  initGitRepo(worktree);
+
+  // Edit ARCHITECTURE.md in repo before spawn so repo has v2 while worktree still has v1
+  writeFileSync(path.join(repo, 'ARCHITECTURE.md'), '# Architecture v2\nPackEngine export.\n');
+
+  const turn1Ready = ctrl.nextTurn();
+  const { ack, done } = await service.spawnTracked({
+    mode: 'implement',
+    name: 'worker-f',
+    cwd: worktree,
+    files: ['ARCHITECTURE.md', 'docs/brief.md'],
+    prompt: 'Implement according to ARCHITECTURE.md.',
+  });
+
+  // Immediately after spawnTracked, ARCHITECTURE.md in worktree should be synced to v2
+  assert.equal(readFileSync(path.join(worktree, 'ARCHITECTURE.md'), 'utf8'), '# Architecture v2\nPackEngine export.\n');
+
+  const turn1 = await turn1Ready;
+  // Wait for async gitBaseline capture on start() before simulating worker file edits
+  while (!JSON.parse(readFileSync(jobFile(repo, ack.jobId, FILES.job), 'utf8')).gitBaseline) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  turn1.emit({ kind: 'started', at: new Date().toISOString(), conversationId: 'thread-f' });
+  // Worker reads ARCHITECTURE.md (so toolInputs mentions ARCHITECTURE.md) and edits src.ts
+  turn1.emit({ kind: 'activity-start', at: new Date().toISOString(), activity: { stepIndex: 1, tool: 'Read', input: 'ARCHITECTURE.md' } });
+  writeFileSync(path.join(worktree, 'src.ts'), 'export const x = 1;\n');
+  turn1.emit({ kind: 'activity-start', at: new Date().toISOString(), activity: { stepIndex: 2, tool: 'Write', input: 'src.ts' } });
+
+  // While turn 1 is running, orchestrator edits ARCHITECTURE.md in main repo to v3!
+  writeFileSync(path.join(repo, 'ARCHITECTURE.md'), '# Architecture v3\nUpdated export.\n');
+
+  // Live detail() while running detects staleReads!
+  const runningDetail = await service.detail(ack.jobId);
+  assert.deepEqual(runningDetail.staleReads, ['ARCHITECTURE.md']);
+
+  // Queue a steer that also adds a new watched file docs/extra.md
+  writeFileSync(path.join(repo, 'docs', 'extra.md'), 'Extra spec.\n');
+  await service.steer({
+    worker: 'worker-f',
+    prompt: 'Re-read ARCHITECTURE.md and docs/extra.md.',
+    files: ['docs/extra.md'],
+    delivery: 'queue',
+  });
+
+  const turn2Ready = ctrl.nextTurn();
+  turn1.finish({ status: 'success', response: 'Finished initial implementation according to v2.' });
+
+  const turn2 = await turn2Ready;
+  // Parent turn finished before re-sync: parent's changedFiles must include src.ts and MUST NOT include ARCHITECTURE.md!
+  const parentDetail = await service.detail(ack.jobId);
+  assert.deepEqual(parentDetail.changedFiles, ['src.ts']);
+  assert.deepEqual(parentDetail.staleReads, ['ARCHITECTURE.md']);
+
+  // Before turn 2 started, pump re-synced ARCHITECTURE.md (to v3) and docs/extra.md into worktree!
+  assert.equal(readFileSync(path.join(worktree, 'ARCHITECTURE.md'), 'utf8'), '# Architecture v3\nUpdated export.\n');
+  assert.equal(readFileSync(path.join(worktree, 'docs', 'extra.md'), 'utf8'), 'Extra spec.\n');
+  assert.match(turn2.spec.prompt, /Synced brief file\(s\) in your working tree: ARCHITECTURE\.md, docs\/extra\.md/);
+
+  // In turn 2, wait for turn 2's gitBaseline capture, then worker modifies docs/brief.md in its worktree
+  const parentAfterSteer = await service.detail(ack.jobId);
+  const turn2JobId = parentAfterSteer.supersededBy!;
+  while (!JSON.parse(readFileSync(jobFile(repo, turn2JobId, FILES.job), 'utf8')).gitBaseline) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  writeFileSync(path.join(worktree, 'docs', 'brief.md'), 'Worker edited brief.\n');
+  turn2.emit({ kind: 'activity-start', at: new Date().toISOString(), activity: { stepIndex: 1, tool: 'Write', input: 'docs/brief.md' } });
+  turn2.finish({ status: 'success', response: 'Updated implementation to v3 and annotated docs/brief.md.' });
+
+  const finalManifest = await done;
+  const finalDetail = await service.detail(finalManifest.jobId);
+  // Because worker modified docs/brief.md in worktree, it IS in changedFiles, and NOT in staleReads.
+  // Meanwhile ARCHITECTURE.md and docs/extra.md (synced from repo, unmodified by worker) are NOT in changedFiles!
+  assert.ok(finalDetail.changedFiles?.includes('docs/brief.md'), 'worker-modified watched file is in changedFiles');
+  assert.equal(finalDetail.changedFiles?.includes('ARCHITECTURE.md'), false, 'unmodified synced watched file is excluded from changedFiles');
+  assert.equal(finalDetail.changedFiles?.includes('docs/extra.md'), false, 'unmodified newly synced watched file is excluded from changedFiles');
+  assert.equal(finalDetail.staleReads, undefined, 'no stale reads after re-sync');
+});
+
+test('watched brief files: rejects path traversal, absolute paths, and missing files', async () => {
+  const ctrl = controlledProvider();
+  const { service, repo } = makeService(ctrl.provider);
+  initGitRepo(repo);
+
+  await assert.rejects(
+    service.spawnTracked({ mode: 'implement', prompt: 'x', files: ['../outside.md'] }),
+    /escapes repository root/,
+  );
+  await assert.rejects(
+    service.spawnTracked({ mode: 'implement', prompt: 'x', files: ['/etc/passwd'] }),
+    /must be a relative path/,
+  );
+  await assert.rejects(
+    service.spawnTracked({ mode: 'implement', prompt: 'x', files: ['nonexistent.md'] }),
+    /does not exist in/,
+  );
 });

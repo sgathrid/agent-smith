@@ -240,16 +240,16 @@ test('the hook (policy) and the mod render the same job in the same words', () =
   const finished = '2026-10-11T12:00:00.000Z';
   const hook = buildBatch([{ knownBefore: true, seen: new Set(), job: {
     id: 'job-ada', name: 'Ada', provider: 'codex', role: 'review', status: 'succeeded', startedAt: started, finishedAt: finished,
-    lastEventAt: finished, warned: false, changedFileCount: 2, checks: { passed: 2, total: 2 },
+    lastEventAt: finished, warned: false, changedFileCount: 2, staleReads: ['ARCHITECTURE.md', 'brief.md'], checks: { passed: 2, total: 2 },
     summarySource: 'worker', latestSummary: 'Two findings.',
   } }], NOW).content;
   const mod = claudeText([noticeFromRadar(row({
     id: 'job-ada', name: 'Ada', provider: 'codex', role: 'review', status: 'succeeded',
-    startedAt: Date.parse(started), endedAt: Date.parse(finished), changedFileCount: 2,
+    startedAt: Date.parse(started), endedAt: Date.parse(finished), changedFileCount: 2, staleReads: ['ARCHITECTURE.md', 'brief.md'],
     acceptance: { checks: [{ ok: true }, { ok: true }] }, summarySource: 'worker', latestSummary: 'Two findings.',
   }), 'finished', NOW)]);
   assert.equal(hook, mod);
-  assert.match(mod, /^Agent Smith · ✓ Ada \(codex review\) 43s · done · checks 2\/2\nstatus job-ada$/);
+  assert.match(mod, /^Agent Smith · ✓ Ada \(codex review\) 43s · done · checks 2\/2 · stale brief: ARCHITECTURE\.md \+1\nstatus job-ada$/);
 });
 
 test('displayNoticeText keeps the notice lines and drops the line for Claude', () => {

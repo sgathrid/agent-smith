@@ -26,6 +26,7 @@ judge it and what its mode asks of it. You supply the rest in `spawn_job`:
 - `context`: why the work matters and who it's for. A worker that knows the purpose makes
   better calls on the details you didn't specify.
 - `cwd`: the absolute directory to work in. It defaults to the server's repository.
+- `files`: relative paths of shared brief or spec files in the repository. When `cwd` is a worktree, Agent Smith syncs them into `cwd` before the worker runs (and re-syncs them on `steer_job` or `resume_job`), and `status` reports `staleReads` if you edit them in the repository while the worker is running.
 - `checks`: commands that decide acceptance, such as tests or a build. The worker sees them
   as its definition of done, and they run after it finishes. Prefer them to asking the
   worker to verify its own work.

@@ -216,6 +216,11 @@ function headline(job) {
             parts.push(`stalled${d ? ` ${d}` : ''}`);
             break;
     }
+    if (job.staleReads && job.staleReads.length > 0) {
+        const first = job.staleReads[0];
+        const extra = job.staleReads.length > 1 ? ` +${job.staleReads.length - 1}` : '';
+        parts.push(`stale brief: ${first}${extra}`);
+    }
     return parts.join(' · ');
 }
 const CLAUDE_JOBS = 8;
@@ -541,6 +546,7 @@ function toNotice(job, kind, now) {
         checks: job.checks ?? null,
         reason: run ? job.outcome : kind === 'failed' ? reasonFromText(job.failureReason) : null,
         summary: job.summarySource === 'worker' ? job.latestSummary ?? null : null,
+        ...(job.staleReads && job.staleReads.length > 0 ? { staleReads: job.staleReads } : {}),
     };
 }
 // ── meta ────────────────────────────────────────────────────────────────────
@@ -1398,6 +1404,9 @@ class AgentSmithReader {
             ...(manifest?.steeredFrom !== undefined ? { steeredFrom: manifest.steeredFrom } : {}),
             ...(typeof (progress?.pendingSteers ?? manifest?.pendingSteers) === 'number'
                 ? { pendingSteers: progress?.pendingSteers ?? manifest?.pendingSteers }
+                : {}),
+            ...(Array.isArray(manifest?.staleReads) && manifest.staleReads.length > 0
+                ? { staleReads: manifest.staleReads }
                 : {}),
         };
         // partial=true when the anchor is missing: something is on disk for this
@@ -3338,6 +3347,9 @@ async function readOne(reader, source, cwd, jobId, now) {
         warned,
         supersededBy: typeof raw['supersededBy'] === 'string' && raw['supersededBy'] !== '' ? raw['supersededBy'] : null,
         steeredFrom: typeof raw['steeredFrom'] === 'string' && raw['steeredFrom'] !== '' ? raw['steeredFrom'] : null,
+        ...(Array.isArray(raw['staleReads']) && raw['staleReads'].length > 0
+            ? { staleReads: raw['staleReads'].filter((f) => typeof f === 'string' && f.trim() !== '') }
+            : {}),
     };
 }
 /**

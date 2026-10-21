@@ -443,9 +443,34 @@ test('status: a failed job carries a short reason (derived from old errors, stor
   assert.equal(ok.reason, undefined);
 });
 
-test('steer_job forwards worker, prompt, context and delivery, and status surfaces supersession fields', async () => {
+test('steer_job forwards worker, prompt, context, files and delivery, and status surfaces supersession and staleReads fields', async () => {
   const seen: Array<Record<string, unknown>> = [];
+  const spawned: Array<Record<string, unknown>> = [];
   const ctx = withService({
+    spawnJob: async (req: Record<string, unknown>) => {
+      spawned.push(req);
+      return {
+        jobId: 'implement-smith-resumed',
+        name: 'Ada',
+        workerId: 'Ada',
+        role: 'implement',
+        provider: 'codex',
+        status: 'running',
+        dir: '/tmp/job',
+        repo: '/tmp',
+        timeoutMs: 60_000,
+        unrestricted: false,
+        note: 'spawned',
+        sandbox: 'workspace-write',
+        sandboxFlags: [],
+        readOnlyRequested: false,
+        readOnlyEnforced: false,
+        modelRequested: null,
+        modelResolved: null,
+        modelSource: 'unknown',
+        preambleApplied: true,
+      };
+    },
     steer: async (req: Record<string, unknown>) => {
       seen.push(req);
       return {
@@ -461,6 +486,9 @@ test('steer_job forwards worker, prompt, context and delivery, and status surfac
       };
     },
     detail: async () => detail({
+      conversation: 'conv-1',
+      watchedFiles: { 'ARCHITECTURE.md': { repoSig: '1:a', cwdSig: '1:a' } },
+      staleReads: ['ARCHITECTURE.md'],
       supersededBy: 'implement-smith-2',
       steeredFrom: 'implement-smith-0',
       pendingSteers: 2,
@@ -470,6 +498,7 @@ test('steer_job forwards worker, prompt, context and delivery, and status surfac
     worker: 'Ada',
     prompt: 'Pivot to profile menu.',
     context: 'Sidebar dropped.',
+    files: ['brief.md'],
     delivery: 'interrupt',
   });
   assert.equal(res.isError, undefined);
@@ -477,13 +506,24 @@ test('steer_job forwards worker, prompt, context and delivery, and status surfac
     worker: 'Ada',
     prompt: 'Pivot to profile menu.',
     context: 'Sidebar dropped.',
+    files: ['brief.md'],
     delivery: 'interrupt',
   });
   assert.equal(body(res).status, 'interrupting');
   assert.equal(body(res).resumable, true);
 
+  // resume_job merges inherited watchedFiles with new files
+  const resumed = await callTool(ctx, 'resume_job', {
+    worker: 'implement-smith-1',
+    prompt: 'Continue.',
+    files: ['extra.md'],
+  });
+  assert.equal(resumed.isError, undefined);
+  assert.deepEqual(spawned[0]?.files, ['ARCHITECTURE.md', 'extra.md']);
+
   const st = body(await callTool(ctx, 'status', { jobId: 'implement-smith-1' }));
   assert.equal(st.supersededBy, 'implement-smith-2');
   assert.equal(st.steeredFrom, 'implement-smith-0');
   assert.equal(st.pendingSteers, 2);
+  assert.deepEqual(st.staleReads, ['ARCHITECTURE.md']);
 });

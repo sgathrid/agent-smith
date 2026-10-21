@@ -144,6 +144,9 @@ export interface RadarJob {
   /** Unconsumed queued steer count while running. */
   readonly pendingSteers?: number | null;
 
+  /** Watched brief files that changed in the repository while the job ran. */
+  readonly staleReads?: readonly string[] | null;
+
   /** Raw provider payload, for the pane's debug view only. Never parsed by a surface. */
   readonly raw: Record<string, unknown>;
 }

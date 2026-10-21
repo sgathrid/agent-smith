@@ -183,6 +183,7 @@ roleDefaults}`, `aliasConfigErrors?`, `modes[{name,description,readOnly,runsComm
 | `timeoutMs` | integer >= 1 | default 2 700 000, clamped 1 000 to 21 600 000 |
 | `unrestricted` | boolean | default true for agy; false for other providers; `true` for codex, claude or opencode asks the user to confirm (above) |
 | `cwd` | string | absolute existing directory; default server repo; checks resolve against it |
+| `files` | array | relative paths of brief/spec files in `repo`; copied into `cwd` when `cwd !== repo`, excluded from `changedFiles` unless modified in `cwd`, and watched for `staleReads` |
 | `conversation` | string | native conversation handle to resume |
 | `checks` | array | items `{name, command}` required, `cwd`, `timeoutMs` (int >= 1; default 60 000), `blocking` (default true); run after success; also listed in the worker's brief as its definition of done |
 
@@ -194,17 +195,17 @@ fallback {when, use, monitorCommand?, monitorTimeoutMs?}}`, `aliasApplied?`/`ali
 given.
 
 ### `resume_job`
-Params: `worker` (name or job id, required), `prompt` (required), `model`, `effort`,
+Params: `worker` (name or job id, required), `prompt` (required), `files` (optional relative paths in `repo`, merged with the previous job's watched files and re-synced into `cwd`), `model`, `effort`,
 `timeoutMs`, `unrestricted` (default: the original job's; an explicit `true` is confirmed as for `spawn_job`), `cwd` (absolute existing directory;
 default: the original job's). An explicit cwd changes the process working directory while
 retaining the prior conversation, which can still mention its previous workspace. Provider, mode, workerId,
-name and conversation come from the finished job; no `provider` or `checks` parameter.
+name, watched files and conversation come from the finished job; no `provider` or `checks` parameter.
 Refuses running workers (pointing to `steer_job`), workers without a conversation handle, ambiguous names. Result:
 a `SpawnAck` plus `taskHandle` and `notify` (not structured).
 
 ### `steer_job` (structured)
 Params: `worker` (name or job id of a running worker, required), `prompt` (required),
-`delivery` enum `queue|interrupt` (required; `queue` appends the steer and chains a continuation turn when the active turn exits; `interrupt` writes `cancel.steer` so the pump stops the active turn once a conversation handle is available and immediately chains the continuation turn), `context` (optional, 1 to 2 000 chars).
+`delivery` enum `queue|interrupt` (required; `queue` appends the steer and chains a continuation turn when the active turn exits; `interrupt` writes `cancel.steer` so the pump stops the active turn once a conversation handle is available and immediately chains the continuation turn), `context` (optional, 1 to 2 000 chars), `files` (optional relative paths in `repo`, merged with the active turn's watched files and re-synced into `cwd` when the steered turn starts).
 Refuses finished workers (pointing to `resume_job`), pipeline stages, and running workers without a live owner process.
 Result (`SteerAck`): `jobId` (the active turn ID), `name, workerId, provider, delivery, status: 'queued'|'interrupting', pendingSteers, signalled, resumable, dir, repo, timeoutMs, note`.
 `resumable` reports whether a conversation handle was known when the steer was accepted; if it is false and no handle arrives before the turn ends, the continuation starts fresh. A queued steer that the turn cannot deliver (for example because it failed) is recorded as a warning on the terminal job rather than being lost silently.

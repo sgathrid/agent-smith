@@ -109,6 +109,7 @@ export function conciseStatus(d: JobDetail, acceptance: AcceptanceView | null, e
     pendingSteers: d.pendingSteers ? d.pendingSteers : null,
     changedFileCount: d.changedFiles ? files.length : null, changedFiles: files.length ? files.slice(0, CONCISE_FILES_CAP) : null,
     changedFilesNote: files.length > CONCISE_FILES_CAP || d.changedFilesTruncated ? `First ${Math.min(files.length, CONCISE_FILES_CAP)} shown; ${DETAIL_HINT} or include_diff for all.` : null,
+    staleReads: d.staleReads?.length ? d.staleReads : null,
     nextAction: d.nextAction, reason: failedReason(d), error: d.error ? trimWords(d.error, 500) : null,
     warnings: warnings.length ? warnings : null,
     summary: summary && !report.includes(summary) ? trimWords(summary, 300) : null,

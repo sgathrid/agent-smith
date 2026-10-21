@@ -35,6 +35,7 @@
 // Shared with the mod, which renders the digest; the mod loader cannot import forge, so it lives there.
 import { ProgressTracker } from '../surfaces/mod/hooks/progress.ts';
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 
@@ -59,6 +60,7 @@ import {
   type ForgeStatus,
   type ForgeView,
   type ForgeViewEvent,
+  type WatchedFileSigs,
 } from './format.ts';
 import { MirrorWriter } from './mirror.ts';
 import type { JobResult, ProviderEvent, WorkerHandle } from '../providers/types.ts';
@@ -105,6 +107,7 @@ export interface StartInput {
   readonly readOnlyRequested?: boolean;
   readonly readOnlyEnforced?: boolean;
   readonly steeredFrom?: string | null;
+  readonly watchedFiles?: Readonly<Record<string, WatchedFileSigs>>;
 }
 
 /**
@@ -141,6 +144,7 @@ export class JobWriter {
   private baselineSigs = new Map<string, string>();
   private changed: { files: string[]; truncated: boolean } | null = null;
   private unattributed: string[] = [];
+  private staleReads: string[] = [];
   /** Concatenated tool inputs of this job, used to attribute changed files to it. */
   private toolInputs = '';
 
@@ -211,6 +215,9 @@ export class JobWriter {
       ...(input.readOnlyRequested === undefined ? {} : { readOnlyRequested: input.readOnlyRequested }),
       ...(input.readOnlyEnforced === undefined ? {} : { readOnlyEnforced: input.readOnlyEnforced }),
       ...(input.steeredFrom ? { steeredFrom: input.steeredFrom } : {}),
+      ...(input.watchedFiles !== undefined && Object.keys(input.watchedFiles).length > 0
+        ? { watchedFiles: input.watchedFiles }
+        : {}),
     };
     this.manifest = manifest;
     this.progress = {
@@ -250,20 +257,56 @@ export class JobWriter {
   async prepareFinish(): Promise<void> {
     try {
       if (this.baselinePending !== null) await this.baselinePending;
-      const base = this.manifest?.gitBaseline;
-      if (base === undefined || this.manifest === null) return;
-      const now = await gitSnapshot(this.cwd);
-      if (now === null) return;
-      const modified = base.dirty.filter(
-        (p) => now.dirty.includes(p) && this.baselineSigs.has(p) && this.baselineSigs.get(p) !== fileSig(this.cwd, p),
-      );
-      const committed = base.head !== null && now.head !== null && base.head !== now.head
-        ? await gitCommittedPaths(this.cwd, base.head, now.head)
-        : [];
-      const diff = diffChangedFiles(base, now.dirty, modified, committed);
-      const split = attributeChanged(diff.files, this.toolInputs);
-      this.changed = { files: split.mine, truncated: diff.truncated };
-      this.unattributed = split.other;
+      if (this.manifest === null) return;
+      const watched = this.manifest.watchedFiles;
+      const base = this.manifest.gitBaseline;
+      if (base !== undefined) {
+        const now = await gitSnapshot(this.cwd);
+        if (now !== null) {
+          const modified = base.dirty.filter(
+            (p) => now.dirty.includes(p) && this.baselineSigs.has(p) && this.baselineSigs.get(p) !== fileSig(this.cwd, p),
+          );
+          const committed = base.head !== null && now.head !== null && base.head !== now.head
+            ? await gitCommittedPaths(this.cwd, base.head, now.head)
+            : [];
+          let baseForDiff = base;
+          let nowDirty = now.dirty;
+          let modifiedFiltered = modified;
+          let committedFiltered = committed;
+          if (watched !== undefined) {
+            const unmodifiedWatched = new Set<string>();
+            const modifiedWatched = new Set<string>();
+            for (const [p, sigs] of Object.entries(watched)) {
+              if (fileSig(this.cwd, p) === sigs.cwdSig) unmodifiedWatched.add(p);
+              else modifiedWatched.add(p);
+            }
+            if (unmodifiedWatched.size > 0) {
+              baseForDiff = { ...base, dirty: base.dirty.filter((p) => !unmodifiedWatched.has(p)) };
+              nowDirty = now.dirty.filter((p) => !unmodifiedWatched.has(p));
+              modifiedFiltered = modified.filter((p) => !unmodifiedWatched.has(p));
+              committedFiltered = committed.filter((p) => !unmodifiedWatched.has(p));
+            }
+            if (modifiedWatched.size > 0) {
+              const nextMod = new Set(modifiedFiltered);
+              for (const p of modifiedWatched) nextMod.add(p);
+              modifiedFiltered = [...nextMod];
+            }
+          }
+          const diff = diffChangedFiles(baseForDiff, nowDirty, modifiedFiltered, committedFiltered);
+          const split = attributeChanged(diff.files, this.toolInputs);
+          this.changed = { files: split.mine, truncated: diff.truncated };
+          this.unattributed = split.other;
+        }
+      }
+      if (watched !== undefined) {
+        const attributedWatched =
+          this.changed !== null
+            ? this.changed.files
+            : this.toolInputs !== ''
+              ? attributeChanged(Object.keys(watched), this.toolInputs).mine
+              : undefined;
+        this.staleReads = computeStaleReads(this.repo, this.cwd, watched, attributedWatched);
+      }
     } catch { /* best effort */ }
   }
 
@@ -468,6 +511,7 @@ export class JobWriter {
         ? {}
         : { changedFiles: this.changed.files, changedFilesTruncated: this.changed.truncated }),
       ...(this.unattributed.length === 0 ? {} : { unattributedFiles: this.unattributed }),
+      ...(this.staleReads.length === 0 ? {} : { staleReads: this.staleReads }),
       ...(this.manifest.pendingSteers !== undefined ? { pendingSteers: 0 } : {}),
     };
     this.manifest = manifest;
@@ -696,13 +740,49 @@ async function gitCommittedPaths(cwd: string, from: string, to: string): Promise
   }
 }
 
-function fileSig(cwd: string, rel: string): string {
+export function fileSig(cwd: string, rel: string): string {
   try {
-    const st = statSync(path.join(cwd, rel));
+    const full = path.join(cwd, rel);
+    const st = statSync(full);
+    if (!st.isFile()) return 'gone';
+    if (st.size <= 4 * 1024 * 1024) {
+      const hash = createHash('sha256').update(readFileSync(full)).digest('hex').slice(0, 16);
+      return `${st.size}:${hash}`;
+    }
     return `${st.size}:${st.mtimeMs}`;
   } catch {
     return 'gone';
   }
+}
+
+export function computeStaleReads(
+  repo: string,
+  cwd: string,
+  watchedFiles?: Readonly<Record<string, WatchedFileSigs>>,
+  changedFiles?: readonly string[],
+): string[] {
+  if (!watchedFiles) return [];
+  const entries = Object.entries(watchedFiles);
+  if (entries.length === 0) return [];
+  const repoRoot = path.resolve(repo);
+  const cwdRoot = path.resolve(cwd);
+  const sameRoot = repoRoot === cwdRoot;
+  const workerChanged = new Set(changedFiles ?? []);
+  const stale: string[] = [];
+  for (const [rel, sigs] of entries) {
+    const currentRepoSig = fileSig(repoRoot, rel);
+    if (!sameRoot) {
+      const currentCwdSig = fileSig(cwdRoot, rel);
+      const externallyEditedInCwd =
+        changedFiles !== undefined && currentCwdSig !== sigs.cwdSig && !workerChanged.has(rel);
+      if (currentRepoSig !== sigs.repoSig || externallyEditedInCwd) {
+        stale.push(rel);
+      }
+    } else if (currentRepoSig !== sigs.repoSig && !workerChanged.has(rel)) {
+      stale.push(rel);
+    }
+  }
+  return stale.sort();
 }
 
 /** Append `add` to `base`, bounded. Pure, so the bounding rule is testable. */

@@ -80,6 +80,16 @@ window while watchers and notice claims transfer across turn chains without firi
 intermediate notices. A queued steer the turn cannot deliver is recorded as a warning on
 the terminal job.
 
+Watched brief files (`files` on `spawn_job`, `resume_job`, `steer_job`): relative paths inside
+`repo` are validated against path traversal and synced into `cwd` when `cwd !== repo`, recording
+`watchedFiles: Record<path, { repoSig, cwdSig }>` on `job.json`. `JobWriter.prepareFinish()`
+excludes synced watched files from `changedFiles` if `cwd` still matches `cwdSig` (so a worker
+merely reading a synced brief file does not pollute `changedFiles`), while keeping any watched
+file whose `cwd` content diverged from `cwdSig`. If `repo`'s copy changes from `repoSig` while
+`cwd`'s copy still matches `cwdSig`, `computeStaleReads` surfaces the path in `staleReads` (on
+`status` and in completion notices as `stale brief: <file>`). Steering or resuming the worker
+re-syncs watched files from `repo` into `cwd` and refreshes `watchedFiles`.
+
 ## Status derivation
 
 `deriveStatus` (`forge/format.ts`) is the one place a terminal verdict is computed.
