@@ -114,6 +114,6 @@ function toolRow(W: UiComponents,key:string,tool:string,input:string,output:stri
   const expanded=o.tools.includes(key)||state==='error';
   return <Box key={`row-${key}`} flexDirection="column">
     <Button key={key} plain label={`${state==='active'?'›':state==='error'?'✗':'✓'} ${oneLine(classify(tool,input).label,Math.max(1,o.width-3))}`} onPress={() => a.tool(key)} />
-    {expanded&&<Text dimColor wrap="wrap">{sanitizeText(`${oneLine(tool)} ${sanitizeText(input)}${output?`\n${sanitizeText(output)}`:''}`)}</Text>}
+    {expanded&&<Text dimColor wrap="wrap">{sanitizeText(`${oneLine(tool)} ${input}${output?`\n${output}`:''}`)}</Text>}
   </Box>;
 }

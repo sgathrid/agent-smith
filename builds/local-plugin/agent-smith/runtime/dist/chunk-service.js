@@ -4649,10 +4649,25 @@ function sanitizeText(s) {
         .replace(/\t/g, '  ')
         .replace(FORBIDDEN_CONTROLS, '');
 }
+/**
+ * Cut to at most `max` UTF-16 units without splitting a surrogate pair.
+ *
+ * `slice` can leave a high surrogate with no low half. `sanitizeText` removes
+ * such halves, so a cut made AFTER sanitizing must not create one: the host
+ * draws an unpaired half as U+FFFD, or refuses the tree a Text's string is
+ * checked in. `max` stays in UTF-16 units because every caller sizes cells in
+ * terminal columns, where a pair already counts as two.
+ */
+function clip(s, max) {
+    if (s.length <= max)
+        return s;
+    const cut = s.slice(0, Math.max(0, max));
+    return /[\ud800-\udbff]$/.test(cut) ? cut.slice(0, -1) : cut;
+}
 /** Collapse all whitespace runs to single spaces and cap the length. */
 function oneLine(s, max = 400) {
     const t = sanitizeText(s).replace(/\s+/g, ' ').trim();
-    return t.length <= max ? t : t.slice(0, max);
+    return clip(t, max);
 }
 // ── activity, from real agy tool shapes ─────────────────────────────────────
 /**
@@ -4909,7 +4924,7 @@ function classify(tool, input) {
     }
     if (SEARCH_TOOLS.has(lower)) {
         const query = oneLine(firstString(params, ['Query', 'Pattern', 'pattern', 'query', 'url'], input ?? ''));
-        const short = query.length > 24 ? `${query.slice(0, 23)}…` : query;
+        const short = query.length > 24 ? `${oneLine(query, 23)}…` : query;
         return { kind: 'search', label: short ? `searching ${short}` : 'searching' };
     }
     // codex: the tool IS the command line.

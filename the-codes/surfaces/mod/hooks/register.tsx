@@ -4,7 +4,7 @@ import type { EngineInterface, Register, UiRenderEvent } from 'claude-code';
 
 import type { RadarJob } from '../types/index.d.ts';
 import { isTerminal, jobLabel, oneLine, sanitizeText } from './format.ts';
-import { findWorker, measurePaneTerminalColumns, paneWidthRequest, recordLaunch, scopeLine, sessionJobs, type Launched } from './dashboard.ts';
+import { commandTerminalColumns, findWorker, measurePaneTerminalColumns, paneWidthRequest, recordLaunch, scopeLine, sessionJobs, type Launched } from './dashboard.ts';
 import { renderList, renderWorker, type ViewActions, type ViewOptions } from './views.tsx';
 import type { ForgeDetail } from './canonical.ts';
 // ── BAND IMPORTS (band author) ────────────────────────────────────────────────
@@ -61,8 +61,6 @@ const PANE = 'agent-smith';
 let lastViewportColumns: number | null = null;
 /** Width last requested from ui.open, avoiding render-triggered reopen loops. */
 let lastPaneRequest: number | null = null;
-
-export { paneWidthRequest } from './dashboard.ts';
 
 function noteViewport(columns: number | undefined): void {
   if (typeof columns === 'number' && Number.isFinite(columns) && columns > 0) {
@@ -351,11 +349,15 @@ async function checkForUpdate($: EngineInterface): Promise<void> {
  * session's start — or the pane — down with it.
  */
 export async function startBand($: EngineInterface, cwd?: string): Promise<void> {
+  // Reset the module's own state, not the host's atoms. A reload fires
+  // session.start again but host-persisted state (paneOpen, selected, ...)
+  // survives it, and a pane the host still has mounted must stay open to this
+  // module: resetting paneOpen here would stop the clock gate and let the band
+  // record the dock's conversation width as the terminal's.
   lastViewportColumns = null;
   lastPaneRequest = null;
   followingSite = null;
   detailCache = null;
-  await update($, paneOpen, () => false).catch(() => {});
 
   // NO_COLOR first, because it decides every colour prop from here on.
   // `$.env.get` requires a string LITERAL name (VERIFIED: a computed name is
@@ -665,6 +667,10 @@ export const register: Register = (on) => {
   // name. A matcher that matches nothing is a pane nobody can open, and it fails
   // SILENTLY, so the two strings are deliberately the same string.
   on('command.run', { command: 'forge' }, async ($, e) => {
+    // A fresh session runs this before any band render has measured the
+    // terminal, and the event carries the terminal's own width. Seed it here so
+    // the first dock request is a third of the terminal, not the fallback.
+    noteViewport(commandTerminalColumns(e.presentation));
     await pollBand($);
     const cfg = await read($, bandConfig);
     const jobs = await read($, bandJobs);
@@ -704,7 +710,10 @@ export const register: Register = (on) => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     noteViewport(measurePaneTerminalColumns(e.viewport, e.props));
-    if (lastPaneRequest !== null && lastPaneRequest !== paneWidthRequest(lastViewportColumns)) await requestPane($).catch(() => {});
+    // requestPane is a no-op when the width it would ask for is the one already
+    // requested; the non-null check is the one thing it cannot know: a pane the
+    // host mounted without this module asking is left where it is.
+    if (lastPaneRequest !== null) await requestPane($).catch(() => {});
     return renderForge($, e);
   });
 };

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { ATTENTION_TTL_MS, PANE_FALLBACK_COLUMNS, PANE_MIN_COLUMNS, checksLabel, countLine, findWorker, forgeList, groupWorkers, measurePaneTerminalColumns, needsAttention, paneWidthRequest, recordLaunch, scopeLine, sessionJobs, statusLine, workerHeading, workerStatus } from '../hooks/dashboard.ts';
+import { ATTENTION_TTL_MS, PANE_FALLBACK_COLUMNS, PANE_MIN_COLUMNS, checksLabel, commandTerminalColumns, countLine, findWorker, forgeList, groupWorkers, measurePaneTerminalColumns, needsAttention, paneWidthRequest, recordLaunch, scopeLine, sessionJobs, statusLine, workerHeading, workerStatus } from '../hooks/dashboard.ts';
 import { sanitizeText } from '../hooks/format.ts';
 import type { RadarJob } from '../types/index.d.ts';
 const job=(id:string,extra:Partial<RadarJob>={}):RadarJob=>({id,status:'running',startedAt:100,endedAt:null,toolCount:1,activity:'Read file.ts',task:'Review',warnings:[],report:null,reasoning:null,raw:{},...extra});
@@ -96,6 +96,17 @@ test('measurePaneTerminalColumns reconstructs terminal width from docked pane ge
   assert.equal(measurePaneTerminalColumns({ columns: 119 }, { bodyColumns: 0, placement: 'dock' }), undefined);
   assert.equal(paneWidthRequest(null), PANE_FALLBACK_COLUMNS);
   assert.equal(paneWidthRequest(60), PANE_MIN_COLUMNS);
+});
+
+test('commandTerminalColumns reads the terminal width the host stamps on a command event', () => {
+  // command.run's presentation.columns is the whole terminal, so a fresh /forge
+  // can size the dock before any band render has measured it.
+  assert.equal(commandTerminalColumns({ isFullscreen: true, columns: 180 }), 180);
+  assert.equal(commandTerminalColumns({ columns: 144.7 }), 144);
+  assert.equal(commandTerminalColumns({ columns: 0 }), undefined);
+  assert.equal(commandTerminalColumns({ columns: '180' }), undefined);
+  assert.equal(commandTerminalColumns(undefined), undefined);
+  assert.equal(commandTerminalColumns(null), undefined);
 });
 
 test('sanitizeText strips ANSI sequences and forbidden controls while preserving newlines and valid astral characters', () => {

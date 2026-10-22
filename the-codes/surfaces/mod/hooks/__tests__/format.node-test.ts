@@ -496,3 +496,18 @@ test('ellipsis on a string at exactly the limit does not add an ellipsis', () =>
   assert.equal(ellipsis('12345', 5), '12345');
   assert.equal(ellipsis('123456', 5), '12345');
 });
+
+test('truncation never splits a surrogate pair the sanitizer would then strip', () => {
+  // The cut lands inside the emoji: the pair is dropped whole, never half-written.
+  const cut = oneLine('a'.repeat(47) + '🚀 tail', 48);
+  assert.equal(cut, 'a'.repeat(47));
+  assert.ok(!/[\ud800-\udfff]/u.test(cut));
+  // A pair that ends exactly on the limit survives intact.
+  assert.equal(oneLine('a'.repeat(46) + '🚀xy', 48), 'a'.repeat(46) + '🚀');
+  assert.equal(oneLine('🚀🚀', 2), '🚀');
+  // fitCell pads back to its fixed width without a half pair.
+  const cell = fitCell('a'.repeat(43) + '🚀zz', 44);
+  assert.equal(cell, 'a'.repeat(43) + ' ');
+  assert.equal(cell.length, 44);
+  assert.equal(ellipsis('a'.repeat(43) + '🚀zz', 44), 'a'.repeat(43));
+});

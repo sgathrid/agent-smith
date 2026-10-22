@@ -842,6 +842,51 @@ test('docked pane rendering does not feed conversationColumns back into ui.open,
   expect(host.opens[1]).toMatchObject({ id: 'agent-smith', columns: 70 });
 });
 
+test('/forge sizes its first dock request from the command presentation, before any band render', async ($, on) => {
+  const { host } = forgeHost(on, ada(), ['job-ada']);
+  await start($);
+  // No AbovePrompt render has measured the terminal yet. command.run's
+  // presentation.columns is the whole terminal, so the first open is a third of
+  // 144 rather than the 60-column fallback.
+  await $.command.run({ command: 'forge', args: '', presentation: { isFullscreen: true, columns: 144 } } as never);
+  expect(host.opens).toHaveLength(1);
+  expect(host.opens[0]).toMatchObject({ id: 'agent-smith', columns: 48 });
+});
+
+test('a second session.start (a reload) leaves a mounted pane measuring the terminal, not the conversation', async ($, on) => {
+  const { host } = forgeHost(on, ada(), ['job-ada']);
+  await start($);
+  await launch($, 'job-ada');
+  const band = await $.ui.mount({
+    plugin: 'agent-smith',
+    surface: 'terminal',
+    ...BAND,
+    viewport: { columns: 180, rows: 40, isFullscreen: true },
+    props: { ...BAND.props, bodyColumns: 180 },
+  } as never);
+  expect(await band.find({ key: 'band-job-ada' })).toBeDefined();
+  await $.command.run({ command: 'forge', args: '' });
+  await $.ui.mount(PANE_TARGET);
+  expect(host.opens).toHaveLength(1);
+
+  // A reload loads the module afresh and fires session.start again while the
+  // host still has the pane mounted. startBand resets the module's own
+  // measurements, not paneOpen: if it reset paneOpen, this band render would
+  // record conversationColumns (119) as the terminal width, and the forced open
+  // below would ask for floor(119 / 3) = 39 columns instead of 60.
+  await start($);
+  await $.ui.mount({
+    plugin: 'agent-smith',
+    surface: 'terminal',
+    ...BAND,
+    requestId: 'forge-band-reloaded',
+    viewport: { columns: 119, rows: 40, isFullscreen: true },
+    props: { ...BAND.props, bodyColumns: 119 },
+  } as never);
+  await $.command.run({ command: 'forge', args: '' });
+  expect(host.opens.at(-1)).toMatchObject({ id: 'agent-smith', columns: 60 });
+});
+
 test('ANSI escapes and control bytes in failed tool output, warnings, check output, summaries, and markdown are stripped at the UI boundary while disk files stay untouched', async ($, on) => {
   const rawView = JSON.stringify({
     schema: 1,

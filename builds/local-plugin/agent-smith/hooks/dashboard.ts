@@ -45,6 +45,21 @@ export function measurePaneTerminalColumns(
 }
 
 /**
+ * Whole-terminal width from a `command.run` event, when the host stamps it.
+ *
+ * `presentation.columns` is the terminal's width as the command runs, so a
+ * command that opens the dock can size it before any render has measured the
+ * terminal. Unknown or absent shapes return undefined, leaving the last render
+ * measurement — or the fallback — in place.
+ */
+export function commandTerminalColumns(presentation: unknown): number | undefined {
+  if (typeof presentation !== 'object' || presentation === null) return undefined;
+  const columns = (presentation as { readonly columns?: unknown }).columns;
+  if (typeof columns !== 'number' || !Number.isFinite(columns) || columns <= 0) return undefined;
+  return Math.floor(columns);
+}
+
+/**
  * Settled (terminal, checks not pending) work ages out of attention so a stale
  * failure stops being drawn as one. Running, pending and stalled (`attention`)
  * jobs never expire. Without `now` or a timestamp nothing expires.

@@ -125,7 +125,7 @@ export function classify(tool: string, input: string | null | undefined): Classi
   }
   if (SEARCH_TOOLS.has(lower)) {
     const query = oneLine(firstString(params, ['Query', 'Pattern', 'pattern', 'query', 'url'], input ?? ''));
-    const short = query.length > 24 ? `${query.slice(0, 23)}…` : query;
+    const short = query.length > 24 ? `${oneLine(query, 23)}…` : query;
     return { kind: 'search', label: short ? `searching ${short}` : 'searching' };
   }
   // codex: the tool IS the command line.

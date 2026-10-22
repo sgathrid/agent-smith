@@ -352,6 +352,21 @@ export function jobLabel(job: RadarJob): string {
 }
 
 /**
+ * Cut to at most `max` UTF-16 units without splitting a surrogate pair.
+ *
+ * `slice` can leave a high surrogate with no low half. `sanitizeText` removes
+ * such halves, so a cut made AFTER sanitizing must not create one: the host
+ * draws an unpaired half as U+FFFD, or refuses the tree a Text's string is
+ * checked in. `max` stays in UTF-16 units because every caller sizes cells in
+ * terminal columns, where a pair already counts as two.
+ */
+function clip(s: string, max: number): string {
+  if (s.length <= max) return s;
+  const cut = s.slice(0, Math.max(0, max));
+  return /[\ud800-\udbff]$/.test(cut) ? cut.slice(0, -1) : cut;
+}
+
+/**
  * Fit a string into a fixed-width cell, cutting at a word boundary.
  *
  * NO ELLIPSIS CHARACTER, and that is the point. `…` (U+2026) is EAW=Ambiguous —
@@ -365,7 +380,7 @@ export function jobLabel(job: RadarJob): string {
 export function fitCell(s: string, width: number): string {
   if (width <= 0) return '';
   if (s.length <= width) return s.padEnd(width);
-  const cut = s.slice(0, width);
+  const cut = clip(s, width);
   const space = cut.lastIndexOf(' ');
   // Only break on a space in the last third: breaking early would throw away a
   // third of the cell to save two characters of raggedness.
@@ -376,7 +391,7 @@ export function fitCell(s: string, width: number): string {
 /** Collapse all whitespace runs to single spaces and cap the length. */
 export function oneLine(s: string, max = 400): string {
   const t = sanitizeText(s).replace(/\s+/g, ' ').trim();
-  return t.length <= max ? t : t.slice(0, max);
+  return clip(t, max);
 }
 
 /**
@@ -389,7 +404,7 @@ export function oneLine(s: string, max = 400): string {
  */
 export function ellipsis(s: string, max: number): string {
   const t = sanitizeText(s).replace(/\s+/g, ' ').trim();
-  return t.length <= max ? t : t.slice(0, Math.max(0, max));
+  return clip(t, Math.max(0, max));
 }
 
 /**
