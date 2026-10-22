@@ -215,6 +215,31 @@ const LEAD = ' ';
 export const SEP = '∙';
 
 /**
+ * Strip complete ANSI escape sequences (CSI, OSC, DCS/PM/APC/SOS, 2-byte ESC,
+ * C1 controls) and remaining forbidden control characters, unpaired surrogates,
+ * and noncharacters (`U+FDD0..U+FDEF`), while preserving `\n` and valid UTF-16
+ * surrogate pairs.
+ *
+ * Why this exists: Claude Code's JSX element validator rejects any `<Text>`,
+ * `<Button label>`, or `<Markdown text>` containing C0/C1 controls (except `\t`
+ * and `\n`), lone surrogates, or `U+FDD0..U+FDEF`. Worker tool output, shell
+ * commands, check output, and prompt text routinely contain ANSI colour codes or
+ * `\r` progress lines; stripping them at the UI boundary keeps the stored job
+ * files intact while preventing a single control byte from aborting the pane.
+ */
+const ANSI_ESCAPE =
+  /(?:\x1b\][\s\S]*?(?:\x07|\x1b\\|\x9c)|\x9d[\s\S]*?(?:\x07|\x1b\\|\x9c)|\x1b[PX^_][\s\S]*?(?:\x1b\\|\x9c)|(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]|\x1b[ -/]*[@-~])/gu;
+const FORBIDDEN_CONTROLS = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ud800-\udfff\ufdd0-\ufdef]/gu;
+
+export function sanitizeText(s: string): string {
+  return s
+    .replace(ANSI_ESCAPE, '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/\t/g, '  ')
+    .replace(FORBIDDEN_CONTROLS, '');
+}
+
+/**
  * Strip markdown decoration from a task line.
  *
  * Backticks and bold markers are how the prompt was WRITTEN; on a status row
@@ -230,7 +255,7 @@ function unmarkdown(s: string): string {
  * collapsed. Never the whole prompt — the real tasks run to 60+ lines.
  */
 function firstLine(task: string): string {
-  for (const raw of task.split('\n')) {
+  for (const raw of sanitizeText(task).split('\n')) {
     const line = unmarkdown(raw).replace(/\s+/g, ' ').trim();
     if (line.length > 0) return line;
   }
@@ -318,9 +343,27 @@ export function fallbackLabel(id: string): string {
 
 /** The row's label: the task if there is one, the id if there is not. */
 export function jobLabel(job: RadarJob): string {
-  if (typeof job.name === 'string' && job.name.trim() !== '') return job.name.trim();
+  if (typeof job.name === 'string') {
+    const clean = oneLine(job.name);
+    if (clean !== '') return clean;
+  }
   const label = deriveTaskLabel(job.task);
-  return label === '' ? fallbackLabel(job.id) : label;
+  return label === '' ? oneLine(fallbackLabel(job.id)) : label;
+}
+
+/**
+ * Cut to at most `max` UTF-16 units without splitting a surrogate pair.
+ *
+ * `slice` can leave a high surrogate with no low half. `sanitizeText` removes
+ * such halves, so a cut made AFTER sanitizing must not create one: the host
+ * draws an unpaired half as U+FFFD, or refuses the tree a Text's string is
+ * checked in. `max` stays in UTF-16 units because every caller sizes cells in
+ * terminal columns, where a pair already counts as two.
+ */
+function clip(s: string, max: number): string {
+  if (s.length <= max) return s;
+  const cut = s.slice(0, Math.max(0, max));
+  return /[\ud800-\udbff]$/.test(cut) ? cut.slice(0, -1) : cut;
 }
 
 /**
@@ -337,7 +380,7 @@ export function jobLabel(job: RadarJob): string {
 export function fitCell(s: string, width: number): string {
   if (width <= 0) return '';
   if (s.length <= width) return s.padEnd(width);
-  const cut = s.slice(0, width);
+  const cut = clip(s, width);
   const space = cut.lastIndexOf(' ');
   // Only break on a space in the last third: breaking early would throw away a
   // third of the cell to save two characters of raggedness.
@@ -347,8 +390,8 @@ export function fitCell(s: string, width: number): string {
 
 /** Collapse all whitespace runs to single spaces and cap the length. */
 export function oneLine(s: string, max = 400): string {
-  const t = s.replace(/\s+/g, ' ').trim();
-  return t.length <= max ? t : t.slice(0, max);
+  const t = sanitizeText(s).replace(/\s+/g, ' ').trim();
+  return clip(t, max);
 }
 
 /**
@@ -360,8 +403,8 @@ export function oneLine(s: string, max = 400): string {
  * and it keeps a hard bound on what a single string can cost.
  */
 export function ellipsis(s: string, max: number): string {
-  const t = s.replace(/\s+/g, ' ').trim();
-  return t.length <= max ? t : t.slice(0, Math.max(0, max));
+  const t = sanitizeText(s).replace(/\s+/g, ' ').trim();
+  return clip(t, Math.max(0, max));
 }
 
 /**
@@ -373,7 +416,7 @@ export function failureWords(job: RadarJob): string {
   const first = job.warnings[0];
   const text = job.failureReason ?? first?.message ?? null;
   if (text !== null && text.trim() !== '') {
-    const words = reasonFromText(text);
+    const words = oneLine(reasonFromText(text));
     if (words !== REASONS.workerError) return words;
   }
   switch (first?.code ?? '') {
@@ -389,7 +432,7 @@ export function failureWords(job: RadarJob): string {
     case '':
       break;
     default:
-      return (first?.code ?? '').replace(/_/g, ' ');
+      return oneLine((first?.code ?? '').replace(/_/g, ' '));
   }
   if (job.acceptance?.state === 'rejected' && job.acceptance.checks.length > 0) return failedChecks(job);
   return text !== null && text.trim() !== '' ? REASONS.workerError : '';
@@ -397,7 +440,7 @@ export function failureWords(job: RadarJob): string {
 
 /** `checks failed: lint` from the failing check names. */
 export function failedChecks(job: RadarJob): string {
-  return checksReason((job.acceptance?.checks ?? []).filter((c) => !c.ok).map((c) => c.name));
+  return oneLine(checksReason((job.acceptance?.checks ?? []).filter((c) => !c.ok).map((c) => oneLine(c.name))));
 }
 
 // ── the detail cell ─────────────────────────────────────────────────────────
@@ -423,7 +466,8 @@ export function jobDetail(job: RadarJob, options: { tools?: boolean } = {}): str
   }
   const parts: string[] = [];
   if (job.status === 'attention') parts.push('stalled');
-  if (job.activity !== '') parts.push(job.activity);
+  const activity = oneLine(job.activity);
+  if (activity !== '') parts.push(activity);
   // Tool count is a liveness signal ONLY while the job is live, so `isTerminal`
   // has already excluded it above. HAZARD A still applies on top: agy-staff
   // deletes events.jsonl on a warning-free success, so the count is genuinely
@@ -750,7 +794,7 @@ export function countSummary(jobs: readonly RadarJob[]): {
 export function describeTool(tool: string, params: Record<string, unknown>): string {
   const str = (k: string): string => {
     const v = params[k];
-    return typeof v === 'string' ? v : '';
+    return typeof v === 'string' ? oneLine(v) : '';
   };
 
   switch (tool) {
@@ -775,7 +819,7 @@ export function describeTool(tool: string, params: Record<string, unknown>): str
     case 'schedule':
       return `waiting ${str('DurationSeconds') || '?'}s`;
     default:
-      return `using ${tool}`;
+      return `using ${oneLine(tool)}`;
   }
 }
 
@@ -796,7 +840,7 @@ export function describeTool(tool: string, params: Record<string, unknown>): str
  * is universally understood.
  */
 export function humanCommand(cmd: string): string {
-  const line = cmd.replace(/\s+/g, ' ').trim();
+  const line = oneLine(cmd);
   if (line === '') return 'running a command';
 
   // A pipeline or a `&&` chain is several actions; the first is what the job is

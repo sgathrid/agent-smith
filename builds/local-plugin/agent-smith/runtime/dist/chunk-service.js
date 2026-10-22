@@ -4627,6 +4627,48 @@ function createMarker(filePath, body) {
  * the band already did the latter. Both surfaces now agree, so there is no
  * band/pane ordering deviation left to document.
  */
+/**
+ * Strip complete ANSI escape sequences (CSI, OSC, DCS/PM/APC/SOS, 2-byte ESC,
+ * C1 controls) and remaining forbidden control characters, unpaired surrogates,
+ * and noncharacters (`U+FDD0..U+FDEF`), while preserving `\n` and valid UTF-16
+ * surrogate pairs.
+ *
+ * Why this exists: Claude Code's JSX element validator rejects any `<Text>`,
+ * `<Button label>`, or `<Markdown text>` containing C0/C1 controls (except `\t`
+ * and `\n`), lone surrogates, or `U+FDD0..U+FDEF`. Worker tool output, shell
+ * commands, check output, and prompt text routinely contain ANSI colour codes or
+ * `\r` progress lines; stripping them at the UI boundary keeps the stored job
+ * files intact while preventing a single control byte from aborting the pane.
+ */
+const ANSI_ESCAPE = /(?:\x1b\][\s\S]*?(?:\x07|\x1b\\|\x9c)|\x9d[\s\S]*?(?:\x07|\x1b\\|\x9c)|\x1b[PX^_][\s\S]*?(?:\x1b\\|\x9c)|(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]|\x1b[ -/]*[@-~])/gu;
+const FORBIDDEN_CONTROLS = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ud800-\udfff\ufdd0-\ufdef]/gu;
+function sanitizeText(s) {
+    return s
+        .replace(ANSI_ESCAPE, '')
+        .replace(/\r\n?/g, '\n')
+        .replace(/\t/g, '  ')
+        .replace(FORBIDDEN_CONTROLS, '');
+}
+/**
+ * Cut to at most `max` UTF-16 units without splitting a surrogate pair.
+ *
+ * `slice` can leave a high surrogate with no low half. `sanitizeText` removes
+ * such halves, so a cut made AFTER sanitizing must not create one: the host
+ * draws an unpaired half as U+FFFD, or refuses the tree a Text's string is
+ * checked in. `max` stays in UTF-16 units because every caller sizes cells in
+ * terminal columns, where a pair already counts as two.
+ */
+function clip(s, max) {
+    if (s.length <= max)
+        return s;
+    const cut = s.slice(0, Math.max(0, max));
+    return /[\ud800-\udbff]$/.test(cut) ? cut.slice(0, -1) : cut;
+}
+/** Collapse all whitespace runs to single spaces and cap the length. */
+function oneLine(s, max = 400) {
+    const t = sanitizeText(s).replace(/\s+/g, ' ').trim();
+    return clip(t, max);
+}
 // ── activity, from real agy tool shapes ─────────────────────────────────────
 /**
  * agy tool name + parameters → a short "what is it doing" phrase.
@@ -4649,7 +4691,7 @@ function createMarker(filePath, body) {
 function describeTool(tool, params) {
     const str = (k) => {
         const v = params[k];
-        return typeof v === 'string' ? v : '';
+        return typeof v === 'string' ? oneLine(v) : '';
     };
     switch (tool) {
         case 'run_command':
@@ -4673,7 +4715,7 @@ function describeTool(tool, params) {
         case 'schedule':
             return `waiting ${str('DurationSeconds') || '?'}s`;
         default:
-            return `using ${tool}`;
+            return `using ${oneLine(tool)}`;
     }
 }
 /**
@@ -4693,7 +4735,7 @@ function describeTool(tool, params) {
  * is universally understood.
  */
 function humanCommand(cmd) {
-    const line = cmd.replace(/\s+/g, ' ').trim();
+    const line = oneLine(cmd);
     if (line === '')
         return 'running a command';
     // A pipeline or a `&&` chain is several actions; the first is what the job is
@@ -4872,17 +4914,17 @@ function classify(tool, input) {
             const changes = Array.isArray(params['changes']) ? params['changes'] : [];
             const first = changes.map((c) => (c && typeof c === 'object' ? c['path'] : undefined))
                 .find((p) => typeof p === 'string');
-            return { kind: 'edit', label: first ? `editing ${basename(first)}` : 'editing files', ...(first ? { path: first } : {}) };
+            return { kind: 'edit', label: first ? `editing ${oneLine(basename(first))}` : 'editing files', ...(first ? { path: first } : {}) };
         }
-        return { kind: 'edit', label: file ? `editing ${file}` : 'editing', ...(path ? { path } : {}) };
+        return { kind: 'edit', label: file ? `editing ${oneLine(file)}` : 'editing', ...(path ? { path } : {}) };
     }
     if (READ_TOOLS.has(lower)) {
         const listing = lower === 'list_dir' || lower === 'ls' || lower === 'list';
-        return { kind: 'read', label: file ? `${listing ? 'listing' : 'reading'} ${file}` : 'reading', ...(path && !listing ? { path } : {}) };
+        return { kind: 'read', label: file ? `${listing ? 'listing' : 'reading'} ${oneLine(file)}` : 'reading', ...(path && !listing ? { path } : {}) };
     }
     if (SEARCH_TOOLS.has(lower)) {
-        const query = firstString(params, ['Query', 'Pattern', 'pattern', 'query', 'url'], input ?? '');
-        const short = query.length > 24 ? `${query.slice(0, 23)}…` : query;
+        const query = oneLine(firstString(params, ['Query', 'Pattern', 'pattern', 'query', 'url'], input ?? ''));
+        const short = query.length > 24 ? `${oneLine(query, 23)}…` : query;
         return { kind: 'search', label: short ? `searching ${short}` : 'searching' };
     }
     // codex: the tool IS the command line.

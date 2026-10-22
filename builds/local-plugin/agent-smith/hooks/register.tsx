@@ -3,8 +3,8 @@ import { atom, read, update } from 'claude-code';
 import type { EngineInterface, Register, UiRenderEvent } from 'claude-code';
 
 import type { RadarJob } from '../types/index.d.ts';
-import { isTerminal, jobLabel } from './format.ts';
-import { findWorker, recordLaunch, scopeLine, sessionJobs, type Launched } from './dashboard.ts';
+import { isTerminal, jobLabel, oneLine, sanitizeText } from './format.ts';
+import { commandTerminalColumns, findWorker, measurePaneTerminalColumns, paneWidthRequest, recordLaunch, scopeLine, sessionJobs, type Launched } from './dashboard.ts';
 import { renderList, renderWorker, type ViewActions, type ViewOptions } from './views.tsx';
 import type { ForgeDetail } from './canonical.ts';
 // ── BAND IMPORTS (band author) ────────────────────────────────────────────────
@@ -57,22 +57,10 @@ import { RELEASED_MANIFEST, manifestVersion, updateLine } from './update.ts';
 /** Pane id. Must match the `requestId` in the ui.render matcher below. */
 const PANE = 'agent-smith';
 
-/** Before the host measures the terminal, ask for a compact pane width. */
-const PANE_FALLBACK_COLUMNS = 60;
-const PANE_MIN_COLUMNS = 24;
-
 /** Last measured whole-terminal width, supplied by the host render event. */
 let lastViewportColumns: number | null = null;
 /** Width last requested from ui.open, avoiding render-triggered reopen loops. */
 let lastPaneRequest: number | null = null;
-
-/** A pane request for the rightmost third, respecting the host's 24-column floor. */
-export function paneWidthRequest(viewportColumns: number | null): number {
-  if (viewportColumns === null || !Number.isFinite(viewportColumns) || viewportColumns <= 0) {
-    return PANE_FALLBACK_COLUMNS;
-  }
-  return Math.max(PANE_MIN_COLUMNS, Math.floor(viewportColumns / 3));
-}
 
 function noteViewport(columns: number | undefined): void {
   if (typeof columns === 'number' && Number.isFinite(columns) && columns > 0) {
@@ -361,6 +349,15 @@ async function checkForUpdate($: EngineInterface): Promise<void> {
  * session's start — or the pane — down with it.
  */
 export async function startBand($: EngineInterface, cwd?: string): Promise<void> {
+  // Reset the module's own state, not the host's atoms. A reload fires
+  // session.start again but host-persisted state (paneOpen, selected, ...)
+  // survives it, and a pane the host still has mounted must stay open to this
+  // module: resetting paneOpen here would stop the clock gate and let the band
+  // record the dock's conversation width as the terminal's.
+  lastViewportColumns = null;
+  lastPaneRequest = null;
+  followingSite = null;
+  detailCache = null;
 
   // NO_COLOR first, because it decides every colour prop from here on.
   // `$.env.get` requires a string LITERAL name (VERIFIED: a computed name is
@@ -517,13 +514,18 @@ export function registerBand(on: Parameters<Register>[0]): void {
       origin.name === 'agent-smith' &&
       typeof e.props.text === 'string'
     ) {
-      return next({ ...e, props: { ...e.props, text: displayNoticeText(e.props.text) } });
+      return next({ ...e, props: { ...e.props, text: sanitizeText(displayNoticeText(e.props.text)) } });
     }
     return next(e);
   });
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    noteViewport(e.viewport?.columns);
+    // When the dock pane is open (or requested), AbovePrompt's viewport.columns
+    // is narrowed to conversationColumns, not the full terminal width. Only record
+    // AbovePrompt's viewport while the pane is closed.
+    if (lastPaneRequest === null && !await read($, paneOpen)) {
+      noteViewport(e.viewport?.columns);
+    }
     // Yield FIRST. Everything Claude Code and every other mod draw in this band
     // comes back in `rest`, and we return it as our LAST child, untouched.
     // TERMINAL-UI.md L170-173.
@@ -545,7 +547,7 @@ export function registerBand(on: Parameters<Register>[0]): void {
     const error = await read($, readError);
     if (error) {
       const { Box, Text } = $.ui.resolve(e);
-      return <Box flexDirection="column"><Text wrap="truncate-end">{error}</Text>{rest}</Box>;
+      return <Box flexDirection="column"><Text wrap="truncate-end">{oneLine(error)}</Text>{rest}</Box>;
     }
     const shown = sortForBand(all).filter((j) => isShown(j, at));
     // No jobs → render NOTHING (TERMINAL-UI.md L168-171). Not "no jobs", not an
@@ -665,6 +667,10 @@ export const register: Register = (on) => {
   // name. A matcher that matches nothing is a pane nobody can open, and it fails
   // SILENTLY, so the two strings are deliberately the same string.
   on('command.run', { command: 'forge' }, async ($, e) => {
+    // A fresh session runs this before any band render has measured the
+    // terminal, and the event carries the terminal's own width. Seed it here so
+    // the first dock request is a third of the terminal, not the fallback.
+    noteViewport(commandTerminalColumns(e.presentation));
     await pollBand($);
     const cfg = await read($, bandConfig);
     const jobs = await read($, bandJobs);
@@ -695,13 +701,19 @@ export const register: Register = (on) => {
   });
 
   on('ui.close', async ($, e, next) => {
-    if (e.id === PANE) await update($, paneOpen, () => false);
+    if (e.id === PANE) {
+      lastPaneRequest = null;
+      await update($, paneOpen, () => false);
+    }
     return next(e);
   });
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    noteViewport(e.viewport?.columns);
-    if (lastPaneRequest !== null && lastPaneRequest !== paneWidthRequest(lastViewportColumns)) await requestPane($).catch(() => {});
+    noteViewport(measurePaneTerminalColumns(e.viewport, e.props));
+    // requestPane is a no-op when the width it would ask for is the one already
+    // requested; the non-null check is the one thing it cannot know: a pane the
+    // host mounted without this module asking is left where it is.
+    if (lastPaneRequest !== null) await requestPane($).catch(() => {});
     return renderForge($, e);
   });
 };
@@ -767,7 +779,7 @@ async function renderForge($: EngineInterface, e: UiRenderEvent): Promise<JSX.El
     back: () => show($, null),
     task: async () => { await update($, taskOpen, (open) => !open); },
     tool: async (key) => { await update($, expandedTools, (keys) => keys.includes(key) ? keys.filter((k) => k !== key) : [...keys, key]); },
-    close: async () => { await update($, paneOpen, () => false); await $.ui.close({ id: PANE }); },
+    close: async () => { lastPaneRequest = null; await update($, paneOpen, () => false); await $.ui.close({ id: PANE }); },
   };
   let content = renderList(W, scope === 'all' ? jobs : mine, o, a);
   if (pick !== null) {
@@ -786,11 +798,11 @@ async function renderForge($: EngineInterface, e: UiRenderEvent): Promise<JSX.El
         }
       }
     } catch (failure) {
-      content = <Box flexDirection="column"><Text wrap="wrap">{`Unable to read job detail: ${String(failure).slice(0, 200)}`}</Text>{content}</Box>;
+      content = <Box flexDirection="column"><Text wrap="wrap">{sanitizeText(`Unable to read job detail: ${String(failure).slice(0, 200)}`)}</Text>{content}</Box>;
     }
   }
-  return error ? <Box flexDirection="column"><Text wrap="wrap">{error}</Text>{content}</Box> : content;
+  return error ? <Box flexDirection="column"><Text wrap="wrap">{sanitizeText(error)}</Text>{content}</Box> : content;
 }
 
 export { EMPTY_STATE, describeTool, elapsed, elapsedCell, formatHeaderLine, formatJobLine,
-  pickGlyph, pickColor, isRecessive, isTerminal, countSummary, oneLine } from './format.ts';
+  pickGlyph, pickColor, isRecessive, isTerminal, countSummary, oneLine, sanitizeText } from './format.ts';

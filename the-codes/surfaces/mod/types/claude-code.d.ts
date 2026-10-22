@@ -222,7 +222,13 @@ declare module 'claude-code' {
   // ── render sites ───────────────────────────────────────────────────────────
 
   export interface UiRenderEvent {
-    /** Whole window measurement; bodyColumns remains the pane's own budget. */
+    /**
+     * The surface's measured cell size. On the terminal, `columns` is the
+     * CONVERSATION's width — the whole terminal, less a docked Pane and its
+     * divider — not the terminal's; `props.bodyColumns` remains the component's
+     * own budget. Reconstruct the terminal width from a docked Pane's
+     * `props.bodyColumns` (see `measurePaneTerminalColumns`).
+     */
     readonly viewport?: { readonly columns: number; readonly rows: number; readonly isFullscreen?: boolean };
     /** 'AbovePrompt' | 'Pane' | 'Spinner' — where the host is drawing. */
     readonly component: string;
@@ -236,6 +242,8 @@ declare module 'claude-code' {
        * instead is what made the pane's rows wrap to two lines.
        */
       readonly bodyColumns: number;
+      /** Where the surface seated the pane: `dock` beside the transcript, or `inline` above the prompt. */
+      readonly placement?: 'dock' | 'inline';
       readonly hasSurvey?: boolean;
       readonly isWorking?: boolean;
       readonly isFocused?: boolean;
