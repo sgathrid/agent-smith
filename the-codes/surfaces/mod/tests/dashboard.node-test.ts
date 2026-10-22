@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { ATTENTION_TTL_MS, checksLabel, countLine, findWorker, forgeList, groupWorkers, needsAttention, recordLaunch, scopeLine, sessionJobs, workerStatus } from '../hooks/dashboard.ts';
+import { ATTENTION_TTL_MS, PANE_FALLBACK_COLUMNS, PANE_MIN_COLUMNS, checksLabel, countLine, findWorker, forgeList, groupWorkers, measurePaneTerminalColumns, needsAttention, paneWidthRequest, recordLaunch, scopeLine, sessionJobs, statusLine, workerHeading, workerStatus } from '../hooks/dashboard.ts';
+import { sanitizeText } from '../hooks/format.ts';
 import type { RadarJob } from '../types/index.d.ts';
 const job=(id:string,extra:Partial<RadarJob>={}):RadarJob=>({id,status:'running',startedAt:100,endedAt:null,toolCount:1,activity:'Read file.ts',task:'Review',warnings:[],report:null,reasoning:null,raw:{},...extra});
 test('the list puts running and checking work first, then settled work most recent first',()=>{
@@ -78,4 +79,45 @@ test('a denial, and an old job with only the long error, read as the same short 
   assert.equal(workerStatus(job('d',{status:'failed',failureReason:long})),'failed · denied view_file');
   assert.equal(workerStatus(job('s',{status:'succeeded',acceptance:{state:'rejected',checks:[{name:'lint',ok:false,outputTail:''}]}})),'checks failed: lint');
   assert.equal(workerStatus(job('t',{status:'attention'})),'stalled');
+});
+
+test('measurePaneTerminalColumns reconstructs terminal width from docked pane geometry and leaves fullscreen/non-docked viewports intact', () => {
+  // Docked pane on a 180-column terminal: viewport.columns is conversationColumns (119), bodyColumns is 60, divider is 1.
+  assert.equal(measurePaneTerminalColumns({ columns: 119 }, { bodyColumns: 60, placement: 'dock' }), 180);
+  assert.equal( paneWidthRequest(measurePaneTerminalColumns({ columns: 119 }, { bodyColumns: 60, placement: 'dock' }) ?? null), 60);
+  // User-resized dock (e.g. dragged to 75 columns on a 180-column terminal -> conversationColumns is 104):
+  // terminal width is still 180, so paneWidthRequest(180) stays 60 and matches lastPaneRequest without fighting user sizing.
+  assert.equal(measurePaneTerminalColumns({ columns: 104 }, { bodyColumns: 75, placement: 'dock' }), 180);
+  // Fullscreen or non-docked placement uses viewport.columns directly.
+  assert.equal(measurePaneTerminalColumns({ columns: 180 }, { bodyColumns: 180, placement: 'fullscreen' }), 180);
+  assert.equal(measurePaneTerminalColumns({ columns: 150 }, { bodyColumns: 50 }), 150);
+  // Missing or invalid geometry returns undefined so lastViewportColumns is not clobbered.
+  assert.equal(measurePaneTerminalColumns(undefined, { bodyColumns: 60, placement: 'dock' }), undefined);
+  assert.equal(measurePaneTerminalColumns({ columns: 119 }, { bodyColumns: 0, placement: 'dock' }), undefined);
+  assert.equal(paneWidthRequest(null), PANE_FALLBACK_COLUMNS);
+  assert.equal(paneWidthRequest(60), PANE_MIN_COLUMNS);
+});
+
+test('sanitizeText strips ANSI sequences and forbidden controls while preserving newlines and valid astral characters', () => {
+  // Complete CSI, OSC (BEL and ST), DCS, and C1 sequences are removed cleanly without leaving parameter tails.
+  const ansi = '\x1b[38;5;196mred\x1b[0m \x1b]8;;https://example.com\x07link\x1b]8;;\x1b\\ \x1bP1$r0m\x1b\\ \x9b32mgreen\x9b0m';
+  assert.equal(sanitizeText(ansi), 'red link  green');
+  // Progress carriage returns become newlines; tabs become spaces; NUL, BEL, BS, VT, FF, DEL, C1, noncharacters, and lone surrogates are stripped.
+  const controls = 'step 1\rstep 2\r\nstep 3\tindented\x00\x07\x08\x0b\x0c\x1f\x7f\x85\ufdd0\ud800 🚀';
+  assert.equal(sanitizeText(controls), 'step 1\nstep 2\nstep 3  indented 🚀');
+  // Dashboard helpers sanitize heading, status, and check labels.
+  const dirtyJob = job('dirty', {
+    name: '\x1b[31mRenyi\x1b[0m\x07',
+    role: 'review\x1b[2K\x08',
+    activity: 'running \x1b[32mcargo test\x1b[0m\r10%',
+  });
+  const dirtyAcceptance: NonNullable<RadarJob['acceptance']> = {
+    state: 'rejected',
+    checks: [{ name: '\x1b[33mlint\x1b[0m\x07', ok: false, outputTail: '' }],
+  };
+  assert.equal(workerHeading(dirtyJob), 'Renyi · review');
+  assert.equal(workerStatus(dirtyJob), 'Running · running cargo test 10%');
+  assert.equal(workerStatus({ ...dirtyJob, status: 'succeeded', acceptance: dirtyAcceptance }), 'checks failed: lint');
+  assert.equal(checksLabel(dirtyAcceptance), '✗ lint');
+  assert.ok(!/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ud800-\udfff\ufdd0-\ufdef]/u.test(statusLine(dirtyJob, 1000, 50)));
 });

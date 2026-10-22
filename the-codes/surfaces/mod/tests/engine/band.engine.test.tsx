@@ -497,7 +497,7 @@ test('the last finished band row expires and stops repainting', async ($, on) =>
 
 // ── /forge: the band's digits and the command open one focused sidebar ─────
 
-const PANE_TARGET = { plugin: 'agent-smith', surface: 'terminal', component: 'Pane', requestId: 'agent-smith', viewport: { columns: 180, rows: 40, isFullscreen: true }, props: { title: 'Agent Smith', isFocused: true, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} } } as never;
+const PANE_TARGET = { plugin: 'agent-smith', surface: 'terminal', component: 'Pane', requestId: 'agent-smith', viewport: { columns: 119, rows: 40, isFullscreen: true }, props: { title: 'Agent Smith', isFocused: true, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} } } as never;
 const iso = (ms: number) => new Date(ms).toISOString();
 /** One canonical job directory, keyed by full path. */
 function canonicalJob(id: string, job: Record<string, unknown>, extra: Record<string, string> = {}): Record<string, string> {
@@ -776,6 +776,148 @@ test('pagination makes the tenth worker selectable', async ($, on) => {
   expect(await pane.find({key:'job-job-9'})).toBeDefined();
   await pane.press({key:'job-job-9'});
   expect(await pane.find({key:'back'})).toBeDefined();
+});
+
+test('docked pane rendering does not feed conversationColumns back into ui.open, nor let AbovePrompt overwrite terminal width while open', async ($, on) => {
+  const { host } = forgeHost(on, ada(), ['job-ada']);
+  await start($);
+  await launch($, 'job-ada');
+  // 1. AbovePrompt measures a 180-column terminal before the pane is open.
+  const band = await $.ui.mount({
+    plugin: 'agent-smith',
+    surface: 'terminal',
+    ...BAND,
+    viewport: { columns: 180, rows: 40, isFullscreen: true },
+    props: { ...BAND.props, bodyColumns: 180 },
+  } as never);
+  expect(await band.find({ key: 'band-job-ada' })).toBeDefined();
+
+  // 2. /forge requests 60 columns (floor(180 / 3)).
+  await $.command.run({ command: 'forge', args: '' });
+  expect(host.opens).toHaveLength(1);
+  expect(host.opens[0]).toMatchObject({ id: 'agent-smith', focus: true, columns: 60 });
+
+  // 3. The host mounts the docked Pane with viewport.columns = conversationColumns (119) and bodyColumns = 60.
+  //    Without reconstructing terminalColumns = 119 + 60 + 1 = 180, the Pane render would request 39 columns and loop.
+  const pane = await $.ui.mount(PANE_TARGET);
+  expect(await pane.find({ key: 'job-job-ada' })).toBeDefined();
+  expect(host.opens).toHaveLength(1);
+
+  // 4. While the pane is open, AbovePrompt renders at conversationColumns (119).
+  //    It must not overwrite the 180-column terminal measurement, so a subsequent Pane render still does not call ui.open.
+  await $.ui.mount({
+    plugin: 'agent-smith',
+    surface: 'terminal',
+    ...BAND,
+    requestId: 'forge-band-docked',
+    viewport: { columns: 119, rows: 40, isFullscreen: true },
+    props: { ...BAND.props, bodyColumns: 119 },
+  } as never);
+  await pane.press({ key: 'job-job-ada' });
+  expect(await pane.find({ key: 'back' })).toBeDefined();
+  expect(host.opens).toHaveLength(1);
+
+  // 5. If the user drags the dock to 75 columns on the same 180-column terminal (viewport.columns = 104, bodyColumns = 75),
+  //    reconstructed terminal width is still 180, so the Pane handler does not fight the user's sizing.
+  await (pane as unknown as { unmount(): Promise<void> }).unmount();
+  const resizedPane = await $.ui.mount({
+    ...(PANE_TARGET as Record<string, unknown>),
+    requestId: 'agent-smith',
+    viewport: { columns: 104, rows: 40, isFullscreen: true },
+    props: { ...((PANE_TARGET as { props: Record<string, unknown> }).props), bodyColumns: 75, placement: 'dock' },
+  } as never);
+  expect(await resizedPane.find({ key: 'back' })).toBeDefined();
+  expect(host.opens).toHaveLength(1);
+
+  // 6. When the terminal genuinely resizes to 210 columns (docked at 60 -> viewport.columns = 149),
+  //    the Pane handler reconstructs 210 and requests 70 columns once.
+  await (resizedPane as unknown as { unmount(): Promise<void> }).unmount();
+  await $.ui.mount({
+    ...(PANE_TARGET as Record<string, unknown>),
+    requestId: 'agent-smith',
+    viewport: { columns: 149, rows: 40, isFullscreen: true },
+    props: { ...((PANE_TARGET as { props: Record<string, unknown> }).props), bodyColumns: 60, placement: 'dock' },
+  } as never);
+  expect(host.opens).toHaveLength(2);
+  expect(host.opens[1]).toMatchObject({ id: 'agent-smith', columns: 70 });
+});
+
+test('ANSI escapes and control bytes in failed tool output, warnings, check output, summaries, and markdown are stripped at the UI boundary while disk files stay untouched', async ($, on) => {
+  const rawView = JSON.stringify({
+    schema: 1,
+    prompt: 'Inspect \x1b[31mRenyi\x1b[0m\r\nstep 2\x07',
+    preamble: 'Preamble \x1b[32mok\x1b[0m\x08',
+    truncated: false,
+    tools: [],
+    transcript: [],
+    timeline: [
+      { kind: 'assistant', sequence: 0, at: iso(RUNNING_NOW), text: 'Heading \x1b[1mbold\x1b[0m\r\nline 2\x07\ufdd0' },
+      {
+        kind: 'tool',
+        sequence: 1,
+        at: iso(RUNNING_NOW),
+        stepIndex: 0,
+        tool: 'Bash\x07',
+        input: '{"command":"cargo test --color=always"}\r\x1b[2K',
+        output: '\x1b[31merror[E0425]\x1b[0m: cannot find value\r\n10%\r100%\x07\x1f',
+        state: 'error',
+      },
+    ],
+  });
+  const rawAcceptance = JSON.stringify({
+    state: 'rejected',
+    pending: false,
+    checks: [
+      {
+        name: 'clippy\x1b[31m!\x1b[0m\x07',
+        ok: false,
+        outputTail: '\x1b[33mwarning\x1b[0m: unused variable\r\ndone\x07\x7f',
+        reason: 'exit 1\x1b[0m\x07',
+      },
+    ],
+  });
+  const files = canonicalJob(
+    'job-dirty',
+    {
+      status: 'failed',
+      name: '\x1b[36mRenyi\x1b[0m\x07',
+      workerId: 'renyi\x07',
+      role: 'implement\x1b[0m',
+      provider: 'codex\x07',
+      model: 'gpt-6\x1b[0m',
+      finishedAt: iso(RUNNING_NOW + 1000),
+      updatedAt: iso(RUNNING_NOW + 1000),
+      error: 'Denied \x1b[31mrm\x1b[0m\r\nsecond line\x07',
+    },
+    {
+      'progress.json': JSON.stringify({ warnings: ['Warn \x1b[33mretry\x1b[0m\x07'] }),
+      'view.json': rawView,
+      'acceptance.json': rawAcceptance,
+      'result.md': 'Final \x1b[32mreport\x1b[0m\r\nclean\x07\ufdef',
+    },
+  );
+  forgeHost(on, files, ['job-dirty']);
+  await start($);
+  await launch($, 'job-dirty');
+  await $.command.run({ command: 'forge', args: 'job-dirty' });
+  const pane = await $.ui.mount(PANE_TARGET);
+
+  // Expanded failed tool row, warnings, check output, and markdown render without control characters.
+  expect(await pane.find({ type: 'Text', text: /✗ Renyi · implement/ })).toBeDefined();
+  expect(await pane.find({ type: 'Text', text: /Denied rm\nsecond line/ })).toBeDefined();
+  expect(await pane.find({ type: 'Text', text: /Warn retry/ })).toBeDefined();
+  expect(await pane.find({ type: 'Markdown', text: 'Heading bold\nline 2' })).toBeDefined();
+  expect(await pane.find({ type: 'Text', text: /error\[E0425\]: cannot find value\n10%\n100%/ })).toBeDefined();
+  expect(await pane.find({ type: 'Markdown', text: 'Final report\nclean' })).toBeDefined();
+  expect(await pane.find({ type: 'Text', text: '✗ clippy! · exit 1' })).toBeDefined();
+  expect(await pane.find({ type: 'Text', text: 'warning: unused variable\ndone' })).toBeDefined();
+
+  await pane.press({ key: 'task' });
+  expect(await pane.find({ type: 'Markdown', text: 'Preamble ok\n\nInspect Renyi\nstep 2' })).toBeDefined();
+
+  // Stored job files on disk are untouched.
+  expect(files['/work/.agent-smith/jobs/job-dirty/view.json']).toBe(rawView);
+  expect(files['/work/.agent-smith/jobs/job-dirty/acceptance.json']).toBe(rawAcceptance);
 });
 
 

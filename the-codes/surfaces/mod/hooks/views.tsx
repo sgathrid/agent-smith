@@ -3,7 +3,7 @@ import type { UiComponents } from 'claude-code';
 import type { RadarJob } from '../types/index.d.ts';
 import type { ForgeDetail } from './canonical.ts';
 import { checksLabel, forgeList, isLive, needsAttention, scopeLine, statusLine, workerHeading, workerStatus } from './dashboard.ts';
-import { elapsed, isTerminal, oneLine, pickColor, pickGlyph } from './format.ts';
+import { elapsed, isTerminal, oneLine, pickColor, pickGlyph, sanitizeText } from './format.ts';
 import { classify, progressLines } from './progress.ts';
 
 /** A running worker this long without a new event is called out as quiet. */
@@ -65,40 +65,40 @@ export function renderWorker(W: UiComponents, d: ForgeDetail, o: ViewOptions, a:
   const job=d.job;
   const prompt=job.prompt??job.task;
   const span=job.startedAt===null?null:(job.endedAt??o.now)-job.startedAt;
-  const meta=[[job.provider,job.model].filter(Boolean).join('·'),span===null?'':elapsed(span),checksLabel(job.acceptance)].filter(Boolean).join(' · ');
+  const meta=oneLine([[job.provider,job.model].filter(Boolean).join('·'),span===null?'':elapsed(span),checksLabel(job.acceptance)].filter(Boolean).join(' · '));
   const failing=job.acceptance?.checks.filter(check => !check.ok) ?? [];
   return <Box flexDirection="column">
     <Text bold color={o.colour?pickColor(job.status):undefined} wrap="truncate-end">{`${pickGlyph(job.status)} ${workerHeading(job)}`}</Text>
     {meta!=='' && <Text dimColor wrap="truncate-end">{meta}</Text>}
     <Text wrap="truncate-end">{workerStatus(job)}</Text>
     {job.progress && <Box flexDirection="column">
-      {progressLines(job.progress, job.toolCount).map((line,i) => <Text key={`progress-${i}`} dimColor={i>0} wrap="truncate-end">{line}</Text>)}
+      {progressLines(job.progress, job.toolCount).map((line,i) => <Text key={`progress-${i}`} dimColor={i>0} wrap="truncate-end">{sanitizeText(line)}</Text>)}
       {job.status==='running' && job.lastEventAt!=null && o.now-job.lastEventAt>QUIET_MS &&
         <Text color={o.colour?'yellow':undefined} wrap="truncate-end">{`Stalled ${elapsed(o.now-job.lastEventAt)}`}</Text>}
     </Box>}
-    {job.warnings.map((warning,i) => <Text key={`warning-${i}`} color={o.colour?'yellow':undefined} wrap="wrap">{warning.message}</Text>)}
+    {job.warnings.map((warning,i) => <Text key={`warning-${i}`} color={o.colour?'yellow':undefined} wrap="wrap">{sanitizeText(warning.message)}</Text>)}
     <Button key="task" plain hotkey="t" label={o.taskOpen?'Task (as sent)':`Task: ${oneLine(prompt,Math.max(1,o.width-12))}`} onPress={a.task} />
-    {o.taskOpen && <Markdown text={job.preamble?`${job.preamble}\n\n${prompt}`:prompt} />}
-    {o.taskOpen && <Text dimColor wrap="wrap">{`${job.id}\nWorker: ${job.workerId??job.id}${job.pipeline?`\nPipeline: ${job.pipeline} · ${job.stage??'stage unknown'}`:''}${job.attempt!=null?`\nAttempt: ${job.attempt}`:''}`}</Text>}
+    {o.taskOpen && <Markdown text={sanitizeText(job.preamble?`${job.preamble}\n\n${prompt}`:prompt)} />}
+    {o.taskOpen && <Text dimColor wrap="wrap">{sanitizeText(`${oneLine(job.id)}\nWorker: ${oneLine(job.workerId??job.id)}${job.pipeline?`\nPipeline: ${oneLine(job.pipeline)} · ${oneLine(job.stage??'stage unknown')}`:''}${job.attempt!=null?`\nAttempt: ${job.attempt}`:''}`)}</Text>}
     {d.timeline===null && <Text dimColor wrap="wrap">Older snapshot: output and tools are separate; their original order is unavailable.</Text>}
     {d.timeline?.map(event => event.kind==='assistant'
-      ? <Markdown key={`event-${event.sequence}`} text={event.text} />
+      ? <Markdown key={`event-${event.sequence}`} text={sanitizeText(event.text)} />
       : toolRow(W,`event-${event.sequence}`,event.tool,event.input,event.output,event.state,o,a))}
     {d.timeline===null && <>
-      {d.transcript.length>0 && <Markdown text={d.transcript.join('\n\n')} />}
+      {d.transcript.length>0 && <Markdown text={sanitizeText(d.transcript.join('\n\n'))} />}
       {d.history.map((tool,i) => toolRow(W,`legacy-tool-${i}`,tool.tool,tool.label,tool.output,tool.state,o,a))}
     </>}
-    {(d.timeline?.length??d.transcript.length+d.history.length)===0 && <Text dimColor wrap="wrap">{job.latestSummary??'No worker activity recorded yet.'}</Text>}
+    {(d.timeline?.length??d.transcript.length+d.history.length)===0 && <Text dimColor wrap="wrap">{sanitizeText(job.latestSummary??'No worker activity recorded yet.')}</Text>}
     {isTerminal(job.status)
       ? <Box flexDirection="column">
         <Text bold wrap="truncate-end">Result</Text>
-        {job.report?.trim()?<Markdown text={job.report}/>:<Text dimColor wrap="wrap">No report was written.</Text>}
+        {job.report?.trim()?<Markdown text={sanitizeText(job.report)}/>:<Text dimColor wrap="wrap">No report was written.</Text>}
       </Box>
       : <Text dimColor wrap="truncate-end">{o.following?'Following live output.':'Paused. Scroll to the bottom to follow again.'}</Text>}
     {failing.map((check,i) => <Box key={`check-${i}`} flexDirection="column">
-      <Text color={o.colour?'red':undefined} wrap="wrap">{[`✗ ${check.name}`,check.timedOut?'timed out':null,check.signal?`signal ${check.signal}`:null,
-        check.skipped?`skipped: ${check.skipped}`:null,check.reason].filter(Boolean).join(' · ')}</Text>
-      {check.outputTail && <Text dimColor wrap="wrap">{check.outputTail}</Text>}
+      <Text color={o.colour?'red':undefined} wrap="wrap">{sanitizeText([`✗ ${oneLine(check.name)}`,check.timedOut?'timed out':null,check.signal?`signal ${oneLine(check.signal)}`:null,
+        check.skipped?`skipped: ${oneLine(check.skipped)}`:null,check.reason?oneLine(check.reason):null].filter(Boolean).join(' · '))}</Text>
+      {check.outputTail && <Text dimColor wrap="wrap">{sanitizeText(check.outputTail)}</Text>}
     </Box>)}
     {runs.length>0 && <Text bold wrap="truncate-end">Earlier runs</Text>}
     {runs.map(run => <Button key={`run-${run.id}`} plain label={oneLine(`${run.id} · ${run.status}`,o.width)} onPress={() => a.pick(run)} />)}
@@ -114,6 +114,6 @@ function toolRow(W: UiComponents,key:string,tool:string,input:string,output:stri
   const expanded=o.tools.includes(key)||state==='error';
   return <Box key={`row-${key}`} flexDirection="column">
     <Button key={key} plain label={`${state==='active'?'›':state==='error'?'✗':'✓'} ${oneLine(classify(tool,input).label,Math.max(1,o.width-3))}`} onPress={() => a.tool(key)} />
-    {expanded&&<Text dimColor wrap="wrap">{`${tool} ${input}${output?`\n${output}`:''}`}</Text>}
+    {expanded&&<Text dimColor wrap="wrap">{sanitizeText(`${oneLine(tool)} ${sanitizeText(input)}${output?`\n${sanitizeText(output)}`:''}`)}</Text>}
   </Box>;
 }

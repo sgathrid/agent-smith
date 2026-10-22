@@ -17,7 +17,7 @@
  *     shows, so an absent edit count means "not visible", not zero.
  */
 import type { ProgressDigest, ProgressPhase } from '../types/index.d.ts';
-import { basename, describeTool, humanCommand, parseInputPreview } from './format.ts';
+import { basename, describeTool, humanCommand, oneLine, parseInputPreview } from './format.ts';
 
 export type { ProgressDigest, ProgressPhase };
 export type ProgressKind = 'read' | 'search' | 'edit' | 'test' | 'command' | 'other';
@@ -115,16 +115,16 @@ export function classify(tool: string, input: string | null | undefined): Classi
       const changes = Array.isArray(params['changes']) ? params['changes'] : [];
       const first = changes.map((c) => (c && typeof c === 'object' ? (c as Record<string, unknown>)['path'] : undefined))
         .find((p): p is string => typeof p === 'string');
-      return { kind: 'edit', label: first ? `editing ${basename(first)}` : 'editing files', ...(first ? { path: first } : {}) };
+      return { kind: 'edit', label: first ? `editing ${oneLine(basename(first))}` : 'editing files', ...(first ? { path: first } : {}) };
     }
-    return { kind: 'edit', label: file ? `editing ${file}` : 'editing', ...(path ? { path } : {}) };
+    return { kind: 'edit', label: file ? `editing ${oneLine(file)}` : 'editing', ...(path ? { path } : {}) };
   }
   if (READ_TOOLS.has(lower)) {
     const listing = lower === 'list_dir' || lower === 'ls' || lower === 'list';
-    return { kind: 'read', label: file ? `${listing ? 'listing' : 'reading'} ${file}` : 'reading', ...(path && !listing ? { path } : {}) };
+    return { kind: 'read', label: file ? `${listing ? 'listing' : 'reading'} ${oneLine(file)}` : 'reading', ...(path && !listing ? { path } : {}) };
   }
   if (SEARCH_TOOLS.has(lower)) {
-    const query = firstString(params, ['Query', 'Pattern', 'pattern', 'query', 'url'], input ?? '');
+    const query = oneLine(firstString(params, ['Query', 'Pattern', 'pattern', 'query', 'url'], input ?? ''));
     const short = query.length > 24 ? `${query.slice(0, 23)}…` : query;
     return { kind: 'search', label: short ? `searching ${short}` : 'searching' };
   }
@@ -233,12 +233,12 @@ const plural = (n: number, one: string, many = `${one}s`): string => `${n} ${n =
  */
 export function progressPhrase(digest: ProgressDigest, activity: string): string {
   const parts: string[] = [];
-  if (digest.repeat !== null) parts.push(`repeating ${digest.repeat.label} ×${digest.repeat.count}`);
+  if (digest.repeat !== null) parts.push(`repeating ${oneLine(digest.repeat.label)} ×${digest.repeat.count}`);
   else {
     // A verb phrase ("reading config.py", "running tests") says what is happening.
     // A raw command fallback ("ls tests/", "printf %s") does not; the phase does.
-    const now = activity.trim();
-    parts.push(/^[a-z]+ing\b/.test(now) ? now : digest.phase);
+    const now = oneLine(activity);
+    parts.push(/^[a-z]+ing\b/.test(now) ? now : oneLine(digest.phase));
   }
   if (digest.editedCount > 0) parts.push(`${plural(digest.editedCount, 'file')} edited`);
   if (digest.testRuns > 0) parts.push(digest.lastTestFailed ? 'last test run failed' : `ran tests ×${digest.testRuns}`);
@@ -249,8 +249,9 @@ export function progressPhrase(digest: ProgressDigest, activity: string): string
 /** The pane's progress block: a few full lines, nothing truncated mid-thought. */
 export function progressLines(digest: ProgressDigest, toolCount: number | null): string[] {
   const lines: string[] = [];
+  const phase = oneLine(digest.phase) || 'running';
   const counts = [
-    `${digest.phase[0]!.toUpperCase()}${digest.phase.slice(1)}`,
+    `${phase[0]!.toUpperCase()}${phase.slice(1)}`,
     digest.filesRead > 0 ? `${plural(digest.filesRead, 'file')} read` : '',
     digest.searches > 0 ? plural(digest.searches, 'search', 'searches') : '',
     digest.commands > 0 ? plural(digest.commands, 'command') : '',
@@ -261,12 +262,12 @@ export function progressLines(digest: ProgressDigest, toolCount: number | null):
     const more = digest.editedCount - digest.edited.length;
     lines.push(digest.edited.length === 0
       ? `Edited: ${plural(digest.editedCount, 'file')}`
-      : `Edited: ${shortPaths(digest.edited).join(', ')}${more > 0 ? ` (+${more} more)` : ''}`);
+      : `Edited: ${shortPaths(digest.edited.map((p) => oneLine(p))).join(', ')}${more > 0 ? ` (+${more} more)` : ''}`);
   }
   if (digest.testRuns > 0) {
     lines.push(`Tests: ran ${plural(digest.testRuns, 'time')}${digest.lastTestFailed ? ' · last run failed' : ''}`);
   }
-  if (digest.repeat !== null) lines.push(`Repeating: ${digest.repeat.label} ×${digest.repeat.count}`);
+  if (digest.repeat !== null) lines.push(`Repeating: ${oneLine(digest.repeat.label)} ×${digest.repeat.count}`);
   return lines;
 }
 

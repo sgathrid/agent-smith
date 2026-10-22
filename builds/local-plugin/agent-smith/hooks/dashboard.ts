@@ -5,6 +5,45 @@ import { countSummary, elapsedCell, failedChecks, failureWords, isTerminal, jobL
 /** A settled failure or rejection stops asking for attention this long after it ended. */
 export const ATTENTION_TTL_MS = 24 * 60 * 60 * 1000;
 
+/** Before the host measures the terminal, ask for a compact pane width. */
+export const PANE_FALLBACK_COLUMNS = 60;
+export const PANE_MIN_COLUMNS = 24;
+
+/** A pane request for the rightmost third, respecting the host's 24-column floor. */
+export function paneWidthRequest(viewportColumns: number | null): number {
+  if (viewportColumns === null || !Number.isFinite(viewportColumns) || viewportColumns <= 0) {
+    return PANE_FALLBACK_COLUMNS;
+  }
+  return Math.max(PANE_MIN_COLUMNS, Math.floor(viewportColumns / 3));
+}
+
+/**
+ * Reconstruct whole-terminal width from a Pane render event.
+ *
+ * When `placement === 'dock'`, Claude Code sets `viewport.columns` on the Pane
+ * render event to `conversationColumns` (`terminalColumns - (bodyColumns + 1)`),
+ * not `terminalColumns`. Treating `viewport.columns` as the full terminal width
+ * feeds `conversationColumns` back into `paneWidthRequest` on every Pane render
+ * and causes a self-cancelling resize loop.
+ */
+export function measurePaneTerminalColumns(
+  viewport: { readonly columns?: number } | undefined,
+  props: { readonly bodyColumns?: number; readonly placement?: string } | undefined,
+): number | undefined {
+  const viewportColumns = viewport?.columns;
+  if (typeof viewportColumns !== 'number' || !Number.isFinite(viewportColumns) || viewportColumns <= 0) {
+    return undefined;
+  }
+  if (props?.placement === 'dock') {
+    const bodyColumns = props.bodyColumns;
+    if (typeof bodyColumns === 'number' && Number.isFinite(bodyColumns) && bodyColumns > 0) {
+      return Math.floor(viewportColumns) + Math.floor(bodyColumns) + 1;
+    }
+    return undefined;
+  }
+  return Math.floor(viewportColumns);
+}
+
 /**
  * Settled (terminal, checks not pending) work ages out of attention so a stale
  * failure stops being drawn as one. Running, pending and stalled (`attention`)
@@ -36,7 +75,7 @@ export function findWorker(jobs: readonly RadarJob[], query: string): RadarJob |
     forgeList(jobs).find((job) => job.name?.trim().toLowerCase() === q || job.workerId?.toLowerCase() === q);
 }
 export function workerHeading(job: RadarJob): string {
-  const role = job.role ?? job.provider;
+  const role = oneLine(job.role ?? job.provider ?? '');
   return `${jobLabel(job)}${role ? ` · ${role}` : ''}`;
 }
 export function workerStatus(job: RadarJob): string {
@@ -48,7 +87,10 @@ export function workerStatus(job: RadarJob): string {
   }
   if (job.status === 'succeeded' && job.acceptance?.state === 'rejected' && job.acceptance.checks.length > 0) return failedChecks(job);
   if (job.acceptance?.state === 'rejected') return `${job.status} · checks failed`;
-  if (job.status === 'running') return job.activity ? `Running · ${job.activity}` : 'Running';
+  if (job.status === 'running') {
+    const act = oneLine(job.activity);
+    return act ? `Running · ${act}` : 'Running';
+  }
   if (job.status === 'attention') return 'stalled';
   return job.status === 'succeeded' ? 'done' : job.status;
 }
@@ -57,7 +99,7 @@ export function checksLabel(acceptance?: RadarAcceptance): string {
   if (!acceptance) return '';
   if (acceptance.pending) return 'checking';
   const failed = acceptance.checks.filter((check) => !check.ok);
-  if (failed.length > 0) return `✗ ${failed.map((check) => check.name).join(', ')}`;
+  if (failed.length > 0) return `✗ ${failed.map((check) => oneLine(check.name)).join(', ')}`;
   if (acceptance.checks.length > 0) return `checks ✓ ${acceptance.checks.length}/${acceptance.checks.length}`;
   return acceptance.state === 'rejected' ? 'checks failed' : '';
 }

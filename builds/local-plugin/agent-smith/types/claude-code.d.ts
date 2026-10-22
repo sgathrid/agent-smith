@@ -236,6 +236,7 @@ declare module 'claude-code' {
        * instead is what made the pane's rows wrap to two lines.
        */
       readonly bodyColumns: number;
+      readonly placement?: 'dock' | 'fullscreen' | string;
       readonly hasSurvey?: boolean;
       readonly isWorking?: boolean;
       readonly isFocused?: boolean;
