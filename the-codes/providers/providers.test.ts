@@ -8,7 +8,7 @@ import { buildArgv as buildCodexArgv, codexStderrLevel, createCodexTranslator } 
 import { buildArgv as buildAgyArgv } from './agy.ts';
 import { buildArgv as buildOpencodeArgv, createOpencodeTranslator } from './opencode.ts';
 import { spawnWorker } from './ndjson.ts';
-import type { SpawnSpec } from './types.ts';
+import type { ProviderEvent, SpawnSpec } from './types.ts';
 
 const tmpDirs: string[] = [];
 
@@ -283,4 +283,98 @@ test('opencode translator emits a started event with conversationId on first ses
     part: { type: 'text', text: 'hello' },
   });
   assert.equal(second.some((ev) => ev.kind === 'started'), false);
+});
+
+test('opencode: a tool_use part reports its state input and output on one step', () => {
+  const tx = createOpencodeTranslator(10_000);
+  const events = tx.onEvent({
+    type: 'tool_use',
+    timestamp: 1791335768123,
+    sessionID: 'ses_tool_1',
+    part: {
+      partID: 'prt_1',
+      id: 'call_1',
+      type: 'tool',
+      tool: 'bash',
+      state: { status: 'completed', input: { command: 'cargo test' }, output: 'ok', title: 'bash' },
+    },
+  });
+
+  const start = events.find((e) => e.kind === 'activity-start');
+  const end = events.find((e) => e.kind === 'activity-end');
+  assert.ok(start?.kind === 'activity-start');
+  assert.ok(end?.kind === 'activity-end');
+  assert.equal(end.activity.tool, 'bash');
+  assert.equal(end.activity.stepIndex, start.activity.stepIndex, 'start and end share one step');
+  assert.match(start.activity.input ?? '', /cargo test/);
+  assert.match(end.activity.input ?? '', /cargo test/, 'the completed part keeps the parameters it was invoked with');
+  assert.equal(end.activity.output, 'ok');
+  assert.equal(end.status, 'done');
+});
+
+test('opencode: one tool call keeps one step from running to completed', () => {
+  const tx = createOpencodeTranslator(10_000);
+  const running = tx.onEvent({
+    type: 'tool_use',
+    part: {
+      partID: 'prt_run',
+      id: 'call_123',
+      type: 'tool',
+      tool: 'bash',
+      state: { status: 'running', input: { command: 'npm test' } },
+    },
+  });
+  const completed = tx.onEvent({
+    type: 'tool_use',
+    part: {
+      partID: 'prt_done',
+      id: 'call_123',
+      type: 'tool',
+      tool: 'bash',
+      state: { status: 'completed', output: 'pass' },
+    },
+  });
+
+  const activities = [...running, ...completed].flatMap((e) =>
+    e.kind === 'activity-start' || e.kind === 'activity-update' || e.kind === 'activity-end' ? [e] : []);
+  assert.deepEqual(activities.map((e) => e.kind), ['activity-start', 'activity-update', 'activity-end']);
+  assert.deepEqual(
+    [...new Set(activities.map((e) => e.activity.stepIndex))],
+    [0],
+    'a changed partID must not split the same call into two steps',
+  );
+  const end = activities.at(-1);
+  assert.ok(end?.kind === 'activity-end');
+  assert.equal(end.activity.output, 'pass');
+});
+
+test('opencode: step_finish counters accumulate across steps without per-step noise', () => {
+  const tx = createOpencodeTranslator(10_000);
+  const tokens = { input: 100, output: 20, reasoning: 5, cache: { read: 50, write: 10 } };
+  const events: ProviderEvent[] = [];
+  for (let i = 0; i < 2; i += 1) {
+    events.push(...tx.onEvent({
+      type: 'step_start',
+      sessionID: 'ses_steps',
+      part: { partID: `prt_s${i}`, type: 'step-start' },
+    }));
+    events.push(...tx.onEvent({
+      type: 'step_finish',
+      sessionID: 'ses_steps',
+      part: { partID: `prt_f${i}`, type: 'step-finish', tokens },
+    }));
+  }
+
+  assert.deepEqual(events.filter((e) => e.kind === 'notice'), [], 'step boundaries are not unrecognised events');
+  const usages = events.filter((e) => e.kind === 'usage');
+  assert.equal(usages.length, 2);
+  const last = usages.at(-1);
+  assert.ok(last?.kind === 'usage');
+  assert.deepEqual(last.usage, {
+    inputTokens: 200,
+    outputTokens: 40,
+    thinkingTokens: 10,
+    cacheReadTokens: 100,
+    cacheWriteTokens: 20,
+  });
 });
