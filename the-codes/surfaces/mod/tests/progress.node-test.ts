@@ -126,6 +126,53 @@ test('an edit whose file is not named still counts as an edit', () => {
   assert.ok(progressLines(d, 1).includes('Edited: 1 file'));
 });
 
+test('process tools (read_file, edit_file, write_file) classify like their agent counterparts', () => {
+  const t = new ProgressTracker();
+  run(t, 1, 'read_file', { path: '/w/src/a.ts' });
+  run(t, 2, 'read_file', { path: '/w/src/b.ts' });
+  run(t, 3, 'edit_file', { path: '/w/src/a.ts' });
+  run(t, 4, 'write_file', { path: '/w/src/c.ts' });
+  const d = t.digest('/w');
+  assert.equal(d.filesRead, 2);
+  assert.equal(d.editedCount, 2);
+  assert.deepEqual(d.edited, ['src/a.ts', 'src/c.ts']);
+  assert.deepEqual(
+    [classify('edit_file', J({ path: '/w/x.ts' })).label, classify('write_file', J({ path: '/w/x.ts' })).kind,
+      classify('read_file', J({ path: '/w/x.ts' })).label],
+    ['editing x.ts', 'edit', 'reading x.ts'],
+  );
+});
+
+test('a tool call whose parameters never arrived is not called a repeat', () => {
+  // "repeating running a command ×17" is a fact about a missing input, not
+  // about the worker: a bare `bash` event with no command proves nothing.
+  const t = new ProgressTracker();
+  for (let i = 0; i < 17; i += 1) t.start(i, 'bash', i % 2 === 0 ? undefined : '');
+  const d = t.digest();
+  assert.equal(d.repeat, null);
+  assert.equal(/repeating/.test(progressPhrase(d, 'running a command')), false);
+  assert.equal(classify('bash', undefined).kind, 'command');
+});
+
+test('unclassified tool calls (MCP) are never reported as a repeat', () => {
+  const t = new ProgressTracker();
+  for (let i = 0; i < 6; i += 1) run(t, i, 'call_mcp_tool', { server: 'github', tool: 'search_issues' });
+  const d = t.digest();
+  assert.equal(d.repeat, null);
+  assert.equal(d.phase, 'starting', 'an unclassified call does not invent a phase');
+  assert.equal(classify('call_mcp_tool', J({ server: 'github' })).kind, 'other');
+});
+
+test('an empty start is upgraded when the input arrives on a later update, while codex command-as-tool counts immediately', () => {
+  const t = new ProgressTracker();
+  t.start(1, 'bash', undefined);
+  assert.equal(t.digest().testRuns, 0);
+  t.start(1, 'bash', J({ command: 'cargo test' }));
+  assert.equal(t.digest().testRuns, 1, 'the call is classified once, with the parameters it actually had');
+  t.start(2, `/bin/zsh -lc 'cargo test -p core'`, undefined);
+  assert.equal(t.digest().testRuns, 2, 'codex passes the command line as the tool name');
+});
+
 test('shell setup steps do not stand in for the command', () => {
   assert.deepEqual([classify('run_command', J({ CommandLine: 'unset VIRTUAL_ENV; uv run pytest -q' })).kind, classify('run_command', J({ CommandLine: 'unset VIRTUAL_ENV; uv run pytest -q' })).label], ['test', 'running tests']);
   assert.equal(classify('run_command', J({ CommandLine: 'unset VIRTUAL_ENV; uv run ruff check .' })).label, 'uv run');

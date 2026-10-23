@@ -920,7 +920,9 @@ class AgentSmithReader {
             [SMITH_PAYLOAD.usage]: manifest?.usage ?? null,
             ...(Array.isArray(manifest?.changedFiles) && manifest.changedFilesTruncated !== true
                 ? { changed_files: manifest.changedFiles } : {}),
-            [SMITH_PAYLOAD.toolCalls]: progress?.toolCalls ?? manifest?.toolCalls ?? 0,
+            // No progress.json and no manifest count is unknown, not zero: a job that
+            // wrote nothing must not claim it made no tool calls.
+            [SMITH_PAYLOAD.toolCalls]: progress?.toolCalls ?? manifest?.toolCalls ?? null,
             [SMITH_PAYLOAD.pipeline]: manifest?.pipeline ?? null,
             [SMITH_PAYLOAD.stage]: manifest?.stage ?? null,
             [SMITH_PAYLOAD.attempt]: manifest?.attempt ?? null,
@@ -932,6 +934,7 @@ class AgentSmithReader {
             [SMITH_PAYLOAD.lastActivity]: progress?.lastActivity ?? null,
             [SMITH_PAYLOAD.latestText]: progress?.latestText ?? null,
             [SMITH_PAYLOAD.progressWarnings]: progress?.warnings ?? [],
+            ...(progress?.digest !== undefined ? { digest: progress.digest } : {}),
             ...(manifest?.supersededBy !== undefined ? { supersededBy: manifest.supersededBy } : {}),
             ...(manifest?.steeredFrom !== undefined ? { steeredFrom: manifest.steeredFrom } : {}),
             ...(typeof (progress?.pendingSteers ?? manifest?.pendingSteers) === 'number'

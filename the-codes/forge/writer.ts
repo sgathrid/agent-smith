@@ -347,11 +347,14 @@ export class JobWriter {
       return;
     }
 
-    if (event.kind === 'activity-start' || event.kind === 'activity-end') {
+    if (event.kind === 'activity-start' || event.kind === 'activity-update' || event.kind === 'activity-end') {
       this.deltaOpen = false;
       const ref = event.activity;
+      const isStart = event.kind === 'activity-start';
+      // An update is an in-flight call: it keeps the row active and must NOT
+      // count as a new tool call when its step was already registered.
       const status =
-        event.kind === 'activity-start'
+        isStart || event.kind === 'activity-update'
           ? ('active' as const)
           : event.status === 'denied'
             ? ('denied' as const)
@@ -368,23 +371,29 @@ export class JobWriter {
       // ACTIVE and DONE for the same step_index, and only ACTIVE had the
       // parameters — 14,900 archived records confirm it). So the DONE row
       // INHERITS the input from the ACTIVE row rather than dropping it, which is
-      // what keeps the pane's activity phrase readable on a finished job.
+      // what keeps the pane's activity phrase readable on a finished job. The
+      // same applies to an update, and to a later update that finally names the
+      // parameters the start did not have.
       const idx = this.recent.findIndex((a) => a.stepIndex === ref.stepIndex);
-      const input = ref.input ?? (idx >= 0 ? this.recent[idx]?.input : undefined);
+      const previousRow = idx >= 0 ? this.recent[idx] : undefined;
+      const input = ref.input ?? previousRow?.input;
+      const tool = ref.tool === 'tool_result' ? previousRow?.tool ?? ref.tool : ref.tool;
       const row: ForgeActivity = {
         stepIndex: ref.stepIndex,
-        tool: ref.tool === 'tool_result' ? this.recent[idx]?.tool ?? ref.tool : ref.tool,
+        tool,
         status,
         ...(input === undefined ? {} : { input }),
       };
-      if (event.kind === 'activity-start' && ref.input !== undefined) {
+      // Only an input that arrived AFTER a start without one is "new" evidence:
+      // re-sent parameters on every update must not fill the attribution buffer.
+      if (ref.input !== undefined && previousRow?.input === undefined) {
         if (this.toolInputs.length < TOOL_INPUTS_CAP) this.toolInputs += ref.input + '\n';
-        if (classify(row.tool, input).kind === 'edit' && this.editToolInputs.length < TOOL_INPUTS_CAP) {
+        if (classify(tool, input).kind === 'edit' && this.editToolInputs.length < TOOL_INPUTS_CAP) {
           this.editToolInputs += ref.input + '\n';
         }
       }
-      if (event.kind === 'activity-start') this.tracker.start(ref.stepIndex, row.tool, input);
-      else this.tracker.end(ref.stepIndex, row.tool, input, status);
+      if (event.kind === 'activity-end') this.tracker.end(ref.stepIndex, row.tool, input, status);
+      else this.tracker.start(ref.stepIndex, row.tool, ref.input ?? input);
       this.lastActivity = row;
       if (idx >= 0) this.recent[idx] = row;
       else this.recent.push(row);

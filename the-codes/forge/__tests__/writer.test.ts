@@ -206,6 +206,47 @@ test('a DONE record inherits the input from its ACTIVE record', () => {
   assert.equal(p.recentActivities[0]?.status, 'done');
 });
 
+test('an activity UPDATE keeps the call alive, fills in its input and never counts twice', () => {
+  // A tool that runs for minutes emits updates, not new calls. Ignoring them
+  // left `lastEventAt` frozen (a live job looked stalled), and treating them as
+  // starts would inflate the tool count.
+  const r = repo();
+  const w = start(r);
+  const first = new Date(Date.now() + 1_000).toISOString();
+  const second = new Date(Date.now() + 60_000).toISOString();
+  w.onEvent({ kind: 'activity-start', at: first, activity: { stepIndex: 3, tool: 'bash' } } satisfies ProviderEvent);
+  w.onEvent({
+    kind: 'activity-update',
+    at: second,
+    activity: { stepIndex: 3, tool: 'bash', input: '{"command":"cargo test"}', output: 'Compiling' },
+  } satisfies ProviderEvent);
+
+  const p = JSON.parse(readFileSync(jobFile(r, w.jobId, FILES.progress), 'utf8')) as {
+    lastEventAt: string;
+    toolCalls: number;
+    digest: { testRuns: number };
+    recentActivities: { stepIndex: number; tool: string; status: string; input?: string }[];
+  };
+  assert.equal(p.lastEventAt, second, 'a long tool call keeps the job visibly alive');
+  assert.equal(p.toolCalls, 1, 'an update is the same call, not a new one');
+  assert.deepEqual(p.recentActivities[0], {
+    stepIndex: 3,
+    tool: 'bash',
+    status: 'active',
+    input: '{"command":"cargo test"}',
+  });
+  assert.equal(p.digest.testRuns, 1, 'input that arrives on an update still classifies the call');
+
+  const view = JSON.parse(readFileSync(jobFile(r, w.jobId, FILES.view), 'utf8')) as {
+    tools: { stepIndex: number; input: string; output: string; state: string }[];
+  };
+  assert.equal(view.tools.length, 1);
+  assert.equal(view.tools[0]?.stepIndex, 3);
+  assert.equal(view.tools[0]?.state, 'active', 'an update does not finish the call');
+  assert.match(view.tools[0]?.input ?? '', /cargo test/);
+  assert.equal(view.tools[0]?.output, 'Compiling');
+});
+
 test('only five activities are retained, and they are the newest five', () => {
   const r = repo();
   const w = start(r);
