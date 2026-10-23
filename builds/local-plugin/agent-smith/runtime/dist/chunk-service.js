@@ -8663,7 +8663,18 @@ class ForgeService {
             const observed = await readObservedJob(provider, this.repo, id);
             if (observed === null)
                 continue;
-            out.push(toSummary(observed, provider === 'agent-smith' ? 'agent-smith' : 'agy-staff'));
+            const summary = toSummary(observed, provider === 'agent-smith' ? 'agent-smith' : 'agy-staff');
+            if (provider !== 'agent-smith') {
+                out.push(summary);
+                continue;
+            }
+            // Attach acceptance from the sidecar so a list row carries the verdict the
+            // caller would otherwise have to poll `status` for once per job. Absent
+            // (unchecked, no checks) means nothing to say: the row stays as it was.
+            const found = readAcceptance(this.repo, id);
+            const acceptance = 'checks' in found ? found : { state: 'unchecked', checks: [] };
+            const meaningful = acceptance.state !== 'unchecked' || acceptance.pending === true || acceptance.checks.length > 0;
+            out.push(meaningful ? { ...summary, acceptance } : summary);
         }
         return out;
     }
@@ -8674,6 +8685,8 @@ function toSummary(observed, source) {
     const raw = observed.raw;
     const toolCalls = typeof raw['tool_calls'] === 'number' ? raw['tool_calls'] : null;
     const task = typeof raw['task'] === 'string' && raw['task'] !== '' ? raw['task'] : null;
+    const changedFiles = raw['changed_files'];
+    const digest = readDigest(raw['digest']);
     const activities = Array.isArray(raw['recent_activities']) ? raw['recent_activities'] : [];
     const currentActivity = observed.status === 'running'
         ? [...activities].reverse().find(isActiveForgeActivity) ?? null
@@ -8722,6 +8735,33 @@ function toSummary(observed, source) {
         ...(typeof raw['pendingSteers'] === 'number'
             ? { pendingSteers: raw['pendingSteers'] }
             : {}),
+        ...(Array.isArray(changedFiles) ? { changedFileCount: changedFiles.length } : {}),
+        ...(digest !== null ? { digest } : {}),
+    };
+}
+/** progress.json `digest`, accepted only when it has the shape the writer produces. */
+function readDigest(v) {
+    if (v === null || typeof v !== 'object' || Array.isArray(v))
+        return null;
+    const d = v;
+    if (typeof d['phase'] !== 'string' || !Array.isArray(d['edited']))
+        return null;
+    const n = (key) => typeof d[key] === 'number' ? d[key] : 0;
+    const repeat = d['repeat'];
+    const r = repeat !== null && typeof repeat === 'object' && !Array.isArray(repeat)
+        ? repeat : null;
+    return {
+        phase: (['starting', 'exploring', 'editing', 'testing', 'running'].includes(d['phase'])
+            ? d['phase'] : 'running'),
+        filesRead: n('filesRead'),
+        searches: n('searches'),
+        commands: n('commands'),
+        testRuns: n('testRuns'),
+        edited: d['edited'].filter((e) => typeof e === 'string'),
+        editedCount: n('editedCount'),
+        lastTestFailed: d['lastTestFailed'] === true,
+        repeat: r !== null && typeof r['label'] === 'string' && typeof r['count'] === 'number'
+            ? { label: r['label'], count: r['count'] } : null,
     };
 }
 function appendSteerEntry(repo, jobId, entry) {

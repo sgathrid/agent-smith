@@ -232,6 +232,35 @@ test('list_jobs: a turn a steer replaced is left out; its continuation stands fo
   assert.deepEqual(body(await callTool(ctx, 'list_jobs', { response_format: 'detailed' })).map((r: any) => r.jobId), ['implement-smith-2']);
 });
 
+test('list_jobs: a concise row carries digest, acceptance, changedFileCount and stalled for the whole fleet', async () => {
+  const digest = {
+    phase: 'testing', filesRead: 3, searches: 0, edited: ['a.ts', 'b.ts', 'c.ts', 'd.ts', 'e.ts', 'f.ts'],
+    editedCount: 6, commands: 2, testRuns: 1, lastTestFailed: false, repeat: { label: 'Bash npm test', count: 3 },
+  };
+  const ctx = withService({ list: async () => [summary(1, {
+    status: 'running', finishedAt: null, updatedAt: iso(20 * 60_000), changedFileCount: 2,
+    acceptance: { state: 'rejected', checks: [{ name: 'tests', ok: false }, { name: 'lint', ok: true }] },
+    digest,
+  })] });
+  const row = body(await callTool(ctx, 'list_jobs', {}))[0];
+  assert.equal(row.stalled, true);
+  assert.equal(row.changedFileCount, 2);
+  assert.deepEqual(row.acceptance, { state: 'rejected', passed: ['lint'], failed: ['tests'] });
+  assert.deepEqual(row.digest, {
+    phase: 'testing', filesRead: 3, edited: ['a.ts', 'b.ts', 'c.ts', 'd.ts', 'e.ts'],
+    editedCount: 6, testRuns: 1, repeat: { label: 'Bash npm test', count: 3 },
+  });
+
+  // Zero counters, an unchecked acceptance and a fresh timestamp say nothing: the row stays lean.
+  const quiet = body(await callTool(withService({ list: async () => [summary(2, {
+    status: 'running', finishedAt: null, updatedAt: iso(30_000),
+    acceptance: { state: 'unchecked', checks: [] },
+    digest: { phase: 'starting', filesRead: 0, searches: 0, edited: [], editedCount: 0, commands: 0, testRuns: 0, lastTestFailed: false, repeat: null },
+  })] }), 'list_jobs', {}))[0];
+  assert.deepEqual(quiet.digest, { phase: 'starting' });
+  for (const dropped of ['stalled', 'changedFileCount', 'acceptance']) assert.equal(dropped in quiet, false, dropped);
+});
+
 test('status: a steered head lists its earlier turns oldest first, each with its own report', async () => {
   const turns: Record<string, Record<string, unknown>> = {
     'implement-smith-3': detail({ jobId: 'implement-smith-3', steeredFrom: 'implement-smith-2', report: 'Third.' }),

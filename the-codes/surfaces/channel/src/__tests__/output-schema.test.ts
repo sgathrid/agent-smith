@@ -123,6 +123,22 @@ test('list_jobs validates concise (bare and cut) and detailed', async () => {
   assert.deepEqual((concise.items as { taskStatus: string }[]).map(r => r.taskStatus), ['completed', 'working', 'working', 'failed']);
 });
 
+test('list_jobs concise rows validate digest, acceptance, changedFileCount and stalled', async () => {
+  const rich: JobSummary = {
+    ...summary, jobId: 'job-4', name: 'Dee', status: 'running', finishedAt: null,
+    updatedAt: '2026-10-11T09:00:00.000Z', changedFileCount: 2,
+    digest: { phase: 'testing', filesRead: 3, searches: 1, edited: ['src/a.ts', 'src/b.ts'], editedCount: 2, commands: 2, testRuns: 1, lastTestFailed: true, repeat: null },
+    acceptance: { state: 'rejected', checks: [{ name: 'tests', ok: false, exitCode: 1, durationMs: 5, outputTail: 'bad', blocking: true, timedOut: false, signal: null }], at: '2026-10-11T09:06:00.000Z' },
+  };
+  const listService = { repo, spawnedIds: new Set<string>(), list: async () => [rich] };
+  const out = assertValid('list_jobs', await callTool({ ...ctx, service: listService as never }, 'list_jobs', {}), 'list_jobs fleet row');
+  const row = (out.items as Record<string, unknown>[])[0]!;
+  assert.equal(row.stalled, true);
+  assert.equal(row.changedFileCount, 2);
+  assert.deepEqual(row.acceptance, { state: 'rejected', failed: ['tests'] });
+  assert.deepEqual(row.digest, { phase: 'testing', filesRead: 3, edited: ['src/a.ts', 'src/b.ts'], editedCount: 2, testRuns: 1, lastTestFailed: true });
+});
+
 test('list_capabilities validates with installed, errored and uninstalled providers', async () => {
   const caps = assertValid('list_capabilities', await callTool(ctx, 'list_capabilities', {}), 'list_capabilities');
   assert.ok((caps.providers as { available: boolean }[]).some(p => !p.available));
