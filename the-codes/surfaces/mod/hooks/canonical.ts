@@ -128,7 +128,9 @@ export async function readForgeJobs(fs: FsLike, repo: string, now: number): Prom
   }
   return jobs;
 }
-export interface ForgeDetail { job: RadarJob; history: ToolEntry[]; transcript: string[]; timeline: ActivityEvent[] | null; }
+export interface ForgeDetail { job: RadarJob; history: ToolEntry[]; transcript: string[]; timeline: ActivityEvent[] | null;
+  /** The writer bounded this snapshot, so the timeline is a preview, not the whole run. */
+  truncated?: boolean; }
 export async function readForgeDetail(fs: FsLike, repo: string, id: string, now: number): Promise<ForgeDetail | null> {
   const job = await readForgeJob(fs, repo, id, now);
   if (!job) return null;
@@ -154,5 +156,6 @@ export async function readForgeDetail(fs: FsLike, repo: string, id: string, now:
   }) : null;
   return { job: { ...job, report, prompt: text(view?.prompt), preamble: text(view?.preamble),
     // A bounded preview is normal for a long job, not a warning.
-    warnings: [...job.warnings, ...(view === null ? [{code:'detail_unavailable',message:'This older job has no detail snapshot; summary and report are shown.'}] : [])] }, history, transcript, timeline };
+    warnings: [...job.warnings, ...(view === null ? [{code:'detail_unavailable',message:'This older job has no detail snapshot; summary and report are shown.'}] : [])] }, history, transcript, timeline,
+    truncated: view?.truncated === true };
 }

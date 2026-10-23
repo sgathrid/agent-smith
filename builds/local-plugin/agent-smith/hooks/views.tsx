@@ -2,7 +2,7 @@
 import type { UiComponents } from 'claude-code';
 import type { RadarJob } from '../types/index.d.ts';
 import type { ForgeDetail } from './canonical.ts';
-import { checksLabel, forgeList, isLive, needsAttention, scopeLine, statusLine, workerHeading, workerStatus } from './dashboard.ts';
+import { checksLabel, condenseTimeline, forgeList, isLive, needsAttention, scopeLine, statusLine, timelineGroupLabel, workerHeading, workerStatus, type TimelineItem } from './dashboard.ts';
 import { elapsed, isTerminal, oneLine, pickColor, pickGlyph, sanitizeText } from './format.ts';
 import { classify, progressLines } from './progress.ts';
 
@@ -65,14 +65,23 @@ export function renderWorker(W: UiComponents, d: ForgeDetail, o: ViewOptions, a:
   const job=d.job;
   const prompt=job.prompt??job.task;
   const span=job.startedAt===null?null:(job.endedAt??o.now)-job.startedAt;
-  const meta=oneLine([[job.provider,job.model].filter(Boolean).join('·'),span===null?'':elapsed(span),checksLabel(job.acceptance)].filter(Boolean).join(' · '));
+  const meta=oneLine([[job.provider,job.model].filter(Boolean).join('·'),runs.length>0?`turn ${runs.length+1}`:'',span===null?'':elapsed(span),checksLabel(job.acceptance)].filter(Boolean).join(' · '));
   const failing=job.acceptance?.checks.filter(check => !check.ok) ?? [];
+  // A live worker's own words, one line, when it wrote any.
+  const note=job.status==='running'||job.status==='attention'
+    ? (job.reasoning?oneLine(job.reasoning,Math.max(1,o.width-6)):'') : '';
+  // A shell-edited worker (codex) has no edit tool calls to count, so its
+  // changedFiles manifest is the only evidence of what it touched.
+  const changedFiles=isTerminal(job.status)&&job.changedFileCount!=null&&job.changedFileCount>0&&(job.progress?.editedCount??0)===0
+    ? job.changedFileCount : 0;
   return <Box flexDirection="column">
     <Text bold color={o.colour?pickColor(job.status):undefined} wrap="truncate-end">{`${pickGlyph(job.status)} ${workerHeading(job)}`}</Text>
     {meta!=='' && <Text dimColor wrap="truncate-end">{meta}</Text>}
     <Text wrap="truncate-end">{workerStatus(job)}</Text>
-    {job.progress && <Box flexDirection="column">
-      {progressLines(job.progress, job.toolCount).map((line,i) => <Text key={`progress-${i}`} dimColor={i>0} wrap="truncate-end">{sanitizeText(line)}</Text>)}
+    {changedFiles>0 && <Text dimColor wrap="truncate-end">{`Changed: ${changedFiles} ${changedFiles===1?'file':'files'}`}</Text>}
+    {(job.progress||note!=='') && <Box flexDirection="column">
+      {job.progress && progressLines(job.progress, job.toolCount).map((line,i) => <Text key={`progress-${i}`} dimColor={i>0} wrap="truncate-end">{sanitizeText(line)}</Text>)}
+      {note!=='' && <Text dimColor wrap="truncate-end">{`Note: ${note}`}</Text>}
       {job.status==='running' && job.lastEventAt!=null && o.now-job.lastEventAt>QUIET_MS &&
         <Text color={o.colour?'yellow':undefined} wrap="truncate-end">{`Stalled ${elapsed(o.now-job.lastEventAt)}`}</Text>}
     </Box>}
@@ -81,9 +90,11 @@ export function renderWorker(W: UiComponents, d: ForgeDetail, o: ViewOptions, a:
     {o.taskOpen && <Markdown text={sanitizeText(job.preamble?`${job.preamble}\n\n${prompt}`:prompt)} />}
     {o.taskOpen && <Text dimColor wrap="wrap">{sanitizeText(`${oneLine(job.id)}\nWorker: ${oneLine(job.workerId??job.id)}${job.pipeline?`\nPipeline: ${oneLine(job.pipeline)} · ${oneLine(job.stage??'stage unknown')}`:''}${job.attempt!=null?`\nAttempt: ${job.attempt}`:''}`)}</Text>}
     {d.timeline===null && <Text dimColor wrap="wrap">Older snapshot: output and tools are separate; their original order is unavailable.</Text>}
-    {d.timeline?.map(event => event.kind==='assistant'
-      ? <Markdown key={`event-${event.sequence}`} text={sanitizeText(event.text)} />
-      : toolRow(W,`event-${event.sequence}`,event.tool,event.input,event.output,event.state,o,a))}
+    {d.timeline && condenseTimeline(d.timeline).map(item => item.kind==='group'
+      ? timelineGroup(W,item,o,a)
+      : item.event.kind==='assistant'
+        ? <Markdown key={`event-${item.event.sequence}`} text={sanitizeText(item.event.text)} />
+        : toolRow(W,`event-${item.event.sequence}`,item.event.tool,item.event.input,item.event.output,item.event.state,o,a))}
     {d.timeline===null && <>
       {d.transcript.length>0 && <Markdown text={sanitizeText(d.transcript.join('\n\n'))} />}
       {d.history.map((tool,i) => toolRow(W,`legacy-tool-${i}`,tool.tool,tool.label,tool.output,tool.state,o,a))}
@@ -115,5 +126,20 @@ function toolRow(W: UiComponents,key:string,tool:string,input:string,output:stri
   return <Box key={`row-${key}`} flexDirection="column">
     <Button key={key} plain label={`${state==='active'?'›':state==='error'?'✗':'✓'} ${oneLine(classify(tool,input).label,Math.max(1,o.width-3))}`} onPress={() => a.tool(key)} />
     {expanded&&<Text dimColor wrap="wrap">{sanitizeText(`${oneLine(tool)} ${input}${output?`\n${output}`:''}`)}</Text>}
+  </Box>;
+}
+
+/**
+ * A condensed run of completed read/search calls: one summary row, expanded into
+ * the individual rows on press. Nothing is dropped — the same keys the rows
+ * would have had are used inside the group.
+ */
+function timelineGroup(W: UiComponents, item: Extract<TimelineItem,{kind:'group'}>, o: ViewOptions, a: ViewActions): JSX.Element {
+  const {Box,Button,Markdown}=W;
+  return <Box key={`row-${item.key}`} flexDirection="column">
+    <Button key={item.key} plain label={`✓ ${timelineGroupLabel(item.reads,item.searches)}`} onPress={() => a.tool(item.key)} />
+    {o.tools.includes(item.key) && item.events.map(event => event.kind==='tool'
+      ? toolRow(W,`event-${event.sequence}`,event.tool,event.input,event.output,event.state,o,a)
+      : <Markdown key={`event-${event.sequence}`} text={sanitizeText(event.text)} />)}
   </Box>;
 }
