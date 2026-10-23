@@ -72,8 +72,8 @@ function failedReason(d: JobDetail): string | null {
   return stored ? stored : reasonFromText(d.error);
 }
 
-/** One compact row for list_jobs. */
-export function conciseRow(j: JobSummary) {
+/** One compact row for list_jobs. `now` is injectable so stall detection is testable. */
+export function conciseRow(j: JobSummary, now = Date.now()) {
   return compact({
     jobId: j.jobId, name: j.name, status: j.status, taskStatus: taskStatus(j.status), provider: j.provider, model: j.model, mode: j.mode,
     summary: j.latestSummary ? trimWords(j.latestSummary, CONCISE_SUMMARY_CHARS) : null,
@@ -81,6 +81,15 @@ export function conciseRow(j: JobSummary) {
     supersededBy: j.supersededBy ?? null, steeredFrom: j.steeredFrom ?? null,
     pendingSteers: j.pendingSteers ? j.pendingSteers : null,
     nextAction: j.nextAction, warningCount: j.warnings.length || null,
+    stalled: j.status === 'running' && j.updatedAt !== null && now - Date.parse(j.updatedAt) > STALL_GRACE_MS ? true : null,
+    changedFileCount: typeof j.changedFileCount === 'number' ? j.changedFileCount : null,
+    acceptance: j.acceptance && (j.acceptance.state !== 'unchecked' || j.acceptance.pending || j.acceptance.checks.length > 0)
+      ? checkVerdicts(j.acceptance) : null,
+    digest: j.digest ? compact({
+      phase: j.digest.phase, filesRead: j.digest.filesRead || null,
+      editedCount: j.digest.editedCount || null, edited: j.digest.edited.length ? j.digest.edited.slice(0, 5) : null,
+      testRuns: j.digest.testRuns || null, lastTestFailed: j.digest.lastTestFailed ? true : null, repeat: j.digest.repeat,
+    }) : null,
   });
 }
 
