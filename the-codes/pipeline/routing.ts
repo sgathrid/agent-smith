@@ -143,6 +143,7 @@ const PROVIDER_FAMILIES: Readonly<Record<string, string>> = {
   anthropic: 'anthropic',
   agy: 'unknown',
   opencode: 'unknown',
+  kimi: 'unknown',
 };
 
 /**
@@ -480,6 +481,10 @@ export const DEFAULT_LADDERS: Readonly<Record<string, ProviderLadder>> = {
   },
   agy: { defaultModel: 'agy-default', label: 'agy' },
   opencode: { defaultModel: 'opencode-default', label: 'opencode' },
+  // No invented model id: kimi's real default lives in its config.toml, and
+  // print mode has no per-run effort flag (routing's effort is ignored by the
+  // adapter with a warning).
+  kimi: { label: 'kimi' },
 };
 
 const TIER_ORDER: readonly CostTier[] = ['t0-cheap', 't1-effort', 't2-stronger', 't3-cross-family'];

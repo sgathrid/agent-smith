@@ -14,7 +14,7 @@
  *
  * The rule for this layer: providers may speak in whatever dialect their CLI
  * emits, but they must translate into ProviderEvent before anything else sees
- * them. core/ never parses agy/Codex/OpenCode/Anthropic JSON.
+ * them. core/ never parses agy/Codex/OpenCode/Kimi/Anthropic JSON.
  */
 
 // ---------------------------------------------------------------------------
@@ -33,6 +33,7 @@
  *   claude  -> input_tokens, cache_creation_input_tokens, cache_read_input_tokens,
  *              output_tokens (+ usage.output_tokens_details.thinking_tokens)
  *   opencode-> UNKNOWN (see opencode.ts)
+ *   kimi    -> NOT REPORTED by stream-json; absent rather than invented
  * `total_tokens` is therefore OPTIONAL and providers that can compute it DO.
  * We never fabricate a zero: absent means absent.
  */
@@ -70,6 +71,8 @@ export interface SpawnSpec {
    * Reasoning effort, provider-native ("high" | "xhigh" | ...).
    * NOTE: agy accepts effort BOTH as its own flag (--effort) and baked into the
    * model id ("gemini-3.8-flash-high"). We prefer the id form; see agy.ts.
+   * kimi has NO per-run effort flag: it ignores this with a warning and reads
+   * effort from its own config.toml instead.
    */
   effort?: string;
 
@@ -302,7 +305,7 @@ export interface WorkerHandle {
 }
 
 export interface Provider {
-  /** Registry key: "agy" | "codex" | "opencode" | "claude". */
+  /** Registry key: "agy" | "codex" | "opencode" | "claude" | "kimi". */
   name: string;
 
   /**

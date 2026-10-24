@@ -1,7 +1,7 @@
 # agent-smith — the band
 
-A Claude Code mod that draws **one live line per running agy / Codex / OpenCode
-job** in the `AbovePrompt` band. Each line has a digit: pressing it in an empty
+A Claude Code mod that draws **one live line per running agy / Codex / OpenCode /
+Kimi job** in the `AbovePrompt` band. Each line has a digit: pressing it in an empty
 prompt opens the focused sidebar on that worker's live view. `/forge` opens the
 sidebar on the worker list; `/forge <name or job id>` opens one worker.
 

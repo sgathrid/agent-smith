@@ -125,7 +125,7 @@ import { POLL_MS, pollOnce, scheduleLoop } from './poller.ts';
  *   6. that list_capabilities is the source for provider, model and effort
  */
 const INSTRUCTIONS =
-  'Agent Smith runs work on external coding agents: codex, agy, opencode and claude. ' +
+  'Agent Smith runs work on external coding agents: codex, agy, opencode, kimi and claude. ' +
   'Delegate self-contained work big enough to justify a separate agent, or to get ' +
   "another model's view, such as codex reviewing agy's work; for a few quick reads, " +
   'do it yourself. For a Claude model, use your native Agent tool unless you need ' +

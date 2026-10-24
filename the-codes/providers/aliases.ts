@@ -5,7 +5,7 @@ import { readFileSync as nodeRead } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-export type AliasProvider = 'agy' | 'codex' | 'opencode' | 'claude';
+export type AliasProvider = 'agy' | 'codex' | 'opencode' | 'claude' | 'kimi';
 export type AliasMode = 'implement' | 'review' | 'moderate' | 'verify';
 export interface Alias { provider: AliasProvider; model?: string; effort?: string }
 export type AliasScope = 'project' | 'user';
@@ -24,7 +24,7 @@ export interface ResolvedRequest {
 }
 export interface ConfigFs { readFile(p: string): string | undefined }
 
-const PROVIDERS = ['agy', 'codex', 'opencode', 'claude'];
+const PROVIDERS = ['agy', 'codex', 'opencode', 'claude', 'kimi'];
 const MODES = ['implement', 'review', 'moderate', 'verify'];
 const NAME_RE = /^[a-z0-9][a-z0-9._-]*$/;
 

@@ -33,7 +33,7 @@ export type ProviderName = string;
  * Known provider names, for surfaces that want a friendly label or an icon.
  * Optional convenience only — never switch on this exhaustively.
  */
-export const KNOWN_PROVIDERS = ['agy', 'codex', 'opencode', 'claude'] as const;
+export const KNOWN_PROVIDERS = ['agy', 'codex', 'opencode', 'claude', 'kimi'] as const;
 export type KnownProviderName = (typeof KNOWN_PROVIDERS)[number];
 
 /**

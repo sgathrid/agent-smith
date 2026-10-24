@@ -15,7 +15,7 @@ providers/  -> forge/ runtime -> surfaces/channel (MCP + hook watcher) -> surfac
 
 | Layer | Owns |
 |---|---|
-| `providers/` | `agy`, `codex`, `opencode`, `claude` adapters: argv, process groups, timeouts, NDJSON-to-`ProviderEvent` translation, sandbox description, model discovery (`listModels`) and harness-config defaults (`harnessDefaults`), `models.json` aliases (`aliases.ts`), the lazy catalog cache (`catalog.ts`). |
+| `providers/` | `agy`, `codex`, `opencode`, `claude`, `kimi` adapters: argv, process groups, timeouts, NDJSON-to-`ProviderEvent` translation, sandbox description, model discovery (`listModels`) and harness-config defaults (`harnessDefaults`), `models.json` aliases (`aliases.ts`), the lazy catalog cache (`catalog.ts`). |
 | `forge/` | Job directory format and status rules (`format.ts`), the single-writer `JobWriter` (`writer.ts`), `ForgeService` (spawn/list/detail/cancel, `service.ts`), closed modes (`modes.ts`), executable acceptance (`checks.ts`), pipeline runner and persistence (`runner.ts`, `execute.ts`), compat mirror (`mirror.ts`). |
 | `pipeline/` | DAG validation, bounded scheduling (1-32), failure propagation, routing/escalation. Does not interpret prose. |
 | `verify/` | Runs acceptance commands against the real working tree; exit codes decide, not worker text. |
@@ -232,11 +232,14 @@ prompt starts with the brief; `view.json` (and the mirrored spec) keep the prepe
   is returned uncached.
 - Sources: `agy models` (base ids, `-low|-medium|-high` suffix stripped into efforts);
   `codex debug models`, falling back to `<codexHome>/models_cache.json` marked `stale`;
-  `opencode models` (`verified: false`); `claude` static aliases `fable|opus|sonnet|haiku`
-  (`source: 'static'`).
+  `opencode models` (`verified: false`); `kimi provider list --json` (keys of its `models`
+  map are the aliases `--model` accepts; live-verified on 2.1.1; efforts are not advertised
+  because print mode has no per-run effort flag); `claude` static aliases
+  `fable|opus|sonnet|haiku` (`source: 'static'`).
 - Harness defaults (`harnessDefaults`, synchronous file read, no CLI): codex
   `<codexHome>/config.toml` top-level `model` and `model_reasoning_effort`; claude
-  `<claudeHome>/settings.json` top-level `model`. agy and opencode have none.
+  `<claudeHome>/settings.json` top-level `model`; kimi `<kimiHome>/config.toml` top-level
+  `default_model`. agy and opencode have none.
 - Spawn path: a catalog is consulted only if the request names `model` or `effort`, with a
   hard `CATALOG_WAIT_MS` = 2 s race; on timeout/error it is treated as absent. With no
   `model`, `modelResolved` comes from `harnessDefaults().model` (`modelSource`
@@ -248,6 +251,9 @@ prompt starts with the brief; `view.json` (and the mirrored spec) keep the prepe
   effort not in the model's nonempty `efforts` (model or catalog default) -> error. Stale,
   static (claude), unverified (opencode), empty or errored catalogs never reject; the ack
   gets "could not verify ... passing it through unchecked" in `warnings`.
+- Kimi has no per-run effort flag: a requested `effort` is ignored with a warning event, and
+  the value comes from `[thinking].effort` or a model alias's `default_effort` in
+  `config.toml`.
 - Alias resolution (`providers/aliases.ts`, `resolveRequest`), per call, `models.json` re-read
   each time: (1) `model` equals an alias name -> expand to alias provider/model (call `effort`
   wins over alias `effort`; a conflicting call `provider` throws; alias names that look like
@@ -393,7 +399,9 @@ user (up to 10 minutes) before anything launches.
   `confirmUnrestricted`; the server handle reaches `callTool` as `HandlerContext.server`). It
   fails closed: decline, cancel or no answer returns `isError`. Clients without form elicitation
   launch with an ack warning; `AGENT_SMITH_CONFIRM_UNRESTRICTED=0` skips the prompt.
-- `unrestricted` defaults to false for every provider except `agy` (headless agy cannot prompt, so it defaults to true) and is recorded in `job.json`. Each harness
+- `unrestricted` defaults to false for every provider except `agy` and `kimi` (their headless
+  modes cannot prompt, so it defaults to true) and is recorded in `job.json`. Kimi print mode
+  force-sets the auto policy, so read-only is not enforceable there. Each harness
   owns its sandbox (see CONFIGURATION.md); the ack echoes `sandbox`, `sandboxFlags`,
   `readOnlyRequested`, `readOnlyEnforced`.
 - Worker-authored fields (`report`, `latestSummary`) are untrusted data; `latestSummary`

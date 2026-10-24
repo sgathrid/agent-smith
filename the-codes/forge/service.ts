@@ -571,8 +571,14 @@ export class ForgeService {
     }
     const timeoutMs = clampTimeout(request.timeoutMs);
     const cwd = request.cwd ?? this.repo;
-    // agy cannot prompt headless, so restricted means silent denial: default it on. Explicit false (or AGENT_SMITH_AGY_RESTRICTED=1) opts out.
-    const unrestricted = request.unrestricted ?? (provider.name === 'agy' && process.env['AGENT_SMITH_AGY_RESTRICTED'] !== '1');
+    // agy and kimi cannot prompt headless, so restricted means silent denial:
+    // default them on. agy has an env opt-out; kimi's print mode force-sets the
+    // auto policy and has no restricted mode to opt into.
+    const unrestricted = request.unrestricted ?? (
+      provider.name === 'agy'
+        ? process.env['AGENT_SMITH_AGY_RESTRICTED'] !== '1'
+        : provider.name === 'kimi'
+    );
     const warnings: string[] = [];
     if (request.model !== undefined || request.effort !== undefined) {
       warnings.push(
@@ -602,6 +608,11 @@ export class ForgeService {
     if (provider.name === 'agy' && preset?.runsCommands === true && !unrestricted) {
       warnings.push(
         'agy cannot prompt for permission headless; commands will be denied and the job will return an empty result. Retry with unrestricted:true if this job needs shell access.',
+      );
+    }
+    if (provider.name === 'kimi' && !unrestricted) {
+      warnings.push(
+        'kimi print mode force-sets the auto permission policy; unrestricted:false cannot restrict it. The sandbox field reports the posture actually used.',
       );
     }
     const brief = buildBrief({

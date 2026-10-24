@@ -2,7 +2,7 @@
 
 **Claude delegates. Other models work. You see it happen.**
 
-Agent Smith brings Codex, OpenCode, and agy into Claude Code's delegation workflow—with native task-list entries, live progress above your prompt, and worker transcripts inside your terminal.
+Agent Smith brings Codex, OpenCode, agy, and Kimi into Claude Code's delegation workflow—with native task-list entries, live progress above your prompt, and worker transcripts inside your terminal.
 
 - **Delegate across providers.** Ask Claude to hand off a review, implementation, or verification task in plain English.
 - **Keep working.** Workers run in the background. Claude gets notified when they finish, without repeatedly asking for status.
@@ -12,7 +12,7 @@ Agent Smith brings Codex, OpenCode, and agy into Claude Code's delegation workfl
 
 ## Install
 
-You need **Node.js 22.18+**, a current **Claude Code**, and at least one worker CLI (`codex`, `opencode`, or `agy`) installed and authenticated. Agent Smith uses those CLIs and their configured accounts. It also supports separate `claude` workers.
+You need **Node.js 22.18+**, a current **Claude Code**, and at least one worker CLI (`codex`, `opencode`, `agy`, or `kimi`) installed and authenticated. Agent Smith uses those CLIs and their configured accounts. It also supports separate `claude` workers.
 
 Install for **all your projects**:
 
@@ -104,7 +104,7 @@ When you attach checks such as `npm test`, Agent Smith runs them after the worke
 
 Agent Smith is a Claude Code plugin: a delegation skill, an MCP server that runs the provider CLIs, and an integrated terminal UI. Workers appear in the **native task list**; the live band and `/forge` show their activity, results, and check output.
 
-These are external workers integrated into Claude Code, not sessions created by its built-in `Agent` tool. Each uses its own provider's permissions. In particular, **agy runs unrestricted by default**; review restrictions vary by provider. See [provider permissions](docs/CONFIGURATION.md#harness-default-sources).
+These are external workers integrated into Claude Code, not sessions created by its built-in `Agent` tool. Each uses its own provider's permissions. In particular, **agy and Kimi run unrestricted by default**; review restrictions vary by provider. See [provider permissions](docs/CONFIGURATION.md#harness-default-sources).
 
 For parallel workers editing code, give each its own git worktree. Worker state and reports live in `.agent-smith/` within your project.
 

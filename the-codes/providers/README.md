@@ -3,7 +3,7 @@
 This directory owns **how workers are started and watched**. It is the only
 layer that speaks CLI dialects. `core/` is provider-agnostic and `harness/`
 reads state that workers write themselves; neither parses agy/Codex/OpenCode/
-Anthropic JSON.
+Kimi/Anthropic JSON.
 
 Non-negotiables, enforced in `ndjson.ts` so no adapter can quietly break them:
 
@@ -192,6 +192,46 @@ this, because the stale docs make it look like an oversight.
 Unlike the others there is no way to express a restricted run: `unrestricted:false`
 omits `--auto` and relies on the agent's configured permissions.
 
+### kimi — `kimi.ts` (Kimi Code CLI)
+
+```
+kimi --output-format stream-json
+    [--model <alias>] [--session <id>] [--add-dir <dir>]...
+    -p <prompt>
+```
+
+This is **Kimi Code CLI** (`MoonshotAI/kimi-code`), not the archived Python
+`kimi-cli`. The CLI surface and the stream-json schema are source-verified from
+that repository (`cli/commands.ts`, `cli/options.ts`, `cli/prompt-render.ts`,
+`cli/v2/run-v2-print.ts`) and live-verified on 2.1.1 for a fresh turn, resume
+and `provider list --json`.
+
+- **Print mode is always unrestricted.** `run-v2-print.ts` calls `forceAuto()`,
+  setting the session to the `auto` permission policy before the turn. There is
+  no flag to restrict it and no approval prompt; `--yolo` is rejected alongside
+  `-p`. `unrestricted` therefore defaults to true for kimi, and a requested
+  `readOnly` is not enforced. Static deny rules in `config.toml` still apply.
+- **No per-run effort flag.** Effort comes from `[thinking].effort` or a model
+  alias's `default_effort` in `config.toml`. `SpawnSpec.effort` is ignored with
+  a warning event, and discovered models report `efforts: []` rather than
+  inviting a knob the adapter cannot turn.
+- **Resume.** `--session <id>` resumes an existing session, but only from the
+  directory that created it: a different cwd exits 1 with "Session ... was
+  created under a different directory". `resume_job` defaults to the original
+  job's cwd, so the normal path is fine; overriding cwd fails loudly. A fresh run
+  learns its id from the final `role:"meta", type:"session.resume_hint"` line.
+  The adapter never emits `--continue`: it is cwd-ambiguous and would let
+  parallel workers collide.
+- **Stream-json shape.** `role:"assistant"` carries `content` and `tool_calls`;
+  `role:"tool"` carries `tool_call_id` and `content`; retries and the resume hint
+  are `role:"meta"`. Thinking deltas and token usage are not emitted in JSON
+  mode, so `usage` stays absent rather than invented. `ToolResultEvent.isError`
+  is dropped by the upstream writer; an `isError`/`status:"error"` field inside a
+  serialized result is honoured when present, otherwise the activity is `done`
+  and the failure text remains in its output. The writer flushes a tool call
+  only when the step or its result arrives, so there is no in-flight tool line:
+  a long command is a silent gap until it finishes.
+
 ### claude — `claude.ts` (the prober / moderator)
 
 ```
@@ -230,6 +270,13 @@ executing the invocation against a live model.
 
 Flag *existence* was checked against `--help` on every CLI. Flag *semantics* and
 success-path event shapes were only verified where a run actually succeeded.
+
+**kimi — live-verified for turns, tools and resume.** `kimi 2.1.1` returned
+`OK` in 7.9 s, `RESUMED` in 6.2 s from the captured session id, and one Bash
+activity step (input plus result, file written) in 6.8 s. Retry meta and
+`--add-dir` remain source-verified only. The parser treats unknown roles/meta
+types as notices with their payload preserved, so any drift shows up rather
+than being silently dropped.
 
 **opencode — least trustworthy.** I never observed a successful run. Both attempts
 failed at the provider layer (`provider.quota` HTTP 402 "Insufficient account

@@ -7,6 +7,7 @@ import { buildArgv as buildClaudeArgv, buildResult as buildClaudeResult, createC
 import { buildArgv as buildCodexArgv, codexStderrLevel, createCodexTranslator } from './codex.ts';
 import { buildArgv as buildAgyArgv } from './agy.ts';
 import { buildArgv as buildOpencodeArgv, createOpencodeTranslator } from './opencode.ts';
+import { buildArgv as buildKimiArgv, buildResult as buildKimiResult, createKimiTranslator } from './kimi.ts';
 import { spawnWorker } from './ndjson.ts';
 import type { ProviderEvent, SpawnSpec } from './types.ts';
 
@@ -256,6 +257,137 @@ const proc=await spawnWorker({provider:'fixture',binary:process.execPath,argv:[$
   await promisify(execFile)(process.execPath, ['--experimental-strip-types', supervisor], { timeout: 5000 });
   await new Promise(resolve => setTimeout(resolve, 900));
   assert.equal(existsSync(marker), false, 'the supervisor exited while its tool continued running');
+});
+
+test('kimi: assistant text and tool calls resolve to one activity step closed by the tool result', () => {
+  const tx = createKimiTranslator(200);
+  const first = tx.onEvent({
+    role: 'assistant',
+    content: 'Checking the tree.',
+    tool_calls: [{
+      type: 'function',
+      id: 'call-1',
+      function: { name: 'Bash', arguments: '{"command":"git status"}' },
+    }],
+  });
+  const text = first.find((e) => e.kind === 'text');
+  assert.ok(text?.kind === 'text');
+  assert.equal(text.text, 'Checking the tree.');
+  const start = first.find((e) => e.kind === 'activity-start');
+  assert.ok(start?.kind === 'activity-start');
+  assert.equal(start.activity.tool, 'Bash');
+  assert.equal(start.activity.toolCallId, 'call-1');
+  assert.match(start.activity.input ?? '', /git status/);
+
+  const second = tx.onEvent({ role: 'tool', tool_call_id: 'call-1', content: 'clean' });
+  const end = second.find((e) => e.kind === 'activity-end');
+  assert.ok(end?.kind === 'activity-end');
+  assert.equal(end.activity.stepIndex, start.activity.stepIndex, 'the result closes the call it belongs to');
+  assert.equal(end.activity.tool, 'Bash', 'the result line carries no name; the start supplies it');
+  assert.equal(end.activity.output, 'clean');
+  assert.equal(end.status, 'done');
+});
+
+test('kimi: the resume hint supplies the session id without leaking its prose into the report', () => {
+  const tx = createKimiTranslator(200);
+  const events = tx.onEvent({
+    role: 'meta',
+    type: 'session.resume_hint',
+    session_id: 'sess-9',
+    command: 'kimi -r sess-9',
+    content: 'To resume this session: kimi -r sess-9',
+  });
+  const started = events.find((e) => e.kind === 'started');
+  assert.ok(started?.kind === 'started');
+  assert.equal(started.conversationId, 'sess-9');
+  assert.equal(tx.finalText, '', 'the hint is not assistant text');
+  assert.equal(events.some((e) => e.kind === 'text'), false);
+  assert.equal(
+    tx.onEvent({ role: 'meta', type: 'session.resume_hint', session_id: 'sess-9' }).some((e) => e.kind === 'started'),
+    false,
+    'a duplicate hint does not emit a second started event',
+  );
+
+  const result = buildKimiResult({
+    jobId: 'kimi-resume',
+    startedAtMs: Date.now() - 1,
+    stateDir: '/tmp',
+    exit: { code: 0, signal: null, killReason: undefined, stderr: '' },
+    tx,
+  });
+  assert.equal(result.status, 'malformed', 'a session id is not a report');
+  assert.deepEqual(result.raw, { sessionId: 'sess-9' });
+});
+
+test('kimi: retry meta warns, and unknown lines are preserved rather than dropped', () => {
+  const tx = createKimiTranslator(200);
+  const retry = tx.onEvent({
+    role: 'meta',
+    type: 'turn.step.retrying',
+    failed_attempt: 1,
+    next_attempt: 2,
+    max_attempts: 10,
+    delay_ms: 500,
+    error_name: 'RateLimitError',
+    error_message: 'slow down',
+  })[0];
+  assert.ok(retry?.kind === 'notice');
+  assert.equal(retry.level, 'warn');
+  assert.match(retry.message, /RateLimitError/);
+  assert.equal(tx.sawError, false, 'a retried step is not yet a failed job');
+
+  const unknown = tx.onEvent({ role: 'system', content: 'hi' })[0];
+  assert.ok(unknown?.kind === 'notice');
+  assert.match(unknown.message, /unrecognised line "system"/);
+  assert.deepEqual([...tx.unrecognised], ['role:system']);
+});
+
+test('kimi: a structured tool error marks the activity, never the whole job', () => {
+  const tx = createKimiTranslator(200);
+  tx.onEvent({ role: 'assistant', tool_calls: [{ id: 'c1', function: { name: 'Bash', arguments: '{}' } }] });
+  const end = tx.onEvent({ role: 'tool', tool_call_id: 'c1', content: JSON.stringify({ isError: true, output: 'boom' }) }).at(-1);
+  assert.ok(end?.kind === 'activity-end');
+  assert.equal(end.status, 'error');
+  assert.equal(tx.sawError, false, 'the agent may recover from a failed tool');
+});
+
+test('kimi: success needs assistant text; a non-zero exit is an error', () => {
+  const good = createKimiTranslator(200);
+  good.onEvent({ role: 'assistant', content: 'Done.' });
+  const success = buildKimiResult({
+    jobId: 'kimi-ok', startedAtMs: Date.now() - 1, stateDir: '/tmp',
+    exit: { code: 0, signal: null, killReason: undefined, stderr: '' }, tx: good,
+  });
+  assert.equal(success.status, 'success');
+  assert.equal(success.response, 'Done.');
+
+  const failed = createKimiTranslator(200);
+  failed.onEvent({ role: 'assistant', content: 'Partial.' });
+  const error = buildKimiResult({
+    jobId: 'kimi-fail', startedAtMs: Date.now() - 1, stateDir: '/tmp',
+    exit: { code: 2, signal: null, killReason: undefined, stderr: 'auth failed' }, tx: failed,
+  });
+  assert.equal(error.status, 'error');
+  assert.match(error.error!, /exited 2/);
+  assert.match(error.error!, /auth failed/);
+});
+
+test('kimi: add-dir is repeatable and the prompt stays last', () => {
+  const argv = buildKimiArgv(spec({
+    model: 'kimi-code/k3',
+    conversation: 'sess-1',
+    addDirs: ['/tmp/one', '/tmp/two'],
+  }));
+  assert.deepEqual(argv, [
+    '--output-format', 'stream-json',
+    '--model', 'kimi-code/k3',
+    '--session', 'sess-1',
+    '--add-dir', '/tmp/one',
+    '--add-dir', '/tmp/two',
+    '-p', 'continue the work',
+  ]);
+  assert.equal(argv.includes('--effort'), false);
+  assert.equal(argv.includes('--continue'), false);
 });
 
 test('opencode: addDirs must NOT emit --dir, which the CLI rejects', () => {

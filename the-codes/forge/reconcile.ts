@@ -127,7 +127,7 @@ function recoveredConversation(result: JobResult): string | null {
   const raw = result.raw as Record<string, unknown>;
   const key = result.provider === 'agy' ? 'conversation_id'
     : result.provider === 'codex' ? 'threadId'
-      : result.provider === 'claude' || result.provider === 'opencode' ? 'sessionId' : null;
+      : result.provider === 'claude' || result.provider === 'opencode' || result.provider === 'kimi' ? 'sessionId' : null;
   const value = key === null ? null : raw[key];
   return typeof value === 'string' && value.trim() !== '' ? value : null;
 }

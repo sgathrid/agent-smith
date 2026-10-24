@@ -72,6 +72,13 @@ export const CLI_LADDERS: Readonly<Record<string, ProviderLadder>> = Object.free
     // own opencode.json. Guessing it here would be guessing at their config.
     label: 'opencode',
   },
+  kimi: {
+    // No model asserted: kimi's real default is `default_model` in its own
+    // config.toml. Its print mode has no per-run effort flag either, so the
+    // adapter ignores routing's effort with a warning rather than inventing an
+    // alias.
+    label: 'kimi',
+  },
 });
 
 /**

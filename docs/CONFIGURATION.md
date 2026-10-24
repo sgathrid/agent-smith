@@ -29,7 +29,7 @@ entries are skipped and reported as `models.json: ...` ack `warnings` and
 }
 ```
 
-- Alias name: `^[a-z0-9][a-z0-9._-]*$`. `provider` required, one of `agy|codex|opencode|claude`;
+- Alias name: `^[a-z0-9][a-z0-9._-]*$`. `provider` required, one of `agy|codex|opencode|claude|kimi`;
   `model` and `effort` optional strings.
 - `roleDefaults` keys: `implement|review|moderate|verify`; value must name an alias.
 - Precedence: a project alias replaces a user alias of the same name wholesale (no field
@@ -55,12 +55,14 @@ Only variables the code reads.
 | `AGENT_SMITH_CODEX_BIN` | `providers/codex.ts` | `codex` | Same, for codex. |
 | `AGENT_SMITH_OPENCODE_BIN` | `providers/opencode.ts` | `opencode` | Same, for opencode. |
 | `AGENT_SMITH_CLAUDE_BIN` | `providers/claude.ts` | `claude` | Same, for the claude worker. |
+| `AGENT_SMITH_KIMI_BIN` | `providers/kimi.ts` | `kimi` | Same, for the kimi worker. |
 | `AGENT_SMITH_CODEX_SANDBOX` | `providers/codex.ts` | unset | `read-only`, `workspace-write` or `danger-full-access`; overrides every other codex sandbox choice (including `unrestricted` and a mode's read-only request). Other values ignored. Shown in the ack `sandbox` string. |
 | `AGENT_SMITH_CODEX_MODEL` | `providers/codex.ts` | unset | Appended as `-c model="<value>"` to every codex run when nonempty, in addition to any `--model` from the request. Not validated and not reflected in `modelResolved`. |
 | `AGENT_SMITH_CODEX_HOME`, then `CODEX_HOME` | `providers/codex.ts` | `~/.codex` | Codex config dir: `config.toml` (default model/effort) and `models_cache.json` (stale fallback catalog). |
 | `AGENT_SMITH_CLAUDE_HOME`, then `CLAUDE_CONFIG_DIR` | `providers/claude.ts` | `~/.claude` | Claude config dir: `settings.json` top-level `model` is the default model. |
 | `AGENT_SMITH_CLAUDE_BARE` | `providers/claude.ts` | unset | `1` adds `--bare` to claude workers (no hooks/CLAUDE.md; disables keychain auth) and suppresses `--setting-sources`. |
 | `AGENT_SMITH_CLAUDE_SETTING_SOURCES` | `providers/claude.ts` | `user` | Value for `--setting-sources`; empty string omits the flag. Ignored when `AGENT_SMITH_CLAUDE_BARE=1`. |
+| `AGENT_SMITH_KIMI_HOME`, then `KIMI_CODE_HOME` | `providers/kimi.ts` | `~/.kimi-code` | Kimi config dir: `config.toml` top-level `default_model` (and `[thinking].effort`, model alias `default_effort`). |
 | `AGENT_SMITH_HOME` | `providers/aliases.ts` | `os.homedir()` | Where the user-level `.agent-smith/models.json` is looked up. |
 | `AGENT_SMITH_STATE_DIR` | `providers/ndjson.ts` | `~/.agent-smith/state` | Provider state root used only when a spawn gives no `stateDir`. The forge always passes the job directory, so MCP/CLI jobs do not use it. |
 | `AGENT_SMITH_CHANNEL` | `surfaces/channel/src/server.ts` | enabled | `0` disables the `claude/channel` capability, the startup baseline and the 5 s poll loop. The built plugin sets it to `0`; `dev.sh --channels` leaves it unset. |
@@ -84,6 +86,7 @@ never a CLI call on the spawn path.
 | `codex` | `codex debug models`; on failure `<codexHome>/models_cache.json` (marked `stale`) | `<codexHome>/config.toml` top-level `model`, `model_reasoning_effort` |
 | `opencode` | `opencode models` (`verified: false`; use `provider/model` ids) | none |
 | `claude` | static `fable`, `opus`, `sonnet`, `haiku` (efforts low/medium/high/xhigh/max) | `<claudeHome>/settings.json` top-level `model` (no effort) |
+| `kimi` | `kimi provider list --json` (keys of its `models` map are the aliases `--model` accepts; live-verified on 2.1.1) | `<kimiHome>/config.toml` top-level `default_model` (no per-run effort flag) |
 
 Sandbox posture per provider (echoed in the ack): agy default = `--dangerously-skip-permissions`
 (headless agy cannot prompt, so restricted means silent denial; opt out with `unrestricted:false`
@@ -92,7 +95,15 @@ read-only is not enforceable). codex default = `-s workspace-write`, `-s read-on
 read-only modes, bypass flag when unrestricted (resume uses `-c sandbox_mode=...`). claude
 default = `--permission-mode dontAsk --permission-prompts none` (no read-only enforcement),
 `--dangerously-skip-permissions` when unrestricted. opencode default = the agent's own rules
-(no flag), `--auto` when unrestricted.
+(no flag), `--auto` when unrestricted. kimi print mode force-sets the auto permission policy
+(it cannot prompt and has no restricted flag), so `unrestricted` defaults true and
+`readOnlyEnforced` is false; static deny rules from `config.toml` still apply. kimi also has
+no per-run effort flag: effort comes from `[thinking].effort` or a model alias's
+`default_effort` in `config.toml`.
+
+Kimi models can also be reached through Codex's OpenAI-compatible provider configuration
+(`~/.codex/config.toml`). That runs Codex's agent loop and tools under the `codex` provider,
+not the Kimi CLI.
 
 ## Timeouts and limits
 
@@ -126,7 +137,7 @@ Claude channel notifications are available on legacy connections only.
 
 All tools reject unknown fields. Failures return `isError` with a sentence to act on.
 Efforts (`EFFORTS`): `low|medium|high|xhigh|max|ultra`; each model lists the efforts it
-accepts. Providers: `agy|codex|opencode|claude`. Tools marked structured also return
+accepts. Providers: `agy|codex|opencode|claude|kimi`. Tools marked structured also return
 `structuredContent` (arrays wrapped as `{items}`) and declare a per-tool `outputSchema` that types the
 fields below and allows extra ones (`additionalProperties: true`); clients validate against it.
 
@@ -145,7 +156,7 @@ claude or opencode asks the user first via MCP form elicitation ("Allow codex wo
 without approval prompts in <cwd>? It will be able to run any command."). Accept launches; decline,
 cancel or no answer within 10 minutes returns `isError` (`The user declined unrestricted access; rerun
 without unrestricted, or ask the user.`) and launches nothing. A client without form elicitation gets
-the launch as before plus an ack warning that it was not confirmed. Never asked for agy, for
+the launch as before plus an ack warning that it was not confirmed. Never asked for agy or kimi, for
 `unrestricted: false` or absent, for a setting `resume_job` inherits, or with
 `AGENT_SMITH_CONFIRM_UNRESTRICTED=0`. `run_pipeline`'s `unrestricted` is not confirmed.
 
@@ -181,7 +192,7 @@ roleDefaults}`, `aliasConfigErrors?`, `modes[{name,description,readOnly,runsComm
 | `provider` | enum | default: alias/roleDefault provider, else `agy` if installed, else the first installed |
 | `model`, `effort` | string, enum | optional; validated against a fresh catalog, otherwise warnings only |
 | `timeoutMs` | integer >= 1 | default 2 700 000, clamped 1 000 to 21 600 000 |
-| `unrestricted` | boolean | default true for agy; false for other providers; `true` for codex, claude or opencode asks the user to confirm (above) |
+| `unrestricted` | boolean | default true for agy and kimi; false for other providers; `true` for codex, claude or opencode asks the user to confirm (above) |
 | `cwd` | string | absolute existing directory; default server repo; checks resolve against it |
 | `files` | array | relative paths of brief/spec files in `repo` (max 32 files, 4 MiB total; symlinks escaping `repo` are rejected); copied into `cwd` when `cwd !== repo`, excluded from `changedFiles` unless modified by the worker, and watched for `staleReads` |
 | `conversation` | string | native conversation handle to resume |
@@ -198,7 +209,9 @@ given.
 Params: `worker` (name or job id, required), `prompt` (required), `files` (optional relative paths in `repo`, merged with the previous job's existing watched files and re-synced into `cwd` only when changed in `repo` so worker worktree edits are preserved), `model`, `effort`,
 `timeoutMs`, `unrestricted` (default: the original job's; an explicit `true` is confirmed as for `spawn_job`), `cwd` (absolute existing directory;
 default: the original job's). An explicit cwd changes the process working directory while
-retaining the prior conversation, which can still mention its previous workspace. Provider, mode, workerId,
+retaining the prior conversation, which can still mention its previous workspace. kimi is
+stricter: it resumes a session only from the directory that created it, so keeping the default
+cwd is required there. Provider, mode, workerId,
 name, watched files and conversation come from the finished job; no `provider` or `checks` parameter.
 Refuses running workers (pointing to `steer_job`), workers without a conversation handle, ambiguous names. Result:
 a `SpawnAck` plus `taskHandle` and `notify`.
@@ -251,7 +264,7 @@ stopped; check `status`.
 
 ### `run_pipeline`
 Params: `spec` object (unknown fields rejected): `name` (required), `task` (required unless
-`stages`), `workDir` (default repo), `concurrency` 1-32, `unrestricted` (default: true for agy stages, false for others),
+`stages`), `workDir` (default repo), `concurrency` 1-32, `unrestricted` (default: true for agy and kimi stages, false for others),
 `stages[]`. Stage fields: `name`, `provider` (required unless `continues` is set); `agentName`, `workerId`,
 `conversation`, `continues` (see below), `model`, `effort`, `prompt`, `context` (as `spawn_job`), `title`, `role`, `dependsOn[]`, `workDir`,
 `resultPath`, `timeoutMs`, `routingPinned`, `checks[]` (same shape as `spawn_job`),
