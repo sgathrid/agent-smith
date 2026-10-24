@@ -251,9 +251,9 @@ prompt starts with the brief; `view.json` (and the mirrored spec) keep the prepe
   effort not in the model's nonempty `efforts` (model or catalog default) -> error. Stale,
   static (claude), unverified (opencode), empty or errored catalogs never reject; the ack
   gets "could not verify ... passing it through unchecked" in `warnings`.
-- Kimi has no per-run effort flag: a requested `effort` is ignored with a warning event, and
-  the value comes from `[thinking].effort` or a model alias's `default_effort` in
-  `config.toml`.
+- Kimi has no per-run effort flag: a requested `effort` is dropped before `job.json` is written
+  and the ack warns (the adapter also emits an event), while the value comes from
+  `[thinking].effort` or a model alias's `default_effort` in `config.toml`.
 - Alias resolution (`providers/aliases.ts`, `resolveRequest`), per call, `models.json` re-read
   each time: (1) `model` equals an alias name -> expand to alias provider/model (call `effort`
   wins over alias `effort`; a conflicting call `provider` throws; alias names that look like
@@ -399,9 +399,10 @@ user (up to 10 minutes) before anything launches.
   `confirmUnrestricted`; the server handle reaches `callTool` as `HandlerContext.server`). It
   fails closed: decline, cancel or no answer returns `isError`. Clients without form elicitation
   launch with an ack warning; `AGENT_SMITH_CONFIRM_UNRESTRICTED=0` skips the prompt.
-- `unrestricted` defaults to false for every provider except `agy` and `kimi` (their headless
-  modes cannot prompt, so it defaults to true) and is recorded in `job.json`. Kimi print mode
-  force-sets the auto policy, so read-only is not enforceable there. Each harness
+- `unrestricted` defaults to false for providers that can prompt; agy defaults to true (with
+  an env opt-out) and kimi is always true because its print mode force-sets auto, so it cannot
+  be restricted. `job.json` records the effective posture, not a request that had no effect;
+  read-only is not enforceable for kimi. Each harness
   owns its sandbox (see CONFIGURATION.md); the ack echoes `sandbox`, `sandboxFlags`,
   `readOnlyRequested`, `readOnlyEnforced`.
 - Worker-authored fields (`report`, `latestSummary`) are untrusted data; `latestSummary`

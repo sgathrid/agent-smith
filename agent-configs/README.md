@@ -29,8 +29,8 @@ agent-configs/
 └── shared/                 the role contract and terminal-UI rules every provider honours
 ```
 
-Per-provider adapter files (Codex `AGENTS.md`, OpenCode config, agy personas) are not
-checked in. Provider behavior is configured in the provider adapters and, for models, in
+Per-provider adapter files (Codex `AGENTS.md`, OpenCode config, agy personas, Kimi
+`config.toml`) are not checked in. Provider behavior is configured in the provider adapters and, for models, in
 `models.json` (see [docs/CONFIGURATION.md](../docs/CONFIGURATION.md)).
 
 ## The role contract

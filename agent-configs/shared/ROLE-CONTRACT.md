@@ -97,9 +97,10 @@ budget while degrading as budget grows ([2406.06461](https://arxiv.org/abs/2406.
 4. **Stop at ambiguity.** Flag it in `## Notes`; do not invent scope.
 ## Permissions
 
-Workers run restricted by default in both the CLI and MCP. Reviewers may run
-commands and checks where their harness policy allows them. Role instructions
-alone do not enforce permissions.
+Workers run restricted by default in both the CLI and MCP, except agy (which can
+be opted out) and kimi (whose print mode cannot prompt or be restricted).
+Reviewers may run commands and checks where their harness policy allows them.
+Role instructions alone do not enforce permissions.
 
 The caller must explicitly set `--unrestricted` (CLI) or `unrestricted: true`
 (MCP) to request bypassing harness approvals. This does not inherit Claude's

@@ -307,6 +307,10 @@ test('kimi: the resume hint supplies the session id without leaking its prose in
     false,
     'a duplicate hint does not emit a second started event',
   );
+  const changed = tx.onEvent({ role: 'meta', type: 'session.resume_hint', session_id: 'sess-other' });
+  assert.equal(changed.some((e) => e.kind === 'started'), false);
+  assert.ok(changed.some((e) => e.kind === 'notice' && e.level === 'warn' && /changed the session id/.test(e.message)));
+  assert.equal(tx.sessionId, 'sess-9', 'the first issued id wins');
 
   const result = buildKimiResult({
     jobId: 'kimi-resume',
@@ -372,6 +376,25 @@ test('kimi: success needs assistant text; a non-zero exit is an error', () => {
   assert.match(error.error!, /auth failed/);
 });
 
+test('kimi: spawn failures and signal deaths carry a cause, not "exited null"', () => {
+  const blank = () => createKimiTranslator(200);
+  const spawn = buildKimiResult({
+    jobId: 'kimi-spawn', startedAtMs: Date.now() - 1, stateDir: '/tmp',
+    exit: { code: null, signal: null, killReason: undefined, stderr: '', spawnError: 'spawn error: ENOENT' },
+    tx: blank(),
+  });
+  assert.equal(spawn.status, 'spawn-failed');
+  assert.match(spawn.error!, /ENOENT/);
+
+  const signal = buildKimiResult({
+    jobId: 'kimi-signal', startedAtMs: Date.now() - 1, stateDir: '/tmp',
+    exit: { code: null, signal: 'SIGTERM', killReason: undefined, stderr: '' },
+    tx: blank(),
+  });
+  assert.equal(signal.status, 'error');
+  assert.match(signal.error!, /exited on SIGTERM, no result/);
+});
+
 test('kimi: add-dir is repeatable and the prompt stays last', () => {
   const argv = buildKimiArgv(spec({
     model: 'kimi-code/k3',
@@ -381,13 +404,97 @@ test('kimi: add-dir is repeatable and the prompt stays last', () => {
   assert.deepEqual(argv, [
     '--output-format', 'stream-json',
     '--model', 'kimi-code/k3',
-    '--session', 'sess-1',
+    '--session=sess-1',
     '--add-dir', '/tmp/one',
     '--add-dir', '/tmp/two',
     '-p', 'continue the work',
   ]);
   assert.equal(argv.includes('--effort'), false);
   assert.equal(argv.includes('--continue'), false);
+});
+
+test('kimi: duplicate ids keep one step, and an orphan result is still visible', () => {
+  const tx = createKimiTranslator(200);
+  const first = tx.onEvent({ role: 'assistant', tool_calls: [{ id: 'same', function: { name: 'Read', arguments: '{"path":"a"}' } }] });
+  const second = tx.onEvent({ role: 'assistant', tool_calls: [{ id: 'same', function: { name: 'Read', arguments: '{"path":"b"}' } }] });
+  assert.equal(first.filter((e) => e.kind === 'activity-start').length, 1);
+  assert.equal(second.filter((e) => e.kind === 'activity-start').length, 0, 'the same call id is not opened twice');
+  const orphan = tx.onEvent({ role: 'tool', tool_call_id: 'missing', content: 'orphan output' }).find((e) => e.kind === 'activity-end');
+  assert.ok(orphan?.kind === 'activity-end');
+  assert.equal(orphan.activity.tool, 'tool');
+  assert.equal(orphan.activity.output, 'orphan output');
+  const late = tx.onEvent({ role: 'assistant', tool_calls: [{ id: 'missing', function: { name: 'Bash', arguments: '{}' } }] });
+  assert.equal(late.filter((e) => e.kind === 'activity-start').length, 0, 'a late call must not reopen a finished activity');
+});
+
+test('kimi: malformed tool_calls and non-string results are visible, not silent', () => {
+  const tx = createKimiTranslator(200);
+  const badCalls = tx.onEvent({ role: 'assistant', content: 'x', tool_calls: { id: 'c1' } });
+  assert.ok(badCalls.some((e) => e.kind === 'notice' && /tool_calls was not an array/.test(e.message)));
+
+  tx.onEvent({ role: 'assistant', tool_calls: [{ id: 'c2', function: { name: 'Bash', arguments: '{}' } }] });
+  const end = tx.onEvent({ role: 'tool', tool_call_id: 'c2', content: { isError: true, output: 'object content' } }).find((e) => e.kind === 'activity-end');
+  assert.ok(end?.kind === 'activity-end');
+  assert.equal(end.status, 'error');
+  assert.match(end.activity.output ?? '', /object content/);
+
+  const repeated = tx.onEvent({ role: 'tool', tool_call_id: 'c2', content: 'again' });
+  assert.ok(repeated.some((e) => e.kind === 'notice' && /repeated tool result/.test(e.message)));
+  assert.equal(repeated.some((e) => e.kind === 'activity-end'), false);
+});
+
+test('kimi: missing ids get distinct steps, and session ids are trusted only on the resume hint', () => {
+  const tx = createKimiTranslator(200);
+  const hint = tx.onEvent({ role: 'meta', type: 'session.resume_hint', sessionId: 'sess-camel' });
+  assert.ok(hint.some((e) => e.kind === 'started' && e.conversationId === 'sess-camel'));
+
+  const ignored = tx.onEvent({ role: 'assistant', sessionId: 'evil', content: 'x' });
+  assert.equal(ignored.some((e) => e.kind === 'started'), false, 'a non-hint session id is not a resume handle');
+  const events = tx.onEvent({
+    role: 'assistant',
+    usage: { prompt_tokens: 3, completion_tokens: 4 },
+    tool_calls: [
+      { function: { name: 'Read', arguments: '{}' } },
+      { function: { name: 'Bash', arguments: '{}' } },
+    ],
+  });
+  const starts = events.filter((e) => e.kind === 'activity-start');
+  assert.equal(starts.length, 2);
+  assert.notEqual(starts[0]!.activity.stepIndex, starts[1]!.activity.stepIndex);
+  const usage = events.find((e) => e.kind === 'usage');
+  assert.ok(usage?.kind === 'usage');
+  assert.deepEqual(usage.usage, { inputTokens: 3, outputTokens: 4 });
+  const negative = tx.onEvent({ role: 'assistant', usage: { prompt_tokens: -1, output_tokens: 2 } }).find((e) => e.kind === 'usage');
+  assert.ok(negative?.kind === 'usage');
+  assert.deepEqual(negative.usage, { outputTokens: 2 }, 'negative counters are not real usage');
+});
+
+test('kimi: structured error variants close the activity as error, null does not', () => {
+  for (const content of [JSON.stringify({ is_error: true }), JSON.stringify({ status: 'error' }), JSON.stringify({ error: 'boom' })]) {
+    const tx = createKimiTranslator(200);
+    tx.onEvent({ role: 'assistant', tool_calls: [{ id: 'e', function: { name: 'Bash', arguments: '{}' } }] });
+    const end = tx.onEvent({ role: 'tool', tool_call_id: 'e', content }).find((e) => e.kind === 'activity-end');
+    assert.ok(end?.kind === 'activity-end');
+    assert.equal(end.status, 'error', content);
+    assert.equal(tx.sawError, false, 'a tool error is not automatically a job error');
+  }
+  const tx = createKimiTranslator(200);
+  tx.onEvent({ role: 'assistant', tool_calls: [{ id: 'ok', function: { name: 'Bash', arguments: '{}' } }] });
+  const ok = tx.onEvent({ role: 'tool', tool_call_id: 'ok', content: JSON.stringify({ error: null, isError: false }) }).find((e) => e.kind === 'activity-end');
+  assert.ok(ok?.kind === 'activity-end');
+  assert.equal(ok.status, 'done');
+});
+
+test('kimi: a meta error line is fatal, and leading-dash values stay argv values', () => {
+  const tx = createKimiTranslator(200);
+  const events = tx.onEvent({ role: 'meta', type: 'error', error: { message: 'quota exhausted' } });
+  assert.equal(tx.sawError, true);
+  assert.equal(tx.error, 'quota exhausted');
+  assert.ok(events.some((e) => e.kind === 'notice' && e.level === 'error'));
+
+  const argv = buildKimiArgv(spec({ model: '-m', prompt: '- fix it' }));
+  assert.deepEqual(argv, ['--output-format', 'stream-json', '--model', '-m', '-p', '- fix it']);
+  assert.throws(() => buildKimiArgv(spec({ conversation: '-s' })), /must not start with/);
 });
 
 test('opencode: addDirs must NOT emit --dir, which the CLI rejects', () => {

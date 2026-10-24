@@ -96,10 +96,13 @@ read-only modes, bypass flag when unrestricted (resume uses `-c sandbox_mode=...
 default = `--permission-mode dontAsk --permission-prompts none` (no read-only enforcement),
 `--dangerously-skip-permissions` when unrestricted. opencode default = the agent's own rules
 (no flag), `--auto` when unrestricted. kimi print mode force-sets the auto permission policy
-(it cannot prompt and has no restricted flag), so `unrestricted` defaults true and
+(it cannot prompt and has no restricted flag), so `unrestricted` is always true and
 `readOnlyEnforced` is false; static deny rules from `config.toml` still apply. kimi also has
-no per-run effort flag: effort comes from `[thinking].effort` or a model alias's
-`default_effort` in `config.toml`.
+no per-run effort flag: a requested effort is dropped before `job.json` is written and the
+ack warns; effort comes from `[thinking].effort` or a model alias's `default_effort` in
+`config.toml`. Because the stream does not expose a tool's error bit, a tool denied by a
+config rule appears only in its output and the job can report success; acceptance checks are
+the reliable detector.
 
 Kimi models can also be reached through Codex's OpenAI-compatible provider configuration
 (`~/.codex/config.toml`). That runs Codex's agent loop and tools under the `codex` provider,
@@ -192,7 +195,7 @@ roleDefaults}`, `aliasConfigErrors?`, `modes[{name,description,readOnly,runsComm
 | `provider` | enum | default: alias/roleDefault provider, else `agy` if installed, else the first installed |
 | `model`, `effort` | string, enum | optional; validated against a fresh catalog, otherwise warnings only |
 | `timeoutMs` | integer >= 1 | default 2 700 000, clamped 1 000 to 21 600 000 |
-| `unrestricted` | boolean | default true for agy and kimi; false for other providers; `true` for codex, claude or opencode asks the user to confirm (above) |
+| `unrestricted` | boolean | default true for agy; always true for kimi (it cannot be restricted); false for other providers; `true` for codex, claude or opencode asks the user to confirm (above) |
 | `cwd` | string | absolute existing directory; default server repo; checks resolve against it |
 | `files` | array | relative paths of brief/spec files in `repo` (max 32 files, 4 MiB total; symlinks escaping `repo` are rejected); copied into `cwd` when `cwd !== repo`, excluded from `changedFiles` unless modified by the worker, and watched for `staleReads` |
 | `conversation` | string | native conversation handle to resume |
@@ -264,7 +267,7 @@ stopped; check `status`.
 
 ### `run_pipeline`
 Params: `spec` object (unknown fields rejected): `name` (required), `task` (required unless
-`stages`), `workDir` (default repo), `concurrency` 1-32, `unrestricted` (default: true for agy and kimi stages, false for others),
+`stages`), `workDir` (default repo), `concurrency` 1-32, `unrestricted` (default: true for agy, always true for kimi, false for others),
 `stages[]`. Stage fields: `name`, `provider` (required unless `continues` is set); `agentName`, `workerId`,
 `conversation`, `continues` (see below), `model`, `effort`, `prompt`, `context` (as `spawn_job`), `title`, `role`, `dependsOn[]`, `workDir`,
 `resultPath`, `timeoutMs`, `routingPinned`, `checks[]` (same shape as `spawn_job`),

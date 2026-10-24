@@ -110,6 +110,14 @@ const FAMILY_PREFIXES = [
     ['haiku', 'anthropic'],
     ['gemini', 'google'],
     ['gemma', 'google'],
+    // Kimi Code's managed aliases are Moonshot models. The provider-name fallback
+    // stays 'unknown' because a kimi config can point at any OpenAI-compatible
+    // vendor; only an id that names Moonshot itself claims the family.
+    ['kimi-code/', 'moonshot'],
+    ['moonshot-ai/', 'moonshot'],
+    ['moonshot/', 'moonshot'],
+    ['kimi-', 'moonshot'],
+    ['k3', 'moonshot'],
     ['llama', 'meta'],
     ['qwen', 'alibaba'],
     ['deepseek', 'deepseek'],
@@ -128,6 +136,8 @@ const PROVIDER_FAMILIES = {
     anthropic: 'anthropic',
     agy: 'unknown',
     opencode: 'unknown',
+    // Config-dependent: [models] can name any vendor. Moonshot model ids are
+    // resolved by the prefix table above.
     kimi: 'unknown',
 };
 /**
@@ -350,7 +360,7 @@ const DEFAULT_LADDERS = {
     // No invented model id: kimi's real default lives in its config.toml, and
     // print mode has no per-run effort flag (routing's effort is ignored by the
     // adapter with a warning).
-    kimi: { label: 'kimi' },
+    kimi: { label: 'kimi', efforts: false },
 };
 const TIER_ORDER = ['t0-cheap', 't1-effort', 't2-stronger', 't3-cross-family'];
 /** Effort to use at each tier. Note t0/t1 keep the cheapest MODEL. */
@@ -427,6 +437,10 @@ function nextRouting(current, verdict, stage, ladders = DEFAULT_LADDERS, policy 
     for (let next = idx + 1; next < TIER_ORDER.length; next++) {
         const tier = TIER_ORDER[next];
         if (tier === undefined)
+            continue;
+        // t1 changes effort, not model. A provider that cannot set effort per run
+        // would spend a full duplicate attempt for nothing; skip the rung.
+        if (tier === 't1-effort' && ladder.efforts === false)
             continue;
         const model = modelForTier(tier, current.provider, current.model, ladder);
         if (model === undefined)
@@ -3865,11 +3879,15 @@ const codexProvider = {
  *     --add-dir <dir>                extra workspace dir; may be repeated
  *     -y, --yolo / --auto / --plan   interactive permission modes
  *
+ * `--session` takes an OPTIONAL value, so the adapter emits the attached
+ * `--session=<id>` form: with a space, an id beginning with "-" would be parsed
+ * as another option. An id beginning with "-" is rejected before spawn too.
+ *
  * CONFLICT: `-p` cannot be combined with `--yolo` (options.ts throws). `--auto`
  * is pointless here because print mode force-sets the auto policy anyway (see
  * below). `-c` is cwd-ambiguous: with several workers in one repository it can
  * resume another worker's session, so this adapter never emits it. Resume uses
- * `--session <id>` only.
+ * `--session=<id>` only.
  *
  * ----------------------------------------------------------------------------
  * PERMISSIONS: PRINT MODE IS ALWAYS UNRESTRICTED
@@ -3885,16 +3903,19 @@ const codexProvider = {
  *   - `readOnly` is not enforceable. describeSandbox reports
  *     readOnlyEnforced:false so a review mode is never silently trusted.
  *   - A job cannot end "denied" from a policy prompt. A config deny rule shows
- *     up as tool output, not as a structured denial, so it is not reclassified.
+ *     up as tool output, not as a structured denial, so it is not reclassified;
+ *     acceptance checks are the reliable detector for that case.
  *
  * ----------------------------------------------------------------------------
  * EFFORT: NO PER-RUN FLAG
  * ----------------------------------------------------------------------------
  * `kimi` has no --effort. Thinking effort comes from `[thinking].effort` or a
  * model alias's `default_effort` in config.toml. SpawnSpec.effort is therefore
- * ignored, with a warning event so the operator can see it. buildArgv never
- * emits a flag the CLI does not have. listModels() reports efforts:[] for the
- * same reason: advertising efforts would invite a request we cannot honor.
+ * ignored: forge/service.ts drops it before recording job.json and adds an ack
+ * warning, and the adapter also emits a warning event for direct callers.
+ * buildArgv never emits a flag the CLI does not have. listModels() reports
+ * efforts:[] for the same reason: advertising efforts would invite a request we
+ * cannot honor.
  *
  * ----------------------------------------------------------------------------
  * STREAM-JSON SCHEMA (from prompt-render.ts)
@@ -3961,9 +3982,16 @@ function buildArgv$1(spec) {
     if (spec.model !== undefined && spec.model !== '')
         argv.push('--model', spec.model);
     if (spec.conversation !== undefined && spec.conversation !== '') {
-        // --session requires an EXISTING id. A fresh run gets one from the final
-        // resume_hint line; it cannot choose its own id up front.
-        argv.push('--session', spec.conversation);
+        // --session takes an OPTIONAL value, so `--session <id>` with an id starting
+        // with "-" would be parsed as another option. The attached `=` form binds it
+        // as a value; reject the remaining hostile shape rather than relying on the
+        // CLI's own guard.
+        if (spec.conversation.startsWith('-')) {
+            throw new Error(`kimi session id must not start with "-": ${spec.conversation}`);
+        }
+        // A fresh run gets an id from the final resume_hint line; resume requires an
+        // existing session, and the CLI refuses one from a different cwd.
+        argv.push(`--session=${spec.conversation}`);
     }
     for (const dir of spec.addDirs ?? [])
         argv.push('--add-dir', dir);
@@ -3978,7 +4006,7 @@ function toTokenUsage$1(usage) {
     const pick = (...keys) => {
         for (const k of keys) {
             const v = num(usage, k);
-            if (v !== undefined)
+            if (v !== undefined && v >= 0)
                 return v;
         }
         return undefined;
@@ -4020,6 +4048,20 @@ function toolOutputIsError(content) {
         return true;
     return parsed['error'] !== undefined && parsed['error'] !== null && parsed['error'] !== false;
 }
+/** Render a tool-result value as text without dropping a non-string payload. */
+function contentText(value) {
+    if (typeof value === 'string')
+        return value;
+    if (value === undefined)
+        return '';
+    try {
+        const json = JSON.stringify(value);
+        return json ?? String(value);
+    }
+    catch {
+        return String(value);
+    }
+}
 /**
  * Build the translator. Every line is handled by role because that is the
  * writer's actual discriminator; `type` is only read inside meta lines. A shape
@@ -4030,6 +4072,7 @@ function createKimiTranslator(maxChars) {
     const tx = {
         finalText: '',
         sawError: false,
+        completedTools: 0,
         unrecognised: new Set(),
         onEvent: () => [],
     };
@@ -4037,6 +4080,7 @@ function createKimiTranslator(maxChars) {
     const toolSteps = new Map();
     const toolNames = new Map();
     const started = new Set();
+    const ended = new Set();
     const stepFor = (id) => {
         const known = toolSteps.get(id);
         if (known !== undefined)
@@ -4051,13 +4095,9 @@ function createKimiTranslator(maxChars) {
         const role = str(raw, 'role');
         const type = str(raw, 'type') ?? '';
         // ---- session id: the resume handle arrives on the final meta line -------
-        const sessionId = str(raw, 'session_id') ?? str(raw, 'sessionId');
-        if (sessionId !== undefined && sessionId !== '' && tx.sessionId !== sessionId) {
-            const first = tx.sessionId === undefined;
-            tx.sessionId = sessionId;
-            if (first)
-                out.push({ kind: 'started', at, conversationId: sessionId, raw });
-        }
+        // It is accepted ONLY there. Any other line carrying a session_id is a
+        // shape the writer does not produce; letting it overwrite the handle would
+        // make a resume point at an id the CLI never issued.
         // ---- usage, if a future writer adds it --------------------------------
         const usage = toTokenUsage$1(obj(raw, 'usage') ?? obj(raw, 'tokens') ?? {});
         if (usage !== undefined) {
@@ -4071,8 +4111,22 @@ function createKimiTranslator(maxChars) {
                 return out;
             }
             if (type === 'session.resume_hint') {
-                if (sessionId === undefined || sessionId === '') {
+                const id = str(raw, 'session_id') ?? str(raw, 'sessionId');
+                if (id === undefined || id === '') {
                     out.push({ kind: 'notice', at, level: 'warn', message: 'kimi resume hint without a session_id', raw });
+                }
+                else if (tx.sessionId === undefined) {
+                    tx.sessionId = id;
+                    out.push({ kind: 'started', at, conversationId: id, raw });
+                }
+                else if (tx.sessionId !== id) {
+                    out.push({
+                        kind: 'notice',
+                        at,
+                        level: 'warn',
+                        message: `kimi resume hint changed the session id from ${tx.sessionId} to ${id}; keeping the first`,
+                        raw,
+                    });
                 }
                 return out;
             }
@@ -4116,35 +4170,47 @@ function createKimiTranslator(maxChars) {
                 out.push({ kind: 'text', at, text: content, stream: 'assistant' });
             }
             const calls = raw['tool_calls'];
-            if (Array.isArray(calls)) {
-                for (const rawCall of calls) {
-                    if (rawCall === null || typeof rawCall !== 'object' || Array.isArray(rawCall))
-                        continue;
-                    const call = rawCall;
-                    const fn = obj(call, 'function');
-                    const name = str(fn, 'name') ?? str(call, 'name') ?? 'tool';
-                    const id = str(call, 'id') ?? str(call, 'tool_call_id') ?? `call-${step}`;
-                    let args = fn?.['arguments'] ?? call['arguments'];
-                    if (typeof args === 'string') {
-                        try {
-                            args = JSON.parse(args);
+            if (calls !== undefined) {
+                if (!Array.isArray(calls)) {
+                    tx.unrecognised.add('assistant:tool_calls');
+                    out.push({
+                        kind: 'notice',
+                        at,
+                        level: 'warn',
+                        message: 'kimi assistant tool_calls was not an array (payload preserved in events.jsonl)',
+                        raw,
+                    });
+                }
+                else {
+                    for (const rawCall of calls) {
+                        if (rawCall === null || typeof rawCall !== 'object' || Array.isArray(rawCall))
+                            continue;
+                        const call = rawCall;
+                        const fn = obj(call, 'function');
+                        const name = str(fn, 'name') ?? str(call, 'name') ?? 'tool';
+                        const id = str(call, 'id') ?? str(call, 'tool_call_id') ?? `call-${step}`;
+                        let args = fn?.['arguments'] ?? call['arguments'];
+                        if (typeof args === 'string') {
+                            try {
+                                args = JSON.parse(args);
+                            }
+                            catch {
+                                // Keep the raw string; preview() renders it without inventing structure.
+                            }
                         }
-                        catch {
-                            // Keep the raw string; preview() renders it without inventing structure.
+                        const input = preview(args, maxChars);
+                        const idx = stepFor(id);
+                        toolNames.set(id, name);
+                        if (!started.has(id)) {
+                            started.add(id);
+                            const ref = { stepIndex: idx, tool: name, toolCallId: id };
+                            if (input !== undefined) {
+                                ref.input = input.text;
+                                if (input.truncated)
+                                    ref.truncated = true;
+                            }
+                            out.push({ kind: 'activity-start', at, activity: ref });
                         }
-                    }
-                    const input = preview(args, maxChars);
-                    const idx = stepFor(id);
-                    toolNames.set(id, name);
-                    if (!started.has(id)) {
-                        started.add(id);
-                        const ref = { stepIndex: idx, tool: name, toolCallId: id };
-                        if (input !== undefined) {
-                            ref.input = input.text;
-                            if (input.truncated)
-                                ref.truncated = true;
-                        }
-                        out.push({ kind: 'activity-start', at, activity: ref });
                     }
                 }
             }
@@ -4153,7 +4219,19 @@ function createKimiTranslator(maxChars) {
         // ---- tool result: closes the matching call ----------------------------
         if (role === 'tool') {
             const id = str(raw, 'tool_call_id') ?? str(raw, 'id') ?? `tool-${step}`;
-            const content = str(raw, 'content') ?? '';
+            if (ended.has(id)) {
+                out.push({
+                    kind: 'notice',
+                    at,
+                    level: 'info',
+                    message: `kimi repeated tool result for "${id}" (ignored)`,
+                    raw,
+                });
+                return out;
+            }
+            // The writer uses stringifyToolOutput(), but a future/hostile shape may
+            // hand us an object. Coercing it keeps the payload and its error flag.
+            const content = contentText(raw['content']);
             const output = truncate(content, maxChars);
             const status = toolOutputIsError(content) ? 'error' : 'done';
             const ref = {
@@ -4164,6 +4242,10 @@ function createKimiTranslator(maxChars) {
             };
             if (output.truncated)
                 ref.truncated = true;
+            // A result before its call must not be re-opened by the late call line.
+            started.add(id);
+            ended.add(id);
+            tx.completedTools += 1;
             out.push({ kind: 'activity-end', at, activity: ref, status });
             return out;
         }
@@ -4175,8 +4257,9 @@ function createKimiTranslator(maxChars) {
             return out;
         }
         // ---- fallthrough: never drop data -------------------------------------
-        const label = role ?? type ?? 'unknown';
-        tx.unrecognised.add(`role:${label}`);
+        const label = role ?? (type !== '' ? type : 'unknown');
+        const key = role === undefined ? `type:${label}` : `role:${label}`;
+        tx.unrecognised.add(key);
         out.push({
             kind: 'notice',
             at,
@@ -4209,16 +4292,26 @@ function buildResult$1(args) {
         status = 'error';
         error = `${tx.error ?? 'worker error'}${unrecognised}${stderrClause(exit.stderr)}`;
     }
+    else if (exit.spawnError !== undefined) {
+        // spawnWorker reports ENOENT/bad-cwd through onStderr and resolves with a
+        // null exit code. Without this branch the operator sees "exited null".
+        status = 'spawn-failed';
+        error = `${exit.spawnError}${unrecognised}`;
+    }
     else if (exit.code !== 0) {
         status = 'error';
-        error = `exited ${exit.code}${unrecognised}${stderrClause(exit.stderr)}`;
+        error = exit.code === null
+            ? `${noResultText({ code: exit.code, signal: exit.signal, stderr: '' })}${unrecognised}${stderrClause(exit.stderr)}`
+            : `exited ${exit.code}${unrecognised}${stderrClause(exit.stderr)}`;
     }
     else if (tx.finalText.trim() === '') {
         // Zero exit and no assistant text. With a source-verified parser this is
         // more likely an account/network failure or a silent policy denial than an
-        // empty model reply, and neither is a success.
+        // empty model reply, and neither is a success. A completed tool step is
+        // still worth naming, because it explains where the turn went.
+        const tools = tx.completedTools > 0 ? ` · ${tx.completedTools} tool step(s) completed` : '';
         status = 'malformed';
-        error = `no output${unrecognised}${stderrClause(exit.stderr)}`;
+        error = `no output${unrecognised}${tools}${stderrClause(exit.stderr)}`;
     }
     else {
         status = 'success';
@@ -4340,6 +4433,9 @@ function kimiHarnessDefaults(home = kimiHome()) {
 // ---------------------------------------------------------------------------
 const kimiProvider = {
     name: 'kimi',
+    // Print mode has no --effort; effort lives in config.toml. The service must
+    // not record a request it cannot apply.
+    supportsEffort: false,
     harnessDefaults: () => kimiHarnessDefaults(),
     async available() {
         try {
@@ -4377,6 +4473,7 @@ const kimiProvider = {
                 }]);
         }
         const startedAtMs = Date.now();
+        let spawnError;
         const proc = await spawnWorker({
             provider: 'kimi',
             binary: KIMI_BINARY,
@@ -4391,13 +4488,14 @@ const kimiProvider = {
                 const raw = tryParseObject(line);
                 if (raw === undefined) {
                     // stream-json is one object per line; a banner or a future format
-                    // change must be visible rather than silently dropped.
-                    bus.emit({
-                        kind: 'notice',
-                        at: nowIso(),
-                        level: 'warn',
-                        message: `kimi stdout (non-JSON): ${truncate(line, 400).text}`,
-                    });
+                    // change must be visible rather than silently dropped. publish() also
+                    // puts it in events.jsonl, not only in the live bus.
+                    publish([{
+                            kind: 'notice',
+                            at: nowIso(),
+                            level: 'warn',
+                            message: `kimi stdout (non-JSON): ${truncate(line, 400).text}`,
+                        }]);
                     return;
                 }
                 publish(tx.onEvent(raw));
@@ -4406,7 +4504,9 @@ const kimiProvider = {
                 const text = chunk.trim();
                 if (text === '')
                     return;
-                bus.emit({ kind: 'notice', at: nowIso(), level: 'info', message: truncate(text, 800).text });
+                if (text.startsWith('spawn error:'))
+                    spawnError = text;
+                publish([{ kind: 'notice', at: nowIso(), level: 'info', message: truncate(text, 800).text }]);
             },
         });
         let resolveResult = () => { };
@@ -4420,7 +4520,7 @@ const kimiProvider = {
                 startedAtMs,
                 stateDir,
                 tx,
-                exit: { code, signal, killReason: proc.killReason, stderr: stderrTailOf(proc) },
+                exit: { code, signal, killReason: proc.killReason, stderr: stderrTailOf(proc), ...(spawnError === undefined ? {} : { spawnError }) },
             });
             bus.close();
             writeResultFile(stateDir, final);
@@ -8220,19 +8320,17 @@ function recoveredConversation(result) {
  * concurrency of 3; a spawn path that holds the caller is that failure again.
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * SAFETY: --dangerously-skip-permissions IS OFF BY DEFAULT (EXCEPT FOR agy)
+ * SAFETY: --dangerously-skip-permissions IS OFF BY DEFAULT (EXCEPT FOR agy AND kimi)
  * ─────────────────────────────────────────────────────────────────────────────
  *
  * `SpawnSpec.unrestricted` is a required field and this module defaults it to
- * `false`. It has to: agy runs headless and CANNOT prompt for tool permission, so
- * in the default mode a denied tool is auto-denied, agy reports status "SUCCESS",
- * returns an empty response and exits 0 (verified live — see providers/agy.ts,
- * THE TRAP). Passing the flag by default would be "safe" for the job and
- * dangerous for the user, and the whole point of this repo is that we never
- * quietly choose for them. The one exception is agy, where restricted mode just
- * fails silently, so it defaults to unrestricted (pass unrestricted:false or set
- * AGENT_SMITH_AGY_RESTRICTED=1 to opt out). Everything else is opt-in, per call. It is recorded in
- * job.json as `unrestricted: true` so nobody has to guess later.
+ * `false`. It has to: a provider that can prompt must not bypass prompts by
+ * default. agy and kimi cannot prompt headless: agy's restricted mode silently
+ * denies tools and reports success with an empty response (verified live — see
+ * providers/agy.ts, THE TRAP), so it defaults to unrestricted with an env
+ * opt-out. kimi's print mode force-sets the auto policy and has no restricted
+ * mode, so it is always unrestricted. `job.json` records the effective posture,
+ * not a request that had no effect; everything else is opt-in per call.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * WHY THIS IS NOT A CLI
@@ -8436,15 +8534,27 @@ class ForgeService {
         }
         const timeoutMs = clampTimeout(request.timeoutMs);
         const cwd = request.cwd ?? this.repo;
-        // agy and kimi cannot prompt headless, so restricted means silent denial:
-        // default them on. agy has an env opt-out; kimi's print mode force-sets the
-        // auto policy and has no restricted mode to opt into.
-        const unrestricted = request.unrestricted ?? (provider.name === 'agy'
-            ? process.env['AGENT_SMITH_AGY_RESTRICTED'] !== '1'
-            : provider.name === 'kimi');
+        // agy and kimi cannot prompt headless. agy has an env opt-out; kimi's print
+        // mode force-sets the auto policy and has no restricted mode, so the
+        // EFFECTIVE posture is always unrestricted. Record that, not the request,
+        // and warn when the two differ so the durable job is not a lie.
+        const unrestrictedRequested = request.unrestricted;
+        const unrestricted = provider.name === 'kimi'
+            ? true
+            : unrestrictedRequested ?? (provider.name === 'agy' && process.env['AGENT_SMITH_AGY_RESTRICTED'] !== '1');
         const warnings = [];
-        if (request.model !== undefined || request.effort !== undefined) {
-            warnings.push(...checkAgainstCatalog(provider.name, request.model, request.effort, await this.catalogFor(provider.name)));
+        if (unrestrictedRequested === false && provider.name === 'kimi') {
+            warnings.push('kimi print mode force-sets the auto permission policy; unrestricted:false cannot restrict it. The ack and job.json record the effective posture.');
+        }
+        // A provider that cannot apply a per-run effort must not have one recorded
+        // as applied. Drop it at the service boundary (so job.json is truthful) and
+        // tell the caller; the adapter also emits an event for direct users.
+        const effort = provider.supportsEffort === false ? undefined : request.effort;
+        if (request.effort !== undefined && provider.supportsEffort === false) {
+            warnings.push(`kimi has no per-run effort flag; effort "${request.effort}" was ignored. Set [thinking].effort or a model alias default_effort in config.toml.`);
+        }
+        if (request.model !== undefined || effort !== undefined) {
+            warnings.push(...checkAgainstCatalog(provider.name, request.model, effort, await this.catalogFor(provider.name)));
         }
         let modelResolved = request.model ?? null;
         let modelSource = request.model === undefined ? 'unknown' : 'requested';
@@ -8468,9 +8578,6 @@ class ForgeService {
         const readOnlyEnforced = sandboxInfo?.readOnlyEnforced ?? false;
         if (provider.name === 'agy' && preset?.runsCommands === true && !unrestricted) {
             warnings.push('agy cannot prompt for permission headless; commands will be denied and the job will return an empty result. Retry with unrestricted:true if this job needs shell access.');
-        }
-        if (provider.name === 'kimi' && !unrestricted) {
-            warnings.push('kimi print mode force-sets the auto permission policy; unrestricted:false cannot restrict it. The sandbox field reports the posture actually used.');
         }
         const brief = buildBrief({
             preset,
@@ -8528,7 +8635,7 @@ class ForgeService {
             provider: provider.name,
             mode,
             model: request.model ?? null,
-            effort: request.effort ?? null,
+            effort: effort ?? null,
             cwd,
             prompt,
             // Exactly what was prepended, so the /forge pane's "Show preamble" matches what the worker read.
@@ -8570,7 +8677,7 @@ class ForgeService {
             repo: this.repo,
             timeoutMs,
             unrestricted,
-            note: `queued · ${humanDuration(timeoutMs)} limit · ${unrestricted ? 'unrestricted' : 'approvals on'}`,
+            note: `queued · ${humanDuration(timeoutMs)} limit · ${provider.name === 'kimi' ? 'auto policy (cannot restrict)' : unrestricted ? 'unrestricted' : 'approvals on'}`,
             sandbox,
             sandboxFlags,
             readOnlyRequested,
@@ -8601,7 +8708,7 @@ class ForgeService {
             modelRequested: request.model ?? null,
             modelResolved,
             modelSource,
-            effort: request.effort,
+            effort,
             timeoutMs,
             unrestricted,
             conversation: request.conversation,

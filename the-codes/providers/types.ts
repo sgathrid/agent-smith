@@ -329,6 +329,13 @@ export interface Provider {
   describeSandbox?(spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly' | 'artifactPath'>): SandboxInfo;
 
   /**
+   * True when the CLI can change reasoning effort per run (a flag or a model-id
+   * variant). Default true. When false, forge/service.ts does not ask for one
+   * and records the request as a warning instead of an applied effort.
+   */
+  readonly supportsEffort?: boolean;
+
+  /**
    * The provider's own configured default model/effort, read from its config
    * file only. Sync, no CLI, no network: safe on the spawn hot path.
    */

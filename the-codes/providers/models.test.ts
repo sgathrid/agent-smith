@@ -124,7 +124,7 @@ test('claude: static aliases, default from settings.json', async () => {
 
 test('kimi: parses model aliases, overrides labels, and config default', async () => {
   const home = tmp();
-  writeFileSync(path.join(home, 'config.toml'), 'default_model = "kimi-code/k3"\n\n[thinking]\neffort = "high"\n');
+  writeFileSync(path.join(home, 'config.toml'), '\uFEFFdefault_model = "kimi-code/k3"\r\n\r\n[thinking]\r\neffort = "high"\r\n');
   const json = JSON.stringify({
     providers: { 'managed:kimi-code': { type: 'kimi' } },
     models: {
@@ -148,6 +148,7 @@ test('kimi: parses model aliases, overrides labels, and config default', async (
 
   assert.equal(parseKimiModels('not json'), undefined);
   assert.equal(parseKimiModels('{"models":[]}'), undefined);
+  assert.deepEqual(parseKimiModels('{"models":{"a":null}}'), [], 'a null entry is skipped, not a crash');
   const empty = await listKimiModels(ok('{"models":{}}'), undefined, tmp());
   assert.equal(empty.models.length, 0);
   assert.match(empty.error!, /no models/);
@@ -160,7 +161,7 @@ test('kimi: print mode has no effort flag, and sandbox never claims read-only', 
   assert.deepEqual(argv, [
     '--output-format', 'stream-json',
     '--model', 'kimi-code/k3',
-    '--session', 'sess-1',
+    '--session=sess-1',
     '--add-dir', '/tmp/a',
     '--add-dir', '/tmp/b',
     '-p', 'p',

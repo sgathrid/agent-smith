@@ -124,6 +124,14 @@ const FAMILY_PREFIXES: ReadonlyArray<readonly [string, string]> = [
   ['haiku', 'anthropic'],
   ['gemini', 'google'],
   ['gemma', 'google'],
+  // Kimi Code's managed aliases are Moonshot models. The provider-name fallback
+  // stays 'unknown' because a kimi config can point at any OpenAI-compatible
+  // vendor; only an id that names Moonshot itself claims the family.
+  ['kimi-code/', 'moonshot'],
+  ['moonshot-ai/', 'moonshot'],
+  ['moonshot/', 'moonshot'],
+  ['kimi-', 'moonshot'],
+  ['k3', 'moonshot'],
   ['llama', 'meta'],
   ['qwen', 'alibaba'],
   ['deepseek', 'deepseek'],
@@ -143,6 +151,8 @@ const PROVIDER_FAMILIES: Readonly<Record<string, string>> = {
   anthropic: 'anthropic',
   agy: 'unknown',
   opencode: 'unknown',
+  // Config-dependent: [models] can name any vendor. Moonshot model ids are
+  // resolved by the prefix table above.
   kimi: 'unknown',
 };
 
@@ -459,6 +469,12 @@ export interface ProviderLadder {
   readonly strongerModel?: ModelId | undefined;
   /** A model from a *different* family. Used by t3. */
   readonly crossFamilyModel?: ModelId | undefined;
+  /**
+   * False when the provider cannot change reasoning effort per run. The t1
+   * "same model, more effort" rung is then skipped rather than duplicated.
+   * Default true.
+   */
+  readonly efforts?: boolean | undefined;
   /** Human label used in rationale strings. */
   readonly label?: string | undefined;
 }
@@ -484,7 +500,7 @@ export const DEFAULT_LADDERS: Readonly<Record<string, ProviderLadder>> = {
   // No invented model id: kimi's real default lives in its config.toml, and
   // print mode has no per-run effort flag (routing's effort is ignored by the
   // adapter with a warning).
-  kimi: { label: 'kimi' },
+  kimi: { label: 'kimi', efforts: false },
 };
 
 const TIER_ORDER: readonly CostTier[] = ['t0-cheap', 't1-effort', 't2-stronger', 't3-cross-family'];
@@ -578,6 +594,9 @@ export function nextRouting(
   for (let next = idx + 1; next < TIER_ORDER.length; next++) {
     const tier = TIER_ORDER[next];
     if (tier === undefined) continue;
+    // t1 changes effort, not model. A provider that cannot set effort per run
+    // would spend a full duplicate attempt for nothing; skip the rung.
+    if (tier === 't1-effort' && ladder.efforts === false) continue;
     const model = modelForTier(tier, current.provider, current.model, ladder);
     if (model === undefined) continue;
 

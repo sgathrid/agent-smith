@@ -77,7 +77,7 @@ test('rejected checks are a failure, not done: glyph x and the failed check name
 });
 
 test('every provider is named as itself; agy is not the default', () => {
-  for (const provider of ['codex', 'claude', 'agy', 'opencode']) {
+  for (const provider of ['codex', 'claude', 'agy', 'opencode', 'kimi']) {
     const text = claudeText([notice({ name: 'W', provider, role: 'review' })]);
     assert.match(text, new RegExp(`^Agent Smith · ✓ W \\(${provider} review\\) · done`));
     assert.doesNotMatch(text, /agy-radar/);

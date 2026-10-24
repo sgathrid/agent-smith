@@ -54,11 +54,15 @@
  *     --add-dir <dir>                extra workspace dir; may be repeated
  *     -y, --yolo / --auto / --plan   interactive permission modes
  *
+ * `--session` takes an OPTIONAL value, so the adapter emits the attached
+ * `--session=<id>` form: with a space, an id beginning with "-" would be parsed
+ * as another option. An id beginning with "-" is rejected before spawn too.
+ *
  * CONFLICT: `-p` cannot be combined with `--yolo` (options.ts throws). `--auto`
  * is pointless here because print mode force-sets the auto policy anyway (see
  * below). `-c` is cwd-ambiguous: with several workers in one repository it can
  * resume another worker's session, so this adapter never emits it. Resume uses
- * `--session <id>` only.
+ * `--session=<id>` only.
  *
  * ----------------------------------------------------------------------------
  * PERMISSIONS: PRINT MODE IS ALWAYS UNRESTRICTED
@@ -74,16 +78,19 @@
  *   - `readOnly` is not enforceable. describeSandbox reports
  *     readOnlyEnforced:false so a review mode is never silently trusted.
  *   - A job cannot end "denied" from a policy prompt. A config deny rule shows
- *     up as tool output, not as a structured denial, so it is not reclassified.
+ *     up as tool output, not as a structured denial, so it is not reclassified;
+ *     acceptance checks are the reliable detector for that case.
  *
  * ----------------------------------------------------------------------------
  * EFFORT: NO PER-RUN FLAG
  * ----------------------------------------------------------------------------
  * `kimi` has no --effort. Thinking effort comes from `[thinking].effort` or a
  * model alias's `default_effort` in config.toml. SpawnSpec.effort is therefore
- * ignored, with a warning event so the operator can see it. buildArgv never
- * emits a flag the CLI does not have. listModels() reports efforts:[] for the
- * same reason: advertising efforts would invite a request we cannot honor.
+ * ignored: forge/service.ts drops it before recording job.json and adds an ack
+ * warning, and the adapter also emits a warning event for direct callers.
+ * buildArgv never emits a flag the CLI does not have. listModels() reports
+ * efforts:[] for the same reason: advertising efforts would invite a request we
+ * cannot honor.
  *
  * ----------------------------------------------------------------------------
  * STREAM-JSON SCHEMA (from prompt-render.ts)
@@ -156,7 +163,7 @@ import {
   runCapture,
 } from './discovery.ts';
 import type { RunFn } from './discovery.ts';
-import { stderrClause, timedOutText } from './failure-text.ts';
+import { noResultText, stderrClause, timedOutText } from './failure-text.ts';
 import path from 'node:path';
 
 export const KIMI_BINARY = process.env['AGENT_SMITH_KIMI_BIN'] ?? 'kimi';
@@ -196,9 +203,16 @@ export function buildArgv(spec: SpawnSpec): string[] {
   const argv: string[] = ['--output-format', 'stream-json'];
   if (spec.model !== undefined && spec.model !== '') argv.push('--model', spec.model);
   if (spec.conversation !== undefined && spec.conversation !== '') {
-    // --session requires an EXISTING id. A fresh run gets one from the final
-    // resume_hint line; it cannot choose its own id up front.
-    argv.push('--session', spec.conversation);
+    // --session takes an OPTIONAL value, so `--session <id>` with an id starting
+    // with "-" would be parsed as another option. The attached `=` form binds it
+    // as a value; reject the remaining hostile shape rather than relying on the
+    // CLI's own guard.
+    if (spec.conversation.startsWith('-')) {
+      throw new Error(`kimi session id must not start with "-": ${spec.conversation}`);
+    }
+    // A fresh run gets an id from the final resume_hint line; resume requires an
+    // existing session, and the CLI refuses one from a different cwd.
+    argv.push(`--session=${spec.conversation}`);
   }
   for (const dir of spec.addDirs ?? []) argv.push('--add-dir', dir);
   argv.push('-p', spec.prompt);
@@ -214,7 +228,7 @@ function toTokenUsage(usage: Record<string, unknown>): TokenUsage | undefined {
   const pick = (...keys: string[]): number | undefined => {
     for (const k of keys) {
       const v = num(usage, k);
-      if (v !== undefined) return v;
+      if (v !== undefined && v >= 0) return v;
     }
     return undefined;
   };
@@ -249,6 +263,18 @@ function toolOutputIsError(content: string): boolean {
   return parsed['error'] !== undefined && parsed['error'] !== null && parsed['error'] !== false;
 }
 
+/** Render a tool-result value as text without dropping a non-string payload. */
+function contentText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (value === undefined) return '';
+  try {
+    const json = JSON.stringify(value);
+    return json ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
 export interface KimiTranslator {
   onEvent(raw: Record<string, unknown>): ProviderEvent[];
   /** All assistant text, step by step, in stream order. */
@@ -257,6 +283,8 @@ export interface KimiTranslator {
   error?: string;
   usage?: TokenUsage;
   sessionId?: string;
+  /** Completed tool steps. Used to explain a zero-exit run with no text. */
+  completedTools: number;
   unrecognised: Set<string>;
 }
 
@@ -270,6 +298,7 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
   const tx: KimiTranslator = {
     finalText: '',
     sawError: false,
+    completedTools: 0,
     unrecognised: new Set<string>(),
     onEvent: () => [],
   };
@@ -277,6 +306,7 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
   const toolSteps = new Map<string, number>();
   const toolNames = new Map<string, string>();
   const started = new Set<string>();
+  const ended = new Set<string>();
 
   const stepFor = (id: string): number => {
     const known = toolSteps.get(id);
@@ -293,12 +323,9 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
     const type = str(raw, 'type') ?? '';
 
     // ---- session id: the resume handle arrives on the final meta line -------
-    const sessionId = str(raw, 'session_id') ?? str(raw, 'sessionId');
-    if (sessionId !== undefined && sessionId !== '' && tx.sessionId !== sessionId) {
-      const first = tx.sessionId === undefined;
-      tx.sessionId = sessionId;
-      if (first) out.push({ kind: 'started', at, conversationId: sessionId, raw });
-    }
+    // It is accepted ONLY there. Any other line carrying a session_id is a
+    // shape the writer does not produce; letting it overwrite the handle would
+    // make a resume point at an id the CLI never issued.
 
     // ---- usage, if a future writer adds it --------------------------------
     const usage = toTokenUsage(obj(raw, 'usage') ?? obj(raw, 'tokens') ?? {});
@@ -314,8 +341,20 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
         return out;
       }
       if (type === 'session.resume_hint') {
-        if (sessionId === undefined || sessionId === '') {
+        const id = str(raw, 'session_id') ?? str(raw, 'sessionId');
+        if (id === undefined || id === '') {
           out.push({ kind: 'notice', at, level: 'warn', message: 'kimi resume hint without a session_id', raw });
+        } else if (tx.sessionId === undefined) {
+          tx.sessionId = id;
+          out.push({ kind: 'started', at, conversationId: id, raw });
+        } else if (tx.sessionId !== id) {
+          out.push({
+            kind: 'notice',
+            at,
+            level: 'warn',
+            message: `kimi resume hint changed the session id from ${tx.sessionId} to ${id}; keeping the first`,
+            raw,
+          });
         }
         return out;
       }
@@ -360,33 +399,44 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
       }
 
       const calls = raw['tool_calls'];
-      if (Array.isArray(calls)) {
-        for (const rawCall of calls) {
-          if (rawCall === null || typeof rawCall !== 'object' || Array.isArray(rawCall)) continue;
-          const call = rawCall as Record<string, unknown>;
-          const fn = obj(call, 'function');
-          const name = str(fn, 'name') ?? str(call, 'name') ?? 'tool';
-          const id = str(call, 'id') ?? str(call, 'tool_call_id') ?? `call-${step}`;
+      if (calls !== undefined) {
+        if (!Array.isArray(calls)) {
+          tx.unrecognised.add('assistant:tool_calls');
+          out.push({
+            kind: 'notice',
+            at,
+            level: 'warn',
+            message: 'kimi assistant tool_calls was not an array (payload preserved in events.jsonl)',
+            raw,
+          });
+        } else {
+          for (const rawCall of calls) {
+            if (rawCall === null || typeof rawCall !== 'object' || Array.isArray(rawCall)) continue;
+            const call = rawCall as Record<string, unknown>;
+            const fn = obj(call, 'function');
+            const name = str(fn, 'name') ?? str(call, 'name') ?? 'tool';
+            const id = str(call, 'id') ?? str(call, 'tool_call_id') ?? `call-${step}`;
 
-          let args: unknown = fn?.['arguments'] ?? call['arguments'];
-          if (typeof args === 'string') {
-            try {
-              args = JSON.parse(args) as unknown;
-            } catch {
-              // Keep the raw string; preview() renders it without inventing structure.
+            let args: unknown = fn?.['arguments'] ?? call['arguments'];
+            if (typeof args === 'string') {
+              try {
+                args = JSON.parse(args) as unknown;
+              } catch {
+                // Keep the raw string; preview() renders it without inventing structure.
+              }
             }
-          }
-          const input = preview(args, maxChars);
-          const idx = stepFor(id);
-          toolNames.set(id, name);
-          if (!started.has(id)) {
-            started.add(id);
-            const ref: ActivityRef = { stepIndex: idx, tool: name, toolCallId: id };
-            if (input !== undefined) {
-              ref.input = input.text;
-              if (input.truncated) ref.truncated = true;
+            const input = preview(args, maxChars);
+            const idx = stepFor(id);
+            toolNames.set(id, name);
+            if (!started.has(id)) {
+              started.add(id);
+              const ref: ActivityRef = { stepIndex: idx, tool: name, toolCallId: id };
+              if (input !== undefined) {
+                ref.input = input.text;
+                if (input.truncated) ref.truncated = true;
+              }
+              out.push({ kind: 'activity-start', at, activity: ref });
             }
-            out.push({ kind: 'activity-start', at, activity: ref });
           }
         }
       }
@@ -396,7 +446,19 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
     // ---- tool result: closes the matching call ----------------------------
     if (role === 'tool') {
       const id = str(raw, 'tool_call_id') ?? str(raw, 'id') ?? `tool-${step}`;
-      const content = str(raw, 'content') ?? '';
+      if (ended.has(id)) {
+        out.push({
+          kind: 'notice',
+          at,
+          level: 'info',
+          message: `kimi repeated tool result for "${id}" (ignored)`,
+          raw,
+        });
+        return out;
+      }
+      // The writer uses stringifyToolOutput(), but a future/hostile shape may
+      // hand us an object. Coercing it keeps the payload and its error flag.
+      const content = contentText(raw['content']);
       const output = truncate(content, maxChars);
       const status: ActivityStatus = toolOutputIsError(content) ? 'error' : 'done';
       const ref: ActivityRef = {
@@ -406,6 +468,10 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
         output: output.text,
       };
       if (output.truncated) ref.truncated = true;
+      // A result before its call must not be re-opened by the late call line.
+      started.add(id);
+      ended.add(id);
+      tx.completedTools += 1;
       out.push({ kind: 'activity-end', at, activity: ref, status });
       return out;
     }
@@ -419,8 +485,9 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
     }
 
     // ---- fallthrough: never drop data -------------------------------------
-    const label = role ?? type ?? 'unknown';
-    tx.unrecognised.add(`role:${label}`);
+    const label = role ?? (type !== '' ? type : 'unknown');
+    const key = role === undefined ? `type:${label}` : `role:${label}`;
+    tx.unrecognised.add(key);
     out.push({
       kind: 'notice',
       at,
@@ -443,6 +510,8 @@ interface ExitInfo {
   signal: NodeJS.Signals | null;
   killReason: 'cancelled' | 'timeout' | undefined;
   stderr: string;
+  /** Set when spawnWorker reports that the binary could not be started. */
+  spawnError?: string;
 }
 
 export function buildResult(args: {
@@ -470,15 +539,24 @@ export function buildResult(args: {
   } else if (tx.sawError) {
     status = 'error';
     error = `${tx.error ?? 'worker error'}${unrecognised}${stderrClause(exit.stderr)}`;
+  } else if (exit.spawnError !== undefined) {
+    // spawnWorker reports ENOENT/bad-cwd through onStderr and resolves with a
+    // null exit code. Without this branch the operator sees "exited null".
+    status = 'spawn-failed';
+    error = `${exit.spawnError}${unrecognised}`;
   } else if (exit.code !== 0) {
     status = 'error';
-    error = `exited ${exit.code}${unrecognised}${stderrClause(exit.stderr)}`;
+    error = exit.code === null
+      ? `${noResultText({ code: exit.code, signal: exit.signal, stderr: '' })}${unrecognised}${stderrClause(exit.stderr)}`
+      : `exited ${exit.code}${unrecognised}${stderrClause(exit.stderr)}`;
   } else if (tx.finalText.trim() === '') {
     // Zero exit and no assistant text. With a source-verified parser this is
     // more likely an account/network failure or a silent policy denial than an
-    // empty model reply, and neither is a success.
+    // empty model reply, and neither is a success. A completed tool step is
+    // still worth naming, because it explains where the turn went.
+    const tools = tx.completedTools > 0 ? ` · ${tx.completedTools} tool step(s) completed` : '';
     status = 'malformed';
-    error = `no output${unrecognised}${stderrClause(exit.stderr)}`;
+    error = `no output${unrecognised}${tools}${stderrClause(exit.stderr)}`;
   } else {
     status = 'success';
   }
@@ -600,6 +678,9 @@ export function kimiHarnessDefaults(home: string = kimiHome()): { model?: string
 
 export const kimiProvider: Provider = {
   name: 'kimi',
+  // Print mode has no --effort; effort lives in config.toml. The service must
+  // not record a request it cannot apply.
+  supportsEffort: false,
 
   harnessDefaults: () => kimiHarnessDefaults(),
 
@@ -645,6 +726,7 @@ export const kimiProvider: Provider = {
     }
 
     const startedAtMs = Date.now();
+    let spawnError: string | undefined;
 
     const proc = await spawnWorker({
       provider: 'kimi',
@@ -660,13 +742,14 @@ export const kimiProvider: Provider = {
         const raw = tryParseObject(line);
         if (raw === undefined) {
           // stream-json is one object per line; a banner or a future format
-          // change must be visible rather than silently dropped.
-          bus.emit({
+          // change must be visible rather than silently dropped. publish() also
+          // puts it in events.jsonl, not only in the live bus.
+          publish([{
             kind: 'notice',
             at: nowIso(),
             level: 'warn',
             message: `kimi stdout (non-JSON): ${truncate(line, 400).text}`,
-          });
+          }]);
           return;
         }
         publish(tx.onEvent(raw));
@@ -674,7 +757,8 @@ export const kimiProvider: Provider = {
       onStderr(chunk) {
         const text = chunk.trim();
         if (text === '') return;
-        bus.emit({ kind: 'notice', at: nowIso(), level: 'info', message: truncate(text, 800).text });
+        if (text.startsWith('spawn error:')) spawnError = text;
+        publish([{ kind: 'notice', at: nowIso(), level: 'info', message: truncate(text, 800).text }]);
       },
     });
 
@@ -690,7 +774,7 @@ export const kimiProvider: Provider = {
         startedAtMs,
         stateDir,
         tx,
-        exit: { code, signal, killReason: proc.killReason, stderr: stderrTailOf(proc) },
+        exit: { code, signal, killReason: proc.killReason, stderr: stderrTailOf(proc), ...(spawnError === undefined ? {} : { spawnError }) },
       });
       bus.close();
       writeResultFile(stateDir, final);

@@ -207,7 +207,7 @@ export interface ForgeManifest {
   readonly role?: string;
   readonly latestSummary?: string | null;
   readonly summarySource?: 'worker' | null;
-  /** Registry key: agy | codex | opencode | claude. */
+  /** Registry key: agy | codex | opencode | claude | kimi. */
   readonly provider: string;
   /** Stage/role name: implement | review | moderate | custom. */
   readonly mode: string;

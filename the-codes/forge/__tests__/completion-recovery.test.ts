@@ -112,7 +112,7 @@ test('service startup publishes a provider completion already present on disk', 
   assert.equal(readAcceptance(repo, jobId).state, 'accepted', 'published acceptance is preserved');
 });
 
-for (const [provider, key] of [['agy', 'conversation_id'], ['codex', 'threadId'], ['claude', 'sessionId'], ['opencode', 'sessionId']]) {
+for (const [provider, key] of [['agy', 'conversation_id'], ['codex', 'threadId'], ['claude', 'sessionId'], ['opencode', 'sessionId'], ['kimi', 'sessionId']]) {
   test(`recovers ${provider} resume identity from an older result with no conversation anchor`, () => {
     const { repo, jobId, file, result } = fixture();
     const manifest = JSON.parse(readFileSync(file, 'utf8'));

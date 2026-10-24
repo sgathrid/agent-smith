@@ -250,6 +250,22 @@ test('the ladder stops when a provider has no cross-family model', () => {
   assert.equal(r3, null);
 });
 
+test('a provider without per-run effort skips the t1 rung instead of duplicating the model', () => {
+  const ladders = { kimi: { label: 'kimi', efforts: false } } as const;
+  const kimi = stage('implement', { provider: 'kimi' });
+  const base = planInitialRouting(kimi, ladders);
+  const next = nextRouting({ ...base, model: 'moonshot-ai/kimi-k3' }, escalate('no-progress'), kimi, ladders);
+  assert.equal(next, null, 'no t1 placebo and no stronger/cross-family rung to climb');
+});
+
+test('Moonshot model ids resolve to their own family; the kimi provider name does not guess', () => {
+  assert.equal(familyOf('moonshot-ai/kimi-k3'), 'moonshot');
+  assert.equal(familyOf('kimi-code/k3'), 'moonshot');
+  assert.equal(familyOf('k3-max'), 'moonshot');
+  assert.equal(familyOf('kimi'), 'unknown', 'a config-dependent provider name is not a vendor claim');
+  assert.equal(sameFamily('moonshot-ai/kimi-k3', 'gpt-5.6'), false);
+});
+
 test('no stall means no escalation', () => {
   const base = planInitialRouting(stage('implement'));
   const calm: StallVerdict = { shape: null, escalate: false, because: 'all good', evidence: [] };

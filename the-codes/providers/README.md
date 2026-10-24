@@ -58,7 +58,7 @@ output format changed. It is deliberately distinct from `'error'`.
 
 ## Per-provider invocation
 
-Exact argv. All four are spawned with piped stdio and no TTY.
+Exact argv. All five are spawned with piped stdio and no TTY.
 
 ### agy (Antigravity) — `agy.ts`
 
@@ -209,12 +209,13 @@ and `provider list --json`.
 - **Print mode is always unrestricted.** `run-v2-print.ts` calls `forceAuto()`,
   setting the session to the `auto` permission policy before the turn. There is
   no flag to restrict it and no approval prompt; `--yolo` is rejected alongside
-  `-p`. `unrestricted` therefore defaults to true for kimi, and a requested
+  `-p`. `unrestricted` is therefore always true for kimi, and a requested
   `readOnly` is not enforced. Static deny rules in `config.toml` still apply.
 - **No per-run effort flag.** Effort comes from `[thinking].effort` or a model
-  alias's `default_effort` in `config.toml`. `SpawnSpec.effort` is ignored with
-  a warning event, and discovered models report `efforts: []` rather than
-  inviting a knob the adapter cannot turn.
+  alias's `default_effort` in `config.toml`. `SpawnSpec.effort` is dropped at
+  the service boundary, `job.json` records none, and the ack warns; the adapter
+  also emits an event for direct callers. Discovered models report `efforts: []`
+  rather than inviting a knob the adapter cannot turn.
 - **Resume.** `--session <id>` resumes an existing session, but only from the
   directory that created it: a different cwd exits 1 with "Session ... was
   created under a different directory". `resume_job` defaults to the original
@@ -328,17 +329,18 @@ looked for.
 | Var | Effect |
 |---|---|
 | `AGENT_SMITH_STATE_DIR` | Root for provider-written state. Default `~/.agent-smith/state`. |
-| `AGENT_SMITH_AGY_BIN` / `_CODEX_BIN` / `_OPENCODE_BIN` / `_CLAUDE_BIN` | Binary name or absolute path. |
+| `AGENT_SMITH_AGY_BIN` / `_CODEX_BIN` / `_OPENCODE_BIN` / `_CLAUDE_BIN` / `_KIMI_BIN` | Binary name or absolute path. |
 | `AGENT_SMITH_CODEX_MODEL` / `_CODEX_SANDBOX` | codex `-c model=` / `-s` override. |
 | `AGENT_SMITH_HOME` | Root for alias resolution (`aliases.ts`). Falls back to `~`. Not used by `stateRoot()`. |
 | `AGENT_SMITH_CLAUDE_HOME` / `CLAUDE_CONFIG_DIR` | Claude config dir. Falls back to `~/.claude`. |
 | `AGENT_SMITH_CODEX_HOME` / `CODEX_HOME` | Codex home. Falls back to `~/.codex`. |
+| `AGENT_SMITH_KIMI_HOME` / `KIMI_CODE_HOME` | Kimi config dir: `config.toml` default model. Falls back to `~/.kimi-code`. |
 | `AGENT_SMITH_CLAUDE_SETTING_SOURCES` | `--setting-sources` value; empty string omits the flag. |
 | `AGENT_SMITH_CLAUDE_BARE=1` | Use `--bare`. |
 
 ## stateDir layout
 
-Uniform across all four providers, created before `spawn()` resolves so a
+Uniform across all five providers, created before `spawn()` resolves so a
 consumer can tail immediately:
 
 ```
