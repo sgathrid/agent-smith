@@ -31,9 +31,9 @@ export interface Classified {
 }
 
 
-const READ_TOOLS = new Set(['view_file', 'read', 'list_dir', 'ls', 'list', 'notebookread']);
-const SEARCH_TOOLS = new Set(['grep_search', 'grep', 'glob', 'find_by_name', 'codebase_search', 'search_web', 'web_search', 'websearch', 'webfetch']);
-const EDIT_TOOLS = new Set(['write_to_file', 'replace_file_content', 'edit', 'multiedit', 'write', 'notebookedit', 'patch', 'file_change', 'apply_patch']);
+const READ_TOOLS = new Set(['view_file', 'read', 'read_file', 'list_dir', 'ls', 'list', 'notebookread']);
+const SEARCH_TOOLS = new Set(['grep_search', 'grep', 'glob', 'find_by_name', 'search_files', 'find_files', 'codebase_search', 'search_web', 'web_search', 'websearch', 'webfetch']);
+const EDIT_TOOLS = new Set(['write_to_file', 'replace_file_content', 'edit', 'edit_file', 'write', 'write_file', 'create_file', 'str_replace_editor', 'multiedit', 'notebookedit', 'patch', 'file_change', 'apply_patch']);
 const COMMAND_TOOLS = new Set(['run_command', 'bash', 'shell', 'command_execution', 'exec']);
 
 const PATH_KEYS = ['AbsolutePath', 'TargetFile', 'file_path', 'filePath', 'notebook_path', 'path'];
@@ -140,6 +140,13 @@ const REPEAT_MIN = 4;
 /** Accumulates one job's tool calls into a ProgressDigest. Feed it every activity start and end. */
 export class ProgressTracker {
   private readonly steps = new Map<number, Classified>();
+  /**
+   * Steps whose first ACTIVITY event carried no input. A provider can split the
+   * call into "started, parameters not yet known" and "updated, here they are";
+   * such a step is classified but not counted until the input arrives, so a
+   * later update can upgrade it without double-counting.
+   */
+  private readonly provisional = new Set<number>();
   private readonly read = new Set<string>();
   private readonly editedSet = new Set<string>();
   private edited: string[] = [];
@@ -157,9 +164,32 @@ export class ProgressTracker {
 
   /** A tool call began. Repeated starts of one step (ACTIVE then DONE) are counted once. */
   start(stepIndex: number, tool: string, input: string | null | undefined): void {
-    if (this.steps.has(stepIndex)) return;
+    // Codex passes the shell command line as `tool` with no separate `input`.
+    const effectiveInput = (input ?? '').trim() !== '' ? input! : (/\s/.test(tool.trim()) ? tool.trim() : '');
+    const hasInput = effectiveInput !== '';
+    const seen = this.steps.get(stepIndex);
+    if (seen !== undefined) {
+      // The parameters arrived after the step was first seen: classify for real.
+      if (!this.provisional.has(stepIndex) || !hasInput) return;
+      this.provisional.delete(stepIndex);
+      const upgraded = classify(tool, input);
+      this.steps.set(stepIndex, upgraded);
+      this.apply(upgraded, effectiveInput);
+      return;
+    }
     const c = classify(tool, input);
     this.steps.set(stepIndex, c);
+    if (!hasInput) {
+      // No input means we do not know what ran. Remember the step so `end()`
+      // keeps its verdict, but do not count a likely-misleading call.
+      this.provisional.add(stepIndex);
+      this.resetRepeat();
+      return;
+    }
+    this.apply(c, effectiveInput);
+  }
+
+  private apply(c: Classified, input: string | null | undefined): void {
     switch (c.kind) {
       case 'read': if (c.path) this.read.add(c.path); break;
       case 'search': this.searches += 1; break;
@@ -175,14 +205,26 @@ export class ProgressTracker {
       default: break;
     }
     if (c.kind !== 'other') this.recent = [...this.recent, c].slice(-WINDOW);
+    // An unclassified call is not a repeat of anything: "repeating editing ×17"
+    // is not a fact about the worker, it is a fact about a missing input.
+    if (c.kind === 'other') {
+      this.resetRepeat();
+      return;
+    }
     const key = `${c.kind}\u0000${c.label}\u0000${input ?? ''}`;
     if (key === this.repeatKey) this.repeatCount += 1;
     else { this.repeatKey = key; this.repeatLabel = c.label; this.repeatCount = 1; }
   }
 
+  private resetRepeat(): void {
+    this.repeatKey = '';
+    this.repeatLabel = '';
+    this.repeatCount = 0;
+  }
+
   /** A tool call ended. Only an explicit error marks a test run failed. */
   end(stepIndex: number, tool: string, input: string | null | undefined, status: string): void {
-    if (!this.steps.has(stepIndex)) this.start(stepIndex, tool, input);
+    this.start(stepIndex, tool, input);
     const c = this.steps.get(stepIndex)!;
     if (c.kind === 'test') {
       this.lastTestFailed = status === 'error';

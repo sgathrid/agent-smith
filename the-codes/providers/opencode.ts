@@ -233,11 +233,16 @@ function deepString(o: Record<string, unknown>, keys: string[]): string | undefi
 function findUsage(o: Record<string, unknown>): Record<string, unknown> | undefined {
   const direct = obj(o, 'usage') ?? obj(o, 'tokens');
   if (direct !== undefined) return direct;
-  for (const nest of ['properties', 'info', 'message', 'data']) {
+  for (const nest of ['part', 'properties', 'info', 'message', 'data']) {
     const inner = obj(o, nest);
     if (inner === undefined) continue;
     const u = obj(inner, 'usage') ?? obj(inner, 'tokens');
     if (u !== undefined) return u;
+    // Bus events nest the part one level further: { properties: { part: … } }.
+    const part = obj(inner, 'part');
+    if (part === undefined) continue;
+    const deep = obj(part, 'usage') ?? obj(part, 'tokens');
+    if (deep !== undefined) return deep;
   }
   return undefined;
 }
@@ -247,8 +252,10 @@ function findUsage(o: Record<string, unknown>): Record<string, unknown> | undefi
  *
  * UNVERIFIED field names. opencode is models.dev-driven and its counters are
  * likely to mirror Vercel AI SDK naming (promptTokens / completionTokens /
- * cachedInputTokens) rather than snake_case. We accept BOTH spellings and leave
- * anything we do not recognise undefined. We never invent a total.
+ * cachedInputTokens) rather than snake_case, while `step_finish` parts observed
+ * in the wild use SHORT keys (`input`, `output`, `reasoning`, `cache.read`).
+ * We accept every spelling and leave anything we do not recognise undefined. We
+ * never invent a total.
  */
 function toTokenUsage(usage: Record<string, unknown> | undefined): TokenUsage | undefined {
   if (usage === undefined) return undefined;
@@ -260,17 +267,41 @@ function toTokenUsage(usage: Record<string, unknown> | undefined): TokenUsage | 
     return undefined;
   };
   const out: TokenUsage = {};
-  const input = pick('input_tokens', 'inputTokens', 'promptTokens', 'prompt_tokens');
-  const output = pick('output_tokens', 'outputTokens', 'completionTokens', 'completion_tokens');
-  const thinking = pick('reasoning_tokens', 'thinking_tokens', 'reasoningTokens');
-  const cacheRead = pick('cache_read_tokens', 'cacheReadTokens', 'cachedInputTokens');
+  const input = pick('input_tokens', 'inputTokens', 'promptTokens', 'prompt_tokens', 'input');
+  const output = pick('output_tokens', 'outputTokens', 'completionTokens', 'completion_tokens', 'output');
+  const thinking = pick('reasoning_tokens', 'thinking_tokens', 'reasoningTokens', 'reasoning');
+  const cacheRead = pick('cache_read_tokens', 'cacheReadTokens', 'cachedInputTokens') ?? num(obj(usage, 'cache'), 'read');
+  const cacheWrite = pick('cache_write_tokens', 'cacheWriteTokens') ?? num(obj(usage, 'cache'), 'write');
   const total = pick('total_tokens', 'totalTokens');
   if (input !== undefined) out.inputTokens = input;
   if (output !== undefined) out.outputTokens = output;
   if (thinking !== undefined) out.thinkingTokens = thinking;
   if (cacheRead !== undefined) out.cacheReadTokens = cacheRead;
+  if (cacheWrite !== undefined) out.cacheWriteTokens = cacheWrite;
   if (total !== undefined) out.totalTokens = total;
   return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/**
+ * `step_finish` reports ONE step's counters; a job has many steps. Sum them so
+ * the caller sees the job's usage rather than only the last step's.
+ */
+function addUsage(previous: TokenUsage | undefined, next: TokenUsage): TokenUsage {
+  if (previous === undefined) return { ...next };
+  const out: TokenUsage = { ...previous };
+  const add = (key: keyof TokenUsage): void => {
+    const a = previous[key];
+    const b = next[key];
+    if (a === undefined && b === undefined) return;
+    out[key] = (a ?? 0) + (b ?? 0);
+  };
+  add('inputTokens');
+  add('outputTokens');
+  add('thinkingTokens');
+  add('cacheReadTokens');
+  add('cacheWriteTokens');
+  add('totalTokens');
+  return out;
 }
 
 /** Terminal-state words we might see on a tool part. */
@@ -349,28 +380,84 @@ export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
       return out;
     }
 
+    // ---- part location ------------------------------------------------------
+    // `run --format json` emits `part` at the top level; the server bus nests it
+    // under `properties`. Both carry the same Part object, so find it once.
+    const part = obj(raw, 'part') ?? obj(obj(raw, 'properties') ?? {}, 'part');
+    const partState = obj(part ?? {}, 'state') ?? obj(raw, 'state');
+    const partType = str(part, 'type') ?? '';
+    const isStepStart = type === 'step_start' || type === 'step-start' || partType === 'step-start';
+    const isStepFinish = type === 'step_finish' || type === 'step-finish' || partType === 'step-finish';
+
     // ---- usage, wherever it hides -------------------------------------------
+    // A `step_finish` reports only its own step's counters, so accumulate them.
+    // Other carriers (message.updated) report a running total, so replace.
     const usage = toTokenUsage(findUsage(raw));
     if (usage !== undefined) {
-      tx.usage = usage;
-      out.push({ kind: 'usage', at, usage });
+      let merged: TokenUsage;
+      if (isStepFinish) merged = addUsage(tx.usage, usage);
+      // A step's opening counters must not clobber what previous steps added.
+      else if (isStepStart) merged = tx.usage ?? usage;
+      else merged = usage;
+      tx.usage = merged;
+      out.push({ kind: 'usage', at, usage: merged });
     }
 
     // ---- tool-shaped parts --------------------------------------------------
-    // Detection is by content: a `tool`/`toolName` string plus a state word.
-    const toolName = deepString(raw, ['tool', 'toolName', 'tool_name', 'name']);
-    const stateWord = (deepString(raw, ['state', 'status']) ?? '').toLowerCase();
-    const partId = deepString(raw, ['id', 'partID', 'partId', 'callID', 'callId']) ?? `anon-${step}`;
+    // Detection is by content: a `tool`/`toolName` string plus a state word, or a
+    // tool-shaped `part`. `part.state` is an OBJECT, so its state word has to be
+    // read off it — a plain string search never sees it.
+    const isToolType = type.includes('tool') || partType === 'tool' || partType === 'tool_use';
+    const toolName =
+      str(part, 'tool') ??
+      str(part, 'toolName') ??
+      deepString(raw, ['tool', 'toolName', 'tool_name', 'name']);
+    const stateWord = (
+      str(partState, 'status') ??
+      str(partState, 'state') ??
+      deepString(raw, ['state', 'status']) ??
+      ''
+    ).toLowerCase();
+    // Prefer the CALL id over the part id: the part id can differ between a
+    // streaming update and the completed record for the same call, and splitting
+    // those into two steps double-counts the tool.
+    const partId =
+      str(part, 'callID') ??
+      str(part, 'callId') ??
+      str(partState, 'callID') ??
+      str(partState, 'callId') ??
+      deepString(raw, ['callID', 'callId', 'id', 'partID', 'partId']) ??
+      `anon-${step}`;
 
-    if (toolName !== undefined && (stateWord !== '' || type.includes('tool'))) {
+    if (toolName !== undefined && (stateWord !== '' || isToolType)) {
       const isDone = DONE_WORDS.has(stateWord) || type.endsWith('.completed') || type.endsWith('.done');
       const isErr = ERROR_WORDS.has(stateWord) || type.endsWith('.error');
-      const denied =
-        deepString(raw, ['error', 'message'])?.toLowerCase().includes('denied') === true ||
-        deepString(raw, ['error'])?.toLowerCase().includes('permission') === true;
+      const errorTexts = [
+        str(partState, 'error'),
+        str(obj(partState, 'error'), 'message'),
+        deepString(raw, ['error', 'message']),
+        deepString(raw, ['error']),
+      ];
+      const denied = errorTexts.some(
+        (t) => t !== undefined && (t.toLowerCase().includes('denied') || t.toLowerCase().includes('permission')),
+      );
 
-      const input = preview(obj(raw, 'properties')?.['input'] ?? raw['input'] ?? raw['arguments'], maxChars);
-      const output = preview(raw['output'] ?? raw['result'], maxChars);
+      const inputValue =
+        partState?.['input'] ??
+        part?.['input'] ??
+        obj(raw, 'properties')?.['input'] ??
+        raw['input'] ??
+        raw['arguments'];
+      const input = preview(inputValue, maxChars);
+
+      // An error-state part often reports its only detail under `state.error`,
+      // sometimes as a string and sometimes as `{ message }`.
+      const stateError = partState?.['error'];
+      const stateErrorText =
+        typeof stateError === 'string' ? stateError : str(obj(partState, 'error'), 'message');
+      const outputValue =
+        partState?.['output'] ?? stateErrorText ?? part?.['output'] ?? raw['output'] ?? raw['result'];
+      const output = preview(outputValue, maxChars);
 
       if (!partStep.has(partId)) {
         const idx = step++;
@@ -422,6 +509,12 @@ export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
       return out;
     }
 
+    // ---- step boundaries ----------------------------------------------------
+    // One per assistant step. Their counters were handled above and there is
+    // nothing else a reader needs per step, so they are silent: one info notice
+    // per step would bury real warnings under hundreds of lines of noise.
+    if (isStepStart || isStepFinish) return out;
+
     // ---- session lifecycle --------------------------------------------------
     // Documented bus names (opencode.ai/docs/server "Events"), UNVERIFIED for
     // `run --format json`. Treated as terminal only for the unambiguous ones.
@@ -464,6 +557,10 @@ export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
  */
 const KNOWN_TYPES = new Set([
   'error',
+  'step_start',
+  'step-start',
+  'step_finish',
+  'step-finish',
   'session.idle',
   'session.idle.completed',
   'session.completed',

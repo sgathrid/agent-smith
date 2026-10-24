@@ -3997,13 +3997,20 @@ function findUsage(o) {
     const direct = obj(o, 'usage') ?? obj(o, 'tokens');
     if (direct !== undefined)
         return direct;
-    for (const nest of ['properties', 'info', 'message', 'data']) {
+    for (const nest of ['part', 'properties', 'info', 'message', 'data']) {
         const inner = obj(o, nest);
         if (inner === undefined)
             continue;
         const u = obj(inner, 'usage') ?? obj(inner, 'tokens');
         if (u !== undefined)
             return u;
+        // Bus events nest the part one level further: { properties: { part: … } }.
+        const part = obj(inner, 'part');
+        if (part === undefined)
+            continue;
+        const deep = obj(part, 'usage') ?? obj(part, 'tokens');
+        if (deep !== undefined)
+            return deep;
     }
     return undefined;
 }
@@ -4012,8 +4019,10 @@ function findUsage(o) {
  *
  * UNVERIFIED field names. opencode is models.dev-driven and its counters are
  * likely to mirror Vercel AI SDK naming (promptTokens / completionTokens /
- * cachedInputTokens) rather than snake_case. We accept BOTH spellings and leave
- * anything we do not recognise undefined. We never invent a total.
+ * cachedInputTokens) rather than snake_case, while `step_finish` parts observed
+ * in the wild use SHORT keys (`input`, `output`, `reasoning`, `cache.read`).
+ * We accept every spelling and leave anything we do not recognise undefined. We
+ * never invent a total.
  */
 function toTokenUsage(usage) {
     if (usage === undefined)
@@ -4027,10 +4036,11 @@ function toTokenUsage(usage) {
         return undefined;
     };
     const out = {};
-    const input = pick('input_tokens', 'inputTokens', 'promptTokens', 'prompt_tokens');
-    const output = pick('output_tokens', 'outputTokens', 'completionTokens', 'completion_tokens');
-    const thinking = pick('reasoning_tokens', 'thinking_tokens', 'reasoningTokens');
-    const cacheRead = pick('cache_read_tokens', 'cacheReadTokens', 'cachedInputTokens');
+    const input = pick('input_tokens', 'inputTokens', 'promptTokens', 'prompt_tokens', 'input');
+    const output = pick('output_tokens', 'outputTokens', 'completionTokens', 'completion_tokens', 'output');
+    const thinking = pick('reasoning_tokens', 'thinking_tokens', 'reasoningTokens', 'reasoning');
+    const cacheRead = pick('cache_read_tokens', 'cacheReadTokens', 'cachedInputTokens') ?? num(obj(usage, 'cache'), 'read');
+    const cacheWrite = pick('cache_write_tokens', 'cacheWriteTokens') ?? num(obj(usage, 'cache'), 'write');
     const total = pick('total_tokens', 'totalTokens');
     if (input !== undefined)
         out.inputTokens = input;
@@ -4040,9 +4050,34 @@ function toTokenUsage(usage) {
         out.thinkingTokens = thinking;
     if (cacheRead !== undefined)
         out.cacheReadTokens = cacheRead;
+    if (cacheWrite !== undefined)
+        out.cacheWriteTokens = cacheWrite;
     if (total !== undefined)
         out.totalTokens = total;
     return Object.keys(out).length > 0 ? out : undefined;
+}
+/**
+ * `step_finish` reports ONE step's counters; a job has many steps. Sum them so
+ * the caller sees the job's usage rather than only the last step's.
+ */
+function addUsage(previous, next) {
+    if (previous === undefined)
+        return { ...next };
+    const out = { ...previous };
+    const add = (key) => {
+        const a = previous[key];
+        const b = next[key];
+        if (a === undefined && b === undefined)
+            return;
+        out[key] = (a ?? 0) + (b ?? 0);
+    };
+    add('inputTokens');
+    add('outputTokens');
+    add('thinkingTokens');
+    add('cacheReadTokens');
+    add('cacheWriteTokens');
+    add('totalTokens');
+    return out;
 }
 /** Terminal-state words we might see on a tool part. */
 const DONE_WORDS = new Set(['completed', 'complete', 'done', 'success', 'succeeded', 'finished']);
@@ -4102,24 +4137,73 @@ function createOpencodeTranslator(maxChars) {
             });
             return out;
         }
+        // ---- part location ------------------------------------------------------
+        // `run --format json` emits `part` at the top level; the server bus nests it
+        // under `properties`. Both carry the same Part object, so find it once.
+        const part = obj(raw, 'part') ?? obj(obj(raw, 'properties') ?? {}, 'part');
+        const partState = obj(part ?? {}, 'state') ?? obj(raw, 'state');
+        const partType = str(part, 'type') ?? '';
+        const isStepStart = type === 'step_start' || type === 'step-start' || partType === 'step-start';
+        const isStepFinish = type === 'step_finish' || type === 'step-finish' || partType === 'step-finish';
         // ---- usage, wherever it hides -------------------------------------------
+        // A `step_finish` reports only its own step's counters, so accumulate them.
+        // Other carriers (message.updated) report a running total, so replace.
         const usage = toTokenUsage(findUsage(raw));
         if (usage !== undefined) {
-            tx.usage = usage;
-            out.push({ kind: 'usage', at, usage });
+            let merged;
+            if (isStepFinish)
+                merged = addUsage(tx.usage, usage);
+            // A step's opening counters must not clobber what previous steps added.
+            else if (isStepStart)
+                merged = tx.usage ?? usage;
+            else
+                merged = usage;
+            tx.usage = merged;
+            out.push({ kind: 'usage', at, usage: merged });
         }
         // ---- tool-shaped parts --------------------------------------------------
-        // Detection is by content: a `tool`/`toolName` string plus a state word.
-        const toolName = deepString(raw, ['tool', 'toolName', 'tool_name', 'name']);
-        const stateWord = (deepString(raw, ['state', 'status']) ?? '').toLowerCase();
-        const partId = deepString(raw, ['id', 'partID', 'partId', 'callID', 'callId']) ?? `anon-${step}`;
-        if (toolName !== undefined && (stateWord !== '' || type.includes('tool'))) {
+        // Detection is by content: a `tool`/`toolName` string plus a state word, or a
+        // tool-shaped `part`. `part.state` is an OBJECT, so its state word has to be
+        // read off it — a plain string search never sees it.
+        const isToolType = type.includes('tool') || partType === 'tool' || partType === 'tool_use';
+        const toolName = str(part, 'tool') ??
+            str(part, 'toolName') ??
+            deepString(raw, ['tool', 'toolName', 'tool_name', 'name']);
+        const stateWord = (str(partState, 'status') ??
+            str(partState, 'state') ??
+            deepString(raw, ['state', 'status']) ??
+            '').toLowerCase();
+        // Prefer the CALL id over the part id: the part id can differ between a
+        // streaming update and the completed record for the same call, and splitting
+        // those into two steps double-counts the tool.
+        const partId = str(part, 'callID') ??
+            str(part, 'callId') ??
+            str(partState, 'callID') ??
+            str(partState, 'callId') ??
+            deepString(raw, ['callID', 'callId', 'id', 'partID', 'partId']) ??
+            `anon-${step}`;
+        if (toolName !== undefined && (stateWord !== '' || isToolType)) {
             const isDone = DONE_WORDS.has(stateWord) || type.endsWith('.completed') || type.endsWith('.done');
             const isErr = ERROR_WORDS.has(stateWord) || type.endsWith('.error');
-            const denied = deepString(raw, ['error', 'message'])?.toLowerCase().includes('denied') === true ||
-                deepString(raw, ['error'])?.toLowerCase().includes('permission') === true;
-            const input = preview(obj(raw, 'properties')?.['input'] ?? raw['input'] ?? raw['arguments'], maxChars);
-            const output = preview(raw['output'] ?? raw['result'], maxChars);
+            const errorTexts = [
+                str(partState, 'error'),
+                str(obj(partState, 'error'), 'message'),
+                deepString(raw, ['error', 'message']),
+                deepString(raw, ['error']),
+            ];
+            const denied = errorTexts.some((t) => t !== undefined && (t.toLowerCase().includes('denied') || t.toLowerCase().includes('permission')));
+            const inputValue = partState?.['input'] ??
+                part?.['input'] ??
+                obj(raw, 'properties')?.['input'] ??
+                raw['input'] ??
+                raw['arguments'];
+            const input = preview(inputValue, maxChars);
+            // An error-state part often reports its only detail under `state.error`,
+            // sometimes as a string and sometimes as `{ message }`.
+            const stateError = partState?.['error'];
+            const stateErrorText = typeof stateError === 'string' ? stateError : str(obj(partState, 'error'), 'message');
+            const outputValue = partState?.['output'] ?? stateErrorText ?? part?.['output'] ?? raw['output'] ?? raw['result'];
+            const output = preview(outputValue, maxChars);
             if (!partStep.has(partId)) {
                 const idx = step++;
                 partStep.set(partId, idx);
@@ -4180,6 +4264,12 @@ function createOpencodeTranslator(maxChars) {
             // it doubles as a terminal marker candidate below.
             return out;
         }
+        // ---- step boundaries ----------------------------------------------------
+        // One per assistant step. Their counters were handled above and there is
+        // nothing else a reader needs per step, so they are silent: one info notice
+        // per step would bury real warnings under hundreds of lines of noise.
+        if (isStepStart || isStepFinish)
+            return out;
         // ---- session lifecycle --------------------------------------------------
         // Documented bus names (opencode.ai/docs/server "Events"), UNVERIFIED for
         // `run --format json`. Treated as terminal only for the unambiguous ones.
@@ -4218,6 +4308,10 @@ function createOpencodeTranslator(maxChars) {
  */
 const KNOWN_TYPES = new Set([
     'error',
+    'step_start',
+    'step-start',
+    'step_finish',
+    'step-finish',
     'session.idle',
     'session.idle.completed',
     'session.completed',
@@ -4824,9 +4918,9 @@ function parseInputPreview(preview) {
     catch {
         return {};
     }
-}const READ_TOOLS = new Set(['view_file', 'read', 'list_dir', 'ls', 'list', 'notebookread']);
-const SEARCH_TOOLS = new Set(['grep_search', 'grep', 'glob', 'find_by_name', 'codebase_search', 'search_web', 'web_search', 'websearch', 'webfetch']);
-const EDIT_TOOLS = new Set(['write_to_file', 'replace_file_content', 'edit', 'multiedit', 'write', 'notebookedit', 'patch', 'file_change', 'apply_patch']);
+}const READ_TOOLS = new Set(['view_file', 'read', 'read_file', 'list_dir', 'ls', 'list', 'notebookread']);
+const SEARCH_TOOLS = new Set(['grep_search', 'grep', 'glob', 'find_by_name', 'search_files', 'find_files', 'codebase_search', 'search_web', 'web_search', 'websearch', 'webfetch']);
+const EDIT_TOOLS = new Set(['write_to_file', 'replace_file_content', 'edit', 'edit_file', 'write', 'write_file', 'create_file', 'str_replace_editor', 'multiedit', 'notebookedit', 'patch', 'file_change', 'apply_patch']);
 const COMMAND_TOOLS = new Set(['run_command', 'bash', 'shell', 'command_execution', 'exec']);
 const PATH_KEYS = ['AbsolutePath', 'TargetFile', 'file_path', 'filePath', 'notebook_path', 'path'];
 const COMMAND_KEYS = ['CommandLine', 'command', 'cmd'];
@@ -4936,6 +5030,13 @@ const REPEAT_MIN = 4;
 /** Accumulates one job's tool calls into a ProgressDigest. Feed it every activity start and end. */
 class ProgressTracker {
     steps = new Map();
+    /**
+     * Steps whose first ACTIVITY event carried no input. A provider can split the
+     * call into "started, parameters not yet known" and "updated, here they are";
+     * such a step is classified but not counted until the input arrives, so a
+     * later update can upgrade it without double-counting.
+     */
+    provisional = new Set();
     read = new Set();
     editedSet = new Set();
     edited = [];
@@ -4952,10 +5053,32 @@ class ProgressTracker {
     activeTest = false;
     /** A tool call began. Repeated starts of one step (ACTIVE then DONE) are counted once. */
     start(stepIndex, tool, input) {
-        if (this.steps.has(stepIndex))
+        // Codex passes the shell command line as `tool` with no separate `input`.
+        const effectiveInput = (input ?? '').trim() !== '' ? input : (/\s/.test(tool.trim()) ? tool.trim() : '');
+        const hasInput = effectiveInput !== '';
+        const seen = this.steps.get(stepIndex);
+        if (seen !== undefined) {
+            // The parameters arrived after the step was first seen: classify for real.
+            if (!this.provisional.has(stepIndex) || !hasInput)
+                return;
+            this.provisional.delete(stepIndex);
+            const upgraded = classify(tool, input);
+            this.steps.set(stepIndex, upgraded);
+            this.apply(upgraded, effectiveInput);
             return;
+        }
         const c = classify(tool, input);
         this.steps.set(stepIndex, c);
+        if (!hasInput) {
+            // No input means we do not know what ran. Remember the step so `end()`
+            // keeps its verdict, but do not count a likely-misleading call.
+            this.provisional.add(stepIndex);
+            this.resetRepeat();
+            return;
+        }
+        this.apply(c, effectiveInput);
+    }
+    apply(c, input) {
         switch (c.kind) {
             case 'read':
                 if (c.path)
@@ -4984,6 +5107,12 @@ class ProgressTracker {
         }
         if (c.kind !== 'other')
             this.recent = [...this.recent, c].slice(-8);
+        // An unclassified call is not a repeat of anything: "repeating editing ×17"
+        // is not a fact about the worker, it is a fact about a missing input.
+        if (c.kind === 'other') {
+            this.resetRepeat();
+            return;
+        }
         const key = `${c.kind}\u0000${c.label}\u0000${input ?? ''}`;
         if (key === this.repeatKey)
             this.repeatCount += 1;
@@ -4993,10 +5122,14 @@ class ProgressTracker {
             this.repeatCount = 1;
         }
     }
+    resetRepeat() {
+        this.repeatKey = '';
+        this.repeatLabel = '';
+        this.repeatCount = 0;
+    }
     /** A tool call ended. Only an explicit error marks a test run failed. */
     end(stepIndex, tool, input, status) {
-        if (!this.steps.has(stepIndex))
-            this.start(stepIndex, tool, input);
+        this.start(stepIndex, tool, input);
         const c = this.steps.get(stepIndex);
         if (c.kind === 'test') {
             this.lastTestFailed = status === 'error';
@@ -5723,10 +5856,13 @@ class JobWriter {
             this.touch(at);
             return;
         }
-        if (event.kind === 'activity-start' || event.kind === 'activity-end') {
+        if (event.kind === 'activity-start' || event.kind === 'activity-update' || event.kind === 'activity-end') {
             this.deltaOpen = false;
             const ref = event.activity;
-            const status = event.kind === 'activity-start'
+            const isStart = event.kind === 'activity-start';
+            // An update is an in-flight call: it keeps the row active and must NOT
+            // count as a new tool call when its step was already registered.
+            const status = isStart || event.kind === 'activity-update'
                 ? 'active'
                 : event.status === 'denied'
                     ? 'denied'
@@ -5741,26 +5877,32 @@ class JobWriter {
             // ACTIVE and DONE for the same step_index, and only ACTIVE had the
             // parameters — 14,900 archived records confirm it). So the DONE row
             // INHERITS the input from the ACTIVE row rather than dropping it, which is
-            // what keeps the pane's activity phrase readable on a finished job.
+            // what keeps the pane's activity phrase readable on a finished job. The
+            // same applies to an update, and to a later update that finally names the
+            // parameters the start did not have.
             const idx = this.recent.findIndex((a) => a.stepIndex === ref.stepIndex);
-            const input = ref.input ?? (idx >= 0 ? this.recent[idx]?.input : undefined);
+            const previousRow = idx >= 0 ? this.recent[idx] : undefined;
+            const input = ref.input ?? previousRow?.input;
+            const tool = ref.tool === 'tool_result' ? previousRow?.tool ?? ref.tool : ref.tool;
             const row = {
                 stepIndex: ref.stepIndex,
-                tool: ref.tool === 'tool_result' ? this.recent[idx]?.tool ?? ref.tool : ref.tool,
+                tool,
                 status,
                 ...(input === undefined ? {} : { input }),
             };
-            if (event.kind === 'activity-start' && ref.input !== undefined) {
+            // Only an input that arrived AFTER a start without one is "new" evidence:
+            // re-sent parameters on every update must not fill the attribution buffer.
+            if (ref.input !== undefined && previousRow?.input === undefined) {
                 if (this.toolInputs.length < TOOL_INPUTS_CAP)
                     this.toolInputs += ref.input + '\n';
-                if (classify(row.tool, input).kind === 'edit' && this.editToolInputs.length < TOOL_INPUTS_CAP) {
+                if (classify(tool, input).kind === 'edit' && this.editToolInputs.length < TOOL_INPUTS_CAP) {
                     this.editToolInputs += ref.input + '\n';
                 }
             }
-            if (event.kind === 'activity-start')
-                this.tracker.start(ref.stepIndex, row.tool, input);
-            else
+            if (event.kind === 'activity-end')
                 this.tracker.end(ref.stepIndex, row.tool, input, status);
+            else
+                this.tracker.start(ref.stepIndex, row.tool, ref.input ?? input);
             this.lastActivity = row;
             if (idx >= 0)
                 this.recent[idx] = row;
