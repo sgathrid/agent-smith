@@ -4,7 +4,7 @@ import type { EngineInterface, Register, UiRenderEvent } from 'claude-code';
 
 import type { RadarJob } from '../types/index.d.ts';
 import { isTerminal, jobLabel, oneLine, sanitizeText } from './format.ts';
-import { commandTerminalColumns, findWorker, measurePaneTerminalColumns, paneWidthRequest, recordLaunch, scopeLine, sessionJobs, type Launched } from './dashboard.ts';
+import { commandTerminalColumns, findWorker, measurePaneTerminalColumns, paneWidthRequest, recordLaunch, scopeLine, sessionBoard, sessionJobs, type Launched } from './dashboard.ts';
 import { renderList, renderWorker, type ViewActions, type ViewOptions } from './views.tsx';
 import type { ForgeDetail } from './canonical.ts';
 // ── BAND IMPORTS (band author) ────────────────────────────────────────────────
@@ -653,7 +653,7 @@ export const register: Register = (on) => {
       .register({
         name: 'forge',
         immediate: true,
-        description: 'Show this session\'s workers; /forge all shows the repository\'s; /forge <name> opens one worker',
+        description: 'Show this session\'s workers; /forge all shows the repository\'s; /forge recap prints a factual board; /forge <name> opens one worker',
       })
       .catch(() => {});
     return rest;
@@ -676,14 +676,25 @@ export const register: Register = (on) => {
     const jobs = await read($, bandJobs);
     const mine = await sessionRows($);
     const args = typeof e.args === 'string' ? e.args.trim() : '';
+    // `/forge recap` (and `/forge all recap` / `/forge recap all`) prints the board
+    // instead of opening one worker. `recap` is a verb here, never a worker name,
+    // so it must not fall through to findWorker and toast "No worker matches".
+    const tokens = args.split(/\s+/).filter((token) => token !== '');
+    const isRecap = tokens.includes('recap');
+    const rest = isRecap ? tokens.filter((token) => token !== 'recap') : tokens;
+    const word = rest[0] ?? '';
     // `/forge pane` is the session list, kept because people have typed it.
     // Legacy jobs have no session owner, so legacy is always the repository.
-    const scope = args === 'all' || cfg.legacy ? 'all' : 'session';
-    const query = args === 'pane' || args === 'all' ? '' : args;
+    const scope = word === 'all' || cfg.legacy ? 'all' : 'session';
+    const query = isRecap || word === 'pane' || word === 'all' ? '' : rest.join(' ');
     // This session's worker first; then the repository's, so an older one still opens by name.
     const job = query === '' ? undefined : findWorker(mine, query) ?? findWorker(jobs, query);
     if (query !== '' && job === undefined) await $.ui.toast(`No worker matches "${query}"; showing the list`);
     await update($, listScope, () => scope);
+    if (isRecap) {
+      await openForge($, null);
+      return { text: sessionBoard(scope === 'all' ? jobs : mine, scope, await $.clock.now()) };
+    }
     await openForge($, job?.id ?? null);
     return { text: scopeLine(scope === 'all' ? jobs : mine, scope) };
   });

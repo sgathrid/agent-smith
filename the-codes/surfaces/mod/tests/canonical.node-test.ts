@@ -120,6 +120,17 @@ test('unreadable or malformed canonical state is not reported as an empty projec
   await assert.rejects(readForgeJobs(fs, '/repo', now), /permission denied/);
 });
 
+test('canonical detail reports whether the writer bounded its snapshot', async () => {
+  const detail = async (view: Record<string, unknown>) => readForgeDetail(memoryFs({
+    [`${base}/job.json`]: JSON.stringify({ ...manifest, status: 'succeeded' }),
+    [`${base}/view.json`]: JSON.stringify({ schema: 1, prompt: 'Full task', tools: [], transcript: [], timeline: [], ...view }),
+  }), '/repo', 'job-a', now);
+  assert.equal((await detail({ truncated: true }))?.truncated, true);
+  assert.equal((await detail({ truncated: false }))?.truncated, false);
+  // An older snapshot that never recorded the flag is not reported as truncated.
+  assert.equal((await detail({}))?.truncated, false);
+});
+
 test('canonical: a job with a recorded short reason uses it; an old long error is classified on read', async () => {
   const base = '/repo/.agent-smith/jobs/j1';
   const read = async (extra: Record<string, unknown>) => (await readForgeJobs(memoryFs({

@@ -636,6 +636,55 @@ test('a fresh session over old jobs: an empty band, an empty session list, no li
   expect(host.toasts).toHaveLength(0);
 });
 
+test('/forge recap prints the multi-line session board instead of treating "recap" as a worker name', async ($, on) => {
+  const { host } = forgeHost(on, { ...ada(), ...failedJob('job-failed', RUNNING_NOW) }, ['job-ada','job-failed']);
+  await start($);
+  await launch($, 'job-ada');
+  const mine = await $.command.run({command:'forge',args:'recap'}) as {text?: string};
+  expect(mine.text).toBe('This session · 1 running\n⏺ Ada · reviewer — Running · 5s');
+  expect(host.toasts).toHaveLength(0);
+  // The list pane opened: recap is a board request, never a lookup that misses.
+  const pane = await $.ui.mount(PANE_TARGET);
+  expect(await pane.find({key:'job-job-ada'})).toBeDefined();
+  expect(await pane.find({key:'back'})).toBeUndefined();
+  const board = 'Repository · 1 running · 1 failed\n⏺ Ada · reviewer — Running · 5s\n✗ job-failed — failed · server stopped · 5s';
+  expect(await $.command.run({command:'forge',args:'all recap'})).toMatchObject({text:board});
+  expect(await $.command.run({command:'forge',args:'recap all'})).toMatchObject({text:board});
+  expect(host.toasts).toHaveLength(0);
+});
+
+test('a long run of completed read calls folds into one expandable row, leaving edit, test and active rows', async ($, on) => {
+  const view = JSON.stringify({schema:1,prompt:'Long task instructions',preamble:'',truncated:false,tools:[],transcript:[],timeline:[
+    {kind:'tool',sequence:0,at:iso(RUNNING_NOW),stepIndex:0,tool:'Read',input:'src/a.ts',output:'a',state:'done'},
+    {kind:'tool',sequence:1,at:iso(RUNNING_NOW),stepIndex:1,tool:'Read',input:'src/b.ts',output:'b',state:'done'},
+    {kind:'tool',sequence:2,at:iso(RUNNING_NOW),stepIndex:2,tool:'Grep',input:'{"pattern":"render"}',output:'match',state:'done'},
+    {kind:'tool',sequence:3,at:iso(RUNNING_NOW),stepIndex:3,tool:'Read',input:'src/c.ts',output:'c',state:'done'},
+    {kind:'tool',sequence:4,at:iso(RUNNING_NOW),stepIndex:4,tool:'Edit',input:'{"file_path":"src/a.ts"}',output:'ok',state:'done'},
+    {kind:'tool',sequence:5,at:iso(RUNNING_NOW),stepIndex:5,tool:'Bash',input:'{"command":"cargo test"}',output:'ok',state:'done'},
+    {kind:'tool',sequence:6,at:iso(RUNNING_NOW),stepIndex:6,tool:'Read',input:'src/d.ts',output:'d',state:'active'},
+  ]});
+  const files = canonicalJob('job-rec', {status:'running',name:'Rae',workerId:'rae',role:'implement'}, {'view.json':view});
+  forgeHost(on, files, ['job-rec']);
+  await start($);
+  await launch($, 'job-rec');
+  await $.command.run({command:'forge',args:'rae'});
+  const pane = await $.ui.mount(PANE_TARGET);
+
+  const group = await pane.find({key:'group-0'}) as {props?: Record<string,unknown>} | undefined;
+  expect(String(group?.props?.label)).toBe('✓ read 3 files · 1 search');
+  // Folded rows are not drawn until the group is opened.
+  expect(await pane.find({key:'event-0'})).toBeUndefined();
+  // The edit, the test run and the active call are never folded away.
+  expect(await pane.find({key:'event-4'})).toBeDefined();
+  expect(await pane.find({key:'event-5'})).toBeDefined();
+  expect(await pane.find({key:'event-6'})).toBeDefined();
+
+  await pane.press({key:'group-0'});
+  expect(await pane.find({key:'event-0'})).toBeDefined();
+  expect(await pane.find({key:'event-3'})).toBeDefined();
+});
+
+
 test('after a launch only that job shows; a pipeline launch shows its stage jobs', async ($, on) => {
   const stage = canonicalJob('job-stage', {status:'running',name:'Bo',workerId:'bo',pipeline:'run-7',stage:'build'});
   forgeHost(on, { ...ada(), ...failedJob('job-failed', RUNNING_NOW), ...stage }, ['job-ada','job-failed','job-stage']);

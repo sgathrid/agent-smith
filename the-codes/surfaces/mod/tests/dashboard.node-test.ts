@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { ATTENTION_TTL_MS, PANE_FALLBACK_COLUMNS, PANE_MIN_COLUMNS, checksLabel, commandTerminalColumns, countLine, findWorker, forgeList, groupWorkers, measurePaneTerminalColumns, needsAttention, paneWidthRequest, recordLaunch, scopeLine, sessionJobs, statusLine, workerHeading, workerStatus } from '../hooks/dashboard.ts';
-import { sanitizeText } from '../hooks/format.ts';
+import { ATTENTION_TTL_MS, PANE_FALLBACK_COLUMNS, PANE_MIN_COLUMNS, checksLabel, commandTerminalColumns, condenseTimeline, countLine, findWorker, forgeList, groupWorkers, measurePaneTerminalColumns, needsAttention, paneWidthRequest, recordLaunch, scopeLine, sessionBoard, sessionJobs, statusLine, timelineGroupLabel, turnCount, workerHeading, workerStatus } from '../hooks/dashboard.ts';
+import { oneLine, sanitizeText } from '../hooks/format.ts';
 import type { RadarJob } from '../types/index.d.ts';
 const job=(id:string,extra:Partial<RadarJob>={}):RadarJob=>({id,status:'running',startedAt:100,endedAt:null,toolCount:1,activity:'Read file.ts',task:'Review',warnings:[],report:null,reasoning:null,raw:{},...extra});
 test('the list puts running and checking work first, then settled work most recent first',()=>{
@@ -131,4 +131,95 @@ test('sanitizeText strips ANSI sequences and forbidden controls while preserving
   assert.equal(workerStatus({ ...dirtyJob, status: 'succeeded', acceptance: dirtyAcceptance }), 'checks failed: lint');
   assert.equal(checksLabel(dirtyAcceptance), '✗ lint');
   assert.ok(!/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ud800-\udfff\ufdd0-\ufdef]/u.test(statusLine(dirtyJob, 1000, 50)));
+});
+
+test('a job with no recorded start shows no clock cell, never a fabricated 0s',()=>{
+  const undated=job('undated',{startedAt:null,endedAt:null});
+  assert.equal(statusLine(undated,1_000_000,60),oneLine(workerStatus(undated),60));
+  assert.doesNotMatch(statusLine(undated,1_000_000,60),/0s/);
+  // A dated job keeps its fixed-width clock cell at the end.
+  assert.match(statusLine(job('timed',{startedAt:1000}),11_000,60),/Running · Read file\.ts +10s$/);
+});
+
+test('a finished row carries the evidence the writer recorded, and never a fabricated 0 files',()=>{
+  const accepted:NonNullable<RadarJob['acceptance']>={state:'accepted',checks:[
+    {name:'tests',ok:true,outputTail:''},{name:'lint',ok:true,outputTail:''}]};
+  assert.equal(workerStatus(job('done',{status:'succeeded',endedAt:200,changedFileCount:3,acceptance:accepted})),
+    'done · 3 files changed · checks ✓ 2/2');
+  assert.equal(workerStatus(job('rejected',{status:'succeeded',endedAt:200,changedFileCount:2,
+    acceptance:{state:'rejected',checks:[{name:'lint',ok:false,outputTail:''}]}})),'checks failed: lint · 2 files changed');
+  // An absent count is not zero: the row says nothing about files.
+  assert.equal(workerStatus(job('quiet',{status:'succeeded',endedAt:200})),'done');
+  // A job that edits through the shell still has its digest's file count.
+  const digest={phase:'editing' as const,filesRead:2,searches:0,commands:1,testRuns:0,
+    edited:['a.ts'],editedCount:1,lastTestFailed:false,repeat:null};
+  assert.equal(workerStatus(job('edited',{status:'succeeded',endedAt:200,progress:digest})),'done · 1 file edited');
+  // A steered continuation is named, not hidden.
+  assert.equal(workerStatus(job('steer',{status:'succeeded',endedAt:200,steeredFrom:'job-0',changedFileCount:1})),
+    'done · 1 file changed · after steer');
+  // A failure keeps its reason and adds the same evidence.
+  assert.equal(workerStatus(job('broke',{status:'failed',endedAt:200,failureReason:'timeout',changedFileCount:2})),
+    'failed · timed out · 2 files changed');
+});
+
+test('the /forge recap board is a multi-line factual summary of the fleet',()=>{
+  assert.equal(sessionBoard([],'session',1000),'No workers in this session');
+  assert.equal(sessionBoard([],'all',1000),'repository: no workers yet');
+
+  const single=[job('run',{name:'Ada',workerId:'ada',role:'reviewer',startedAt:1000})];
+  assert.equal(sessionBoard(single,'session',6000),
+    ['This session · 1 running','⏺ Ada · reviewer — Running · Read file.ts · 5s'].join('\n'));
+
+  const fleet=[
+    job('run',{name:'Ada',workerId:'ada',role:'reviewer',startedAt:8000}),
+    job('t1',{name:'Ada',workerId:'ada',role:'reviewer',status:'succeeded',startedAt:1000,endedAt:2000,changedFileCount:1}),
+    job('done',{name:'Bo',workerId:'bo',status:'succeeded',startedAt:2000,endedAt:5000,changedFileCount:3,
+      acceptance:{state:'accepted',checks:[{name:'tests',ok:true,outputTail:''},{name:'lint',ok:true,outputTail:''}]}}),
+    job('boom',{name:'Cy',workerId:'cy',status:'failed',startedAt:1000,endedAt:3000,failureReason:'timeout'}),
+    job('rej',{name:'Di',workerId:'di',status:'succeeded',startedAt:1000,endedAt:2000,changedFileCount:1,
+      acceptance:{state:'rejected',checks:[{name:'cargo',ok:false,outputTail:''}]}}),
+  ];
+  assert.deepEqual(sessionBoard(fleet,'all',10_000).split('\n'),[
+    'Repository · 1 running · 1 failed · 2 done',
+    '⏺ Ada · reviewer · turn 2 — Running · Read file.ts · 2s',
+    '✓ Bo — done · 3 files changed · checks ✓ 2/2 · 3s',
+    '✗ Cy — failed · timed out · 2s',
+    '✗ Di — checks failed: cargo · 1 file changed · 1s',
+  ]);
+  assert.equal(turnCount(fleet[0]!,fleet),2);
+  assert.equal(turnCount(fleet[2]!,fleet),1);
+  assert.equal(turnCount(job('lone'),fleet),1);
+
+  const many=Array.from({length:13},(_,i)=>job(`w${i}`,{workerId:`w${i}`,status:'succeeded',startedAt:1000,endedAt:2000+i}));
+  const capped=sessionBoard(many,'session',10_000).split('\n');
+  assert.equal(capped.length,14); // header + 12 rows + the fold note
+  assert.equal(capped.at(-1),'…and 1 more');
+});
+
+test('consecutive completed read and search calls condense; active, errored and prose rows never do',()=>{
+  const tool=(sequence:number,name:string,input:string,state='done')=>({kind:'tool' as const,sequence,
+    at:'2026-01-01T00:00:00Z',stepIndex:sequence,tool:name,input,output:'',state});
+  const prose=(sequence:number)=>({kind:'assistant' as const,sequence,at:'2026-01-01T00:00:00Z',text:'thinking'});
+  const shape=(items:ReturnType<typeof condenseTimeline>)=>
+    items.map(item=>item.kind==='group'?item.key:`event-${item.event.sequence}`);
+
+  const items=condenseTimeline([
+    tool(0,'Read','a.ts'),tool(1,'Grep','{"pattern":"x"}'),tool(2,'Read','b.ts'),
+    tool(3,'Edit','{"file_path":"a.ts"}'),
+    tool(4,'Read','c.ts'),
+  ]);
+  assert.deepEqual(shape(items),['group-0','event-3','event-4']);
+  const group=items[0]!;
+  assert.equal(group.kind==='group'&&timelineGroupLabel(group.reads,group.searches),'read 2 files · 1 search');
+
+  // Two is not a run, and the timeline's last event never joins one.
+  assert.deepEqual(shape(condenseTimeline([tool(0,'Read','a.ts'),tool(1,'Read','b.ts')])),['event-0','event-1']);
+  assert.deepEqual(shape(condenseTimeline([tool(0,'Read','a.ts'),tool(1,'Read','b.ts'),tool(2,'Read','c.ts')])),
+    ['event-0','event-1','event-2']);
+  // Active and errored calls break a run instead of hiding inside it.
+  assert.deepEqual(shape(condenseTimeline([tool(0,'Read','a.ts'),tool(1,'Read','b.ts'),
+    tool(2,'Read','c.ts','active'),tool(3,'Read','d.ts')])),['event-0','event-1','event-2','event-3']);
+  // Assistant prose breaks a run too.
+  assert.deepEqual(shape(condenseTimeline([tool(0,'Read','a.ts'),prose(1),tool(2,'Read','b.ts'),
+    tool(3,'Read','c.ts'),tool(4,'Read','d.ts')])),['event-0','event-1','event-2','event-3','event-4']);
 });
