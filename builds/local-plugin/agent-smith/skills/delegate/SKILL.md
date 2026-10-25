@@ -1,6 +1,6 @@
 ---
 name: delegate
-description: Delegate a task to a named external Codex, OpenCode, agy, or Claude harness worker using Agent Smith, brief it with context, workspace and acceptance checks, and verify what it reports. Use when asked for an external worker, a second opinion from another model, or a follow-up to an earlier worker.
+description: Delegate a task to a named external Codex, OpenCode, agy, Kimi, or Claude harness worker using Agent Smith, brief it with context, workspace and acceptance checks, and verify what it reports. Use when asked for an external worker, a second opinion from another model, or a follow-up to an earlier worker.
 ---
 
 Agent Smith runs work on external coding agents through this plugin's MCP tools. When the
@@ -49,6 +49,9 @@ What we've seen so far:
 - **codex** has been fast and precise for reviews.
 - **agy** is slower, about 1 to 3 minutes even for a small review, and needs broad access to
   run commands.
+- **kimi** (Kimi Code CLI) is a Moonshot worker. Print mode always runs unrestricted and has
+  no per-run effort flag: a requested effort is ignored. Use its configured model and effort,
+  and tell the user that effort cannot be set per run for kimi.
 - **Claude models**: for a Claude model on its own, use your native Agent tool. It is
   lighter and shows up in the user's own task list. Use Agent Smith's `claude` provider
   only when you need what it adds: executable checks, a stage in a pipeline, a worker you
@@ -58,11 +61,12 @@ What we've seen so far:
 
 ## Permissions
 
-Agy runs unrestricted by default. Headless agy can't ask for permission, so in restricted
-mode it denies its own tools, reports success and does nothing. Other providers run
-restricted by default. Respect the user's choice: if they want agy restricted, pass
-`unrestricted: false` (or they can set `AGENT_SMITH_AGY_RESTRICTED=1`). If a restricted
-worker fails because a tool was denied, ask the user before retrying with
+Agy and Kimi run unrestricted by default. Headless agy can't ask for permission, so in
+restricted mode it denies its own tools, reports success and does nothing. Kimi's print mode
+force-sets the auto policy, so `unrestricted: false` cannot restrict it; the ack's sandbox
+string says so. Other providers run restricted by default. Respect the user's choice: if they
+want agy restricted, pass `unrestricted: false` (or they can set `AGENT_SMITH_AGY_RESTRICTED=1`).
+If a restricted worker fails because a tool was denied, ask the user before retrying with
 `unrestricted: true`.
 
 ## While it runs
@@ -77,7 +81,8 @@ worker finishes its current turn first, but the steer is dropped if that turn fa
 `interrupt` suits a worker heading the wrong way: it stops now, at the cost of the tool call
 in flight. Each steer starts a new turn with its own job ID, so refer to the worker by name;
 `status` lists the earlier turns' reports in `earlierTurns`. Once a worker has finished,
-follow up with `resume_job`.
+follow up with `resume_job`. A kimi worker resumes only from the directory that spawned it, so
+leave `cwd` unset for kimi.
 
 ## Reading the result
 
@@ -94,6 +99,8 @@ When a job fails, its `nextAction` field suggests one next step. In short:
 - orphaned: `resume_job` if it has a conversation handle, otherwise rerun.
 - denied: see Permissions above, or narrow the task if it was already unrestricted.
 - timeout: raise `timeoutMs` or split the task.
+- stalled: kimi reports a tool call only when it finishes, so a quiet kimi job is often just a
+  long command; check again before intervening.
 - network-like error: retry once.
 - empty output: ask the worker what happened with `resume_job`.
 

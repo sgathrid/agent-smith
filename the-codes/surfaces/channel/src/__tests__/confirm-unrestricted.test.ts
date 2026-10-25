@@ -89,13 +89,13 @@ test('AGENT_SMITH_CONFIRM_UNRESTRICTED=0 disables the prompt and the warning', a
 
 test('no prompt for agy, for unrestricted false or absent, or for an inherited setting on resume', async () => {
   const h = harness({ caps: FORM, action: 'decline' });
-  for (const args of [{ ...spawnArgs, provider: 'agy' }, { ...spawnArgs, unrestricted: false }, { mode: 'review', provider: 'claude', prompt: 'x' }]) {
+  for (const args of [{ ...spawnArgs, provider: 'agy' }, { ...spawnArgs, provider: 'kimi' }, { ...spawnArgs, unrestricted: false }, { mode: 'review', provider: 'claude', prompt: 'x' }]) {
     const r = await callTool(h.ctx, 'spawn_job', args);
     assert.equal(r.isError, undefined, text(r));
   }
   assert.equal((await callTool(h.ctx, 'resume_job', { worker: 'Ada', prompt: 'more' })).isError, undefined);
   assert.equal(h.asked.length, 0);
-  assert.equal(h.spawned.length, 4);
+  assert.equal(h.spawned.length, 5);
 });
 
 test('the prompt names an unnamed worker generically and asks only after validation passes', async () => {

@@ -2,7 +2,7 @@
 
 **Claude delegates. Other models work. You see it happen.**
 
-Agent Smith brings Codex, OpenCode, and agy into Claude Code's delegation workflow—with native task-list entries, live progress above your prompt, and worker transcripts inside your terminal.
+Agent Smith brings Codex, OpenCode, agy, and Kimi into Claude Code's delegation workflow—with native task-list entries, live progress above your prompt, and worker transcripts inside your terminal.
 
 - **Delegate across providers.** Ask Claude to hand off a review, implementation, or verification task in plain English.
 - **Keep working.** Workers run in the background. Claude gets notified when they finish, without repeatedly asking for status.
@@ -12,7 +12,7 @@ Agent Smith brings Codex, OpenCode, and agy into Claude Code's delegation workfl
 
 ## Install
 
-You need **Node.js 22.18+**, a current **Claude Code**, and at least one worker CLI (`codex`, `opencode`, or `agy`) installed and authenticated. Agent Smith uses those CLIs and their configured accounts. It also supports separate `claude` workers.
+You need **Node.js 22.18+**, a current **Claude Code**, and at least one worker CLI (`codex`, `opencode`, `agy`, or `kimi`) installed and authenticated. Agent Smith uses those CLIs and their configured accounts. It also supports separate `claude` workers. Kimi Code CLI (`kimi`) is installed from [MoonshotAI/kimi-code](https://github.com/MoonshotAI/kimi-code).
 
 Install for **all your projects**:
 
@@ -96,6 +96,10 @@ Follow-ups resume a finished worker, or steer a running one mid-run.
 
 > Have OpenCode review the proposed design for failure modes before we implement it.
 
+**Second opinion from Moonshot:**
+
+> Have Kimi review the diff for edge cases we missed. Don't edit anything.
+
 Name the provider you want. Claude discovers the installed providers and available models; you don't need to write tool calls or pipeline JSON.
 
 When you attach checks such as `npm test`, Agent Smith runs them after the worker exits and records whether they pass. A finished process and accepted work are tracked separately.
@@ -104,7 +108,7 @@ When you attach checks such as `npm test`, Agent Smith runs them after the worke
 
 Agent Smith is a Claude Code plugin: a delegation skill, an MCP server that runs the provider CLIs, and an integrated terminal UI. Workers appear in the **native task list**; the live band and `/forge` show their activity, results, and check output.
 
-These are external workers integrated into Claude Code, not sessions created by its built-in `Agent` tool. Each uses its own provider's permissions. In particular, **agy runs unrestricted by default**; review restrictions vary by provider. See [provider permissions](docs/CONFIGURATION.md#harness-default-sources).
+These are external workers integrated into Claude Code, not sessions created by its built-in `Agent` tool. Each uses its own provider's permissions. In particular, **agy runs unrestricted by default** and can be restricted, while **Kimi is always unrestricted** — its print mode cannot prompt or be restricted, and read-only modes are not enforced for it. Review restrictions otherwise vary by provider. See [provider permissions](docs/CONFIGURATION.md#harness-default-sources).
 
 For parallel workers editing code, give each its own git worktree. Worker state and reports live in `.agent-smith/` within your project.
 

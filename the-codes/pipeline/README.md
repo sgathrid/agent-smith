@@ -41,6 +41,8 @@ duplicate names, unknown deps and cycles.
    self-consistency is not verification. Not debate (2406.06461).
 6. No stall signal = the stage stays cheap. The common case must be cheap.
 
-Ladder `t0-cheap → t1-effort → t2-stronger → t3-cross-family`, ceiling 2.
+Ladder `t0-cheap → t1-effort → t2-stronger → t3-cross-family`, ceiling 2. A
+provider that cannot change effort per run declares `efforts: false`, so t1 is
+skipped instead of duplicating the same model for no change.
 
-Tests: `node --test the-codes/pipeline/` — 50 tests.
+Tests: `node --test the-codes/pipeline/`.

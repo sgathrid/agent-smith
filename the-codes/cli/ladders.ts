@@ -21,7 +21,7 @@
  * THE THREE FIELDS ARE NOT SYMMETRIC, AND THAT IS DELIBERATE
  * ============================================================================
  *   defaultModel        what t0 uses. Verified, or absent → let the CLI decide.
- *   strongerModel       t2 rung. Absent for agy and opencode: we could not
+ *   strongerModel       t2 rung. Absent for agy, opencode and kimi: we could not
  *                       establish a stronger id, and routing.ts SKIPS a rung a
  *                       provider cannot fill rather than substituting something
  *                       it was not measured for. An absent strongerModel makes
@@ -71,6 +71,15 @@ export const CLI_LADDERS: Readonly<Record<string, ProviderLadder>> = Object.free
     // opencode's model is `provider/model#variant` and comes from the user's
     // own opencode.json. Guessing it here would be guessing at their config.
     label: 'opencode',
+  },
+  kimi: {
+    // No model asserted: kimi's real default is `default_model` in its own
+    // config.toml. Its print mode has no per-run effort flag either, so the
+    // adapter ignores routing's effort with a warning rather than inventing an
+    // alias. `efforts: false` makes the t1 rung skip instead of duplicating the
+    // model for no change.
+    label: 'kimi',
+    efforts: false,
   },
 });
 

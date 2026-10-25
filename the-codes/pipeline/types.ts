@@ -17,7 +17,7 @@
  * root. See `createRunnerRouter` in pipeline.ts for the wiring point.
  */
 
-/** Opaque provider key. Values like 'gemini' | 'codex' | 'claude' | 'agy'. */
+/** Opaque provider key. Values like 'gemini' | 'codex' | 'claude' | 'agy' | 'kimi'. */
 export type ProviderId = string;
 
 /** Opaque model key. Free-form: each provider has its own model naming. */

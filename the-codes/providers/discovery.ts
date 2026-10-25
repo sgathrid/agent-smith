@@ -60,3 +60,15 @@ export function configDir(envNames: readonly string[], fallback: string): string
 export function errMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
+
+/** Top-level `key = "value"` pairs of a config.toml (stops at the first [table]). */
+export function parseTomlTopLevel(text: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (line.startsWith('[')) break;
+    const m = line.match(/^([A-Za-z0-9_.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s#]+))/);
+    if (m) out[m[1]!] = m[2] ?? m[3] ?? m[4] ?? '';
+  }
+  return out;
+}

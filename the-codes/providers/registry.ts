@@ -21,6 +21,7 @@
 import { agyProvider, AGY_BINARY } from './agy.ts';
 import { claudeProvider, CLAUDE_BINARY } from './claude.ts';
 import { codexProvider, CODEX_BINARY } from './codex.ts';
+import { kimiProvider, KIMI_BINARY } from './kimi.ts';
 import { opencodeProvider, OPENCODE_BINARY } from './opencode.ts';
 import type { Provider } from './types.ts';
 
@@ -39,6 +40,7 @@ export const PROVIDERS: readonly Provider[] = Object.freeze([
   codexProvider,
   opencodeProvider,
   claudeProvider,
+  kimiProvider,
 ]);
 
 /** name → Provider. Built once; the set is static. */
@@ -162,6 +164,8 @@ export function binaryFor(providerName: string): string {
       return OPENCODE_BINARY;
     case 'claude':
       return CLAUDE_BINARY;
+    case 'kimi':
+      return KIMI_BINARY;
     default:
       return providerName;
   }
@@ -178,6 +182,7 @@ export const PROVIDER_ROLES: Readonly<Record<string, string>> = Object.freeze({
   codex: 'reviewer. Different model family from the implementer, so its agreement is evidence.',
   opencode: 'generalist. Fast, multi-provider, useful when another vendor is cheaper.',
   claude: 'prober / moderator. Reads the diff and argues about it; sees subagent work via --forward-subagent-text.',
+  kimi: 'Moonshot Kimi Code workhorse. Print mode always auto-approves and has no per-run effort knob.',
 });
 
 /**
@@ -199,4 +204,5 @@ export const PROVIDER_FAMILIES: Readonly<Record<string, 'anthropic' | 'openai' |
     codex: 'openai',
     claude: 'anthropic',
     opencode: 'unknown',
+    kimi: 'unknown',
   });

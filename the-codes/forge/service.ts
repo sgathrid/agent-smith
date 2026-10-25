@@ -27,19 +27,17 @@
  * concurrency of 3; a spawn path that holds the caller is that failure again.
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * SAFETY: --dangerously-skip-permissions IS OFF BY DEFAULT (EXCEPT FOR agy)
+ * SAFETY: --dangerously-skip-permissions IS OFF BY DEFAULT (EXCEPT FOR agy AND kimi)
  * ─────────────────────────────────────────────────────────────────────────────
  *
  * `SpawnSpec.unrestricted` is a required field and this module defaults it to
- * `false`. It has to: agy runs headless and CANNOT prompt for tool permission, so
- * in the default mode a denied tool is auto-denied, agy reports status "SUCCESS",
- * returns an empty response and exits 0 (verified live — see providers/agy.ts,
- * THE TRAP). Passing the flag by default would be "safe" for the job and
- * dangerous for the user, and the whole point of this repo is that we never
- * quietly choose for them. The one exception is agy, where restricted mode just
- * fails silently, so it defaults to unrestricted (pass unrestricted:false or set
- * AGENT_SMITH_AGY_RESTRICTED=1 to opt out). Everything else is opt-in, per call. It is recorded in
- * job.json as `unrestricted: true` so nobody has to guess later.
+ * `false`. It has to: a provider that can prompt must not bypass prompts by
+ * default. agy and kimi cannot prompt headless: agy's restricted mode silently
+ * denies tools and reports success with an empty response (verified live — see
+ * providers/agy.ts, THE TRAP), so it defaults to unrestricted with an env
+ * opt-out. kimi's print mode force-sets the auto policy and has no restricted
+ * mode, so it is always unrestricted. `job.json` records the effective posture,
+ * not a request that had no effect; everything else is opt-in per call.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * WHY THIS IS NOT A CLI
@@ -571,12 +569,34 @@ export class ForgeService {
     }
     const timeoutMs = clampTimeout(request.timeoutMs);
     const cwd = request.cwd ?? this.repo;
-    // agy cannot prompt headless, so restricted means silent denial: default it on. Explicit false (or AGENT_SMITH_AGY_RESTRICTED=1) opts out.
-    const unrestricted = request.unrestricted ?? (provider.name === 'agy' && process.env['AGENT_SMITH_AGY_RESTRICTED'] !== '1');
+    // agy and kimi cannot prompt headless. agy has an env opt-out; kimi's print
+    // mode force-sets the auto policy and has no restricted mode, so the
+    // EFFECTIVE posture is always unrestricted. Record that, not the request,
+    // and warn when the two differ so the durable job is not a lie.
+    const unrestrictedRequested = request.unrestricted;
+    const unrestricted = provider.name === 'kimi'
+      ? true
+      : unrestrictedRequested ?? (
+          provider.name === 'agy' && process.env['AGENT_SMITH_AGY_RESTRICTED'] !== '1'
+        );
     const warnings: string[] = [];
-    if (request.model !== undefined || request.effort !== undefined) {
+    if (unrestrictedRequested === false && provider.name === 'kimi') {
       warnings.push(
-        ...checkAgainstCatalog(provider.name, request.model, request.effort, await this.catalogFor(provider.name)),
+        'kimi print mode force-sets the auto permission policy; unrestricted:false cannot restrict it. The ack and job.json record the effective posture.',
+      );
+    }
+    // A provider that cannot apply a per-run effort must not have one recorded
+    // as applied. Drop it at the service boundary (so job.json is truthful) and
+    // tell the caller; the adapter also emits an event for direct users.
+    const effort = provider.supportsEffort === false ? undefined : request.effort;
+    if (request.effort !== undefined && provider.supportsEffort === false) {
+      warnings.push(
+        `kimi has no per-run effort flag; effort "${request.effort}" was ignored. Set [thinking].effort or a model alias default_effort in config.toml.`,
+      );
+    }
+    if (request.model !== undefined || effort !== undefined) {
+      warnings.push(
+        ...checkAgainstCatalog(provider.name, request.model, effort, await this.catalogFor(provider.name)),
       );
     }
     let modelResolved: string | null = request.model ?? null;
@@ -663,7 +683,7 @@ export class ForgeService {
       provider: provider.name,
       mode,
       model: request.model ?? null,
-      effort: request.effort ?? null,
+      effort: effort ?? null,
       cwd,
       prompt,
       // Exactly what was prepended, so the /forge pane's "Show preamble" matches what the worker read.
@@ -705,7 +725,9 @@ export class ForgeService {
       timeoutMs,
       unrestricted,
       note:
-        `queued · ${humanDuration(timeoutMs)} limit · ${unrestricted ? 'unrestricted' : 'approvals on'}`,
+        `queued · ${humanDuration(timeoutMs)} limit · ${
+          provider.name === 'kimi' ? 'auto policy (cannot restrict)' : unrestricted ? 'unrestricted' : 'approvals on'
+        }`,
       sandbox,
       sandboxFlags,
       readOnlyRequested,
@@ -737,7 +759,7 @@ export class ForgeService {
       modelRequested: request.model ?? null,
       modelResolved,
       modelSource,
-      effort: request.effort,
+      effort,
       timeoutMs,
       unrestricted,
       conversation: request.conversation,

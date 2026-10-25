@@ -3,7 +3,7 @@
   "owner": {
     "name": "Agent Smith"
   },
-  "description": "Delegate work to Codex, OpenCode, agy, and Claude workers with executable acceptance checks and a live worker band.",
+  "description": "Delegate work to Codex, OpenCode, agy, Kimi and Claude workers with executable acceptance checks and a live worker band.",
   "plugins": [
     {
       "name": "agent-smith",

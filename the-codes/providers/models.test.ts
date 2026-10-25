@@ -4,11 +4,12 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { buildArgv as agyArgv, listAgyModels, parseAgyModels, agyProvider } from './agy.ts';
-import { buildArgv as codexArgv, listCodexModels, parseCodexModels, parseTomlTopLevel, codexProvider } from './codex.ts';
+import { buildArgv as codexArgv, listCodexModels, parseCodexModels, codexProvider } from './codex.ts';
 import { buildArgv as claudeArgv, listClaudeModels, claudeProvider } from './claude.ts';
 import { buildArgv as opencodeArgv, listOpencodeModels, opencodeProvider } from './opencode.ts';
+import { buildArgv as kimiArgv, listKimiModels, parseKimiModels, kimiProvider } from './kimi.ts';
 import { getCatalogs, resetCatalogCacheForTest } from './catalog.ts';
-import type { RunFn } from './discovery.ts';
+import { parseTomlTopLevel, type RunFn } from './discovery.ts';
 import type { ModelCatalog, Provider, SpawnSpec } from './types.ts';
 
 const dirs: string[] = [];
@@ -121,6 +122,58 @@ test('claude: static aliases, default from settings.json', async () => {
   assert.match((await listClaudeModels(undefined, home)).error!, /settings\.json/);
 });
 
+test('kimi: parses model aliases, overrides labels, and config default', async () => {
+  const home = tmp();
+  writeFileSync(path.join(home, 'config.toml'), '\uFEFFdefault_model = "kimi-code/k3"\r\n\r\n[thinking]\r\neffort = "high"\r\n');
+  const json = JSON.stringify({
+    providers: { 'managed:kimi-code': { type: 'kimi' } },
+    models: {
+      'kimi-code/k3': {
+        provider: 'managed:kimi-code', model: 'k3', display_name: 'K3',
+        support_efforts: ['low', 'high'], default_effort: 'high',
+        overrides: { displayName: 'K3 custom' },
+      },
+      local: { provider: 'openai', model: 'local-model', max_context_size: 1 },
+    },
+  });
+  const seen: string[][] = [];
+  const cat = await listKimiModels(async (_bin, args) => { seen.push([...args]); return { stdout: json }; }, undefined, home);
+  assert.deepEqual(seen, [['provider', 'list', '--json']]);
+  assert.deepEqual(cat.models.map((m) => m.id), ['kimi-code/k3', 'local']);
+  assert.deepEqual(cat.models[0], { id: 'kimi-code/k3', label: 'K3 custom', efforts: [] });
+  assert.equal(cat.models[1]!.label, 'local-model');
+  assert.equal(cat.defaultModel, 'kimi-code/k3');
+  assert.equal(cat.defaultSource, 'harness-config');
+  assert.equal(cat.verified, true);
+
+  assert.equal(parseKimiModels('not json'), undefined);
+  assert.equal(parseKimiModels('{"models":[]}'), undefined);
+  assert.deepEqual(parseKimiModels('{"models":{"a":null}}'), [], 'a null entry is skipped, not a crash');
+  const empty = await listKimiModels(ok('{"models":{}}'), undefined, tmp());
+  assert.equal(empty.models.length, 0);
+  assert.match(empty.error!, /no models/);
+  const failed = await listKimiModels(async () => ({ stdout: '', error: 'no kimi' }), undefined, tmp());
+  assert.equal(failed.error, 'no kimi');
+});
+
+test('kimi: print mode has no effort flag, and sandbox never claims read-only', () => {
+  const argv = kimiArgv(spec({ model: 'kimi-code/k3', effort: 'high', conversation: 'sess-1', addDirs: ['/tmp/a', '/tmp/b'] }));
+  assert.deepEqual(argv, [
+    '--output-format', 'stream-json',
+    '--model', 'kimi-code/k3',
+    '--session=sess-1',
+    '--add-dir', '/tmp/a',
+    '--add-dir', '/tmp/b',
+    '-p', 'p',
+  ]);
+  assert.equal(argv.includes('--effort'), false);
+  assert.equal(argv.includes('--continue'), false);
+  const sandbox = kimiProvider.describeSandbox!({ unrestricted: true, readOnly: true });
+  assert.equal(sandbox.readOnlyEnforced, false);
+  assert.deepEqual(sandbox.flags, []);
+  assert.match(sandbox.sandbox, /auto permission policy/);
+});
+
 test('codex sandbox: readOnly, unrestricted, default, resume, env override', () => {
   const saved = process.env['AGENT_SMITH_CODEX_SANDBOX'];
   delete process.env['AGENT_SMITH_CODEX_SANDBOX'];
@@ -151,8 +204,8 @@ test('codex sandbox: readOnly, unrestricted, default, resume, env override', () 
   }
 });
 
-test('agy/opencode/claude describeSandbox matches argv and only claims read-only when it enforces it', () => {
-  for (const [p, build] of [[agyProvider, agyArgv], [opencodeProvider, opencodeArgv], [claudeProvider, claudeArgv]] as const) {
+test('agy/opencode/claude/kimi describeSandbox matches argv and only claims read-only when it enforces it', () => {
+  for (const [p, build] of [[agyProvider, agyArgv], [opencodeProvider, opencodeArgv], [claudeProvider, claudeArgv], [kimiProvider, kimiArgv]] as const) {
     for (const unrestricted of [false, true]) {
       const s = { unrestricted, readOnly: true };
       const info = p.describeSandbox!(s);

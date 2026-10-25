@@ -383,7 +383,7 @@ test('an unknown provider is rejected with a list, not a stack trace', async () 
   const service = new ForgeService({ repo: r });
   await assert.rejects(
     () => service.spawnJob({ mode: 'implement', prompt: 'x', provider: 'cdoe' }),
-    /unknown provider "cdoe"\. Known providers: agy, codex, opencode, claude/,
+    /unknown provider "cdoe"\. Known providers: agy, codex, opencode, claude, kimi/,
   );
   // And NOTHING was written: a rejected request leaves no half-created job behind.
   assert.deepEqual(readdirSync(r), []);

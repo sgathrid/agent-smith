@@ -31,8 +31,8 @@ export interface Classified {
 }
 
 
-const READ_TOOLS = new Set(['view_file', 'read', 'read_file', 'list_dir', 'ls', 'list', 'notebookread']);
-const SEARCH_TOOLS = new Set(['grep_search', 'grep', 'glob', 'find_by_name', 'search_files', 'find_files', 'codebase_search', 'search_web', 'web_search', 'websearch', 'webfetch']);
+const READ_TOOLS = new Set(['view_file', 'read', 'read_file', 'list_dir', 'ls', 'list', 'notebookread', 'readmediafile']);
+const SEARCH_TOOLS = new Set(['grep_search', 'grep', 'glob', 'find_by_name', 'search_files', 'find_files', 'codebase_search', 'search_web', 'web_search', 'websearch', 'webfetch', 'fetchurl']);
 const EDIT_TOOLS = new Set(['write_to_file', 'replace_file_content', 'edit', 'edit_file', 'write', 'write_file', 'create_file', 'str_replace_editor', 'multiedit', 'notebookedit', 'patch', 'file_change', 'apply_patch']);
 const COMMAND_TOOLS = new Set(['run_command', 'bash', 'shell', 'command_execution', 'exec']);
 
@@ -99,7 +99,8 @@ function firstString(params: Record<string, unknown>, keys: readonly string[], r
 /**
  * One tool call → its kind and a phrase. Every provider's tool vocabulary:
  * agy (view_file, run_command, …), claude (Read, Edit, Bash, …), opencode (read,
- * edit, bash, …) and codex (a shell command line as the tool, or file_change).
+ * edit, bash, …), codex (a shell command line as the tool, or file_change) and
+ * kimi (Read, Write, Edit, Grep, Glob, Bash, … — PascalCase, matched lowercased).
  * Input may be truncated JSON; a parse failure falls back to the bare tool name.
  */
 export function classify(tool: string, input: string | null | undefined): Classified {

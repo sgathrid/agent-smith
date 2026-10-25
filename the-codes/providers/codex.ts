@@ -112,7 +112,7 @@ import type {
   WorkerHandle,
 } from './types.ts';
 import type { ListModelsOptions, ModelCatalog, ModelInfo, SandboxInfo } from './types.ts';
-import { DEFAULT_DISCOVERY_TIMEOUT_MS, configDir, errMessage, readTextSafe, runCapture } from './discovery.ts';
+import { DEFAULT_DISCOVERY_TIMEOUT_MS, configDir, errMessage, parseTomlTopLevel, readTextSafe, runCapture } from './discovery.ts';
 import type { RunFn } from './discovery.ts';
 import path from 'node:path';
 import { noResultText, stderrClause, timedOutText } from './failure-text.ts';
@@ -674,18 +674,6 @@ export function parseCodexModels(text: string): ModelInfo[] | undefined {
       info.defaultEffort = r['default_reasoning_level'];
     }
     out.push(info);
-  }
-  return out;
-}
-
-/** Top-level `key = "value"` pairs of a config.toml (stops at the first [table]). */
-export function parseTomlTopLevel(text: string): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const raw of text.split(/\r?\n/)) {
-    const line = raw.trim();
-    if (line.startsWith('[')) break;
-    const m = line.match(/^([A-Za-z0-9_.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s#]+))/);
-    if (m) out[m[1]!] = m[2] ?? m[3] ?? m[4] ?? '';
   }
   return out;
 }

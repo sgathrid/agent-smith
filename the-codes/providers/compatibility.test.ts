@@ -12,9 +12,16 @@ const help = {
   codex: '--json --skip-git-repo-check -C --model -c -s --add-dir --dangerously-bypass-approvals-and-sandbox',
   claude: '--print --output-format --verbose --forward-subagent-text --model --effort --add-dir --permission-mode --permission-prompts --dangerously-skip-permissions --allowedTools --disallowedTools --resume --bare --setting-sources',
   opencode: '--standalone --format --model --auto --session',
+  kimi: '--prompt --output-format --model --session --add-dir',
 };
-const fakeProbe = (provider: keyof typeof help): ProbeCommand => async (_binary, args) =>
-  ({ output: args[0] === '--version' ? `${provider} 9.0.0` : help[provider] });
+const fakeProbe = (provider: keyof typeof help): ProbeCommand => async (_binary, args) => {
+  if (args[0] === '--version') return { output: `${provider} 9.0.0` };
+  // Kimi's two probes are different surfaces: the root prompt flags and the
+  // provider subcommand's --json. Returning the same text for both would make
+  // the --json requirement untestable.
+  if (provider === 'kimi' && args[0] === 'provider') return { output: '--json' };
+  return { output: help[provider] };
+};
 
 for (const provider of Object.keys(help) as (keyof typeof help)[]) {
   test(`doctor recognizes ${provider} adapter flags from bounded version and help commands`, async () => {
@@ -30,7 +37,9 @@ for (const provider of Object.keys(help) as (keyof typeof help)[]) {
     assert.equal(result.version, `${provider} 9.0.0`);
     assert.deepEqual(calls, provider === 'codex'
       ? [['--version'], ['exec', '--help'], ['exec', 'resume', '--help']]
-      : [['--version'], ...(provider === 'opencode' ? [['run', '--help']] : [['--help']])]);
+      : provider === 'kimi'
+        ? [['--version'], ['--help'], ['provider', 'list', '--help']]
+        : [['--version'], ...(provider === 'opencode' ? [['run', '--help']] : [['--help']])]);
   });
 }
 
@@ -55,6 +64,13 @@ test('OpenCode requires both standalone and auto with whole flag boundaries', as
     ({ output: args[0] === '--version' ? '2.0.0' : '--standalone-other --auto-approve --format --model --session' }) });
   assert.equal(result.state, 'incompatible');
   assert.match(result.reason, /missing --standalone, --auto/);
+});
+
+test('Kimi requires provider list --json, not just the prompt flags', async () => {
+  const result = await checkCompatibility('kimi', 'kimi', { probe: async (_binary, args) =>
+    ({ output: args[0] === '--version' ? '2.1.1' : args[0] === '--help' ? help.kimi : '--help' }) });
+  assert.equal(result.state, 'incompatible');
+  assert.match(result.reason, /provider list --help: missing --json/);
 });
 
 for (const phase of ['--version', '--help']) {
@@ -101,7 +117,7 @@ test('CLI doctor reports adapter compatibility using the configured binaries', (
   writeFileSync(binary, `#!${process.execPath}\nconst args = process.argv.slice(2);\nif (args.join(' ') === '--version') console.log('fake 9.0.0');\nelse if (args.at(-1) === '--help') console.log(${JSON.stringify(Object.values(help).join(' '))});\nelse process.exit(9);\n`);
   chmodSync(binary, 0o755);
   const env = { ...process.env };
-  for (const name of ['AGY', 'CODEX', 'CLAUDE', 'OPENCODE']) env[`AGENT_SMITH_${name}_BIN`] = binary;
+  for (const name of ['AGY', 'CODEX', 'CLAUDE', 'OPENCODE', 'KIMI']) env[`AGENT_SMITH_${name}_BIN`] = binary;
   const result = spawnSync(process.execPath, [fileURLToPath(new URL('../../scripts/agent-smith.mjs', import.meta.url)), 'doctor'],
     { env, encoding: 'utf8', timeout: 10_000 });
   assert.equal(result.status, 0, result.stderr);

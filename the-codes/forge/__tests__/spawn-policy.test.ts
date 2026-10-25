@@ -313,3 +313,32 @@ test('agy preflight warns when a command-running mode is restricted', async () =
   const review = await service.spawnJob({ mode: 'review', name: 'r', prompt: 'x' });
   assert.equal(review.warnings, undefined);
 });
+
+test('kimi records the effective posture and warns when a caller asks for restricted', async () => {
+  const { service } = svc(fakeProvider('kimi'));
+  const dflt = await service.spawnJob({ mode: 'implement', prompt: 'x' });
+  assert.equal(dflt.unrestricted, true, 'kimi print mode cannot prompt; default it on');
+  assert.match(dflt.note ?? '', /auto policy \(cannot restrict\)/);
+  assert.equal(dflt.warnings, undefined);
+
+  const restricted = await service.spawnJob({ mode: 'implement', name: 'kimi-restricted', prompt: 'x', unrestricted: false });
+  assert.equal(restricted.unrestricted, true, 'the record is the posture actually used, not the request');
+  assert.match(restricted.note ?? '', /auto policy \(cannot restrict\)/);
+  assert.ok(restricted.warnings?.some((w) => /kimi print mode force-sets the auto permission policy/.test(w)));
+  const job = JSON.parse(readFileSync(path.join(restricted.dir, 'job.json'), 'utf8'));
+  assert.equal(job.unrestricted, true, 'job.json must not claim a restriction that did not happen');
+
+  const explicit = await service.spawnJob({ mode: 'implement', name: 'kimi-explicit', prompt: 'x', unrestricted: true });
+  assert.equal(explicit.warnings, undefined);
+});
+
+test('a provider without per-run effort control records no effort and warns', async () => {
+  const fake = fakeProvider('kimi');
+  (fake.provider as Provider & { supportsEffort?: boolean }).supportsEffort = false;
+  const { service } = svc(fake);
+  const ack = await service.spawnJob({ mode: 'implement', prompt: 'x', effort: 'high' });
+  assert.ok(ack.warnings?.some((w) => /has no per-run effort flag/.test(w)));
+  const job = JSON.parse(readFileSync(path.join(ack.dir, 'job.json'), 'utf8'));
+  assert.equal(job.effort, null, 'an effort that was not applied must not be recorded as if it was');
+  assert.equal(fake.specs[0]?.effort, undefined, 'the adapter is not asked to honor an impossible knob');
+});

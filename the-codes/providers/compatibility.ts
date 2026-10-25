@@ -25,6 +25,12 @@ const HELP: Record<string, readonly { args: readonly string[]; flags: readonly s
     '--model', '--effort', '--add-dir', '--permission-mode', '--permission-prompts',
     '--dangerously-skip-permissions', '--allowedTools', '--disallowedTools', '--resume', '--bare', '--setting-sources'] }],
   opencode: [{ args: ['run', '--help'], flags: ['--standalone', '--format', '--model', '--auto', '--session'] }],
+  kimi: [
+    { args: ['--help'], flags: ['--prompt', '--output-format', '--model', '--session', '--add-dir'] },
+    // The archived Python kimi-cli has no `provider list --json`; requiring it
+    // keeps doctor from blessing that binary for this adapter.
+    { args: ['provider', 'list', '--help'], flags: ['--json'] },
+  ],
 };
 
 export const probeCommand: ProbeCommand = (binary, args, timeoutMs) => new Promise(resolve => {

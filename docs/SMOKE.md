@@ -6,6 +6,6 @@ The fake run covers tool discovery, a solo review followed by resume by worker n
 
 Pass `--keep` to preserve the scratch root and all MCP evidence for inspection. The summary prints its path. Remove that directory manually when finished.
 
-Pass `--live` to open a separate MCP server process without the fake executable overrides, refresh installed-provider and catalog discovery, then submit one short review prompt to each available provider. Use `--providers=agy,codex` to bound live runs; unknown or unavailable names fail explicitly. The runner leaves model selection to each provider's configured default and does not hardcode model IDs. Live calls may use provider quota. Add `--keep` to preserve discovery and job evidence.
+Pass `--live` to open a separate MCP server process without the fake executable overrides, refresh installed-provider and catalog discovery, then submit one short review prompt to each available provider. Use `--providers=agy,codex,kimi` to bound live runs; unknown or unavailable names fail explicitly. The runner leaves model selection to each provider's configured default and does not hardcode model IDs. Live calls may use provider quota. Add `--keep` to preserve discovery and job evidence.
 
 The runner requires Node 22.18 or newer and the MCP SDK installed by `the-codes/surfaces/channel`. It accepts no repo path override so the scratch boundary stays explicit.
