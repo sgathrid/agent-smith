@@ -1,6 +1,5 @@
 /** nextAction taxonomy + git changed-files reference. */
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, unlinkSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -8,6 +7,7 @@ import { test } from 'node:test';
 
 import { FILES, ORPHAN_REASON, diffChangedFiles, jobFile, nextActionFor, CHANGED_FILES_CAP, type ForgeManifest } from '../format.ts';
 import { JobWriter, parsePorcelainZ } from '../writer.ts';
+import { initGitRepo } from '../testing/git-repo.ts';
 import type { JobResult } from '../../providers/types.js';
 
 const F = { status: 'failed' } as const;
@@ -70,15 +70,9 @@ test('parsePorcelainZ handles renames and untracked', () => {
   assert.deepEqual(parsePorcelainZ(' M a.ts\0R  new.ts\0old.ts\0?? b.ts\0'), ['a.ts', 'b.ts', 'new.ts', 'old.ts']);
 });
 
-function sh(cwd: string, ...a: string[]): void {
-  execFileSync('git', a, { cwd, stdio: 'ignore' });
-}
 function gitRepo(): string {
   const r = mkdtempSync(path.join(tmpdir(), 'smith-git-'));
-  sh(r, 'init', '-q');
-  sh(r, 'config', 'user.email', 't@t'); sh(r, 'config', 'user.name', 't'); sh(r, 'config', 'commit.gpgsign', 'false');
-  writeFileSync(path.join(r, 'a.txt'), 'a'); writeFileSync(path.join(r, 'b.txt'), 'b'); writeFileSync(path.join(r, 'c.txt'), 'c');
-  sh(r, 'add', '.'); sh(r, 'commit', '-qm', 'init');
+  initGitRepo(r, { 'a.txt': 'a', 'b.txt': 'b', 'c.txt': 'c' });
   return r;
 }
 function result(): JobResult {

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -10,8 +10,9 @@ import { buildArgv as buildOpencodeArgv, createOpencodeTranslator } from './open
 import { buildArgv as buildKimiArgv, buildResult as buildKimiResult, createKimiTranslator } from './kimi.ts';
 import { spawnWorker } from './ndjson.ts';
 import type { ProviderEvent, SpawnSpec } from './types.ts';
+import { trackedTempDirs } from '../forge/testing/tmp.ts';
 
-const tmpDirs: string[] = [];
+const tempDir = trackedTempDirs('agent-smith-provider-test-');
 
 test('Codex model-refresh timeout is informational; unrelated stderr errors remain warnings', () => {
   assert.equal(codexStderrLevel('ERROR codex_core::models_manager: failed to refresh available models: request timed out'), 'info');
@@ -20,12 +21,6 @@ test('Codex model-refresh timeout is informational; unrelated stderr errors rema
   assert.equal(codexStderrLevel('ERROR authentication failed; failed to refresh available models: request timed out'), 'warn');
   assert.equal(codexStderrLevel('Not inside a trusted directory'), 'warn');
 });
-
-function tempDir(): string {
-  const dir = mkdtempSync(path.join(os.tmpdir(), 'agent-smith-provider-test-'));
-  tmpDirs.push(dir);
-  return dir;
-}
 
 function spec(overrides: Partial<SpawnSpec> = {}): SpawnSpec {
   return {
@@ -37,10 +32,6 @@ function spec(overrides: Partial<SpawnSpec> = {}): SpawnSpec {
     ...overrides,
   };
 }
-
-test.after(() => {
-  for (const dir of tmpDirs) rmSync(dir, { recursive: true, force: true });
-});
 
 test('Codex argv applies effort and resumes the supplied thread', () => {
   const argv = buildCodexArgv(spec({

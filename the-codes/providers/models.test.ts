@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -11,15 +11,10 @@ import { buildArgv as kimiArgv, listKimiModels, parseKimiModels, kimiProvider } 
 import { getCatalogs, resetCatalogCacheForTest } from './catalog.ts';
 import { parseTomlTopLevel, type RunFn } from './discovery.ts';
 import type { ModelCatalog, Provider, SpawnSpec } from './types.ts';
+import { trackedTempDirs } from '../forge/testing/tmp.ts';
 
-const dirs: string[] = [];
-const tmp = (): string => {
-  const d = mkdtempSync(path.join(os.tmpdir(), 'as-models-'));
-  dirs.push(d);
-  return d;
-};
+const tmp = trackedTempDirs('as-models-');
 test.after(() => {
-  for (const d of dirs) rmSync(d, { recursive: true, force: true });
   resetCatalogCacheForTest();
 });
 
