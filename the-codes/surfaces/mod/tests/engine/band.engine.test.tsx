@@ -32,6 +32,7 @@ import { describe, expect, mock, test } from 'claude-code/testing';
 import type { BandLine, BandBudget } from '../../hooks/band.ts';
 import { BAND_ROWS, buildLine, isShown, noColor, rowBudget } from '../../hooks/band.ts';
 import type { RadarJob } from '../../../types/index.d.ts';
+import { proseText } from '../../hooks/views.tsx';
 
 // ── fixtures, verbatim from the corpus ──────────────────────────────────────
 
@@ -1216,5 +1217,17 @@ describe('completion notices', () => {
     await clock.advance(3000);
     expect(said.logs).toEqual([]);
     expect(said.prompts).toEqual([]);
+  });
+});
+
+describe('proseText', () => {
+  test('marks plain prose and leaves markdown blocks intact', () => {
+    expect(proseText('Done: tests pass.')).toBe('● Done: tests pass.');
+    expect(proseText('\n  Leading space trimmed.')).toBe('● Leading space trimmed.');
+    expect(proseText('    const a = 1;\n    const b = 2;')).toBe('    const a = 1;\n    const b = 2;');
+    expect(proseText('-----')).toBe('-----');
+    expect(proseText('* * *\nnext')).toBe('* * *\nnext');
+    expect(proseText('- item')).toBe('- item');
+    expect(proseText('<details>x</details>')).toBe('<details>x</details>');
   });
 });
