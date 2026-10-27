@@ -50,7 +50,6 @@ import {
 import type { RadarJob } from '../types/index.d.ts';
 
 export { elapsedCell, isTerminal, pickColor, pickGlyph } from './format.ts';
-export { fitCell, formatJobLine, formatJobRow, paneColumns } from './format.ts';
 
 /* ────────────────────────────────────────────────────────────────────────────
  * TIMING (TERMINAL-UI.md L147-162)

@@ -74,7 +74,7 @@
  * that to `failed`, never to `succeeded`.
  */
 
-import { describeActivity, describeTool, parseInputPreview } from './format.ts';
+import { describeActivity, describeTool } from './tools-describe.ts';
 import { STALL_GRACE_MS } from './stale.ts';
 import { REASONS } from './reasons.ts';
 import type { RadarJob, RadarStatus, ToolEntry } from '../types/index.d.ts';
@@ -98,7 +98,7 @@ export interface FsLike {
 }
 
 /** agy-staff's jobs directory, relative to a repo root. */
-export const JOBS_SUFFIX = ['.agy-staff', 'jobs'] as const;
+const JOBS_SUFFIX = ['.agy-staff', 'jobs'] as const;
 
 const SPEC = '.spec.json';
 const PROGRESS = '.progress.json';
@@ -117,7 +117,7 @@ export function jobsDir(repo: string): string {
 const ORPHAN_REASON = REASONS.serverStopped;
 
 /** `<repo>/.agent-smith/jobs/<id>/orphaned`, from `<repo>/.agy-staff/jobs`. */
-export function orphanMarker(dir: string, id: string): string {
+function orphanMarker(dir: string, id: string): string {
   return `${dir.replace(/\/\.agy-staff\/jobs$/, '/.agent-smith/jobs')}/${id}/orphaned`;
 }
 

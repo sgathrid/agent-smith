@@ -19,3 +19,15 @@
  * cold target directory.
  */
 export const STALL_GRACE_MS = 15 * 60 * 1000;
+
+/**
+ * The one stall rule. Only a `running` job can stall (a settled job has nothing
+ * left to be silent about). No evidence of progress at all, or a timestamp that
+ * does not parse, counts as STALLED: "we do not know" must never be drawn as
+ * "fine". `updatedAt` is an ISO string or epoch ms, as each caller holds it.
+ */
+export function isStalled(status: string, updatedAt: string | number | null | undefined, now: number): boolean {
+  if (status !== 'running') return false;
+  const then = typeof updatedAt === 'number' ? updatedAt : typeof updatedAt === 'string' ? Date.parse(updatedAt) : NaN;
+  return Number.isNaN(then) || now - then > STALL_GRACE_MS;
+}

@@ -6,21 +6,17 @@ import type { RadarJob, RadarStatus, ToolEntry, RadarAcceptance, ActivityEvent }
 import { toEpoch, type FsLike } from './jobs.ts';
 import type { ProgressDigest } from '../types/index.d.ts';
 import { classify, progressPhrase } from './progress.ts';
-import { STALL_GRACE_MS } from './stale.ts';
-import { REASONS, STEER_NOT_APPLIED_RE, reasonFromText } from './reasons.ts';
+import { isStalled } from './stale.ts';
+import { firstText, record } from './guards.ts';
+import { isLiveStatus } from './format.ts';
+import { REASONS, STEER_NOT_APPLIED_RE } from './reasons.ts';
 
 type RecordValue = Record<string, unknown>;
 const STATUSES = new Set(['running', 'attention', 'succeeded', 'failed', 'canceled']);
-function record(v: unknown): RecordValue | null {
-  return v !== null && typeof v === 'object' && !Array.isArray(v) ? v as RecordValue : null;
-}
-function text(...values: unknown[]): string | null {
-  return values.find(v => typeof v === 'string' && v.trim() !== '') as string | undefined ?? null;
-}
 function number(v: unknown): number | null {
   return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null;
 }
-export function forgeJobDir(repo: string, id: string): string {
+function forgeJobDir(repo: string, id: string): string {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/.test(id) || id === '.' || id === '..') throw new Error('Invalid job id');
   return `${repo.replace(/\/+$/, '')}/.agent-smith/jobs/${id}`;
 }
@@ -37,7 +33,7 @@ function acceptance(value: RecordValue | null): RadarAcceptance {
     checks: (Array.isArray(value.checks) ? value.checks : []).flatMap(c => {
       const check = record(c);
       return check && typeof check.name === 'string' ? [{ name: check.name, ok: check.ok === true,
-        outputTail: text(check.outputTail) ?? '',
+        outputTail: firstText(check.outputTail) ?? '',
         ...(typeof check.reason === 'string' && check.reason.trim() !== '' ? {reason:check.reason} : {}),
         ...(typeof check.timedOut === 'boolean' ? {timedOut:check.timedOut} : {}),
         ...(typeof check.signal === 'string' || check.signal === null ? {signal:check.signal as string|null} : {}),
@@ -49,7 +45,7 @@ export function acceptanceLabel(value?: RadarAcceptance): string {
   return value?.pending ? 'checking' : value?.state ?? 'unchecked';
 }
 
-export async function readForgeJob(fs: FsLike, repo: string, id: string, now: number): Promise<RadarJob | null> {
+async function readForgeJob(fs: FsLike, repo: string, id: string, now: number): Promise<RadarJob | null> {
   const dir = forgeJobDir(repo, id);
   const m = await json(fs, `${dir}/job.json`);
   if (m === null) return null;
@@ -58,8 +54,8 @@ export async function readForgeJob(fs: FsLike, repo: string, id: string, now: nu
   const p = await json(fs, `${dir}/progress.json`);
   let a = acceptance(await json(fs, `${dir}/acceptance.json`));
   let status = m.status as RadarStatus;
-  const live = status === 'running' || status === 'attention';
-  const lastSeen = toEpoch(text(p?.lastEventAt, m.updatedAt));
+  const live = isLiveStatus(status);
+  const lastSeen = toEpoch(firstText(p?.lastEventAt, m.updatedAt));
   const warnings = (Array.isArray(p?.warnings) ? p.warnings : []).filter((w): w is string => typeof w === 'string')
     .map(message => ({ code: STEER_NOT_APPLIED_RE.test(message) ? 'steer_not_applied' : 'tool_error', message }));
   if (live && await fs.exists(`${dir}/orphaned`) && !await fs.exists(`${dir}/result.json`)) {
@@ -70,7 +66,7 @@ export async function readForgeJob(fs: FsLike, repo: string, id: string, now: nu
     // The supervisor is gone; its spawn-time placeholder cannot settle itself.
     a = { ...a, pending: false };
     if (!canceled) warnings.unshift({ code: 'orphaned', message: REASONS.serverStopped });
-  } else if (live && (lastSeen === null || now - lastSeen > STALL_GRACE_MS)) status = 'attention';
+  } else if (isStalled(status, lastSeen, now)) status = 'attention';
   if (typeof m.error === 'string' && m.error !== '') warnings.unshift({ code: 'tool_error', message: m.error });
   const activities = Array.isArray(p?.recentActivities) ? p.recentActivities.map(record).filter(v => v !== null) : [];
   const recent = activities.reduce<RecordValue | null>((last, row) =>
@@ -78,28 +74,28 @@ export async function readForgeJob(fs: FsLike, repo: string, id: string, now: nu
   const latestActivity = record(p?.lastActivity);
   const latest = latestActivity && typeof latestActivity.tool === 'string' ? latestActivity : recent;
   const resolved = record(m.resolved);
-  const latestSummary = text(p?.latestSummary, m.latestSummary);
+  const latestSummary = firstText(p?.latestSummary, m.latestSummary);
   const progress = digest(p?.digest);
-  const now0 = latest ? classify(text(latest.tool) ?? '', text(latest.input)).label : '';
+  const now0 = latest ? classify(firstText(latest.tool) ?? '', firstText(latest.input)).label : '';
   const staleReads = (Array.isArray(m.staleReads) ? m.staleReads : []).filter((f): f is string => typeof f === 'string' && f.trim() !== '');
   return {
-    id, name: text(m.name, resolved?.name, p?.name), workerId: text(m.workerId, resolved?.workerId, p?.workerId) ?? id,
-    role: text(m.role, resolved?.role, p?.role, resolved?.mode, m.mode),
-    provider: text(m.provider), model: text(m.modelResolved, m.model),
-    lastEventAt: lastSeen, pipeline: text(m.pipeline), stage: text(m.stage), attempt: number(m.attempt),
-    status, startedAt: toEpoch(text(m.startedAt, m.createdAt)), endedAt: toEpoch(text(m.finishedAt)) ?? (status === 'failed' && live ? lastSeen : null),
+    id, name: firstText(m.name, resolved?.name, p?.name), workerId: firstText(m.workerId, resolved?.workerId, p?.workerId) ?? id,
+    role: firstText(m.role, resolved?.role, p?.role, resolved?.mode, m.mode),
+    provider: firstText(m.provider), model: firstText(m.modelResolved, m.model),
+    lastEventAt: lastSeen, pipeline: firstText(m.pipeline), stage: firstText(m.stage), attempt: number(m.attempt),
+    status, startedAt: toEpoch(firstText(m.startedAt, m.createdAt)), endedAt: toEpoch(firstText(m.finishedAt)) ?? (status === 'failed' && live ? lastSeen : null),
     toolCount: number(p?.toolCalls) ?? number(m.toolCalls),
-    activity: progress && (status === 'running' || status === 'attention') ? progressPhrase(progress, now0) : now0,
+    activity: progress && isLiveStatus(status) ? progressPhrase(progress, now0) : now0,
     progress,
-    task: text(m.task) ?? '', latestSummary,
+    task: firstText(m.task) ?? '', latestSummary,
     summarySource: (p?.summarySource ?? m.summarySource) === 'worker' && latestSummary !== null ? 'worker' : null,
     changedFileCount: Array.isArray(m.changedFiles) && m.changedFilesTruncated !== true ? m.changedFiles.length : null,
-    acceptance: a, failureReason: text(m.reason, m.failureReason, m.error, status === 'failed' ? warnings[0]?.message : null),
-    failureDetail: text(m.error),
-    supersededBy: text(m.supersededBy), steeredFrom: text(m.steeredFrom),
+    acceptance: a, failureReason: firstText(m.reason, m.failureReason, m.error, status === 'failed' ? warnings[0]?.message : null),
+    failureDetail: firstText(m.error),
+    supersededBy: firstText(m.supersededBy), steeredFrom: firstText(m.steeredFrom),
     pendingSteers: number(p?.pendingSteers) ?? number(m.pendingSteers),
     ...(staleReads.length > 0 ? { staleReads } : {}),
-    warnings, report: null, reasoning: text(p?.latestText), raw: {},
+    warnings, report: null, reasoning: firstText(p?.latestText), raw: {},
   };
 }
 /** progress.json `digest`, accepted only when it has the shape the writer produces. */
@@ -142,8 +138,8 @@ export async function readForgeDetail(fs: FsLike, repo: string, id: string, now:
   const history: ToolEntry[] = (Array.isArray(view?.tools) ? view.tools : []).flatMap(t => {
     const tool = record(t);
     if (!tool || typeof tool.tool !== 'string') return [];
-    return [{ at: toEpoch(text(tool.at)), tool: tool.tool, label: text(tool.input) ?? '',
-      output: text(tool.output) ?? '', state: text(tool.state) ?? 'done' }];
+    return [{ at: toEpoch(firstText(tool.at)), tool: tool.tool, label: firstText(tool.input) ?? '',
+      output: firstText(tool.output) ?? '', state: firstText(tool.state) ?? 'done' }];
   });
   const transcript = (Array.isArray(view?.transcript) ? view.transcript : []).filter((t): t is string => typeof t === 'string');
   const timeline: ActivityEvent[] | null = Array.isArray(view?.timeline) ? view.timeline.flatMap(value => {
@@ -154,7 +150,7 @@ export async function readForgeDetail(fs: FsLike, repo: string, id: string, now:
       typeof item.input === 'string' && typeof item.output === 'string' && typeof item.state === 'string') return [item as ActivityEvent];
     return [];
   }) : null;
-  return { job: { ...job, report, prompt: text(view?.prompt), preamble: text(view?.preamble),
+  return { job: { ...job, report, prompt: firstText(view?.prompt), preamble: firstText(view?.preamble),
     // A bounded preview is normal for a long job, not a warning.
     warnings: [...job.warnings, ...(view === null ? [{code:'detail_unavailable',message:'This older job has no detail snapshot; summary and report are shown.'}] : [])] }, history, transcript, timeline,
     truncated: view?.truncated === true };

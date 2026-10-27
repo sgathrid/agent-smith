@@ -17,7 +17,8 @@
  *     shows, so an absent edit count means "not visible", not zero.
  */
 import type { ProgressDigest, ProgressPhase } from '../types/index.d.ts';
-import { basename, describeTool, humanCommand, oneLine, parseInputPreview } from './format.ts';
+import { basename, describeTool, humanCommand, parseInputPreview } from './tools-describe.ts';
+import { oneLine } from './text.ts';
 
 export type { ProgressDigest, ProgressPhase };
 export type ProgressKind = 'read' | 'search' | 'edit' | 'test' | 'command' | 'other';

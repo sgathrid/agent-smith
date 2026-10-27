@@ -50,6 +50,12 @@
 
 import type { RadarJob, RadarStatus } from '../types/index.d.ts';
 import { REASONS, checksReason, reasonFromText } from './reasons.ts';
+import { ELAPSED_WIDTH, clockCell, elapsed, elapsedCell } from './clock.ts';
+import { fitCell, oneLine, sanitizeText } from './text.ts';
+
+// The clock and text helpers live in their own files; format.ts stays the one
+// vocabulary the band, pane and tests import from.
+export { ELAPSED_WIDTH, clockCell, elapsed, elapsedCell, fitCell, oneLine, sanitizeText };
 
 // ── glyphs ──────────────────────────────────────────────────────────────────
 
@@ -127,9 +133,16 @@ export function pickColor(
   }
 }
 
-/** True for the states that have stopped and will never move again. */
-export function isTerminal(status: RadarStatus): boolean {
+/** True for the states that have stopped and will never move again.
+ * Takes any string so wire payloads (notice.ts) can ask without a cast; only
+ * the three settled names count, so 'unknown' and unrecognised words are not. */
+export function isTerminal(status: string): boolean {
   return status === 'succeeded' || status === 'failed' || status === 'canceled';
+}
+
+/** True for the states still in flux: running, or running but gone quiet. */
+export function isLiveStatus(status: string): boolean {
+  return status === 'running' || status === 'attention';
 }
 
 /**
@@ -145,51 +158,6 @@ export function isRecessive(status: RadarStatus): boolean {
   return status === 'succeeded' || status === 'canceled' || status === 'unknown';
 }
 
-// ── elapsed ─────────────────────────────────────────────────────────────────
-
-/**
- * Duration in ms → a compact clock string.
- *
- * `48s`, `12m04s`, `1h02m`. The seconds field is `padStart(2,'0')` because
- * TERMINAL-UI.md §Width calls for tabular alignment and names the terminal
- * equivalent of `font-variant-numeric: tabular-nums` as fixed-width padding:
- * without it `9s` and `12s` occupy different widths and the column tears.
- *
- * Hours deliberately drop the seconds (`1h02m`, not `1h02m03s`). A band that
- * needs 8 columns for a clock is a band that cannot afford 8 columns; at that
- * scale the seconds digit is noise anyway. See ELAPSED_WIDTH.
- */
-export function elapsed(ms: number): string {
-  const total = Math.max(0, Math.round(ms / 1000));
-  if (total < 60) return `${total}s`;
-  if (total < 3600) return `${Math.floor(total / 60)}m${String(total % 60).padStart(2, '0')}s`;
-  return `${Math.floor(total / 3600)}h${String(Math.floor((total % 3600) / 60)).padStart(2, '0')}m`;
-}
-
-/**
- * Column width for `elapsed()`, in terminal columns.
- *
- * WIDTH IS A CORRECTNESS PROPERTY HERE. `48s`, `12m04s` and `1h02m` are 3, 6 and
- * 5 wide; padStart(6) makes all three occupy 6, so the second that changes is
- * the last character of a constant-width cell and nothing to its right moves
- * when the clock ticks. Remove the padding and the row tears every second.
- */
-export const ELAPSED_WIDTH = 6;
-
-/** elapsed(), right-aligned into ELAPSED_WIDTH. */
-export function elapsedCell(ms: number): string {
-  return elapsed(ms).padStart(ELAPSED_WIDTH);
-}
-
-/** The clock cell for one job, or a BLANK cell when the start is unknown. */
-export function clockCell(job: RadarJob, now: number): string {
-  const span = job.startedAt === null ? null : (job.endedAt ?? now) - job.startedAt;
-  // BLANK, never `0s`: harness/normalize.ts refuses to invent a start time for
-  // agy-staff and neither do we. A confident `0s` about a job that has been
-  // working for half an hour is the one lie this surface must not tell.
-  return span === null ? '' : elapsedCell(span);
-}
-
 // ── the label: the task, not the job id ─────────────────────────────────────
 
 /**
@@ -200,10 +168,10 @@ export function clockCell(job: RadarJob, now: number): string {
  * band row reads completely at 80 columns — the width TERMINAL-UI.md calls the
  * floor for a glance surface.
  */
-export const BAND_LABEL_WIDTH = 44;
+const BAND_LABEL_WIDTH = 44;
 
 /** The detail cell on a band row. Sized to fit 80 columns beside the label. */
-export const BAND_DETAIL_WIDTH = 22;
+const BAND_DETAIL_WIDTH = 22;
 
 /** Fixed gutter between two cells. One space, always — never a run of them. */
 const GUTTER = ' ';
@@ -213,31 +181,6 @@ const LEAD = ' ';
 
 /** Separator between two facts INSIDE one cell. EAW=Neutral (see pickGlyph). */
 export const SEP = '∙';
-
-/**
- * Strip complete ANSI escape sequences (CSI, OSC, DCS/PM/APC/SOS, 2-byte ESC,
- * C1 controls) and remaining forbidden control characters, unpaired surrogates,
- * and noncharacters (`U+FDD0..U+FDEF`), while preserving `\n` and valid UTF-16
- * surrogate pairs.
- *
- * Why this exists: Claude Code's JSX element validator rejects any `<Text>`,
- * `<Button label>`, or `<Markdown text>` containing C0/C1 controls (except `\t`
- * and `\n`), lone surrogates, or `U+FDD0..U+FDEF`. Worker tool output, shell
- * commands, check output, and prompt text routinely contain ANSI colour codes or
- * `\r` progress lines; stripping them at the UI boundary keeps the stored job
- * files intact while preventing a single control byte from aborting the pane.
- */
-const ANSI_ESCAPE =
-  /(?:\x1b\][\s\S]*?(?:\x07|\x1b\\|\x9c)|\x9d[\s\S]*?(?:\x07|\x1b\\|\x9c)|\x1b[PX^_][\s\S]*?(?:\x1b\\|\x9c)|(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]|\x1b[ -/]*[@-~])/gu;
-const FORBIDDEN_CONTROLS = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ud800-\udfff\ufdd0-\ufdef]/gu;
-
-export function sanitizeText(s: string): string {
-  return s
-    .replace(ANSI_ESCAPE, '')
-    .replace(/\r\n?/g, '\n')
-    .replace(/\t/g, '  ')
-    .replace(FORBIDDEN_CONTROLS, '');
-}
 
 /**
  * Strip markdown decoration from a task line.
@@ -349,62 +292,6 @@ export function jobLabel(job: RadarJob): string {
   }
   const label = deriveTaskLabel(job.task);
   return label === '' ? oneLine(fallbackLabel(job.id)) : label;
-}
-
-/**
- * Cut to at most `max` UTF-16 units without splitting a surrogate pair.
- *
- * `slice` can leave a high surrogate with no low half. `sanitizeText` removes
- * such halves, so a cut made AFTER sanitizing must not create one: the host
- * draws an unpaired half as U+FFFD, or refuses the tree a Text's string is
- * checked in. `max` stays in UTF-16 units because every caller sizes cells in
- * terminal columns, where a pair already counts as two.
- */
-function clip(s: string, max: number): string {
-  if (s.length <= max) return s;
-  const cut = s.slice(0, Math.max(0, max));
-  return /[\ud800-\udbff]$/.test(cut) ? cut.slice(0, -1) : cut;
-}
-
-/**
- * Fit a string into a fixed-width cell, cutting at a word boundary.
- *
- * NO ELLIPSIS CHARACTER, and that is the point. `…` (U+2026) is EAW=Ambiguous —
- * one column in a Western terminal, two in a CJK-locale one — so a truncation
- * marker is exactly the character that would make a fixed-width column drift in
- * the locales the fixed width exists to protect. The cell's right edge is the
- * marker: a label that stops mid-clause at column 44 is visibly a clipped label,
- * because every other row's label starts at the same place and ends at the same
- * place. `cell()` therefore slices to exactly `width` columns, always.
- */
-export function fitCell(s: string, width: number): string {
-  if (width <= 0) return '';
-  if (s.length <= width) return s.padEnd(width);
-  const cut = clip(s, width);
-  const space = cut.lastIndexOf(' ');
-  // Only break on a space in the last third: breaking early would throw away a
-  // third of the cell to save two characters of raggedness.
-  const body = space >= Math.floor(width * 0.6) ? cut.slice(0, space) : cut;
-  return body.padEnd(width);
-}
-
-/** Collapse all whitespace runs to single spaces and cap the length. */
-export function oneLine(s: string, max = 400): string {
-  const t = sanitizeText(s).replace(/\s+/g, ' ').trim();
-  return clip(t, max);
-}
-
-/**
- * A backwards-compatible length-capped trim.
- *
- * Kept because the DETAIL view uses it for prose that has no cell to sit in
- * (a report excerpt, a warning message). Those are handed to `wrap="truncate-end"`
- * by the renderer as well, so this is belt and braces rather than the mechanism,
- * and it keeps a hard bound on what a single string can cost.
- */
-export function ellipsis(s: string, max: number): string {
-  const t = sanitizeText(s).replace(/\s+/g, ' ').trim();
-  return clip(t, Math.max(0, max));
 }
 
 /**
@@ -598,7 +485,7 @@ export function formatJobRow(job: RadarJob, options: RowOptions = {}): JobRow {
     clock,
     plain,
     accent: pickColor(job.status),
-    bold: job.status === 'running' || job.status === 'attention',
+    bold: isLiveStatus(job.status),
     recessive: isRecessive(job.status),
   };
 }
@@ -741,7 +628,7 @@ export function sortJobs(jobs: readonly RadarJob[]): RadarJob[] {
  */
 export function sortForBand(jobs: readonly RadarJob[]): RadarJob[] {
   return [...jobs].sort((a, b) => {
-    const rank = (s: RadarStatus): number => (s === 'running' || s === 'attention' ? 0 : 1);
+    const rank = (s: RadarStatus): number => (isLiveStatus(s) ? 0 : 1);
     const r = rank(a.status) - rank(b.status);
     if (r !== 0) return r;
     return (b.endedAt ?? b.startedAt ?? 0) - (a.endedAt ?? a.startedAt ?? 0);
@@ -764,179 +651,9 @@ export function countSummary(jobs: readonly RadarJob[]): {
   let failed = 0;
   let finished = 0;
   for (const j of jobs) {
-    if (j.status === 'running' || j.status === 'attention') running += 1;
+    if (isLiveStatus(j.status)) running += 1;
     else if (j.status === 'failed') failed += 1;
     else finished += 1;
   }
   return { running, failed, finished };
-}
-
-// ── activity, from real agy tool shapes ─────────────────────────────────────
-
-/**
- * agy tool name + parameters → a short "what is it doing" phrase.
- *
- * Measured against the real corpus in .agy-staff/jobs:
- *   run_command           { CommandLine }
- *   view_file             { AbsolutePath }
- *   write_to_file         { TargetFile }
- *   replace_file_content  { TargetFile }
- *   grep_search           { Query | Pattern }
- *   list_dir              { AbsolutePath }
- *   call_mcp_tool         { ServerName, ToolName, Arguments }
- *   manage_task           { Action, TaskId }
- *   schedule              { DurationSeconds, Prompt }
- *
- * TERMINAL-UI.md §Motion: "terse tool descriptions, never raw output". Every
- * branch truncates at the source; there is no code path that hands raw tool
- * output to a list row.
- */
-export function describeTool(tool: string, params: Record<string, unknown>): string {
-  const str = (k: string): string => {
-    const v = params[k];
-    return typeof v === 'string' ? oneLine(v) : '';
-  };
-
-  switch (tool) {
-    case 'run_command':
-      return humanCommand(str('CommandLine'));
-    case 'view_file':
-      return `reading ${basename(str('AbsolutePath'))}`;
-    case 'write_to_file':
-      // Same verb as replace_file_content, deliberately: from the reader's side
-    // there is no difference between "created" and "changed" a file, and the
-    // tool name is an implementation detail of agy, not of the work.
-    case 'replace_file_content':
-      return `editing ${basename(str('TargetFile'))}`;
-    case 'grep_search':
-      return `searching ${basename(str('Query') || str('Pattern'))}`;
-    case 'list_dir':
-      return `listing ${basename(str('AbsolutePath'))}`;
-    case 'call_mcp_tool':
-      return `${str('ToolName') || str('ServerName') || 'an mcp tool'}`;
-    case 'manage_task':
-      return `task ${str('Action') || 'update'}`;
-    case 'schedule':
-      return `waiting ${str('DurationSeconds') || '?'}s`;
-    default:
-      return `using ${oneLine(tool)}`;
-  }
-}
-
-/**
- * A shell command → what a person would say they are doing.
- *
- * The corpus is 76 run_command records and the raw line is what put
- * `cargo tree -p renyi-mcp -e features -i` on a status row: real, precise, and
- * unreadable at a glance. So the COMMON commands get a verb, and anything else
- * gets a TRIMMED form rather than an invented one.
- *
- * The fallback rule is the important half. When there is no mapping this shows
- * the command's first two words and stops — `git rebase --onto main feature/x`
- * becomes `git rebase`, not `preparing the branch`. Inventing a plausible verb
- * for an arbitrary command would be a lie the user cannot check, and it would be
- * a lie in the one field the band exists to be trustworthy about. `cargo tree`
- * is in the table because it appears in the corpus four times, not because it
- * is universally understood.
- */
-export function humanCommand(cmd: string): string {
-  const line = oneLine(cmd);
-  if (line === '') return 'running a command';
-
-  // A pipeline or a `&&` chain is several actions; the first is what the job is
-  // doing now, and the rest are what it will do after. `cargo test 2>&1 | tail`
-  // is "running tests", not "running a shell pipeline".
-  const first = line.split(/\s*(?:&&|\|\||;|\||&&)\s*/)[0] ?? line;
-
-  const words = first.split(' ').filter((w) => !w.startsWith('-'));
-  const prog = basename(words[0] ?? '');
-  const sub = words[1] ?? '';
-
-  switch (prog) {
-    case 'cargo':
-    case 'rustup':
-      switch (sub) {
-        case 'test':
-        case 'nextest':
-          return 'running tests';
-        case 'clippy':
-          return 'linting';
-        case 'fmt':
-          return 'formatting';
-        case 'build':
-          return 'building';
-        case 'check':
-          return 'checking the build';
-        case 'tree':
-          return 'inspecting dependencies';
-        case 'doc':
-          return 'reading the docs';
-        case 'run':
-          return `running ${basename(words[2] ?? 'the binary')}`;
-        default:
-          break;
-      }
-      break;
-    case 'npm':
-    case 'pnpm':
-    case 'yarn':
-    case 'bun':
-      // `npm test` and `npm run test` are the same intent; `npm run build` is
-      // building. Anything else under `npm run` is somebody's script and we do
-      // not know what it does.
-      if (sub === 'test') return 'running tests';
-      if (sub === 'run' && (words[2] === 'build')) return 'building';
-      if (sub === 'run' && (words[2] === 'test')) return 'running tests';
-      return `running ${prog} scripts`;
-    case 'python':
-    case 'python3':
-      return 'running a script';
-    case 'git':
-      if (sub === 'status' || sub === 'diff' || sub === 'log' || sub === 'show') return 'checking git';
-      if (sub === 'commit') return 'committing';
-      if (sub === 'push') return 'pushing';
-      return `git ${sub}`.trim();
-    case 'grep':
-    case 'rg':
-    case 'ag':
-      return 'searching';
-    case 'graft':
-      return `navigating the graph`;
-    default:
-      break;
-  }
-
-  // The honest fallback: the command's name, and at most one argument.
-  const trimmed = words.slice(0, 2).join(' ');
-  return trimmed === '' ? 'running a command' : trimmed;
-}
-
-/** Last path segment only. */
-export function basename(p: string): string {
-  const i = p.lastIndexOf('/');
-  return i === -1 ? p : p.slice(i + 1);
-}
-
-/**
- * `input_preview` is a JSON STRING of the tool parameters, truncated by agy-staff.
- * A truncated JSON string does not parse, so this never throws — a failure just
- * means we have no parameters and the caller falls back to the bare tool name.
- */
-export function parseInputPreview(preview: string | null | undefined): Record<string, unknown> {
-  if (!preview) return {};
-  try {
-    const v: unknown = JSON.parse(preview);
-    return typeof v === 'object' && v !== null ? (v as Record<string, unknown>) : {};
-  } catch {
-    return {};
-  }
-}
-
-/**
- * The activity phrase for a job, from its most recent activity record.
- * Exported because the band and the pane both call it and must agree.
- */
-export function describeActivity(tool: string | null, inputPreview: string | null): string {
-  if (!tool) return '';
-  return describeTool(tool, parseInputPreview(inputPreview));
 }

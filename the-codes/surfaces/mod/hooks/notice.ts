@@ -14,6 +14,7 @@
  */
 
 import { checksReason, reasonFromText } from './reasons.ts';
+import { isTerminal } from './format.ts';
 
 /**
  * The fields of a Forge row (types/index.d.ts RadarJob) a notice reads. Declared
@@ -84,7 +85,8 @@ const GLYPH: Record<NoticeKind, string> = { finished: '✓', failed: '✗', canc
 
 // ── text ────────────────────────────────────────────────────────────────────
 
-/** Bound prose at a sentence or word boundary, never mid-word. */
+/** Bound prose at a sentence or word boundary, never mid-word. Shared with the
+ * channel (policy.ts re-exports it); views.ts `trimWords` is its near-twin. */
 export function compactExcerpt(value: string, max: number): string {
   const text = value.replace(/\s+/g, ' ').trim();
   if (text.length <= max) return text;
@@ -95,7 +97,7 @@ export function compactExcerpt(value: string, max: number): string {
 }
 
 /** `43s`, `12m`, `1h05m`; '' for an unknown or negative span. */
-export function durationWords(ms: number | null | undefined): string {
+function durationWords(ms: number | null | undefined): string {
   if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return '';
   const s = Math.round(ms / 1000);
   if (s < 90) return `${s}s`;
@@ -290,7 +292,7 @@ export function parseSettledRead(toolName: unknown, response: unknown): { readon
   const status = payload['status'];
   if (typeof jobId !== 'string' || jobId.length === 0) return null;
   if (typeof payload['supersededBy'] === 'string' && payload['supersededBy'].length > 0) return null;
-  if (status !== 'succeeded' && status !== 'failed' && status !== 'canceled') return null;
+  if (typeof status !== 'string' || !isTerminal(status)) return null;
   const acceptance = payload['acceptance'];
   if (isObj(acceptance) && acceptance['pending'] === true) return null;
   return { kind: 'job', id: jobId };
@@ -300,7 +302,7 @@ export function unclaim(owned: readonly Owned[], settled: { readonly kind: 'job'
   return owned.filter((o) => !(o.kind === settled.kind && o.id === settled.id));
 }
 
-export function launchKind(toolName: unknown): 'job' | 'run' | null {
+function launchKind(toolName: unknown): 'job' | 'run' | null {
   if (typeof toolName !== 'string') return null;
   const bare = toolName.includes('__') ? toolName.slice(toolName.lastIndexOf('__') + 2) : toolName;
   return LAUNCH[bare] ?? null;
@@ -338,7 +340,7 @@ export function parseLaunch(toolName: unknown, response: unknown): Launch | null
   if (payload === null || typeof payload['error'] === 'string') return null;
   const id = kind === 'job' ? payload['jobId'] : payload['runId'];
   // Hosts may expose only structuredContent and omit the outer MCP metadata.
-  if (kind === 'job' && ['succeeded', 'failed', 'canceled'].includes(String(payload['status']))) return null;
+  if (kind === 'job' && isTerminal(String(payload['status']))) return null;
   if (typeof id !== 'string' || id.length === 0) return null;
   let repo: string | null = null;
   if (typeof payload['repo'] === 'string' && payload['repo'].length > 0) repo = trimSlash(payload['repo']);
@@ -351,7 +353,7 @@ export function parseLaunch(toolName: unknown, response: unknown): Launch | null
 // ── projections ─────────────────────────────────────────────────────────────
 
 /** The pushable kind for a job state, or null for progress and unknowns. */
-export function kindOf(status: string): NoticeKind | null {
+function kindOf(status: string): NoticeKind | null {
   switch (status) {
     case 'succeeded': return 'finished';
     case 'failed': return 'failed';
@@ -428,7 +430,7 @@ export function asRunRecord(value: unknown): RunRecord | null {
 }
 
 /** A finished pipeline run as a notice; null while it runs. */
-export function noticeFromRun(run: RunRecord): NoticeJob | null {
+function noticeFromRun(run: RunRecord): NoticeJob | null {
   if (run.status === 'running' || run.finishedAt === null) return null;
   return {
     id: run.runId, kind: run.status === 'passed' ? 'finished' : 'failed', name: run.pipeline, role: 'pipeline', run: true,
