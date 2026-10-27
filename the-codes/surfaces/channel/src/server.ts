@@ -191,6 +191,11 @@ function resolveCwd(): string {
 
 const CWD = resolveCwd();
 
+// Discover models in the background so the first list_capabilities, and any spawn
+// that validates a model in this process, finds them cached instead of racing a
+// cold CLI. Fire and forget: it never blocks startup and never rejects.
+if (process.env['AGENT_SMITH_NO_CATALOG_WARMUP'] !== '1') forge.warmCatalogs();
+
 // Establish the historical baseline before accepting spawn calls. Otherwise a
 // fast new worker could finish during the first poll and be mistaken for history.
 if (CHANNEL_ENABLED) await pollOnce(CWD, Date.now(), sendBatch);

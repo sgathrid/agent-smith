@@ -82,6 +82,7 @@ export const SMITH_PAYLOAD = {
   canceled: 'canceled',
   cancelAt: 'cancel_at',
   lastEventAt: 'last_event_at',
+  lastAliveAt: 'last_alive_at',
   recentActivities: 'recent_activities',
   lastActivity: 'last_activity',
   latestText: 'latest_text',
@@ -173,7 +174,10 @@ export class AgentSmithReader implements JobStateReader {
     const report = await readTextSafe(jobFile(cwd, jobId, FILES.report));
     const progress = await readJsonSafe<{
       lastEventAt?: string;
+      lastAliveAt?: string;
+      workerPid?: number;
       toolCalls?: number;
+      toolErrors?: number;
       recentActivities?: unknown[];
       lastActivity?: unknown;
       latestText?: string | null;
@@ -256,6 +260,15 @@ export class AgentSmithReader implements JobStateReader {
       [SMITH_PAYLOAD.canceled]: canceled,
       [SMITH_PAYLOAD.cancelAt]: cancelAt,
       [SMITH_PAYLOAD.lastEventAt]: progress?.lastEventAt ?? manifest?.updatedAt ?? null,
+      // The process owner's heartbeat (providers/ndjson.ts). Absent for jobs
+      // written by older builds: liveness then falls back to event silence.
+      [SMITH_PAYLOAD.lastAliveAt]: progress?.lastAliveAt ?? null,
+      ...(typeof progress?.workerPid === 'number' ? { workerPid: progress.workerPid } : {}),
+      ...(typeof (manifest?.toolErrors ?? progress?.toolErrors) === 'number'
+        ? { toolErrors: manifest?.toolErrors ?? progress?.toolErrors } : {}),
+      ...(manifest?.failedEarly === true ? { failedEarly: true } : {}),
+      ...(manifest?.changedFilesUnknown === true ? { changedFilesUnknown: true } : {}),
+      ...(manifest?.cwdMissingAtFinish === true ? { cwdMissingAtFinish: true } : {}),
       [SMITH_PAYLOAD.recentActivities]: progress?.recentActivities ?? [],
       [SMITH_PAYLOAD.lastActivity]: progress?.lastActivity ?? null,
       [SMITH_PAYLOAD.latestText]: progress?.latestText ?? null,

@@ -39,6 +39,8 @@ export interface SpawnRequest {
   readonly unrestricted?: boolean | undefined;
   /** Resume a prior conversation. Providers that cannot resume ignore this. */
   readonly conversation?: string | undefined;
+  /** Extra worker environment. Only the keys are persisted (`env-keys.json`); values live in memory. */
+  readonly env?: Readonly<Record<string, string>> | undefined;
   /** Overrides the repo root. Only pipeline stages set this. */
   readonly cwd?: string | undefined;
   /**
@@ -79,6 +81,8 @@ export interface SpawnAck {
   readonly repo: string;
   /** The budget the job actually got, after clamping. */
   readonly timeoutMs: number;
+  /** Names of the environment variables passed to the worker; never the values. */
+  readonly envKeys?: readonly string[];
   /** True only when the caller asked for it AND we passed it. */
   readonly unrestricted: boolean;
   /** One sentence an operator can act on. */
@@ -182,6 +186,8 @@ export function modeError(mode: string): Error {
   );
 }
 
+/** Sidecar naming the env variables a job's worker was given. Keys only. */
+export const ENV_KEYS_FILE = 'env-keys.json';
 const AGY_EFFORT_SUFFIX = /-(low|medium|high)$/;
 
 /**
@@ -232,9 +238,11 @@ export function checkAgainstCatalog(
   }
   if (effort !== undefined) {
     const target = match ?? (catalog.defaultModel === undefined ? undefined : catalog.models.find((m) => m.id === catalog.defaultModel));
-    if (target !== undefined && target.efforts.length > 0 && !target.efforts.includes(effort)) {
+    // Defensive: a catalog from disk or a provider could carry a model without an efforts array.
+    const efforts = Array.isArray(target?.efforts) ? target!.efforts : [];
+    if (target !== undefined && efforts.length > 0 && !efforts.includes(effort)) {
       throw new Error(
-        `effort "${effort}" is not valid for ${provider} model "${target.id}". Valid efforts: ${target.efforts.join(', ')}.`,
+        `effort "${effort}" is not valid for ${provider} model "${target.id}". Valid efforts: ${efforts.join(', ')}.`,
       );
     }
   }
@@ -271,6 +279,7 @@ export interface TurnSpec {
   timeoutMs: number;
   unrestricted: boolean;
   conversation: string | undefined;
+  env: Readonly<Record<string, string>> | undefined;
   pipeline: string | null;
   stage: string | null;
   attempt: number | null;

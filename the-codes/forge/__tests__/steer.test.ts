@@ -2,7 +2,8 @@
  * steer.test.ts — pump-owned live worker steering (queue and interrupt).
  */
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 
@@ -614,4 +615,23 @@ test('resolveHead crosses the finish window through steer.head before superseded
   writeManifest('child', { steeredFrom: 'parent' });
 
   assert.equal(service.resolveHead('parent'), 'child');
+});
+
+test('a writing turn whose cwd vanished does not chain its queued steer', async () => {
+  const ctrl = controlledProvider();
+  const { service } = makeService(ctrl.provider);
+  const cwd = mkdtempSync(path.join(tmpdir(), 'agent-smith-steer-cwd-'));
+  const t1Ready = ctrl.nextTurn();
+  const { ack, done } = await service.spawnTracked({ mode: 'implement', name: 'cwd-gone', prompt: 'Work.', cwd });
+  const t1 = await t1Ready;
+  await service.steer({ worker: ack.jobId, prompt: 'Then this.', delivery: 'queue' });
+  rmSync(cwd, { recursive: true, force: true });
+  t1.finish({ status: 'success' });
+  const finalManifest = await done;
+  assert.equal(finalManifest.jobId, ack.jobId);
+  assert.equal(finalManifest.status, 'failed');
+  assert.equal(finalManifest.cwdMissingAtFinish, true);
+  assert.equal(ctrl.turns.length, 1, 'no continuation on an unverifiable turn');
+  const detail = await service.detail(ack.jobId);
+  assert.ok(detail.warnings.some((w) => /queued steer not applied/.test(w.message)));
 });

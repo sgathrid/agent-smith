@@ -1,6 +1,6 @@
 {
   "name": "agent-smith",
-  "version": "0.2.12",
+  "version": "0.3.0",
   "description": "Forge for coding agents: one task, many workers, one place to watch them.",
   "license": "MIT",
   "type": "module",

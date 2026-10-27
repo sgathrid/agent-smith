@@ -10,7 +10,8 @@ test('the list puts running and checking work first, then settled work most rece
   const older=job('older',{status:'failed',startedAt:10,endedAt:30});
   const newer=job('newer',{status:'succeeded',startedAt:5,endedAt:90});
   assert.deepEqual(forgeList([older,newer,pending,running]).map(j=>j.id),['run','pending','newer','older']);
-  assert.match(workerStatus(pending),/done · checking/);
+  assert.match(workerStatus(pending),/^exited · checking$/);
+  assert.equal(workerStatus(job('p2',{status:'succeeded',startedAt:10,endedAt:20,acceptance:{state:'unchecked',pending:true,running:'ui-suite',checks:[]}})),'exited · checking: ui-suite');
 });
 test('only real worker identities group runs; live runs win over older failures',()=>{
   const earlier=job('old',{workerId:'ada',status:'failed',startedAt:200});
@@ -78,7 +79,11 @@ test('a denial, and an old job with only the long error, read as the same short 
   const long='worker soft-denied 1 tool action(s) (view_file) — it exited 0 and reported success while doing nothing.';
   assert.equal(workerStatus(job('d',{status:'failed',failureReason:long})),'failed · denied view_file');
   assert.equal(workerStatus(job('s',{status:'succeeded',acceptance:{state:'rejected',checks:[{name:'lint',ok:false,outputTail:''}]}})),'checks failed: lint');
-  assert.equal(workerStatus(job('t',{status:'attention'})),'stalled');
+  assert.equal(workerStatus(job('t',{status:'attention'})),'no output');
+  assert.equal(workerStatus(job('t',{status:'attention',liveness:{state:'silent',silentForMs:16*60_000,since:0,forMs:16*60_000}})),'no output 16m');
+  assert.equal(workerStatus(job('t',{status:'attention',liveness:{state:'dead',silentForMs:16*60_000,since:0,forMs:3*60_000}})),'process gone 3m');
+  assert.equal(workerStatus(job('t',{status:'running',activity:'running tests',liveness:{state:'in-tool',silentForMs:16*60_000,since:0,forMs:16*60_000,tool:'cargo test'}})),'Running · in `cargo test` 16m');
+  assert.equal(workerStatus(job('t',{status:'running',activity:'running tests',liveness:{state:'in-tool',silentForMs:5_000,since:0,forMs:5_000,tool:'cargo test'}})),'Running · running tests');
 });
 
 test('measurePaneTerminalColumns reconstructs terminal width from docked pane geometry and leaves fullscreen/non-docked viewports intact', () => {
@@ -228,4 +233,12 @@ test('consecutive completed read and search calls condense; active, errored and 
   assert.deepEqual(shape(shell),['group-0','event-3','event-4']);
   const run=shell[0]!;
   assert.equal(run.kind==='group'&&timelineGroupLabel(run.reads,run.searches,run.commands),'read 1 file · 2 commands');
+});
+
+test('a settled row says when it started; a live row does not',()=>{
+  const t=new Date(2026,0,5,14,5).getTime();
+  const done=job('d',{status:'succeeded',startedAt:t,endedAt:t+90_000,acceptance:{state:'accepted',checks:[]}});
+  assert.match(statusLine(done,t+120_000,80),/^done · started 14:05 +1m30s$/);
+  assert.match(statusLine(job('f',{status:'failed',startedAt:t,endedAt:t+5_000}),t+9_000,80),/^failed · started 14:05 +5s$/);
+  assert.doesNotMatch(statusLine(job('r',{startedAt:t}),t+10_000,60),/started/);
 });

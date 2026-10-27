@@ -1,7 +1,7 @@
 /** Provider completion can reach disk before the supervisor's terminal anchor. */
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -130,4 +130,41 @@ test('invalid recovered identity retains the existing conversation', () => {
   writeResultFile(result.stateDir, { ...result, raw: { conversation_id: {} } });
   assert.equal(reconcileOrphan(repo, jobId), true);
   assert.equal(JSON.parse(readFileSync(file, 'utf8')).conversation, 'existing-session');
+});
+
+test('recovery fails a writing job whose cwd is gone, keeps a review, and summarises from the end', () => {
+  for (const [mode, expected] of [['implement', 'failed'], ['review', 'succeeded']] as const) {
+    const { repo, jobId, file, result } = fixture();
+    const gone = mkdtempSync(path.join(tmpdir(), 'completion-recovery-cwd-'));
+    rmSync(gone, { recursive: true, force: true });
+    writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, 'utf8')), mode, cwd: gone }));
+    const tail = 'Verdict: merge.';
+    writeResultFile(result.stateDir, { ...result, response: `${'Long preamble. '.repeat(120)}\n\n${tail}` });
+    assert.equal(reconcileOrphan(repo, jobId), true);
+    const recovered = JSON.parse(readFileSync(file, 'utf8'));
+    assert.equal(recovered.status, expected, mode);
+    assert.equal(recovered.cwdMissingAtFinish, true);
+    assert.equal(recovered.changedFilesUnknown, true);
+    assert.match(recovered.latestSummary, /Verdict: merge\.$/);
+  }
+});
+
+test('recovery counts only completed edits as writing; the digest is a fallback for old files', () => {
+  for (const [label, progress, expected] of [
+    ['edit attempted, none completed', { editsCompleted: 0, digest: { editedCount: 1 } }, 'succeeded'],
+    ['edit completed', { editsCompleted: 1, digest: { editedCount: 1 } }, 'failed'],
+    ['pre-counter file with a digest edit', { digest: { editedCount: 1 } }, 'failed'],
+  ] as const) {
+    const { repo, jobId, file, result } = fixture();
+    const gone = mkdtempSync(path.join(tmpdir(), 'completion-recovery-cwd-'));
+    rmSync(gone, { recursive: true, force: true });
+    writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, 'utf8')), mode: 'review', cwd: gone }));
+    const progressFile = jobFile(repo, jobId, FILES.progress);
+    const onDisk = JSON.parse(readFileSync(progressFile, 'utf8')) as Record<string, unknown>;
+    delete onDisk['editsCompleted'];
+    writeFileSync(progressFile, JSON.stringify({ ...onDisk, ...progress }));
+    writeResultFile(result.stateDir, { ...result, response: 'Full review.' });
+    assert.equal(reconcileOrphan(repo, jobId), true);
+    assert.equal(JSON.parse(readFileSync(file, 'utf8')).status, expected, label);
+  }
 });

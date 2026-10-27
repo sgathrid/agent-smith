@@ -285,7 +285,7 @@ async function announce($: EngineInterface, repo: string, jobs: readonly RadarJo
     const result = due(owned, jobs, runs, at);
     const ownedChanged =
       result.owned.length !== owned.length ||
-      result.owned.some((o, i) => o.id !== owned[i]?.id || o.kind !== owned[i]?.kind || o.saidAttention !== owned[i]?.saidAttention);
+      result.owned.some((o, i) => o.id !== owned[i]?.id || o.kind !== owned[i]?.kind || o.saidAttention !== owned[i]?.saidAttention || o.saidExited !== owned[i]?.saidExited);
     const changed = result.notices.length > 0 || ownedChanged;
     if (!changed) return;
     for (const o of result.owned) {

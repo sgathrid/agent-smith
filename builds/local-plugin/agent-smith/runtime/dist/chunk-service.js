@@ -1,4 +1,4 @@
-import {h as readManifest,b as readPipeline,c as cancelPipeline,n as normalize,A as AgentSmithReader,k as AgyStaffReader,P as PROVIDERS,l as errMessage,o as findProvider,j as jobFile,q as SCHEMA_VERSION,t as validOwnerPid,u as ownerAlive,g as isTerminalForgeStatus,F as FILES,w as reportFor,x as deriveOrphan,y as deriveStatus,z as writeAtomic,B as writeJsonAtomic,C as failureFields,R as REASONS,d as readAcceptance,E as writeAcceptance,p as providerNames,G as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,H as nextActionFor,I as jobDir,J as fileSig,K as jobsDir,L as JobWriter,N as isMode,O as newJobId,Q as humanDuration,T as pipeEvents,U as pipelineRecordPath,V as isForgeJobId,W as computeStaleReads,X as SMITH_PAYLOAD,Y as isForgeStatus}from'./chunk-execute.js';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import {readFileSync,existsSync,mkdirSync,appendFileSync,realpathSync,lstatSync,copyFileSync,statSync,readdirSync,unlinkSync}from'node:fs';import path from'node:path';/** Detached execution, with one preparation barrier before a worker may start. */
+import {h as readManifest,c as readPipeline,d as cancelPipeline,n as normalize,A as AgentSmithReader,k as AgyStaffReader,P as PROVIDERS,l as errMessage,o as findProvider,w as writeJsonAtomic,j as jobFile,F as FILES,q as SCHEMA_VERSION,t as validOwnerPid,u as ownerAlive,g as isTerminalForgeStatus,x as reportFor,y as cwdFacts,z as deriveOrphan,B as deriveStatus,C as writeAtomic,E as summaryTail,G as failureFields,R as REASONS,b as readAcceptance,H as writeAcceptance,p as providerNames,I as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,J as nextActionFor,K as jobDir,L as fileSig,N as jobsDir,O as JobWriter,Q as isMode,T as newJobId,U as humanDuration,V as pipeEvents,W as pipelineRecordPath,X as isForgeJobId,Y as computeStaleReads,Z as SMITH_PAYLOAD,_ as isForgeStatus}from'./chunk-execute.js';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import {readFileSync,existsSync,mkdirSync,appendFileSync,realpathSync,lstatSync,copyFileSync,statSync,readdirSync,unlinkSync}from'node:fs';import path from'node:path';/** Detached execution, with one preparation barrier before a worker may start. */
 async function launch(url, payload, onPrepared) {
     const child = fork(fileURLToPath(url), [], {
         detached: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
@@ -158,6 +158,43 @@ function errText(err) {
  */
 const CATALOG_TTL_MS = 5 * 60_000;
 const DEFAULT_TIMEOUT_MS = 10_000;
+/** Disk entry: the catalog and when it was discovered (ms). */
+function catalogFile(repo, name) {
+    return path.join(repo, '.agent-smith', 'catalogs', `${name.replace(/[^A-Za-z0-9._-]/g, '_')}.json`);
+}
+function readDisk(repo, name) {
+    if (repo === undefined)
+        return undefined;
+    try {
+        const v = JSON.parse(readFileSync(catalogFile(repo, name), 'utf8'));
+        const c = v.catalog;
+        if (typeof v.at !== 'number' || c === undefined || c === null || c.provider !== name || !Array.isArray(c.models))
+            return undefined;
+        // A malformed entry must be ignored and rediscovered, never served as fresh: the spawn path
+        // reads model ids from it and a null entry would throw inside validation and block the launch.
+        const wellFormed = c.models.every((m) => {
+            if (m === null || typeof m !== 'object')
+                return false;
+            const { id, efforts } = m;
+            // Validation indexes `efforts`, so a model without a string array there would throw at spawn.
+            return typeof id === 'string' && Array.isArray(efforts) && efforts.every((e) => typeof e === 'string');
+        });
+        if (!wellFormed || typeof c.source !== 'string')
+            return undefined;
+        return { catalog: c, at: v.at };
+    }
+    catch {
+        return undefined;
+    }
+}
+function writeDisk(repo, name, entry) {
+    if (repo === undefined || entry.catalog.source === 'static')
+        return;
+    try {
+        writeJsonAtomic(catalogFile(repo, name), entry);
+    }
+    catch { /* the disk cache is an optimization */ }
+}
 const cache = new Map();
 let clock = Date.now;
 let providerSource = () => PROVIDERS;
@@ -167,9 +204,13 @@ function lookup(name) {
 function failed(name, error) {
     return { provider: name, models: [], defaultSource: 'unknown', source: 'live', stale: false, verified: false, error };
 }
-async function discover(provider, timeoutMs, refresh) {
+async function discover(provider, timeoutMs, refresh, repo) {
     const name = provider.name;
-    const hit = cache.get(name);
+    // Memory first, then another process's discovery. `refresh` never serves either as fresh, but an
+    // older entry still backs the stale-on-error fallback, and a successful discovery rewrites the file.
+    const hit = cache.get(name) ?? readDisk(repo, name);
+    if (hit !== undefined && !cache.has(name))
+        cache.set(name, hit);
     if (!refresh && hit !== undefined && clock() - hit.at < CATALOG_TTL_MS) {
         return { ...hit.catalog, source: hit.catalog.source === 'static' ? 'static' : 'cache', stale: false };
     }
@@ -197,7 +238,9 @@ async function discover(provider, timeoutMs, refresh) {
     }
     const usable = fresh.error === undefined || fresh.models.length > 0;
     if (usable) {
-        cache.set(name, { catalog: fresh, at: clock() });
+        const entry = { catalog: fresh, at: clock() };
+        cache.set(name, entry);
+        writeDisk(repo, name, entry);
         return fresh;
     }
     if (hit !== undefined) {
@@ -254,7 +297,7 @@ async function getCatalogs(options = {}) {
             }));
             targets = all.filter((_, i) => flags[i]);
         }
-        const results = await Promise.all(targets.map((p) => discover(p, timeoutMs, refresh).catch((e) => failed(p.name, errMessage(e)))));
+        const results = await Promise.all(targets.map((p) => discover(p, timeoutMs, refresh, options.repo).catch((e) => failed(p.name, errMessage(e)))));
         return [...results, ...missing];
     }
     catch (e) {
@@ -329,12 +372,16 @@ function reconcileOrphan(repo, jobId, now = Date.now()) {
         const cancelSteerFile = jobFile(repo, jobId, FILES.cancelSteer);
         const canceled = existsSync(cancelFile) || existsSync(cancelSteerFile);
         const report = result === null ? null : reportFor(result);
+        // Without the writer, the cwd and the mode (plus the completed-edit count
+        // in progress.json) are all recovery can prove about a writing job.
+        const facts = cwdFacts(manifest.cwd, manifest.mode, editedOnDisk(repo, jobId));
         const verdict = result === null
             ? deriveOrphan(manifest, null, now, undefined, canceled)
             : deriveStatus({
                 alreadyTerminal: canceled || result.status === 'cancelled' ? 'canceled' : null,
                 ok: result.ok, jobStatus: result.status,
                 deniedActions: result.deniedActions ?? [], report,
+                ...facts,
             });
         if (verdict === null)
             return false;
@@ -363,8 +410,12 @@ function reconcileOrphan(repo, jobId, now = Date.now()) {
                     ...(nonfatal === true ? { nonfatal: true } : {}),
                 })),
                 usage: result.usage === undefined ? null : Object.fromEntries(Object.entries(result.usage).filter((entry) => typeof entry[1] === 'number')),
-                latestSummary: result.response.trim().slice(0, 1_000) || manifest.latestSummary || null,
+                // The conclusion is at the end of the response (same rule as writer.finish).
+                latestSummary: summaryTail(result.response, 1_000) || manifest.latestSummary || null,
                 summarySource: result.response.trim() || manifest.latestSummary ? 'worker' : null,
+                // Recovery never runs the finish-time git diff.
+                changedFilesUnknown: true,
+                ...(facts.cwdMissing ? { cwdMissingAtFinish: true } : {}),
             });
             abandonPendingAcceptance(repo, jobId, result.finishedAt);
             return true;
@@ -389,6 +440,23 @@ function abandonPendingAcceptance(repo, jobId, at) {
             state: 'rejected', checks: [], at, pending: false,
             reason: 'server stopped; checks not run',
         });
+    }
+}
+/**
+ * progress.json recorded at least one completed edit (evidence the job wrote).
+ * `editsCompleted` counts only edits that ended without error; the digest's
+ * `editedCount` counts at start and is read only for files written before the
+ * counter existed.
+ */
+function editedOnDisk(repo, jobId) {
+    try {
+        const p = JSON.parse(readFileSync(jobFile(repo, jobId, FILES.progress), 'utf8'));
+        if (typeof p.editsCompleted === 'number')
+            return p.editsCompleted > 0;
+        return typeof p.digest?.editedCount === 'number' && p.digest.editedCount > 0;
+    }
+    catch {
+        return false;
     }
 }
 /** Missing or partially written provider output cannot keep a dead job running. */
@@ -485,6 +553,8 @@ function modeError(mode) {
     const lines = MODES.map((m) => `  ${m}: ${MODE_PRESETS[m].description}`).join('\n');
     return new Error(`${mode === '' ? 'mode is required' : `unknown mode "${mode}"`}. Valid modes:\n${lines}`);
 }
+/** Sidecar naming the env variables a job's worker was given. Keys only. */
+const ENV_KEYS_FILE = 'env-keys.json';
 const AGY_EFFORT_SUFFIX = /-(low|medium|high)$/;
 /**
  * Check model/effort against a catalog. Pure. Throws only when the catalog is
@@ -527,8 +597,10 @@ function checkAgainstCatalog(provider, model, effort, catalog) {
     }
     if (effort !== undefined) {
         const target = match ?? (catalog.defaultModel === undefined ? undefined : catalog.models.find((m) => m.id === catalog.defaultModel));
-        if (target !== undefined && target.efforts.length > 0 && !target.efforts.includes(effort)) {
-            throw new Error(`effort "${effort}" is not valid for ${provider} model "${target.id}". Valid efforts: ${target.efforts.join(', ')}.`);
+        // Defensive: a catalog from disk or a provider could carry a model without an efforts array.
+        const efforts = Array.isArray(target?.efforts) ? target.efforts : [];
+        if (target !== undefined && efforts.length > 0 && !efforts.includes(effort)) {
+            throw new Error(`effort "${effort}" is not valid for ${provider} model "${target.id}". Valid efforts: ${efforts.join(', ')}.`);
         }
     }
     return warnings;
@@ -601,6 +673,7 @@ function toSummary(observed, source) {
             deniedCount: Array.isArray(raw['denied_actions']) ? raw['denied_actions'].length : 0,
             unrestricted: raw['unrestricted'] === true,
             steerNotApplied: observed.warnings.some((w) => w.code === 'steer_not_applied'),
+            failedEarly: raw['failedEarly'] === true,
         }),
         mode: observed.mode,
         model: observed.model,
@@ -624,6 +697,12 @@ function toSummary(observed, source) {
             : {}),
         ...(Array.isArray(changedFiles) ? { changedFileCount: changedFiles.length } : {}),
         ...(digest !== null ? { digest } : {}),
+        ...(typeof raw['toolErrors'] === 'number' && raw['toolErrors'] > 0 ? { toolErrors: raw['toolErrors'] } : {}),
+        ...(raw['failedEarly'] === true ? { failedEarly: true } : {}),
+        ...(raw['changedFilesUnknown'] === true ? { changedFilesUnknown: true } : {}),
+        ...(raw['cwdMissingAtFinish'] === true ? { cwdMissingAtFinish: true } : {}),
+        ...(typeof raw['last_event_at'] === 'string' ? { lastEventAt: raw['last_event_at'] } : {}),
+        ...(typeof raw['last_alive_at'] === 'string' ? { lastAliveAt: raw['last_alive_at'] } : {}),
     };
 }
 /** progress.json `digest`, accepted only when it has the shape the writer produces. */
@@ -859,6 +938,109 @@ function syncWatchedFiles(repo, cwd, files, previousWatched, onWarning) {
     }
     return out;
 }/**
+ * pipeline/types.ts — vocabulary for mixed-provider stage pipelines.
+ *
+ * The headline feature this file exists for:
+ *
+ *     implement → gemini   ·   review → codex   ·   moderate → claude-sonnet
+ *
+ * One task, a different worker per stage. Nothing in this file knows how to
+ * talk to any worker; `StageRunner` (below) is the seam, and it is injected.
+ *
+ * WHY NO IMPORT FROM providers/
+ * providers/ is written concurrently by another engineer. If pipeline/ imported
+ * a concrete provider client we would have a compile-order dependency on work
+ * that does not exist yet, and pipeline/ could not be tested without spawning
+ * real agents. So the dependency points *inward*: pipeline/ declares the shape
+ * it needs, forge/ supplies an implementation over providers/ at the composition
+ * root (forge/runner.ts, forge/execute.ts). See `createRunnerRouter` in pipeline.ts for the wiring point.
+ */
+/**
+ * Reasoning effort, where the worker supports it.
+ *
+ * Evidence (measured on this user's own jobs): raising effort to `high` cost
+ * **+50% wall clock and 1.9x thinking tokens for ZERO accuracy gain** on an
+ * in-band task. That is why `low` is the default everywhere in this codebase
+ * and why escalation — not the default — is what buys effort.
+ */
+const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/**
+ * Worker `env` keys that are refused, because they change how the worker
+ * binary is found, loaded or configured. The env is applied when the CLI is
+ * spawned, BEFORE any sandbox it sets up exists: `PATH` can swap the binary
+ * for a shim, `NODE_OPTIONS=--import=…` or `DYLD_INSERT_LIBRARIES` run code
+ * ahead of the worker, and a provider config dir can drop its read-only
+ * settings, while the ack would still report the sandbox as enforced.
+ * Matched case-insensitively (Windows env names are).
+ */
+const ENV_DENYLIST = {
+    PATH: 'would change which worker binary runs',
+    HOME: 'would change which config the worker loads',
+    SHELL: 'would change the shell the worker runs commands with',
+    TMPDIR: 'would move the worker\'s temporary and sandbox files',
+    NODE_OPTIONS: 'would run code before the worker starts',
+    NODE_PATH: 'would change which modules the worker loads',
+    PYTHONPATH: 'would change which modules the worker loads',
+    PYTHONHOME: 'would change which runtime the worker loads',
+    PYTHONSTARTUP: 'would run code before the worker starts',
+    // Shell startup files: a shell-based launcher sources these before the worker body runs.
+    BASH_ENV: 'would run code before the worker starts',
+    ENV: 'would run code before the worker starts',
+    ZDOTDIR: 'would run code before the worker starts',
+    SHELLOPTS: 'would change how the shell runs the worker',
+    PROMPT_COMMAND: 'would run code before the worker starts',
+    PERL5OPT: 'would run code before the worker starts',
+    RUBYOPT: 'would run code before the worker starts',
+};
+/**
+ * Key prefixes refused for the same reason: the dynamic loader (`LD_`, `DYLD_`),
+ * XDG config/data dirs, Agent Smith's own settings (`AGENT_SMITH_*_BIN`,
+ * `_HOME`, `_CODEX_SANDBOX`, …) and each provider's config (`CLAUDE_CONFIG_DIR`,
+ * `CODEX_HOME`, `KIMI_CODE_HOME`, `OPENCODE_*`, `AGY_*`). The adapters' own
+ * keys are all covered here; do not list them again above.
+ */
+const ENV_DENY_PREFIXES = {
+    LD_: 'would change which libraries the worker loads',
+    DYLD_: 'would change which libraries the worker loads',
+    XDG_: 'would change which config the worker loads',
+    AGENT_SMITH_: 'is Agent Smith\'s own setting, not the worker\'s',
+    AGY_: 'would change the provider\'s config',
+    CLAUDE_: 'would change the provider\'s config',
+    CODEX_: 'would change the provider\'s config',
+    OPENCODE_: 'would change the provider\'s config',
+    KIMI_: 'would change the provider\'s config',
+};
+/** Why a worker `env` key is refused, or null when it is allowed. */
+function deniedEnvReason(key) {
+    const upper = key.toUpperCase();
+    const exact = ENV_DENYLIST[upper];
+    if (exact !== undefined)
+        return exact;
+    for (const [prefix, why] of Object.entries(ENV_DENY_PREFIXES))
+        if (upper.startsWith(prefix))
+            return why;
+    return null;
+}
+/** Validate a worker `env` map: plain identifier keys not on the denylist, string values without NUL. Returns it unchanged, or undefined when absent. */
+function validateEnv(raw, label = 'env') {
+    if (raw === undefined)
+        return undefined;
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw))
+        throw new Error(`${label} must be an object of string values.`);
+    const out = {};
+    for (const [key, value] of Object.entries(raw)) {
+        if (!ENV_KEY.test(key))
+            throw new Error(`${label} key "${key}" is not a valid variable name (letters, digits, underscore; no leading digit).`);
+        const denied = deniedEnvReason(key);
+        if (denied !== null)
+            throw new Error(`${label}.${key} ${denied}; it is not allowed in a worker env.`);
+        if (typeof value !== 'string' || value.includes('\0'))
+            throw new Error(`${label}.${key} must be a string without NUL characters.`);
+        out[key] = value;
+    }
+    return out;
+}/**
  * service.ts — the composition root that can START a worker.
  *
  * It wires providers/ (adapters) and pipeline/ (StageRunner) to the job
@@ -930,7 +1112,14 @@ class WorkerLookupError extends Error {
         this.jobIds = jobIds;
     }
 }
+/**
+ * How long a spawn waits for the model catalog before passing the model through
+ * unchecked. Cold discovery shells out (`agy models` alone took 2.1 s), so the
+ * first spawn, when no catalog has been seen yet, waits longer; every later
+ * spawn finds the TTL cache warm or gives up quickly.
+ */
 const CATALOG_WAIT_MS = 2_000;
+const CATALOG_COLD_WAIT_MS = 5_000;
 /**
  * The forge. One instance per process; the live-handle map is per instance.
  *
@@ -953,6 +1142,10 @@ class ForgeService {
     mirrorOn;
     flushMs;
     catalogSource;
+    catalogWaitMs;
+    /** Set once any catalog lookup has completed; until then a spawn waits the cold budget. */
+    catalogSeen = false;
+    catalogWarm;
     harnessDefaults;
     providerSource;
     describeSandbox;
@@ -962,7 +1155,8 @@ class ForgeService {
         this.mirrorOn = options.mirror ?? true;
         this.flushMs = options.flushMs;
         this.providerSource = options.providerSource ?? requireProvider;
-        this.catalogSource = options.catalogSource ?? ((providers) => getCatalogs({ providers }));
+        this.catalogSource = options.catalogSource ?? ((providers) => getCatalogs({ providers, repo: this.repo }));
+        this.catalogWaitMs = { warm: options.catalogWaitMs?.warm ?? CATALOG_WAIT_MS, cold: options.catalogWaitMs?.cold ?? CATALOG_COLD_WAIT_MS };
         this.harnessDefaults = options.harnessDefaults ?? getHarnessDefaults;
         this.describeSandbox = options.describeSandbox ?? ((p, spec) => p.describeSandbox?.(spec));
         // Publish abandoned-job recovery when the owner service starts, so the
@@ -996,16 +1190,35 @@ class ForgeService {
                 throw busy(active.jobId);
         }
     }
+    /**
+     * Start model discovery in the background so the first spawn finds it cached.
+     * Never blocks, never rejects; a second call is a no-op.
+     */
+    warmCatalogs() {
+        if (this.catalogWarm !== undefined)
+            return;
+        this.catalogWarm = Promise.resolve()
+            .then(() => this.catalogSource())
+            .then((all) => { this.catalogSeen = true; return all; })
+            .catch(() => [])
+            // Once settled the provider TTL cache owns freshness; later lookups must not reuse this snapshot.
+            .finally(() => { this.catalogWarm = undefined; });
+    }
     /** Never throws, never waits long: a catalog is advice, not a gate on starting. */
     async catalogFor(provider) {
         let timer;
         try {
+            const waitMs = this.catalogSeen ? this.catalogWaitMs.warm : this.catalogWaitMs.cold;
             const timeout = new Promise((resolve) => {
-                timer = setTimeout(() => resolve(undefined), CATALOG_WAIT_MS);
+                timer = setTimeout(() => resolve(undefined), waitMs);
                 timer.unref?.();
             });
-            const all = await Promise.race([this.catalogSource([provider]), timeout]);
-            return all?.find((c) => c.provider === provider) ?? all?.[0];
+            // Join a warm-up still in flight rather than starting a second discovery.
+            const warm = this.catalogWarm;
+            const all = await Promise.race([warm ?? this.catalogSource([provider]), timeout]);
+            if (all !== undefined)
+                this.catalogSeen = true;
+            return all?.find((c) => c.provider === provider) ?? (warm === undefined ? all?.[0] : undefined);
         }
         catch {
             return undefined;
@@ -1050,6 +1263,8 @@ class ForgeService {
             throw new Error('prompt is empty; there is nothing to hand the worker.');
         }
         const timeoutMs = clampTimeout(request.timeoutMs);
+        const env = validateEnv(request.env);
+        const envKeys = env === undefined ? [] : Object.keys(env);
         const cwd = request.cwd ?? this.repo;
         // agy and kimi cannot prompt headless. agy has an env opt-out; kimi's print
         // mode force-sets the auto policy and has no restricted mode, so the
@@ -1150,6 +1365,7 @@ class ForgeService {
             timeoutMs,
             unrestricted,
             conversation: request.conversation,
+            env,
             pipeline: request.pipeline ?? null,
             stage: request.stage ?? null,
             attempt: request.attempt ?? null,
@@ -1169,6 +1385,8 @@ class ForgeService {
         try {
             if (request.checks !== undefined)
                 writeJsonAtomic(jobFile(this.repo, jobId, FILES.checksSpec), request.checks);
+            if (envKeys.length > 0)
+                writeJsonAtomic(jobFile(this.repo, jobId, ENV_KEYS_FILE), envKeys);
             await request.onPrepared?.(jobId);
         }
         catch (error) {
@@ -1186,6 +1404,7 @@ class ForgeService {
             dir: jobDir(this.repo, jobId),
             repo: this.repo,
             timeoutMs,
+            ...(envKeys.length > 0 ? { envKeys } : {}),
             unrestricted,
             note: `queued · ${humanDuration(timeoutMs)} limit · ${provider.name === 'kimi' ? 'auto policy (cannot restrict)' : unrestricted ? 'unrestricted' : 'approvals on'}`,
             sandbox,
@@ -1233,6 +1452,7 @@ class ForgeService {
                     ...(spec.model === undefined ? {} : { model: spec.model }),
                     ...(spec.effort === undefined ? {} : { effort: spec.effort }),
                     ...(currentConversation === undefined ? {} : { conversation: currentConversation }),
+                    ...(spec.env === undefined ? {} : { env: { ...spec.env } }),
                     // THE KEY LINE. Handing the provider adapter OUR job directory as its
                     // stateDir means events.jsonl / argv.json / stderr.log / result.json are
                     // written by the already-verified plumbing in providers/ndjson.ts, for
@@ -1319,6 +1539,9 @@ class ForgeService {
                     jobStatus: result.status,
                     deniedActions: result.deniedActions ?? [],
                     report: report === '' ? null : report,
+                    // Same cwd rule as finish(): a writing turn whose cwd vanished failed,
+                    // so a queued steer must not chain onto it.
+                    ...currentWriter.verdictFacts(),
                 });
                 const shouldChain = !liveEntry.userCanceled &&
                     unconsumed.length > 0 &&
@@ -1441,6 +1664,8 @@ class ForgeService {
         }));
         if (spec.checks !== undefined)
             writeJsonAtomic(jobFile(this.repo, nextJobId, FILES.checksSpec), spec.checks);
+        if (spec.env !== undefined && Object.keys(spec.env).length > 0)
+            writeJsonAtomic(jobFile(this.repo, nextJobId, ENV_KEYS_FILE), Object.keys(spec.env));
         for (const w of syncWarnings)
             nextWriter.warn(w);
         // The child anchor exists; publish its id before the parent's terminal
@@ -1909,4 +2134,4 @@ function describe(err) {
     if (err instanceof Error)
         return err.message;
     return String(err);
-}export{ForgeService as F,MAX_WATCHED_FILES as M,getInstalledProviders as a,getCatalogs as g,launchPipeline as l};
+}export{EFFORTS as E,ForgeService as F,MAX_WATCHED_FILES as M,ENV_KEYS_FILE as a,getInstalledProviders as b,getCatalogs as g,launchPipeline as l,validateEnv as v};

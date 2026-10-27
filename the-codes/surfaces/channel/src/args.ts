@@ -2,7 +2,7 @@
 import path from 'node:path';
 import { statSync } from 'node:fs';
 import { inheritContinuedProviders } from '../../../pipeline/pipeline.ts';
-import { EFFORTS, type Effort, type Stage, type StageCheck } from '../../../pipeline/types.ts';
+import { EFFORTS, validateEnv, type Effort, type Stage, type StageCheck } from '../../../pipeline/types.ts';
 import { FORMATS, MAX_CONTEXT_CHARS, PROVIDERS, stageSchema } from './tool-defs.ts';
 import type { ResponseFormat } from './views.ts';
 
@@ -75,6 +75,6 @@ export function parseStages(raw: unknown): Stage[] | undefined {
       if (!Array.isArray(s.consumes)) throw new Error('consumes must be an array.');
       consumes = s.consumes.map(v => { const a = record(v, 'artifact'); keys(a, ['stage', 'path', 'label']); return { stage: text(a, 'stage', true)!, path: text(a, 'path', true)!, label: text(a, 'label') }; });
     }
-    return { name: text(s, 'name', true)!, agentName: text(s, 'agentName'), workerId: text(s, 'workerId'), conversation: text(s, 'conversation'), continues: text(s, 'continues'), provider: allowed(s, 'provider', PROVIDERS), model: text(s, 'model'), effort: allowed(s, 'effort', EFFORTS) as Effort | undefined, prompt: text(s, 'prompt'), context: contextText(s), title: text(s, 'title'), role: text(s, 'role'), dependsOn, consumes, workDir: text(s, 'workDir'), resultPath: text(s, 'resultPath'), timeoutMs: number(s, 'timeoutMs'), routingPinned: boolean(s, 'routingPinned'), checks: parseChecks(s.checks) };
+    return { name: text(s, 'name', true)!, agentName: text(s, 'agentName'), workerId: text(s, 'workerId'), conversation: text(s, 'conversation'), continues: text(s, 'continues'), provider: allowed(s, 'provider', PROVIDERS), model: text(s, 'model'), effort: allowed(s, 'effort', EFFORTS) as Effort | undefined, prompt: text(s, 'prompt'), context: contextText(s), title: text(s, 'title'), role: text(s, 'role'), dependsOn, consumes, workDir: text(s, 'workDir'), resultPath: text(s, 'resultPath'), timeoutMs: number(s, 'timeoutMs'), routingPinned: boolean(s, 'routingPinned'), checks: parseChecks(s.checks), env: validateEnv(s.env, 'env') };
   }));
 }

@@ -72,7 +72,7 @@ import type { ForgeService, SpawnRequest } from './service.ts';
 import type { ForgeActivity, ForgeManifest } from './format.ts';
 import { appendBounded } from './writer.ts';
 import { isMode, MODE_PRESETS } from './modes.ts';
-import { markAcceptancePending, runAcceptance, writeAcceptance } from './checks.ts';
+import { evaluateAcceptanceReport, pendingAcceptance, writeAcceptance } from './checks.ts';
 import type { Acceptance } from './checks.ts';
 
 /**
@@ -351,6 +351,7 @@ export function createForgeRunner(deps: RunnerDeps): StageRunner {
       // second, independent line of defence rather than the only one.
       timeoutMs: stage.timeoutMs ?? 0,
       unrestricted: deps.unrestricted,
+      ...(stage.env === undefined ? {} : { env: stage.env }),
       pipeline: ctx.pipeline,
       stage: stage.name,
       attempt: ctx.attempt,
@@ -370,7 +371,7 @@ export function createForgeRunner(deps: RunnerDeps): StageRunner {
       const tracked = await deps.service.spawnTracked(request);
       jobId = tracked.ack.jobId;
       // As spawn_job does: the job reads "checks pending" until a verdict exists.
-      if (stage.checks?.length) recordAcceptance(deps.service.repo, jobId, 'pending');
+      if (stage.checks?.length) recordAcceptance(deps.service.repo, jobId, pendingAcceptance(stage.checks));
       deps.onStageRunning?.({
         stage: stage.name, jobId, status: 'running', provider: ctx.routing.provider,
         ...(ctx.routing.model === undefined ? {} : { model: ctx.routing.model }),
@@ -403,7 +404,7 @@ export function createForgeRunner(deps: RunnerDeps): StageRunner {
       publishArtifact(deps.service.repo, jobId, stage, artifactRoot);
       const result = toStageResult(stage, ctx, manifest, observations, startedAt, artifactRoot);
       if (!stage.checks?.length) return manifest.status === 'succeeded' ? { ...result, acceptance: 'unchecked' } : result;
-      const { acceptance, report } = await runAcceptance({
+      const { acceptance, report } = await evaluateAcceptanceReport({
         succeeded: manifest.status === 'succeeded', checks: stage.checks, baseDir: ctx.workDir, signal: ctx.signal,
       });
       recordAcceptance(deps.service.repo, jobId, acceptance);
@@ -450,8 +451,8 @@ export function createForgeRunner(deps: RunnerDeps): StageRunner {
 }
 
 /** Persist the stage job's acceptance beside its record. A failed write must not fail the stage. */
-function recordAcceptance(repo: string, jobId: string, acceptance: Acceptance | 'pending'): void {
-  try { if (acceptance === 'pending') markAcceptancePending(repo, jobId); else writeAcceptance(repo, jobId, acceptance); } catch (err) { process.stderr.write(`agent-smith acceptance ${jobId}: ${String(err)}\n`); }
+function recordAcceptance(repo: string, jobId: string, acceptance: Acceptance): void {
+  try { writeAcceptance(repo, jobId, acceptance); } catch (err) { process.stderr.write(`agent-smith acceptance ${jobId}: ${String(err)}\n`); }
 }
 
 /* ── observation collection ──────────────────────────────────────────────── */

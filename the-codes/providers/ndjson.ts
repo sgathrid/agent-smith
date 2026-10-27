@@ -296,7 +296,18 @@ export interface SpawnWorkerOptions extends WorkerPumps {
   stateDir: string;
   jobId: string;
   mode: string;
+  /**
+   * Called while the child runs: once right after spawn, then every
+   * `heartbeatMs`. Adapters hand it to `bus.emit` as a `heartbeat` event (never
+   * to events.jsonl), so the job writer can record `lastAliveAt`.
+   */
+  onHeartbeat?: (at: string, pid: number | undefined) => void;
+  /** Heartbeat interval. Defaults to HEARTBEAT_MS; overridable for tests. */
+  heartbeatMs?: number;
 }
+
+/** Default heartbeat interval; mirrors surfaces/mod/hooks/stale.ts HEARTBEAT_MS. */
+export const HEARTBEAT_MS = 30_000;
 
 /**
  * The concrete child type we actually get: stdin is null (stdio[0]='ignore'),
@@ -357,6 +368,8 @@ export function spawnWorker(opts: SpawnWorkerOptions): Promise<WorkerProcess> {
   let killReason: 'cancelled' | 'timeout' | undefined;
   let killTimer: NodeJS.Timeout | undefined;
   let timeoutTimer: NodeJS.Timeout | undefined;
+  let heartbeatTimer: NodeJS.Timeout | undefined;
+  let firstBeat: NodeJS.Timeout | undefined;
   const killGraceMs = Math.max(0, opts.killGraceMs ?? 5_000);
 
   function signalTree(signal: NodeJS.Signals): void {
@@ -409,12 +422,49 @@ export function spawnWorker(opts: SpawnWorkerOptions): Promise<WorkerProcess> {
     timeoutTimer.unref?.();
   }
 
+  // Liveness from the process owner. Provider events stop during a long tool
+  // call; this does not. The first beat waits one macrotask so the caller has
+  // subscribed to the adapter's bus (spawn resolves first).
+  //
+  // The beat stops when the CLI process EXITS, not when its stdio closes: a
+  // descendant that inherited stdout can hold it open long after the worker
+  // died, and beats in that window would make a dead pid look alive. Each beat
+  // also probes the pid itself and stops if it is gone.
+  let leaderExited = false;
+  const stopHeartbeat = (): void => {
+    leaderExited = true;
+    if (firstBeat !== undefined) clearTimeout(firstBeat);
+    if (heartbeatTimer !== undefined) clearInterval(heartbeatTimer);
+    firstBeat = undefined;
+    heartbeatTimer = undefined;
+  };
+  handle.on('exit', stopHeartbeat);
+  const onHeartbeat = opts.onHeartbeat;
+  const pid = handle.pid;
+  if (onHeartbeat !== undefined && pid !== undefined) {
+    const beat = (): void => {
+      if (leaderExited) return;
+      try {
+        process.kill(pid, 0);
+      } catch (err) {
+        // EPERM: it exists, we just may not signal it. Anything else: gone.
+        if ((err as NodeJS.ErrnoException).code !== 'EPERM') { stopHeartbeat(); return; }
+      }
+      try { onHeartbeat(nowIso(), pid); } catch { /* a listener must not kill the worker */ }
+    };
+    firstBeat = setTimeout(beat, 0);
+    firstBeat.unref?.();
+    heartbeatTimer = setInterval(beat, Math.max(1, opts.heartbeatMs ?? HEARTBEAT_MS));
+    heartbeatTimer.unref?.();
+  }
+
   const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
     let settled = false;
     const finish = (code: number | null, signal: NodeJS.Signals | null): void => {
       if (settled) return;
       settled = true;
       if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
+      stopHeartbeat();
       if (killTimer !== undefined) {
         clearTimeout(killTimer);
         killTimer = undefined;
@@ -613,6 +663,8 @@ export async function runNdjsonWorker(cfg: NdjsonWorkerConfig): Promise<WorkerHa
     stateDir,
     jobId,
     mode: spec.mode,
+    // Liveness only: on the bus, never in events.jsonl (see ProviderEvent 'heartbeat').
+    onHeartbeat: (at, pid) => bus.emit({ kind: 'heartbeat', at, ...(pid === undefined ? {} : { pid }) }),
     ...(spec.env !== undefined ? { env: spec.env } : {}),
     onStdoutLine(line) {
       const raw = tryParseObject(line);

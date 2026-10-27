@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { evaluateAcceptance, markAcceptancePending, readAcceptance, settleAcceptance, toVerifyChecks, writeAcceptance } from '../checks.ts';
+import { acceptanceBudgetMs, evaluateAcceptance, markAcceptancePending, pendingAcceptance, readAcceptance, runAcceptance, settleAcceptance, toVerifyChecks, writeAcceptance } from '../checks.ts';
 
 test('toVerifyChecks resolves cwd and applies default timeout', () => {
   const [c] = toVerifyChecks([{ name: 'a', command: 'true', cwd: 'sub' }], '/base');
@@ -90,4 +90,34 @@ test('settleAcceptance records the verdict on the final turn and supersedes the 
   assert.equal(first.state, 'unchecked');
   assert.equal(first.reason, 'superseded by steered turn');
   assert.equal(first.pending, undefined);
+});
+
+test('the pending placeholder carries a budget: the checks timeouts summed, plus grace, capped', () => {
+  assert.equal(acceptanceBudgetMs([{ name: 'a', command: 'x' }]), 60_000 + 30_000);
+  assert.equal(acceptanceBudgetMs([{ name: 'a', command: 'x', timeoutMs: 600_000 }, { name: 'b', command: 'x', timeoutMs: 600_000 }]), 1_230_000);
+  assert.equal(acceptanceBudgetMs([{ name: 'a', command: 'x', timeoutMs: 3_600_000 }]), 30 * 60_000);
+  assert.deepEqual(pendingAcceptance([{ name: 'a', command: 'x' }]), { state: 'unchecked', checks: [], pending: true, budgetMs: 90_000 });
+});
+
+test('evaluateAcceptance reports which checks run; runAcceptance keeps the placeholder current', async () => {
+  const baseDir = tmpdir();
+  const seen: string[][] = [];
+  await evaluateAcceptance({ succeeded: true, baseDir, checks: [{ name: 'one', command: 'true' }], onProgress: (r) => seen.push([...r]) });
+  assert.deepEqual(seen, [['one'], []]);
+  const repo = mkdtempSync(path.join(tmpdir(), 'acceptance-run-'));
+  const checks = [{ name: 'slow', command: 'sleep 0.4' }];
+  const run = runAcceptance({ repo, jobId: 'j1', succeeded: true, checks, baseDir });
+  await new Promise(r => setTimeout(r, 200));
+  const mid = readAcceptance(repo, 'j1') as { pending?: boolean; running?: string; budgetMs?: number };
+  assert.equal(mid.pending, true); assert.equal(mid.running, 'slow'); assert.equal(mid.budgetMs, 90_000);
+  assert.equal((await run).state, 'accepted');
+});
+
+test('aborting running checks records unchecked, checks canceled', async () => {
+  const ac = new AbortController();
+  const repo = mkdtempSync(path.join(tmpdir(), 'acceptance-abort-'));
+  const run = runAcceptance({ repo, jobId: 'j2', succeeded: true, checks: [{ name: 'hang', command: 'sleep 30' }], baseDir: tmpdir(), signal: ac.signal });
+  setTimeout(() => ac.abort(), 100);
+  const r = await run;
+  assert.equal(r.state, 'unchecked'); assert.equal(r.reason, 'checks canceled'); assert.deepEqual(r.checks, []);
 });

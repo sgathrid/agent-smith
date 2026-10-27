@@ -14,7 +14,8 @@ legacy mode always shows the repository.
 ```
  ● implement-musm82da-f1dc1fe4 cargo test --workspace · 341 tools ·     12m04s
  ● implement-muroviej-a23df195 reading decoded_view.rs ·  22 tools ·     02m18s
- ! implement-musm82da-f1dc1fe4 stalled ·  341 tools · 1h02m03s
+ ● implement-musm82da-f1dc1fe4 in `cargo test` 16m ·  341 tools ·   38m10s
+ ! implement-muroviej-a23df195 no output 16m ·  22 tools ·   41m02s
  ✓ research-muroabc-f1dc1fe4 finished, warnings ·  8 tools ·      48s
    +2 more · /forge
 ```
@@ -32,7 +33,9 @@ liveness → outcome), with the **elapsed time last**:
 | state | glyph | colour | line |
 |---|---|---|---|
 | running | `●` | yellow, bold | `● <id> <activity> · N tools · 12m04s` |
-| stalled | `!` | cyan, bold | `! <id> stalled · N tools · 1h02m03s` |
+| running, one call open for over a minute | `●` | yellow, bold | ``● <id> in `cargo test` 16m · N tools · 38m10s`` |
+| quiet: no output (`silent`) | `!` | cyan, bold | `! <id> no output 16m · N tools · 1h02m03s` |
+| quiet: process gone (`dead`) | `!` | cyan, bold | `! <id> process gone 3m · N tools · 1h02m03s` |
 | succeeded | `✓` | green | `✓ <id> finished · N tools · 48s` |
 | succeeded with warnings | `✓` | green | `✓ <id> finished, warnings · 48s` |
 | failed | `✗` | red | `✗ <id> failed · suspicious success · 48s` |
@@ -56,6 +59,11 @@ number:
 - **Finished jobs linger 10 s, then leave.** Pending acceptance stays visible.
   Linger is measured from the execution finish time — *not* from when we first noticed — so a corpus of 20
   jobs finished hours ago draws nothing instead of claiming four are in flight.
+- **Quiet is a fact, never "stalled".** Liveness comes from `hooks/stale.ts`
+  `livenessOf` (the channel uses the same function): a call still open is
+  `in \`<command>\` <time>`, 15 minutes without output is `no output <time>`, a
+  worker process whose heartbeat stopped 2 minutes ago is `process gone <time>`.
+  Only the last two are `!`; a long command stays `●`.
 - **Nothing renders when there is nothing to say.** Not "0 jobs", not an empty
   box. The host's own output comes back untouched, as our last child.
 - **A survey holds the band.** `e.props.hasSurvey` → we draw nothing.
@@ -148,7 +156,9 @@ finished`, or `No agents in this session`); `/forge all` labels its counts
 `repository: …`.
 
 The list shows running and checking workers first, then a "Recent" section of
-settled ones, most recent first. A failure from the last 24 hours is drawn red
+settled ones, most recent first. A settled row ends with `started HH:MM`, so two workers
+with alike names can be told apart. A worker that exited while its checks run reads
+`exited · checking: <check>`, never `done`. A failure from the last 24 hours is drawn red
 with its failure label; after that it is drawn dim like other finished work.
 
 The worker view is one scroll: a header (status, name, provider·model, elapsed
@@ -241,7 +251,8 @@ hooks/register.tsx          § BAND (band author) + § PANE (pane author)
 hooks/band.ts               the band's pure rules
 hooks/jobs.ts               THE READER — one, over an injected filesystem
 hooks/format.ts             pure formatting, shared by band and pane
-hooks/stale.ts              the stall threshold, shared by band and channel
+hooks/stale.ts              livenessOf and its thresholds, shared by band and channel
+hooks/notice.ts             completion notice words and who may announce
 types/index.d.ts            RadarJob + the PluginState declaration
 tests/                      node --test: the RULES
 tests/engine/               claude plugin test: the RENDERING

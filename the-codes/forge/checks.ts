@@ -40,6 +40,29 @@ export interface Acceptance {
   /** True only in the placeholder written at spawn, before the job is terminal. */
   readonly pending?: boolean;
   readonly reason?: string;
+  /**
+   * Pending placeholder only: how long the checks may take (their own timeouts
+   * plus a grace, capped). A notice holds for this long, not a flat guess.
+   */
+  readonly budgetMs?: number;
+  /** Pending only: names of the checks running right now, comma separated. */
+  readonly running?: string;
+  /** Pending only: ISO time the checks started. */
+  readonly startedAt?: string;
+}
+
+export const ACCEPTANCE_GRACE_MS = 30_000;
+export const ACCEPTANCE_BUDGET_CAP_MS = 30 * 60_000;
+
+/** Upper bound on how long checks can run: their timeouts summed (they may overlap), plus a grace, capped. */
+export function acceptanceBudgetMs(checks: readonly StageCheck[]): number {
+  const total = checks.reduce((sum, c) => sum + (c.timeoutMs ?? DEFAULT_CHECK_TIMEOUT_MS), 0);
+  return Math.min(ACCEPTANCE_BUDGET_CAP_MS, total + ACCEPTANCE_GRACE_MS);
+}
+
+/** The placeholder written at spawn: checks will run once the job ends. */
+export function pendingAcceptance(checks: readonly StageCheck[] | undefined): Acceptance {
+  return { state: 'unchecked', checks: [], pending: true, ...(checks?.length ? { budgetMs: acceptanceBudgetMs(checks) } : {}) };
 }
 
 /** Normalize a runner report into the persisted acceptance shape. */
@@ -102,28 +125,42 @@ export function toVerifyChecks(checks: readonly StageCheck[], baseDir: string): 
   }));
 }
 
+/** What every acceptance runner takes. */
+export interface AcceptanceInput {
+  readonly succeeded: boolean; readonly checks: readonly StageCheck[] | undefined;
+  readonly baseDir: string; readonly signal?: AbortSignal; readonly now?: () => Date;
+  /** Called with the names of the checks running whenever that set changes. */
+  readonly onProgress?: (running: readonly string[]) => void;
+}
+
 /**
  * Run the checks once and return both the persisted verdict and the raw report.
  * Pipeline stages need the report (its verdicts become stage evidence); every
  * other caller only wants the Acceptance, via `evaluateAcceptance`.
  */
-export async function runAcceptance(input: {
-  readonly succeeded: boolean; readonly checks: readonly StageCheck[] | undefined;
-  readonly baseDir: string; readonly signal?: AbortSignal; readonly now?: () => Date;
-}): Promise<{ readonly acceptance: Acceptance; readonly report: CheckReport | null }> {
+export async function evaluateAcceptanceReport(input: AcceptanceInput): Promise<{ readonly acceptance: Acceptance; readonly report: CheckReport | null }> {
   const stamp = (): string => (input.now ?? (() => new Date()))().toISOString();
   if (!input.checks?.length) return { acceptance: { state: 'unchecked', checks: [], at: stamp() }, report: null };
   if (!input.succeeded) {
     return { acceptance: { state: 'rejected', checks: [], at: stamp(), reason: 'job did not succeed; checks not run' }, report: null };
   }
-  const rawReport = await runChecks(toVerifyChecks(input.checks, input.baseDir), { signal: input.signal });
+  const running = new Set<string>();
+  const rawReport = await runChecks(toVerifyChecks(input.checks, input.baseDir), {
+    signal: input.signal,
+    ...(input.onProgress === undefined ? {} : {
+      onCheck: ({ check, state }) => {
+        if (state === 'start') running.add(check.name); else running.delete(check.name);
+        input.onProgress!([...running]);
+      },
+    }),
+  });
   const report = normalizeAcceptanceReport(rawReport, input.checks);
   const checks = acceptanceChecksFromReport(report, input.checks);
   return { acceptance: { state: acceptanceState(checks), at: stamp(), checks }, report };
 }
 
-export async function evaluateAcceptance(input: Parameters<typeof runAcceptance>[0]): Promise<Acceptance> {
-  return (await runAcceptance(input)).acceptance;
+export async function evaluateAcceptance(input: AcceptanceInput): Promise<Acceptance> {
+  return (await evaluateAcceptanceReport(input)).acceptance;
 }
 
 export function writeAcceptance(repo: string, jobId: string, acceptance: Acceptance): void {
@@ -132,10 +169,11 @@ export function writeAcceptance(repo: string, jobId: string, acceptance: Accepta
 
 /**
  * The placeholder written when a job is prepared, before it is terminal, so a
- * reader can tell "checks still to run" from "no checks attached".
+ * reader can tell "checks still to run" from "no checks attached". With the
+ * checks it also records how long they may take (`budgetMs`).
  */
-export function markAcceptancePending(repo: string, jobId: string): void {
-  writeAcceptance(repo, jobId, { state: 'unchecked', checks: [], pending: true });
+export function markAcceptancePending(repo: string, jobId: string, checks?: readonly StageCheck[]): void {
+  writeAcceptance(repo, jobId, pendingAcceptance(checks));
 }
 
 /** A steered job's earlier turns never get checks of their own; the final turn carries the verdict. */
@@ -144,13 +182,42 @@ export function markAcceptanceSuperseded(repo: string, jobId: string): void {
 }
 
 /**
- * Evaluate the finished job, record the verdict on its final turn, and mark
- * every other prepared turn superseded. Returns the verdict written.
+ * evaluateAcceptance for a job on disk: keeps acceptance.json's pending placeholder
+ * current with the checks running, then returns the verdict (the caller writes it).
+ * An abort records `unchecked: checks canceled` instead of a verdict from killed checks.
  */
-export async function settleAcceptance(input: Parameters<typeof runAcceptance>[0] & {
+export async function runAcceptance(input: Omit<AcceptanceInput, 'onProgress'> & {
+  readonly repo: string; readonly jobId: string;
+}): Promise<Acceptance> {
+  const budgetMs = acceptanceBudgetMs(input.checks ?? []);
+  const startedAt = new Date().toISOString();
+  const acceptance = await evaluateAcceptance({
+    succeeded: input.succeeded, checks: input.checks, baseDir: input.baseDir,
+    ...(input.signal === undefined ? {} : { signal: input.signal }),
+    ...(input.now === undefined ? {} : { now: input.now }),
+    onProgress: (running) => {
+      try {
+        writeAcceptance(input.repo, input.jobId, {
+          state: 'unchecked', checks: [], pending: true, budgetMs, startedAt,
+          ...(running.length > 0 ? { running: running.join(', ') } : {}),
+        });
+      } catch { /* progress is advisory; the verdict write is not */ }
+    },
+  });
+  return input.signal?.aborted
+    ? { state: 'unchecked', checks: [], at: acceptance.at ?? startedAt, reason: 'checks canceled' }
+    : acceptance;
+}
+
+/**
+ * Evaluate the finished job (progress and cancel as in `runAcceptance`), record
+ * the verdict on its final turn, and mark every other prepared turn superseded.
+ * Returns the verdict written.
+ */
+export async function settleAcceptance(input: Omit<AcceptanceInput, 'onProgress'> & {
   readonly repo: string; readonly finalJobId: string; readonly preparedJobIds: readonly string[];
 }): Promise<Acceptance> {
-  const acceptance = await evaluateAcceptance(input);
+  const acceptance = await runAcceptance({ ...input, jobId: input.finalJobId });
   writeAcceptance(input.repo, input.finalJobId, acceptance);
   for (const id of input.preparedJobIds) if (id !== input.finalJobId) markAcceptanceSuperseded(input.repo, id);
   return acceptance;

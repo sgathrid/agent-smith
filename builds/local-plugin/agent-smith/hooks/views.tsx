@@ -169,9 +169,13 @@ const timelineKey=(item: TimelineItem): string => item.kind==='group'?item.key:`
 /**
  * The worker's words, marked `●` like Claude Code's own transcript so they stand
  * apart from the dimmed tool rows. A text that opens with a heading, list, quote,
- * fence or table is left unmarked: a prefix would break its markdown.
+ * fence, table, rule, HTML block or indented code block is left unmarked and
+ * keeps its indentation: a prefix would break its markdown.
  */
 export function proseText(text: string): string {
-  const clean=sanitizeText(text).replace(/^\s+/,'');
-  return /^(?:#|[-*+]\s|\d+[.)]\s|>|`{3}|~{3}|\|)/.test(clean) ? clean : `● ${clean}`;
+  const clean=sanitizeText(text).replace(/^(?:[ \t]*\n)+/,'');
+  if (/^(?: {4}|\t)/.test(clean)) return clean;
+  const body=clean.replace(/^\s+/,'');
+  const firstLine=body.split('\n',1)[0]!;
+  return /^(?:#|[-*+]\s|\d+[.)]\s|>|`{3}|~{3}|\||<)/.test(body) || /^(?:[-*_][ \t]*){3,}$/.test(firstLine) ? body : `● ${body}`;
 }

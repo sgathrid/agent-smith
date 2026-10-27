@@ -2,6 +2,7 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DEFAULT_TIMEOUT_MS } from '../../../forge/service.ts';
+import { readAcceptance } from '../../../forge/checks.ts';
 import { POLL_MS } from './poller.ts';
 
 const MONITOR_CAP_MS = 1_800_000;
@@ -20,6 +21,12 @@ export function builtMonitorPath(moduleFile = fileURLToPath(import.meta.url)): s
   return undefined;
 }
 
+/** The acceptance budget written at spawn, 0 without checks: the verdict can land this long after the job ends. */
+function pendingBudgetMs(repo: string, jobId: string): number {
+  const b = (readAcceptance(repo, jobId) as { pending?: boolean; budgetMs?: unknown }).budgetMs;
+  return typeof b === 'number' && b > 0 ? b : 0;
+}
+
 /**
  * The `notify` hint attached to spawn/resume/pipeline acks. Exported for tests.
  *
@@ -32,7 +39,7 @@ export function notifyHint(target: { job: string } | { run: string }, repo: stri
   const job = 'job' in target;
   const note = `You will be notified when this ${job ? 'job' : 'run'} ends. Silence until then is normal: don't poll or start a monitor.`;
   const noNotice = job
-    ? `no notice has arrived ${Math.ceil(((timeoutMs ?? DEFAULT_TIMEOUT_MS) + NOTICE_GRACE_MS) / 60_000)} min after launch`
+    ? `no notice has arrived ${Math.ceil(((timeoutMs ?? DEFAULT_TIMEOUT_MS) + pendingBudgetMs(repo, target.job) + NOTICE_GRACE_MS) / 60_000)} min after launch`
     : 'pipeline_status shows the run ended and no notice arrived';
   const when = `Only if ${noNotice}, this session can't receive messages between turns (headless), ` +
     'or you are a subagent that must return this result before your turn ends.';

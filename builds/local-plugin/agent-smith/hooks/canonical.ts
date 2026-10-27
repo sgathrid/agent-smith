@@ -6,10 +6,10 @@ import type { RadarJob, RadarStatus, ToolEntry, RadarAcceptance, ActivityEvent }
 import { toEpoch, type FsLike } from './jobs.ts';
 import type { ProgressDigest } from '../types/index.d.ts';
 import { classify, progressPhrase } from './progress.ts';
-import { isStalled } from './stale.ts';
+import { isStalled, livenessOf } from './stale.ts';
 import { firstText, record } from './guards.ts';
 import { isLiveStatus } from './format.ts';
-import { REASONS, STEER_NOT_APPLIED_RE } from './reasons.ts';
+import { REASONS, STEER_NOT_APPLIED_RE, reasonFromText } from './reasons.ts';
 
 type RecordValue = Record<string, unknown>;
 const STATUSES = new Set(['running', 'attention', 'succeeded', 'failed', 'canceled']);
@@ -30,6 +30,8 @@ function acceptance(value: RecordValue | null): RadarAcceptance {
   if (value === null) return { state: 'unchecked', checks: [] };
   if (!['accepted', 'rejected', 'unchecked'].includes(String(value.state))) throw new Error('Invalid acceptance state');
   return { state: value.state as RadarAcceptance['state'], pending: value.pending === true,
+    ...(typeof value.budgetMs === 'number' && Number.isFinite(value.budgetMs) && value.budgetMs > 0 ? { budgetMs: value.budgetMs } : {}),
+    ...(typeof value.running === 'string' && value.running !== '' ? { running: value.running } : {}),
     checks: (Array.isArray(value.checks) ? value.checks : []).flatMap(c => {
       const check = record(c);
       return check && typeof check.name === 'string' ? [{ name: check.name, ok: check.ok === true,
@@ -66,7 +68,13 @@ async function readForgeJob(fs: FsLike, repo: string, id: string, now: number): 
     // The supervisor is gone; its spawn-time placeholder cannot settle itself.
     a = { ...a, pending: false };
     if (!canceled) warnings.unshift({ code: 'orphaned', message: REASONS.serverStopped });
-  } else if (isStalled(status, lastSeen, now)) status = 'attention';
+  }
+  // One liveness rule for band, pane, notices and the channel (stale.ts):
+  // attention is silent or dead; a long open tool call stays running.
+  const liveness = live && status !== 'failed' && status !== 'canceled'
+    ? livenessOf({ status: 'running', lastEventAt: lastSeen, lastAliveAt: firstText(p?.lastAliveAt), lastActivity: record(p?.lastActivity), now })
+    : null;
+  if (liveness !== null) status = isStalled(liveness) ? 'attention' : 'running';
   if (typeof m.error === 'string' && m.error !== '') warnings.unshift({ code: 'tool_error', message: m.error });
   const activities = Array.isArray(p?.recentActivities) ? p.recentActivities.map(record).filter(v => v !== null) : [];
   const recent = activities.reduce<RecordValue | null>((last, row) =>
@@ -82,7 +90,7 @@ async function readForgeJob(fs: FsLike, repo: string, id: string, now: number): 
     id, name: firstText(m.name, resolved?.name, p?.name), workerId: firstText(m.workerId, resolved?.workerId, p?.workerId) ?? id,
     role: firstText(m.role, resolved?.role, p?.role, resolved?.mode, m.mode),
     provider: firstText(m.provider), model: firstText(m.modelResolved, m.model),
-    lastEventAt: lastSeen, pipeline: firstText(m.pipeline), stage: firstText(m.stage), attempt: number(m.attempt),
+    lastEventAt: lastSeen, ...(liveness !== null ? { liveness } : {}), pipeline: firstText(m.pipeline), stage: firstText(m.stage), attempt: number(m.attempt),
     status, startedAt: toEpoch(firstText(m.startedAt, m.createdAt)), endedAt: toEpoch(firstText(m.finishedAt)) ?? (status === 'failed' && live ? lastSeen : null),
     toolCount: number(p?.toolCalls) ?? number(m.toolCalls),
     activity: progress && isLiveStatus(status) ? progressPhrase(progress, now0) : now0,

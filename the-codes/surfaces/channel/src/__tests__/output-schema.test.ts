@@ -159,3 +159,29 @@ test('a schema violation is caught (the harness can fail)', () => {
   assert.equal(validator.getValidator(schema as never)({ jobId: 'j', status: 'done', taskStatus: 'working' }).valid, false);
   assert.equal(validator.getValidator(schema as never)({ jobId: 'j', status: 'running' }).valid, false);
 });
+
+test('liveness and finish evidence validate in list_jobs and status; stalled is the silent-or-dead alias', async () => {
+  const now = Date.now(); const iso = (ms: number) => new Date(now - ms).toISOString();
+  const open = { stepIndex: 5, tool: 'Bash', input: '{"command":"cargo test --workspace"}', status: 'active' as const };
+  const inTool: JobDetail = { ...running, jobId: 'job-l1', name: 'Lu', updatedAt: iso(40 * 60_000), lastEventAt: iso(40 * 60_000), lastAliveAt: iso(5_000), lastActivity: open };
+  const dead: JobDetail = { ...running, jobId: 'job-l2', name: 'Mo', updatedAt: iso(60_000), lastEventAt: iso(60_000), lastAliveAt: iso(3 * 60_000) };
+  const evidence: JobDetail = { ...detail, jobId: 'job-l3', name: 'Ny', status: 'failed', toolErrors: 2, failedEarly: true, changedFilesUnknown: true, cwdMissingAtFinish: true, changedFiles: undefined };
+  const rows = [inTool, dead, evidence];
+  const svc = { repo, spawnedIds: new Set<string>(), list: async () => rows, detail: async (id: string) => rows.find(r => r.jobId === id)! };
+  const c = { ...ctx, service: svc as never };
+  const listed = assertValid('list_jobs', await callTool(c, 'list_jobs', {}), 'list_jobs liveness');
+  const [a, b, e] = listed.items as Record<string, unknown>[];
+  assert.deepEqual(a!.liveness, { state: 'in-tool', silentForMs: (a!.liveness as { silentForMs: number }).silentForMs, tool: 'cargo test --workspace' });
+  assert.equal(a!.stalled, undefined, 'a long command is not a stall');
+  assert.equal((b!.liveness as { state: string }).state, 'dead');
+  assert.equal(b!.stalled, true);
+  assert.deepEqual([e!.toolErrors, e!.failedEarly, e!.changedFilesUnknown, e!.cwdMissingAtFinish, e!.liveness], [2, true, true, true, undefined]);
+  assertValid('list_jobs', await callTool(c, 'list_jobs', { response_format: 'detailed' }), 'list_jobs liveness detailed');
+  for (const response_format of ['concise', 'detailed']) {
+    const s = assertValid('status', await callTool(c, 'status', { jobId: 'job-l2', response_format }), `status dead ${response_format}`);
+    assert.equal((s.liveness as { state: string }).state, 'dead');
+    assert.equal(s.stalled, true);
+    const f = assertValid('status', await callTool(c, 'status', { jobId: 'job-l3', response_format }), `status evidence ${response_format}`);
+    assert.deepEqual([f.toolErrors, f.failedEarly, f.changedFilesUnknown, f.cwdMissingAtFinish], [2, true, true, true]);
+  }
+});

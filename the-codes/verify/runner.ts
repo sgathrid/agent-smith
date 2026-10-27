@@ -357,6 +357,8 @@ export interface RunChecksOptions extends RunCheckOptions {
   concurrency?: number | undefined;
   /** Stop dispatching after the first blocking failure. Default false (collect all). */
   failFast?: boolean | undefined;
+  /** Called as each check starts and ends, so a caller can say which are running. */
+  onCheck?: ((event: { readonly check: Check; readonly state: 'start' | 'end' }) => void) | undefined;
 }
 
 /**
@@ -382,7 +384,9 @@ export async function runChecks(
       const index = cursor++;
       const check = checks[index];
       if (check === undefined) return;
+      try { options.onCheck?.({ check, state: 'start' }); } catch { /* a progress hook must not fail a check */ }
       const verdict = await runCheck(check, options);
+      try { options.onCheck?.({ check, state: 'end' }); } catch { /* as above */ }
       verdicts[index] = verdict;
       if (options.failFast && !verdict.passed && verdict.blocking) stop = true;
     }

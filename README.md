@@ -6,7 +6,7 @@ Agent Smith brings Codex, OpenCode, agy, and Kimi into Claude Code's delegation 
 
 - **Delegate across providers.** Ask Claude to hand off a review, implementation, or verification task in plain English.
 - **Keep working.** Workers run in the background. Claude gets notified when they finish, without repeatedly asking for status.
-- **See what they're doing.** Follow tool calls, spot stalled work, and inspect failures as they appear. Open `/forge` for the details.
+- **See what they're doing.** Follow tool calls, see which workers have gone quiet, and inspect failures as they appear. Open `/forge` for the details.
 
 > Have Codex review the changes on this branch. Call the worker Ada.
 

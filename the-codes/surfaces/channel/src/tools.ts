@@ -3,18 +3,18 @@ import { readFileSync } from 'node:fs';
 import type { CallToolResult } from '@modelcontextprotocol/server';
 import type { Server } from '@modelcontextprotocol/server';
 import type { ForgeStatus } from '../../../forge/format.ts';
-import { type ForgeService, type JobDetail } from '../../../forge/service.ts';
+import { ENV_KEYS_FILE, type ForgeService, type JobDetail } from '../../../forge/service.ts';
 import { launchPipeline } from '../../../forge/supervisor.ts';
 import { FILES, jobFile } from '../../../forge/format.ts';
 import { startPipeline, readPipeline, cancelPipeline } from '../../../forge/execute.ts';
 import { markAcceptancePending, markAcceptanceSuperseded, readAcceptance, settleAcceptance } from '../../../forge/checks.ts';
 import { validateSpec } from '../../../pipeline/pipeline.ts';
-import { EFFORTS, type StageCheck } from '../../../pipeline/types.ts';
+import { EFFORTS, validateEnv, type StageCheck } from '../../../pipeline/types.ts';
 import { MODES, MODE_PRESETS } from '../../../forge/modes.ts';
 import { getCatalogs, getInstalledProviders } from '../../../providers/catalog.ts';
 import { providerNames } from '../../../providers/registry.ts';
 import { loadModelConfig, resolveRequest, describeAliases } from '../../../providers/aliases.ts';
-import { CONCISE_LIST_LIMIT, EARLIER_TURNS_CAP, conciseCapabilities, conciseRow, conciseStatus, concisePipeline, earlierTurn, jobDiff, parseSince, taskStatus, type ResponseFormat } from './views.ts';
+import { CONCISE_LIST_LIMIT, EARLIER_TURNS_CAP, conciseCapabilities, conciseRow, conciseStatus, concisePipeline, earlierTurn, jobDiff, jobLiveness, livenessView, parseSince, taskStatus, type ResponseFormat } from './views.ts';
 import { isStalled } from '../../mod/hooks/stale.ts';
 import { PROVIDERS, TOOL_DEFS, MAX_WAIT_MS } from './tool-defs.ts';
 import { allowed, boolean, contextText, filesList, format, keys, number, parseChecks, parseStages, record, text, workingDirectory } from './args.ts';
@@ -71,19 +71,32 @@ export function structured(value: unknown, { compact = false }: { compact?: bool
   return sc !== null && typeof sc === 'object' ? { ...out, structuredContent: sc as Record<string, unknown> } : out;
 }
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+/** Checks running now for a finished job, by job ID, so `cancel` can stop them. */
+const RUNNING_CHECKS = new Map<string, AbortController>();
+function abortChecks(...ids: string[]): boolean {
+  let aborted = false;
+  for (const id of ids) { const c = RUNNING_CHECKS.get(id); if (c) { c.abort(); aborted = true; } }
+  return aborted;
+}
 /** Detached, tools-layer-owned: await terminal state, run checks, write acceptance.json. Never throws. */
 function gateAcceptance(ctx: HandlerContext, jobId: string, done: Promise<{ jobId?: string; status: string; cwd?: string | null }>, checks: StageCheck[], preparedJobIds: readonly string[]): void {
   if (ctx.service.supervisorUrl) return; // The execution owner runs checks across server reloads.
   void (async () => {
     const manifest = await done;
-    await settleAcceptance({ succeeded: manifest.status === 'succeeded', checks, baseDir: manifest.cwd ?? ctx.service.repo, repo: ctx.service.repo, finalJobId: manifest.jobId ?? jobId, preparedJobIds });
+    const finalJobId = manifest.jobId ?? jobId;
+    const controller = new AbortController();
+    RUNNING_CHECKS.set(finalJobId, controller);
+    try {
+      await settleAcceptance({ succeeded: manifest.status === 'succeeded', checks, baseDir: manifest.cwd ?? ctx.service.repo, repo: ctx.service.repo, finalJobId, preparedJobIds, signal: controller.signal });
+    } finally { RUNNING_CHECKS.delete(finalJobId); }
   })().catch(err => process.stderr.write(`agent-smith acceptance ${jobId}: ${String(err)}\n`));
 }
 export function failure(message: string, detail?: unknown): ToolOutcome { return { isError: true, content: [{ type: 'text', text: message + (detail === undefined ? '' : `\n${JSON.stringify(detail)}`) }] }; }
 
 /** The full `status` view of one job; Tasks results reuse it. */
-export function fullStatus(detail: JobDetail, acceptance: ReturnType<typeof readAcceptance>) {
-  return { ...detail, resumable: Boolean(detail.conversation), stalled: isStalled(detail.status, detail.updatedAt, Date.now()), taskStatus: taskStatus(detail.status), report: detail.report?.slice(0, REPORT_HEAD_CHARS) ?? null, reportTruncated: (detail.report?.length ?? 0) > REPORT_HEAD_CHARS, acceptance };
+export function fullStatus(detail: JobDetail, acceptance: ReturnType<typeof readAcceptance>, now = Date.now()) {
+  const live = jobLiveness(detail, now);
+  return { ...detail, resumable: Boolean(detail.conversation), ...(live === null ? {} : { liveness: livenessView(live) }), stalled: isStalled(live), taskStatus: taskStatus(detail.status), report: detail.report?.slice(0, REPORT_HEAD_CHARS) ?? null, reportTruncated: (detail.report?.length ?? 0) > REPORT_HEAD_CHARS, acceptance };
 }
 
 type Args = Record<string, unknown>;
@@ -119,10 +132,10 @@ const spawnJob: Handler = async (ctx, args) => {
       if (prevId) {
         try { markAcceptanceSuperseded(ctx.service.repo, prevId); } catch { /* ignore */ }
       }
-      try { markAcceptancePending(ctx.service.repo, jobId); } catch (err) { process.stderr.write(`agent-smith acceptance ${jobId}: ${String(err)}\n`); }
+      try { markAcceptancePending(ctx.service.repo, jobId, checks); } catch (err) { process.stderr.write(`agent-smith acceptance ${jobId}: ${String(err)}\n`); }
     }
   };
-  const request = { mode, prompt: text(args, 'prompt', true)!, context: contextText(args), files: filesList(args), checks, cwd: workingDirectory(args), name: text(args, 'name'), task: text(args, 'task'), provider, model: resolved.model, effort: resolved.effort, timeoutMs: number(args, 'timeoutMs'), conversation: text(args, 'conversation'), unrestricted: boolean(args, 'unrestricted'), onPrepared };
+  const request = { mode, prompt: text(args, 'prompt', true)!, context: contextText(args), files: filesList(args), checks, cwd: workingDirectory(args), name: text(args, 'name'), task: text(args, 'task'), provider, model: resolved.model, effort: resolved.effort, timeoutMs: number(args, 'timeoutMs'), conversation: text(args, 'conversation'), unrestricted: boolean(args, 'unrestricted'), env: validateEnv(args.env), onPrepared };
   // After every argument is validated, so the user is never asked about a call that then fails.
   const gate = await confirmUnrestricted(ctx, { unrestricted: request.unrestricted, provider, worker: request.name, cwd: request.cwd ?? ctx.service.repo });
   if (gate.refused) return gate.refused;
@@ -131,7 +144,7 @@ const spawnJob: Handler = async (ctx, args) => {
   const { ack, done } = await ctx.service.spawnTracked(request);
   if (!preparedJobIds.includes(ack.jobId)) {
     preparedJobIds.push(ack.jobId);
-    try { markAcceptancePending(ctx.service.repo, ack.jobId); } catch (err) { process.stderr.write(`agent-smith acceptance ${ack.jobId}: ${String(err)}\n`); }
+    try { markAcceptancePending(ctx.service.repo, ack.jobId, checks); } catch (err) { process.stderr.write(`agent-smith acceptance ${ack.jobId}: ${String(err)}\n`); }
   }
   gateAcceptance(ctx, ack.jobId, done, checks, preparedJobIds);
   return structured({ ...withNotes(ack), provider, checks: checks.map(c => c.name) });
@@ -154,7 +167,7 @@ const resumeJob: Handler = async (ctx, args) => {
   const onPrepared = (id: string) => {
     ctx.onJobPrepared?.(id);
     preparedJobIds.push(id);
-    if (checks?.length) markAcceptancePending(ctx.service.repo, id);
+    if (checks?.length) markAcceptancePending(ctx.service.repo, id, checks);
   };
   const prompt = text(args, 'prompt', true)!; const cwd = workingDirectory(args) ?? detail.cwd ?? ctx.service.repo;
   const timeoutMs = number(args, 'timeoutMs'); const unrestricted = boolean(args, 'unrestricted');
@@ -163,11 +176,13 @@ const resumeJob: Handler = async (ctx, args) => {
   // Only an explicit unrestricted:true asks; an inherited setting was the original job's.
   const gate = await confirmUnrestricted(ctx, { unrestricted, provider: detail.provider ?? '', worker: detail.name, cwd });
   if (gate.refused) return gate.refused;
-  const request = { checks, mode: detail.mode ?? 'task', prompt, files: mergedFiles.length > 0 ? mergedFiles : undefined, ...(detail.watchedFiles ? { previousWatchedFiles: detail.watchedFiles } : {}), provider: detail.provider ?? undefined, model: resumeModel.model ?? detail.model ?? undefined, effort: resumeModel.effort ?? detail.effort ?? undefined, name: detail.name, workerId: detail.workerId, task: detail.task ?? undefined, cwd, conversation: detail.conversation, timeoutMs, unrestricted: unrestricted ?? detail.unrestricted, onPrepared };
+  const request = { checks, mode: detail.mode ?? 'task', prompt, files: mergedFiles.length > 0 ? mergedFiles : undefined, ...(detail.watchedFiles ? { previousWatchedFiles: detail.watchedFiles } : {}), provider: detail.provider ?? undefined, model: resumeModel.model ?? detail.model ?? undefined, effort: resumeModel.effort ?? detail.effort ?? undefined, name: detail.name, workerId: detail.workerId, task: detail.task ?? undefined, cwd, conversation: detail.conversation, timeoutMs, unrestricted: unrestricted ?? detail.unrestricted, env: validateEnv(args.env), onPrepared };
   const tracked = checks?.length ? await ctx.service.spawnTracked(request) : null;
   const resumed = tracked?.ack ?? await ctx.service.spawnJob(request);
   if (tracked && checks) gateAcceptance(ctx, resumed.jobId, tracked.done, checks, preparedJobIds);
-  const allWarnings = [...(resumed.warnings ?? []), ...(gate.warning ? [gate.warning] : [])];
+  let droppedEnv: string[] = [];
+  if (request.env === undefined) { try { droppedEnv = JSON.parse(readFileSync(jobFile(ctx.service.repo, detail.jobId, ENV_KEYS_FILE), 'utf8')) as string[]; } catch { /* the original had no env */ } }
+  const allWarnings = [...(resumed.warnings ?? []), ...(gate.warning ? [gate.warning] : []), ...(droppedEnv.length > 0 ? [`The original job set env ${droppedEnv.join(', ')}; values are not stored, so this turn runs without them. Pass env again to keep them.`] : [])];
   return structured({ ...resumed, taskHandle: launchTask(resumed.jobId), notify: notifyHint({ job: resumed.jobId }, ctx.service.repo, resumed.timeoutMs), ...(allWarnings.length > 0 ? { warnings: allWarnings } : {}) });
 };
 
@@ -191,7 +206,7 @@ const listJobs: Handler = async (ctx, args) => {
     limit: fmt === 'concise' && limit !== undefined ? limit + 1 : limit, sinceMs: since === undefined ? undefined : parseSince(since), ids: boolean(args, 'session') ? ctx.service.spawnedIds : undefined });
   // A turn a steer replaced is not a worker; its continuation's row stands for it.
   const workers = jobs.filter(j => !j.supersededBy);
-  if (fmt !== 'concise') return structured(workers.map(j => ({ ...j, taskStatus: taskStatus(j.status) })));
+  if (fmt !== 'concise') return structured(workers.map(j => { const live = jobLiveness(j); return { ...j, taskStatus: taskStatus(j.status), ...(live === null ? {} : { liveness: livenessView(live), stalled: isStalled(live) }) }; }));
   const rows = workers.slice(0, limit).map(j => conciseRow(j));
   return structured(workers.length > rows.length
     ? { items: rows, more: `More than ${rows.length} jobs match; narrow with since, status or session, or raise limit.` }
@@ -232,7 +247,16 @@ const pipelineStatus: Handler = async (ctx, args) => {
 
 const cancelJob: Handler = async (ctx, args) => {
   const id = text(args, 'jobId', true)!;
-  return json(readPipeline(ctx.service.repo, id) ? cancelPipeline(ctx.service.repo, id) : ctx.service.cancel(id));
+  if (readPipeline(ctx.service.repo, id)) return json(cancelPipeline(ctx.service.repo, id));
+  const result = ctx.service.cancel(id);
+  // A worker that already exited can still have checks running; stop those too.
+  // `checksCanceled` is true only when this process aborted them. With a detached supervisor
+  // the marker `cancel` just wrote is the request; the supervisor stops the checks within ~200 ms.
+  if (abortChecks(id, result.jobId)) return json({ ...result, checksCanceled: true });
+  const pending = readAcceptance(ctx.service.repo, result.jobId) as { pending?: boolean; running?: string };
+  return json(pending.pending === true && pending.running !== undefined
+    ? { ...result, checksCanceled: false, checksNote: 'Cancel recorded; the supervisor running the acceptance checks will stop them. Check status for acceptance.' }
+    : result);
 };
 
 const runPipeline: Handler = async (ctx, args) => {
@@ -262,7 +286,7 @@ export async function callTool(ctx: HandlerContext, name: string, rawArgs: unkno
 }
 
 async function listCapabilities(ctx: HandlerContext, refresh: boolean, fmt: ResponseFormat, only: string | undefined) {
-  const cats = ctx.catalogs ? await installedCatalogs(ctx) : await installedCatalogs({ catalogs: () => getCatalogs({ refresh }) });
+  const cats = ctx.catalogs ? await installedCatalogs(ctx) : await installedCatalogs({ catalogs: () => getCatalogs({ refresh, repo: ctx.service.repo }) });
   const installed = new Set(cats.map(c => c.provider));
   const all = [
     ...cats.map(c => ({ name: c.provider, available: true, defaultModel: c.defaultModel, defaultEffort: c.defaultEffort, defaultSource: c.defaultSource,

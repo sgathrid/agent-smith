@@ -1,4 +1,4 @@
-import {r as reasonFromText,Z as checksReason,_ as readJsonSafe,U as pipelineRecordPath,$ as readdirSafe,n as normalize,d as readAcceptance,a0 as existsSafe,g as isTerminalForgeStatus,A as AgentSmithReader,k as AgyStaffReader,V as isForgeJobId}from'./chunk-execute.js';import path from'node:path';/**
+import {r as reasonFromText,$ as checksReason,a0 as toolLabel,a1 as readJsonSafe,W as pipelineRecordPath,a2 as readdirSafe,n as normalize,b as readAcceptance,A as AgentSmithReader,g as isTerminalForgeStatus,a3 as existsSafe,k as AgyStaffReader,X as isForgeJobId}from'./chunk-execute.js';import path from'node:path';/**
  * format.ts — PURE presentation logic for the /forge pane and the band.
  *
  * WHY THIS FILE IS NOT `register.tsx`:
@@ -69,7 +69,8 @@ function isTerminal$1(status) {
 /**
  * Acceptance checks run after a job ends, so a finished job briefly carries a
  * pending placeholder. Hold its notice until the verdict lands, never longer
- * than this: a crashed checker must not silence a finished job.
+ * than this: a crashed checker must not silence a finished job. A placeholder
+ * that carries its own `budgetMs` (the checks' timeouts summed) holds that long.
  */
 const ACCEPTANCE_HOLD_MS = 5 * 60_000;
 const GLYPH = { finished: '✓', failed: '✗', cancelled: '■', attention: '!' };
@@ -129,13 +130,17 @@ function rejected(job) {
  *   ✗ Cy (codex implement) 3m · checks failed: lint
  *   ✓ Ed (codex review) 6s · done · after steer
  *   ✗ Flo (codex review) 4s · failed: timed out · queued steer not applied
- *   ! Di (opencode research) · stalled 16m
+ *   ! Di (opencode research) · no output for 16m
+ *   ! Di (opencode research) · no output for 16m (in `npm test`)
+ *   ! Di (opencode research) · process gone 3m
+ * A quiet job is stated as a fact, never as a prompt to interrupt it.
  */
 function headline(job) {
     const d = durationWords(job.durationMs);
     const reason = job.reason ? compactExcerpt(job.reason, 160) : '';
     const bad = rejected(job);
-    const glyph = bad ? GLYPH.failed : GLYPH[job.kind];
+    const awaiting = job.kind === 'finished' && !job.run && !bad && job.checksRunning !== undefined;
+    const glyph = bad ? GLYPH.failed : awaiting ? '…' : GLYPH[job.kind];
     const parts = [`${glyph} ${who(job)}${d && job.kind !== 'attention' ? ` ${d}` : ''}`];
     switch (job.kind) {
         case 'finished':
@@ -143,6 +148,9 @@ function headline(job) {
                 parts.push(reason || 'done');
             else if (bad)
                 parts.push(checksReason(job.checks?.failed ?? []));
+            else if (awaiting) {
+                parts.push('exited', typeof job.checksRunning === 'string' ? `checks running: ${job.checksRunning}` : 'checks pending');
+            }
             else {
                 parts.push('done');
                 if (job.checks && job.checks.total > 0)
@@ -156,7 +164,10 @@ function headline(job) {
             parts.push('canceled');
             break;
         case 'attention':
-            parts.push(`stalled${d ? ` ${d}` : ''}`);
+            if (job.liveness?.state === 'dead')
+                parts.push(`process gone${d ? ` ${d}` : ''}`);
+            else
+                parts.push(`no output${d ? ` for ${d}` : ''}${job.liveness?.tool ? ` (in \`${job.liveness.tool}\`)` : ''}`);
             break;
     }
     if (job.steered)
@@ -185,7 +196,8 @@ function claudeText(jobs) {
     if (!one) {
         const counts = new Map();
         for (const job of jobs) {
-            const label = rejected(job) ? 'failed' : STATE[job.kind];
+            const label = rejected(job) ? 'failed' : job.checksRunning !== undefined && job.kind === 'finished' && !job.run ? 'exited'
+                : job.kind === 'attention' && job.liveness?.state === 'dead' ? 'process gone' : STATE[job.kind];
             counts.set(label, (counts.get(label) ?? 0) + 1);
         }
         lines.push(`Agent Smith · ${jobs.length} jobs: ${[...shown(counts)].map(([k, n]) => `${n} ${k}`).join(', ')}`);
@@ -204,10 +216,10 @@ function claudeText(jobs) {
 }
 /** Counts in the order a reader scans them: done first, then what needs a look. */
 function shown(counts) {
-    return ['done', 'failed', 'canceled', 'stalled'].flatMap((k) => (counts.has(k) ? [[k, counts.get(k)]] : []));
+    return ['done', 'exited', 'failed', 'canceled', 'no output', 'process gone'].flatMap((k) => (counts.has(k) ? [[k, counts.get(k)]] : []));
 }
 const STATE = {
-    finished: 'done', failed: 'failed', cancelled: 'canceled', attention: 'stalled',
+    finished: 'done', failed: 'failed', cancelled: 'canceled', attention: 'no output',
 };
 // ── launch acks ─────────────────────────────────────────────────────────────
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -337,7 +349,8 @@ function stageReason(s) {
  *
  *   finished  the job reached a terminal success
  *   failed    it reached a terminal failure, or a suspicious success
- *   attention it went silent past the grace period and is not coming back
+ *   attention it went silent past the grace period (no event, process alive or
+ *             unknown), or its process stopped while it is still marked running
  *   cancelled a human stopped it
  *
  * Not pushable, and the reasoning matters:
@@ -395,7 +408,10 @@ function pushKindFor(job) {
  * stalled again, and the default epoch never changes.
  */
 function dedupeKey(job, epoch = 0) {
-    return `${job.id}#${job.status}#${epoch}`;
+    // A job that exited with checks still running speaks again when the verdict lands.
+    // A silent job whose process then dies is a second fact: dead is keyed apart.
+    const dead = job.status === 'attention' && job.liveness?.state === 'dead' ? '#dead' : '';
+    return `${job.id}#${job.status}${dead}${job.checksRunning === undefined ? '' : '#checks'}#${epoch}`;
 }
 /**
  * True if this job should be pushed right now.
@@ -446,7 +462,8 @@ function shouldPush(candidate, now) {
         // a reader that just started will produce exactly this state for every job.
         // Saying "has stopped making progress" about a job whose progress we have
         // never observed would be a confident sentence about nothing.
-        if (job.lastEventAt === null)
+        // A dead process is a fact of its own (its heartbeat stopped), event times or not.
+        if (job.lastEventAt === null && job.liveness?.state !== 'dead')
             return false;
     }
     return true;
@@ -482,9 +499,12 @@ function buildBatch(candidates, now) {
  */
 function toNotice(job, kind, now) {
     const run = job.role === 'pipeline' && job.outcome !== undefined;
-    const span = kind === 'attention'
-        ? (job.lastEventAt === null ? NaN : now - Date.parse(job.lastEventAt))
-        : (job.startedAt && job.finishedAt ? Date.parse(job.finishedAt) - Date.parse(job.startedAt) : NaN);
+    const dead = kind === 'attention' && job.liveness?.state === 'dead';
+    const span = dead
+        ? (job.liveness?.since == null ? NaN : now - job.liveness.since)
+        : kind === 'attention'
+            ? (job.lastEventAt === null ? NaN : now - Date.parse(job.lastEventAt))
+            : (job.startedAt && job.finishedAt ? Date.parse(job.finishedAt) - Date.parse(job.startedAt) : NaN);
     return {
         id: job.id, kind, name: job.name ?? null, provider: job.provider ?? null, role: job.role ?? null,
         source: job.source ?? null, run,
@@ -496,6 +516,8 @@ function toNotice(job, kind, now) {
         ...(job.staleReads && job.staleReads.length > 0 ? { staleReads: job.staleReads } : {}),
         ...(job.steeredFrom ? { steered: true } : {}),
         ...(job.steerNotApplied ? { steerNotApplied: true } : {}),
+        ...(kind === 'finished' && job.checksRunning !== undefined ? { checksRunning: job.checksRunning } : {}),
+        ...(kind === 'attention' && job.liveness ? { liveness: { state: job.liveness.state, ...(job.liveness.tool ? { tool: job.liveness.tool } : {}) } } : {}),
     };
 }
 // ── meta ────────────────────────────────────────────────────────────────────
@@ -558,17 +580,50 @@ function assertMetaSafe(meta) {
  * cold target directory.
  */
 const STALL_GRACE_MS = 15 * 60 * 1000;
+/** A heartbeat older than this, on a job still marked running, means nobody is running it. */
+const ALIVE_GRACE_MS = 2 * 60_000;
+const LIVENESS_STATES = ['active', 'in-tool', 'waiting', 'silent', 'dead'];
+function epoch(v) {
+    if (typeof v === 'number')
+        return Number.isFinite(v) ? v : null;
+    if (typeof v !== 'string' || v === '')
+        return null;
+    const t = Date.parse(v);
+    return Number.isFinite(t) ? t : null;
+}
 /**
- * The one stall rule. Only a `running` job can stall (a settled job has nothing
- * left to be silent about). No evidence of progress at all, or a timestamp that
- * does not parse, counts as STALLED: "we do not know" must never be drawn as
- * "fine". `updatedAt` is an ISO string or epoch ms, as each caller holds it.
+ * The one liveness rule. Both surfaces call it (the channel for `status` and
+ * `list_jobs` and its attention push, the mod for the band, pane and notices),
+ * so they cannot disagree. Null for a job that is not running.
  */
-function isStalled(status, updatedAt, now) {
-    if (status !== 'running')
-        return false;
-    const then = typeof updatedAt === 'number' ? updatedAt : typeof updatedAt === 'string' ? Date.parse(updatedAt) : NaN;
-    return Number.isNaN(then) || now - then > STALL_GRACE_MS;
+function livenessOf(i) {
+    if (i.status !== 'running' && i.status !== 'attention')
+        return null;
+    const times = [epoch(i.lastEventAt), epoch(i.updatedAt)].filter((t) => t !== null);
+    const lastSeen = times.length > 0 ? Math.max(...times) : null;
+    const silentForMs = lastSeen === null ? 0 : Math.max(0, i.now - lastSeen);
+    const alive = epoch(i.lastAliveAt);
+    const a = i.lastActivity;
+    const open = a != null && a.status === 'active' && typeof a.tool === 'string' && a.tool !== '';
+    const tool = open ? toolLabel(a.tool, typeof a.input === 'string' ? a.input : null) : undefined;
+    const withTool = tool === undefined ? {} : { tool };
+    if (alive !== null && i.now - alive > ALIVE_GRACE_MS)
+        return { state: 'dead', silentForMs, since: alive, forMs: i.now - alive, ...withTool };
+    // No event time at all: unknown is never drawn as healthy.
+    if (lastSeen === null)
+        return { state: 'silent', silentForMs, since: null, forMs: silentForMs, ...withTool };
+    // An older build wrote no heartbeat: only the old silence rule is provable.
+    if (alive === null && silentForMs > STALL_GRACE_MS)
+        return { state: 'silent', silentForMs, since: lastSeen, forMs: silentForMs, ...withTool };
+    if (open)
+        return { state: 'in-tool', silentForMs, since: lastSeen, forMs: silentForMs, ...withTool };
+    if (silentForMs > STALL_GRACE_MS)
+        return { state: 'silent', silentForMs, since: lastSeen, forMs: silentForMs };
+    return { state: 'active', silentForMs, since: lastSeen, forMs: silentForMs };
+}
+/** The old boolean, derived: true for `silent` or `dead`. */
+function isStalled(l) {
+    return l !== null && (l.state === 'silent' || l.state === 'dead');
 }/**
  * watch-source.ts — what the channel reads.
  *
@@ -638,9 +693,11 @@ function acceptancePending(cwd, job, now) {
     if (job.finishedAt === null)
         return false;
     const finished = Date.parse(job.finishedAt);
-    if (Number.isFinite(finished) && now - finished > ACCEPTANCE_HOLD_MS)
+    const placeholder = readAcceptance(cwd, job.id);
+    if (placeholder.pending !== true)
         return false;
-    return readAcceptance(cwd, job.id).pending === true;
+    const budget = typeof placeholder.budgetMs === 'number' && placeholder.budgetMs > 0 ? placeholder.budgetMs : ACCEPTANCE_HOLD_MS;
+    return !(Number.isFinite(finished) && now - finished > budget);
 }
 const isTerminal = (job) => isTerminalForgeStatus(job.status) && job.finishedAt !== null;
 function cacheKey(cwd, id) {
@@ -674,7 +731,11 @@ async function readPipelineRecord(cwd, runId) {
 }
 /** Read exactly one job by id from either source (primary first). Never throws. */
 async function readJob(cwd, jobId, now = Date.now()) {
-    return (await readOne(new AgentSmithReader(), 'agent-smith', cwd, jobId, now)) ?? (await readOne(new AgyStaffReader(), 'agy-staff', cwd, jobId, now));
+    const own = await readOne(new AgentSmithReader(), 'agent-smith', cwd, jobId, now);
+    // A watcher polls until the job settles: while its checks are inside their budget it is still in flight.
+    if (own !== null && isTerminal(own) && acceptancePending(cwd, own, now))
+        return { ...own, status: 'running', finishedAt: null };
+    return own ?? (await readOne(new AgyStaffReader(), 'agy-staff', cwd, jobId, now));
 }
 /** One read of every job. Never throws; an unreadable directory yields []. */
 async function readAll(cwd, now = Date.now()) {
@@ -740,7 +801,8 @@ async function collect(reader, source, cwd, now, claimed, out, skip) {
             claimed.delete(id);
             continue;
         }
-        if (isTerminal(job))
+        // Past its hold with checks still running: re-read next poll so the verdict is announced too.
+        if (isTerminal(job) && job.checksRunning === undefined)
             terminalCache.set(cacheKey(cwd, id), job);
         out.push(job);
     }
@@ -785,9 +847,12 @@ async function readOne(reader, source, cwd, jobId, now) {
         failureReason: [raw['reason'], raw['error']].find((v) => typeof v === 'string' && v !== '') ?? null,
         failureDetail: typeof raw['error'] === 'string' ? raw['error'] : null,
         checks,
+        ...(source === 'agent-smith' && observed.status === 'succeeded' && acceptance.pending === true
+            ? { checksRunning: typeof acceptance.running === 'string' && acceptance.running !== '' ? acceptance.running : true } : {}),
         ...(source === 'agy-staff' ? { source } : {}),
         summarySource: observed.raw['summarySource'] === 'worker' ? 'worker' : null,
         status: toWatchStatus(observed, now),
+        ...livenessField(watchLiveness(observed, now)),
         lastEventAt: observed.updatedAt,
         finishedAt: observed.finishedAt,
         warned,
@@ -800,11 +865,30 @@ async function readOne(reader, source, cwd, jobId, now) {
     };
 }
 /**
- * ObservedStatus → WatchStatus, plus the stall escalation.
+ * The shared liveness rule (mod/hooks/stale.ts) over an observed job: event
+ * silence, the open tool call and the process owner's heartbeat. Null unless running.
+ */
+function watchLiveness(observed, now) {
+    const raw = observed.raw;
+    const activity = raw['last_activity'];
+    return livenessOf({
+        status: observed.status, updatedAt: observed.updatedAt, now,
+        lastEventAt: typeof raw['last_event_at'] === 'string' ? raw['last_event_at'] : null,
+        lastAliveAt: typeof raw['last_alive_at'] === 'string' ? raw['last_alive_at'] : null,
+        lastActivity: activity !== null && typeof activity === 'object' ? activity : null,
+    });
+}
+/** Only the quiet states travel to the notice: they are what `attention` means. */
+function livenessField(l) {
+    if (l === null || (l.state !== 'silent' && l.state !== 'dead'))
+        return {};
+    return { liveness: { state: l.state, silentForMs: l.silentForMs, since: l.since, ...(l.tool ? { tool: l.tool } : {}) } };
+}
+/**
+ * ObservedStatus → WatchStatus, plus the liveness escalation.
  *
- * The stall threshold is imported from ./stale.ts rather than duplicated, so the
- * pane and the channel cannot disagree about when a job counts as stalled. The
- * number itself is 15 min.
+ * The rule is mod/hooks/stale.ts livenessOf, shared with the pane, so the two
+ * cannot disagree about when a job needs attention (silent or dead).
  *
  * WHY ESCALATE HERE AND NOT IN THE POLICY: a stall is a fact about the job, and
  * a fact belongs to the reader. The policy's job is only to decide whether a fact
@@ -813,8 +897,9 @@ async function readOne(reader, source, cwd, jobId, now) {
 function toWatchStatus(observed, now) {
     if (observed.status !== 'running')
         return observed.status;
-    // No evidence of progress counts as stalled: "we do not know" must never be drawn as "fine".
-    return isStalled(observed.status, observed.updatedAt, now) ? 'attention' : 'running';
+    // silent or dead needs eyes; active and in-tool (a long command) do not. No
+    // event time at all is `silent`: "we do not know" is never drawn as "fine".
+    return isStalled(watchLiveness(observed, now)) ? 'attention' : 'running';
 }/**
  * poller.ts — the poll loop's BRAIN, with no transport attached.
  *
@@ -975,4 +1060,4 @@ function scheduleLoop(cwd, intervalMs, send, onError) {
         timer.unref?.();
     };
     tick();
-}export{POLL_MS as P,parseLaunch as a,readPipelineRecord as b,claimMarkerPath as c,buildBatch as d,dedupeKey as e,resetPoller as f,readAll as g,isStalled as i,pollOnce as p,readJob as r,scheduleLoop as s};
+}export{LIVENESS_STATES as L,POLL_MS as P,parseLaunch as a,readPipelineRecord as b,claimMarkerPath as c,buildBatch as d,dedupeKey as e,resetPoller as f,readAll as g,isStalled as i,livenessOf as l,pollOnce as p,readJob as r,scheduleLoop as s};

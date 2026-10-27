@@ -98,7 +98,7 @@ import {
 } from '../surfaces/mod/hooks/reasons.ts';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 
 /** Per-repo job root, relative to the repo. Ours; nothing else reads it as truth. */
 export const JOBS_DIR_SEGMENTS = ['.agent-smith', 'jobs'] as const;
@@ -262,6 +262,19 @@ export interface ForgeManifest {
   readonly deniedActions: readonly ForgeDenial[];
   readonly usage: Readonly<Record<string, number>> | null;
   readonly toolCalls: number;
+  /**
+   * Tool calls that ended in an error state (distinct steps). Evidence, not a
+   * verdict: a worker that recovers from a failed `read` still succeeds.
+   * Absent until the first tool error.
+   */
+  readonly toolErrors?: number;
+  /**
+   * True when the job failed before doing any work: zero tool calls and either
+   * finished within FAILED_EARLY_MS or its first event was an error. Usually a
+   * route problem (model not available in the region, account out of funds);
+   * `error` keeps the provider's text verbatim. Absent otherwise.
+   */
+  readonly failedEarly?: boolean;
 
   /** Set when this job is one stage of a pipeline. */
   readonly pipeline: string | null;
@@ -284,6 +297,14 @@ export interface ForgeManifest {
    */
   readonly changedFiles?: readonly string[];
   readonly changedFilesTruncated?: boolean;
+  /**
+   * True when `changedFiles` could not be computed at finish (no git baseline,
+   * git failed or timed out, or the cwd was gone). An absent `changedFiles` then
+   * means "unknown", never "no edits". Absent when changedFiles is known.
+   */
+  readonly changedFilesUnknown?: boolean;
+  /** True when the job's cwd no longer existed at finish, so nothing in it could be checked. */
+  readonly cwdMissingAtFinish?: boolean;
   /**
    * Paths that changed while this job ran but that none of this job's own tool
    * calls mention: another job's or the operator's edits (or shell side effects).
@@ -374,6 +395,23 @@ export interface ForgeProgress {
   readonly lastActivity?: ForgeActivity | null;
   readonly latestText: string | null;
   readonly toolCalls: number;
+  /**
+   * Edit tool calls that ENDED without error (not started, not failed, not
+   * denied): the cwd rule's evidence that a job wrote. Unlike
+   * `digest.editedCount`, which counts at start for the pane. Absent only on
+   * files written before this counter existed.
+   */
+  readonly editsCompleted?: number;
+  /** Tool calls that ended in an error state so far. Absent until the first one. */
+  readonly toolErrors?: number;
+  /**
+   * Last heartbeat from the process owner (providers/ndjson.ts): the worker's
+   * CLI process was running at this time. Moves without events; never moves
+   * lastEventAt. Absent for jobs from builds before heartbeats, and until the first beat.
+   */
+  readonly lastAliveAt?: string;
+  /** The worker CLI's pid (its process group leader), from the heartbeat. */
+  readonly workerPid?: number;
   readonly warnings: readonly string[];
   /** What the worker has done so far, from its tool calls. */
   readonly digest?: ProgressDigest;
@@ -488,6 +526,30 @@ export interface StatusDerivation {
   readonly deniedActions?: readonly ForgeDenial[] | null | undefined;
   /** The report body. Empty ⇒ nothing was delivered, whatever the exit code. */
   readonly report?: string | null | undefined;
+  /** The job's cwd was gone at finish: no edit or check in it can be verified. */
+  readonly cwdMissing?: boolean | undefined;
+  /** The job was meant to write (implement/verify mode) or its events show edits. */
+  readonly writing?: boolean | undefined;
+}
+
+/** deriveStatus's reason when a writing job's cwd vanished before it could be checked. */
+export const CWD_GONE_REASON = 'working directory gone; nothing could be verified';
+
+/** A failure this soon after start, with no tool call, is a route failure, not the work. */
+export const FAILED_EARLY_MS = 20_000;
+
+/** Writing modes: a vanished cwd makes their success unverifiable. */
+export function isWritingMode(mode: string | null | undefined): boolean {
+  return mode === 'implement' || mode === 'verify';
+}
+
+/**
+ * deriveStatus's cwd inputs, from what the caller can prove: whether `cwd`
+ * still exists, and whether the job was meant to write (its mode) or is known
+ * to have edited. An empty or absent cwd is never "missing" (nothing to check).
+ */
+export function cwdFacts(cwd: string | null | undefined, mode: string | null | undefined, edited = false): { cwdMissing: boolean; writing: boolean } {
+  return { cwdMissing: typeof cwd === 'string' && cwd !== '' && !existsSync(cwd), writing: isWritingMode(mode) || edited };
 }
 
 export interface StatusVerdict {
@@ -515,9 +577,12 @@ export interface StatusVerdict {
  *      not what happened to the task.
  *   2. deniedActions non-empty    ⇒ failed, suspicious. agy exited 0, said
  *      "SUCCESS", returned "" and did nothing. THE TRAP. Unless every denial
- *      is nonfatal and a report was delivered: then succeeded, with a note.
+ *      is nonfatal and a report was delivered: then succeeded, with a note —
+ *      but only after rule 3b has passed.
  *   3. ok === false               ⇒ failed. The adapter already weighed exit
  *      code against the result event; we do not second-guess it.
+ *   3b. cwd gone, writing job     ⇒ failed, suspicious. Its edits and checks
+ *      cannot be verified; a nonfatal denial does not excuse it.
  *   4. ok === true, report empty  ⇒ failed, suspicious. The net for every
  *      provider that does not report denials. "You asked me nothing and I said
  *      nothing" is only a success when the job also made no tool calls — which
@@ -568,6 +633,7 @@ export function failureFields(
   if (fatal) reason = deniedReason(denialNames(denials));
   else if (result.status === 'timeout') reason = REASONS.timedOut;
   else if (verdict.reason === REASONS.noOutput) reason = REASONS.noOutput;
+  else if (verdict.reason === CWD_GONE_REASON && adapterError === '') reason = 'working directory gone';
   else reason = reasonFromText(adapterError !== '' ? adapterError : verdict.reason);
   return { error, reason };
 }
@@ -588,15 +654,8 @@ export function deriveStatus(d: StatusDerivation): StatusVerdict {
   // Denials the adapter marked non-fatal (a delivered report plus denied calls,
   // e.g. a reviewer that wanted a shell) do not fail the job, whatever the
   // provider. `action: 'tool'` is the pre-flag claude encoding, still on disk.
-  if (denials.length > 0 && d.ok === true && !looksEmpty(d.report) && denials.every((x) => x.nonfatal === true || x.action === 'tool')) {
-    return {
-      status: 'succeeded',
-      suspicious: false,
-      reason: null,
-      note: `${denials.length} ${denials.length === 1 ? 'call' : 'calls'} denied` + (deniedNames(denials) === '' ? '' : `: ${deniedNames(denials)}`),
-    };
-  }
-  if (denials.length > 0) {
+  const nonfatalOnly = denials.length > 0 && d.ok === true && !looksEmpty(d.report) && denials.every((x) => x.nonfatal === true || x.action === 'tool');
+  if (denials.length > 0 && !nonfatalOnly) {
     return { status: 'failed', suspicious: true, reason: deniedReason(denialNames(denials)) };
   }
 
@@ -605,6 +664,24 @@ export function deriveStatus(d: StatusDerivation): StatusVerdict {
       status: 'failed',
       suspicious: false,
       reason: d.jobStatus === 'timeout' ? REASONS.timedOut : REASONS.workerError,
+    };
+  }
+
+  // A writing job whose cwd vanished cannot show its edits or pass a check:
+  // its "done" is a claim with nothing behind it. A read-only job's report is
+  // the deliverable, so it stands (the writer records a warning instead).
+  // Checked before the nonfatal-denial success, which would otherwise let a
+  // denied call excuse a writing job from it.
+  if (d.cwdMissing === true && d.writing === true) {
+    return { status: 'failed', suspicious: true, reason: CWD_GONE_REASON };
+  }
+
+  if (nonfatalOnly) {
+    return {
+      status: 'succeeded',
+      suspicious: false,
+      reason: null,
+      note: `${denials.length} ${denials.length === 1 ? 'call' : 'calls'} denied` + (deniedNames(denials) === '' ? '' : `: ${deniedNames(denials)}`),
     };
   }
 
@@ -726,6 +803,8 @@ export interface NextActionInput {
   readonly unrestricted?: boolean | undefined;
   /** A queued steer was dropped because this turn failed. */
   readonly steerNotApplied?: boolean | undefined;
+  /** manifest.failedEarly: failed before any tool call (route/model/account). */
+  readonly failedEarly?: boolean | undefined;
 }
 
 /**
@@ -756,6 +835,11 @@ function baseNextAction(i: NextActionInput): string | null {
   if (RATE_LIMIT_RE.test(err)) return 'Rate limited; resume_job after a short wait.';
   if (COMPATIBILITY_RE.test(err)) return 'Bad flag or model: run agent-smith doctor, then fix the request.';
   if (START_RE.test(err)) return "Couldn't start: run agent-smith doctor.";
+  // After the specific diagnoses, before the generic ones: resuming a route
+  // that failed before any work just fails again.
+  if (i.failedEarly === true && i.jobStatus !== 'timeout') {
+    return 'Route failed before any work (model/account): pick another model from list_capabilities or fix the account.';
+  }
   if (i.jobStatus === 'timeout' || TIMEOUT_RE.test(err)) {
     return 'Raise timeoutMs or split the task; resume_job keeps context.';
   }

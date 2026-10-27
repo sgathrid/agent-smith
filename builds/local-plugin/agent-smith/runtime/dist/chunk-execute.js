@@ -1,4 +1,4 @@
-import path from'node:path';import {readFileSync,constants,mkdirSync,writeFileSync,createWriteStream,renameSync,unlinkSync,openSync,fsyncSync,closeSync,appendFileSync,statSync,existsSync,copyFileSync}from'node:fs';import {readdir,open,access,constants as constants$1}from'node:fs/promises';import {randomBytes,randomUUID,createHash}from'node:crypto';import {spawn,execFile}from'node:child_process';import os from'node:os';import readline from'node:readline';/**
+import path from'node:path';import {readFileSync,existsSync,constants,mkdirSync,writeFileSync,createWriteStream,renameSync,unlinkSync,openSync,fsyncSync,closeSync,appendFileSync,statSync,copyFileSync}from'node:fs';import {readdir,open,access,constants as constants$1}from'node:fs/promises';import {randomBytes,randomUUID,createHash}from'node:crypto';import {spawn,execFile}from'node:child_process';import os from'node:os';import readline from'node:readline';/**
  * reasons.ts — every failure, in two to four words.
  *
  * One vocabulary for every surface: the completion notice, the band, the pane,
@@ -367,6 +367,22 @@ function looksEmpty$1(text) {
         return true;
     return text.trim().length < MIN_USEFUL_CHARS;
 }
+/** deriveStatus's reason when a writing job's cwd vanished before it could be checked. */
+const CWD_GONE_REASON = 'working directory gone; nothing could be verified';
+/** A failure this soon after start, with no tool call, is a route failure, not the work. */
+const FAILED_EARLY_MS = 20_000;
+/** Writing modes: a vanished cwd makes their success unverifiable. */
+function isWritingMode(mode) {
+    return mode === 'implement' || mode === 'verify';
+}
+/**
+ * deriveStatus's cwd inputs, from what the caller can prove: whether `cwd`
+ * still exists, and whether the job was meant to write (its mode) or is known
+ * to have edited. An empty or absent cwd is never "missing" (nothing to check).
+ */
+function cwdFacts(cwd, mode, edited = false) {
+    return { cwdMissing: typeof cwd === 'string' && cwd !== '' && !existsSync(cwd), writing: isWritingMode(mode) || edited };
+}
 /**
  * THE ONLY PLACE A JOB IS DECLARED FINISHED, AND IT IS PURE.
  *
@@ -379,9 +395,12 @@ function looksEmpty$1(text) {
  *      not what happened to the task.
  *   2. deniedActions non-empty    ⇒ failed, suspicious. agy exited 0, said
  *      "SUCCESS", returned "" and did nothing. THE TRAP. Unless every denial
- *      is nonfatal and a report was delivered: then succeeded, with a note.
+ *      is nonfatal and a report was delivered: then succeeded, with a note —
+ *      but only after rule 3b has passed.
  *   3. ok === false               ⇒ failed. The adapter already weighed exit
  *      code against the result event; we do not second-guess it.
+ *   3b. cwd gone, writing job     ⇒ failed, suspicious. Its edits and checks
+ *      cannot be verified; a nonfatal denial does not excuse it.
  *   4. ok === true, report empty  ⇒ failed, suspicious. The net for every
  *      provider that does not report denials. "You asked me nothing and I said
  *      nothing" is only a success when the job also made no tool calls — which
@@ -431,6 +450,8 @@ function failureFields(verdict, result, maxError = 1_200) {
         reason = REASONS.timedOut;
     else if (verdict.reason === REASONS.noOutput)
         reason = REASONS.noOutput;
+    else if (verdict.reason === CWD_GONE_REASON && adapterError === '')
+        reason = 'working directory gone';
     else
         reason = reasonFromText(adapterError !== '' ? adapterError : verdict.reason);
     return { error, reason };
@@ -451,15 +472,8 @@ function deriveStatus(d) {
     // Denials the adapter marked non-fatal (a delivered report plus denied calls,
     // e.g. a reviewer that wanted a shell) do not fail the job, whatever the
     // provider. `action: 'tool'` is the pre-flag claude encoding, still on disk.
-    if (denials.length > 0 && d.ok === true && !looksEmpty$1(d.report) && denials.every((x) => x.nonfatal === true || x.action === 'tool')) {
-        return {
-            status: 'succeeded',
-            suspicious: false,
-            reason: null,
-            note: `${denials.length} ${denials.length === 1 ? 'call' : 'calls'} denied` + (deniedNames(denials) === '' ? '' : `: ${deniedNames(denials)}`),
-        };
-    }
-    if (denials.length > 0) {
+    const nonfatalOnly = denials.length > 0 && d.ok === true && !looksEmpty$1(d.report) && denials.every((x) => x.nonfatal === true || x.action === 'tool');
+    if (denials.length > 0 && !nonfatalOnly) {
         return { status: 'failed', suspicious: true, reason: deniedReason(denialNames(denials)) };
     }
     if (d.ok === false) {
@@ -467,6 +481,22 @@ function deriveStatus(d) {
             status: 'failed',
             suspicious: false,
             reason: d.jobStatus === 'timeout' ? REASONS.timedOut : REASONS.workerError,
+        };
+    }
+    // A writing job whose cwd vanished cannot show its edits or pass a check:
+    // its "done" is a claim with nothing behind it. A read-only job's report is
+    // the deliverable, so it stands (the writer records a warning instead).
+    // Checked before the nonfatal-denial success, which would otherwise let a
+    // denied call excuse a writing job from it.
+    if (d.cwdMissing === true && d.writing === true) {
+        return { status: 'failed', suspicious: true, reason: CWD_GONE_REASON };
+    }
+    if (nonfatalOnly) {
+        return {
+            status: 'succeeded',
+            suspicious: false,
+            reason: null,
+            note: `${denials.length} ${denials.length === 1 ? 'call' : 'calls'} denied` + (deniedNames(denials) === '' ? '' : `: ${deniedNames(denials)}`),
         };
     }
     if (looksEmpty$1(d.report)) {
@@ -580,6 +610,11 @@ function baseNextAction(i) {
         return 'Bad flag or model: run agent-smith doctor, then fix the request.';
     if (START_RE.test(err))
         return "Couldn't start: run agent-smith doctor.";
+    // After the specific diagnoses, before the generic ones: resuming a route
+    // that failed before any work just fails again.
+    if (i.failedEarly === true && i.jobStatus !== 'timeout') {
+        return 'Route failed before any work (model/account): pick another model from list_capabilities or fix the account.';
+    }
     if (i.jobStatus === 'timeout' || TIMEOUT_RE.test(err)) {
         return 'Raise timeoutMs or split the task; resume_job keeps context.';
     }
@@ -827,6 +862,7 @@ const SMITH_PAYLOAD = {
     canceled: 'canceled',
     cancelAt: 'cancel_at',
     lastEventAt: 'last_event_at',
+    lastAliveAt: 'last_alive_at',
     recentActivities: 'recent_activities',
     lastActivity: 'last_activity',
     latestText: 'latest_text',
@@ -980,6 +1016,15 @@ class AgentSmithReader {
             [SMITH_PAYLOAD.canceled]: canceled,
             [SMITH_PAYLOAD.cancelAt]: cancelAt,
             [SMITH_PAYLOAD.lastEventAt]: progress?.lastEventAt ?? manifest?.updatedAt ?? null,
+            // The process owner's heartbeat (providers/ndjson.ts). Absent for jobs
+            // written by older builds: liveness then falls back to event silence.
+            [SMITH_PAYLOAD.lastAliveAt]: progress?.lastAliveAt ?? null,
+            ...(typeof progress?.workerPid === 'number' ? { workerPid: progress.workerPid } : {}),
+            ...(typeof (manifest?.toolErrors ?? progress?.toolErrors) === 'number'
+                ? { toolErrors: manifest?.toolErrors ?? progress?.toolErrors } : {}),
+            ...(manifest?.failedEarly === true ? { failedEarly: true } : {}),
+            ...(manifest?.changedFilesUnknown === true ? { changedFilesUnknown: true } : {}),
+            ...(manifest?.cwdMissingAtFinish === true ? { cwdMissingAtFinish: true } : {}),
             [SMITH_PAYLOAD.recentActivities]: progress?.recentActivities ?? [],
             [SMITH_PAYLOAD.lastActivity]: progress?.lastActivity ?? null,
             [SMITH_PAYLOAD.latestText]: progress?.latestText ?? null,
@@ -3222,6 +3267,8 @@ function createEventBus(maxQueue = 4096) {
         },
     };
 }
+/** Default heartbeat interval; mirrors surfaces/mod/hooks/stale.ts HEARTBEAT_MS. */
+const HEARTBEAT_MS = 30_000;
 const STDERR_CAPTURE_LIMIT = 256 * 1024; // 256 KB retained in memory for JobResult
 const STDERR_LOG_LIMIT = 4 * 1024 * 1024; // 4 MB retained on disk
 /**
@@ -3256,6 +3303,8 @@ function spawnWorker(opts) {
     let killReason;
     let killTimer;
     let timeoutTimer;
+    let heartbeatTimer;
+    let firstBeat;
     const killGraceMs = Math.max(0, opts.killGraceMs ?? 5_000);
     function signalTree(signal) {
         const pid = handle.pid;
@@ -3309,6 +3358,51 @@ function spawnWorker(opts) {
         // Do not hold the event loop open on our account.
         timeoutTimer.unref?.();
     }
+    // Liveness from the process owner. Provider events stop during a long tool
+    // call; this does not. The first beat waits one macrotask so the caller has
+    // subscribed to the adapter's bus (spawn resolves first).
+    //
+    // The beat stops when the CLI process EXITS, not when its stdio closes: a
+    // descendant that inherited stdout can hold it open long after the worker
+    // died, and beats in that window would make a dead pid look alive. Each beat
+    // also probes the pid itself and stops if it is gone.
+    let leaderExited = false;
+    const stopHeartbeat = () => {
+        leaderExited = true;
+        if (firstBeat !== undefined)
+            clearTimeout(firstBeat);
+        if (heartbeatTimer !== undefined)
+            clearInterval(heartbeatTimer);
+        firstBeat = undefined;
+        heartbeatTimer = undefined;
+    };
+    handle.on('exit', stopHeartbeat);
+    const onHeartbeat = opts.onHeartbeat;
+    const pid = handle.pid;
+    if (onHeartbeat !== undefined && pid !== undefined) {
+        const beat = () => {
+            if (leaderExited)
+                return;
+            try {
+                process.kill(pid, 0);
+            }
+            catch (err) {
+                // EPERM: it exists, we just may not signal it. Anything else: gone.
+                if (err.code !== 'EPERM') {
+                    stopHeartbeat();
+                    return;
+                }
+            }
+            try {
+                onHeartbeat(nowIso(), pid);
+            }
+            catch { /* a listener must not kill the worker */ }
+        };
+        firstBeat = setTimeout(beat, 0);
+        firstBeat.unref?.();
+        heartbeatTimer = setInterval(beat, Math.max(1, opts.heartbeatMs ?? HEARTBEAT_MS));
+        heartbeatTimer.unref?.();
+    }
     const exited = new Promise((resolve) => {
         let settled = false;
         const finish = (code, signal) => {
@@ -3317,6 +3411,7 @@ function spawnWorker(opts) {
             settled = true;
             if (timeoutTimer !== undefined)
                 clearTimeout(timeoutTimer);
+            stopHeartbeat();
             if (killTimer !== undefined) {
                 clearTimeout(killTimer);
                 killTimer = undefined;
@@ -3467,6 +3562,8 @@ async function runNdjsonWorker(cfg) {
         stateDir,
         jobId,
         mode: spec.mode,
+        // Liveness only: on the bus, never in events.jsonl (see ProviderEvent 'heartbeat').
+        onHeartbeat: (at, pid) => bus.emit({ kind: 'heartbeat', at, ...(pid === undefined ? {} : { pid }) }),
         ...(spec.env !== undefined ? { env: spec.env } : {}),
         onStdoutLine(line) {
             const raw = tryParseObject(line);
@@ -6369,6 +6466,8 @@ function addUsage(previous, next) {
 /** Terminal-state words we might see on a tool part. */
 const DONE_WORDS = new Set(['completed', 'complete', 'done', 'success', 'succeeded', 'finished']);
 const ERROR_WORDS = new Set(['error', 'failed', 'failure', 'cancelled', 'canceled', 'aborted']);
+/** Failed tool calls that each get their own warning notice; the rest are only counted. */
+const TOOL_ERROR_NOTICES = 5;
 /**
  * Build the translator.
  *
@@ -6383,6 +6482,7 @@ function createOpencodeTranslator(maxChars) {
         finalText: '',
         sawTerminal: false,
         sawError: false,
+        toolErrors: 0,
         unrecognised: new Set(),
         deniedNotices: [],
         onEvent: () => [],
@@ -6522,8 +6622,21 @@ function createOpencodeTranslator(maxChars) {
                 out.push({ kind: 'activity-end', at, activity: ref, status });
                 if (denied)
                     tx.deniedNotices.push(toolName);
-                if (isErr)
-                    tx.sawError = true;
+                else if (isErr) {
+                    // A failed tool call (a `read` of a missing path) is evidence, not a
+                    // verdict: the agent usually recovers and still delivers its report.
+                    // Only `error` / `session.error`, a nonzero exit or an empty report fail the job.
+                    tx.toolErrors += 1;
+                    const detail = (stateErrorText ?? output?.text ?? '').split('\n')[0].slice(0, 160);
+                    // The count is the evidence; past a few, per-call warnings only bury real ones.
+                    if (tx.toolErrors <= TOOL_ERROR_NOTICES)
+                        out.push({
+                            kind: 'notice',
+                            at,
+                            level: 'warn',
+                            message: `opencode tool ${toolName} failed (step ${idx})${detail === '' ? '' : `: ${detail}`}`,
+                        });
+                }
             }
             else {
                 // In-flight: emit an update so a long tool call is not a silent gap.
@@ -6624,14 +6737,15 @@ function buildResult(args) {
     let error;
     // Event types the parser did not know: the clue when a run looks empty or broken.
     const unrecognised = tx.unrecognised.size > 0 ? ` · unrecognised events: ${[...tx.unrecognised].join(', ')}` : '';
+    const toolErrors = tx.toolErrors > 0 ? ` · ${tx.toolErrors} tool error(s)` : '';
     const early = earlyVerdict(exit, durationMs);
     if (early !== undefined) {
         ({ status, error } = early);
     }
     else if (tx.sawError) {
-        // An `error` event or an error-state tool part. opencode's provider.quota
-        // 402 exits 1 with an error event and no text, so this is the common path
-        // for a misconfigured account.
+        // An `error` or `session.error` event (never a failed tool call: see
+        // toolErrors). opencode's provider.quota 402 exits 1 with an error event
+        // and no text, so this is the common path for a misconfigured account.
         status = 'error';
         error = `${tx.error ?? 'worker error'}${unrecognised}${stderrClause(exit.stderr)}`;
     }
@@ -6643,7 +6757,7 @@ function buildResult(args) {
     }
     else if (exit.code !== 0) {
         status = 'error';
-        error = `exited ${exit.code}${unrecognised}${stderrClause(exit.stderr)}`;
+        error = `exited ${exit.code}${unrecognised}${toolErrors}${stderrClause(exit.stderr)}`;
     }
     else if (tx.finalText.trim() === '') {
         // Exited 0 with no text and no error event. Do not call that a success.
@@ -6653,7 +6767,7 @@ function buildResult(args) {
         // Most likely an event-shape gap in the adapter, not an empty model reply:
         // check events.jsonl and extend the parser.
         status = 'malformed';
-        error = `no output${unrecognised}${stderrClause(exit.stderr)}`;
+        error = `no output${unrecognised}${toolErrors}${stderrClause(exit.stderr)}`;
     }
     else {
         status = 'success';
@@ -7111,6 +7225,21 @@ function firstString(params, keys, raw = '') {
         }
     }
     return '';
+}
+/**
+ * A short name for an in-flight tool call, as a reader would type it: the
+ * command line's first step for a shell tool (`cargo test`), else the tool
+ * name. Used for liveness text ("in `cargo test` 16m").
+ */
+function toolLabel(tool, input, max = 40) {
+    const lower = tool.trim().toLowerCase();
+    if (COMMAND_TOOLS.has(lower)) {
+        const command = unwrapShell(firstString(parseInputPreview(input), COMMAND_KEYS, input ?? '')).replace(/\s+/g, ' ').trim();
+        const first = command.split(/\s*(?:&&|\|\||;|\|)\s*/).find((s) => s !== '') ?? '';
+        if (first !== '')
+            return oneLine(first, max);
+    }
+    return oneLine(tool, max);
 }
 /**
  * One tool call → its kind and a phrase. Every provider's tool vocabulary:
@@ -7745,6 +7874,8 @@ function parseMarkedSpec(body) {
 const RECENT_ACTIVITIES = 5;
 /** How much assistant text we keep as the "reasoning" cell. */
 const LATEST_TEXT_CHARS = 4_000;
+/** Max length of `latestSummary`. */
+const SUMMARY_CHARS = 1_000;
 /**
  * Owns the on-disk state of exactly one job.
  *
@@ -7765,6 +7896,17 @@ class JobWriter {
     toolCalls = 0;
     toolSteps = new Set();
     latestText = null;
+    /** The current assistant message only (reset at each tool call): what `latestSummary` shows while running. */
+    currentMessage = '';
+    /** Steps whose tool call ended in an error state. */
+    toolErrorSteps = new Set();
+    /** Last heartbeat and the worker pid it named; carried through every progress rebuild. */
+    lastAliveAt = null;
+    workerPid;
+    lastHeartbeatFlushMs = 0;
+    /** Whether the first substantive event (not `started`/`usage`) was an error notice. */
+    firstEventSeen = false;
+    firstEventWasError = false;
     tracker = new ProgressTracker();
     view = { schema: 1, prompt: '', preamble: null, transcript: [], tools: [], timeline: [], truncated: false };
     deltaOpen = false;
@@ -7783,6 +7925,13 @@ class JobWriter {
     toolInputs = '';
     /** Concatenated inputs of edit tool calls only, so read calls never attribute an external edit to the worker. */
     editToolInputs = '';
+    /**
+     * Steps whose edit tool call ENDED without error. The writing-job evidence
+     * for the cwd rule: an edit that errored or was denied changed nothing, so
+     * it must not turn a review into a writing job. (The progress digest counts
+     * edits at start, which is right for the pane but not for a verdict.)
+     */
+    editStepsCompleted = new Set();
     constructor(options) {
         this.repo = options.repo;
         this.jobId = options.jobId;
@@ -7862,6 +8011,7 @@ class JobWriter {
             lastActivity: null,
             latestText: null,
             toolCalls: 0,
+            editsCompleted: 0,
             warnings: [],
         };
         this.mirror.claim(this.jobId);
@@ -7902,6 +8052,10 @@ class JobWriter {
             if (this.baselinePending !== null)
                 await this.baselinePending;
             if (this.manifest === null)
+                return;
+            // A vanished cwd has nothing to diff or compare; finish() records it as
+            // cwdMissingAtFinish + changedFilesUnknown instead of a silent "no edits".
+            if (!existsSync(this.cwd))
                 return;
             const watched = this.manifest.watchedFiles;
             const watchedKeys = watched !== undefined ? Object.keys(watched) : [];
@@ -7955,11 +8109,33 @@ class JobWriter {
         }
         catch { /* best effort */ }
     }
+    /**
+     * Record that the worker's process is alive: progress.json `lastAliveAt` (and
+     * `workerPid`). Not activity: `updatedAt`, `lastEventAt`, the timeline and the
+     * mirror's events stay untouched, and only progress.json is rewritten.
+     */
+    heartbeat(at, pid) {
+        if (this.finished || this.manifest === null || this.progress === null)
+            return;
+        this.lastAliveAt = at;
+        if (typeof pid === 'number')
+            this.workerPid = pid;
+        this.progress = { ...this.progress, lastAliveAt: at, ...(this.workerPid === undefined ? {} : { workerPid: this.workerPid }) };
+        // Coalesced like every progress write; heartbeats are HEARTBEAT_MS apart, so in practice each lands.
+        const nowMs = Date.parse(at);
+        if (!shouldFlush(this.lastHeartbeatFlushMs, Number.isNaN(nowMs) ? Date.now() : nowMs, this.flushMs))
+            return;
+        this.lastHeartbeatFlushMs = Number.isNaN(nowMs) ? Date.now() : nowMs;
+        writeJsonAtomic(jobFile(this.repo, this.jobId, FILES.progress), this.progress);
+    }
     /** Feed one normalized provider event into the snapshot. */
     onEvent(event) {
         if (this.finished || this.manifest === null)
             return;
         switch (event.kind) {
+            case 'heartbeat':
+                this.heartbeat(event.at, event.pid);
+                return;
             case 'started':
                 this.onStarted(event);
                 return;
@@ -7972,6 +8148,9 @@ class JobWriter {
                 this.onText(event);
                 return;
             case 'notice':
+                // Info notices (lifecycle chatter) are not "the first thing that happened".
+                if (event.level !== 'info')
+                    this.noteFirstEvent(event.level === 'error');
                 if (event.level === 'warn' || event.level === 'error') {
                     this.addWarning(event.message.slice(0, 400));
                     this.touch(event.at);
@@ -8055,6 +8234,15 @@ class JobWriter {
             this.tracker.end(ref.stepIndex, row.tool, input, status);
         else
             this.tracker.start(ref.stepIndex, row.tool, ref.input ?? input);
+        if (event.kind === 'activity-end' && status === 'done' && classify(tool, input).kind === 'edit') {
+            this.editStepsCompleted.add(ref.stepIndex);
+        }
+        // A tool call ends the assistant message before it: the next text is a new one.
+        if (isStart)
+            this.currentMessage = '';
+        if (status === 'error')
+            this.toolErrorSteps.add(ref.stepIndex);
+        this.noteFirstEvent(false);
         this.lastActivity = row;
         if (idx >= 0)
             this.recent[idx] = row;
@@ -8126,8 +8314,19 @@ class JobWriter {
         const bounded = boundTimeline(timeline);
         this.view = { ...this.view, timeline: bounded.events, truncated: this.view.truncated || bounded.truncated };
         this.latestText = appendBounded(this.latestText ?? '', event.text, LATEST_TEXT_CHARS);
-        this.manifest = { ...this.manifest, latestSummary: this.latestText.trim().slice(-1e3) || this.manifest.latestSummary || null, summarySource: 'worker' };
+        this.currentMessage = appendBounded(this.currentMessage, event.text, LATEST_TEXT_CHARS);
+        this.noteFirstEvent(false);
+        this.manifest = { ...this.manifest, latestSummary: summaryTail(this.currentMessage, SUMMARY_CHARS) || this.manifest.latestSummary || null, summarySource: 'worker' };
         this.touch(at);
+    }
+    /**
+     * The cwd facts deriveStatus needs: is the cwd gone, and was this job meant
+     * to write (mode) or seen editing (one of its own edit tool calls completed
+     * without error). Every verdict for this job (finish, the steer chain) reads
+     * them from here.
+     */
+    verdictFacts() {
+        return cwdFacts(this.cwd, this.manifest?.mode, this.editStepsCompleted.size > 0);
     }
     /**
      * Write the terminal state.
@@ -8148,14 +8347,25 @@ class JobWriter {
         // A marker records a request, not proof that the worker stopped. Only the
         // adapter's terminal cancellation verdict can make the job canceled.
         const alreadyTerminal = result.status === 'cancelled' ? 'canceled' : null;
+        const { cwdMissing, writing } = this.verdictFacts();
         const verdict = deriveStatus({
             alreadyTerminal,
             ok: result.ok,
             jobStatus: result.status,
             deniedActions: result.deniedActions ?? [],
             report,
+            cwdMissing,
+            writing,
         });
+        // deriveStatus warns for a writing job (via `suspicious`); a read-only job keeps its verdict and gets this.
+        if (cwdMissing && !verdict.suspicious) {
+            this.addWarning(`working directory ${this.cwd} was gone at finish; changed files and checks could not be verified`);
+        }
         const failure = failureFields(verdict, result);
+        // Failed before doing anything: a route (model/region/account) problem, not the work.
+        const failedEarly = verdict.status === 'failed' && !result.ok && result.status !== 'timeout' && result.status !== 'cancelled' &&
+            this.toolCalls === 0 && (result.durationMs <= FAILED_EARLY_MS || this.firstEventWasError);
+        const response = result.response.trim();
         const usage = result.usage === undefined
             ? null
             : Object.fromEntries(Object.entries(result.usage).filter((e) => typeof e[1] === 'number'));
@@ -8177,12 +8387,16 @@ class JobWriter {
             })),
             usage,
             toolCalls: this.toolCalls,
+            ...(this.toolErrorSteps.size === 0 ? {} : { toolErrors: this.toolErrorSteps.size }),
+            ...(failedEarly ? { failedEarly: true } : {}),
             conversation: this.conversation,
-            latestSummary: result.response.trim().slice(0, 1_000) || this.manifest.latestSummary || null,
-            summarySource: result.response.trim() || this.manifest.latestSummary ? 'worker' : null,
+            // A worker's conclusion is at the END of its final response, not the start.
+            latestSummary: summaryTail(response, SUMMARY_CHARS) || this.manifest.latestSummary || null,
+            summarySource: response || this.manifest.latestSummary ? 'worker' : null,
             ...(this.changed === null
-                ? {}
+                ? { changedFilesUnknown: true }
                 : { changedFiles: this.changed.files, changedFilesTruncated: this.changed.truncated }),
+            ...(cwdMissing ? { cwdMissingAtFinish: true } : {}),
             ...(this.unattributed.length === 0 ? {} : { unattributedFiles: this.unattributed }),
             ...(this.staleReads.length === 0 ? {} : { staleReads: this.staleReads }),
             ...(this.manifest.pendingSteers !== undefined ? { pendingSteers: 0 } : {}),
@@ -8315,6 +8529,11 @@ class JobWriter {
             lastActivity: this.lastActivity,
             latestText: this.latestText,
             toolCalls: this.toolCalls,
+            // Always written, even 0: recovery must tell "no edit completed" from a pre-counter file.
+            editsCompleted: this.editStepsCompleted.size,
+            ...(this.toolErrorSteps.size === 0 ? {} : { toolErrors: this.toolErrorSteps.size }),
+            ...(this.lastAliveAt === null ? {} : { lastAliveAt: this.lastAliveAt }),
+            ...(this.workerPid === undefined ? {} : { workerPid: this.workerPid }),
             warnings: this.progress?.warnings ?? [],
             digest: this.tracker.digest(this.cwd),
             ...(this.progress?.pendingSteers !== undefined ? { pendingSteers: this.progress.pendingSteers } : {}),
@@ -8323,6 +8542,12 @@ class JobWriter {
         const clock = Number.isNaN(nowMs) ? Date.now() : nowMs;
         if (shouldFlush(this.lastFlushMs, clock, this.flushMs))
             this.flushProgress(at);
+    }
+    noteFirstEvent(isError) {
+        if (this.firstEventSeen)
+            return;
+        this.firstEventSeen = true;
+        this.firstEventWasError = isError;
     }
     addWarning(message) {
         if (this.progress === null)
@@ -8450,6 +8675,23 @@ function appendBounded(base, add, max) {
     // Cut from the FRONT: the newest text is what the pane shows, and a stale
     // opening paragraph is worth less than the sentence the worker just wrote.
     return joined.slice(joined.length - max);
+}
+/**
+ * The last `max` chars of `text`, starting at a paragraph (else line) boundary
+ * so the summary opens on a whole thought, not mid-sentence. A worker's
+ * conclusion is at the end of its message. Pure; exported for tests.
+ */
+function summaryTail(text, max) {
+    const t = text.trim();
+    if (t.length <= max)
+        return t;
+    const tail = t.slice(t.length - max);
+    for (const sep of ['\n\n', '\n']) {
+        const i = tail.indexOf(sep);
+        if (i >= 0 && tail.slice(i).trim() !== '')
+            return tail.slice(i).trim();
+    }
+    return tail.trim();
 }
 /** Read back a report we wrote. Used by abort(), where we never had one. */
 function reportText(repo, jobId) {
@@ -8933,7 +9175,15 @@ async function runChecks(checks, options = {}) {
             const check = checks[index];
             if (check === undefined)
                 return;
+            try {
+                options.onCheck?.({ check, state: 'start' });
+            }
+            catch { /* a progress hook must not fail a check */ }
             const verdict = await runCheck(check, options);
+            try {
+                options.onCheck?.({ check, state: 'end' });
+            }
+            catch { /* as above */ }
             verdicts[index] = verdict;
             if (options.failFast && !verdict.passed && verdict.blocking)
                 stop = true;
@@ -8968,6 +9218,17 @@ async function runChecks(checks, options = {}) {
  */
 const ACCEPTANCE_FILE = 'acceptance.json';
 const DEFAULT_CHECK_TIMEOUT_MS = 60_000;
+const ACCEPTANCE_GRACE_MS = 30_000;
+const ACCEPTANCE_BUDGET_CAP_MS = 30 * 60_000;
+/** Upper bound on how long checks can run: their timeouts summed (they may overlap), plus a grace, capped. */
+function acceptanceBudgetMs(checks) {
+    const total = checks.reduce((sum, c) => sum + (c.timeoutMs ?? DEFAULT_CHECK_TIMEOUT_MS), 0);
+    return Math.min(ACCEPTANCE_BUDGET_CAP_MS, total + ACCEPTANCE_GRACE_MS);
+}
+/** The placeholder written at spawn: checks will run once the job ends. */
+function pendingAcceptance(checks) {
+    return { state: 'unchecked', checks: [], pending: true, ...(checks?.length ? { budgetMs: acceptanceBudgetMs(checks) } : {}) };
+}
 /** Normalize a runner report into the persisted acceptance shape. */
 function acceptanceChecksFromReport(report, configuredChecks) {
     return report.verdicts.map((v, index) => {
@@ -9023,41 +9284,81 @@ function toVerifyChecks(checks, baseDir) {
  * Pipeline stages need the report (its verdicts become stage evidence); every
  * other caller only wants the Acceptance, via `evaluateAcceptance`.
  */
-async function runAcceptance(input) {
+async function evaluateAcceptanceReport(input) {
     const stamp = () => (input.now ?? (() => new Date()))().toISOString();
     if (!input.checks?.length)
         return { acceptance: { state: 'unchecked', checks: [], at: stamp() }, report: null };
     if (!input.succeeded) {
         return { acceptance: { state: 'rejected', checks: [], at: stamp(), reason: 'job did not succeed; checks not run' }, report: null };
     }
-    const rawReport = await runChecks(toVerifyChecks(input.checks, input.baseDir), { signal: input.signal });
+    const running = new Set();
+    const rawReport = await runChecks(toVerifyChecks(input.checks, input.baseDir), {
+        signal: input.signal,
+        ...(input.onProgress === undefined ? {} : {
+            onCheck: ({ check, state }) => {
+                if (state === 'start')
+                    running.add(check.name);
+                else
+                    running.delete(check.name);
+                input.onProgress([...running]);
+            },
+        }),
+    });
     const report = normalizeAcceptanceReport(rawReport, input.checks);
     const checks = acceptanceChecksFromReport(report, input.checks);
     return { acceptance: { state: acceptanceState(checks), at: stamp(), checks }, report };
 }
 async function evaluateAcceptance(input) {
-    return (await runAcceptance(input)).acceptance;
+    return (await evaluateAcceptanceReport(input)).acceptance;
 }
 function writeAcceptance(repo, jobId, acceptance) {
     writeJsonAtomic(path.join(jobDir(repo, jobId), ACCEPTANCE_FILE), acceptance);
 }
 /**
  * The placeholder written when a job is prepared, before it is terminal, so a
- * reader can tell "checks still to run" from "no checks attached".
+ * reader can tell "checks still to run" from "no checks attached". With the
+ * checks it also records how long they may take (`budgetMs`).
  */
-function markAcceptancePending(repo, jobId) {
-    writeAcceptance(repo, jobId, { state: 'unchecked', checks: [], pending: true });
+function markAcceptancePending(repo, jobId, checks) {
+    writeAcceptance(repo, jobId, pendingAcceptance(checks));
 }
 /** A steered job's earlier turns never get checks of their own; the final turn carries the verdict. */
 function markAcceptanceSuperseded(repo, jobId) {
     writeAcceptance(repo, jobId, { state: 'unchecked', checks: [], reason: 'superseded by steered turn' });
 }
 /**
- * Evaluate the finished job, record the verdict on its final turn, and mark
- * every other prepared turn superseded. Returns the verdict written.
+ * evaluateAcceptance for a job on disk: keeps acceptance.json's pending placeholder
+ * current with the checks running, then returns the verdict (the caller writes it).
+ * An abort records `unchecked: checks canceled` instead of a verdict from killed checks.
+ */
+async function runAcceptance(input) {
+    const budgetMs = acceptanceBudgetMs(input.checks ?? []);
+    const startedAt = new Date().toISOString();
+    const acceptance = await evaluateAcceptance({
+        succeeded: input.succeeded, checks: input.checks, baseDir: input.baseDir,
+        ...(input.signal === undefined ? {} : { signal: input.signal }),
+        ...(input.now === undefined ? {} : { now: input.now }),
+        onProgress: (running) => {
+            try {
+                writeAcceptance(input.repo, input.jobId, {
+                    state: 'unchecked', checks: [], pending: true, budgetMs, startedAt,
+                    ...(running.length > 0 ? { running: running.join(', ') } : {}),
+                });
+            }
+            catch { /* progress is advisory; the verdict write is not */ }
+        },
+    });
+    return input.signal?.aborted
+        ? { state: 'unchecked', checks: [], at: acceptance.at ?? startedAt, reason: 'checks canceled' }
+        : acceptance;
+}
+/**
+ * Evaluate the finished job (progress and cancel as in `runAcceptance`), record
+ * the verdict on its final turn, and mark every other prepared turn superseded.
+ * Returns the verdict written.
  */
 async function settleAcceptance(input) {
-    const acceptance = await evaluateAcceptance(input);
+    const acceptance = await runAcceptance({ ...input, jobId: input.finalJobId });
     writeAcceptance(input.repo, input.finalJobId, acceptance);
     for (const id of input.preparedJobIds)
         if (id !== input.finalJobId)
@@ -9339,6 +9640,7 @@ function createForgeRunner(deps) {
             // second, independent line of defence rather than the only one.
             timeoutMs: stage.timeoutMs ?? 0,
             unrestricted: deps.unrestricted,
+            ...(stage.env === undefined ? {} : { env: stage.env }),
             pipeline: ctx.pipeline,
             stage: stage.name,
             attempt: ctx.attempt,
@@ -9358,7 +9660,7 @@ function createForgeRunner(deps) {
             jobId = tracked.ack.jobId;
             // As spawn_job does: the job reads "checks pending" until a verdict exists.
             if (stage.checks?.length)
-                recordAcceptance(deps.service.repo, jobId, 'pending');
+                recordAcceptance(deps.service.repo, jobId, pendingAcceptance(stage.checks));
             deps.onStageRunning?.({
                 stage: stage.name, jobId, status: 'running', provider: ctx.routing.provider,
                 ...(ctx.routing.model === undefined ? {} : { model: ctx.routing.model }),
@@ -9391,7 +9693,7 @@ function createForgeRunner(deps) {
             const result = toStageResult(stage, ctx, manifest, observations, startedAt, artifactRoot);
             if (!stage.checks?.length)
                 return manifest.status === 'succeeded' ? { ...result, acceptance: 'unchecked' } : result;
-            const { acceptance, report } = await runAcceptance({
+            const { acceptance, report } = await evaluateAcceptanceReport({
                 succeeded: manifest.status === 'succeeded', checks: stage.checks, baseDir: ctx.workDir, signal: ctx.signal,
             });
             recordAcceptance(deps.service.repo, jobId, acceptance);
@@ -9439,10 +9741,7 @@ function createForgeRunner(deps) {
 /** Persist the stage job's acceptance beside its record. A failed write must not fail the stage. */
 function recordAcceptance(repo, jobId, acceptance) {
     try {
-        if (acceptance === 'pending')
-            markAcceptancePending(repo, jobId);
-        else
-            writeAcceptance(repo, jobId, acceptance);
+        writeAcceptance(repo, jobId, acceptance);
     }
     catch (err) {
         process.stderr.write(`agent-smith acceptance ${jobId}: ${String(err)}\n`);
@@ -9757,4 +10056,4 @@ function startPipeline(service, spec, options = {}) {
         throw error;
     }).finally(() => clearInterval(poll));
     return { runId, recordPath, done, cancel: () => { cancelPipeline(service.repo, runId); } };
-}export{readdirSafe as $,AgentSmithReader as A,writeJsonAtomic as B,failureFields as C,DEFAULT_TIMEOUT_MS as D,writeAcceptance as E,FILES as F,getProvider as G,nextActionFor as H,jobDir as I,fileSig as J,jobsDir as K,JobWriter as L,MODES as M,isMode as N,newJobId$1 as O,PROVIDERS as P,humanDuration as Q,REASONS as R,STAGE_PROMPTS as S,pipeEvents as T,pipelineRecordPath as U,isForgeJobId as V,computeStaleReads as W,SMITH_PAYLOAD as X,isForgeStatus as Y,checksReason as Z,readJsonSafe as _,MODE_PRESETS as a,existsSafe as a0,readPipeline as b,cancelPipeline as c,readAcceptance as d,settleAcceptance as e,markAcceptanceSuperseded as f,isTerminalForgeStatus as g,readManifest as h,inheritContinuedProviders as i,jobFile as j,AgyStaffReader as k,errMessage as l,markAcceptancePending as m,normalize as n,findProvider as o,providerNames as p,SCHEMA_VERSION as q,reasonFromText as r,startPipeline as s,validOwnerPid as t,ownerAlive as u,validateSpec as v,reportFor as w,deriveOrphan as x,deriveStatus as y,writeAtomic as z};
+}export{checksReason as $,AgentSmithReader as A,deriveStatus as B,writeAtomic as C,DEFAULT_TIMEOUT_MS as D,summaryTail as E,FILES as F,failureFields as G,writeAcceptance as H,getProvider as I,nextActionFor as J,jobDir as K,fileSig as L,MODES as M,jobsDir as N,JobWriter as O,PROVIDERS as P,isMode as Q,REASONS as R,STAGE_PROMPTS as S,newJobId$1 as T,humanDuration as U,pipeEvents as V,pipelineRecordPath as W,isForgeJobId as X,computeStaleReads as Y,SMITH_PAYLOAD as Z,isForgeStatus as _,MODE_PRESETS as a,toolLabel as a0,readJsonSafe as a1,readdirSafe as a2,existsSafe as a3,readAcceptance as b,readPipeline as c,cancelPipeline as d,settleAcceptance as e,markAcceptanceSuperseded as f,isTerminalForgeStatus as g,readManifest as h,inheritContinuedProviders as i,jobFile as j,AgyStaffReader as k,errMessage as l,markAcceptancePending as m,normalize as n,findProvider as o,providerNames as p,SCHEMA_VERSION as q,reasonFromText as r,startPipeline as s,validOwnerPid as t,ownerAlive as u,validateSpec as v,writeJsonAtomic as w,reportFor as x,cwdFacts as y,deriveOrphan as z};

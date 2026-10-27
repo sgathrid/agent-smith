@@ -62,11 +62,27 @@ test('failure says failed and the short reason', () => {
   );
 });
 
-test('canceled and stalled read as what they are', () => {
+test('canceled and quiet read as what they are: facts, never "stalled"', () => {
   assert.equal(headline(notice({ kind: 'cancelled', name: 'Cy', provider: 'claude', role: 'implement', durationMs: 125_000 })),
     '■ Cy (claude implement) 2m · canceled');
   assert.equal(headline(notice({ kind: 'attention', name: 'Di', provider: 'opencode', role: 'research', durationMs: 16 * 60_000 })),
-    '! Di (opencode research) · stalled 16m');
+    '! Di (opencode research) · no output for 16m');
+  assert.equal(headline(notice({ kind: 'attention', name: 'Di', provider: 'opencode', role: 'research', durationMs: 16 * 60_000,
+    liveness: { state: 'silent', tool: 'npm test' } })), '! Di (opencode research) · no output for 16m (in `npm test`)');
+  assert.equal(headline(notice({ kind: 'attention', name: 'Di', provider: 'opencode', role: 'research', durationMs: 3 * 60_000,
+    liveness: { state: 'dead' } })), '! Di (opencode research) · process gone 3m');
+  const both = claudeText([notice({ id: 'a', kind: 'attention', durationMs: 16 * 60_000 }), notice({ id: 'b', kind: 'attention', liveness: { state: 'dead' } })]);
+  assert.match(both, /^Agent Smith · 2 jobs: 1 no output, 1 process gone$/m);
+  assert.doesNotMatch(both, /stalled/);
+});
+
+test('noticeFromRadar: silent counts from the last event, dead from the last heartbeat', () => {
+  const silent = noticeFromRadar(row({ id: 'q', status: 'attention', lastEventAt: NOW - 16 * 60_000,
+    liveness: { state: 'silent', silentForMs: 16 * 60_000, since: NOW - 16 * 60_000, tool: 'cargo test' } }), 'attention', NOW);
+  assert.equal(headline(silent), '! job q · no output for 16m (in `cargo test`)');
+  const dead = noticeFromRadar(row({ id: 'd', status: 'attention', lastEventAt: NOW - 60_000,
+    liveness: { state: 'dead', silentForMs: 60_000, since: NOW - 3 * 60_000 } }), 'attention', NOW);
+  assert.equal(headline(dead), '! job d · process gone 3m');
 });
 
 test('rejected checks are a failure, not done: glyph x and the failed check names', () => {
@@ -220,11 +236,56 @@ test('running is silent; a stall is said once, then the ending is said too', () 
   assert.equal(due(owned, [row({ id: 'j', status: 'succeeded', endedAt: NOW })], new Map(), NOW).notices[0]?.kind, 'finished');
 });
 
+test('a silent job whose process then dies is said again, once, as process gone', () => {
+  let owned: Owned[] = claim([], launch('j'), NOW);
+  const silent = row({ id: 'j', status: 'attention', lastEventAt: NOW - 16 * 60_000,
+    liveness: { state: 'silent', silentForMs: 16 * 60_000, since: NOW - 16 * 60_000 } });
+  const first = due(owned, [silent], new Map(), NOW);
+  assert.match(headline(first.notices[0]!), /no output for 16m/);
+  owned = first.owned;
+  const dead = row({ id: 'j', status: 'attention', lastEventAt: NOW - 18 * 60_000,
+    liveness: { state: 'dead', silentForMs: 18 * 60_000, since: NOW - 3 * 60_000 } });
+  const second = due(owned, [dead], new Map(), NOW);
+  assert.equal(second.notices.length, 1);
+  assert.match(headline(second.notices[0]!), /process gone 3m/);
+  assert.deepEqual(due(second.owned, [dead], new Map(), NOW + 3000).notices, [], 'dead is said once');
+});
+
+test('a dead job is said at once, without a silence notice first', () => {
+  const owned = claim([], launch('j'), NOW);
+  const dead = row({ id: 'j', status: 'attention', lastEventAt: NOW - 60_000,
+    liveness: { state: 'dead', silentForMs: 60_000, since: NOW - 3 * 60_000 } });
+  const r = due(owned, [dead], new Map(), NOW);
+  assert.match(headline(r.notices[0]!), /process gone 3m/);
+  assert.deepEqual(due(r.owned, [dead], new Map(), NOW + 3000).notices, []);
+});
+
 test('a pending acceptance verdict holds the notice, but not past the hold', () => {
   const owned = claim([], launch('j'), NOW);
   const pending = row({ id: 'j', status: 'succeeded', endedAt: NOW, acceptance: { pending: true, checks: [] } });
   assert.deepEqual(due(owned, [pending], new Map(), NOW + 1000).notices, []);
   assert.equal(due(owned, [pending], new Map(), NOW + ACCEPTANCE_HOLD_MS + 1).notices.length, 1);
+});
+
+test('the hold follows the checks budget; past it the notice says exited, checks running, then the verdict follows', () => {
+  const owned = claim([], launch('j'), NOW);
+  const budget = 20 * 60_000;
+  const pending = row({ id: 'j', name: 'Ada', provider: 'codex', role: 'implement', status: 'succeeded', startedAt: NOW - 60_000, endedAt: NOW, acceptance: { pending: true, budgetMs: budget, running: 'ui-suite', checks: [] } });
+  // Past the flat default, inside the budget: still held.
+  assert.deepEqual(due(owned, [pending], new Map(), NOW + ACCEPTANCE_HOLD_MS + 1).notices, []);
+  const late = due(owned, [pending], new Map(), NOW + budget + 1);
+  assert.equal(late.notices.length, 1);
+  const text = claudeText(late.notices);
+  assert.match(text, /exited · checks running: ui-suite/);
+  assert.doesNotMatch(text, /done|✓/);
+  assert.equal(late.owned[0]?.saidExited, true);
+  // Said once while the checks still run.
+  assert.deepEqual(due(late.owned, [pending], new Map(), NOW + budget + 60_000).notices, []);
+  // The verdict is announced when it lands.
+  const verdict = row({ id: 'j', name: 'Ada', status: 'succeeded', startedAt: NOW - 60_000, endedAt: NOW, acceptance: { checks: [{ ok: true, name: 'ui-suite' }] } });
+  const final = due(late.owned, [verdict], new Map(), NOW + budget + 120_000);
+  assert.match(claudeText(final.notices), /✓ .*done · checks 1\/1/);
+  assert.deepEqual(final.owned, []);
 });
 
 test('a claimed run is announced with its stage jobs when it ends, not before', () => {

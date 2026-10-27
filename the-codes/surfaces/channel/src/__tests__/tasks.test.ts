@@ -613,6 +613,7 @@ test('isolated Claude Code host probe negotiates 2026-07-28 against Tasks-enable
   const tmp = mkdtempSync(path.join(os.tmpdir(), 'smith-claude-host-probe-'));
   const claudeHome = path.join(tmp, 'claude-config');
   const wireLog = path.join(tmp, 'wire.jsonl');
+  const pidLog = path.join(tmp, 'pids.txt');
   const spy = path.join(tmp, 'spy-server.mjs');
   mkdirSync(claudeHome, { recursive: true });
   writeFileSync(spy, `#!${process.execPath}
@@ -623,6 +624,8 @@ const child = spawn(process.execPath, ['--experimental-strip-types', ${JSON.stri
   env: { ...process.env, AGENT_SMITH_TASKS: '1', AGENT_SMITH_CHANNEL: '0' },
   stdio: ['pipe', 'pipe', 'pipe'],
 });
+// The test deletes this directory after \`claude mcp get\` returns; it waits for these pids first.
+appendFileSync(process.env.SPY_PID_LOG, process.pid + '\\n' + child.pid + '\\n');
 process.stdin.on('data', chunk => {
   appendFileSync(log, 'IN ' + chunk.toString('utf8'));
   child.stdin.write(chunk);
@@ -639,7 +642,7 @@ child.on('exit', code => process.exit(code ?? 0));
     const isolatedEnv = { ...process.env, CLAUDE_CONFIG_DIR: claudeHome, HOME: tmp };
     const addRes = spawnSync(
       'claude',
-      ['mcp', 'add-json', 'smith-probe', JSON.stringify({ type: 'stdio', command: spy, env: { SPY_WIRE_LOG: wireLog, AGY_WATCH_CWD: tmp } })],
+      ['mcp', 'add-json', 'smith-probe', JSON.stringify({ type: 'stdio', command: spy, env: { SPY_WIRE_LOG: wireLog, SPY_PID_LOG: pidLog, AGY_WATCH_CWD: tmp } })],
       { cwd: tmp, env: isolatedEnv, encoding: 'utf8', timeout: 10_000 },
     );
     assert.equal(addRes.status, 0, addRes.stderr);
@@ -657,7 +660,21 @@ child.on('exit', code => process.exit(code ?? 0));
     assert.match(wire, /"io\.modelcontextprotocol\/tasks":\{\}/);
     assert.match(wire, /"method":"tools\/list"/);
   } finally {
-    rmSync(tmp, { recursive: true, force: true });
+    // `claude mcp get` returns before the spy, the server child and claude's own
+    // config writes under HOME have finished: deleting at once raced them (ENOTEMPTY).
+    awaitExit(readPids(pidLog), 5_000);
+    rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   }
 });
+
+function readPids(file: string): number[] {
+  try { return readFileSync(file, 'utf8').split('\n').map(Number).filter(n => Number.isInteger(n) && n > 0); } catch { return []; }
+}
+
+/** Block until every pid has exited or the budget runs out; a pid we cannot signal counts as gone. */
+function awaitExit(pids: number[], budgetMs: number): void {
+  const deadline = Date.now() + budgetMs;
+  const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  while (pids.some(alive) && Date.now() < deadline) spawnSync('sleep', ['0.05']);
+}
 

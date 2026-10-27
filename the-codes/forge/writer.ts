@@ -36,13 +36,15 @@
 import { classify, ProgressTracker } from '../surfaces/mod/hooks/progress.ts';
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 
 import { createMarker, writeAtomic, writeJsonAtomic } from './atomic.ts';
 import {
+  FAILED_EARLY_MS,
   FILES,
   PROGRESS_FLUSH_MS,
+  cwdFacts,
   attributeChanged,
   failureFields,
   diffChangedFiles,
@@ -70,6 +72,9 @@ const RECENT_ACTIVITIES = 5;
 
 /** How much assistant text we keep as the "reasoning" cell. */
 const LATEST_TEXT_CHARS = 4_000;
+
+/** Max length of `latestSummary`. */
+const SUMMARY_CHARS = 1_000;
 
 export interface JobWriterOptions {
   readonly repo: string;
@@ -131,6 +136,17 @@ export class JobWriter {
   private toolCalls = 0;
   private toolSteps = new Set<number>();
   private latestText: string | null = null;
+  /** The current assistant message only (reset at each tool call): what `latestSummary` shows while running. */
+  private currentMessage = '';
+  /** Steps whose tool call ended in an error state. */
+  private toolErrorSteps = new Set<number>();
+  /** Last heartbeat and the worker pid it named; carried through every progress rebuild. */
+  private lastAliveAt: string | null = null;
+  private workerPid: number | undefined;
+  private lastHeartbeatFlushMs = 0;
+  /** Whether the first substantive event (not `started`/`usage`) was an error notice. */
+  private firstEventSeen = false;
+  private firstEventWasError = false;
   private readonly tracker = new ProgressTracker();
   private view: ForgeView = { schema: 1, prompt: '', preamble: null, transcript: [], tools: [], timeline: [], truncated: false };
   private deltaOpen = false;
@@ -149,6 +165,13 @@ export class JobWriter {
   private toolInputs = '';
   /** Concatenated inputs of edit tool calls only, so read calls never attribute an external edit to the worker. */
   private editToolInputs = '';
+  /**
+   * Steps whose edit tool call ENDED without error. The writing-job evidence
+   * for the cwd rule: an edit that errored or was denied changed nothing, so
+   * it must not turn a review into a writing job. (The progress digest counts
+   * edits at start, which is right for the pane but not for a verdict.)
+   */
+  private readonly editStepsCompleted = new Set<number>();
 
   constructor(options: JobWriterOptions) {
     this.repo = options.repo;
@@ -230,6 +253,7 @@ export class JobWriter {
       lastActivity: null,
       latestText: null,
       toolCalls: 0,
+      editsCompleted: 0,
       warnings: [],
     };
 
@@ -270,6 +294,9 @@ export class JobWriter {
     try {
       if (this.baselinePending !== null) await this.baselinePending;
       if (this.manifest === null) return;
+      // A vanished cwd has nothing to diff or compare; finish() records it as
+      // cwdMissingAtFinish + changedFilesUnknown instead of a silent "no edits".
+      if (!existsSync(this.cwd)) return;
       const watched = this.manifest.watchedFiles;
       const watchedKeys = watched !== undefined ? Object.keys(watched) : [];
       const editedWatchedSet = new Set(this.editedFiles(watchedKeys));
@@ -321,16 +348,36 @@ export class JobWriter {
     } catch { /* best effort */ }
   }
 
+  /**
+   * Record that the worker's process is alive: progress.json `lastAliveAt` (and
+   * `workerPid`). Not activity: `updatedAt`, `lastEventAt`, the timeline and the
+   * mirror's events stay untouched, and only progress.json is rewritten.
+   */
+  heartbeat(at: string, pid?: number): void {
+    if (this.finished || this.manifest === null || this.progress === null) return;
+    this.lastAliveAt = at;
+    if (typeof pid === 'number') this.workerPid = pid;
+    this.progress = { ...this.progress, lastAliveAt: at, ...(this.workerPid === undefined ? {} : { workerPid: this.workerPid }) };
+    // Coalesced like every progress write; heartbeats are HEARTBEAT_MS apart, so in practice each lands.
+    const nowMs = Date.parse(at);
+    if (!shouldFlush(this.lastHeartbeatFlushMs, Number.isNaN(nowMs) ? Date.now() : nowMs, this.flushMs)) return;
+    this.lastHeartbeatFlushMs = Number.isNaN(nowMs) ? Date.now() : nowMs;
+    writeJsonAtomic(jobFile(this.repo, this.jobId, FILES.progress), this.progress);
+  }
+
   /** Feed one normalized provider event into the snapshot. */
   onEvent(event: ProviderEvent): void {
     if (this.finished || this.manifest === null) return;
     switch (event.kind) {
+      case 'heartbeat': this.heartbeat(event.at, event.pid); return;
       case 'started': this.onStarted(event); return;
       case 'activity-start':
       case 'activity-update':
       case 'activity-end': this.onActivity(event); return;
       case 'text': this.onText(event); return;
       case 'notice':
+        // Info notices (lifecycle chatter) are not "the first thing that happened".
+        if (event.level !== 'info') this.noteFirstEvent(event.level === 'error');
         if (event.level === 'warn' || event.level === 'error') {
           this.addWarning(event.message.slice(0, 400));
           this.touch(event.at);
@@ -412,6 +459,13 @@ export class JobWriter {
     }
     if (event.kind === 'activity-end') this.tracker.end(ref.stepIndex, row.tool, input, status);
     else this.tracker.start(ref.stepIndex, row.tool, ref.input ?? input);
+    if (event.kind === 'activity-end' && status === 'done' && classify(tool, input).kind === 'edit') {
+      this.editStepsCompleted.add(ref.stepIndex);
+    }
+    // A tool call ends the assistant message before it: the next text is a new one.
+    if (isStart) this.currentMessage = '';
+    if (status === 'error') this.toolErrorSteps.add(ref.stepIndex);
+    this.noteFirstEvent(false);
     this.lastActivity = row;
     if (idx >= 0) this.recent[idx] = row;
     else this.recent.push(row);
@@ -470,8 +524,20 @@ export class JobWriter {
     const bounded = boundTimeline(timeline);
     this.view = { ...this.view, timeline: bounded.events, truncated: this.view.truncated || bounded.truncated };
     this.latestText = appendBounded(this.latestText ?? '', event.text, LATEST_TEXT_CHARS);
-    this.manifest = { ...this.manifest, latestSummary: this.latestText.trim().slice(-1_000) || this.manifest.latestSummary || null, summarySource: 'worker' };
+    this.currentMessage = appendBounded(this.currentMessage, event.text, LATEST_TEXT_CHARS);
+    this.noteFirstEvent(false);
+    this.manifest = { ...this.manifest, latestSummary: summaryTail(this.currentMessage, SUMMARY_CHARS) || this.manifest.latestSummary || null, summarySource: 'worker' };
     this.touch(at);  }
+
+  /**
+   * The cwd facts deriveStatus needs: is the cwd gone, and was this job meant
+   * to write (mode) or seen editing (one of its own edit tool calls completed
+   * without error). Every verdict for this job (finish, the steer chain) reads
+   * them from here.
+   */
+  verdictFacts(): { cwdMissing: boolean; writing: boolean } {
+    return cwdFacts(this.cwd, this.manifest?.mode, this.editStepsCompleted.size > 0);
+  }
 
   /**
    * Write the terminal state.
@@ -494,15 +560,27 @@ export class JobWriter {
     // adapter's terminal cancellation verdict can make the job canceled.
     const alreadyTerminal: ForgeStatus | null = result.status === 'cancelled' ? 'canceled' : null;
 
+    const { cwdMissing, writing } = this.verdictFacts();
     const verdict = deriveStatus({
       alreadyTerminal,
       ok: result.ok,
       jobStatus: result.status,
       deniedActions: result.deniedActions ?? [],
       report,
+      cwdMissing,
+      writing,
     });
+    // deriveStatus warns for a writing job (via `suspicious`); a read-only job keeps its verdict and gets this.
+    if (cwdMissing && !verdict.suspicious) {
+      this.addWarning(`working directory ${this.cwd} was gone at finish; changed files and checks could not be verified`);
+    }
 
     const failure = failureFields(verdict, result);
+    // Failed before doing anything: a route (model/region/account) problem, not the work.
+    const failedEarly =
+      verdict.status === 'failed' && !result.ok && result.status !== 'timeout' && result.status !== 'cancelled' &&
+      this.toolCalls === 0 && (result.durationMs <= FAILED_EARLY_MS || this.firstEventWasError);
+    const response = result.response.trim();
 
     const usage =
       result.usage === undefined
@@ -529,12 +607,16 @@ export class JobWriter {
       })),
       usage,
       toolCalls: this.toolCalls,
+      ...(this.toolErrorSteps.size === 0 ? {} : { toolErrors: this.toolErrorSteps.size }),
+      ...(failedEarly ? { failedEarly: true } : {}),
       conversation: this.conversation,
-      latestSummary: result.response.trim().slice(0, 1_000) || this.manifest.latestSummary || null,
-      summarySource: result.response.trim() || this.manifest.latestSummary ? 'worker' : null,
+      // A worker's conclusion is at the END of its final response, not the start.
+      latestSummary: summaryTail(response, SUMMARY_CHARS) || this.manifest.latestSummary || null,
+      summarySource: response || this.manifest.latestSummary ? 'worker' : null,
       ...(this.changed === null
-        ? {}
+        ? { changedFilesUnknown: true }
         : { changedFiles: this.changed.files, changedFilesTruncated: this.changed.truncated }),
+      ...(cwdMissing ? { cwdMissingAtFinish: true } : {}),
       ...(this.unattributed.length === 0 ? {} : { unattributedFiles: this.unattributed }),
       ...(this.staleReads.length === 0 ? {} : { staleReads: this.staleReads }),
       ...(this.manifest.pendingSteers !== undefined ? { pendingSteers: 0 } : {}),
@@ -674,6 +756,11 @@ export class JobWriter {
       lastActivity: this.lastActivity,
       latestText: this.latestText,
       toolCalls: this.toolCalls,
+      // Always written, even 0: recovery must tell "no edit completed" from a pre-counter file.
+      editsCompleted: this.editStepsCompleted.size,
+      ...(this.toolErrorSteps.size === 0 ? {} : { toolErrors: this.toolErrorSteps.size }),
+      ...(this.lastAliveAt === null ? {} : { lastAliveAt: this.lastAliveAt }),
+      ...(this.workerPid === undefined ? {} : { workerPid: this.workerPid }),
       warnings: this.progress?.warnings ?? [],
       digest: this.tracker.digest(this.cwd),
       ...(this.progress?.pendingSteers !== undefined ? { pendingSteers: this.progress.pendingSteers } : {}),
@@ -681,6 +768,12 @@ export class JobWriter {
     const nowMs = Date.parse(at);
     const clock = Number.isNaN(nowMs) ? Date.now() : nowMs;
     if (shouldFlush(this.lastFlushMs, clock, this.flushMs)) this.flushProgress(at);
+  }
+
+  private noteFirstEvent(isError: boolean): void {
+    if (this.firstEventSeen) return;
+    this.firstEventSeen = true;
+    this.firstEventWasError = isError;
   }
 
   private addWarning(message: string): void {
@@ -817,6 +910,22 @@ export function appendBounded(base: string, add: string, max: number): string {
   // Cut from the FRONT: the newest text is what the pane shows, and a stale
   // opening paragraph is worth less than the sentence the worker just wrote.
   return joined.slice(joined.length - max);
+}
+
+/**
+ * The last `max` chars of `text`, starting at a paragraph (else line) boundary
+ * so the summary opens on a whole thought, not mid-sentence. A worker's
+ * conclusion is at the end of its message. Pure; exported for tests.
+ */
+export function summaryTail(text: string, max: number): string {
+  const t = text.trim();
+  if (t.length <= max) return t;
+  const tail = t.slice(t.length - max);
+  for (const sep of ['\n\n', '\n']) {
+    const i = tail.indexOf(sep);
+    if (i >= 0 && tail.slice(i).trim() !== '') return tail.slice(i).trim();
+  }
+  return tail.trim();
 }
 
 /** Read back a report we wrote. Used by abort(), where we never had one. */

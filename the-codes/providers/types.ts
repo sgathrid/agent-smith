@@ -182,7 +182,14 @@ export type ProviderEvent =
    * warnings, API errors, "permission auto-denied" notices, parse failures.
    * `level: 'error'` does NOT mean the job failed — see JobResult for that.
    */
-  | { kind: 'notice'; at: string; level: 'info' | 'warn' | 'error'; message: string; raw?: unknown };
+  | { kind: 'notice'; at: string; level: 'info' | 'warn' | 'error'; message: string; raw?: unknown }
+
+  /**
+   * The CLI process is still running (providers/ndjson.ts, every HEARTBEAT_MS
+   * and once at spawn). Liveness, not activity: it is emitted on the bus only,
+   * never written to events.jsonl, and does not move a job's lastEventAt.
+   */
+  | { kind: 'heartbeat'; at: string; pid?: number };
 
 // ---------------------------------------------------------------------------
 // JobResult

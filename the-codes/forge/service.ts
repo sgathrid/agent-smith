@@ -91,17 +91,19 @@ import { computeStaleReads, JobWriter, pipeEvents, reportFor } from './writer.ts
 import { writeAtomic, writeJsonAtomic } from './atomic.ts';
 import { readAcceptance, type Acceptance } from './checks.ts';
 import {
-  checkAgainstCatalog, clampTimeout, modeError, requireProvider, turnStartInput,
+  checkAgainstCatalog, clampTimeout, ENV_KEYS_FILE, modeError, requireProvider, turnStartInput,
   type SpawnAck, type SpawnRequest, type SteerAck, type SteerRequest, type TrackedSpawn, type TurnSpec,
 } from './spawn-request.ts';
 import { toSummary, type JobDetail, type JobSummary, type ListFilter } from './summary.ts';
 import { appendSteerEntry, buildSteeredPrompt, readSteerEntries, readSteerHead } from './steer-log.ts';
 import { syncWatchedFiles, validateWatchedFiles } from './watched-files.ts';
+import { validateEnv } from '../pipeline/types.ts';
 
 // The types and constants other packages import from here. Their homes are the
 // modules above; this is the one place that keeps the old import path working.
 export type { JobDetail, JobSummary, ListFilter, SpawnAck, SpawnRequest, SteerAck, SteerRequest, TrackedSpawn };
 export { MAX_WATCHED_FILES } from './watched-files.ts';
+export { ENV_KEYS_FILE };
 
 /**
  * Default wall-clock budget for one job.
@@ -175,7 +177,9 @@ export interface ForgeOptions {
   /** Progress coalescing window, ms. Overridable so tests need not sleep. */
   readonly flushMs?: number | undefined;
   /** Model catalog source. Default: providers/catalog.ts getCatalogs. Injectable for tests. */
-  readonly catalogSource?: ((providers: string[]) => Promise<ModelCatalog[]>) | undefined;
+  readonly catalogSource?: ((providers?: string[]) => Promise<ModelCatalog[]>) | undefined;
+  /** Catalog wait before a spawn passes the model through unchecked: `cold` until a catalog has been seen once. Injectable for tests. */
+  readonly catalogWaitMs?: { readonly warm?: number; readonly cold?: number } | undefined;
   /** Provider config-file defaults (sync, no CLI). Default: providers/catalog.ts getHarnessDefaults. Injectable for tests. */
   readonly harnessDefaults?: ((provider: string) => { model?: string; effort?: string }) | undefined;
   /** Provider lookup. Default: requireProvider. Injectable for tests. */
@@ -186,7 +190,15 @@ export interface ForgeOptions {
     | undefined;
 }
 
+/**
+ * How long a spawn waits for the model catalog before passing the model through
+ * unchecked. Cold discovery shells out (`agy models` alone took 2.1 s), so the
+ * first spawn, when no catalog has been seen yet, waits longer; every later
+ * spawn finds the TTL cache warm or gives up quickly.
+ */
 const CATALOG_WAIT_MS = 2_000;
+const CATALOG_COLD_WAIT_MS = 5_000;
+
 /**
  * The forge. One instance per process; the live-handle map is per instance.
  *
@@ -208,7 +220,11 @@ export class ForgeService {
   readonly spawnedRuns = new Set<string>();
   private readonly mirrorOn: boolean;
   private readonly flushMs: number | undefined;
-  private readonly catalogSource: (providers: string[]) => Promise<ModelCatalog[]>;
+  private readonly catalogSource: (providers?: string[]) => Promise<ModelCatalog[]>;
+  private readonly catalogWaitMs: { readonly warm: number; readonly cold: number };
+  /** Set once any catalog lookup has completed; until then a spawn waits the cold budget. */
+  private catalogSeen = false;
+  private catalogWarm: Promise<ModelCatalog[]> | undefined;
   private readonly harnessDefaults: (provider: string) => { model?: string; effort?: string };
   private readonly providerSource: (name: string) => Provider;
   private readonly describeSandbox: NonNullable<ForgeOptions['describeSandbox']>;
@@ -219,7 +235,8 @@ export class ForgeService {
     this.mirrorOn = options.mirror ?? true;
     this.flushMs = options.flushMs;
     this.providerSource = options.providerSource ?? requireProvider;
-    this.catalogSource = options.catalogSource ?? ((providers) => getCatalogs({ providers }));
+    this.catalogSource = options.catalogSource ?? ((providers) => getCatalogs({ providers, repo: this.repo }));
+    this.catalogWaitMs = { warm: options.catalogWaitMs?.warm ?? CATALOG_WAIT_MS, cold: options.catalogWaitMs?.cold ?? CATALOG_COLD_WAIT_MS };
     this.harnessDefaults = options.harnessDefaults ?? getHarnessDefaults;
     this.describeSandbox = options.describeSandbox ?? ((p, spec) => p.describeSandbox?.(spec));
     // Publish abandoned-job recovery when the owner service starts, so the
@@ -253,16 +270,34 @@ export class ForgeService {
     }
   }
 
+  /**
+   * Start model discovery in the background so the first spawn finds it cached.
+   * Never blocks, never rejects; a second call is a no-op.
+   */
+  warmCatalogs(): void {
+    if (this.catalogWarm !== undefined) return;
+    this.catalogWarm = Promise.resolve()
+      .then(() => this.catalogSource())
+      .then((all) => { this.catalogSeen = true; return all; })
+      .catch(() => [] as ModelCatalog[])
+      // Once settled the provider TTL cache owns freshness; later lookups must not reuse this snapshot.
+      .finally(() => { this.catalogWarm = undefined; });
+  }
+
   /** Never throws, never waits long: a catalog is advice, not a gate on starting. */
   private async catalogFor(provider: string): Promise<ModelCatalog | undefined> {
     let timer: NodeJS.Timeout | undefined;
     try {
+      const waitMs = this.catalogSeen ? this.catalogWaitMs.warm : this.catalogWaitMs.cold;
       const timeout = new Promise<undefined>((resolve) => {
-        timer = setTimeout(() => resolve(undefined), CATALOG_WAIT_MS);
+        timer = setTimeout(() => resolve(undefined), waitMs);
         timer.unref?.();
       });
-      const all = await Promise.race([this.catalogSource([provider]), timeout]);
-      return all?.find((c) => c.provider === provider) ?? all?.[0];
+      // Join a warm-up still in flight rather than starting a second discovery.
+      const warm = this.catalogWarm;
+      const all = await Promise.race([warm ?? this.catalogSource([provider]), timeout]);
+      if (all !== undefined) this.catalogSeen = true;
+      return all?.find((c) => c.provider === provider) ?? (warm === undefined ? all?.[0] : undefined);
     } catch {
       return undefined;
     } finally {
@@ -304,6 +339,8 @@ export class ForgeService {
       throw new Error('prompt is empty; there is nothing to hand the worker.');
     }
     const timeoutMs = clampTimeout(request.timeoutMs);
+    const env = validateEnv(request.env);
+    const envKeys = env === undefined ? [] : Object.keys(env);
     const cwd = request.cwd ?? this.repo;
     // agy and kimi cannot prompt headless. agy has an env opt-out; kimi's print
     // mode force-sets the auto policy and has no restricted mode, so the
@@ -417,6 +454,7 @@ export class ForgeService {
       timeoutMs,
       unrestricted,
       conversation: request.conversation,
+      env,
       pipeline: request.pipeline ?? null,
       stage: request.stage ?? null,
       attempt: request.attempt ?? null,
@@ -436,6 +474,7 @@ export class ForgeService {
     }));
     try {
       if (request.checks !== undefined) writeJsonAtomic(jobFile(this.repo, jobId, FILES.checksSpec), request.checks);
+      if (envKeys.length > 0) writeJsonAtomic(jobFile(this.repo, jobId, ENV_KEYS_FILE), envKeys);
       await request.onPrepared?.(jobId);
     } catch (error) {
       writer.abort('failed', `setup failed · ${String(error)}`);
@@ -453,6 +492,7 @@ export class ForgeService {
       dir: jobDir(this.repo, jobId),
       repo: this.repo,
       timeoutMs,
+      ...(envKeys.length > 0 ? { envKeys } : {}),
       unrestricted,
       note:
         `queued · ${humanDuration(timeoutMs)} limit · ${
@@ -511,6 +551,7 @@ export class ForgeService {
           ...(spec.model === undefined ? {} : { model: spec.model }),
           ...(spec.effort === undefined ? {} : { effort: spec.effort }),
           ...(currentConversation === undefined ? {} : { conversation: currentConversation }),
+          ...(spec.env === undefined ? {} : { env: { ...spec.env } }),
           // THE KEY LINE. Handing the provider adapter OUR job directory as its
           // stateDir means events.jsonl / argv.json / stderr.log / result.json are
           // written by the already-verified plumbing in providers/ndjson.ts, for
@@ -603,6 +644,9 @@ export class ForgeService {
           jobStatus: result.status,
           deniedActions: result.deniedActions ?? [],
           report: report === '' ? null : report,
+          // Same cwd rule as finish(): a writing turn whose cwd vanished failed,
+          // so a queued steer must not chain onto it.
+          ...currentWriter.verdictFacts(),
         });
 
         const shouldChain =
@@ -747,6 +791,7 @@ export class ForgeService {
       steeredFrom: parent.jobId,
     }));
     if (spec.checks !== undefined) writeJsonAtomic(jobFile(this.repo, nextJobId, FILES.checksSpec), spec.checks);
+    if (spec.env !== undefined && Object.keys(spec.env).length > 0) writeJsonAtomic(jobFile(this.repo, nextJobId, ENV_KEYS_FILE), Object.keys(spec.env));
     for (const w of syncWarnings) nextWriter.warn(w);
 
     // The child anchor exists; publish its id before the parent's terminal

@@ -46,3 +46,17 @@ test('toSummary leaves digest and changedFileCount absent when the job has none'
   assert.equal(toSummary(observed({ digest: 'editing' }), 'agent-smith').digest, undefined);
   assert.equal(toSummary(observed({ changed_files: 'not-a-list' }), 'agent-smith').changedFileCount, undefined);
 });
+
+test('toSummary carries finish evidence and liveness inputs, and failedEarly reaches nextAction', () => {
+  const raw = { failedEarly: true, toolErrors: 3, changedFilesUnknown: true, cwdMissingAtFinish: true,
+    job_status: 'error', error: 'Selected model is not supported in the selected location',
+    last_event_at: '2026-10-27T10:00:00.000Z', last_alive_at: '2026-10-27T10:00:30.000Z' };
+  const s = toSummary(observed(raw, 'failed'), 'agent-smith');
+  assert.deepEqual([s.failedEarly, s.toolErrors, s.changedFilesUnknown, s.cwdMissingAtFinish], [true, 3, true, true]);
+  assert.equal(s.lastEventAt, '2026-10-27T10:00:00.000Z');
+  assert.equal(s.lastAliveAt, '2026-10-27T10:00:30.000Z');
+  assert.match(s.nextAction ?? '', /^Route failed before any work/);
+  const plain = toSummary(observed({ job_status: 'error', error: 'Selected model is not supported in the selected location' }, 'failed'), 'agent-smith');
+  assert.doesNotMatch(plain.nextAction ?? '', /^Route failed before any work/);
+  assert.equal(plain.failedEarly, undefined);
+});

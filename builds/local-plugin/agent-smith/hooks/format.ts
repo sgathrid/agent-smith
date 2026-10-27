@@ -52,6 +52,7 @@ import type { RadarJob, RadarStatus } from '../types/index.d.ts';
 import { REASONS, checksReason, reasonFromText } from './reasons.ts';
 import { ELAPSED_WIDTH, clockCell, elapsed, elapsedCell } from './clock.ts';
 import { fitCell, oneLine, sanitizeText } from './text.ts';
+import { durationWords } from './notice.ts';
 
 // The clock and text helpers live in their own files; format.ts stays the one
 // vocabulary the band, pane and tests import from.
@@ -332,6 +333,28 @@ export function failedChecks(job: RadarJob): string {
 
 // ── the detail cell ─────────────────────────────────────────────────────────
 
+/** An open tool call shorter than this is ordinary activity, not worth a clock. */
+const IN_TOOL_SHOWN_MS = 60_000;
+
+/**
+ * What a live job's liveness says, as facts (stale.ts livenessOf):
+ * `in \`cargo test\` 16m` (a call open for a while), `no output 16m` (silent),
+ * `process gone 3m` (dead). '' when there is nothing to add. Never "stalled":
+ * a quiet worker is not a verdict, and the user should not be nudged to kill it.
+ */
+export function livenessWords(job: RadarJob): string {
+  const l = job.liveness;
+  if (!l) return job.status === 'attention' ? 'no output' : '';
+  // No known event time gives forMs 0: say nothing rather than a fabricated `0s`.
+  const d = l.forMs > 0 ? durationWords(l.forMs) : '';
+  switch (l.state) {
+    case 'dead': return `process gone${d ? ` ${d}` : ''}`;
+    case 'silent': return `no output${d ? ` ${d}` : ''}`;
+    case 'in-tool': return l.tool && l.forMs >= IN_TOOL_SHOWN_MS ? `in \`${oneLine(l.tool, 40)}\`${d ? ` ${d}` : ''}` : '';
+    default: return '';
+  }
+}
+
 /**
  * What the third cell says.
  *
@@ -352,8 +375,10 @@ export function jobDetail(job: RadarJob, options: { tools?: boolean } = {}): str
     return outcome(job);
   }
   const parts: string[] = [];
-  if (job.status === 'attention') parts.push('stalled');
-  const activity = oneLine(job.activity);
+  const quiet = livenessWords(job);
+  if (quiet !== '') parts.push(quiet);
+  // An open call already named by the liveness words needs no second phrase.
+  const activity = job.liveness?.state === 'in-tool' && quiet !== '' ? '' : oneLine(job.activity);
   if (activity !== '') parts.push(activity);
   // Tool count is a liveness signal ONLY while the job is live, so `isTerminal`
   // has already excluded it above. HAZARD A still applies on top: agy-staff
@@ -378,7 +403,7 @@ export function outcome(job: RadarJob): string {
     case 'running':
       return '';
     case 'attention':
-      return 'stalled';
+      return livenessWords(job) || 'no output';
     case 'succeeded':
       if (job.acceptance?.state === 'rejected' && !job.acceptance.pending && job.acceptance.checks.length > 0) return failedChecks(job);
       return job.warnings.length > 0 ? `done ${SEP} warnings` : 'done';
@@ -594,7 +619,7 @@ export const EMPTY_STATE = 'No workers yet';
  * The order the PANE draws its list:
  *
  *   0  running            live
- *   1  stalled            live, but gone quiet — directly under the working ones
+ *   1  attention          live, but gone quiet (no output or process gone) — directly under the working ones
  *   2  failed             terminal, and the one terminal state to act on
  *   3  everything else    succeeded, canceled, unknown — newest first
  *
