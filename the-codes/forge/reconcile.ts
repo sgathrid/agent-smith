@@ -1,10 +1,10 @@
 /** Service-owned recovery of abandoned jobs. Readers never write job records. */
 import { existsSync, readFileSync } from 'node:fs';
 import { REASONS } from '../surfaces/mod/hooks/reasons.ts';
-import { FILES, SCHEMA_VERSION, deriveOrphan, failureFields, deriveStatus, isPidAlive, jobFile, type ForgeManifest } from './format.ts';
+import { FILES, SCHEMA_VERSION, cwdFacts, deriveOrphan, failureFields, deriveStatus, isPidAlive, jobFile, type ForgeManifest } from './format.ts';
 import { writeAtomic, writeJsonAtomic } from './atomic.ts';
 import { readAcceptance, writeAcceptance } from './checks.ts';
-import { reportFor } from './writer.ts';
+import { reportFor, summaryTail } from './writer.ts';
 import type { JobResult } from '../providers/types.ts';
 
 /**
@@ -34,12 +34,16 @@ export function reconcileOrphan(repo: string, jobId: string, now = Date.now()): 
     const cancelSteerFile = jobFile(repo, jobId, FILES.cancelSteer);
     const canceled = existsSync(cancelFile) || existsSync(cancelSteerFile);
     const report = result === null ? null : reportFor(result);
+    // Without the writer, the cwd and the mode (plus the completed-edit count
+    // in progress.json) are all recovery can prove about a writing job.
+    const facts = cwdFacts(manifest.cwd, manifest.mode, editedOnDisk(repo, jobId));
     const verdict = result === null
       ? deriveOrphan(manifest, null, now, undefined, canceled)
       : deriveStatus({
         alreadyTerminal: canceled || result.status === 'cancelled' ? 'canceled' : null,
         ok: result.ok, jobStatus: result.status,
         deniedActions: result.deniedActions ?? [], report,
+        ...facts,
       });
     if (verdict === null) return false;
     if (readFileSync(file, 'utf8') !== before || isPidAlive(manifest.ownerPid)
@@ -66,8 +70,12 @@ export function reconcileOrphan(repo: string, jobId: string, now = Date.now()): 
         })),
         usage: result.usage === undefined ? null : Object.fromEntries(
           Object.entries(result.usage).filter((entry) => typeof entry[1] === 'number')),
-        latestSummary: result.response.trim().slice(0, 1_000) || manifest.latestSummary || null,
+        // The conclusion is at the end of the response (same rule as writer.finish).
+        latestSummary: summaryTail(result.response, 1_000) || manifest.latestSummary || null,
         summarySource: result.response.trim() || manifest.latestSummary ? 'worker' : null,
+        // Recovery never runs the finish-time git diff.
+        changedFilesUnknown: true,
+        ...(facts.cwdMissing ? { cwdMissingAtFinish: true } : {}),
       });
       settleAcceptance(repo, jobId, result.finishedAt);
       return true;
@@ -91,6 +99,20 @@ function settleAcceptance(repo: string, jobId: string, at: string): void {
       reason: 'server stopped; checks not run',
     });
   }
+}
+
+/**
+ * progress.json recorded at least one completed edit (evidence the job wrote).
+ * `editsCompleted` counts only edits that ended without error; the digest's
+ * `editedCount` counts at start and is read only for files written before the
+ * counter existed.
+ */
+function editedOnDisk(repo: string, jobId: string): boolean {
+  try {
+    const p = JSON.parse(readFileSync(jobFile(repo, jobId, FILES.progress), 'utf8')) as { editsCompleted?: unknown; digest?: { editedCount?: unknown } };
+    if (typeof p.editsCompleted === 'number') return p.editsCompleted > 0;
+    return typeof p.digest?.editedCount === 'number' && p.digest.editedCount > 0;
+  } catch { return false; }
 }
 
 /** Missing or partially written provider output cannot keep a dead job running. */

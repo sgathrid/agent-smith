@@ -11,7 +11,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
+import { REASONS } from '../../surfaces/mod/hooks/reasons.ts';
 import {
+  CWD_GONE_REASON,
   FILES,
   MIN_USEFUL_CHARS,
   SCHEMA_VERSION,
@@ -150,6 +152,21 @@ test('a delivered report with non-fatal tool denials succeeds with a warning', (
   assert.match(v.note ?? '', /^1 call denied/);
   // Same denial with no report is still a failure.
   assert.equal(deriveStatus({ ok: true, jobStatus: 'success', deniedActions: [{ action: 'tool' }], report: '' }).status, 'failed');
+});
+
+test('a nonfatal denial does not excuse a writing job whose cwd vanished', () => {
+  const base = { ok: true, jobStatus: 'success', report: 'Implemented change.', cwdMissing: true } as const;
+  const bash = [{ action: 'Bash', nonfatal: true }];
+  // Without and with the denial: both failed, same reason.
+  assert.deepEqual(deriveStatus({ ...base, writing: true }), { status: 'failed', suspicious: true, reason: CWD_GONE_REASON });
+  assert.deepEqual(deriveStatus({ ...base, writing: true, deniedActions: bash }), { status: 'failed', suspicious: true, reason: CWD_GONE_REASON });
+  // A read-only job keeps its nonfatal-denial success.
+  const ro = deriveStatus({ ...base, writing: false, deniedActions: bash });
+  assert.equal(ro.status, 'succeeded');
+  assert.match(ro.note ?? '', /^1 call denied: Bash/);
+  // Fatal denials and ok === false still outrank the cwd rule.
+  assert.match(deriveStatus({ ...base, writing: true, deniedActions: [{ action: 'Bash' }] }).reason ?? '', /denied/);
+  assert.equal(deriveStatus({ ...base, ok: false, jobStatus: 'timeout', writing: true }).reason, REASONS.timedOut);
 });
 
 test('the paranoid net: SUCCESS, no denials reported, empty response ⇒ FAILED', () => {

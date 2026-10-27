@@ -3,7 +3,7 @@ import { execFile } from 'node:child_process';
 import type { JobDetail, JobSummary } from '../../../forge/service.ts';
 import type { Acceptance } from '../../../forge/checks.ts';
 import type { PipelineRecord } from '../../../forge/execute.ts';
-import { STALL_GRACE_MS } from '../../mod/hooks/stale.ts';
+import { isStalled, livenessOf, type Liveness } from '../../mod/hooks/stale.ts';
 import { reasonFromText } from '../../mod/hooks/reasons.ts';
 
 export type ResponseFormat = 'concise' | 'detailed';
@@ -72,8 +72,31 @@ function failedReason(d: JobDetail): string | null {
   return stored ? stored : reasonFromText(d.error);
 }
 
-/** One compact row for list_jobs. `now` is injectable so stall detection is testable. */
+/**
+ * The job's liveness (mod/hooks/stale.ts livenessOf, shared with the band), or
+ * null when it is not running. One call site per view so every surface agrees.
+ */
+export function jobLiveness(j: JobSummary, now = Date.now()): Liveness | null {
+  return livenessOf({ status: j.status, updatedAt: j.updatedAt, lastEventAt: j.lastEventAt, lastAliveAt: j.lastAliveAt,
+    lastActivity: j.lastActivity, now });
+}
+/** `liveness` as Claude reads it: the state, how long since the last event, and the open tool call. */
+export function livenessView(l: Liveness | null) {
+  return l === null ? null : { state: l.state, silentForMs: l.silentForMs, ...(l.tool ? { tool: l.tool } : {}) };
+}
+/** Evidence the writer recorded at finish; each only when set. */
+function evidence(j: JobSummary) {
+  return {
+    toolErrors: j.toolErrors ? j.toolErrors : null,
+    failedEarly: j.failedEarly ? true : null,
+    changedFilesUnknown: j.changedFilesUnknown ? true : null,
+    cwdMissingAtFinish: j.cwdMissingAtFinish ? true : null,
+  };
+}
+
+/** One compact row for list_jobs. `now` is injectable so liveness is testable. */
 export function conciseRow(j: JobSummary, now = Date.now()) {
+  const live = jobLiveness(j, now);
   return compact({
     jobId: j.jobId, name: j.name, status: j.status, taskStatus: taskStatus(j.status), provider: j.provider, model: j.model, mode: j.mode,
     summary: j.latestSummary ? trimWords(j.latestSummary, CONCISE_SUMMARY_CHARS) : null,
@@ -81,8 +104,10 @@ export function conciseRow(j: JobSummary, now = Date.now()) {
     supersededBy: j.supersededBy ?? null, steeredFrom: j.steeredFrom ?? null,
     pendingSteers: j.pendingSteers ? j.pendingSteers : null,
     nextAction: j.nextAction, warningCount: j.warnings.length || null,
-    stalled: j.status === 'running' && j.updatedAt !== null && now - Date.parse(j.updatedAt) > STALL_GRACE_MS ? true : null,
+    liveness: livenessView(live),
+    stalled: isStalled(live) ? true : null,
     changedFileCount: typeof j.changedFileCount === 'number' ? j.changedFileCount : null,
+    ...evidence(j),
     acceptance: j.acceptance && (j.acceptance.state !== 'unchecked' || j.acceptance.pending || j.acceptance.checks.length > 0)
       ? checkVerdicts(j.acceptance) : null,
     digest: j.digest ? compact({
@@ -98,30 +123,33 @@ const names = (a: Partial<Acceptance>, ok: boolean) => { const n = (a.checks ?? 
 function checkVerdicts(a: AcceptanceView | null | undefined) {
   if (!a) return null;
   return compact({
-    state: a.state, pending: a.pending ? true : null, reason: a.reason ?? null,
+    state: a.state, pending: a.pending ? true : null, running: a.pending ? a.running ?? null : null, reason: a.reason ?? null,
     passed: names(a, true), failed: names(a, false),
   });
 }
 
 /** Concise single-job view: identity, verdicts, timing, one report. */
-export function conciseStatus(d: JobDetail, acceptance: AcceptanceView | null, extra: { waited?: boolean; stillRunning?: boolean } = {}) {
+export function conciseStatus(d: JobDetail, acceptance: AcceptanceView | null, extra: { waited?: boolean; stillRunning?: boolean } = {}, now = Date.now()) {
+  const live = jobLiveness(d, now);
   const report = d.report ?? '';
   const cut = report.length > CONCISE_REPORT_CHARS;
   const summary = d.latestSummary?.trim();
   const started = d.startedAt ? Date.parse(d.startedAt) : NaN;
-  const ended = d.finishedAt ? Date.parse(d.finishedAt) : Date.now();
+  const ended = d.finishedAt ? Date.parse(d.finishedAt) : now;
   const files = d.changedFiles ?? [];
   const warnings = d.warnings.length ? warningTexts(d.warnings, d.error) : [];
   return compact({
     jobId: d.jobId, name: d.name, provider: d.provider, model: d.model, mode: d.mode, status: d.status, taskStatus: taskStatus(d.status),
     resumable: Boolean(d.conversation),
-    stalled: d.status === 'running' && d.updatedAt !== null && Date.now() - Date.parse(d.updatedAt) > STALL_GRACE_MS,
+    liveness: livenessView(live),
+    stalled: isStalled(live),
     acceptance: checkVerdicts(acceptance),
     startedAt: d.startedAt, finishedAt: d.finishedAt, durationMs: Number.isNaN(started) ? null : Math.max(0, ended - started),
     toolCalls: d.toolCalls, lastActivity: lastActivity(d.lastActivity),
     supersededBy: d.supersededBy ?? null, steeredFrom: d.steeredFrom ?? null,
     pendingSteers: d.pendingSteers ? d.pendingSteers : null,
     changedFileCount: d.changedFiles ? files.length : null, changedFiles: files.length ? files.slice(0, CONCISE_FILES_CAP) : null,
+    ...evidence(d),
     changedFilesNote: files.length > CONCISE_FILES_CAP || d.changedFilesTruncated ? `First ${Math.min(files.length, CONCISE_FILES_CAP)} shown; ${DETAIL_HINT} or include_diff for all.` : null,
     staleReads: d.staleReads?.length ? d.staleReads : null,
     nextAction: d.nextAction, reason: failedReason(d), error: d.error ? trimWords(d.error, 500) : null,

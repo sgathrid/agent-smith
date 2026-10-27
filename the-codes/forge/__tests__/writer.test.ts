@@ -14,6 +14,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  rmSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -26,7 +27,7 @@ import { normalize } from '../../harness/normalize.ts';
 import { readAllObservedJobs } from '../../harness/registry.ts';
 import { writeAtomic, writeJsonAtomic, appendLine, createMarker } from '../atomic.ts';
 import { FILES, SCHEMA_VERSION, jobDir, jobFile, type ForgeManifest } from '../format.ts';
-import { JobWriter, appendBounded } from '../writer.ts';
+import { JobWriter, appendBounded, summaryTail } from '../writer.ts';
 import type { JobResult, ProviderEvent } from '../../providers/types.js';
 
 function repo(): string {
@@ -767,4 +768,232 @@ test('an unrelated error still shows beside a denial warning', async () => {
   const messages = observed.warnings.map((x) => x.message);
   assert.ok(messages.some((m) => /denied/.test(m)), messages.join(' | '));
   assert.ok(messages.includes('exited 3, no result'), messages.join(' | '));
+});
+
+/* ── honest state: cwd gone, tool errors, summary, early failure ───────────── */
+
+function startIn(r: string, cwd: string, mode: string, jobId = `${mode}-smith-abcd1234`): JobWriter {
+  const w = new JobWriter({ repo: r, jobId, mirror: false, flushMs: 0 });
+  w.start({
+    provider: 'opencode', mode, model: 'm', effort: null, cwd, prompt: 'do it', unrestricted: false,
+    conversation: null, timeoutMs: 1000, pipeline: null, stage: null, attempt: null,
+  });
+  return w;
+}
+
+function readManifest(r: string, jobId: string): ForgeManifest {
+  return JSON.parse(readFileSync(jobFile(r, jobId, FILES.job), 'utf8')) as ForgeManifest;
+}
+
+function readProgressWarnings(r: string, jobId: string): string[] {
+  return (JSON.parse(readFileSync(jobFile(r, jobId, FILES.progress), 'utf8')) as { warnings: string[] }).warnings;
+}
+
+test('an implement job whose cwd vanished before finish fails as unverifiable', async () => {
+  const r = repo();
+  const cwd = mkdtempSync(path.join(tmpdir(), 'agent-smith-cwd-'));
+  const w = startIn(r, cwd, 'implement');
+  rmSync(cwd, { recursive: true, force: true });
+  await w.prepareFinish();
+  const m = w.finish(result({ durationMs: 120_000 }), '# Report\n\nall done');
+  assert.equal(m.status, 'failed');
+  assert.equal(m.cwdMissingAtFinish, true);
+  assert.equal(m.changedFilesUnknown, true);
+  assert.equal(m.changedFiles, undefined, 'no silent "no edits"');
+  assert.equal(m.reason, 'working directory gone');
+  assert.match(m.error ?? '', /working directory gone; nothing could be verified/);
+  assert.equal(m.failedEarly, undefined, 'the provider succeeded; this is not a route failure');
+  assert.deepEqual(readManifest(r, w.jobId).cwdMissingAtFinish, true);
+});
+
+test('a cwd-gone implement job reads back as failed through the reader, mirror on', async () => {
+  const r = repo();
+  const cwd = mkdtempSync(path.join(tmpdir(), 'agent-smith-cwd-'));
+  const w = new JobWriter({ repo: r, jobId: 'implement-smith-cwdgone1', mirror: true, flushMs: 0 });
+  w.start({
+    provider: 'opencode', mode: 'implement', model: 'm', effort: null, cwd, prompt: 'do it', unrestricted: false,
+    conversation: null, timeoutMs: 1000, pipeline: null, stage: null, attempt: null,
+  });
+  rmSync(cwd, { recursive: true, force: true });
+  await w.prepareFinish();
+  w.finish(result({ durationMs: 120_000 }), '# Report\n\nall done');
+  const observed = normalize((await new AgentSmithReader().read(r, w.jobId))!);
+  assert.equal(observed.status, 'failed');
+  assert.ok(observed.warnings.some((x) => /working directory gone/.test(x.message)), observed.warnings.map((x) => x.message).join(' | '));
+});
+
+test('a review whose worktree was cleaned after it reported still succeeds, with a warning', async () => {
+  const r = repo();
+  const cwd = mkdtempSync(path.join(tmpdir(), 'agent-smith-cwd-'));
+  const w = startIn(r, cwd, 'review');
+  rmSync(cwd, { recursive: true, force: true });
+  await w.prepareFinish();
+  const m = w.finish(result(), '# Review\n\nfindings');
+  assert.equal(m.status, 'succeeded');
+  assert.equal(m.cwdMissingAtFinish, true);
+  assert.equal(m.changedFilesUnknown, true);
+  assert.ok(readProgressWarnings(r, w.jobId).some((x) => /was gone at finish/.test(x)));
+});
+
+test('a review whose events show edits is a writing job: cwd gone fails it', async () => {
+  const r = repo();
+  const cwd = mkdtempSync(path.join(tmpdir(), 'agent-smith-cwd-'));
+  const w = startIn(r, cwd, 'review');
+  w.onEvent({ kind: 'activity-start', at: now(), activity: { stepIndex: 0, tool: 'edit', input: JSON.stringify({ filePath: `${cwd}/a.ts` }) } });
+  w.onEvent({ kind: 'activity-end', at: now(), activity: { stepIndex: 0, tool: 'edit' }, status: 'done' });
+  rmSync(cwd, { recursive: true, force: true });
+  await w.prepareFinish();
+  assert.equal(w.finish(result({ durationMs: 60_000 }), '# Review\n\nfixed it').status, 'failed');
+  const p = JSON.parse(readFileSync(jobFile(r, w.jobId, FILES.progress), 'utf8')) as { editsCompleted?: number };
+  assert.equal(p.editsCompleted, 1);
+});
+
+test('a review whose edit attempt failed, was denied or never ended is not a writing job', async () => {
+  for (const [i, end] of (['error', 'denied', null] as const).entries()) {
+    const r = repo();
+    const cwd = mkdtempSync(path.join(tmpdir(), 'agent-smith-cwd-'));
+    const w = startIn(r, cwd, 'review', `review-smith-edit000${i}`);
+    w.onEvent({ kind: 'activity-start', at: now(), activity: { stepIndex: 0, tool: 'edit', input: JSON.stringify({ filePath: `${cwd}/a.ts` }) } });
+    if (end !== null) w.onEvent({ kind: 'activity-end', at: now(), activity: { stepIndex: 0, tool: 'edit' }, status: end });
+    assert.equal(w.verdictFacts().writing, false, String(end));
+    rmSync(cwd, { recursive: true, force: true });
+    await w.prepareFinish();
+    const m = w.finish(result({ durationMs: 60_000 }), '# Review\n\nfull findings');
+    assert.equal(m.status, 'succeeded', String(end));
+    assert.equal(m.cwdMissingAtFinish, true);
+    assert.ok(readProgressWarnings(r, w.jobId).some((x) => /was gone at finish/.test(x)), String(end));
+    const p = JSON.parse(readFileSync(jobFile(r, w.jobId, FILES.progress), 'utf8')) as { editsCompleted?: number };
+    assert.equal(p.editsCompleted, 0, 'written even when 0');
+  }
+});
+
+test('an implement job with a completed edit whose cwd vanished fails', async () => {
+  const r = repo();
+  const cwd = mkdtempSync(path.join(tmpdir(), 'agent-smith-cwd-'));
+  const w = startIn(r, cwd, 'implement');
+  w.onEvent({ kind: 'activity-start', at: now(), activity: { stepIndex: 0, tool: 'edit', input: JSON.stringify({ filePath: `${cwd}/a.ts` }) } });
+  w.onEvent({ kind: 'activity-end', at: now(), activity: { stepIndex: 0, tool: 'edit' }, status: 'done' });
+  rmSync(cwd, { recursive: true, force: true });
+  await w.prepareFinish();
+  const m = w.finish(result({ durationMs: 60_000 }), 'Implemented change.');
+  assert.equal(m.status, 'failed');
+  assert.equal(m.reason, 'working directory gone');
+});
+
+test('a cwd that is not a git repo marks changedFiles unknown rather than absent', async () => {
+  const r = repo();
+  const w = startIn(r, r, 'implement');
+  await w.prepareFinish();
+  const m = w.finish(result(), 'done');
+  assert.equal(m.status, 'succeeded');
+  assert.equal(m.changedFilesUnknown, true);
+  assert.equal(m.cwdMissingAtFinish, undefined);
+});
+
+test('tool errors are counted in progress and the manifest, and do not fail the job', () => {
+  const r = repo();
+  const w = startIn(r, r, 'review');
+  for (const step of [0, 1]) {
+    w.onEvent({ kind: 'activity-start', at: now(), activity: { stepIndex: step, tool: 'read', input: '{"path":"missing"}' } });
+    w.onEvent({ kind: 'activity-end', at: now(), activity: { stepIndex: step, tool: 'read' }, status: 'error' });
+  }
+  w.onEvent({ kind: 'activity-start', at: now(), activity: { stepIndex: 2, tool: 'read' } });
+  w.onEvent({ kind: 'activity-end', at: now(), activity: { stepIndex: 2, tool: 'read' }, status: 'done' });
+  const progress = JSON.parse(readFileSync(jobFile(r, w.jobId, FILES.progress), 'utf8')) as { toolErrors?: number };
+  assert.equal(progress.toolErrors, 2);
+  const m = w.finish(result({ durationMs: 60_000 }), '# Review\n\nfindings');
+  assert.equal(m.status, 'succeeded');
+  assert.equal(m.toolErrors, 2);
+  assert.equal(m.toolCalls, 3);
+});
+
+test('latestSummary shows only the current message while running, and the END of the final response', () => {
+  const r = repo();
+  const w = startIn(r, r, 'review');
+  w.onEvent({ kind: 'text', at: now(), stream: 'assistant', text: 'I am waiting for npm test to finish.' });
+  w.onEvent({ kind: 'activity-start', at: now(), activity: { stepIndex: 0, tool: 'bash', input: 'npm test' } });
+  w.onEvent({ kind: 'activity-end', at: now(), activity: { stepIndex: 0, tool: 'bash' }, status: 'done' });
+  w.onEvent({ kind: 'text', at: now(), stream: 'assistant', text: 'Tests pass. ' });
+  w.onEvent({ kind: 'text', at: now(), stream: 'assistant', text: 'Writing the report.' });
+  assert.equal(w.snapshot()?.latestSummary, 'Tests pass. Writing the report.');
+
+  const response = `# Findings\n\n${'Preamble sentence. '.repeat(80)}\n\n## Verdict\n\nShip it: no defects found.`;
+  const m = w.finish(result({ response }), response);
+  assert.ok((m.latestSummary ?? '').length <= 1_000);
+  assert.equal(m.latestSummary, '## Verdict\n\nShip it: no defects found.');
+  assert.equal(m.summarySource, 'worker');
+});
+
+test('summaryTail cuts at a paragraph, else a line, else raw', () => {
+  assert.equal(summaryTail('short', 10), 'short');
+  assert.equal(summaryTail('aaaa\n\nbbbb\n\ncc', 9), 'cc');
+  assert.equal(summaryTail('aaaa\nbbbb', 7), 'bbbb');
+  assert.equal(summaryTail('abcdefghij', 4), 'ghij');
+});
+
+test('a fast failure with no tool calls is marked failedEarly; a slow or busy one is not', () => {
+  const r = repo();
+  const early = startIn(r, r, 'review', 'review-smith-early001');
+  early.onEvent({ kind: 'started', at: now(), conversationId: 'ses_1' });
+  early.onEvent({ kind: 'notice', at: now(), level: 'error', message: 'Selected model is not supported in the selected location' });
+  const m = early.finish(result({ ok: false, status: 'error', error: 'Selected model is not supported in the selected location', durationMs: 3_000, response: '' }), '');
+  assert.equal(m.status, 'failed');
+  assert.equal(m.failedEarly, true);
+  assert.equal(m.error, 'Selected model is not supported in the selected location', 'provider text kept verbatim');
+
+  // Slow, but the first thing it ever said was an error: still a route failure.
+  const slow = startIn(r, r, 'review', 'review-smith-early002');
+  slow.onEvent({ kind: 'notice', at: now(), level: 'error', message: 'HTTP 402: Insufficient account funds' });
+  assert.equal(slow.finish(result({ ok: false, status: 'error', error: 'HTTP 402: Insufficient account funds', durationMs: 90_000, response: '' }), '').failedEarly, true);
+
+  const worked = startIn(r, r, 'review', 'review-smith-early003');
+  worked.onEvent({ kind: 'activity-start', at: now(), activity: { stepIndex: 0, tool: 'read' } });
+  assert.equal(worked.finish(result({ ok: false, status: 'error', error: 'exited 1', durationMs: 3_000, response: '' }), '').failedEarly, undefined);
+
+  const late = startIn(r, r, 'review', 'review-smith-early004');
+  late.onEvent({ kind: 'text', at: now(), stream: 'assistant', text: 'thinking about it' });
+  assert.equal(late.finish(result({ ok: false, status: 'error', error: 'exited 1', durationMs: 90_000, response: '' }), '').failedEarly, undefined);
+
+  const timedOut = startIn(r, r, 'review', 'review-smith-early005');
+  assert.equal(timedOut.finish(result({ ok: false, status: 'timeout', error: 'timed out', durationMs: 1_000, response: '' }), '').failedEarly, undefined);
+});
+
+/* ── liveness: the process owner's heartbeat ───────────────────────────────── */
+
+test('a heartbeat records lastAliveAt and workerPid without moving lastEventAt, updatedAt or the timeline', async () => {
+  const r = repo();
+  const w = start(r);
+  const t0 = new Date(Date.now() + 1_000).toISOString();
+  w.onEvent({ kind: 'activity-start', at: t0, activity: { stepIndex: 1, tool: 'run_command', input: 'cargo test' } });
+  const before = readManifest(r, w.jobId);
+  const view = readFileSync(jobFile(r, w.jobId, FILES.view), 'utf8');
+  const beat = new Date(Date.now() + 60_000).toISOString();
+  w.onEvent({ kind: 'heartbeat', at: beat, pid: 4242 });
+  const p = JSON.parse(readFileSync(jobFile(r, w.jobId, FILES.progress), 'utf8')) as Record<string, unknown>;
+  assert.equal(p['lastAliveAt'], beat);
+  assert.equal(p['workerPid'], 4242);
+  assert.equal(p['lastEventAt'], t0, 'a heartbeat is not activity');
+  assert.equal(readManifest(r, w.jobId).updatedAt, before.updatedAt);
+  assert.equal(readFileSync(jobFile(r, w.jobId, FILES.view), 'utf8'), view, 'not in the timeline');
+  // The next event keeps the heartbeat; the reader exposes it.
+  const t1 = new Date(Date.now() + 90_000).toISOString();
+  w.onEvent({ kind: 'activity-end', at: t1, activity: { stepIndex: 1, tool: 'run_command' }, status: 'done' });
+  const after = JSON.parse(readFileSync(jobFile(r, w.jobId, FILES.progress), 'utf8')) as Record<string, unknown>;
+  assert.equal(after['lastAliveAt'], beat);
+  assert.equal(after['lastEventAt'], t1);
+  const raw = await new AgentSmithReader().read(r, w.jobId);
+  assert.equal(raw?.payload['last_alive_at'], beat);
+  assert.equal(raw?.payload['workerPid'], 4242);
+});
+
+test('verdictFacts: the steer chain and finish read the same cwd rule', () => {
+  const r = repo();
+  const cwd = mkdtempSync(path.join(tmpdir(), 'agent-smith-cwd-'));
+  const impl = startIn(r, cwd, 'implement');
+  const review = startIn(r, cwd, 'review', 'review-smith-abcd1234');
+  assert.deepEqual(impl.verdictFacts(), { cwdMissing: false, writing: true });
+  assert.deepEqual(review.verdictFacts(), { cwdMissing: false, writing: false });
+  rmSync(cwd, { recursive: true, force: true });
+  assert.deepEqual(impl.verdictFacts(), { cwdMissing: true, writing: true });
+  assert.deepEqual(review.verdictFacts(), { cwdMissing: true, writing: false });
 });

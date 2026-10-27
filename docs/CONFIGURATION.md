@@ -67,6 +67,7 @@ Only variables the code reads.
 | `AGENT_SMITH_STATE_DIR` | `providers/ndjson.ts` | `~/.agent-smith/state` | Provider state root used only when a spawn gives no `stateDir`. The forge always passes the job directory, so MCP/CLI jobs do not use it. |
 | `AGENT_SMITH_CHANNEL` | `surfaces/channel/src/server.ts` | enabled | `0` disables the `claude/channel` capability, the startup baseline and the 5 s poll loop. The built plugin sets it to `0`; `dev.sh --channels` leaves it unset. |
 | `AGENT_SMITH_TASKS` | `surfaces/channel/src/mcp.ts` | unset (`0`) | `1` advertises `extensions['io.modelcontextprotocol/tasks']` on modern (`2026-07-28`) connections and registers `tasks/get`, `tasks/update` and `tasks/cancel`, returning `resultType: 'task'` for `spawn_job`/`resume_job` requests that advertise client Tasks support. |
+| `AGENT_SMITH_NO_CATALOG_WARMUP` | `surfaces/channel/src/server.ts` | unset | `1` skips the background model discovery the MCP server starts at launch. The first spawn that names a model then waits up to `CATALOG_COLD_WAIT_MS` for a cold catalog, unless a fresh `.agent-smith/catalogs/<provider>.json` already holds it. |
 | `AGENT_SMITH_CONFIRM_UNRESTRICTED` | `surfaces/channel/src/tools.ts` | enabled | `0` stops `spawn_job`/`resume_job` asking the user to confirm an explicit `unrestricted: true` for codex, claude or opencode, and drops the "not confirmed" ack warning. For automation with no one to answer. |
 | `AGY_WATCH_CWD` | `server.ts`, `monitor.ts`, `watch-hook.ts` | `process.cwd()` | Repo to operate on. MCP server order: positional argv path, then this, then cwd. `monitor.js`: `--cwd`, positional first arg, then this. Hook: last resort after payload `repo`/`dir`/`recordPath` and hook `cwd`. `dev.sh` sets it to `--repo`. |
 | `HOME`, `PATH` | `discovery.ts`, `ndjson.ts` | process env | `HOME` roots the default config dirs; `PATH` is probed for provider binaries (cached per binary+PATH). |
@@ -117,13 +118,17 @@ not the Kimi CLI.
 | `wait_ms` (status) | 1 to `MAX_WAIT_MS` = 60 000; polls every 500 ms | `tools.ts` |
 | `CATALOG_TTL_MS` | 300 000 (5 min), per provider, in-process | `providers/catalog.ts` |
 | Discovery timeout | 10 000 per provider (+1 000 guard) | `catalog.ts` |
-| `CATALOG_WAIT_MS` | 2 000, spawn-time catalog race | `service.ts` |
+| `CATALOG_COLD_WAIT_MS` / `CATALOG_WAIT_MS` | 5 000 until a catalog lookup has completed in the process (warm-up or a spawn), then 2 000; spawn-time catalog race. A supervisor's lookup is instant while the disk catalog cache (`CATALOG_TTL_MS` 5 min) is fresh | `service.ts`, `providers/catalog.ts` |
 | `PROGRESS_FLUSH_MS` | 250 | `format.ts` |
 | Cancel marker poll | 200 ms (job), 250 ms (pipeline) | `service.ts`, `execute.ts` |
 | Legacy orphan rule | 2 x default = 90 min silence (no `ownerPid`) | `format.ts` |
 | Stale cancel | marker older than 60 s with no live owner | `harness/agent-smith.ts` |
-| Stall (`attention`) | 15 min without evidence of progress | `mod/hooks/stale.ts` |
+| `HEARTBEAT_MS` | 30 000; the process owner records `progress.json` `lastAliveAt` while the worker CLI runs | `providers/ndjson.ts`, `mod/hooks/stale.ts` |
+| Liveness `silent` (`attention`) | `STALL_GRACE_MS` = 15 min without a provider event, unless a tool call is open (`in-tool`) | `mod/hooks/stale.ts` |
+| Liveness `dead` (`attention`) | `ALIVE_GRACE_MS` = 2 min without a heartbeat while running | `mod/hooks/stale.ts` |
+| `FAILED_EARLY_MS` | 20 000; a failure this soon with no tool call is `failedEarly` | `forge/format.ts` |
 | Check timeout | 60 000 default per check; output tail 2 000 chars | `forge/checks.ts` |
+| Acceptance budget | `budgetMs` = the checks' timeouts summed + 30 000, capped at 1 800 000; notices hold this long for a verdict (`ACCEPTANCE_HOLD_MS` = 300 000 without one) | `forge/checks.ts`, `mod/hooks/notice.ts` |
 | `REPORT_HEAD_CHARS` | detailed `status` returns the first 8 000 report chars (`reportTruncated`); concise returns 2 000 | `tools.ts`, `views.ts` |
 | `changedFiles` cap | 200 paths (`changedFilesTruncated`); git calls capped at 2 s | `format.ts`, `writer.ts` |
 | List | default 50, max 500 | `tools.ts` |
@@ -200,22 +205,24 @@ roleDefaults}`, `aliasConfigErrors?`, `modes[{name,description,readOnly,runsComm
 | `files` | array | relative paths of brief/spec files in `repo` (max 32 files, 4 MiB total; symlinks escaping `repo` are rejected); copied into `cwd` when `cwd !== repo`, excluded from `changedFiles` unless modified by the worker, and watched for `staleReads` |
 | `conversation` | string | native conversation handle to resume |
 | `checks` | array | items `{name, command}` required, `cwd`, `timeoutMs` (int >= 1; default 60 000), `blocking` (default true); run after success; also listed in the worker's brief as its definition of done |
+| `env` | object | extra worker environment variables, merged over the server's (e.g. a per-worktree `CARGO_TARGET_DIR`); keys `^[A-Za-z_][A-Za-z0-9_]*$`, string values without NUL. Keys that change how the worker binary is found, loaded or configured are refused, because the env applies before any worker sandbox exists: `PATH`, `HOME`, `SHELL`, `TMPDIR`, `NODE_OPTIONS`, `NODE_PATH`, `PYTHONPATH`, `PYTHONHOME`, `PYTHONSTARTUP`, the shell startup files `BASH_ENV`, `ENV`, `ZDOTDIR`, `SHELLOPTS`, `PROMPT_COMMAND`, `PERL5OPT`, `RUBYOPT`, and any key starting `LD_`, `DYLD_`, `XDG_`, `AGENT_SMITH_`, `AGY_`, `CLAUDE_`, `CODEX_`, `OPENCODE_` or `KIMI_` (case-insensitive; `ENV_DENYLIST` in `pipeline/types.ts`). Only the names are stored (`env-keys.json`); values are never written |
 
 Result (`SpawnAck`): `jobId, name, workerId, role, provider, status:'running', dir, repo,
 timeoutMs, unrestricted, note, sandbox, sandboxFlags, readOnlyRequested, readOnlyEnforced,
 modelRequested, modelResolved, modelSource` (`requested|harness-config|reported|unknown`),
 `preambleApplied`, `warnings?`; plus `taskHandle {taskId, status, pollIntervalMs}`, `notify {mode:'hook', note,
-fallback {when, use, monitorCommand?, monitorTimeoutMs?}}`, `aliasApplied?`/`aliasSource?`, and `checks` (names) when checks were
-given.
+fallback {when, use, monitorCommand?, monitorTimeoutMs?}}`, `aliasApplied?`/`aliasSource?`, `checks` (names) when checks were
+given, and `envKeys` (names, never values) when `env` was given.
 
 ### `resume_job` (structured)
 Params: `worker` (name or job id, required), `prompt` (required), `files` (optional relative paths in `repo`, merged with the previous job's existing watched files and re-synced into `cwd` only when changed in `repo` so worker worktree edits are preserved), `model`, `effort`,
 `timeoutMs`, `unrestricted` (default: the original job's; an explicit `true` is confirmed as for `spawn_job`), `cwd` (absolute existing directory;
-default: the original job's). An explicit cwd changes the process working directory while
+default: the original job's), `env` (as for `spawn_job`; not inherited, because values are not
+stored: when the original job had env and this call passes none, the ack warns). An explicit cwd changes the process working directory while
 retaining the prior conversation, which can still mention its previous workspace. kimi is
 stricter: it resumes a session only from the directory that created it, so keeping the default
 cwd is required there. Provider, mode, workerId,
-name, watched files and conversation come from the finished job; no `provider` or `checks` parameter.
+name, watched files, acceptance checks and conversation come from the finished job; no `provider` parameter, and `checks` replaces the inherited checks (`[]` clears them).
 Refuses running workers (pointing to `steer_job`), workers without a conversation handle, ambiguous names. Result:
 a `SpawnAck` plus `taskHandle` and `notify`.
 
@@ -232,17 +239,22 @@ Params: `provider` enum `agent-smith|agy-staff|all` (default `agent-smith`), `st
 or relative `30m`/`2h`/`1d`; jobs last active at or after it), `session` (only jobs spawned by this server
 process; empty after a restart), `response_format` `concise|detailed` (default `concise`). Running first,
 then newest. Every row (both formats) adds `taskStatus`. Concise rows: `jobId, name, status, provider, model, mode, summary` (trimmed to 200 chars on a
-word boundary), `toolCalls, lastActivity` (one line), `startedAt, finishedAt, nextAction?, warningCount?`.
+word boundary), `toolCalls, lastActivity` (one line), `startedAt, finishedAt, nextAction?, warningCount?`,
+`changedFileCount?`, `acceptance?`, `digest?`, and when they apply `liveness`, `stalled`,
+`toolErrors`, `failedEarly`, `changedFilesUnknown`, `cwdMissingAtFinish` (see `status`).
 Detailed rows (`JobSummary`): `jobId, name, workerId, role, latestSummary, summarySource,
 source, status, provider, mode, model, task, toolCalls, currentActivity, lastActivity, startedAt,
-updatedAt, finishedAt, warnings[], nextAction, unrestricted?`. `latestSummary` is untrusted.
+updatedAt, finishedAt, warnings[], nextAction, unrestricted?`, the same evidence fields,
+`lastEventAt`, `lastAliveAt`, and for running jobs `liveness` and `stalled`. `latestSummary` is
+untrusted: the worker's current message while it runs, the end of its final response once done.
 
 ### `status` (read-only, structured)
 Params: `jobId` (required), `wait_ms` 1-60000 (long-poll while running), `response_format`
 `concise|detailed` (default `concise`), `include_diff` (boolean).
 Both formats add `taskStatus`.
 Concise result: `jobId, name, provider, model, mode, status, taskStatus`, `acceptance {state, passed[], failed[]
-(check names), pending?, reason?}`, `startedAt, finishedAt, durationMs, toolCalls, lastActivity`,
+(check names), pending?, running?, reason?}` (`running`: the checks running now, while `pending`),
+`liveness` and `stalled` (running jobs), `startedAt, finishedAt, durationMs, toolCalls, lastActivity`,
 `changedFileCount`, `changedFiles` (first 20), `nextAction`, `error`, `warnings` (deduped strings), one `report`
 (first 2 000 chars; a trailing note says it was cut and `reportTruncated` is true), `summary` only when
 the report does not already contain it, and with `wait_ms`: `waited`, `stillRunning`. Null fields are omitted.
@@ -250,18 +262,38 @@ the report does not already contain it, and with `wait_ms`: `waited`, `stillRunn
 `gitBaseline.head`, run in the job's `cwd`, capped at 40 000 chars on a line boundary. `diffNote` says how
 to see the rest (`git diff <head> -- <file>`), lists new untracked files (which a diff cannot show), or
 explains why there is no diff (no git baseline, job still running, no changes; `diff` is then null or empty).
+
+Liveness, for running jobs (`mod/hooks/stale.ts` `livenessOf`, the rule the band uses too):
+`liveness {state, silentForMs, tool?}` with `state` one of `active` (an event in the last 15 min),
+`in-tool` (a tool call started and not ended; `tool` names it, e.g. `cargo test`), `silent` (no
+event for 15 min while the worker process runs, or, for a job from an older version without a
+heartbeat, no event for 15 min), `dead` (no heartbeat for 2 min though the job still reads
+running), and `waiting`, reserved and not reported yet. `silentForMs` is the time since the last
+event. `stalled` is a deprecated alias, kept for one release: true for `silent` or `dead`.
+
+Finish evidence, present only when true or nonzero: `toolErrors` (tool calls that ended in an
+error; a warning, not a verdict), `failedEarly` (failed before any tool call: model, region or
+account; `error` keeps the provider text and `nextAction` suggests another route),
+`changedFilesUnknown` (changed files could not be computed, so a missing `changedFiles` means
+unknown, not none), `cwdMissingAtFinish` (the cwd was gone at finish; a writing job then fails
+with reason `working directory gone`).
 The diff is evidence, not attribution: parallel workers in one tree see each other's edits, and edits that
 were already uncommitted at spawn in a changed file are included.
 Detailed result (the full record): `JobSummary` fields plus `report` (first 8 000 chars), `reportTruncated`, `error`,
 `exitCode`, `unrestricted`, `pipeline`, `stage`, `usage`, `conversation`, `effort`, `cwd`,
 `modelRequested/modelResolved/modelSource`, `preambleApplied`, `sandbox`, `sandboxFlags`,
 `readOnlyRequested/readOnlyEnforced`, `cancellable`, `gitBaseline?`, `changedFiles?`,
-`changedFilesTruncated?`, `acceptance {state:'accepted|rejected|unchecked', checks[],
-at?, pending?, reason?}`, and with `wait_ms`: `waited:true`, `stillRunning`.
+`changedFilesTruncated?`, the evidence fields above, `liveness?`, `stalled`, `acceptance
+{state:'accepted|rejected|unchecked', checks[], at?, pending?, budgetMs?, running?, startedAt?,
+reason?}`, and with `wait_ms`: `waited:true`, `stillRunning`.
 
 ### `cancel` (destructive, idempotent)
 Params: `jobId` (a job id or a pipeline run id; a run record is tried first). Job result:
-`{jobId, requested, signalled, note}`; `signalled` is true only when this process held the
+`{jobId, requested, signalled, note}`, plus `checksCanceled: true` when the worker had already
+exited and this process aborted its running acceptance checks (acceptance then reads `unchecked`,
+reason `checks canceled`). When a detached supervisor owns the checks, the result instead carries
+`checksCanceled: false` and a `checksNote` (the supervisor stops them within about 200 ms, same
+outcome); `signalled` is true only when this process held the
 live worker. Run result: `{requested, runId, note}`. A request does not prove the worker
 stopped; check `status`.
 
@@ -270,8 +302,8 @@ Params: `spec` object (unknown fields rejected): `name` (required), `task` (requ
 `stages`), `workDir` (default repo), `concurrency` 1-32, `unrestricted` (default: true for agy, always true for kimi, false for others),
 `stages[]`. Stage fields: `name`, `provider` (required unless `continues` is set); `agentName`, `workerId`,
 `conversation`, `continues` (see below), `model`, `effort`, `prompt`, `context` (as `spawn_job`), `title`, `role`, `dependsOn[]`, `workDir`,
-`resultPath`, `timeoutMs`, `routingPinned`, `checks[]` (same shape as `spawn_job`),
-`consumes[{stage,path,label?}]`. Without `stages`: implement -> review -> moderate from
+`resultPath`, `timeoutMs`, `routingPinned`, `checks[]` (same shape as `spawn_job`), `env` (as
+`spawn_job`; names only on disk), `consumes[{stage,path,label?}]`. Without `stages`: implement -> review -> moderate from
 installed providers. Result: `{runId, recordPath, stages[{name,provider,dependsOn}],
 started:true, task, notify}` (not structured).
 

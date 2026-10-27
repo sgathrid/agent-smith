@@ -203,3 +203,134 @@ test('runJobWatch follows supersededBy without emitting an intermediate parent n
   assert.match(lines[0]!, /W-b/);
   assert.match(lines[0]!, /status b/);
 });
+
+test('a watcher holds a job whose checks are inside their budget, then says exited with checks running, then the verdict', async () => {
+  clearReadCache();
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'pending-notice-'));
+  const dir = path.join(repo, '.agent-smith', 'jobs', 'j-1');
+  fs.mkdirSync(dir, { recursive: true });
+  const finished = Date.now() - 10 * 60_000;
+  fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({
+    schema: 1, jobId: 'j-1', status: 'succeeded', provider: 'codex', name: 'Ada',
+    startedAt: new Date(finished - 60_000).toISOString(), finishedAt: new Date(finished).toISOString(),
+  }));
+  const acceptance = (extra: object) => fs.writeFileSync(path.join(dir, 'acceptance.json'), JSON.stringify(extra));
+  const { readJob } = await import('../watch-source.ts');
+  // 10 minutes after exit: past the flat 5-minute default, inside a 20-minute budget.
+  acceptance({ state: 'unchecked', checks: [], pending: true, budgetMs: 20 * 60_000, running: 'ui-suite' });
+  const held = await readJob(repo, 'j-1', Date.now());
+  assert.equal(held?.status, 'running');
+  // No budget on the placeholder: the 5-minute default has passed.
+  acceptance({ state: 'unchecked', checks: [], pending: true, running: 'ui-suite' });
+  const late = await readJob(repo, 'j-1', Date.now());
+  assert.equal(late?.status, 'succeeded');
+  assert.equal(late?.checksRunning, 'ui-suite');
+  const text = headline(toNotice(late!, 'finished', Date.now()));
+  assert.match(text, /exited · checks running: ui-suite/);
+  assert.doesNotMatch(text, /done|✓/);
+  const { dedupeKey } = await import('../policy.ts');
+  acceptance({ state: 'accepted', checks: [{ name: 'ui-suite', ok: true }] });
+  const verdict = await readJob(repo, 'j-1', Date.now());
+  assert.notEqual(dedupeKey(late!), dedupeKey(verdict!), 'the verdict is announced again');
+  assert.match(headline(toNotice(verdict!, 'finished', Date.now())), /✓ .*done · checks 1\/1/);
+  fs.rmSync(repo, { recursive: true, force: true });
+});
+
+test('announceOnce: the exited-with-checks notice is the only one; the default still sends the verdict as a second notice', async () => {
+  const script = {
+    a: [
+      job('a', 'running'),
+      job('a', 'succeeded', { checksRunning: 'ui-suite' }),
+      job('a', 'succeeded', { checks: { passed: 1, total: 1 } as never }),
+    ],
+  };
+  const once = (() => {
+    const lines: string[] = []; const tick = { n: 0 }; let clock = T0;
+    const p = runJobWatch({ cwd: '/repo', jobIds: ['a'], intervalMs: 50, now: () => (clock += 1000), announceOnce: true,
+      readJob: async () => script.a[Math.min(tick.n++, 2)]!, emit: (l) => { lines.push(l); } });
+    return { p, lines };
+  })();
+  assert.equal(await once.p, 'done');
+  assert.equal(once.lines.length, 1);
+  assert.match(once.lines[0]!, /exited · checks running: ui-suite/);
+  const twice = watch(script, { jobIds: ['a'] });
+  assert.equal(await twice.p, 'done');
+  assert.equal(twice.lines.length, 2, 'the mod-style default keeps watching for the verdict');
+});
+
+function hookRepo(budgetMs: number | undefined, extra: object, finishedAgoMs: number) {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'hook-budget-'));
+  const dir = path.join(repo, '.agent-smith', 'jobs', 'j-1');
+  fs.mkdirSync(dir, { recursive: true });
+  const finished = Date.now() - finishedAgoMs;
+  fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({
+    schema: 1, jobId: 'j-1', status: 'succeeded', provider: 'codex', name: 'Ada',
+    startedAt: new Date(finished - 60_000).toISOString(), finishedAt: new Date(finished).toISOString(),
+  }));
+  fs.writeFileSync(path.join(dir, 'acceptance.json'), JSON.stringify({ state: 'unchecked', checks: [], pending: true, ...(budgetMs === undefined ? {} : { budgetMs }), ...extra }));
+  return { repo, dir };
+}
+const launchInput = (repo: string, timeoutMs = 60_000) =>
+  JSON.stringify({ tool_name: 'mcp__x__spawn_job', tool_response: { jobId: 'j-1', repo, timeoutMs } });
+
+test('announceOnce: a pipeline stage that exited with checks running contributes no "checks running" line; its verdict comes with the run', async () => {
+  const stage = [job('s1', 'succeeded', { checksRunning: 'slow' }), job('s1', 'succeeded', { checksRunning: 'slow' }), job('s1', 'failed', { outcome: 'checks failed: slow' })];
+  const run = [job('r1', 'running', { role: 'pipeline' }), job('r1', 'running', { role: 'pipeline' }), job('r1', 'failed', { role: 'pipeline', outcome: 'Pipeline failed; s1.' })];
+  const go = (announceOnce: boolean) => {
+    const lines: string[] = []; const tick: Record<string, number> = {}; let clock = T0;
+    const seq = (id: string) => { const s = id === 's1' ? stage : run; const i = Math.min(tick[id] ?? 0, s.length - 1); tick[id] = (tick[id] ?? 0) + 1; return s[i]!; };
+    return runJobWatch({ cwd: '/repo', runIds: ['r1'], intervalMs: 20, now: () => (clock += 1000), announceOnce,
+      readJob: async (_c, id) => seq(id), readRun: async (_c, id) => ({ job: seq(id), stageJobIds: ['s1'] }), emit: (l) => { lines.push(l); } }).then((r) => ({ r, lines }));
+  };
+  const twice = await go(false);
+  assert.equal(twice.r, 'done');
+  assert.ok(twice.lines.some((l) => /checks running: slow/.test(l)), 'default behaviour still reports the stage exited with checks running');
+  const once = await go(true);
+  assert.equal(once.r, 'done');
+  assert.ok(once.lines.every((l) => !/checks running/.test(l)), `no "checks running" line: ${once.lines.join(' | ')}`);
+  assert.ok(once.lines.some((l) => /checks failed: slow|Pipeline failed/.test(l)), 'the verdict is still announced');
+});
+
+test('hook deadline = job timeout + acceptance budget + grace, capped below the hook timeout', () => {
+  const { repo } = hookRepo(10 * 60_000, { running: 'slow' }, 0);
+  try {
+    const t = parseHookInput(JSON.parse(launchInput(repo)));
+    assert.equal(t?.timeoutMs, 60_000 + 10 * 60_000 + 60_000);
+    const huge = hookRepo(30 * 60_000, {}, 0);
+    const c = parseHookInput(JSON.parse(launchInput(huge.repo, 6 * 60 * 60_000)));
+    assert.equal(c?.timeoutMs, 21_900_000 - 60_000, 'never outlives the hook');
+    fs.rmSync(huge.repo, { recursive: true, force: true });
+    // No checks, no placeholder budget: unchanged.
+    const bare = hookRepo(undefined, {}, 0);
+    assert.equal(parseHookInput(JSON.parse(launchInput(bare.repo)))?.timeoutMs, 120_000);
+    fs.rmSync(bare.repo, { recursive: true, force: true });
+  } finally { fs.rmSync(repo, { recursive: true, force: true }); }
+});
+
+test('hook with checks: one write at the verdict, never "checks running" and the verdict together', async () => {
+  clearReadCache();
+  const { repo, dir } = hookRepo(20 * 60_000, { running: 'slow' }, 5_000);
+  try {
+    let out = '';
+    // The verdict lands while the hook is still holding the job.
+    setTimeout(() => fs.writeFileSync(path.join(dir, 'acceptance.json'), JSON.stringify({ state: 'accepted', checks: [{ name: 'slow', ok: true, blocking: true }] })), 300);
+    const code = await runHook(launchInput(repo), (s) => { out += s; }, { intervalMs: 50 });
+    assert.equal(code, 2);
+    assert.match(out, /done · checks 1\/1/);
+    assert.doesNotMatch(out, /checks running/);
+    assert.equal(out.split('Agent Smith').length - 1, 1, 'a single notice');
+  } finally { fs.rmSync(repo, { recursive: true, force: true }); }
+});
+
+test('hook with checks that outlive their budget: one "exited · checks running" notice, then it ends', async () => {
+  clearReadCache();
+  // Exited 10 min ago, 1-min budget: expired.
+  const { repo } = hookRepo(60_000, { running: 'slow' }, 10 * 60_000);
+  try {
+    let out = '';
+    const code = await runHook(launchInput(repo), (s) => { out += s; }, { intervalMs: 50 });
+    assert.equal(code, 2);
+    assert.match(out, /exited · checks running: slow/);
+    assert.equal(out.split('Agent Smith').length - 1, 1);
+  } finally { fs.rmSync(repo, { recursive: true, force: true }); }
+});

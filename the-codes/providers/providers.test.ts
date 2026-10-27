@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { once } from 'node:events';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -6,7 +7,7 @@ import test from 'node:test';
 import { buildArgv as buildClaudeArgv, buildResult as buildClaudeResult, createClaudeTranslator } from './claude.ts';
 import { buildArgv as buildCodexArgv, codexStderrLevel, createCodexTranslator } from './codex.ts';
 import { buildArgv as buildAgyArgv } from './agy.ts';
-import { buildArgv as buildOpencodeArgv, createOpencodeTranslator } from './opencode.ts';
+import { buildArgv as buildOpencodeArgv, buildResult as buildOpencodeResult, createOpencodeTranslator } from './opencode.ts';
 import { buildArgv as buildKimiArgv, buildResult as buildKimiResult, createKimiTranslator } from './kimi.ts';
 import { spawnWorker } from './ndjson.ts';
 import type { ProviderEvent, SpawnSpec } from './types.ts';
@@ -551,6 +552,62 @@ test('opencode: a tool_use part reports its state input and output on one step',
   assert.equal(end.status, 'done');
 });
 
+test('opencode: a failed tool call is a warning; a delivered report still succeeds', () => {
+  // Shape of review-smith-a4b33fdc's step 41: a `read` of a missing path,
+  // followed by the worker's complete report. That job was marked failed.
+  const tx = createOpencodeTranslator(10_000);
+  const events = [
+    ...tx.onEvent({
+      type: 'tool_use',
+      sessionID: 'ses_toolerr',
+      part: {
+        id: 'call_2264873',
+        type: 'tool',
+        tool: 'read',
+        state: { status: 'error', input: { path: '/repo/src/manager.rs' }, error: 'File not found: /repo/src/manager.rs' },
+      },
+    }),
+    ...tx.onEvent({ type: 'text', sessionID: 'ses_toolerr', part: { type: 'text', text: '### Defects Found\n\n1. A real finding.' } }),
+  ];
+  const end = events.find((e) => e.kind === 'activity-end');
+  assert.ok(end?.kind === 'activity-end');
+  assert.equal(end.status, 'error', 'the activity itself still shows the failure');
+  const warn = events.find((e) => e.kind === 'notice');
+  assert.ok(warn?.kind === 'notice');
+  assert.equal(warn.level, 'warn');
+  assert.match(warn.message, /tool read failed.*File not found/);
+  assert.equal(tx.sawError, false);
+  assert.equal(tx.toolErrors, 1);
+
+  const exit = { code: 0, signal: null, killReason: undefined, stderr: '' };
+  const ok = buildOpencodeResult({ jobId: 'j', startedAtMs: Date.now(), stateDir: '/tmp/x', exit, tx });
+  assert.equal(ok.ok, true);
+  assert.equal(ok.status, 'success');
+  assert.equal(ok.error, undefined);
+
+  const failed = buildOpencodeResult({ jobId: 'j', startedAtMs: Date.now(), stateDir: '/tmp/x', exit: { ...exit, code: 1 }, tx });
+  assert.equal(failed.ok, false);
+  assert.match(failed.error ?? '', /exited 1 · 1 tool error\(s\)/);
+
+  const flaky = createOpencodeTranslator(10_000);
+  const notices = [];
+  for (let i = 0; i < 7; i += 1) {
+    notices.push(...flaky.onEvent({ type: 'tool_use', part: { id: `c${i}`, type: 'tool', tool: 'bash', state: { status: 'error', error: 'boom' } } })
+      .filter((e) => e.kind === 'notice'));
+  }
+  assert.equal(flaky.toolErrors, 7);
+  assert.equal(notices.length, 5, 'per-call warnings are capped; the count carries the rest');
+});
+
+test('opencode: a real error event still fails the job, report or not', () => {
+  const tx = createOpencodeTranslator(10_000);
+  tx.onEvent({ type: 'text', part: { type: 'text', text: 'partial' } });
+  tx.onEvent({ type: 'error', error: { type: 'provider.quota', data: { statusCode: 402, message: 'Insufficient account funds' } } });
+  const r = buildOpencodeResult({ jobId: 'j', startedAtMs: Date.now(), stateDir: '/tmp/x', exit: { code: 0, signal: null, killReason: undefined, stderr: '' }, tx });
+  assert.equal(r.ok, false);
+  assert.match(r.error ?? '', /HTTP 402: Insufficient account funds/);
+});
+
 test('opencode: one tool call keeps one step from running to completed', () => {
   const tx = createOpencodeTranslator(10_000);
   const running = tx.onEvent({
@@ -616,4 +673,60 @@ test('opencode: step_finish counters accumulate across steps without per-step no
     cacheReadTokens: 100,
     cacheWriteTokens: 20,
   });
+});
+
+test('spawnWorker heartbeats while the child runs (pid included), stops at exit, and writes nothing to events.jsonl', async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'agent-smith-heartbeat-'));
+  const beats: { at: string; pid: number | undefined }[] = [];
+  const worker = await spawnWorker({
+    provider: 'fake', binary: process.execPath, argv: ['-e', 'setTimeout(()=>{}, 400)'],
+    cwd: dir, timeoutMs: 10_000, stateDir: dir, jobId: 'heartbeat', mode: 'test',
+    heartbeatMs: 50, onHeartbeat: (at, pid) => beats.push({ at, pid }),
+    onStdoutLine() {}, onStderr() {},
+  });
+  await worker.exited;
+  worker.closeLog();
+  const atExit = beats.length;
+  assert.ok(atExit >= 3, `expected several beats over ~400 ms, got ${atExit}`);
+  assert.ok(beats.every((b) => b.pid === worker.child.pid && Number.isFinite(Date.parse(b.at))));
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(beats.length, atExit, 'no beats after exit');
+  assert.equal(existsSync(path.join(dir, 'events.jsonl')), false, 'heartbeats are liveness, not events');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('spawnWorker stops heartbeats when the worker exits, even while a descendant holds stdout open', async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'agent-smith-heartbeat-orphan-'));
+  const beats: number[] = [];
+  // The worker leaves a detached, unreferenced grandchild that inherits its
+  // stdout, then exits: `close` waits for the grandchild, `exit` does not.
+  const script = [
+    "const { spawn } = require('node:child_process');",
+    "spawn(process.execPath, ['-e', 'setTimeout(()=>{}, 1500)'], { detached: true, stdio: ['ignore', 'inherit', 'ignore'] }).unref();",
+    'setTimeout(() => process.exit(0), 150);',
+  ].join('\n');
+  const worker = await spawnWorker({
+    provider: 'fake', binary: process.execPath, argv: ['-e', script],
+    cwd: dir, timeoutMs: 10_000, stateDir: dir, jobId: 'heartbeat-orphan', mode: 'test',
+    heartbeatMs: 30, onHeartbeat: () => beats.push(Date.now()),
+    onStdoutLine() {}, onStderr() {},
+  });
+  let closed = false;
+  void worker.exited.then(() => { closed = true; });
+  await once(worker.child, 'exit');
+  const atExit = beats.length;
+  assert.ok(atExit >= 1, 'beats while the worker ran');
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(closed, false, 'stdout is still held open by the grandchild');
+  assert.equal(beats.length, atExit, 'no heartbeat after the worker exited');
+  await worker.exited;
+  worker.closeLog();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('every adapter routes heartbeats to the bus, never to the event log', () => {
+  for (const name of ['agy', 'claude', 'codex', 'kimi', 'opencode']) {
+    const src = readFileSync(new URL(`./${name}.ts`, import.meta.url), 'utf8');
+    assert.match(src, /onHeartbeat: \(at, pid\) => bus\.emit\(\{ kind: 'heartbeat'/, name);
+  }
 });

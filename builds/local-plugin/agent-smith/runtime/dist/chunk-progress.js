@@ -496,6 +496,22 @@ function looksEmpty$1(text) {
         return true;
     return text.trim().length < MIN_USEFUL_CHARS;
 }
+/** deriveStatus's reason when a writing job's cwd vanished before it could be checked. */
+const CWD_GONE_REASON = 'working directory gone; nothing could be verified';
+/** A failure this soon after start, with no tool call, is a route failure, not the work. */
+const FAILED_EARLY_MS = 20_000;
+/** Writing modes: a vanished cwd makes their success unverifiable. */
+function isWritingMode(mode) {
+    return mode === 'implement' || mode === 'verify';
+}
+/**
+ * deriveStatus's cwd inputs, from what the caller can prove: whether `cwd`
+ * still exists, and whether the job was meant to write (its mode) or is known
+ * to have edited. An empty or absent cwd is never "missing" (nothing to check).
+ */
+function cwdFacts(cwd, mode, edited = false) {
+    return { cwdMissing: typeof cwd === 'string' && cwd !== '' && !existsSync(cwd), writing: isWritingMode(mode) || edited };
+}
 /**
  * THE ONLY PLACE A JOB IS DECLARED FINISHED, AND IT IS PURE.
  *
@@ -508,9 +524,12 @@ function looksEmpty$1(text) {
  *      not what happened to the task.
  *   2. deniedActions non-empty    ⇒ failed, suspicious. agy exited 0, said
  *      "SUCCESS", returned "" and did nothing. THE TRAP. Unless every denial
- *      is nonfatal and a report was delivered: then succeeded, with a note.
+ *      is nonfatal and a report was delivered: then succeeded, with a note —
+ *      but only after rule 3b has passed.
  *   3. ok === false               ⇒ failed. The adapter already weighed exit
  *      code against the result event; we do not second-guess it.
+ *   3b. cwd gone, writing job     ⇒ failed, suspicious. Its edits and checks
+ *      cannot be verified; a nonfatal denial does not excuse it.
  *   4. ok === true, report empty  ⇒ failed, suspicious. The net for every
  *      provider that does not report denials. "You asked me nothing and I said
  *      nothing" is only a success when the job also made no tool calls — which
@@ -560,6 +579,8 @@ function failureFields(verdict, result, maxError = 1_200) {
         reason = REASONS.timedOut;
     else if (verdict.reason === REASONS.noOutput)
         reason = REASONS.noOutput;
+    else if (verdict.reason === CWD_GONE_REASON && adapterError === '')
+        reason = 'working directory gone';
     else
         reason = reasonFromText(adapterError !== '' ? adapterError : verdict.reason);
     return { error, reason };
@@ -580,15 +601,8 @@ function deriveStatus(d) {
     // Denials the adapter marked non-fatal (a delivered report plus denied calls,
     // e.g. a reviewer that wanted a shell) do not fail the job, whatever the
     // provider. `action: 'tool'` is the pre-flag claude encoding, still on disk.
-    if (denials.length > 0 && d.ok === true && !looksEmpty$1(d.report) && denials.every((x) => x.nonfatal === true || x.action === 'tool')) {
-        return {
-            status: 'succeeded',
-            suspicious: false,
-            reason: null,
-            note: `${denials.length} ${denials.length === 1 ? 'call' : 'calls'} denied` + (deniedNames(denials) === '' ? '' : `: ${deniedNames(denials)}`),
-        };
-    }
-    if (denials.length > 0) {
+    const nonfatalOnly = denials.length > 0 && d.ok === true && !looksEmpty$1(d.report) && denials.every((x) => x.nonfatal === true || x.action === 'tool');
+    if (denials.length > 0 && !nonfatalOnly) {
         return { status: 'failed', suspicious: true, reason: deniedReason(denialNames(denials)) };
     }
     if (d.ok === false) {
@@ -596,6 +610,22 @@ function deriveStatus(d) {
             status: 'failed',
             suspicious: false,
             reason: d.jobStatus === 'timeout' ? REASONS.timedOut : REASONS.workerError,
+        };
+    }
+    // A writing job whose cwd vanished cannot show its edits or pass a check:
+    // its "done" is a claim with nothing behind it. A read-only job's report is
+    // the deliverable, so it stands (the writer records a warning instead).
+    // Checked before the nonfatal-denial success, which would otherwise let a
+    // denied call excuse a writing job from it.
+    if (d.cwdMissing === true && d.writing === true) {
+        return { status: 'failed', suspicious: true, reason: CWD_GONE_REASON };
+    }
+    if (nonfatalOnly) {
+        return {
+            status: 'succeeded',
+            suspicious: false,
+            reason: null,
+            note: `${denials.length} ${denials.length === 1 ? 'call' : 'calls'} denied` + (deniedNames(denials) === '' ? '' : `: ${deniedNames(denials)}`),
         };
     }
     if (looksEmpty$1(d.report)) {
@@ -699,6 +729,11 @@ function baseNextAction(i) {
         return 'Bad flag or model: run agent-smith doctor, then fix the request.';
     if (START_RE.test(err))
         return "Couldn't start: run agent-smith doctor.";
+    // After the specific diagnoses, before the generic ones: resuming a route
+    // that failed before any work just fails again.
+    if (i.failedEarly === true && i.jobStatus !== 'timeout') {
+        return 'Route failed before any work (model/account): pick another model from list_capabilities or fix the account.';
+    }
     if (i.jobStatus === 'timeout' || TIMEOUT_RE.test(err)) {
         return 'Raise timeoutMs or split the task; resume_job keeps context.';
     }
@@ -777,6 +812,7 @@ const SMITH_PAYLOAD = {
     canceled: 'canceled',
     cancelAt: 'cancel_at',
     lastEventAt: 'last_event_at',
+    lastAliveAt: 'last_alive_at',
     recentActivities: 'recent_activities',
     lastActivity: 'last_activity',
     latestText: 'latest_text',
@@ -930,6 +966,15 @@ class AgentSmithReader {
             [SMITH_PAYLOAD.canceled]: canceled,
             [SMITH_PAYLOAD.cancelAt]: cancelAt,
             [SMITH_PAYLOAD.lastEventAt]: progress?.lastEventAt ?? manifest?.updatedAt ?? null,
+            // The process owner's heartbeat (providers/ndjson.ts). Absent for jobs
+            // written by older builds: liveness then falls back to event silence.
+            [SMITH_PAYLOAD.lastAliveAt]: progress?.lastAliveAt ?? null,
+            ...(typeof progress?.workerPid === 'number' ? { workerPid: progress.workerPid } : {}),
+            ...(typeof (manifest?.toolErrors ?? progress?.toolErrors) === 'number'
+                ? { toolErrors: manifest?.toolErrors ?? progress?.toolErrors } : {}),
+            ...(manifest?.failedEarly === true ? { failedEarly: true } : {}),
+            ...(manifest?.changedFilesUnknown === true ? { changedFilesUnknown: true } : {}),
+            ...(manifest?.cwdMissingAtFinish === true ? { cwdMissingAtFinish: true } : {}),
             [SMITH_PAYLOAD.recentActivities]: progress?.recentActivities ?? [],
             [SMITH_PAYLOAD.lastActivity]: progress?.lastActivity ?? null,
             [SMITH_PAYLOAD.latestText]: progress?.latestText ?? null,
@@ -2519,7 +2564,15 @@ async function runChecks(checks, options = {}) {
             const check = checks[index];
             if (check === undefined)
                 return;
+            try {
+                options.onCheck?.({ check, state: 'start' });
+            }
+            catch { /* a progress hook must not fail a check */ }
             const verdict = await runCheck(check, options);
+            try {
+                options.onCheck?.({ check, state: 'end' });
+            }
+            catch { /* as above */ }
             verdicts[index] = verdict;
             if (options.failFast && !verdict.passed && verdict.blocking)
                 stop = true;
@@ -2554,6 +2607,17 @@ async function runChecks(checks, options = {}) {
  */
 const ACCEPTANCE_FILE = 'acceptance.json';
 const DEFAULT_CHECK_TIMEOUT_MS = 60_000;
+const ACCEPTANCE_GRACE_MS = 30_000;
+const ACCEPTANCE_BUDGET_CAP_MS = 30 * 60_000;
+/** Upper bound on how long checks can run: their timeouts summed (they may overlap), plus a grace, capped. */
+function acceptanceBudgetMs(checks) {
+    const total = checks.reduce((sum, c) => sum + (c.timeoutMs ?? DEFAULT_CHECK_TIMEOUT_MS), 0);
+    return Math.min(ACCEPTANCE_BUDGET_CAP_MS, total + ACCEPTANCE_GRACE_MS);
+}
+/** The placeholder written at spawn: checks will run once the job ends. */
+function pendingAcceptance(checks) {
+    return { state: 'unchecked', checks: [], pending: true, ...(checks?.length ? { budgetMs: acceptanceBudgetMs(checks) } : {}) };
+}
 /** Normalize a runner report into the persisted acceptance shape. */
 function acceptanceChecksFromReport(report, configuredChecks) {
     return report.verdicts.map((v, index) => {
@@ -2610,7 +2674,19 @@ async function evaluateAcceptance(input) {
         return { state: 'unchecked', checks: [], at };
     if (!input.succeeded)
         return { state: 'rejected', checks: [], at, reason: 'job did not succeed; checks not run' };
-    const rawReport = await runChecks(toVerifyChecks(input.checks, input.baseDir), { signal: input.signal });
+    const running = new Set();
+    const rawReport = await runChecks(toVerifyChecks(input.checks, input.baseDir), {
+        signal: input.signal,
+        ...(input.onProgress === undefined ? {} : {
+            onCheck: ({ check, state }) => {
+                if (state === 'start')
+                    running.add(check.name);
+                else
+                    running.delete(check.name);
+                input.onProgress([...running]);
+            },
+        }),
+    });
     const report = normalizeAcceptanceReport(rawReport, input.checks);
     const checks = acceptanceChecksFromReport(report, input.checks);
     return {
@@ -2636,4 +2712,544 @@ function readAcceptance(repo, jobId) {
     catch {
         return { state: 'unchecked' };
     }
-}export{AgentSmithReader as A,isForgeJobId as B,ClaudeCodeReader as C,DEFAULT_TIMEOUT_MS as D,SMITH_PAYLOAD as E,FILES as F,nextActionFor as G,checksReason as H,readJsonSafe as I,readdirSafe as J,existsSafe as K,PROGRESS_FLUSH_MS as P,REASONS as R,SCHEMA_VERSION as S,readAcceptance as a,exitReason as b,attributeChanged as c,diffChangedFiles as d,evaluateAcceptance as e,deriveStatus as f,failureFields as g,toVerifyChecks as h,isForgeStatePath as i,jobFile as j,runChecks as k,looksEmpty$1 as l,acceptanceChecksFromReport as m,normalizeAcceptanceReport as n,acceptanceState as o,AgyStaffReader as p,normalize as q,reasonFromText as r,shouldFlush as s,taskTitle as t,isPidAlive as u,deriveOrphan as v,writeAcceptance as w,jobsDir as x,newJobId as y,jobDir as z};
+}
+/**
+ * evaluateAcceptance for a job on disk: keeps acceptance.json's pending placeholder
+ * current with the checks running, then returns the verdict (the caller writes it).
+ * An abort records `unchecked: checks canceled` instead of a verdict from killed checks.
+ */
+async function runAcceptance(input) {
+    const budgetMs = acceptanceBudgetMs(input.checks);
+    const startedAt = new Date().toISOString();
+    const acceptance = await evaluateAcceptance({
+        succeeded: input.succeeded, checks: input.checks, baseDir: input.baseDir,
+        ...(input.signal === undefined ? {} : { signal: input.signal }),
+        onProgress: (running) => {
+            try {
+                writeAcceptance(input.repo, input.jobId, {
+                    state: 'unchecked', checks: [], pending: true, budgetMs, startedAt,
+                    ...(running.length > 0 ? { running: running.join(', ') } : {}),
+                });
+            }
+            catch { /* progress is advisory; the verdict write is not */ }
+        },
+    });
+    return input.signal?.aborted
+        ? { state: 'unchecked', checks: [], at: acceptance.at ?? startedAt, reason: 'checks canceled' }
+        : acceptance;
+}/**
+ * format.ts — PURE presentation logic for the /forge pane and the band.
+ *
+ * WHY THIS FILE IS NOT `register.tsx`:
+ * `node --test --experimental-strip-types` CANNOT load a .tsx file — TypeScript's
+ * type stripping has no JSX transform (verified: any JSX element in an imported
+ * .tsx is a hard parse error). So if the formatters lived next to the render
+ * code they would be untestable under the repo's own test runner, which defeats
+ * the point of making them pure in the first place. Everything testable lives
+ * here, in a module with zero imports and zero I/O. `register.tsx` imports this
+ * file and does nothing but lay out what these functions return.
+ *
+ * NOTHING in here reads the clock, the filesystem, or any atom. "Now" is always
+ * a parameter, for the same reason core/liveness.ts does it: a formatter that
+ * called Date.now() itself could not be tested at a boundary.
+ *
+ * THE RULES ENCODED BELOW come from agent-configs/shared/TERMINAL-UI.md. Where a
+ * rule needed interpretation the reasoning is inline.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * THE ROW, IN ONE PLACE
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Every job row in either surface is these four segments, in this order:
+ *
+ *     {glyph} {label} {detail} {elapsed}
+ *       1        2       3        4
+ *
+ *   1 glyph     EAW=Neutral, one column, always drawn. Never colour alone.
+ *   2 label     THE TASK, from `prompt_source.task`. Fixed-width cell.
+ *   3 detail    what it is doing (live) or how it ended (terminal). Fixed cell.
+ *   4 elapsed   fixed 6 columns, RIGHT-aligned, and LAST — see ELAPSED_WIDTH.
+ *
+ * WHY THE JOB ID IS NOT ON THE ROW ANY MORE. Measured against the real 20-job
+ * corpus in .agy-staff/jobs: every id is `implement-musm82da-f1dc1fe4`. That is
+ * 30 columns of which the mode is constant (`implement`, 100% of the corpus, so
+ * it is not information) and `-f1dc1fe4` is a UUID fragment that distinguishes
+ * nothing a reader can act on. The request the job was actually given sits in
+ * `prompt_source.task` and reads "open an agent-built dashboard with real names,
+ * decoded inside Renyi". That is the identity. The id survives in the DETAIL
+ * view, where it is what you would paste into `agy` to talk about the job.
+ *
+ * WHY ELAPSED IS LAST AND FIXED-WIDTH. TERMINAL-UI.md §Width: "put the volatile
+ * field last — elapsed time ticks every second; if it sits mid-line, everything
+ * after it shifts horizontally each tick." The pane used to put the clock second
+ * and rely on right-alignment; that is safe (see ELAPSED_WIDTH) but it is a
+ * weaker version of the same guarantee than simply putting the field last, and
+ * the band already did the latter. Both surfaces now agree, so there is no
+ * band/pane ordering deviation left to document.
+ */
+/**
+ * Strip complete ANSI escape sequences (CSI, OSC, DCS/PM/APC/SOS, 2-byte ESC,
+ * C1 controls) and remaining forbidden control characters, unpaired surrogates,
+ * and noncharacters (`U+FDD0..U+FDEF`), while preserving `\n` and valid UTF-16
+ * surrogate pairs.
+ *
+ * Why this exists: Claude Code's JSX element validator rejects any `<Text>`,
+ * `<Button label>`, or `<Markdown text>` containing C0/C1 controls (except `\t`
+ * and `\n`), lone surrogates, or `U+FDD0..U+FDEF`. Worker tool output, shell
+ * commands, check output, and prompt text routinely contain ANSI colour codes or
+ * `\r` progress lines; stripping them at the UI boundary keeps the stored job
+ * files intact while preventing a single control byte from aborting the pane.
+ */
+const ANSI_ESCAPE = /(?:\x1b\][\s\S]*?(?:\x07|\x1b\\|\x9c)|\x9d[\s\S]*?(?:\x07|\x1b\\|\x9c)|\x1b[PX^_][\s\S]*?(?:\x1b\\|\x9c)|(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]|\x1b[ -/]*[@-~])/gu;
+const FORBIDDEN_CONTROLS = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ud800-\udfff\ufdd0-\ufdef]/gu;
+function sanitizeText(s) {
+    return s
+        .replace(ANSI_ESCAPE, '')
+        .replace(/\r\n?/g, '\n')
+        .replace(/\t/g, '  ')
+        .replace(FORBIDDEN_CONTROLS, '');
+}
+/**
+ * Cut to at most `max` UTF-16 units without splitting a surrogate pair.
+ *
+ * `slice` can leave a high surrogate with no low half. `sanitizeText` removes
+ * such halves, so a cut made AFTER sanitizing must not create one: the host
+ * draws an unpaired half as U+FFFD, or refuses the tree a Text's string is
+ * checked in. `max` stays in UTF-16 units because every caller sizes cells in
+ * terminal columns, where a pair already counts as two.
+ */
+function clip(s, max) {
+    if (s.length <= max)
+        return s;
+    const cut = s.slice(0, Math.max(0, max));
+    return /[\ud800-\udbff]$/.test(cut) ? cut.slice(0, -1) : cut;
+}
+/** Collapse all whitespace runs to single spaces and cap the length. */
+function oneLine(s, max = 400) {
+    const t = sanitizeText(s).replace(/\s+/g, ' ').trim();
+    return clip(t, max);
+}
+// ── activity, from real agy tool shapes ─────────────────────────────────────
+/**
+ * agy tool name + parameters → a short "what is it doing" phrase.
+ *
+ * Measured against the real corpus in .agy-staff/jobs:
+ *   run_command           { CommandLine }
+ *   view_file             { AbsolutePath }
+ *   write_to_file         { TargetFile }
+ *   replace_file_content  { TargetFile }
+ *   grep_search           { Query | Pattern }
+ *   list_dir              { AbsolutePath }
+ *   call_mcp_tool         { ServerName, ToolName, Arguments }
+ *   manage_task           { Action, TaskId }
+ *   schedule              { DurationSeconds, Prompt }
+ *
+ * TERMINAL-UI.md §Motion: "terse tool descriptions, never raw output". Every
+ * branch truncates at the source; there is no code path that hands raw tool
+ * output to a list row.
+ */
+function describeTool(tool, params) {
+    const str = (k) => {
+        const v = params[k];
+        return typeof v === 'string' ? oneLine(v) : '';
+    };
+    switch (tool) {
+        case 'run_command':
+            return humanCommand(str('CommandLine'));
+        case 'view_file':
+            return `reading ${basename(str('AbsolutePath'))}`;
+        case 'write_to_file':
+        // Same verb as replace_file_content, deliberately: from the reader's side
+        // there is no difference between "created" and "changed" a file, and the
+        // tool name is an implementation detail of agy, not of the work.
+        case 'replace_file_content':
+            return `editing ${basename(str('TargetFile'))}`;
+        case 'grep_search':
+            return `searching ${basename(str('Query') || str('Pattern'))}`;
+        case 'list_dir':
+            return `listing ${basename(str('AbsolutePath'))}`;
+        case 'call_mcp_tool':
+            return `${str('ToolName') || str('ServerName') || 'an mcp tool'}`;
+        case 'manage_task':
+            return `task ${str('Action') || 'update'}`;
+        case 'schedule':
+            return `waiting ${str('DurationSeconds') || '?'}s`;
+        default:
+            return `using ${oneLine(tool)}`;
+    }
+}
+/**
+ * A shell command → what a person would say they are doing.
+ *
+ * The corpus is 76 run_command records and the raw line is what put
+ * `cargo tree -p renyi-mcp -e features -i` on a status row: real, precise, and
+ * unreadable at a glance. So the COMMON commands get a verb, and anything else
+ * gets a TRIMMED form rather than an invented one.
+ *
+ * The fallback rule is the important half. When there is no mapping this shows
+ * the command's first two words and stops — `git rebase --onto main feature/x`
+ * becomes `git rebase`, not `preparing the branch`. Inventing a plausible verb
+ * for an arbitrary command would be a lie the user cannot check, and it would be
+ * a lie in the one field the band exists to be trustworthy about. `cargo tree`
+ * is in the table because it appears in the corpus four times, not because it
+ * is universally understood.
+ */
+function humanCommand(cmd) {
+    const line = oneLine(cmd);
+    if (line === '')
+        return 'running a command';
+    // A pipeline or a `&&` chain is several actions; the first is what the job is
+    // doing now, and the rest are what it will do after. `cargo test 2>&1 | tail`
+    // is "running tests", not "running a shell pipeline".
+    const first = line.split(/\s*(?:&&|\|\||;|\||&&)\s*/)[0] ?? line;
+    const words = first.split(' ').filter((w) => !w.startsWith('-'));
+    const prog = basename(words[0] ?? '');
+    const sub = words[1] ?? '';
+    switch (prog) {
+        case 'cargo':
+        case 'rustup':
+            switch (sub) {
+                case 'test':
+                case 'nextest':
+                    return 'running tests';
+                case 'clippy':
+                    return 'linting';
+                case 'fmt':
+                    return 'formatting';
+                case 'build':
+                    return 'building';
+                case 'check':
+                    return 'checking the build';
+                case 'tree':
+                    return 'inspecting dependencies';
+                case 'doc':
+                    return 'reading the docs';
+                case 'run':
+                    return `running ${basename(words[2] ?? 'the binary')}`;
+            }
+            break;
+        case 'npm':
+        case 'pnpm':
+        case 'yarn':
+        case 'bun':
+            // `npm test` and `npm run test` are the same intent; `npm run build` is
+            // building. Anything else under `npm run` is somebody's script and we do
+            // not know what it does.
+            if (sub === 'test')
+                return 'running tests';
+            if (sub === 'run' && (words[2] === 'build'))
+                return 'building';
+            if (sub === 'run' && (words[2] === 'test'))
+                return 'running tests';
+            return `running ${prog} scripts`;
+        case 'python':
+        case 'python3':
+            return 'running a script';
+        case 'git':
+            if (sub === 'status' || sub === 'diff' || sub === 'log' || sub === 'show')
+                return 'checking git';
+            if (sub === 'commit')
+                return 'committing';
+            if (sub === 'push')
+                return 'pushing';
+            return `git ${sub}`.trim();
+        case 'grep':
+        case 'rg':
+        case 'ag':
+            return 'searching';
+        case 'graft':
+            return `navigating the graph`;
+    }
+    // The honest fallback: the command's name, and at most one argument.
+    const trimmed = words.slice(0, 2).join(' ');
+    return trimmed === '' ? 'running a command' : trimmed;
+}
+/** Last path segment only. */
+function basename(p) {
+    const i = p.lastIndexOf('/');
+    return i === -1 ? p : p.slice(i + 1);
+}
+/**
+ * `input_preview` is a JSON STRING of the tool parameters, truncated by agy-staff.
+ * A truncated JSON string does not parse, so this never throws — a failure just
+ * means we have no parameters and the caller falls back to the bare tool name.
+ */
+function parseInputPreview(preview) {
+    if (!preview)
+        return {};
+    try {
+        const v = JSON.parse(preview);
+        return typeof v === 'object' && v !== null ? v : {};
+    }
+    catch {
+        return {};
+    }
+}const READ_TOOLS = new Set(['view_file', 'read', 'read_file', 'list_dir', 'ls', 'list', 'notebookread', 'readmediafile']);
+const SEARCH_TOOLS = new Set(['grep_search', 'grep', 'glob', 'find_by_name', 'search_files', 'find_files', 'codebase_search', 'search_web', 'web_search', 'websearch', 'webfetch', 'fetchurl']);
+const EDIT_TOOLS = new Set(['write_to_file', 'replace_file_content', 'edit', 'edit_file', 'write', 'write_file', 'create_file', 'str_replace_editor', 'multiedit', 'notebookedit', 'patch', 'file_change', 'apply_patch']);
+const COMMAND_TOOLS = new Set(['run_command', 'bash', 'shell', 'command_execution', 'exec']);
+const PATH_KEYS = ['AbsolutePath', 'TargetFile', 'file_path', 'filePath', 'notebook_path', 'path'];
+const COMMAND_KEYS = ['CommandLine', 'command', 'cmd'];
+/** `/bin/zsh -lc 'cat x'` and `bash -lc "…"` → the command inside. codex names a shell call by its command line. */
+function unwrapShell(command) {
+    const m = /^\s*(?:\S*\/)?(?:ba|z|)sh\s+-l?c\s+(['"])([\s\S]*)\1\s*$/.exec(command);
+    return m ? m[2] : command;
+}
+const TEST_RE = /\b(?:pytest|jest|vitest|mocha|tox|nox|rspec|phpunit|ctest|unittest)\b|\b(?:cargo|go|npm|pnpm|yarn|bun|deno|dotnet|mvn|gradle|swift|mix)\s+(?:run\s+)?(?:test|nextest|verify)\b|\bmake\s+(?:test|check)\b|\bnode\s+--test\b/;
+const SEARCH_PROGS = new Set(['grep', 'rg', 'ag', 'ack', 'find', 'fd']);
+/** Steps that prepare a shell rather than do the work. */
+const SETUP_PROGS = new Set(['cd', 'pushd', 'popd', 'export', 'unset', 'source', '.', 'set', 'ulimit']);
+const READ_PROGS = new Set(['cat', 'sed', 'head', 'tail', 'nl', 'less', 'ls', 'tree', 'wc']);
+function classifyCommand(raw) {
+    // A leading `!` negates the exit status; it is not the program.
+    const command = unwrapShell(raw).replace(/\s+/g, ' ').trim().replace(/^!\s*/, '');
+    const segments = command.split(/\s*(?:&&|\|\||;|\|)\s*/).filter((s) => s !== '');
+    const program = (segment) => segment.split(' ').filter((w) => w !== '' && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(w));
+    // `unset VIRTUAL_ENV; uv run pytest`: the setup step is not what the command does.
+    const first = segments.find((s) => !SETUP_PROGS.has(basename(program(s)[0] ?? ''))) ?? segments[0] ?? command;
+    const words = program(first);
+    const prog = basename(words[0] ?? '');
+    const sub = subcommand(words);
+    if (prog === 'git' && sub === 'grep')
+        return { kind: 'search', label: 'git grep' };
+    if (SEARCH_PROGS.has(prog))
+        return { kind: 'search', label: humanCommand(first) };
+    if (READ_PROGS.has(prog))
+        return { kind: 'read', label: humanCommand(first) };
+    if (TEST_RE.test(command))
+        return { kind: 'test', label: 'running tests' };
+    return { kind: 'command', label: humanCommand(first) };
+}
+/** Global options that take a value, so `git -C dir grep` finds `grep`, not `dir`. */
+const VALUE_OPTIONS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace']);
+function subcommand(words) {
+    for (let i = 1; i < words.length; i += 1) {
+        const w = words[i];
+        if (VALUE_OPTIONS.has(w)) {
+            i += 1;
+            continue;
+        }
+        if (!w.startsWith('-'))
+            return w;
+    }
+    return '';
+}
+function firstString(params, keys, raw = '') {
+    for (const k of keys) {
+        const v = params[k];
+        if (typeof v === 'string' && v.trim() !== '')
+            return v;
+    }
+    // A long input (a Write's file body) arrives truncated and no longer parses;
+    // its leading keys are still readable.
+    for (const k of keys) {
+        const m = new RegExp(`"${k}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`).exec(raw);
+        if (m) {
+            try {
+                return JSON.parse(`"${m[1]}"`);
+            }
+            catch {
+                return m[1];
+            }
+        }
+    }
+    return '';
+}
+/**
+ * A short name for an in-flight tool call, as a reader would type it: the
+ * command line's first step for a shell tool (`cargo test`), else the tool
+ * name. Used for liveness text ("in `cargo test` 16m").
+ */
+function toolLabel(tool, input, max = 40) {
+    const lower = tool.trim().toLowerCase();
+    if (COMMAND_TOOLS.has(lower)) {
+        const command = unwrapShell(firstString(parseInputPreview(input), COMMAND_KEYS, input ?? '')).replace(/\s+/g, ' ').trim();
+        const first = command.split(/\s*(?:&&|\|\||;|\|)\s*/).find((s) => s !== '') ?? '';
+        if (first !== '')
+            return oneLine(first, max);
+    }
+    return oneLine(tool, max);
+}
+/**
+ * One tool call → its kind and a phrase. Every provider's tool vocabulary:
+ * agy (view_file, run_command, …), claude (Read, Edit, Bash, …), opencode (read,
+ * edit, bash, …), codex (a shell command line as the tool, or file_change) and
+ * kimi (Read, Write, Edit, Grep, Glob, Bash, … — PascalCase, matched lowercased).
+ * Input may be truncated JSON; a parse failure falls back to the bare tool name.
+ */
+function classify(tool, input) {
+    const params = parseInputPreview(input);
+    const name = tool.trim();
+    const lower = name.toLowerCase();
+    const path = firstString(params, PATH_KEYS, input ?? '');
+    const file = path === '' ? '' : basename(path);
+    if (COMMAND_TOOLS.has(lower))
+        return classifyCommand(firstString(params, COMMAND_KEYS, input ?? ''));
+    if (EDIT_TOOLS.has(lower)) {
+        if (lower === 'file_change') {
+            const changes = Array.isArray(params['changes']) ? params['changes'] : [];
+            const first = changes.map((c) => (c && typeof c === 'object' ? c['path'] : undefined))
+                .find((p) => typeof p === 'string');
+            return { kind: 'edit', label: first ? `editing ${oneLine(basename(first))}` : 'editing files', ...(first ? { path: first } : {}) };
+        }
+        return { kind: 'edit', label: file ? `editing ${oneLine(file)}` : 'editing', ...(path ? { path } : {}) };
+    }
+    if (READ_TOOLS.has(lower)) {
+        const listing = lower === 'list_dir' || lower === 'ls' || lower === 'list';
+        return { kind: 'read', label: file ? `${listing ? 'listing' : 'reading'} ${oneLine(file)}` : 'reading', ...(path && !listing ? { path } : {}) };
+    }
+    if (SEARCH_TOOLS.has(lower)) {
+        const query = oneLine(firstString(params, ['Query', 'Pattern', 'pattern', 'query', 'url'], input ?? ''));
+        const short = query.length > 24 ? `${oneLine(query, 23)}…` : query;
+        return { kind: 'search', label: short ? `searching ${short}` : 'searching' };
+    }
+    // codex: the tool IS the command line.
+    if (/\s/.test(name) || /^(?:\S*\/)?(?:ba|z)?sh$/.test(name))
+        return classifyCommand(name);
+    return { kind: 'other', label: describeTool(name, params) };
+}
+const REPEAT_MIN = 4;
+/** Accumulates one job's tool calls into a ProgressDigest. Feed it every activity start and end. */
+class ProgressTracker {
+    steps = new Map();
+    /**
+     * Steps whose first ACTIVITY event carried no input. A provider can split the
+     * call into "started, parameters not yet known" and "updated, here they are";
+     * such a step is classified but not counted until the input arrives, so a
+     * later update can upgrade it without double-counting.
+     */
+    provisional = new Set();
+    read = new Set();
+    editedSet = new Set();
+    edited = [];
+    /** Edits whose file the tool did not name (codex file_change's shape is unverified): still edits. */
+    unnamedEdits = 0;
+    searches = 0;
+    commands = 0;
+    testRuns = 0;
+    lastTestFailed = false;
+    recent = [];
+    repeatKey = '';
+    repeatLabel = '';
+    repeatCount = 0;
+    activeTest = false;
+    /** A tool call began. Repeated starts of one step (ACTIVE then DONE) are counted once. */
+    start(stepIndex, tool, input) {
+        // Codex passes the shell command line as `tool` with no separate `input`.
+        const effectiveInput = (input ?? '').trim() !== '' ? input : (/\s/.test(tool.trim()) ? tool.trim() : '');
+        const hasInput = effectiveInput !== '';
+        const seen = this.steps.get(stepIndex);
+        if (seen !== undefined) {
+            // The parameters arrived after the step was first seen: classify for real.
+            if (!this.provisional.has(stepIndex) || !hasInput)
+                return;
+            this.provisional.delete(stepIndex);
+            const upgraded = classify(tool, input);
+            this.steps.set(stepIndex, upgraded);
+            this.apply(upgraded, effectiveInput);
+            return;
+        }
+        const c = classify(tool, input);
+        this.steps.set(stepIndex, c);
+        if (!hasInput) {
+            // No input means we do not know what ran. Remember the step so `end()`
+            // keeps its verdict, but do not count a likely-misleading call.
+            this.provisional.add(stepIndex);
+            this.resetRepeat();
+            return;
+        }
+        this.apply(c, effectiveInput);
+    }
+    apply(c, input) {
+        switch (c.kind) {
+            case 'read':
+                if (c.path)
+                    this.read.add(c.path);
+                break;
+            case 'search':
+                this.searches += 1;
+                break;
+            case 'edit':
+                if (c.path) {
+                    if (this.editedSet.has(c.path))
+                        this.edited = this.edited.filter((p) => p !== c.path);
+                    this.editedSet.add(c.path);
+                    this.edited.push(c.path);
+                }
+                else
+                    this.unnamedEdits += 1;
+                break;
+            case 'test':
+                this.testRuns += 1;
+                this.activeTest = true;
+                break;
+            case 'command':
+                this.commands += 1;
+                break;
+        }
+        if (c.kind !== 'other')
+            this.recent = [...this.recent, c].slice(-8);
+        // An unclassified call is not a repeat of anything: "repeating editing ×17"
+        // is not a fact about the worker, it is a fact about a missing input.
+        if (c.kind === 'other') {
+            this.resetRepeat();
+            return;
+        }
+        const key = `${c.kind}\u0000${c.label}\u0000${input ?? ''}`;
+        if (key === this.repeatKey)
+            this.repeatCount += 1;
+        else {
+            this.repeatKey = key;
+            this.repeatLabel = c.label;
+            this.repeatCount = 1;
+        }
+    }
+    resetRepeat() {
+        this.repeatKey = '';
+        this.repeatLabel = '';
+        this.repeatCount = 0;
+    }
+    /** A tool call ended. Only an explicit error marks a test run failed. */
+    end(stepIndex, tool, input, status) {
+        this.start(stepIndex, tool, input);
+        const c = this.steps.get(stepIndex);
+        if (c.kind === 'test') {
+            this.lastTestFailed = status === 'error';
+            this.activeTest = false;
+        }
+    }
+    digest(cwd = '') {
+        const relative = (p) => {
+            const base = cwd.replace(/\/+$/, '');
+            return base !== '' && p.startsWith(`${base}/`) ? p.slice(base.length + 1) : p;
+        };
+        return {
+            phase: this.phase(),
+            filesRead: this.read.size,
+            searches: this.searches,
+            edited: this.edited.slice(-8).map(relative),
+            editedCount: this.editedSet.size + this.unnamedEdits,
+            commands: this.commands,
+            testRuns: this.testRuns,
+            lastTestFailed: this.lastTestFailed,
+            repeat: this.repeatCount >= REPEAT_MIN ? { label: this.repeatLabel, count: this.repeatCount } : null,
+        };
+    }
+    /** All file paths named by edit tool calls so far, relative to `cwd` when inside it. */
+    editedPaths(cwd = '') {
+        const base = cwd.replace(/\/+$/, '');
+        return this.edited.map((p) => (base !== '' && p.startsWith(`${base}/`) ? p.slice(base.length + 1) : p));
+    }
+    /** From a window of recent calls, not the last one alone, so the phase does not flicker. */
+    phase() {
+        const last = this.recent.at(-1);
+        if (last === undefined)
+            return 'starting';
+        if (this.activeTest || last.kind === 'test')
+            return 'testing';
+        if (this.recent.some((c) => c.kind === 'edit'))
+            return 'editing';
+        if (last.kind === 'command')
+            return 'running';
+        return 'exploring';
+    }
+}export{AgentSmithReader as A,isPidAlive as B,ClaudeCodeReader as C,DEFAULT_TIMEOUT_MS as D,deriveOrphan as E,FILES as F,jobsDir as G,newJobId as H,jobDir as I,isForgeJobId as J,SMITH_PAYLOAD as K,nextActionFor as L,checksReason as M,toolLabel as N,readJsonSafe as O,ProgressTracker as P,readdirSafe as Q,REASONS as R,SCHEMA_VERSION as S,existsSafe as T,readAcceptance as a,runAcceptance as b,PROGRESS_FLUSH_MS as c,attributeChanged as d,exitReason as e,diffChangedFiles as f,classify as g,cwdFacts as h,deriveStatus as i,jobFile as j,failureFields as k,FAILED_EARLY_MS as l,looksEmpty$1 as m,isForgeStatePath as n,toVerifyChecks as o,pendingAcceptance as p,normalizeAcceptanceReport as q,reasonFromText as r,shouldFlush as s,taskTitle as t,runChecks as u,acceptanceChecksFromReport as v,writeAcceptance as w,acceptanceState as x,AgyStaffReader as y,normalize as z};

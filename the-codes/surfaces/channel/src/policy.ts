@@ -22,7 +22,8 @@
  *
  *   finished  the job reached a terminal success
  *   failed    it reached a terminal failure, or a suspicious success
- *   attention it went silent past the grace period and is not coming back
+ *   attention it went silent past the grace period (no event, process alive or
+ *             unknown), or its process stopped while it is still marked running
  *   cancelled a human stopped it
  *
  * Not pushable, and the reasoning matters:
@@ -67,6 +68,8 @@ export interface WatchableJob {
   readonly failureDetail?: string | null;
   /** Acceptance check tally, when checks ran. */
   readonly checks?: { readonly passed: number; readonly total: number; readonly failed?: readonly string[] } | null;
+  /** The job exited but its acceptance checks have no verdict yet: names running, or true. */
+  readonly checksRunning?: string | true;
   /** `agy-staff` for a legacy interop job; absent for Forge jobs and runs. */
   readonly source?: 'agy-staff';
   readonly status: WatchStatus;
@@ -84,6 +87,12 @@ export interface WatchableJob {
   readonly steerNotApplied?: boolean;
   /** Watched brief files that changed in the repository while the job ran. */
   readonly staleReads?: readonly string[] | null;
+  /**
+   * Why an `attention` job needs eyes (mod/hooks/stale.ts): `silent` (no event
+   * for the grace period, process alive or unknown) or `dead` (no heartbeat).
+   * `since` is epoch ms of the last heartbeat for dead; `tool` an open tool call.
+   */
+  readonly liveness?: { readonly state: 'silent' | 'dead'; readonly silentForMs: number; readonly since: number | null; readonly tool?: string };
 }
 
 /**
@@ -132,7 +141,10 @@ export function pushKindFor(job: WatchableJob): PushKind | null {
  * stalled again, and the default epoch never changes.
  */
 export function dedupeKey(job: WatchableJob, epoch: number = 0): string {
-  return `${job.id}#${job.status}#${epoch}`;
+  // A job that exited with checks still running speaks again when the verdict lands.
+  // A silent job whose process then dies is a second fact: dead is keyed apart.
+  const dead = job.status === 'attention' && job.liveness?.state === 'dead' ? '#dead' : '';
+  return `${job.id}#${job.status}${dead}${job.checksRunning === undefined ? '' : '#checks'}#${epoch}`;
 }
 
 // ── the decision ────────────────────────────────────────────────────────────
@@ -206,7 +218,8 @@ export function shouldPush(candidate: Candidate, now: number): boolean {
     // a reader that just started will produce exactly this state for every job.
     // Saying "has stopped making progress" about a job whose progress we have
     // never observed would be a confident sentence about nothing.
-    if (job.lastEventAt === null) return false;
+    // A dead process is a fact of its own (its heartbeat stopped), event times or not.
+    if (job.lastEventAt === null && job.liveness?.state !== 'dead') return false;
   }
 
   return true;
@@ -267,9 +280,12 @@ export function buildBatch(candidates: readonly Candidate[], now: number): Batch
  */
 export function toNotice(job: WatchableJob, kind: PushKind, now: number): NoticeJob {
   const run = job.role === 'pipeline' && job.outcome !== undefined;
-  const span = kind === 'attention'
-    ? (job.lastEventAt === null ? NaN : now - Date.parse(job.lastEventAt))
-    : (job.startedAt && job.finishedAt ? Date.parse(job.finishedAt) - Date.parse(job.startedAt) : NaN);
+  const dead = kind === 'attention' && job.liveness?.state === 'dead';
+  const span = dead
+    ? (job.liveness?.since == null ? NaN : now - job.liveness.since)
+    : kind === 'attention'
+      ? (job.lastEventAt === null ? NaN : now - Date.parse(job.lastEventAt))
+      : (job.startedAt && job.finishedAt ? Date.parse(job.finishedAt) - Date.parse(job.startedAt) : NaN);
   return {
     id: job.id, kind, name: job.name ?? null, provider: job.provider ?? null, role: job.role ?? null,
     source: job.source ?? null, run,
@@ -281,6 +297,8 @@ export function toNotice(job: WatchableJob, kind: PushKind, now: number): Notice
     ...(job.staleReads && job.staleReads.length > 0 ? { staleReads: job.staleReads } : {}),
     ...(job.steeredFrom ? { steered: true } : {}),
     ...(job.steerNotApplied ? { steerNotApplied: true } : {}),
+    ...(kind === 'finished' && job.checksRunning !== undefined ? { checksRunning: job.checksRunning } : {}),
+    ...(kind === 'attention' && job.liveness ? { liveness: { state: job.liveness.state, ...(job.liveness.tool ? { tool: job.liveness.tool } : {}) } } : {}),
   };
 }
 

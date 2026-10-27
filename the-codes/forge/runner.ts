@@ -73,7 +73,7 @@ import type { ForgeActivity, ForgeManifest } from './format.ts';
 import { appendBounded } from './writer.ts';
 import { isMode, MODE_PRESETS } from './modes.ts';
 import { runChecks } from '../verify/runner.ts';
-import { acceptanceChecksFromReport, acceptanceState, normalizeAcceptanceReport, toVerifyChecks, writeAcceptance } from './checks.ts';
+import { acceptanceChecksFromReport, acceptanceState, normalizeAcceptanceReport, pendingAcceptance, toVerifyChecks, writeAcceptance } from './checks.ts';
 import type { Acceptance } from './checks.ts';
 import type { Check } from '../verify/types.ts';
 
@@ -353,6 +353,7 @@ export function createForgeRunner(deps: RunnerDeps): StageRunner {
       // second, independent line of defence rather than the only one.
       timeoutMs: stage.timeoutMs ?? 0,
       unrestricted: deps.unrestricted,
+      ...(stage.env === undefined ? {} : { env: stage.env }),
       pipeline: ctx.pipeline,
       stage: stage.name,
       attempt: ctx.attempt,
@@ -372,7 +373,7 @@ export function createForgeRunner(deps: RunnerDeps): StageRunner {
       const tracked = await deps.service.spawnTracked(request);
       jobId = tracked.ack.jobId;
       // As spawn_job does: the job reads "checks pending" until a verdict exists.
-      if (stage.checks?.length) recordAcceptance(deps.service.repo, jobId, { state: 'unchecked', checks: [], pending: true });
+      if (stage.checks?.length) recordAcceptance(deps.service.repo, jobId, pendingAcceptance(stage.checks));
       deps.onStageRunning?.({
         stage: stage.name, jobId, status: 'running', provider: ctx.routing.provider,
         ...(ctx.routing.model === undefined ? {} : { model: ctx.routing.model }),

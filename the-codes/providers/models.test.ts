@@ -331,3 +331,70 @@ test('catalog: stale-on-error and isolation of failing providers', async () => {
   const rd = await getCatalogs();
   assert.equal(rd[0]!.error, 'kaboom');
 });
+
+test('catalog: disk cache is shared across processes, honors TTL, refresh rewrites it, stale-on-error holds', async () => {
+  const { mkdtempSync, readFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const repo = mkdtempSync(path.join(tmpdir(), 'catalog-disk-'));
+  try {
+    let t = 1_000_000;
+    const file = path.join(repo, '.agent-smith', 'catalogs', 'a.json');
+    // "MCP process": discovers and persists.
+    const a1 = fakeProvider('a', async () => good('a'));
+    resetCatalogCacheForTest({ now: () => t, providers: () => [a1] });
+    await getCatalogs({ repo });
+    assert.equal(a1.calls, 1);
+    assert.equal(JSON.parse(readFileSync(file, 'utf8')).at, t);
+    // "Supervisor": fresh memory cache, same repo; must not probe the CLI.
+    const a2 = fakeProvider('a', async () => good('a'));
+    resetCatalogCacheForTest({ now: () => t + 1_000, providers: () => [a2] });
+    const hit = await getCatalogs({ repo });
+    assert.equal(a2.calls, 0);
+    assert.equal(hit[0]!.source, 'cache');
+    assert.equal(hit[0]!.stale, false);
+    // Without a repo there is no disk sharing.
+    resetCatalogCacheForTest({ now: () => t + 1_000, providers: () => [a2] });
+    await getCatalogs();
+    assert.equal(a2.calls, 1);
+    // Past the TTL the disk entry is not fresh; discovery runs and rewrites it.
+    resetCatalogCacheForTest({ now: () => t + 5 * 60_000 + 1, providers: () => [a2] });
+    await getCatalogs({ repo });
+    assert.equal(a2.calls, 2);
+    assert.equal(JSON.parse(readFileSync(file, 'utf8')).at, t + 5 * 60_000 + 1);
+    // refresh bypasses a fresh disk entry and rewrites the file.
+    resetCatalogCacheForTest({ now: () => t + 6 * 60_000, providers: () => [a2] });
+    await getCatalogs({ repo, refresh: true });
+    assert.equal(a2.calls, 3);
+    assert.equal(JSON.parse(readFileSync(file, 'utf8')).at, t + 6 * 60_000);
+    // A failing refresh serves the disk entry as stale with the new error, and leaves the file alone.
+    const down = fakeProvider('a', async () => { throw new Error('down'); });
+    resetCatalogCacheForTest({ now: () => t + 7 * 60_000, providers: () => [down] });
+    const r = await getCatalogs({ repo, refresh: true });
+    assert.equal(r[0]!.stale, true);
+    assert.equal(r[0]!.error, 'down');
+    assert.equal(r[0]!.models.length, 1);
+    assert.equal(JSON.parse(readFileSync(file, 'utf8')).at, t + 6 * 60_000);
+    // A corrupt file is ignored.
+    (await import('node:fs')).writeFileSync(file, '{nope');
+    const a3 = fakeProvider('a', async () => good('a'));
+    resetCatalogCacheForTest({ now: () => t + 7 * 60_000, providers: () => [a3] });
+    await getCatalogs({ repo });
+    assert.equal(a3.calls, 1);
+    // A well-formed file with a malformed model entry is ignored too: served as fresh, a null
+    // entry would throw inside spawn-time validation and block an otherwise valid launch.
+    writeFileSync(file, JSON.stringify({ at: t + 7 * 60_000, catalog: { provider: 'a', models: [null], defaultSource: 'unknown', source: 'live', stale: false, verified: true } }));
+    const a4 = fakeProvider('a', async () => good('a'));
+    resetCatalogCacheForTest({ now: () => t + 7 * 60_000, providers: () => [a4] });
+    const r4 = await getCatalogs({ repo });
+    assert.equal(a4.calls, 1, 'rediscovered instead of serving the malformed entry');
+    assert.equal(r4[0]!.models[0]!.id, good('a').models[0]!.id);
+    // A model without an efforts array (or with efforts: null) is malformed too: validation indexes it.
+    for (const model of [{ id: 'm1' }, { id: 'm1', efforts: null }]) {
+      writeFileSync(file, JSON.stringify({ at: t + 7 * 60_000, catalog: { provider: 'a', models: [model], defaultSource: 'unknown', source: 'live', stale: false, verified: true } }));
+      const a5 = fakeProvider('a', async () => good('a'));
+      resetCatalogCacheForTest({ now: () => t + 7 * 60_000, providers: () => [a5] });
+      await getCatalogs({ repo });
+      assert.equal(a5.calls, 1, `rediscovered for ${JSON.stringify(model)}`);
+    }
+  } finally { rmSync(repo, { recursive: true, force: true }); resetCatalogCacheForTest(); }
+});

@@ -141,6 +141,85 @@ export interface Stage {
    * deliberately pinned model/effort and does not want them rewritten.
    */
   readonly routingPinned?: boolean | undefined;
+  /**
+   * Extra environment for this stage's worker, merged over the server's. Values
+   * are secrets-grade: only the KEYS are ever written to disk.
+   */
+  readonly env?: Readonly<Record<string, string>> | undefined;
+}
+
+const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/**
+ * Worker `env` keys that are refused, because they change how the worker
+ * binary is found, loaded or configured. The env is applied when the CLI is
+ * spawned, BEFORE any sandbox it sets up exists: `PATH` can swap the binary
+ * for a shim, `NODE_OPTIONS=--import=…` or `DYLD_INSERT_LIBRARIES` run code
+ * ahead of the worker, and a provider config dir can drop its read-only
+ * settings, while the ack would still report the sandbox as enforced.
+ * Matched case-insensitively (Windows env names are).
+ */
+export const ENV_DENYLIST: Readonly<Record<string, string>> = {
+  PATH: 'would change which worker binary runs',
+  HOME: 'would change which config the worker loads',
+  SHELL: 'would change the shell the worker runs commands with',
+  TMPDIR: 'would move the worker\'s temporary and sandbox files',
+  NODE_OPTIONS: 'would run code before the worker starts',
+  NODE_PATH: 'would change which modules the worker loads',
+  PYTHONPATH: 'would change which modules the worker loads',
+  PYTHONHOME: 'would change which runtime the worker loads',
+  PYTHONSTARTUP: 'would run code before the worker starts',
+  // Shell startup files: a shell-based launcher sources these before the worker body runs.
+  BASH_ENV: 'would run code before the worker starts',
+  ENV: 'would run code before the worker starts',
+  ZDOTDIR: 'would run code before the worker starts',
+  SHELLOPTS: 'would change how the shell runs the worker',
+  PROMPT_COMMAND: 'would run code before the worker starts',
+  PERL5OPT: 'would run code before the worker starts',
+  RUBYOPT: 'would run code before the worker starts',
+};
+
+/**
+ * Key prefixes refused for the same reason: the dynamic loader (`LD_`, `DYLD_`),
+ * XDG config/data dirs, Agent Smith's own settings (`AGENT_SMITH_*_BIN`,
+ * `_HOME`, `_CODEX_SANDBOX`, …) and each provider's config (`CLAUDE_CONFIG_DIR`,
+ * `CODEX_HOME`, `KIMI_CODE_HOME`, `OPENCODE_*`, `AGY_*`). The adapters' own
+ * keys are all covered here; do not list them again above.
+ */
+export const ENV_DENY_PREFIXES: Readonly<Record<string, string>> = {
+  LD_: 'would change which libraries the worker loads',
+  DYLD_: 'would change which libraries the worker loads',
+  XDG_: 'would change which config the worker loads',
+  AGENT_SMITH_: 'is Agent Smith\'s own setting, not the worker\'s',
+  AGY_: 'would change the provider\'s config',
+  CLAUDE_: 'would change the provider\'s config',
+  CODEX_: 'would change the provider\'s config',
+  OPENCODE_: 'would change the provider\'s config',
+  KIMI_: 'would change the provider\'s config',
+};
+
+/** Why a worker `env` key is refused, or null when it is allowed. */
+export function deniedEnvReason(key: string): string | null {
+  const upper = key.toUpperCase();
+  const exact = ENV_DENYLIST[upper];
+  if (exact !== undefined) return exact;
+  for (const [prefix, why] of Object.entries(ENV_DENY_PREFIXES)) if (upper.startsWith(prefix)) return why;
+  return null;
+}
+
+/** Validate a worker `env` map: plain identifier keys not on the denylist, string values without NUL. Returns it unchanged, or undefined when absent. */
+export function validateEnv(raw: unknown, label = 'env'): Readonly<Record<string, string>> | undefined {
+  if (raw === undefined) return undefined;
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) throw new Error(`${label} must be an object of string values.`);
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (!ENV_KEY.test(key)) throw new Error(`${label} key "${key}" is not a valid variable name (letters, digits, underscore; no leading digit).`);
+    const denied = deniedEnvReason(key);
+    if (denied !== null) throw new Error(`${label}.${key} ${denied}; it is not allowed in a worker env.`);
+    if (typeof value !== 'string' || value.includes('\0')) throw new Error(`${label}.${key} must be a string without NUL characters.`);
+    out[key] = value;
+  }
+  return out;
 }
 
 /**

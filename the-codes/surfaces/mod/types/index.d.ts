@@ -70,6 +70,12 @@ export interface RadarJob {
   readonly failureReason?: string | null;
   readonly failureDetail?: string | null;
   readonly lastEventAt?: number | null;
+  /**
+   * hooks/stale.ts livenessOf, for a live job: active, in-tool (a call still
+   * open), silent (no output past the grace period) or dead (heartbeat stopped).
+   * `attention` means silent or dead. Absent once terminal.
+   */
+  readonly liveness?: { readonly state: 'active' | 'in-tool' | 'waiting' | 'silent' | 'dead'; readonly silentForMs: number; readonly since: number | null; readonly forMs: number; readonly tool?: string } | null;
   readonly pipeline?: string | null;
   readonly stage?: string | null;
   readonly attempt?: number | null;
@@ -159,6 +165,10 @@ export type ActivityEvent =
 export interface RadarAcceptance {
   readonly state: 'accepted' | 'rejected' | 'unchecked';
   readonly pending?: boolean;
+  /** Pending only: how long the checks may take, ms. */
+  readonly budgetMs?: number;
+  /** Pending only: names of the checks running now. */
+  readonly running?: string;
   readonly checks: readonly {
     name: string; ok: boolean; outputTail: string;
     reason?: string; timedOut?: boolean; signal?: string | null; skipped?: string;

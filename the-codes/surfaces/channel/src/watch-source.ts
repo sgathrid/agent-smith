@@ -69,7 +69,7 @@ import { readAcceptance } from '../../../forge/checks.ts';
 // constant the channel also needs. One owner, two importers, no drift. The same
 // reasoning puts the dedupe rules in ./policy.ts rather than in the server: the
 // server is the only thing that could not be reused.
-import { STALL_GRACE_MS } from '../../mod/hooks/stale.ts';
+import { isStalled, livenessOf, type Liveness } from '../../mod/hooks/stale.ts';
 import { ACCEPTANCE_HOLD_MS, pipelineOutcome } from '../../mod/hooks/notice.ts';
 import type { WatchableJob, WatchStatus } from './policy.ts';
 
@@ -103,9 +103,13 @@ export { ACCEPTANCE_HOLD_MS };
 function acceptancePending(cwd: string, job: WatchableJob, now: number): boolean {
   if (job.finishedAt === null) return false;
   const finished = Date.parse(job.finishedAt);
-  if (Number.isFinite(finished) && now - finished > ACCEPTANCE_HOLD_MS) return false;
-  return (readAcceptance(cwd, job.id) as { pending?: boolean }).pending === true;
+  const placeholder = readAcceptance(cwd, job.id) as PendingAcceptance;
+  if (placeholder.pending !== true) return false;
+  const budget = typeof placeholder.budgetMs === 'number' && placeholder.budgetMs > 0 ? placeholder.budgetMs : ACCEPTANCE_HOLD_MS;
+  return !(Number.isFinite(finished) && now - finished > budget);
 }
+/** Acceptance placeholder fields the hold and the notice read. */
+type PendingAcceptance = { pending?: boolean; budgetMs?: unknown; running?: unknown };
 
 const isTerminal = (job: WatchableJob): boolean =>
   (job.status === 'succeeded' || job.status === 'failed' || job.status === 'canceled') && job.finishedAt !== null;
@@ -143,7 +147,10 @@ export async function readPipelineRecord(cwd: string, runId: string): Promise<{ 
 
 /** Read exactly one job by id from either source (primary first). Never throws. */
 export async function readJob(cwd: string, jobId: string, now: number = Date.now()): Promise<WatchableJob | null> {
-  return (await readOne(new AgentSmithReader(), 'agent-smith', cwd, jobId, now)) ?? (await readOne(new AgyStaffReader(), 'agy-staff', cwd, jobId, now));
+  const own = await readOne(new AgentSmithReader(), 'agent-smith', cwd, jobId, now);
+  // A watcher polls until the job settles: while its checks are inside their budget it is still in flight.
+  if (own !== null && isTerminal(own) && acceptancePending(cwd, own, now)) return { ...own, status: 'running', finishedAt: null };
+  return own ?? (await readOne(new AgyStaffReader(), 'agy-staff', cwd, jobId, now));
 }
 
 /** One read of every job. Never throws; an unreadable directory yields []. */
@@ -210,7 +217,8 @@ async function collect(
       claimed.delete(id);
       continue;
     }
-    if (isTerminal(job)) terminalCache.set(cacheKey(cwd, id), job);
+    // Past its hold with checks still running: re-read next poll so the verdict is announced too.
+    if (isTerminal(job) && job.checksRunning === undefined) terminalCache.set(cacheKey(cwd, id), job);
     out.push(job);
   }
 }
@@ -243,7 +251,7 @@ async function readOne(
   // reason itself (`failureReason`), so only the boolean is kept here.
   const warned = observed.warnings.length > 0;
   const raw = observed.raw;
-  const acceptance = source === 'agent-smith' ? readAcceptance(cwd, observed.jobId) as { checks?: readonly { ok?: unknown; name?: unknown }[] } : {};
+  const acceptance = source === 'agent-smith' ? readAcceptance(cwd, observed.jobId) as PendingAcceptance & { checks?: readonly { ok?: unknown; name?: unknown }[] } : {};
   const checks = Array.isArray(acceptance.checks) && acceptance.checks.length > 0
     ? {
       passed: acceptance.checks.filter((c) => c?.ok === true).length, total: acceptance.checks.length,
@@ -261,9 +269,12 @@ async function readOne(
     failureReason: [raw['reason'], raw['error']].find((v): v is string => typeof v === 'string' && v !== '') ?? null,
     failureDetail: typeof raw['error'] === 'string' ? raw['error'] : null,
     checks,
+    ...(source === 'agent-smith' && observed.status === 'succeeded' && acceptance.pending === true
+      ? { checksRunning: typeof acceptance.running === 'string' && acceptance.running !== '' ? acceptance.running : true as const } : {}),
     ...(source === 'agy-staff' ? { source } : {}),
     summarySource: observed.raw['summarySource'] === 'worker' ? 'worker' : null,
     status: toWatchStatus(observed, now),
+    ...livenessField(watchLiveness(observed, now)),
     lastEventAt: observed.updatedAt,
     finishedAt: observed.finishedAt,
     warned,
@@ -277,11 +288,31 @@ async function readOne(
 }
 
 /**
- * ObservedStatus → WatchStatus, plus the stall escalation.
+ * The shared liveness rule (mod/hooks/stale.ts) over an observed job: event
+ * silence, the open tool call and the process owner's heartbeat. Null unless running.
+ */
+export function watchLiveness(observed: ObservedJob, now: number): Liveness | null {
+  const raw = observed.raw;
+  const activity = raw['last_activity'];
+  return livenessOf({
+    status: observed.status, updatedAt: observed.updatedAt, now,
+    lastEventAt: typeof raw['last_event_at'] === 'string' ? raw['last_event_at'] : null,
+    lastAliveAt: typeof raw['last_alive_at'] === 'string' ? raw['last_alive_at'] : null,
+    lastActivity: activity !== null && typeof activity === 'object' ? activity as { tool?: unknown; input?: unknown; status?: unknown } : null,
+  });
+}
+
+/** Only the quiet states travel to the notice: they are what `attention` means. */
+function livenessField(l: Liveness | null): { liveness?: { state: 'silent' | 'dead'; silentForMs: number; since: number | null; tool?: string } } {
+  if (l === null || (l.state !== 'silent' && l.state !== 'dead')) return {};
+  return { liveness: { state: l.state, silentForMs: l.silentForMs, since: l.since, ...(l.tool ? { tool: l.tool } : {}) } };
+}
+
+/**
+ * ObservedStatus → WatchStatus, plus the liveness escalation.
  *
- * The stall threshold is imported from ./stale.ts rather than duplicated, so the
- * pane and the channel cannot disagree about when a job counts as stalled. The
- * number itself matches core/liveness.ts's DEFAULT_GRACE_MS (15 min).
+ * The rule is mod/hooks/stale.ts livenessOf, shared with the pane, so the two
+ * cannot disagree about when a job needs attention (silent or dead).
  *
  * WHY ESCALATE HERE AND NOT IN THE POLICY: a stall is a fact about the job, and
  * a fact belongs to the reader. The policy's job is only to decide whether a fact
@@ -289,13 +320,7 @@ async function readOne(
  */
 export function toWatchStatus(observed: ObservedJob, now: number): WatchStatus {
   if (observed.status !== 'running') return observed.status;
-  if (observed.updatedAt === null) {
-    // No evidence of progress at all. Treat as needing eyes rather than healthy:
-    // "we do not know" must never be drawn as "fine" (the asymmetry
-    // core/liveness.ts documents).
-    return 'attention';
-  }
-  const then = Date.parse(observed.updatedAt);
-  if (Number.isNaN(then)) return 'attention';
-  return now - then > STALL_GRACE_MS ? 'attention' : 'running';
+  // silent or dead needs eyes; active and in-tool (a long command) do not. No
+  // event time at all is `silent`: "we do not know" is never drawn as "fine".
+  return isStalled(watchLiveness(observed, now)) ? 'attention' : 'running';
 }
