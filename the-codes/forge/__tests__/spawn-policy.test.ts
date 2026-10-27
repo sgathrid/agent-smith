@@ -3,7 +3,7 @@
  * catalog validation and the agy preflight, all with injected fakes.
  */
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -341,4 +341,50 @@ test('a provider without per-run effort control records no effort and warns', as
   const job = JSON.parse(readFileSync(path.join(ack.dir, 'job.json'), 'utf8'));
   assert.equal(job.effort, null, 'an effort that was not applied must not be recorded as if it was');
   assert.equal(fake.specs[0]?.effort, undefined, 'the adapter is not asked to honor an impossible knob');
+});
+
+test('env reaches the provider spec; only the keys are written to disk and acked', async () => {
+  const f = fakeProvider('fake');
+  const { service, repo } = svc(f);
+  const ack = await service.spawnJob({ mode: 'implement', prompt: 'x', provider: 'fake', env: { CARGO_TARGET_DIR: '/secret/target', TOKEN: 'hunter2' } });
+  await new Promise(r => setTimeout(r, 50));
+  assert.deepEqual(f.specs[0]!.env, { CARGO_TARGET_DIR: '/secret/target', TOKEN: 'hunter2' });
+  assert.deepEqual(ack.envKeys, ['CARGO_TARGET_DIR', 'TOKEN']);
+  const dir = path.join(repo, '.agent-smith/jobs', ack.jobId);
+  assert.deepEqual(JSON.parse(readFileSync(path.join(dir, 'env-keys.json'), 'utf8')), ['CARGO_TARGET_DIR', 'TOKEN']);
+  for (const file of readdirSync(dir)) {
+    const text = readFileSync(path.join(dir, file), 'utf8');
+    assert.ok(!text.includes('hunter2') && !text.includes('/secret/target'), `${file} must not hold env values`);
+  }
+  const none = await svc(fakeProvider('fake')).service.spawnJob({ mode: 'implement', prompt: 'x', provider: 'fake' });
+  assert.equal(none.envKeys, undefined);
+  await assert.rejects(service.spawnJob({ mode: 'implement', prompt: 'x', provider: 'fake', env: { 'a b': 'c' } }), /not a valid variable name/);
+});
+
+test('first spawn waits the cold catalog budget, later spawns the short one', async () => {
+  const f = fakeProvider('fake');
+  let calls = 0;
+  const slow = async () => { calls++; await new Promise(r => setTimeout(r, 120)); return [catalog()]; };
+  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-policy-'));
+  const service = new ForgeService({ repo, mirror: false, flushMs: 1, providerSource: () => f.provider, catalogSource: slow, harnessDefaults: () => ({}), catalogWaitMs: { warm: 20, cold: 1000 } });
+  const first = await service.spawnJob({ mode: 'implement', prompt: 'x', provider: 'fake', model: 'm1' });
+  assert.equal(first.warnings, undefined, 'the cold wait outlasts the slow catalog');
+  const slower = new ForgeService({ repo, mirror: false, flushMs: 1, providerSource: () => f.provider, catalogSource: async () => { await new Promise(r => setTimeout(r, 200)); return [catalog()]; }, harnessDefaults: () => ({}), catalogWaitMs: { warm: 20, cold: 20 } });
+  const lost = await slower.spawnJob({ mode: 'implement', prompt: 'x', provider: 'fake', model: 'm1', name: 'other' });
+  assert.match(lost.warnings?.[0] ?? '', /no catalog available/);
+  assert.equal(calls, 1);
+});
+
+test('warmCatalogs discovers once in the background and a spawn joins it instead of a second discovery', async () => {
+  const f = fakeProvider('fake');
+  let calls = 0;
+  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-policy-'));
+  const service = new ForgeService({ repo, mirror: false, flushMs: 1, providerSource: () => f.provider, catalogSource: async () => { calls++; await new Promise(r => setTimeout(r, 60)); return [catalog()]; }, harnessDefaults: () => ({}), catalogWaitMs: { warm: 20, cold: 1000 } });
+  service.warmCatalogs(); service.warmCatalogs();
+  const ack = await service.spawnJob({ mode: 'implement', prompt: 'x', provider: 'fake', model: 'm1' });
+  assert.equal(ack.warnings, undefined);
+  assert.equal(calls, 1);
+  const rejecting = new ForgeService({ repo, mirror: false, providerSource: () => f.provider, catalogSource: async () => { throw new Error('boom'); } });
+  rejecting.warmCatalogs();
+  await new Promise(r => setTimeout(r, 20));
 });

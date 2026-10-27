@@ -98,7 +98,7 @@ const names = (a: Partial<Acceptance>, ok: boolean) => { const n = (a.checks ?? 
 function checkVerdicts(a: AcceptanceView | null | undefined) {
   if (!a) return null;
   return compact({
-    state: a.state, pending: a.pending ? true : null, reason: a.reason ?? null,
+    state: a.state, pending: a.pending ? true : null, running: a.pending ? a.running ?? null : null, reason: a.reason ?? null,
     passed: names(a, true), failed: names(a, false),
   });
 }

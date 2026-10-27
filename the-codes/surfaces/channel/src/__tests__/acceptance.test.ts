@@ -97,3 +97,43 @@ test('structuredContent wraps arrays; outputSchema is permissive', async () => {
   assert.deepEqual(r.structuredContent, { items: [{ jobId: 'a' }] });
   for (const n of ['status', 'list_jobs', 'list_capabilities', 'spawn_job']) assert.equal(TOOL_DEFS.find(t => t.name === n)!.outputSchema!.additionalProperties, true);
 });
+
+test('spawn_job writes the checks budget into the pending placeholder', async () => {
+  const f = fake('succeeded');
+  await callTool(f.ctx, 'spawn_job', { mode: 'implement', prompt: 'x', provider: 'agy', checks: [{ name: 'a', command: 'true', timeoutMs: 600_000 }, { name: 'b', command: 'true', timeoutMs: 600_000 }] });
+  const pending = readAcceptance(f.repo, 'job-1') as { pending?: boolean; budgetMs?: number };
+  assert.equal(pending.pending, true); assert.equal(pending.budgetMs, 1_230_000);
+});
+
+test('status shows which check is running, and cancel aborts checks of an exited worker', async () => {
+  const f = fake('succeeded');
+  (f.ctx.service as unknown as { cancel: (id: string) => unknown }).cancel = (id: string) => ({ jobId: id, requested: true, signalled: false, note: 'x' });
+  await callTool(f.ctx, 'spawn_job', { mode: 'implement', prompt: 'x', provider: 'agy', checks: [{ name: 'hang', command: 'sleep 30', timeoutMs: 60_000 }] });
+  f.finish();
+  await new Promise(r => setTimeout(r, 300));
+  const mid = body(await callTool(f.ctx, 'status', { jobId: 'job-1' }));
+  assert.equal(mid.acceptance.pending, true); assert.equal(mid.acceptance.running, 'hang');
+  const c = body(await callTool(f.ctx, 'cancel', { jobId: 'job-1' }));
+  assert.equal(c.checksCanceled, true);
+  await new Promise(r => setTimeout(r, 300));
+  const after = readAcceptance(f.repo, 'job-1');
+  assert.equal(after.state, 'unchecked'); assert.equal((after as { reason?: string }).reason, 'checks canceled');
+  assert.equal((after as { pending?: boolean }).pending, undefined);
+});
+
+test('spawn_job env reaches the service; the ack names keys only; bad env is rejected', async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), 'tools-'));
+  const seen: Record<string, unknown>[] = [];
+  const service = { repo, spawnJob: async (req: Record<string, unknown>) => { seen.push(req); return { jobId: 'job-1', envKeys: Object.keys(req.env as object) }; } };
+  const ctx = { service: service as never, catalogs: async () => [] } as HandlerContext;
+  const ok = await callTool(ctx, 'spawn_job', { mode: 'implement', prompt: 'x', provider: 'agy', env: { CARGO_TARGET_DIR: '/tmp/t' } });
+  assert.deepEqual(seen[0]!.env, { CARGO_TARGET_DIR: '/tmp/t' });
+  assert.deepEqual(body(ok).envKeys, ['CARGO_TARGET_DIR']);
+  assert.doesNotMatch(JSON.stringify(body(ok)), /\/tmp\/t/);
+  for (const env of ['x', ['A'], { 'bad-key': '1' }, { A: 1 }]) {
+    const bad = await callTool(ctx, 'spawn_job', { mode: 'implement', prompt: 'x', provider: 'agy', env });
+    assert.equal(bad.isError, true);
+  }
+  assert.equal(seen.length, 1);
+  assert.equal(parseStages([{ name: 's', provider: 'agy', prompt: 'p', env: { A: 'b' } }])![0]!.env!.A, 'b');
+});

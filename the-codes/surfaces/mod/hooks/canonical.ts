@@ -34,6 +34,8 @@ function acceptance(value: RecordValue | null): RadarAcceptance {
   if (value === null) return { state: 'unchecked', checks: [] };
   if (!['accepted', 'rejected', 'unchecked'].includes(String(value.state))) throw new Error('Invalid acceptance state');
   return { state: value.state as RadarAcceptance['state'], pending: value.pending === true,
+    ...(typeof value.budgetMs === 'number' && Number.isFinite(value.budgetMs) && value.budgetMs > 0 ? { budgetMs: value.budgetMs } : {}),
+    ...(typeof value.running === 'string' && value.running !== '' ? { running: value.running } : {}),
     checks: (Array.isArray(value.checks) ? value.checks : []).flatMap(c => {
       const check = record(c);
       return check && typeof check.name === 'string' ? [{ name: check.name, ok: check.ok === true,

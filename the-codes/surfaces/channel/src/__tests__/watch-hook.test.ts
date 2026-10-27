@@ -203,3 +203,35 @@ test('runJobWatch follows supersededBy without emitting an intermediate parent n
   assert.match(lines[0]!, /W-b/);
   assert.match(lines[0]!, /status b/);
 });
+
+test('a watcher holds a job whose checks are inside their budget, then says exited with checks running, then the verdict', async () => {
+  clearReadCache();
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'pending-notice-'));
+  const dir = path.join(repo, '.agent-smith', 'jobs', 'j-1');
+  fs.mkdirSync(dir, { recursive: true });
+  const finished = Date.now() - 10 * 60_000;
+  fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({
+    schema: 1, jobId: 'j-1', status: 'succeeded', provider: 'codex', name: 'Ada',
+    startedAt: new Date(finished - 60_000).toISOString(), finishedAt: new Date(finished).toISOString(),
+  }));
+  const acceptance = (extra: object) => fs.writeFileSync(path.join(dir, 'acceptance.json'), JSON.stringify(extra));
+  const { readJob } = await import('../watch-source.ts');
+  // 10 minutes after exit: past the flat 5-minute default, inside a 20-minute budget.
+  acceptance({ state: 'unchecked', checks: [], pending: true, budgetMs: 20 * 60_000, running: 'ui-suite' });
+  const held = await readJob(repo, 'j-1', Date.now());
+  assert.equal(held?.status, 'running');
+  // No budget on the placeholder: the 5-minute default has passed.
+  acceptance({ state: 'unchecked', checks: [], pending: true, running: 'ui-suite' });
+  const late = await readJob(repo, 'j-1', Date.now());
+  assert.equal(late?.status, 'succeeded');
+  assert.equal(late?.checksRunning, 'ui-suite');
+  const text = headline(toNotice(late!, 'finished', Date.now()));
+  assert.match(text, /exited · checks running: ui-suite/);
+  assert.doesNotMatch(text, /done|✓/);
+  const { dedupeKey } = await import('../policy.ts');
+  acceptance({ state: 'accepted', checks: [{ name: 'ui-suite', ok: true }] });
+  const verdict = await readJob(repo, 'j-1', Date.now());
+  assert.notEqual(dedupeKey(late!), dedupeKey(verdict!), 'the verdict is announced again');
+  assert.match(headline(toNotice(verdict!, 'finished', Date.now())), /✓ .*done · checks 1\/1/);
+  fs.rmSync(repo, { recursive: true, force: true });
+});

@@ -103,9 +103,13 @@ export { ACCEPTANCE_HOLD_MS };
 function acceptancePending(cwd: string, job: WatchableJob, now: number): boolean {
   if (job.finishedAt === null) return false;
   const finished = Date.parse(job.finishedAt);
-  if (Number.isFinite(finished) && now - finished > ACCEPTANCE_HOLD_MS) return false;
-  return (readAcceptance(cwd, job.id) as { pending?: boolean }).pending === true;
+  const placeholder = readAcceptance(cwd, job.id) as PendingAcceptance;
+  if (placeholder.pending !== true) return false;
+  const budget = typeof placeholder.budgetMs === 'number' && placeholder.budgetMs > 0 ? placeholder.budgetMs : ACCEPTANCE_HOLD_MS;
+  return !(Number.isFinite(finished) && now - finished > budget);
 }
+/** Acceptance placeholder fields the hold and the notice read. */
+type PendingAcceptance = { pending?: boolean; budgetMs?: unknown; running?: unknown };
 
 const isTerminal = (job: WatchableJob): boolean =>
   (job.status === 'succeeded' || job.status === 'failed' || job.status === 'canceled') && job.finishedAt !== null;
@@ -143,7 +147,10 @@ export async function readPipelineRecord(cwd: string, runId: string): Promise<{ 
 
 /** Read exactly one job by id from either source (primary first). Never throws. */
 export async function readJob(cwd: string, jobId: string, now: number = Date.now()): Promise<WatchableJob | null> {
-  return (await readOne(new AgentSmithReader(), 'agent-smith', cwd, jobId, now)) ?? (await readOne(new AgyStaffReader(), 'agy-staff', cwd, jobId, now));
+  const own = await readOne(new AgentSmithReader(), 'agent-smith', cwd, jobId, now);
+  // A watcher polls until the job settles: while its checks are inside their budget it is still in flight.
+  if (own !== null && isTerminal(own) && acceptancePending(cwd, own, now)) return { ...own, status: 'running', finishedAt: null };
+  return own ?? (await readOne(new AgyStaffReader(), 'agy-staff', cwd, jobId, now));
 }
 
 /** One read of every job. Never throws; an unreadable directory yields []. */
@@ -210,7 +217,8 @@ async function collect(
       claimed.delete(id);
       continue;
     }
-    if (isTerminal(job)) terminalCache.set(cacheKey(cwd, id), job);
+    // Past its hold with checks still running: re-read next poll so the verdict is announced too.
+    if (isTerminal(job) && job.checksRunning === undefined) terminalCache.set(cacheKey(cwd, id), job);
     out.push(job);
   }
 }
@@ -243,7 +251,7 @@ async function readOne(
   // reason itself (`failureReason`), so only the boolean is kept here.
   const warned = observed.warnings.length > 0;
   const raw = observed.raw;
-  const acceptance = source === 'agent-smith' ? readAcceptance(cwd, observed.jobId) as { checks?: readonly { ok?: unknown; name?: unknown }[] } : {};
+  const acceptance = source === 'agent-smith' ? readAcceptance(cwd, observed.jobId) as PendingAcceptance & { checks?: readonly { ok?: unknown; name?: unknown }[] } : {};
   const checks = Array.isArray(acceptance.checks) && acceptance.checks.length > 0
     ? {
       passed: acceptance.checks.filter((c) => c?.ok === true).length, total: acceptance.checks.length,
@@ -261,6 +269,8 @@ async function readOne(
     failureReason: [raw['reason'], raw['error']].find((v): v is string => typeof v === 'string' && v !== '') ?? null,
     failureDetail: typeof raw['error'] === 'string' ? raw['error'] : null,
     checks,
+    ...(source === 'agent-smith' && observed.status === 'succeeded' && acceptance.pending === true
+      ? { checksRunning: typeof acceptance.running === 'string' && acceptance.running !== '' ? acceptance.running : true as const } : {}),
     ...(source === 'agy-staff' ? { source } : {}),
     summarySource: observed.raw['summarySource'] === 'worker' ? 'worker' : null,
     status: toWatchStatus(observed, now),

@@ -38,7 +38,7 @@ export interface NoticeRow {
   readonly steeredFrom?: string | null;
   readonly warnings?: readonly { readonly code: string }[] | null;
   readonly staleReads?: readonly string[] | null;
-  readonly acceptance?: { readonly pending?: boolean; readonly checks: readonly { readonly ok: boolean; readonly name?: string }[] };
+  readonly acceptance?: { readonly pending?: boolean; readonly budgetMs?: number; readonly running?: string; readonly checks: readonly { readonly ok: boolean; readonly name?: string }[] };
 }
 
 // ── vocabulary ──────────────────────────────────────────────────────────────
@@ -49,7 +49,8 @@ export type NoticeKind = 'finished' | 'failed' | 'cancelled' | 'attention';
 /**
  * Acceptance checks run after a job ends, so a finished job briefly carries a
  * pending placeholder. Hold its notice until the verdict lands, never longer
- * than this: a crashed checker must not silence a finished job.
+ * than this: a crashed checker must not silence a finished job. A placeholder
+ * that carries its own `budgetMs` (the checks' timeouts summed) holds that long.
  */
 export const ACCEPTANCE_HOLD_MS = 5 * 60_000;
 
@@ -78,6 +79,11 @@ export interface NoticeJob {
   readonly steerNotApplied?: boolean;
   /** A pipeline run: the id is a runId and Claude reads it with pipeline_status. */
   readonly run?: boolean;
+  /**
+   * The worker exited but its acceptance checks have no verdict yet: the names of
+   * those running (true when unnamed). The notice must not say "done".
+   */
+  readonly checksRunning?: string | true;
 }
 
 const GLYPH: Record<NoticeKind, string> = { finished: '✓', failed: '✗', cancelled: '■', attention: '!' };
@@ -141,13 +147,16 @@ export function headline(job: NoticeJob): string {
   const d = durationWords(job.durationMs);
   const reason = job.reason ? compactExcerpt(job.reason, 160) : '';
   const bad = rejected(job);
-  const glyph = bad ? GLYPH.failed : GLYPH[job.kind];
+  const awaiting = job.kind === 'finished' && !job.run && !bad && job.checksRunning !== undefined;
+  const glyph = bad ? GLYPH.failed : awaiting ? '…' : GLYPH[job.kind];
   const parts: string[] = [`${glyph} ${who(job)}${d && job.kind !== 'attention' ? ` ${d}` : ''}`];
   switch (job.kind) {
     case 'finished':
       if (job.run) parts.push(reason || 'done');
       else if (bad) parts.push(checksReason(job.checks?.failed ?? []));
-      else {
+      else if (awaiting) {
+        parts.push('exited', typeof job.checksRunning === 'string' ? `checks running: ${job.checksRunning}` : 'checks pending');
+      } else {
         parts.push('done');
         if (job.checks && job.checks.total > 0) parts.push(`checks ${job.checks.passed}/${job.checks.total}`);
       }
@@ -181,7 +190,7 @@ export function claudeText(jobs: readonly NoticeJob[]): string {
   if (!one) {
     const counts = new Map<string, number>();
     for (const job of jobs) {
-      const label = rejected(job) ? 'failed' : STATE[job.kind];
+      const label = rejected(job) ? 'failed' : job.checksRunning !== undefined && job.kind === 'finished' && !job.run ? 'exited' : STATE[job.kind];
       counts.set(label, (counts.get(label) ?? 0) + 1);
     }
     lines.push(`Agent Smith · ${jobs.length} jobs: ${[...shown(counts)].map(([k, n]) => `${n} ${k}`).join(', ')}`);
@@ -197,7 +206,7 @@ export function claudeText(jobs: readonly NoticeJob[]): string {
 
 /** Counts in the order a reader scans them: done first, then what needs a look. */
 function shown(counts: ReadonlyMap<string, number>): [string, number][] {
-  return ['done', 'failed', 'canceled', 'stalled'].flatMap((k) => (counts.has(k) ? [[k, counts.get(k)!] as [string, number]] : []));
+  return ['done', 'exited', 'failed', 'canceled', 'stalled'].flatMap((k) => (counts.has(k) ? [[k, counts.get(k)!] as [string, number]] : []));
 }
 
 /**
@@ -379,6 +388,7 @@ export function noticeFromRadar(job: NoticeRow, kind: NoticeKind, now: number): 
     ...(job.staleReads && job.staleReads.length > 0 ? { staleReads: job.staleReads } : {}),
     ...(job.steeredFrom ? { steered: true } : {}),
     ...(job.warnings?.some((w) => w.code === 'steer_not_applied') ? { steerNotApplied: true } : {}),
+    ...(kind === 'finished' && job.acceptance?.pending === true ? { checksRunning: job.acceptance.running ?? true } : {}),
   };
 }
 
@@ -457,6 +467,8 @@ export interface Owned {
   readonly until: number;
   /** True once its stall was announced; a stall is said once. */
   readonly saidAttention?: boolean;
+  /** True once "exited, checks running" was announced; the verdict is announced again when it lands. */
+  readonly saidExited?: boolean;
   readonly saidStageAttention?: readonly string[];
 }
 
@@ -507,6 +519,7 @@ export function due(
         ...prev,
         until: Math.max(prev.until, entry.until),
         ...(prev.saidAttention || entry.saidAttention ? { saidAttention: true } : {}),
+        ...(prev.saidExited || entry.saidExited ? { saidExited: true } : {}),
       };
     } else {
       keep.push(entry);
@@ -566,7 +579,14 @@ export function due(
       continue;
     }
     if (job && kind && !held(job, now)) {
-      pushNotice(noticeFromRadar(job, kind, now));
+      const notice = noticeFromRadar(job, kind, now);
+      if (notice.checksRunning === undefined) {
+        pushNotice(notice);
+        continue;
+      }
+      // Held past its budget with checks still pending: say so once, then wait for the verdict.
+      if (!currentOwned.saidExited) pushNotice(notice);
+      if (now <= currentOwned.until) pushKeep({ ...currentOwned, saidExited: true });
       continue;
     }
     if (now <= currentOwned.until) pushKeep(currentOwned);
@@ -577,5 +597,5 @@ export function due(
 /** A finished job whose acceptance verdict is still being written. */
 function held(job: NoticeRow, now: number): boolean {
   if (job.acceptance?.pending !== true) return false;
-  return job.endedAt == null || now - job.endedAt <= ACCEPTANCE_HOLD_MS;
+  return job.endedAt == null || now - job.endedAt <= (job.acceptance.budgetMs ?? ACCEPTANCE_HOLD_MS);
 }

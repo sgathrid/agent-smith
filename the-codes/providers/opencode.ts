@@ -308,12 +308,18 @@ function addUsage(previous: TokenUsage | undefined, next: TokenUsage): TokenUsag
 const DONE_WORDS = new Set(['completed', 'complete', 'done', 'success', 'succeeded', 'finished']);
 const ERROR_WORDS = new Set(['error', 'failed', 'failure', 'cancelled', 'canceled', 'aborted']);
 
+/** Failed tool calls that each get their own warning notice; the rest are only counted. */
+const TOOL_ERROR_NOTICES = 5;
+
 interface OpencodeTranslator {
   onEvent(raw: Record<string, unknown>): ProviderEvent[];
   finalText: string;
   sawTerminal: boolean;
+  /** A fatal `error` / `session.error` event. A failed TOOL call never sets this. */
   sawError: boolean;
   error?: string;
+  /** Tool parts that ended in an error state. Evidence, not a verdict: the agent may recover. */
+  toolErrors: number;
   usage?: TokenUsage;
   sessionId?: string;
   unrecognised: Set<string>;
@@ -334,6 +340,7 @@ export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
     finalText: '',
     sawTerminal: false,
     sawError: false,
+    toolErrors: 0,
     unrecognised: new Set<string>(),
     deniedNotices: [],
     onEvent: () => [],
@@ -483,7 +490,20 @@ export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
         if (denied) ref.denied = true;
         out.push({ kind: 'activity-end', at, activity: ref, status });
         if (denied) tx.deniedNotices.push(toolName);
-        if (isErr) tx.sawError = true;
+        else if (isErr) {
+          // A failed tool call (a `read` of a missing path) is evidence, not a
+          // verdict: the agent usually recovers and still delivers its report.
+          // Only `error` / `session.error`, a nonzero exit or an empty report fail the job.
+          tx.toolErrors += 1;
+          const detail = (stateErrorText ?? output?.text ?? '').split('\n')[0]!.slice(0, 160);
+          // The count is the evidence; past a few, per-call warnings only bury real ones.
+          if (tx.toolErrors <= TOOL_ERROR_NOTICES) out.push({
+            kind: 'notice',
+            at,
+            level: 'warn',
+            message: `opencode tool ${toolName} failed (step ${idx})${detail === '' ? '' : `: ${detail}`}`,
+          });
+        }
       } else {
         // In-flight: emit an update so a long tool call is not a silent gap.
         const idx = partStep.get(partId) ?? 0;
@@ -588,7 +608,7 @@ interface ExitInfo {
   stderr: string;
 }
 
-function buildResult(args: {
+export function buildResult(args: {
   jobId: string;
   startedAtMs: number;
   stateDir: string;
@@ -604,6 +624,7 @@ function buildResult(args: {
 
   // Event types the parser did not know: the clue when a run looks empty or broken.
   const unrecognised = tx.unrecognised.size > 0 ? ` · unrecognised events: ${[...tx.unrecognised].join(', ')}` : '';
+  const toolErrors = tx.toolErrors > 0 ? ` · ${tx.toolErrors} tool error(s)` : '';
   if (exit.killReason === 'cancelled') {
     status = 'cancelled';
     error = 'canceled';
@@ -611,9 +632,9 @@ function buildResult(args: {
     status = 'timeout';
     error = timedOutText(durationMs);
   } else if (tx.sawError) {
-    // An `error` event or an error-state tool part. opencode's provider.quota
-    // 402 exits 1 with an error event and no text, so this is the common path
-    // for a misconfigured account.
+    // An `error` or `session.error` event (never a failed tool call: see
+    // toolErrors). opencode's provider.quota 402 exits 1 with an error event
+    // and no text, so this is the common path for a misconfigured account.
     status = 'error';
     error = `${tx.error ?? 'worker error'}${unrecognised}${stderrClause(exit.stderr)}`;
   } else if (tx.deniedNotices.length > 0) {
@@ -623,7 +644,7 @@ function buildResult(args: {
     error = deniedText(tx.deniedNotices, '');
   } else if (exit.code !== 0) {
     status = 'error';
-    error = `exited ${exit.code}${unrecognised}${stderrClause(exit.stderr)}`;
+    error = `exited ${exit.code}${unrecognised}${toolErrors}${stderrClause(exit.stderr)}`;
   } else if (tx.finalText.trim() === '') {
     // Exited 0 with no text and no error event. Do not call that a success.
     // Be honest about why: with an unverified parser this is the shape most
@@ -632,7 +653,7 @@ function buildResult(args: {
     // Most likely an event-shape gap in the adapter, not an empty model reply:
     // check events.jsonl and extend the parser.
     status = 'malformed';
-    error = `no output${unrecognised}${stderrClause(exit.stderr)}`;
+    error = `no output${unrecognised}${toolErrors}${stderrClause(exit.stderr)}`;
   } else {
     status = 'success';
   }

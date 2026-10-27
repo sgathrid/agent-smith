@@ -141,6 +141,25 @@ export interface Stage {
    * deliberately pinned model/effort and does not want them rewritten.
    */
   readonly routingPinned?: boolean | undefined;
+  /**
+   * Extra environment for this stage's worker, merged over the server's. Values
+   * are secrets-grade: only the KEYS are ever written to disk.
+   */
+  readonly env?: Readonly<Record<string, string>> | undefined;
+}
+
+const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/** Validate a worker `env` map: plain identifier keys, string values without NUL. Returns it unchanged, or undefined when absent. */
+export function validateEnv(raw: unknown, label = 'env'): Readonly<Record<string, string>> | undefined {
+  if (raw === undefined) return undefined;
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) throw new Error(`${label} must be an object of string values.`);
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (!ENV_KEY.test(key)) throw new Error(`${label} key "${key}" is not a valid variable name (letters, digits, underscore; no leading digit).`);
+    if (typeof value !== 'string' || value.includes('\0')) throw new Error(`${label}.${key} must be a string without NUL characters.`);
+    out[key] = value;
+  }
+  return out;
 }
 
 /**

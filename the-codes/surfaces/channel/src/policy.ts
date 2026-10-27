@@ -67,6 +67,8 @@ export interface WatchableJob {
   readonly failureDetail?: string | null;
   /** Acceptance check tally, when checks ran. */
   readonly checks?: { readonly passed: number; readonly total: number; readonly failed?: readonly string[] } | null;
+  /** The job exited but its acceptance checks have no verdict yet: names running, or true. */
+  readonly checksRunning?: string | true;
   /** `agy-staff` for a legacy interop job; absent for Forge jobs and runs. */
   readonly source?: 'agy-staff';
   readonly status: WatchStatus;
@@ -132,7 +134,8 @@ export function pushKindFor(job: WatchableJob): PushKind | null {
  * stalled again, and the default epoch never changes.
  */
 export function dedupeKey(job: WatchableJob, epoch: number = 0): string {
-  return `${job.id}#${job.status}#${epoch}`;
+  // A job that exited with checks still running speaks again when the verdict lands.
+  return `${job.id}#${job.status}${job.checksRunning === undefined ? '' : '#checks'}#${epoch}`;
 }
 
 // ── the decision ────────────────────────────────────────────────────────────
@@ -281,6 +284,7 @@ export function toNotice(job: WatchableJob, kind: PushKind, now: number): Notice
     ...(job.staleReads && job.staleReads.length > 0 ? { staleReads: job.staleReads } : {}),
     ...(job.steeredFrom ? { steered: true } : {}),
     ...(job.steerNotApplied ? { steerNotApplied: true } : {}),
+    ...(kind === 'finished' && job.checksRunning !== undefined ? { checksRunning: job.checksRunning } : {}),
   };
 }
 

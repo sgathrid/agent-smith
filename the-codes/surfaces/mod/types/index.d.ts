@@ -159,6 +159,10 @@ export type ActivityEvent =
 export interface RadarAcceptance {
   readonly state: 'accepted' | 'rejected' | 'unchecked';
   readonly pending?: boolean;
+  /** Pending only: how long the checks may take, ms. */
+  readonly budgetMs?: number;
+  /** Pending only: names of the checks running now. */
+  readonly running?: string;
   readonly checks: readonly {
     name: string; ok: boolean; outputTail: string;
     reason?: string; timedOut?: boolean; signal?: string | null; skipped?: string;

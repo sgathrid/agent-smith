@@ -227,6 +227,27 @@ test('a pending acceptance verdict holds the notice, but not past the hold', () 
   assert.equal(due(owned, [pending], new Map(), NOW + ACCEPTANCE_HOLD_MS + 1).notices.length, 1);
 });
 
+test('the hold follows the checks budget; past it the notice says exited, checks running, then the verdict follows', () => {
+  const owned = claim([], launch('j'), NOW);
+  const budget = 20 * 60_000;
+  const pending = row({ id: 'j', name: 'Ada', provider: 'codex', role: 'implement', status: 'succeeded', startedAt: NOW - 60_000, endedAt: NOW, acceptance: { pending: true, budgetMs: budget, running: 'ui-suite', checks: [] } });
+  // Past the flat default, inside the budget: still held.
+  assert.deepEqual(due(owned, [pending], new Map(), NOW + ACCEPTANCE_HOLD_MS + 1).notices, []);
+  const late = due(owned, [pending], new Map(), NOW + budget + 1);
+  assert.equal(late.notices.length, 1);
+  const text = claudeText(late.notices);
+  assert.match(text, /exited · checks running: ui-suite/);
+  assert.doesNotMatch(text, /done|✓/);
+  assert.equal(late.owned[0]?.saidExited, true);
+  // Said once while the checks still run.
+  assert.deepEqual(due(late.owned, [pending], new Map(), NOW + budget + 60_000).notices, []);
+  // The verdict is announced when it lands.
+  const verdict = row({ id: 'j', name: 'Ada', status: 'succeeded', startedAt: NOW - 60_000, endedAt: NOW, acceptance: { checks: [{ ok: true, name: 'ui-suite' }] } });
+  const final = due(late.owned, [verdict], new Map(), NOW + budget + 120_000);
+  assert.match(claudeText(final.notices), /✓ .*done · checks 1\/1/);
+  assert.deepEqual(final.owned, []);
+});
+
 test('a claimed run is announced with its stage jobs when it ends, not before', () => {
   const owned = claim([], launch('run-1', 'run'), NOW);
   const record = (status: RunRecord['status'], finishedAt: number | null): RunRecord => ({

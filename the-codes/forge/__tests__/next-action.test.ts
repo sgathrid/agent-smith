@@ -139,3 +139,13 @@ test('start() does not wait on git', () => {
   begin(r, r);
   assert.ok(performance.now() - t < 100, 'sync part of start stays fast');
 });
+
+test('a route that failed before any work names the route, after specific diagnoses', () => {
+  const location = 'Selected model is not supported in the selected location';
+  assert.match(nextActionFor({ ...F, error: location, failedEarly: true }) ?? '', /^Route failed before any work.*list_capabilities/);
+  assert.match(nextActionFor({ ...F, error: location }) ?? '', /^Read status.error/, 'without the flag nothing changes');
+  // A specific diagnosis still wins: 402 is out of credits.
+  assert.match(nextActionFor({ ...F, error: 'HTTP 402: Insufficient account funds', failedEarly: true }) ?? '', /^Out of credits/);
+  assert.match(nextActionFor({ ...F, error: 'Upstream request failed: Insufficient account funds', failedEarly: true }) ?? '', /^Route failed/);
+  assert.match(nextActionFor({ ...F, error: 'no output', failedEarly: true }) ?? '', /^Route failed/);
+});

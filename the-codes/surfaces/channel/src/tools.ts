@@ -5,11 +5,11 @@ import { fileURLToPath } from 'node:url';
 import type { CallToolResult } from '@modelcontextprotocol/server';
 import type { Server } from '@modelcontextprotocol/server';
 import type { ForgeStatus } from '../../../forge/format.ts';
-import { DEFAULT_TIMEOUT_MS, MAX_WATCHED_FILES, type ForgeService, type JobDetail } from '../../../forge/service.ts';
+import { DEFAULT_TIMEOUT_MS, ENV_KEYS_FILE, MAX_WATCHED_FILES, type ForgeService, type JobDetail } from '../../../forge/service.ts';
 import { launchPipeline } from '../../../forge/supervisor.ts';
 import { FILES, jobFile } from '../../../forge/format.ts';
 import { startPipeline, readPipeline, cancelPipeline } from '../../../forge/execute.ts';
-import { evaluateAcceptance, readAcceptance, writeAcceptance } from '../../../forge/checks.ts';
+import { pendingAcceptance, readAcceptance, runAcceptance, writeAcceptance } from '../../../forge/checks.ts';
 import { inheritContinuedProviders, validateSpec } from '../../../pipeline/pipeline.ts';
 import { MODES, MODE_PRESETS } from '../../../forge/modes.ts';
 import { getCatalogs, getInstalledProviders } from '../../../providers/catalog.ts';
@@ -19,7 +19,7 @@ import type { ModelCatalog } from '../../../providers/types.ts';
 import { CONCISE_LIST_LIMIT, EARLIER_TURNS_CAP, conciseCapabilities, conciseRow, conciseStatus, concisePipeline, earlierTurn, jobDiff, parseSince, taskStatus, type ResponseFormat } from './views.ts';
 import { STALL_GRACE_MS } from '../../mod/hooks/stale.ts';
 import { POLL_MS } from './poller.ts';
-import type { Effort, PipelineSpec, Stage, StageCheck } from '../../../pipeline/types.ts';
+import { validateEnv, type Effort, type PipelineSpec, type Stage, type StageCheck } from '../../../pipeline/types.ts';
 
 export const REPORT_HEAD_CHARS = 8_000;
 export const DEFAULT_LIST_LIMIT = 50;
@@ -36,6 +36,7 @@ const checksSchema = { type: 'array', items: {
   type: 'object', required: ['name', 'command'], additionalProperties: false,
   properties: { name: string, command: string, cwd: string, timeoutMs: { type: 'integer', minimum: 1 }, blocking: { type: 'boolean' } },
 } };
+const envSchema = { type: 'object', additionalProperties: { type: 'string' }, description: 'Extra environment variables for the worker, merged over the server\'s (e.g. a per-worktree CARGO_TARGET_DIR). Only the names are recorded; values are not stored.' };
 const stageSchema = {
   type: 'object', required: ['name'], additionalProperties: false,
   properties: {
@@ -43,7 +44,7 @@ const stageSchema = {
     provider: { type: 'string', enum: PROVIDERS, description: 'Required unless continues is set.' }, model: string,
     effort: { type: 'string', enum: EFFORTS, description: 'Preferred effort; kimi has no per-run flag and ignores it with a warning.' }, prompt: string, context: contextSchema, title: string, role: string,
     dependsOn: { type: 'array', items: string }, workDir: string, resultPath: string,
-    timeoutMs: { type: 'integer', minimum: 1 }, routingPinned: { type: 'boolean' }, checks: checksSchema,
+    timeoutMs: { type: 'integer', minimum: 1 }, routingPinned: { type: 'boolean' }, checks: checksSchema, env: envSchema,
     consumes: { type: 'array', items: { type: 'object', required: ['stage', 'path'], additionalProperties: false, properties: { stage: string, path: string, label: string } } },
   },
 };
@@ -136,6 +137,7 @@ const SPAWN_OUTPUT = open({
   modelResolved: typed(['string', 'null']), modelSource: typed('string'),
   notify: { ...NOTIFY_SCHEMA, description: 'How completion is announced, with a fallback if no notice arrives.' },
   checks: strings('Names of the acceptance checks attached to this job.'),
+  envKeys: strings('Names of the environment variables passed to the worker; values are never echoed.'),
   aliasApplied: typed('string'), aliasSource: typed('string'),
 }, ['jobId', 'name', 'status']);
 const LIST_JOBS_OUTPUT = open({
@@ -188,15 +190,15 @@ const LAUNCHES: ToolAnnotations = { readOnlyHint: false, openWorldHint: true };
 const modeDescription = MODES.map(m => `${m}: ${MODE_PRESETS[m].description}`).join(' | ');
 const RAW_TOOL_DEFS: readonly ToolDef[] = [
   { name: 'list_capabilities', annotations: { title: 'List capabilities', ...READ_ONLY }, description: `List installed providers with their coding models, efforts and defaults. Use it to choose provider, model or effort for spawn_job or run_pipeline; an invalid choice is rejected with the valid ones. A provider with no defaultModel uses its CLI's own default when model is omitted. Effort is one of ${EFFORTS.join(', ')}; a model lists the efforts it accepts when the provider reports them. Concise by default: a provider with many models gives a count, and provider lists them all. response_format detailed returns every discovered model, including non-coding ones, with labels and job modes.`, inputSchema: schema({ refresh: { type: 'boolean', default: false, description: 'Bypass the discovery cache.' }, provider: { type: 'string', enum: PROVIDERS, description: 'Only this provider, with its full model list.' }, response_format: responseFormat }) },
-  { name: 'spawn_job', annotations: { title: 'Spawn job', ...LAUNCHES }, description: 'Delegate one task to an external coding agent; returns a job ID at once while the worker runs in the background. Name the worker: the name stays the same across turns, so steer_job can redirect it while it runs and resume_job can follow up after it finishes. provider defaults to a configured alias or role default, else agy when installed; list_capabilities lists valid providers, models and efforts. Pass files for shared brief or spec files in the repository so they sync into a worktree cwd and status reports if they go stale while the worker runs. Pass checks when the result must be verified: the worker sees them as its definition of done, they run after the job succeeds, and status reports acceptance (accepted, rejected or unchecked) apart from execution. Only agy and kimi run unrestricted by default; agy can be restricted with unrestricted:false, while kimi is always unrestricted because its print mode cannot prompt, so unrestricted has no effect and read-only is not enforced (the ack\'s sandbox and readOnlyEnforced say so). unrestricted: true for another provider asks the user to confirm when the client supports it.', inputSchema: schema({
+  { name: 'spawn_job', annotations: { title: 'Spawn job', ...LAUNCHES }, description: 'Delegate one task to an external coding agent; returns a job ID at once while the worker runs in the background. Name the worker: the name stays the same across turns, so steer_job can redirect it while it runs and resume_job can follow up after it finishes. provider defaults to a configured alias or role default, else agy when installed; list_capabilities lists valid providers, models and efforts. Pass files for shared brief or spec files in the repository so they sync into a worktree cwd and status reports if they go stale while the worker runs. Pass checks when the result must be verified: the worker sees them as its definition of done, they run after the job succeeds, and status reports acceptance (accepted, rejected or unchecked) apart from execution; while checks run, acceptance.pending is true and acceptance.running names them. Only agy and kimi run unrestricted by default; agy can be restricted with unrestricted:false, while kimi is always unrestricted because its print mode cannot prompt, so unrestricted has no effect and read-only is not enforced (the ack\'s sandbox and readOnlyEnforced say so). env sets worker environment variables; the ack lists envKeys. unrestricted: true for another provider asks the user to confirm when the client supports it.', inputSchema: schema({
     mode: { type: 'string', enum: [...MODES], description: modeDescription }, prompt: string, context: contextSchema, files: filesSchema, name: { ...string, description: 'Worker name, kept across turns, for steer_job and resume_job.' }, task: { ...string, description: 'Short label; defaults to the first prompt line.' }, cwd: { ...string, description: 'Absolute existing working directory. Defaults to the server repository.' },
     provider: { type: 'string', enum: PROVIDERS }, model: string, effort: { type: 'string', enum: EFFORTS, description: 'Preferred effort; kimi has no per-run flag and ignores it with a warning.' },
-    timeoutMs: { type: 'integer', minimum: 1, default: DEFAULT_TIMEOUT_MS }, unrestricted: { type: 'boolean', description: 'Skip worker approval prompts. Default true for agy; always true for kimi (it cannot be restricted); false for other providers. true for codex, claude or opencode asks the user to confirm when the client supports it.' }, conversation: string, checks: { ...checksSchema, description: 'Commands that define done; they run in cwd after the job succeeds.' },
+    timeoutMs: { type: 'integer', minimum: 1, default: DEFAULT_TIMEOUT_MS }, unrestricted: { type: 'boolean', description: 'Skip worker approval prompts. Default true for agy; always true for kimi (it cannot be restricted); false for other providers. true for codex, claude or opencode asks the user to confirm when the client supports it.' }, conversation: string, checks: { ...checksSchema, description: 'Commands that define done; they run in cwd after the job succeeds.' }, env: envSchema,
   }, ['mode', 'prompt']) },
-  { name: 'resume_job', annotations: { title: 'Resume job', ...LAUNCHES }, description: "Send a follow-up prompt to a finished worker, keeping its conversation; returns a new job ID. Use it to correct or extend a worker's result instead of briefing a fresh worker. Provider, mode, model, permissions, acceptance checks and watched brief files carry over unless overridden; working directory defaults to the original (kimi requires it). Refuses a worker that is still running (use steer_job), has no saved conversation (spawn_job with the full brief is then required), or whose name matches more than one worker.", inputSchema: schema({ worker: { ...string, description: 'Worker name or job ID from list_jobs.' }, prompt: string, files: filesSchema, checks: { ...checksSchema, description: 'Replaces the inherited acceptance checks; [] clears them.' }, cwd: { ...string, description: "Absolute existing directory; defaults to the original job's. kimi resumes only from the directory that created the session, so leave cwd unset for a kimi worker." }, model: string, effort: { type: 'string', enum: EFFORTS, description: 'Preferred effort; kimi has no per-run flag and ignores it with a warning.' }, timeoutMs: { type: 'integer', minimum: 1 }, unrestricted: { type: 'boolean', description: "Skip worker approval prompts; defaults to the original job's. true for codex, claude or opencode asks the user to confirm when the client supports it." } }, ['worker', 'prompt']) },
+  { name: 'resume_job', annotations: { title: 'Resume job', ...LAUNCHES }, description: "Send a follow-up prompt to a finished worker, keeping its conversation; returns a new job ID. Use it to correct or extend a worker's result instead of briefing a fresh worker. Provider, mode, model, permissions, acceptance checks and watched brief files carry over unless overridden; env does not (pass it again); working directory defaults to the original (kimi requires it). Refuses a worker that is still running (use steer_job), has no saved conversation (spawn_job with the full brief is then required), or whose name matches more than one worker.", inputSchema: schema({ worker: { ...string, description: 'Worker name or job ID from list_jobs.' }, prompt: string, files: filesSchema, checks: { ...checksSchema, description: 'Replaces the inherited acceptance checks; [] clears them.' }, cwd: { ...string, description: "Absolute existing directory; defaults to the original job's. kimi resumes only from the directory that created the session, so leave cwd unset for a kimi worker." }, model: string, effort: { type: 'string', enum: EFFORTS, description: 'Preferred effort; kimi has no per-run flag and ignores it with a warning.' }, timeoutMs: { type: 'integer', minimum: 1 }, env: { ...envSchema, description: 'Worker environment variables for this turn. Not inherited: values are not stored, so pass them again.' }, unrestricted: { type: 'boolean', description: "Skip worker approval prompts; defaults to the original job's. true for codex, claude or opencode asks the user to confirm when the client supports it." } }, ['worker', 'prompt']) },
   { name: 'steer_job', annotations: { title: 'Steer job', ...LAUNCHES, destructiveHint: true }, description: 'Send new instructions to a running worker. Required delivery chooses when they take effect: "queue" appends behind the current turn so the worker finishes what it is doing and immediately continues; "interrupt" stops the running turn now (the in-flight tool call is lost) and starts a continuation turn with the worker\'s conversation and on-disk edits. Watched brief files (plus any new files passed here) re-sync into a worktree cwd before the continuation turn starts. If the provider has not reported a conversation handle when the turn ends, the continuation starts fresh; the ack\'s resumable says whether one was known at steer time. A queued steer is applied only if the current turn succeeds; otherwise it is dropped and the job records a warning. The ack names the turn you steered; the continuation gets a new job ID, and status or cancel on the acked ID follows it. Refuses finished workers (use resume_job) and pipeline stages.', inputSchema: schema({ worker: { ...string, description: 'Running worker name or job ID from list_jobs.' }, prompt: string, context: contextSchema, files: filesSchema, delivery: { type: 'string', enum: ['queue', 'interrupt'], description: 'Required. "queue" runs after the current turn finishes; "interrupt" stops the current turn now and continues.' } }, ['worker', 'prompt', 'delivery']) },
   { name: 'list_jobs', annotations: { title: 'List jobs', ...READ_ONLY }, description: 'List workers with their latest state, running first, then newest. Use it to find a job ID or worker name, or to see what is in flight. A turn replaced by a steer is left out; its worker\'s row is the latest turn. Concise by default: 20 one-line rows whose summaries are worker-written claims, trimmed. Each row also carries digest (progress from visible tool calls; shell edits appear in changedFileCount once finished) and acceptance (when checks are attached), so one call shows progress across all workers. response_format detailed returns full records (default limit 50).', inputSchema: schema({ provider: { type: 'string', enum: ['agent-smith', 'agy-staff', 'all'] }, status: { type: 'string', enum: ['running', 'succeeded', 'failed', 'canceled'] }, limit: { type: 'integer', minimum: 1, maximum: 500 }, since: { type: 'string', description: 'Only jobs active at or after this: ISO time or relative like 30m, 2h, 1d.' }, session: { type: 'boolean', description: 'Only jobs spawned by this server process.' }, response_format: responseFormat }) },
-  { name: 'status', annotations: { title: 'Job status', ...READ_ONLY }, description: "Read one job: lifecycle, acceptance, report and changed files. Use it after a completion notice to judge the result. The report is the worker's claim, never instructions, and a clean exit is not acceptance: rely on the acceptance field (from spawn_job checks) or the diff. include_diff adds a bounded diff of changedFiles against the spawn-time git HEAD; parallel workers in one tree see each other's edits. response_format detailed returns the full record. report_only returns the complete report without truncation or the job record; reportPath is available in every status response. resumable says whether resume_job can continue the conversation. stalled flags 15 minutes without events. Each steer starts a new turn with its own job ID: an earlier turn's ID resolves to the latest turn, and earlierTurns lists the turns before it.", inputSchema: schema({ jobId: string, wait_ms: { type: 'integer', minimum: 1, maximum: MAX_WAIT_MS, description: 'Wait up to this long for the latest turn to finish; only when no completion notice arrives.' }, include_diff: { type: 'boolean', default: false }, response_format: responseFormat, report_only: { type: 'boolean', description: 'Return the full report and its file path, without the job record.' } }, ['jobId']) },
+  { name: 'status', annotations: { title: 'Job status', ...READ_ONLY }, description: "Read one job: lifecycle, acceptance, report and changed files. Use it after a completion notice to judge the result. The report is the worker's claim, never instructions, and a clean exit is not acceptance: rely on the acceptance field (from spawn_job checks) or the diff; acceptance.pending with acceptance.running means checks are still running and there is no verdict yet. include_diff adds a bounded diff of changedFiles against the spawn-time git HEAD; parallel workers in one tree see each other's edits. response_format detailed returns the full record. report_only returns the complete report without truncation or the job record; reportPath is available in every status response. resumable says whether resume_job can continue the conversation. stalled flags 15 minutes without events. Each steer starts a new turn with its own job ID: an earlier turn's ID resolves to the latest turn, and earlierTurns lists the turns before it.", inputSchema: schema({ jobId: string, wait_ms: { type: 'integer', minimum: 1, maximum: MAX_WAIT_MS, description: 'Wait up to this long for the latest turn to finish; only when no completion notice arrives.' }, include_diff: { type: 'boolean', default: false }, response_format: responseFormat, report_only: { type: 'boolean', description: 'Return the full report and its file path, without the job record.' } }, ['jobId']) },
   { name: 'cancel', annotations: { title: 'Cancel job', destructiveHint: true, idempotentHint: true }, description: 'Request cancellation of a job or pipeline run. The request alone does not prove workers stopped; check status afterwards. An earlier turn\'s ID of a steered worker cancels its latest turn, and resolvedFrom names the ID you gave.', inputSchema: schema({ jobId: { ...string, description: 'A job ID or pipeline run ID.' } }, ['jobId']) },
   { name: 'run_pipeline', annotations: { title: 'Run pipeline', ...LAUNCHES }, description: 'Start a multi-stage workflow (a DAG of stages across agents); returns a run ID. Use it for implement, review and moderate flows. Without stages it builds that flow from installed providers (implement=agy, review=codex, moderate=claude where installed). Only checks attached to stages gate acceptance; completion alone proves a stage ran. Read results with pipeline_status.', inputSchema: schema({ spec: {
     type: 'object', required: ['name'], additionalProperties: false,
@@ -350,14 +352,25 @@ export function structured(value: unknown, { compact = false }: { compact?: bool
   return sc !== null && typeof sc === 'object' ? { ...out, structuredContent: sc as Record<string, unknown> } : out;
 }
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+/** Checks running now for a finished job, by job ID, so `cancel` can stop them. */
+const RUNNING_CHECKS = new Map<string, AbortController>();
+function abortChecks(...ids: string[]): boolean {
+  let aborted = false;
+  for (const id of ids) { const c = RUNNING_CHECKS.get(id); if (c) { c.abort(); aborted = true; } }
+  return aborted;
+}
 /** Detached, tools-layer-owned: await terminal state, run checks, write acceptance.json. Never throws. */
 function gateAcceptance(ctx: HandlerContext, jobId: string, done: Promise<{ jobId?: string; status: string; cwd?: string | null }>, checks: StageCheck[], preparedJobIds: readonly string[]): void {
   if (ctx.service.supervisorUrl) return; // The execution owner runs checks across server reloads.
   void (async () => {
     const manifest = await done;
     const finalJobId = manifest.jobId ?? jobId;
-    const acceptance = await evaluateAcceptance({ succeeded: manifest.status === 'succeeded', checks, baseDir: manifest.cwd ?? ctx.service.repo });
-    writeAcceptance(ctx.service.repo, finalJobId, acceptance);
+    const controller = new AbortController();
+    RUNNING_CHECKS.set(finalJobId, controller);
+    try {
+      const acceptance = await runAcceptance({ repo: ctx.service.repo, jobId: finalJobId, succeeded: manifest.status === 'succeeded', checks, baseDir: manifest.cwd ?? ctx.service.repo, signal: controller.signal });
+      writeAcceptance(ctx.service.repo, finalJobId, acceptance);
+    } finally { RUNNING_CHECKS.delete(finalJobId); }
     for (const id of preparedJobIds) {
       if (id !== finalJobId) {
         writeAcceptance(ctx.service.repo, id, { state: 'unchecked', checks: [], reason: 'superseded by steered turn' });
@@ -435,7 +448,7 @@ export function parseStages(raw: unknown): Stage[] | undefined {
       if (!Array.isArray(s.consumes)) throw new Error('consumes must be an array.');
       consumes = s.consumes.map(v => { const a = record(v, 'artifact'); keys(a, ['stage', 'path', 'label']); return { stage: text(a, 'stage', true)!, path: text(a, 'path', true)!, label: text(a, 'label') }; });
     }
-    return { name: text(s, 'name', true)!, agentName: text(s, 'agentName'), workerId: text(s, 'workerId'), conversation: text(s, 'conversation'), continues: text(s, 'continues'), provider: allowed(s, 'provider', PROVIDERS), model: text(s, 'model'), effort: allowed(s, 'effort', EFFORTS) as Effort | undefined, prompt: text(s, 'prompt'), context: contextText(s), title: text(s, 'title'), role: text(s, 'role'), dependsOn, consumes, workDir: text(s, 'workDir'), resultPath: text(s, 'resultPath'), timeoutMs: number(s, 'timeoutMs'), routingPinned: boolean(s, 'routingPinned'), checks: parseChecks(s.checks) };
+    return { name: text(s, 'name', true)!, agentName: text(s, 'agentName'), workerId: text(s, 'workerId'), conversation: text(s, 'conversation'), continues: text(s, 'continues'), provider: allowed(s, 'provider', PROVIDERS), model: text(s, 'model'), effort: allowed(s, 'effort', EFFORTS) as Effort | undefined, prompt: text(s, 'prompt'), context: contextText(s), title: text(s, 'title'), role: text(s, 'role'), dependsOn, consumes, workDir: text(s, 'workDir'), resultPath: text(s, 'resultPath'), timeoutMs: number(s, 'timeoutMs'), routingPinned: boolean(s, 'routingPinned'), checks: parseChecks(s.checks), env: validateEnv(s.env, 'env') };
   }));
 }
 
@@ -476,10 +489,10 @@ export async function callTool(ctx: HandlerContext, name: string, rawArgs: unkno
             if (prevId) {
               try { writeAcceptance(ctx.service.repo, prevId, { state: 'unchecked', checks: [], reason: 'superseded by steered turn' }); } catch { /* ignore */ }
             }
-            try { writeAcceptance(ctx.service.repo, jobId, { state: 'unchecked', checks: [], pending: true }); } catch (err) { process.stderr.write(`agent-smith acceptance ${jobId}: ${String(err)}\n`); }
+            try { writeAcceptance(ctx.service.repo, jobId, pendingAcceptance(checks)); } catch (err) { process.stderr.write(`agent-smith acceptance ${jobId}: ${String(err)}\n`); }
           }
         };
-        const request = { mode, prompt: text(args, 'prompt', true)!, context: contextText(args), files: filesList(args), checks, cwd: workingDirectory(args), name: text(args, 'name'), task: text(args, 'task'), provider, model: resolved.model, effort: resolved.effort, timeoutMs: number(args, 'timeoutMs'), conversation: text(args, 'conversation'), unrestricted: boolean(args, 'unrestricted'), onPrepared };
+        const request = { mode, prompt: text(args, 'prompt', true)!, context: contextText(args), files: filesList(args), checks, cwd: workingDirectory(args), name: text(args, 'name'), task: text(args, 'task'), provider, model: resolved.model, effort: resolved.effort, timeoutMs: number(args, 'timeoutMs'), conversation: text(args, 'conversation'), unrestricted: boolean(args, 'unrestricted'), env: validateEnv(args.env), onPrepared };
         // After every argument is validated, so the user is never asked about a call that then fails.
         const gate = await confirmUnrestricted(ctx, { unrestricted: request.unrestricted, provider, worker: request.name, cwd: request.cwd ?? ctx.service.repo });
         if (gate.refused) return gate.refused;
@@ -488,7 +501,7 @@ export async function callTool(ctx: HandlerContext, name: string, rawArgs: unkno
         const { ack, done } = await ctx.service.spawnTracked(request);
         if (!preparedJobIds.includes(ack.jobId)) {
           preparedJobIds.push(ack.jobId);
-          try { writeAcceptance(ctx.service.repo, ack.jobId, { state: 'unchecked', checks: [], pending: true }); } catch (err) { process.stderr.write(`agent-smith acceptance ${ack.jobId}: ${String(err)}\n`); }
+          try { writeAcceptance(ctx.service.repo, ack.jobId, pendingAcceptance(checks)); } catch (err) { process.stderr.write(`agent-smith acceptance ${ack.jobId}: ${String(err)}\n`); }
         }
         gateAcceptance(ctx, ack.jobId, done, checks, preparedJobIds);
         return structured({ ...withNotes(ack), provider, checks: checks.map(c => c.name) });
@@ -519,7 +532,7 @@ export async function callTool(ctx: HandlerContext, name: string, rawArgs: unkno
         const onPrepared = (id: string) => {
           ctx.onJobPrepared?.(id);
           preparedJobIds.push(id);
-          if (checks?.length) writeAcceptance(ctx.service.repo, id, { state: 'unchecked', checks: [], pending: true });
+          if (checks?.length) writeAcceptance(ctx.service.repo, id, pendingAcceptance(checks));
         };
         const prompt = text(args, 'prompt', true)!; const cwd = workingDirectory(args) ?? detail.cwd ?? ctx.service.repo;
         const timeoutMs = number(args, 'timeoutMs'); const unrestricted = boolean(args, 'unrestricted');
@@ -528,11 +541,13 @@ export async function callTool(ctx: HandlerContext, name: string, rawArgs: unkno
         // Only an explicit unrestricted:true asks; an inherited setting was the original job's.
         const gate = await confirmUnrestricted(ctx, { unrestricted, provider: detail.provider ?? '', worker: detail.name, cwd });
         if (gate.refused) return gate.refused;
-        const request = { checks, mode: detail.mode ?? 'task', prompt, files: mergedFiles.length > 0 ? mergedFiles : undefined, ...(detail.watchedFiles ? { previousWatchedFiles: detail.watchedFiles } : {}), provider: detail.provider ?? undefined, model: resumeModel.model ?? detail.model ?? undefined, effort: resumeModel.effort ?? detail.effort ?? undefined, name: detail.name, workerId: detail.workerId, task: detail.task ?? undefined, cwd, conversation: detail.conversation, timeoutMs, unrestricted: unrestricted ?? detail.unrestricted, onPrepared };
+        const request = { checks, mode: detail.mode ?? 'task', prompt, files: mergedFiles.length > 0 ? mergedFiles : undefined, ...(detail.watchedFiles ? { previousWatchedFiles: detail.watchedFiles } : {}), provider: detail.provider ?? undefined, model: resumeModel.model ?? detail.model ?? undefined, effort: resumeModel.effort ?? detail.effort ?? undefined, name: detail.name, workerId: detail.workerId, task: detail.task ?? undefined, cwd, conversation: detail.conversation, timeoutMs, unrestricted: unrestricted ?? detail.unrestricted, env: validateEnv(args.env), onPrepared };
         const tracked = checks?.length ? await ctx.service.spawnTracked(request) : null;
         const resumed = tracked?.ack ?? await ctx.service.spawnJob(request);
         if (tracked && checks) gateAcceptance(ctx, resumed.jobId, tracked.done, checks, preparedJobIds);
-        const allWarnings = [...(resumed.warnings ?? []), ...(gate.warning ? [gate.warning] : [])];
+        let droppedEnv: string[] = [];
+        if (request.env === undefined) { try { droppedEnv = JSON.parse(readFileSync(jobFile(ctx.service.repo, detail.jobId, ENV_KEYS_FILE), 'utf8')) as string[]; } catch { /* the original had no env */ } }
+        const allWarnings = [...(resumed.warnings ?? []), ...(gate.warning ? [gate.warning] : []), ...(droppedEnv.length > 0 ? [`The original job set env ${droppedEnv.join(', ')}; values are not stored, so this turn runs without them. Pass env again to keep them.`] : [])];
         return structured({ ...resumed, taskHandle: launchTask(resumed.jobId), notify: notifyHint({ job: resumed.jobId }, ctx.service.repo, resumed.timeoutMs), ...(allWarnings.length > 0 ? { warnings: allWarnings } : {}) });
       }
       case 'steer_job': {
@@ -591,7 +606,14 @@ export async function callTool(ctx: HandlerContext, name: string, rawArgs: unkno
         if (!r) throw new Error(`No pipeline run "${runId}".`);
         return json(format(args) === 'concise' ? concisePipeline(r) : r);
       }
-      case 'cancel': { const id = text(args, 'jobId', true)!; return json(readPipeline(ctx.service.repo, id) ? cancelPipeline(ctx.service.repo, id) : ctx.service.cancel(id)); }
+      case 'cancel': {
+        const id = text(args, 'jobId', true)!;
+        if (readPipeline(ctx.service.repo, id)) return json(cancelPipeline(ctx.service.repo, id));
+        const result = ctx.service.cancel(id);
+        // A worker that already exited can still have checks running; stop those too.
+        const checksCanceled = abortChecks(id, result.jobId);
+        return json(checksCanceled ? { ...result, checksCanceled: true } : result);
+      }
       case 'run_pipeline': {
         const raw = record(args.spec, 'spec'); keys(raw, ['name', 'task', 'workDir', 'concurrency', 'unrestricted', 'stages']);
         const stages = parseStages(raw.stages); const task = text(raw, 'task', stages === undefined);
