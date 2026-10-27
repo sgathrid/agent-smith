@@ -1,4 +1,4 @@
-import {randomUUID,createHash,randomBytes}from'node:crypto';import {mkdirSync,writeFileSync,createWriteStream,readFileSync,renameSync,unlinkSync,openSync,fsyncSync,closeSync,appendFileSync,statSync,existsSync,copyFileSync,readdirSync,realpathSync,lstatSync}from'node:fs';import path from'node:path';import {spawn,execFile,fork}from'node:child_process';import {access,constants}from'node:fs/promises';import os from'node:os';import readline from'node:readline';import {b as exitReason,P as PROGRESS_FLUSH_MS,t as taskTitle,S as SCHEMA_VERSION,c as attributeChanged,d as diffChangedFiles,f as deriveStatus,g as failureFields,j as jobFile,F as FILES,s as shouldFlush,l as looksEmpty,i as isForgeStatePath,h as toVerifyChecks,n as normalizeAcceptanceReport,k as runChecks,m as acceptanceChecksFromReport,o as acceptanceState,w as writeAcceptance,A as AgentSmithReader,p as AgyStaffReader,C as ClaudeCodeReader,q as normalize,u as isPidAlive,v as deriveOrphan,R as REASONS,a as readAcceptance,x as jobsDir,y as newJobId$1,z as jobDir,D as DEFAULT_TIMEOUT_MS$1,B as isForgeJobId,E as SMITH_PAYLOAD,G as nextActionFor}from'./chunk-checks.js';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';/**
+import {randomUUID,createHash,randomBytes}from'node:crypto';import {mkdirSync,writeFileSync,createWriteStream,readFileSync,renameSync,unlinkSync,openSync,fsyncSync,closeSync,appendFileSync,existsSync,statSync,copyFileSync,readdirSync,realpathSync,lstatSync}from'node:fs';import path from'node:path';import {spawn,execFile,fork}from'node:child_process';import {access,constants}from'node:fs/promises';import os from'node:os';import readline from'node:readline';import {e as exitReason,P as ProgressTracker,c as PROGRESS_FLUSH_MS,t as taskTitle,S as SCHEMA_VERSION,d as attributeChanged,f as diffChangedFiles,s as shouldFlush,j as jobFile,F as FILES,g as classify,h as cwdFacts,i as deriveStatus,k as failureFields,l as FAILED_EARLY_MS,m as looksEmpty,n as isForgeStatePath,p as pendingAcceptance,o as toVerifyChecks,q as normalizeAcceptanceReport,u as runChecks,v as acceptanceChecksFromReport,x as acceptanceState,w as writeAcceptance,A as AgentSmithReader,y as AgyStaffReader,C as ClaudeCodeReader,z as normalize,B as isPidAlive,E as deriveOrphan,R as REASONS,a as readAcceptance,G as jobsDir,H as newJobId$1,I as jobDir,D as DEFAULT_TIMEOUT_MS$1,J as isForgeJobId,K as SMITH_PAYLOAD,L as nextActionFor}from'./chunk-progress.js';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';/**
  * pipeline/routing.ts — dynamic model/stage selection.
  *
  * Six rules, each backed by a measurement. If you change one of these, change
@@ -1396,6 +1396,8 @@ function createEventBus(maxQueue = 4096) {
         },
     };
 }
+/** Default heartbeat interval; mirrors surfaces/mod/hooks/stale.ts HEARTBEAT_MS. */
+const HEARTBEAT_MS = 30_000;
 const STDERR_CAPTURE_LIMIT = 256 * 1024; // 256 KB retained in memory for JobResult
 const STDERR_LOG_LIMIT = 4 * 1024 * 1024; // 4 MB retained on disk
 /**
@@ -1428,6 +1430,8 @@ function spawnWorker(opts) {
     let killReason;
     let killTimer;
     let timeoutTimer;
+    let heartbeatTimer;
+    let firstBeat;
     const killGraceMs = Math.max(0, opts.killGraceMs ?? 5_000);
     function signalTree(signal) {
         const pid = handle.pid;
@@ -1480,6 +1484,51 @@ function spawnWorker(opts) {
         // Do not hold the event loop open on our account.
         timeoutTimer.unref?.();
     }
+    // Liveness from the process owner. Provider events stop during a long tool
+    // call; this does not. The first beat waits one macrotask so the caller has
+    // subscribed to the adapter's bus (spawn resolves first).
+    //
+    // The beat stops when the CLI process EXITS, not when its stdio closes: a
+    // descendant that inherited stdout can hold it open long after the worker
+    // died, and beats in that window would make a dead pid look alive. Each beat
+    // also probes the pid itself and stops if it is gone.
+    let leaderExited = false;
+    const stopHeartbeat = () => {
+        leaderExited = true;
+        if (firstBeat !== undefined)
+            clearTimeout(firstBeat);
+        if (heartbeatTimer !== undefined)
+            clearInterval(heartbeatTimer);
+        firstBeat = undefined;
+        heartbeatTimer = undefined;
+    };
+    handle.on('exit', stopHeartbeat);
+    const onHeartbeat = opts.onHeartbeat;
+    const pid = handle.pid;
+    if (onHeartbeat !== undefined && pid !== undefined) {
+        const beat = () => {
+            if (leaderExited)
+                return;
+            try {
+                process.kill(pid, 0);
+            }
+            catch (err) {
+                // EPERM: it exists, we just may not signal it. Anything else: gone.
+                if (err.code !== 'EPERM') {
+                    stopHeartbeat();
+                    return;
+                }
+            }
+            try {
+                onHeartbeat(nowIso(), pid);
+            }
+            catch { /* a listener must not kill the worker */ }
+        };
+        firstBeat = setTimeout(beat, 0);
+        firstBeat.unref?.();
+        heartbeatTimer = setInterval(beat, Math.max(1, opts.heartbeatMs ?? HEARTBEAT_MS));
+        heartbeatTimer.unref?.();
+    }
     const exited = new Promise((resolve) => {
         let settled = false;
         const finish = (code, signal) => {
@@ -1488,6 +1537,7 @@ function spawnWorker(opts) {
             settled = true;
             if (timeoutTimer !== undefined)
                 clearTimeout(timeoutTimer);
+            stopHeartbeat();
             if (killTimer !== undefined) {
                 clearTimeout(killTimer);
                 killTimer = undefined;
@@ -2290,6 +2340,8 @@ const agyProvider = {
             stateDir,
             jobId,
             mode: spec.mode,
+            // Liveness only: on the bus, never in events.jsonl (see ProviderEvent 'heartbeat').
+            onHeartbeat: (at, pid) => bus.emit({ kind: 'heartbeat', at, ...(pid === undefined ? {} : { pid }) }),
             ...(spec.env !== undefined ? { env: spec.env } : {}),
             onStdoutLine(line) {
                 const raw = tryParseObject(line);
@@ -3031,6 +3083,8 @@ const claudeProvider = {
             stateDir,
             jobId,
             mode: spec.mode,
+            // Liveness only: on the bus, never in events.jsonl (see ProviderEvent 'heartbeat').
+            onHeartbeat: (at, pid) => bus.emit({ kind: 'heartbeat', at, ...(pid === undefined ? {} : { pid }) }),
             ...(spec.env !== undefined ? { env: spec.env } : {}),
             onStdoutLine(line) {
                 const raw = tryParseObject(line);
@@ -3772,6 +3826,8 @@ const codexProvider = {
             stateDir,
             jobId,
             mode: spec.mode,
+            // Liveness only: on the bus, never in events.jsonl (see ProviderEvent 'heartbeat').
+            onHeartbeat: (at, pid) => bus.emit({ kind: 'heartbeat', at, ...(pid === undefined ? {} : { pid }) }),
             ...(spec.env !== undefined ? { env: spec.env } : {}),
             onStdoutLine(line) {
                 const raw = tryParseObject(line);
@@ -4483,6 +4539,8 @@ const kimiProvider = {
             stateDir,
             jobId,
             mode: spec.mode,
+            // Liveness only: on the bus, never in events.jsonl (see ProviderEvent 'heartbeat').
+            onHeartbeat: (at, pid) => bus.emit({ kind: 'heartbeat', at, ...(pid === undefined ? {} : { pid }) }),
             ...(spec.env !== undefined ? { env: spec.env } : {}),
             onStdoutLine(line) {
                 const raw = tryParseObject(line);
@@ -4813,6 +4871,8 @@ function addUsage(previous, next) {
 /** Terminal-state words we might see on a tool part. */
 const DONE_WORDS = new Set(['completed', 'complete', 'done', 'success', 'succeeded', 'finished']);
 const ERROR_WORDS = new Set(['error', 'failed', 'failure', 'cancelled', 'canceled', 'aborted']);
+/** Failed tool calls that each get their own warning notice; the rest are only counted. */
+const TOOL_ERROR_NOTICES = 5;
 /**
  * Build the translator.
  *
@@ -4827,6 +4887,7 @@ function createOpencodeTranslator(maxChars) {
         finalText: '',
         sawTerminal: false,
         sawError: false,
+        toolErrors: 0,
         unrecognised: new Set(),
         deniedNotices: [],
         onEvent: () => [],
@@ -4966,8 +5027,21 @@ function createOpencodeTranslator(maxChars) {
                 out.push({ kind: 'activity-end', at, activity: ref, status });
                 if (denied)
                     tx.deniedNotices.push(toolName);
-                if (isErr)
-                    tx.sawError = true;
+                else if (isErr) {
+                    // A failed tool call (a `read` of a missing path) is evidence, not a
+                    // verdict: the agent usually recovers and still delivers its report.
+                    // Only `error` / `session.error`, a nonzero exit or an empty report fail the job.
+                    tx.toolErrors += 1;
+                    const detail = (stateErrorText ?? output?.text ?? '').split('\n')[0].slice(0, 160);
+                    // The count is the evidence; past a few, per-call warnings only bury real ones.
+                    if (tx.toolErrors <= TOOL_ERROR_NOTICES)
+                        out.push({
+                            kind: 'notice',
+                            at,
+                            level: 'warn',
+                            message: `opencode tool ${toolName} failed (step ${idx})${detail === '' ? '' : `: ${detail}`}`,
+                        });
+                }
             }
             else {
                 // In-flight: emit an update so a long tool call is not a silent gap.
@@ -5066,6 +5140,7 @@ function buildResult(args) {
     let error;
     // Event types the parser did not know: the clue when a run looks empty or broken.
     const unrecognised = tx.unrecognised.size > 0 ? ` · unrecognised events: ${[...tx.unrecognised].join(', ')}` : '';
+    const toolErrors = tx.toolErrors > 0 ? ` · ${tx.toolErrors} tool error(s)` : '';
     if (exit.killReason === 'cancelled') {
         status = 'cancelled';
         error = 'canceled';
@@ -5075,9 +5150,9 @@ function buildResult(args) {
         error = timedOutText(durationMs);
     }
     else if (tx.sawError) {
-        // An `error` event or an error-state tool part. opencode's provider.quota
-        // 402 exits 1 with an error event and no text, so this is the common path
-        // for a misconfigured account.
+        // An `error` or `session.error` event (never a failed tool call: see
+        // toolErrors). opencode's provider.quota 402 exits 1 with an error event
+        // and no text, so this is the common path for a misconfigured account.
         status = 'error';
         error = `${tx.error ?? 'worker error'}${unrecognised}${stderrClause(exit.stderr)}`;
     }
@@ -5089,7 +5164,7 @@ function buildResult(args) {
     }
     else if (exit.code !== 0) {
         status = 'error';
-        error = `exited ${exit.code}${unrecognised}${stderrClause(exit.stderr)}`;
+        error = `exited ${exit.code}${unrecognised}${toolErrors}${stderrClause(exit.stderr)}`;
     }
     else if (tx.finalText.trim() === '') {
         // Exited 0 with no text and no error event. Do not call that a success.
@@ -5099,7 +5174,7 @@ function buildResult(args) {
         // Most likely an event-shape gap in the adapter, not an empty model reply:
         // check events.jsonl and extend the parser.
         status = 'malformed';
-        error = `no output${unrecognised}${stderrClause(exit.stderr)}`;
+        error = `no output${unrecognised}${toolErrors}${stderrClause(exit.stderr)}`;
     }
     else {
         status = 'success';
@@ -5205,6 +5280,8 @@ const opencodeProvider = {
             stateDir,
             jobId,
             mode: spec.mode,
+            // Liveness only: on the bus, never in events.jsonl (see ProviderEvent 'heartbeat').
+            onHeartbeat: (at, pid) => bus.emit({ kind: 'heartbeat', at, ...(pid === undefined ? {} : { pid }) }),
             ...(spec.env !== undefined ? { env: spec.env } : {}),
             onStdoutLine(line) {
                 const raw = tryParseObject(line);
@@ -5404,506 +5481,6 @@ function createMarker(filePath, body) {
         closeSync(fd);
     }
     return true;
-}/**
- * format.ts — PURE presentation logic for the /forge pane and the band.
- *
- * WHY THIS FILE IS NOT `register.tsx`:
- * `node --test --experimental-strip-types` CANNOT load a .tsx file — TypeScript's
- * type stripping has no JSX transform (verified: any JSX element in an imported
- * .tsx is a hard parse error). So if the formatters lived next to the render
- * code they would be untestable under the repo's own test runner, which defeats
- * the point of making them pure in the first place. Everything testable lives
- * here, in a module with zero imports and zero I/O. `register.tsx` imports this
- * file and does nothing but lay out what these functions return.
- *
- * NOTHING in here reads the clock, the filesystem, or any atom. "Now" is always
- * a parameter, for the same reason core/liveness.ts does it: a formatter that
- * called Date.now() itself could not be tested at a boundary.
- *
- * THE RULES ENCODED BELOW come from agent-configs/shared/TERMINAL-UI.md. Where a
- * rule needed interpretation the reasoning is inline.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * THE ROW, IN ONE PLACE
- * ─────────────────────────────────────────────────────────────────────────────
- * Every job row in either surface is these four segments, in this order:
- *
- *     {glyph} {label} {detail} {elapsed}
- *       1        2       3        4
- *
- *   1 glyph     EAW=Neutral, one column, always drawn. Never colour alone.
- *   2 label     THE TASK, from `prompt_source.task`. Fixed-width cell.
- *   3 detail    what it is doing (live) or how it ended (terminal). Fixed cell.
- *   4 elapsed   fixed 6 columns, RIGHT-aligned, and LAST — see ELAPSED_WIDTH.
- *
- * WHY THE JOB ID IS NOT ON THE ROW ANY MORE. Measured against the real 20-job
- * corpus in .agy-staff/jobs: every id is `implement-musm82da-f1dc1fe4`. That is
- * 30 columns of which the mode is constant (`implement`, 100% of the corpus, so
- * it is not information) and `-f1dc1fe4` is a UUID fragment that distinguishes
- * nothing a reader can act on. The request the job was actually given sits in
- * `prompt_source.task` and reads "open an agent-built dashboard with real names,
- * decoded inside Renyi". That is the identity. The id survives in the DETAIL
- * view, where it is what you would paste into `agy` to talk about the job.
- *
- * WHY ELAPSED IS LAST AND FIXED-WIDTH. TERMINAL-UI.md §Width: "put the volatile
- * field last — elapsed time ticks every second; if it sits mid-line, everything
- * after it shifts horizontally each tick." The pane used to put the clock second
- * and rely on right-alignment; that is safe (see ELAPSED_WIDTH) but it is a
- * weaker version of the same guarantee than simply putting the field last, and
- * the band already did the latter. Both surfaces now agree, so there is no
- * band/pane ordering deviation left to document.
- */
-/**
- * Strip complete ANSI escape sequences (CSI, OSC, DCS/PM/APC/SOS, 2-byte ESC,
- * C1 controls) and remaining forbidden control characters, unpaired surrogates,
- * and noncharacters (`U+FDD0..U+FDEF`), while preserving `\n` and valid UTF-16
- * surrogate pairs.
- *
- * Why this exists: Claude Code's JSX element validator rejects any `<Text>`,
- * `<Button label>`, or `<Markdown text>` containing C0/C1 controls (except `\t`
- * and `\n`), lone surrogates, or `U+FDD0..U+FDEF`. Worker tool output, shell
- * commands, check output, and prompt text routinely contain ANSI colour codes or
- * `\r` progress lines; stripping them at the UI boundary keeps the stored job
- * files intact while preventing a single control byte from aborting the pane.
- */
-const ANSI_ESCAPE = /(?:\x1b\][\s\S]*?(?:\x07|\x1b\\|\x9c)|\x9d[\s\S]*?(?:\x07|\x1b\\|\x9c)|\x1b[PX^_][\s\S]*?(?:\x1b\\|\x9c)|(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]|\x1b[ -/]*[@-~])/gu;
-const FORBIDDEN_CONTROLS = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ud800-\udfff\ufdd0-\ufdef]/gu;
-function sanitizeText(s) {
-    return s
-        .replace(ANSI_ESCAPE, '')
-        .replace(/\r\n?/g, '\n')
-        .replace(/\t/g, '  ')
-        .replace(FORBIDDEN_CONTROLS, '');
-}
-/**
- * Cut to at most `max` UTF-16 units without splitting a surrogate pair.
- *
- * `slice` can leave a high surrogate with no low half. `sanitizeText` removes
- * such halves, so a cut made AFTER sanitizing must not create one: the host
- * draws an unpaired half as U+FFFD, or refuses the tree a Text's string is
- * checked in. `max` stays in UTF-16 units because every caller sizes cells in
- * terminal columns, where a pair already counts as two.
- */
-function clip(s, max) {
-    if (s.length <= max)
-        return s;
-    const cut = s.slice(0, Math.max(0, max));
-    return /[\ud800-\udbff]$/.test(cut) ? cut.slice(0, -1) : cut;
-}
-/** Collapse all whitespace runs to single spaces and cap the length. */
-function oneLine(s, max = 400) {
-    const t = sanitizeText(s).replace(/\s+/g, ' ').trim();
-    return clip(t, max);
-}
-// ── activity, from real agy tool shapes ─────────────────────────────────────
-/**
- * agy tool name + parameters → a short "what is it doing" phrase.
- *
- * Measured against the real corpus in .agy-staff/jobs:
- *   run_command           { CommandLine }
- *   view_file             { AbsolutePath }
- *   write_to_file         { TargetFile }
- *   replace_file_content  { TargetFile }
- *   grep_search           { Query | Pattern }
- *   list_dir              { AbsolutePath }
- *   call_mcp_tool         { ServerName, ToolName, Arguments }
- *   manage_task           { Action, TaskId }
- *   schedule              { DurationSeconds, Prompt }
- *
- * TERMINAL-UI.md §Motion: "terse tool descriptions, never raw output". Every
- * branch truncates at the source; there is no code path that hands raw tool
- * output to a list row.
- */
-function describeTool(tool, params) {
-    const str = (k) => {
-        const v = params[k];
-        return typeof v === 'string' ? oneLine(v) : '';
-    };
-    switch (tool) {
-        case 'run_command':
-            return humanCommand(str('CommandLine'));
-        case 'view_file':
-            return `reading ${basename(str('AbsolutePath'))}`;
-        case 'write_to_file':
-        // Same verb as replace_file_content, deliberately: from the reader's side
-        // there is no difference between "created" and "changed" a file, and the
-        // tool name is an implementation detail of agy, not of the work.
-        case 'replace_file_content':
-            return `editing ${basename(str('TargetFile'))}`;
-        case 'grep_search':
-            return `searching ${basename(str('Query') || str('Pattern'))}`;
-        case 'list_dir':
-            return `listing ${basename(str('AbsolutePath'))}`;
-        case 'call_mcp_tool':
-            return `${str('ToolName') || str('ServerName') || 'an mcp tool'}`;
-        case 'manage_task':
-            return `task ${str('Action') || 'update'}`;
-        case 'schedule':
-            return `waiting ${str('DurationSeconds') || '?'}s`;
-        default:
-            return `using ${oneLine(tool)}`;
-    }
-}
-/**
- * A shell command → what a person would say they are doing.
- *
- * The corpus is 76 run_command records and the raw line is what put
- * `cargo tree -p renyi-mcp -e features -i` on a status row: real, precise, and
- * unreadable at a glance. So the COMMON commands get a verb, and anything else
- * gets a TRIMMED form rather than an invented one.
- *
- * The fallback rule is the important half. When there is no mapping this shows
- * the command's first two words and stops — `git rebase --onto main feature/x`
- * becomes `git rebase`, not `preparing the branch`. Inventing a plausible verb
- * for an arbitrary command would be a lie the user cannot check, and it would be
- * a lie in the one field the band exists to be trustworthy about. `cargo tree`
- * is in the table because it appears in the corpus four times, not because it
- * is universally understood.
- */
-function humanCommand(cmd) {
-    const line = oneLine(cmd);
-    if (line === '')
-        return 'running a command';
-    // A pipeline or a `&&` chain is several actions; the first is what the job is
-    // doing now, and the rest are what it will do after. `cargo test 2>&1 | tail`
-    // is "running tests", not "running a shell pipeline".
-    const first = line.split(/\s*(?:&&|\|\||;|\||&&)\s*/)[0] ?? line;
-    const words = first.split(' ').filter((w) => !w.startsWith('-'));
-    const prog = basename(words[0] ?? '');
-    const sub = words[1] ?? '';
-    switch (prog) {
-        case 'cargo':
-        case 'rustup':
-            switch (sub) {
-                case 'test':
-                case 'nextest':
-                    return 'running tests';
-                case 'clippy':
-                    return 'linting';
-                case 'fmt':
-                    return 'formatting';
-                case 'build':
-                    return 'building';
-                case 'check':
-                    return 'checking the build';
-                case 'tree':
-                    return 'inspecting dependencies';
-                case 'doc':
-                    return 'reading the docs';
-                case 'run':
-                    return `running ${basename(words[2] ?? 'the binary')}`;
-            }
-            break;
-        case 'npm':
-        case 'pnpm':
-        case 'yarn':
-        case 'bun':
-            // `npm test` and `npm run test` are the same intent; `npm run build` is
-            // building. Anything else under `npm run` is somebody's script and we do
-            // not know what it does.
-            if (sub === 'test')
-                return 'running tests';
-            if (sub === 'run' && (words[2] === 'build'))
-                return 'building';
-            if (sub === 'run' && (words[2] === 'test'))
-                return 'running tests';
-            return `running ${prog} scripts`;
-        case 'python':
-        case 'python3':
-            return 'running a script';
-        case 'git':
-            if (sub === 'status' || sub === 'diff' || sub === 'log' || sub === 'show')
-                return 'checking git';
-            if (sub === 'commit')
-                return 'committing';
-            if (sub === 'push')
-                return 'pushing';
-            return `git ${sub}`.trim();
-        case 'grep':
-        case 'rg':
-        case 'ag':
-            return 'searching';
-        case 'graft':
-            return `navigating the graph`;
-    }
-    // The honest fallback: the command's name, and at most one argument.
-    const trimmed = words.slice(0, 2).join(' ');
-    return trimmed === '' ? 'running a command' : trimmed;
-}
-/** Last path segment only. */
-function basename(p) {
-    const i = p.lastIndexOf('/');
-    return i === -1 ? p : p.slice(i + 1);
-}
-/**
- * `input_preview` is a JSON STRING of the tool parameters, truncated by agy-staff.
- * A truncated JSON string does not parse, so this never throws — a failure just
- * means we have no parameters and the caller falls back to the bare tool name.
- */
-function parseInputPreview(preview) {
-    if (!preview)
-        return {};
-    try {
-        const v = JSON.parse(preview);
-        return typeof v === 'object' && v !== null ? v : {};
-    }
-    catch {
-        return {};
-    }
-}const READ_TOOLS = new Set(['view_file', 'read', 'read_file', 'list_dir', 'ls', 'list', 'notebookread', 'readmediafile']);
-const SEARCH_TOOLS = new Set(['grep_search', 'grep', 'glob', 'find_by_name', 'search_files', 'find_files', 'codebase_search', 'search_web', 'web_search', 'websearch', 'webfetch', 'fetchurl']);
-const EDIT_TOOLS = new Set(['write_to_file', 'replace_file_content', 'edit', 'edit_file', 'write', 'write_file', 'create_file', 'str_replace_editor', 'multiedit', 'notebookedit', 'patch', 'file_change', 'apply_patch']);
-const COMMAND_TOOLS = new Set(['run_command', 'bash', 'shell', 'command_execution', 'exec']);
-const PATH_KEYS = ['AbsolutePath', 'TargetFile', 'file_path', 'filePath', 'notebook_path', 'path'];
-const COMMAND_KEYS = ['CommandLine', 'command', 'cmd'];
-/** `/bin/zsh -lc 'cat x'` and `bash -lc "…"` → the command inside. codex names a shell call by its command line. */
-function unwrapShell(command) {
-    const m = /^\s*(?:\S*\/)?(?:ba|z|)sh\s+-l?c\s+(['"])([\s\S]*)\1\s*$/.exec(command);
-    return m ? m[2] : command;
-}
-const TEST_RE = /\b(?:pytest|jest|vitest|mocha|tox|nox|rspec|phpunit|ctest|unittest)\b|\b(?:cargo|go|npm|pnpm|yarn|bun|deno|dotnet|mvn|gradle|swift|mix)\s+(?:run\s+)?(?:test|nextest|verify)\b|\bmake\s+(?:test|check)\b|\bnode\s+--test\b/;
-const SEARCH_PROGS = new Set(['grep', 'rg', 'ag', 'ack', 'find', 'fd']);
-/** Steps that prepare a shell rather than do the work. */
-const SETUP_PROGS = new Set(['cd', 'pushd', 'popd', 'export', 'unset', 'source', '.', 'set', 'ulimit']);
-const READ_PROGS = new Set(['cat', 'sed', 'head', 'tail', 'nl', 'less', 'ls', 'tree', 'wc']);
-function classifyCommand(raw) {
-    // A leading `!` negates the exit status; it is not the program.
-    const command = unwrapShell(raw).replace(/\s+/g, ' ').trim().replace(/^!\s*/, '');
-    const segments = command.split(/\s*(?:&&|\|\||;|\|)\s*/).filter((s) => s !== '');
-    const program = (segment) => segment.split(' ').filter((w) => w !== '' && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(w));
-    // `unset VIRTUAL_ENV; uv run pytest`: the setup step is not what the command does.
-    const first = segments.find((s) => !SETUP_PROGS.has(basename(program(s)[0] ?? ''))) ?? segments[0] ?? command;
-    const words = program(first);
-    const prog = basename(words[0] ?? '');
-    const sub = subcommand(words);
-    if (prog === 'git' && sub === 'grep')
-        return { kind: 'search', label: 'git grep' };
-    if (SEARCH_PROGS.has(prog))
-        return { kind: 'search', label: humanCommand(first) };
-    if (READ_PROGS.has(prog))
-        return { kind: 'read', label: humanCommand(first) };
-    if (TEST_RE.test(command))
-        return { kind: 'test', label: 'running tests' };
-    return { kind: 'command', label: humanCommand(first) };
-}
-/** Global options that take a value, so `git -C dir grep` finds `grep`, not `dir`. */
-const VALUE_OPTIONS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace']);
-function subcommand(words) {
-    for (let i = 1; i < words.length; i += 1) {
-        const w = words[i];
-        if (VALUE_OPTIONS.has(w)) {
-            i += 1;
-            continue;
-        }
-        if (!w.startsWith('-'))
-            return w;
-    }
-    return '';
-}
-function firstString(params, keys, raw = '') {
-    for (const k of keys) {
-        const v = params[k];
-        if (typeof v === 'string' && v.trim() !== '')
-            return v;
-    }
-    // A long input (a Write's file body) arrives truncated and no longer parses;
-    // its leading keys are still readable.
-    for (const k of keys) {
-        const m = new RegExp(`"${k}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`).exec(raw);
-        if (m) {
-            try {
-                return JSON.parse(`"${m[1]}"`);
-            }
-            catch {
-                return m[1];
-            }
-        }
-    }
-    return '';
-}
-/**
- * One tool call → its kind and a phrase. Every provider's tool vocabulary:
- * agy (view_file, run_command, …), claude (Read, Edit, Bash, …), opencode (read,
- * edit, bash, …), codex (a shell command line as the tool, or file_change) and
- * kimi (Read, Write, Edit, Grep, Glob, Bash, … — PascalCase, matched lowercased).
- * Input may be truncated JSON; a parse failure falls back to the bare tool name.
- */
-function classify(tool, input) {
-    const params = parseInputPreview(input);
-    const name = tool.trim();
-    const lower = name.toLowerCase();
-    const path = firstString(params, PATH_KEYS, input ?? '');
-    const file = path === '' ? '' : basename(path);
-    if (COMMAND_TOOLS.has(lower))
-        return classifyCommand(firstString(params, COMMAND_KEYS, input ?? ''));
-    if (EDIT_TOOLS.has(lower)) {
-        if (lower === 'file_change') {
-            const changes = Array.isArray(params['changes']) ? params['changes'] : [];
-            const first = changes.map((c) => (c && typeof c === 'object' ? c['path'] : undefined))
-                .find((p) => typeof p === 'string');
-            return { kind: 'edit', label: first ? `editing ${oneLine(basename(first))}` : 'editing files', ...(first ? { path: first } : {}) };
-        }
-        return { kind: 'edit', label: file ? `editing ${oneLine(file)}` : 'editing', ...(path ? { path } : {}) };
-    }
-    if (READ_TOOLS.has(lower)) {
-        const listing = lower === 'list_dir' || lower === 'ls' || lower === 'list';
-        return { kind: 'read', label: file ? `${listing ? 'listing' : 'reading'} ${oneLine(file)}` : 'reading', ...(path && !listing ? { path } : {}) };
-    }
-    if (SEARCH_TOOLS.has(lower)) {
-        const query = oneLine(firstString(params, ['Query', 'Pattern', 'pattern', 'query', 'url'], input ?? ''));
-        const short = query.length > 24 ? `${oneLine(query, 23)}…` : query;
-        return { kind: 'search', label: short ? `searching ${short}` : 'searching' };
-    }
-    // codex: the tool IS the command line.
-    if (/\s/.test(name) || /^(?:\S*\/)?(?:ba|z)?sh$/.test(name))
-        return classifyCommand(name);
-    return { kind: 'other', label: describeTool(name, params) };
-}
-const REPEAT_MIN = 4;
-/** Accumulates one job's tool calls into a ProgressDigest. Feed it every activity start and end. */
-class ProgressTracker {
-    steps = new Map();
-    /**
-     * Steps whose first ACTIVITY event carried no input. A provider can split the
-     * call into "started, parameters not yet known" and "updated, here they are";
-     * such a step is classified but not counted until the input arrives, so a
-     * later update can upgrade it without double-counting.
-     */
-    provisional = new Set();
-    read = new Set();
-    editedSet = new Set();
-    edited = [];
-    /** Edits whose file the tool did not name (codex file_change's shape is unverified): still edits. */
-    unnamedEdits = 0;
-    searches = 0;
-    commands = 0;
-    testRuns = 0;
-    lastTestFailed = false;
-    recent = [];
-    repeatKey = '';
-    repeatLabel = '';
-    repeatCount = 0;
-    activeTest = false;
-    /** A tool call began. Repeated starts of one step (ACTIVE then DONE) are counted once. */
-    start(stepIndex, tool, input) {
-        // Codex passes the shell command line as `tool` with no separate `input`.
-        const effectiveInput = (input ?? '').trim() !== '' ? input : (/\s/.test(tool.trim()) ? tool.trim() : '');
-        const hasInput = effectiveInput !== '';
-        const seen = this.steps.get(stepIndex);
-        if (seen !== undefined) {
-            // The parameters arrived after the step was first seen: classify for real.
-            if (!this.provisional.has(stepIndex) || !hasInput)
-                return;
-            this.provisional.delete(stepIndex);
-            const upgraded = classify(tool, input);
-            this.steps.set(stepIndex, upgraded);
-            this.apply(upgraded, effectiveInput);
-            return;
-        }
-        const c = classify(tool, input);
-        this.steps.set(stepIndex, c);
-        if (!hasInput) {
-            // No input means we do not know what ran. Remember the step so `end()`
-            // keeps its verdict, but do not count a likely-misleading call.
-            this.provisional.add(stepIndex);
-            this.resetRepeat();
-            return;
-        }
-        this.apply(c, effectiveInput);
-    }
-    apply(c, input) {
-        switch (c.kind) {
-            case 'read':
-                if (c.path)
-                    this.read.add(c.path);
-                break;
-            case 'search':
-                this.searches += 1;
-                break;
-            case 'edit':
-                if (c.path) {
-                    if (this.editedSet.has(c.path))
-                        this.edited = this.edited.filter((p) => p !== c.path);
-                    this.editedSet.add(c.path);
-                    this.edited.push(c.path);
-                }
-                else
-                    this.unnamedEdits += 1;
-                break;
-            case 'test':
-                this.testRuns += 1;
-                this.activeTest = true;
-                break;
-            case 'command':
-                this.commands += 1;
-                break;
-        }
-        if (c.kind !== 'other')
-            this.recent = [...this.recent, c].slice(-8);
-        // An unclassified call is not a repeat of anything: "repeating editing ×17"
-        // is not a fact about the worker, it is a fact about a missing input.
-        if (c.kind === 'other') {
-            this.resetRepeat();
-            return;
-        }
-        const key = `${c.kind}\u0000${c.label}\u0000${input ?? ''}`;
-        if (key === this.repeatKey)
-            this.repeatCount += 1;
-        else {
-            this.repeatKey = key;
-            this.repeatLabel = c.label;
-            this.repeatCount = 1;
-        }
-    }
-    resetRepeat() {
-        this.repeatKey = '';
-        this.repeatLabel = '';
-        this.repeatCount = 0;
-    }
-    /** A tool call ended. Only an explicit error marks a test run failed. */
-    end(stepIndex, tool, input, status) {
-        this.start(stepIndex, tool, input);
-        const c = this.steps.get(stepIndex);
-        if (c.kind === 'test') {
-            this.lastTestFailed = status === 'error';
-            this.activeTest = false;
-        }
-    }
-    digest(cwd = '') {
-        const relative = (p) => {
-            const base = cwd.replace(/\/+$/, '');
-            return base !== '' && p.startsWith(`${base}/`) ? p.slice(base.length + 1) : p;
-        };
-        return {
-            phase: this.phase(),
-            filesRead: this.read.size,
-            searches: this.searches,
-            edited: this.edited.slice(-8).map(relative),
-            editedCount: this.editedSet.size + this.unnamedEdits,
-            commands: this.commands,
-            testRuns: this.testRuns,
-            lastTestFailed: this.lastTestFailed,
-            repeat: this.repeatCount >= REPEAT_MIN ? { label: this.repeatLabel, count: this.repeatCount } : null,
-        };
-    }
-    /** All file paths named by edit tool calls so far, relative to `cwd` when inside it. */
-    editedPaths(cwd = '') {
-        const base = cwd.replace(/\/+$/, '');
-        return this.edited.map((p) => (base !== '' && p.startsWith(`${base}/`) ? p.slice(base.length + 1) : p));
-    }
-    /** From a window of recent calls, not the last one alone, so the phase does not flicker. */
-    phase() {
-        const last = this.recent.at(-1);
-        if (last === undefined)
-            return 'starting';
-        if (this.activeTest || last.kind === 'test')
-            return 'testing';
-        if (this.recent.some((c) => c.kind === 'edit'))
-            return 'editing';
-        if (last.kind === 'command')
-            return 'running';
-        return 'exploring';
-    }
 }/**
  * mirror.ts — the compat projection, and the only reason it is allowed to exist.
  *
@@ -6354,6 +5931,8 @@ function parseMarkedSpec(body) {
 const RECENT_ACTIVITIES = 5;
 /** How much assistant text we keep as the "reasoning" cell. */
 const LATEST_TEXT_CHARS = 4_000;
+/** Max length of `latestSummary`. */
+const SUMMARY_CHARS = 1_000;
 /**
  * Owns the on-disk state of exactly one job.
  *
@@ -6374,6 +5953,17 @@ class JobWriter {
     toolCalls = 0;
     toolSteps = new Set();
     latestText = null;
+    /** The current assistant message only (reset at each tool call): what `latestSummary` shows while running. */
+    currentMessage = '';
+    /** Steps whose tool call ended in an error state. */
+    toolErrorSteps = new Set();
+    /** Last heartbeat and the worker pid it named; carried through every progress rebuild. */
+    lastAliveAt = null;
+    workerPid;
+    lastHeartbeatFlushMs = 0;
+    /** Whether the first substantive event (not `started`/`usage`) was an error notice. */
+    firstEventSeen = false;
+    firstEventWasError = false;
     tracker = new ProgressTracker();
     view = { schema: 1, prompt: '', preamble: null, transcript: [], tools: [], timeline: [], truncated: false };
     deltaOpen = false;
@@ -6392,6 +5982,13 @@ class JobWriter {
     toolInputs = '';
     /** Concatenated inputs of edit tool calls only, so read calls never attribute an external edit to the worker. */
     editToolInputs = '';
+    /**
+     * Steps whose edit tool call ENDED without error. The writing-job evidence
+     * for the cwd rule: an edit that errored or was denied changed nothing, so
+     * it must not turn a review into a writing job. (The progress digest counts
+     * edits at start, which is right for the pane but not for a verdict.)
+     */
+    editStepsCompleted = new Set();
     constructor(options) {
         this.repo = options.repo;
         this.jobId = options.jobId;
@@ -6471,6 +6068,7 @@ class JobWriter {
             lastActivity: null,
             latestText: null,
             toolCalls: 0,
+            editsCompleted: 0,
             warnings: [],
         };
         this.mirror.claim(this.jobId);
@@ -6511,6 +6109,10 @@ class JobWriter {
             if (this.baselinePending !== null)
                 await this.baselinePending;
             if (this.manifest === null)
+                return;
+            // A vanished cwd has nothing to diff or compare; finish() records it as
+            // cwdMissingAtFinish + changedFilesUnknown instead of a silent "no edits".
+            if (!existsSync(this.cwd))
                 return;
             const watched = this.manifest.watchedFiles;
             const watchedKeys = watched !== undefined ? Object.keys(watched) : [];
@@ -6564,11 +6166,34 @@ class JobWriter {
         }
         catch { /* best effort */ }
     }
+    /**
+     * Record that the worker's process is alive: progress.json `lastAliveAt` (and
+     * `workerPid`). Not activity: `updatedAt`, `lastEventAt`, the timeline and the
+     * mirror's events stay untouched, and only progress.json is rewritten.
+     */
+    heartbeat(at, pid) {
+        if (this.finished || this.manifest === null || this.progress === null)
+            return;
+        this.lastAliveAt = at;
+        if (typeof pid === 'number')
+            this.workerPid = pid;
+        this.progress = { ...this.progress, lastAliveAt: at, ...(this.workerPid === undefined ? {} : { workerPid: this.workerPid }) };
+        // Coalesced like every progress write; heartbeats are HEARTBEAT_MS apart, so in practice each lands.
+        const nowMs = Date.parse(at);
+        if (!shouldFlush(this.lastHeartbeatFlushMs, Number.isNaN(nowMs) ? Date.now() : nowMs, this.flushMs))
+            return;
+        this.lastHeartbeatFlushMs = Number.isNaN(nowMs) ? Date.now() : nowMs;
+        writeJsonAtomic(jobFile(this.repo, this.jobId, FILES.progress), this.progress);
+    }
     /** Feed one normalized provider event into the snapshot. */
     onEvent(event) {
         if (this.finished || this.manifest === null)
             return;
         const at = event.at;
+        if (event.kind === 'heartbeat') {
+            this.heartbeat(at, event.pid);
+            return;
+        }
         if (event.kind === 'started') {
             if (typeof event.conversationId === 'string' && event.conversationId.trim() !== '') {
                 this.conversation = event.conversationId;
@@ -6636,6 +6261,15 @@ class JobWriter {
                 this.tracker.end(ref.stepIndex, row.tool, input, status);
             else
                 this.tracker.start(ref.stepIndex, row.tool, ref.input ?? input);
+            if (event.kind === 'activity-end' && status === 'done' && classify(tool, input).kind === 'edit') {
+                this.editStepsCompleted.add(ref.stepIndex);
+            }
+            // A tool call ends the assistant message before it: the next text is a new one.
+            if (isStart)
+                this.currentMessage = '';
+            if (status === 'error')
+                this.toolErrorSteps.add(ref.stepIndex);
+            this.noteFirstEvent(false);
             this.lastActivity = row;
             if (idx >= 0)
                 this.recent[idx] = row;
@@ -6705,11 +6339,16 @@ class JobWriter {
             const bounded = boundTimeline(timeline);
             this.view = { ...this.view, timeline: bounded.events, truncated: this.view.truncated || bounded.truncated };
             this.latestText = appendBounded(this.latestText ?? '', event.text, LATEST_TEXT_CHARS);
-            this.manifest = { ...this.manifest, latestSummary: this.latestText.trim().slice(-1e3) || this.manifest.latestSummary || null, summarySource: 'worker' };
+            this.currentMessage = appendBounded(this.currentMessage, event.text, LATEST_TEXT_CHARS);
+            this.noteFirstEvent(false);
+            this.manifest = { ...this.manifest, latestSummary: summaryTail(this.currentMessage, SUMMARY_CHARS) || this.manifest.latestSummary || null, summarySource: 'worker' };
             this.touch(at);
             return;
         }
         if (event.kind === 'notice') {
+            // Info notices (lifecycle chatter) are not "the first thing that happened".
+            if (event.level !== 'info')
+                this.noteFirstEvent(event.level === 'error');
             if (event.level === 'warn' || event.level === 'error') {
                 this.addWarning(event.message.slice(0, 400));
                 this.touch(at);
@@ -6729,6 +6368,15 @@ class JobWriter {
      * a throw from the adapter. A job that never gets a terminal write stays
      * `running` forever, which is a lie with a very long fuse.
      */
+    /**
+     * The cwd facts deriveStatus needs: is the cwd gone, and was this job meant
+     * to write (mode) or seen editing (one of its own edit tool calls completed
+     * without error). Every verdict for this job (finish, the steer chain) reads
+     * them from here.
+     */
+    verdictFacts() {
+        return cwdFacts(this.cwd, this.manifest?.mode, this.editStepsCompleted.size > 0);
+    }
     finish(result, report) {
         if (this.finished || this.manifest === null) {
             // A second terminal write is a bug in the caller, but returning the
@@ -6740,14 +6388,25 @@ class JobWriter {
         // A marker records a request, not proof that the worker stopped. Only the
         // adapter's terminal cancellation verdict can make the job canceled.
         const alreadyTerminal = result.status === 'cancelled' ? 'canceled' : null;
+        const { cwdMissing, writing } = this.verdictFacts();
         const verdict = deriveStatus({
             alreadyTerminal,
             ok: result.ok,
             jobStatus: result.status,
             deniedActions: result.deniedActions ?? [],
             report,
+            cwdMissing,
+            writing,
         });
+        // deriveStatus warns for a writing job (via `suspicious`); a read-only job keeps its verdict and gets this.
+        if (cwdMissing && !verdict.suspicious) {
+            this.addWarning(`working directory ${this.cwd} was gone at finish; changed files and checks could not be verified`);
+        }
         const failure = failureFields(verdict, result);
+        // Failed before doing anything: a route (model/region/account) problem, not the work.
+        const failedEarly = verdict.status === 'failed' && !result.ok && result.status !== 'timeout' && result.status !== 'cancelled' &&
+            this.toolCalls === 0 && (result.durationMs <= FAILED_EARLY_MS || this.firstEventWasError);
+        const response = result.response.trim();
         const usage = result.usage === undefined
             ? null
             : Object.fromEntries(Object.entries(result.usage).filter((e) => typeof e[1] === 'number'));
@@ -6769,12 +6428,16 @@ class JobWriter {
             })),
             usage,
             toolCalls: this.toolCalls,
+            ...(this.toolErrorSteps.size === 0 ? {} : { toolErrors: this.toolErrorSteps.size }),
+            ...(failedEarly ? { failedEarly: true } : {}),
             conversation: this.conversation,
-            latestSummary: result.response.trim().slice(0, 1_000) || this.manifest.latestSummary || null,
-            summarySource: result.response.trim() || this.manifest.latestSummary ? 'worker' : null,
+            // A worker's conclusion is at the END of its final response, not the start.
+            latestSummary: summaryTail(response, SUMMARY_CHARS) || this.manifest.latestSummary || null,
+            summarySource: response || this.manifest.latestSummary ? 'worker' : null,
             ...(this.changed === null
-                ? {}
+                ? { changedFilesUnknown: true }
                 : { changedFiles: this.changed.files, changedFilesTruncated: this.changed.truncated }),
+            ...(cwdMissing ? { cwdMissingAtFinish: true } : {}),
             ...(this.unattributed.length === 0 ? {} : { unattributedFiles: this.unattributed }),
             ...(this.staleReads.length === 0 ? {} : { staleReads: this.staleReads }),
             ...(this.manifest.pendingSteers !== undefined ? { pendingSteers: 0 } : {}),
@@ -6907,6 +6570,11 @@ class JobWriter {
             lastActivity: this.lastActivity,
             latestText: this.latestText,
             toolCalls: this.toolCalls,
+            // Always written, even 0: recovery must tell "no edit completed" from a pre-counter file.
+            editsCompleted: this.editStepsCompleted.size,
+            ...(this.toolErrorSteps.size === 0 ? {} : { toolErrors: this.toolErrorSteps.size }),
+            ...(this.lastAliveAt === null ? {} : { lastAliveAt: this.lastAliveAt }),
+            ...(this.workerPid === undefined ? {} : { workerPid: this.workerPid }),
             warnings: this.progress?.warnings ?? [],
             digest: this.tracker.digest(this.cwd),
             ...(this.progress?.pendingSteers !== undefined ? { pendingSteers: this.progress.pendingSteers } : {}),
@@ -6915,6 +6583,12 @@ class JobWriter {
         const clock = Number.isNaN(nowMs) ? Date.now() : nowMs;
         if (shouldFlush(this.lastFlushMs, clock, this.flushMs))
             this.flushProgress(at);
+    }
+    noteFirstEvent(isError) {
+        if (this.firstEventSeen)
+            return;
+        this.firstEventSeen = true;
+        this.firstEventWasError = isError;
     }
     addWarning(message) {
         if (this.progress === null)
@@ -7042,6 +6716,23 @@ function appendBounded(base, add, max) {
     // Cut from the FRONT: the newest text is what the pane shows, and a stale
     // opening paragraph is worth less than the sentence the worker just wrote.
     return joined.slice(joined.length - max);
+}
+/**
+ * The last `max` chars of `text`, starting at a paragraph (else line) boundary
+ * so the summary opens on a whole thought, not mid-sentence. A worker's
+ * conclusion is at the end of its message. Pure; exported for tests.
+ */
+function summaryTail(text, max) {
+    const t = text.trim();
+    if (t.length <= max)
+        return t;
+    const tail = t.slice(t.length - max);
+    for (const sep of ['\n\n', '\n']) {
+        const i = tail.indexOf(sep);
+        if (i >= 0 && tail.slice(i).trim() !== '')
+            return tail.slice(i).trim();
+    }
+    return tail.trim();
 }
 /** Read back a report we wrote. Used by abort(), where we never had one. */
 function reportText(repo, jobId) {
@@ -7432,6 +7123,7 @@ function createForgeRunner(deps) {
             // second, independent line of defence rather than the only one.
             timeoutMs: stage.timeoutMs ?? 0,
             unrestricted: deps.unrestricted,
+            ...(stage.env === undefined ? {} : { env: stage.env }),
             pipeline: ctx.pipeline,
             stage: stage.name,
             attempt: ctx.attempt,
@@ -7451,7 +7143,7 @@ function createForgeRunner(deps) {
             jobId = tracked.ack.jobId;
             // As spawn_job does: the job reads "checks pending" until a verdict exists.
             if (stage.checks?.length)
-                recordAcceptance(deps.service.repo, jobId, { state: 'unchecked', checks: [], pending: true });
+                recordAcceptance(deps.service.repo, jobId, pendingAcceptance(stage.checks));
             deps.onStageRunning?.({
                 stage: stage.name, jobId, status: 'running', provider: ctx.routing.provider,
                 ...(ctx.routing.model === undefined ? {} : { model: ctx.routing.model }),
@@ -8011,6 +7703,32 @@ function errText(err) {
  */
 const CATALOG_TTL_MS = 5 * 60_000;
 const DEFAULT_TIMEOUT_MS = 10_000;
+/** Disk entry: the catalog and when it was discovered (ms). */
+function catalogFile(repo, name) {
+    return path.join(repo, '.agent-smith', 'catalogs', `${name.replace(/[^A-Za-z0-9._-]/g, '_')}.json`);
+}
+function readDisk(repo, name) {
+    if (repo === undefined)
+        return undefined;
+    try {
+        const v = JSON.parse(readFileSync(catalogFile(repo, name), 'utf8'));
+        const c = v.catalog;
+        if (typeof v.at !== 'number' || c === undefined || c === null || c.provider !== name || !Array.isArray(c.models))
+            return undefined;
+        return { catalog: c, at: v.at };
+    }
+    catch {
+        return undefined;
+    }
+}
+function writeDisk(repo, name, entry) {
+    if (repo === undefined || entry.catalog.source === 'static')
+        return;
+    try {
+        writeJsonAtomic(catalogFile(repo, name), entry);
+    }
+    catch { /* the disk cache is an optimization */ }
+}
 const cache = new Map();
 let clock = Date.now;
 let providerSource = () => PROVIDERS;
@@ -8020,9 +7738,13 @@ function lookup(name) {
 function failed(name, error) {
     return { provider: name, models: [], defaultSource: 'unknown', source: 'live', stale: false, verified: false, error };
 }
-async function discover(provider, timeoutMs, refresh) {
+async function discover(provider, timeoutMs, refresh, repo) {
     const name = provider.name;
-    const hit = cache.get(name);
+    // Memory first, then another process's discovery. `refresh` never serves either as fresh, but an
+    // older entry still backs the stale-on-error fallback, and a successful discovery rewrites the file.
+    const hit = cache.get(name) ?? readDisk(repo, name);
+    if (hit !== undefined && !cache.has(name))
+        cache.set(name, hit);
     if (!refresh && hit !== undefined && clock() - hit.at < CATALOG_TTL_MS) {
         return { ...hit.catalog, source: hit.catalog.source === 'static' ? 'static' : 'cache', stale: false };
     }
@@ -8050,7 +7772,9 @@ async function discover(provider, timeoutMs, refresh) {
     }
     const usable = fresh.error === undefined || fresh.models.length > 0;
     if (usable) {
-        cache.set(name, { catalog: fresh, at: clock() });
+        const entry = { catalog: fresh, at: clock() };
+        cache.set(name, entry);
+        writeDisk(repo, name, entry);
         return fresh;
     }
     if (hit !== undefined) {
@@ -8107,7 +7831,7 @@ async function getCatalogs(options = {}) {
             }));
             targets = all.filter((_, i) => flags[i]);
         }
-        const results = await Promise.all(targets.map((p) => discover(p, timeoutMs, refresh).catch((e) => failed(p.name, errMessage(e)))));
+        const results = await Promise.all(targets.map((p) => discover(p, timeoutMs, refresh, options.repo).catch((e) => failed(p.name, errMessage(e)))));
         return [...results, ...missing];
     }
     catch (e) {
@@ -8183,12 +7907,16 @@ function reconcileOrphan(repo, jobId, now = Date.now()) {
         const cancelSteerFile = jobFile(repo, jobId, FILES.cancelSteer);
         const canceled = existsSync(cancelFile) || existsSync(cancelSteerFile);
         const report = result === null ? null : reportFor(result);
+        // Without the writer, the cwd and the mode (plus the completed-edit count
+        // in progress.json) are all recovery can prove about a writing job.
+        const facts = cwdFacts(manifest.cwd, manifest.mode, editedOnDisk(repo, jobId));
         const verdict = result === null
             ? deriveOrphan(manifest, null, now, undefined, canceled)
             : deriveStatus({
                 alreadyTerminal: canceled || result.status === 'cancelled' ? 'canceled' : null,
                 ok: result.ok, jobStatus: result.status,
                 deniedActions: result.deniedActions ?? [], report,
+                ...facts,
             });
         if (verdict === null)
             return false;
@@ -8217,8 +7945,12 @@ function reconcileOrphan(repo, jobId, now = Date.now()) {
                     ...(nonfatal === true ? { nonfatal: true } : {}),
                 })),
                 usage: result.usage === undefined ? null : Object.fromEntries(Object.entries(result.usage).filter((entry) => typeof entry[1] === 'number')),
-                latestSummary: result.response.trim().slice(0, 1_000) || manifest.latestSummary || null,
+                // The conclusion is at the end of the response (same rule as writer.finish).
+                latestSummary: summaryTail(result.response, 1_000) || manifest.latestSummary || null,
                 summarySource: result.response.trim() || manifest.latestSummary ? 'worker' : null,
+                // Recovery never runs the finish-time git diff.
+                changedFilesUnknown: true,
+                ...(facts.cwdMissing ? { cwdMissingAtFinish: true } : {}),
             });
             settleAcceptance(repo, jobId, result.finishedAt);
             return true;
@@ -8243,6 +7975,23 @@ function settleAcceptance(repo, jobId, at) {
             state: 'rejected', checks: [], at, pending: false,
             reason: 'server stopped; checks not run',
         });
+    }
+}
+/**
+ * progress.json recorded at least one completed edit (evidence the job wrote).
+ * `editsCompleted` counts only edits that ended without error; the digest's
+ * `editedCount` counts at start and is read only for files written before the
+ * counter existed.
+ */
+function editedOnDisk(repo, jobId) {
+    try {
+        const p = JSON.parse(readFileSync(jobFile(repo, jobId, FILES.progress), 'utf8'));
+        if (typeof p.editsCompleted === 'number')
+            return p.editsCompleted > 0;
+        return typeof p.digest?.editedCount === 'number' && p.digest.editedCount > 0;
+    }
+    catch {
+        return false;
     }
 }
 /** Missing or partially written provider output cannot keep a dead job running. */
@@ -8291,6 +8040,91 @@ function recoveredConversation(result) {
             : result.provider === 'claude' || result.provider === 'opencode' || result.provider === 'kimi' ? 'sessionId' : null;
     const value = key === null ? null : raw[key];
     return typeof value === 'string' && value.trim() !== '' ? value : null;
+}/**
+ * pipeline/types.ts — vocabulary for mixed-provider stage pipelines.
+ *
+ * The headline feature this file exists for:
+ *
+ *     implement → gemini   ·   review → codex   ·   moderate → claude-sonnet
+ *
+ * One task, a different worker per stage. Nothing in this file knows how to
+ * talk to any worker; `StageRunner` (below) is the seam, and it is injected.
+ *
+ * WHY NO IMPORT FROM providers/
+ * providers/ is written concurrently by another engineer. If pipeline/ imported
+ * a concrete provider client we would have a compile-order dependency on work
+ * that does not exist yet, and pipeline/ could not be tested without spawning
+ * real agents. So the dependency points *inward*: pipeline/ declares the shape
+ * it needs, providers/ (or core/) supplies an implementation at the composition
+ * root. See `createRunnerRouter` in pipeline.ts for the wiring point.
+ */
+const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/**
+ * Worker `env` keys that are refused, because they change how the worker
+ * binary is found, loaded or configured. The env is applied when the CLI is
+ * spawned, BEFORE any sandbox it sets up exists: `PATH` can swap the binary
+ * for a shim, `NODE_OPTIONS=--import=…` or `DYLD_INSERT_LIBRARIES` run code
+ * ahead of the worker, and a provider config dir can drop its read-only
+ * settings, while the ack would still report the sandbox as enforced.
+ * Matched case-insensitively (Windows env names are).
+ */
+const ENV_DENYLIST = {
+    PATH: 'would change which worker binary runs',
+    HOME: 'would change which config the worker loads',
+    SHELL: 'would change the shell the worker runs commands with',
+    TMPDIR: 'would move the worker\'s temporary and sandbox files',
+    NODE_OPTIONS: 'would run code before the worker starts',
+    NODE_PATH: 'would change which modules the worker loads',
+    PYTHONPATH: 'would change which modules the worker loads',
+    PYTHONHOME: 'would change which runtime the worker loads',
+};
+/**
+ * Key prefixes refused for the same reason: the dynamic loader (`LD_`, `DYLD_`),
+ * XDG config/data dirs, Agent Smith's own settings (`AGENT_SMITH_*_BIN`,
+ * `_HOME`, `_CODEX_SANDBOX`, …) and each provider's config (`CLAUDE_CONFIG_DIR`,
+ * `CODEX_HOME`, `KIMI_CODE_HOME`, `OPENCODE_*`, `AGY_*`). The adapters' own
+ * keys are all covered here; do not list them again above.
+ */
+const ENV_DENY_PREFIXES = {
+    LD_: 'would change which libraries the worker loads',
+    DYLD_: 'would change which libraries the worker loads',
+    XDG_: 'would change which config the worker loads',
+    AGENT_SMITH_: 'is Agent Smith\'s own setting, not the worker\'s',
+    AGY_: 'would change the provider\'s config',
+    CLAUDE_: 'would change the provider\'s config',
+    CODEX_: 'would change the provider\'s config',
+    OPENCODE_: 'would change the provider\'s config',
+    KIMI_: 'would change the provider\'s config',
+};
+/** Why a worker `env` key is refused, or null when it is allowed. */
+function deniedEnvReason(key) {
+    const upper = key.toUpperCase();
+    const exact = ENV_DENYLIST[upper];
+    if (exact !== undefined)
+        return exact;
+    for (const [prefix, why] of Object.entries(ENV_DENY_PREFIXES))
+        if (upper.startsWith(prefix))
+            return why;
+    return null;
+}
+/** Validate a worker `env` map: plain identifier keys not on the denylist, string values without NUL. Returns it unchanged, or undefined when absent. */
+function validateEnv(raw, label = 'env') {
+    if (raw === undefined)
+        return undefined;
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw))
+        throw new Error(`${label} must be an object of string values.`);
+    const out = {};
+    for (const [key, value] of Object.entries(raw)) {
+        if (!ENV_KEY.test(key))
+            throw new Error(`${label} key "${key}" is not a valid variable name (letters, digits, underscore; no leading digit).`);
+        const denied = deniedEnvReason(key);
+        if (denied !== null)
+            throw new Error(`${label}.${key} ${denied}; it is not allowed in a worker env.`);
+        if (typeof value !== 'string' || value.includes('\0'))
+            throw new Error(`${label}.${key} must be a string without NUL characters.`);
+        out[key] = value;
+    }
+    return out;
 }/**
  * service.ts — the composition root that can START a worker.
  *
@@ -8386,8 +8220,17 @@ function modeError(mode) {
     const lines = MODES.map((m) => `  ${m}: ${MODE_PRESETS[m].description}`).join('\n');
     return new Error(`${mode === '' ? 'mode is required' : `unknown mode "${mode}"`}. Valid modes:\n${lines}`);
 }
+/** Sidecar naming the env variables a job's worker was given. Keys only. */
+const ENV_KEYS_FILE = 'env-keys.json';
 const AGY_EFFORT_SUFFIX = /-(low|medium|high)$/;
+/**
+ * How long a spawn waits for the model catalog before passing the model through
+ * unchecked. Cold discovery shells out (`agy models` alone took 2.1 s), so the
+ * first spawn, when no catalog has been seen yet, waits longer; every later
+ * spawn finds the TTL cache warm or gives up quickly.
+ */
 const CATALOG_WAIT_MS = 2_000;
+const CATALOG_COLD_WAIT_MS = 5_000;
 /**
  * Check model/effort against a catalog. Pure. Throws only when the catalog is
  * fresh and nonempty AND positively says the value is wrong; otherwise warns.
@@ -8457,6 +8300,10 @@ class ForgeService {
     mirrorOn;
     flushMs;
     catalogSource;
+    catalogWaitMs;
+    /** Set once any catalog lookup has completed; until then a spawn waits the cold budget. */
+    catalogSeen = false;
+    catalogWarm;
     harnessDefaults;
     providerSource;
     describeSandbox;
@@ -8466,7 +8313,8 @@ class ForgeService {
         this.mirrorOn = options.mirror ?? true;
         this.flushMs = options.flushMs;
         this.providerSource = options.providerSource ?? requireProvider;
-        this.catalogSource = options.catalogSource ?? ((providers) => getCatalogs({ providers }));
+        this.catalogSource = options.catalogSource ?? ((providers) => getCatalogs({ providers, repo: this.repo }));
+        this.catalogWaitMs = { warm: options.catalogWaitMs?.warm ?? CATALOG_WAIT_MS, cold: options.catalogWaitMs?.cold ?? CATALOG_COLD_WAIT_MS };
         this.harnessDefaults = options.harnessDefaults ?? getHarnessDefaults;
         this.describeSandbox = options.describeSandbox ?? ((p, spec) => p.describeSandbox?.(spec));
         // Publish abandoned-job recovery when the owner service starts, so the
@@ -8479,16 +8327,35 @@ class ForgeService {
         }
         catch { /* A missing job store is the ordinary fresh-repo case. */ }
     }
+    /**
+     * Start model discovery in the background so the first spawn finds it cached.
+     * Never blocks, never rejects; a second call is a no-op.
+     */
+    warmCatalogs() {
+        if (this.catalogWarm !== undefined)
+            return;
+        this.catalogWarm = Promise.resolve()
+            .then(() => this.catalogSource())
+            .then((all) => { this.catalogSeen = true; return all; })
+            .catch(() => [])
+            // Once settled the provider TTL cache owns freshness; later lookups must not reuse this snapshot.
+            .finally(() => { this.catalogWarm = undefined; });
+    }
     /** Never throws, never waits long: a catalog is advice, not a gate on starting. */
     async catalogFor(provider) {
         let timer;
         try {
+            const waitMs = this.catalogSeen ? this.catalogWaitMs.warm : this.catalogWaitMs.cold;
             const timeout = new Promise((resolve) => {
-                timer = setTimeout(() => resolve(undefined), CATALOG_WAIT_MS);
+                timer = setTimeout(() => resolve(undefined), waitMs);
                 timer.unref?.();
             });
-            const all = await Promise.race([this.catalogSource([provider]), timeout]);
-            return all?.find((c) => c.provider === provider) ?? all?.[0];
+            // Join a warm-up still in flight rather than starting a second discovery.
+            const warm = this.catalogWarm;
+            const all = await Promise.race([warm ?? this.catalogSource([provider]), timeout]);
+            if (all !== undefined)
+                this.catalogSeen = true;
+            return all?.find((c) => c.provider === provider) ?? (warm === undefined ? all?.[0] : undefined);
         }
         catch {
             return undefined;
@@ -8533,6 +8400,8 @@ class ForgeService {
             throw new Error('prompt is empty; there is nothing to hand the worker.');
         }
         const timeoutMs = clampTimeout(request.timeoutMs);
+        const env = validateEnv(request.env);
+        const envKeys = env === undefined ? [] : Object.keys(env);
         const cwd = request.cwd ?? this.repo;
         // agy and kimi cannot prompt headless. agy has an env opt-out; kimi's print
         // mode force-sets the auto policy and has no restricted mode, so the
@@ -8659,6 +8528,8 @@ class ForgeService {
         try {
             if (request.checks !== undefined)
                 writeJsonAtomic(jobFile(this.repo, jobId, 'checks-spec.json'), request.checks);
+            if (envKeys.length > 0)
+                writeJsonAtomic(jobFile(this.repo, jobId, ENV_KEYS_FILE), envKeys);
             await request.onPrepared?.(jobId);
         }
         catch (error) {
@@ -8676,6 +8547,7 @@ class ForgeService {
             dir: jobDir(this.repo, jobId),
             repo: this.repo,
             timeoutMs,
+            ...(envKeys.length > 0 ? { envKeys } : {}),
             unrestricted,
             note: `queued · ${humanDuration(timeoutMs)} limit · ${provider.name === 'kimi' ? 'auto policy (cannot restrict)' : unrestricted ? 'unrestricted' : 'approvals on'}`,
             sandbox,
@@ -8712,6 +8584,7 @@ class ForgeService {
             timeoutMs,
             unrestricted,
             conversation: request.conversation,
+            env,
             pipeline: request.pipeline ?? null,
             stage: request.stage ?? null,
             attempt: request.attempt ?? null,
@@ -8759,6 +8632,7 @@ class ForgeService {
                     ...(spec.model === undefined ? {} : { model: spec.model }),
                     ...(spec.effort === undefined ? {} : { effort: spec.effort }),
                     ...(currentConversation === undefined ? {} : { conversation: currentConversation }),
+                    ...(spec.env === undefined ? {} : { env: { ...spec.env } }),
                     // THE KEY LINE. Handing the provider adapter OUR job directory as its
                     // stateDir means events.jsonl / argv.json / stderr.log / result.json are
                     // written by the already-verified plumbing in providers/ndjson.ts, for
@@ -8845,6 +8719,9 @@ class ForgeService {
                     jobStatus: result.status,
                     deniedActions: result.deniedActions ?? [],
                     report: report === '' ? null : report,
+                    // Same cwd rule as finish(): a writing turn whose cwd vanished failed,
+                    // so a queued steer must not chain onto it.
+                    ...currentWriter.verdictFacts(),
                 });
                 const shouldChain = !liveEntry.userCanceled &&
                     unconsumed.length > 0 &&
@@ -8964,6 +8841,8 @@ class ForgeService {
                     });
                     if (spec.checks !== undefined)
                         writeJsonAtomic(jobFile(this.repo, nextJobId, 'checks-spec.json'), spec.checks);
+                    if (spec.env !== undefined && Object.keys(spec.env).length > 0)
+                        writeJsonAtomic(jobFile(this.repo, nextJobId, ENV_KEYS_FILE), Object.keys(spec.env));
                     for (const w of syncWarnings)
                         nextWriter.warn(w);
                     // The child anchor exists; publish its id before the parent's terminal
@@ -9461,6 +9340,7 @@ function toSummary(observed, source) {
             deniedCount: Array.isArray(raw['denied_actions']) ? raw['denied_actions'].length : 0,
             unrestricted: raw['unrestricted'] === true,
             steerNotApplied: observed.warnings.some((w) => w.code === 'steer_not_applied'),
+            failedEarly: raw['failedEarly'] === true,
         }),
         mode: observed.mode,
         model: observed.model,
@@ -9484,6 +9364,12 @@ function toSummary(observed, source) {
             : {}),
         ...(Array.isArray(changedFiles) ? { changedFileCount: changedFiles.length } : {}),
         ...(digest !== null ? { digest } : {}),
+        ...(typeof raw['toolErrors'] === 'number' && raw['toolErrors'] > 0 ? { toolErrors: raw['toolErrors'] } : {}),
+        ...(raw['failedEarly'] === true ? { failedEarly: true } : {}),
+        ...(raw['changedFilesUnknown'] === true ? { changedFilesUnknown: true } : {}),
+        ...(raw['cwdMissingAtFinish'] === true ? { cwdMissingAtFinish: true } : {}),
+        ...(typeof raw['last_event_at'] === 'string' ? { lastEventAt: raw['last_event_at'] } : {}),
+        ...(typeof raw['last_alive_at'] === 'string' ? { lastAliveAt: raw['last_alive_at'] } : {}),
     };
 }
 /** progress.json `digest`, accepted only when it has the shape the writer produces. */
@@ -9743,4 +9629,4 @@ function describe(err) {
 function pipelineRecordPath(repo, name) {
     const safe = name.replace(/[^A-Za-z0-9._-]+/g, '-').slice(0, 80) || 'pipeline';
     return path.join(repo, '.agent-smith', 'pipelines', `${safe}.json`);
-}export{ForgeService as F,MODES as M,MODE_PRESETS as a,MAX_WATCHED_FILES as b,cancelPipeline as c,getCatalogs as d,getInstalledProviders as g,inheritContinuedProviders as i,launchPipeline as l,providerNames as p,readPipeline as r,startPipeline as s,validateSpec as v};
+}export{ENV_KEYS_FILE as E,ForgeService as F,MODES as M,MODE_PRESETS as a,MAX_WATCHED_FILES as b,cancelPipeline as c,validateEnv as d,getCatalogs as e,getInstalledProviders as g,inheritContinuedProviders as i,launchPipeline as l,providerNames as p,readPipeline as r,startPipeline as s,validateSpec as v};

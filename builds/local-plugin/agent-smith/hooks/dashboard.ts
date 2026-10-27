@@ -1,6 +1,6 @@
 /** Pure rules for the Forge sidebar: which workers it lists and how it labels them. */
 import type { ActivityEvent, RadarAcceptance, RadarJob } from '../types/index.d.ts';
-import { countSummary, elapsed, elapsedCell, failedChecks, failureWords, isTerminal, jobLabel, oneLine, pickGlyph } from './format.ts';
+import { countSummary, elapsed, elapsedCell, failedChecks, failureWords, isTerminal, jobLabel, livenessWords, oneLine, pickGlyph } from './format.ts';
 import { classify } from './progress.ts';
 
 /** A settled failure or rejection stops asking for attention this long after it ended. */
@@ -62,7 +62,7 @@ export function commandTerminalColumns(presentation: unknown): number | undefine
 
 /**
  * Settled (terminal, checks not pending) work ages out of attention so a stale
- * failure stops being drawn as one. Running, pending and stalled (`attention`)
+ * failure stops being drawn as one. Running, pending and quiet (`attention`)
  * jobs never expire. Without `now` or a timestamp nothing expires.
  */
 function expired(job: RadarJob, now?: number): boolean {
@@ -106,7 +106,11 @@ export function workerHeading(job: RadarJob): string {
  */
 export function workerStatus(job: RadarJob): string {
   if (job.supersededBy && isTerminal(job.status)) return 'steered';
-  if (job.acceptance?.pending && isTerminal(job.status)) return `${job.status === 'succeeded' ? 'done' : job.status} · checking`;
+  if (job.acceptance?.pending && isTerminal(job.status)) {
+    // The worker exited; no verdict exists yet, so this must not read as done.
+    const running = job.acceptance.running ? `: ${oneLine(job.acceptance.running, 40)}` : '';
+    return `${job.status === 'succeeded' ? 'exited' : job.status} · checking${running}`;
+  }
   let base: string;
   if (job.status === 'failed') {
     const why = failureWords(job);
@@ -116,10 +120,10 @@ export function workerStatus(job: RadarJob): string {
   } else if (job.acceptance?.state === 'rejected') {
     base = `${job.status} · checks failed`;
   } else if (job.status === 'running') {
-    const act = oneLine(job.activity);
+    const act = livenessWords(job) || oneLine(job.activity);
     return act ? `Running · ${act}` : 'Running';
   } else if (job.status === 'attention') {
-    return 'stalled';
+    return livenessWords(job) || 'no output';
   } else {
     base = job.status === 'succeeded' ? 'done' : job.status;
   }
@@ -161,7 +165,14 @@ export function statusLine(job: RadarJob, now: number, width: number): string {
   if (job.startedAt === null) return oneLine(workerStatus(job), Math.max(1, width));
   const clock = elapsedCell((job.endedAt ?? now) - job.startedAt);
   const room = Math.max(1, width - clock.length - 3);
-  return `${oneLine(workerStatus(job), room).padEnd(room)}   ${clock}`;
+  // A settled row also says when it started, so two workers with alike names can be told apart.
+  const status = isTerminal(job.status) ? `${workerStatus(job)} · started ${clockTime(job.startedAt)}` : workerStatus(job);
+  return `${oneLine(status, room).padEnd(room)}   ${clock}`;
+}
+/** Local `HH:MM` of an epoch-ms time. */
+function clockTime(ms: number): string {
+  const d = new Date(ms);
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 }
 
 /**

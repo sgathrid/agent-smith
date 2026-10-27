@@ -147,7 +147,8 @@ async function runJobWatch(options) {
                         done.add(id);
                     continue;
                 }
-                if (job && TERMINAL.has(job.status) && (seen.get(id)?.has(dedupeKey(job)) ?? false))
+                // Exited with checks still running: the verdict is a second notice, so keep watching (unless announcing once).
+                if (job && TERMINAL.has(job.status) && (options.announceOnce === true || job.checksRunning === undefined) && (seen.get(id)?.has(dedupeKey(job)) ?? false))
                     done.add(id);
             }
             if (want.size > 0 && [...want].every((id) => done.has(id)))

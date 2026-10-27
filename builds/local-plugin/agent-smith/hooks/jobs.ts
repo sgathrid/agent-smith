@@ -75,7 +75,7 @@
  */
 
 import { describeActivity, describeTool, parseInputPreview } from './format.ts';
-import { STALL_GRACE_MS } from './stale.ts';
+import { isStalled, livenessOf } from './stale.ts';
 import { REASONS } from './reasons.ts';
 import type { RadarJob, RadarStatus, ToolEntry } from '../types/index.d.ts';
 
@@ -412,8 +412,8 @@ export function reportBody(result: string | null): string | null {
  *      A run that died before writing status.json — a killed process, a full
  *      disk — still has its log. Without this row such a job sits at `?` forever.
  *   6. progress.json present              => running, or attention if silent past
- *      STALL_GRACE_MS (core/liveness.ts's 15 min, from stale.ts, so the band and
- *      the channel agree on when "stalled" begins).
+ *      STALL_GRACE_MS (stale.ts livenessOf, so the band and the channel agree on
+ *      when a job needs attention).
  *   7. otherwise                          => unknown
  *
  * NO ROW SAYS "THE FILE IS GONE, THEREFORE FINISHED." That inference is HAZARD A,
@@ -608,10 +608,11 @@ export async function resolve(
     // last_event_at yields Infinity, which escalates: we do not know the job is
     // alive, and "unknown" must never be drawn as healthy — the same asymmetry
     // core/liveness.ts documents.
-    const lastSeen = toEpoch(progress.last_event_at);
-    const silence = lastSeen === null ? Number.POSITIVE_INFINITY : now - lastSeen;
-    const status2: RadarStatus = silence > STALL_GRACE_MS ? 'attention' : 'running';
-    return { ...base, status: status2, endedAt: null };
+    // agy-staff writes no heartbeat, so stale.ts applies the silence rule and
+    // labels a quiet job `silent` ("no output 16m"), never "stalled".
+    const liveness = livenessOf({ status: 'running', lastEventAt: toEpoch(progress.last_event_at), now });
+    const status2: RadarStatus = isStalled(liveness) ? 'attention' : 'running';
+    return { ...base, status: status2, endedAt: null, ...(liveness !== null ? { liveness } : {}) };
   }
 
   // --- row 7: no evidence either way ------------------------------------------
