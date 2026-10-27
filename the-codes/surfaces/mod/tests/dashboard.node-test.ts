@@ -222,4 +222,10 @@ test('consecutive completed read and search calls condense; active, errored and 
   // Assistant prose breaks a run too.
   assert.deepEqual(shape(condenseTimeline([tool(0,'Read','a.ts'),prose(1),tool(2,'Read','b.ts'),
     tool(3,'Read','c.ts'),tool(4,'Read','d.ts')])),['event-0','event-1','event-2','event-3','event-4']);
+  // Plain shell commands fold with reads; test runs and edits stay their own rows.
+  const shell=condenseTimeline([tool(0,"/bin/zsh -lc 'git status'",''),tool(1,"/bin/zsh -lc 'node --version'",''),
+    tool(2,"/bin/zsh -lc 'cat a.ts'",''),tool(3,'Bash','{"command":"npm test"}'),tool(4,'Read','e.ts')]);
+  assert.deepEqual(shape(shell),['group-0','event-3','event-4']);
+  const run=shell[0]!;
+  assert.equal(run.kind==='group'&&timelineGroupLabel(run.reads,run.searches,run.commands),'read 1 file · 2 commands');
 });

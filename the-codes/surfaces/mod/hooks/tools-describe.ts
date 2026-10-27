@@ -138,7 +138,8 @@ export function humanCommand(cmd: string): string {
   }
 
   // The honest fallback: the command's name, and at most one argument.
-  const trimmed = words.slice(0, 2).join(' ');
+  // `/Library/Developer/CommandLineTools/usr/bin/git` reads as `git`.
+  const trimmed = [prog, ...words.slice(1, 2)].join(' ');
   return trimmed === '' ? 'running a command' : trimmed;
 }
 

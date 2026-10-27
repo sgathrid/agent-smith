@@ -40,10 +40,15 @@ const COMMAND_TOOLS = new Set(['run_command', 'bash', 'shell', 'command_executio
 const PATH_KEYS = ['AbsolutePath', 'TargetFile', 'file_path', 'filePath', 'notebook_path', 'path'];
 const COMMAND_KEYS = ['CommandLine', 'command', 'cmd'];
 
-/** `/bin/zsh -lc 'cat x'` and `bash -lc "…"` → the command inside. codex names a shell call by its command line. */
+/**
+ * `/bin/zsh -lc 'cat x'` and `bash -lc "…"` → the command inside. codex names a shell call by its command line.
+ * A stored preview is cut short and loses its closing quote; the command is still the inside.
+ */
 export function unwrapShell(command: string): string {
-  const m = /^\s*(?:\S*\/)?(?:ba|z|)sh\s+-l?c\s+(['"])([\s\S]*)\1\s*$/.exec(command);
-  return m ? m[2]! : command;
+  const m = /^\s*(?:\S*\/)?(?:ba|z|)sh\s+-l?c\s+(['"])([\s\S]*)$/.exec(command);
+  if (!m) return command;
+  const inner = m[2]!.trimEnd();
+  return inner.endsWith(m[1]!) ? inner.slice(0, -1) : inner;
 }
 
 const TEST_RE = /\b(?:pytest|jest|vitest|mocha|tox|nox|rspec|phpunit|ctest|unittest)\b|\b(?:cargo|go|npm|pnpm|yarn|bun|deno|dotnet|mvn|gradle|swift|mix)\s+(?:run\s+)?(?:test|nextest|verify)\b|\bmake\s+(?:test|check)\b|\bnode\s+--test\b/;

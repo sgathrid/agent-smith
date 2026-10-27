@@ -571,7 +571,7 @@ test('a running worker with a progress digest shows what it is doing and what it
     commands:2,testRuns:2,lastTestFailed:true,repeat:null};
   const progress = JSON.stringify({jobId:'job-ada',lastEventAt:iso(RUNNING_NOW),recentActivities:[],toolCalls:59,warnings:[],latestText:null,
     lastActivity:{stepIndex:58,tool:'replace_file_content',status:'active',input:JSON.stringify({TargetFile:'/work/src/loader.py'})},digest});
-  forgeHost(on, canonicalJob('job-ada', {status:'running',name:'pp-engine',workerId:'ada',role:'implement',provider:'agy'}, {'progress.json':progress,'view.json':ADA_VIEW}), ['job-ada']);
+  const { clock } = forgeHost(on, canonicalJob('job-ada', {status:'running',name:'pp-engine',workerId:'ada',role:'implement',provider:'agy'}, {'progress.json':progress,'view.json':ADA_VIEW}), ['job-ada']);
   await start($);
   await launch($, 'job-ada');
   const band = await $.ui.mount({plugin:'agent-smith',surface:'terminal',...BAND} as never);
@@ -584,7 +584,12 @@ test('a running worker with a progress digest shows what it is doing and what it
   expect(await pane.find({type:'Text',text:/^Tests: ran 2 times · last run failed$/})).toBeDefined();
   // Tool rows read as plain actions, not the tool name and its raw JSON input.
   const toolRow = await pane.find({key:'event-1'}) as { props?: Record<string,unknown> } | undefined;
-  expect(String(toolRow?.props?.label)).toBe('› reading');
+  // The running call's dim dot blinks once a second, off then on.
+  expect(String(toolRow?.props?.label)).toBe('  reading');
+  await clock.advance(1000);
+  const lit = await pane.find({key:'event-1'}) as { props?: Record<string,unknown> } | undefined;
+  expect(String(lit?.props?.label)).toBe('● reading');
+  expect(lit?.props?.dimColor).toBe(true);
 });
 
 test('/forge opens the focused session list; /forge pane is the same list; /forge all adds the repository', async ($, on) => {
@@ -685,6 +690,41 @@ test('a long run of completed read calls folds into one expandable row, leaving 
 });
 
 
+test('prose and tool rows read apart: a blank row at each turn, dimmed tools, no repeated note or status', async ($, on) => {
+  const view = JSON.stringify({schema:1,prompt:'Review',preamble:'',truncated:false,tools:[],transcript:[],timeline:[
+    {kind:'assistant',sequence:0,at:iso(RUNNING_NOW),text:'Reviewing the range.'},
+    {kind:'tool',sequence:1,at:iso(RUNNING_NOW),stepIndex:0,tool:"/bin/zsh -lc '/Library/Developer/CommandLineTools/usr/bin/git diff 5e7ac74 895fa82 -- the-codes/surf",input:'',output:'',state:'done'},
+    {kind:'tool',sequence:2,at:iso(RUNNING_NOW),stepIndex:1,tool:"/bin/zsh -lc 'node --version'",input:'',output:'',state:'done'},
+    {kind:'assistant',sequence:3,at:iso(RUNNING_NOW),text:'- a list item'},
+    {kind:'tool',sequence:4,at:iso(RUNNING_NOW),stepIndex:2,tool:'Read',input:'a.ts',output:'',state:'error'},
+  ]});
+  const files = canonicalJob('job-rev', {status:'running',name:'Rev',workerId:'rev'},
+    {'view.json':view,'progress.json':JSON.stringify({latestText:'Reviewing the range.',
+      digest:{phase:'running',filesRead:0,searches:0,commands:2,edited:[],editedCount:0,testRuns:1,lastTestFailed:true,repeat:null}})});
+  forgeHost(on, files, ['job-rev']);
+  await start($);
+  await launch($, 'job-rev');
+  await $.command.run({command:'forge',args:'rev'});
+  const pane = await $.ui.mount(PANE_TARGET);
+
+  expect(await pane.find({type:'Markdown',text:'● Reviewing the range.'})).toBeDefined();
+  // A text that opens with markdown block syntax keeps it intact.
+  expect(await pane.find({type:'Markdown',text:'- a list item'})).toBeDefined();
+  expect(await pane.find({key:'gap-event-1'})).toBeDefined();
+  expect(await pane.find({key:'gap-event-2'})).toBeUndefined();
+  expect(await pane.find({key:'gap-event-3'})).toBeDefined();
+  expect(await pane.find({key:'gap-event-4'})).toBeDefined();
+  const cmd = await pane.find({key:'event-1'}) as {props?: Record<string,unknown>} | undefined;
+  expect(String(cmd?.props?.label)).toBe('✓ checking git');
+  expect(cmd?.props?.dimColor).toBe(true);
+  const failed = await pane.find({key:'event-4'}) as {props?: Record<string,unknown>} | undefined;
+  expect(failed?.props?.dimColor).toBe(false);
+  // The note would repeat the first prose row; the status row would repeat the progress block.
+  expect(await pane.find({type:'Text',text:/^Note:/})).toBeUndefined();
+  expect(await pane.find({type:'Text',text:/^Running · running/})).toBeUndefined();
+  expect(await pane.find({type:'Text',text:/^Tests: ran 1 time · last run failed/})).toBeDefined();
+});
+
 test('after a launch only that job shows; a pipeline launch shows its stage jobs', async ($, on) => {
   const stage = canonicalJob('job-stage', {status:'running',name:'Bo',workerId:'bo',pipeline:'run-7',stage:'build'});
   forgeHost(on, { ...ada(), ...failedJob('job-failed', RUNNING_NOW), ...stage }, ['job-ada','job-failed','job-stage']);
@@ -722,7 +762,7 @@ test('/forge Ada opens Ada; an unknown name falls back to the list with a toast'
   await $.command.run({command:'forge',args:'ada'});
   const pane = await $.ui.mount(PANE_TARGET);
   expect(await pane.find({key:'back'})).toBeDefined();
-  expect(await pane.find({type:'Markdown',text:'Tracing the renderer.'})).toBeDefined();
+  expect(await pane.find({type:'Markdown',text:'● Tracing the renderer.'})).toBeDefined();
   await $.command.run({command:'forge',args:'Grace'});
   expect(host.toasts.at(-1)).toMatch(/No worker matches "Grace"/);
   expect(await pane.find({key:'job-job-ada'})).toBeDefined();
@@ -749,7 +789,7 @@ test('the worker view is one scroll: header, task, transcript, then result and f
     {name:'tests',ok:true,outputTail:''},{name:'lint',ok:false,outputTail:'src/a.ts: unused import',reason:'exit 1'}]});
   await clock.advance(3000);
   expect(await pane.find({type:'Text',text:/✗ lint/})).toBeDefined();
-  expect(await pane.find({type:'Markdown',text:'Tracing the renderer.'})).toBeDefined();
+  expect(await pane.find({type:'Markdown',text:'● Tracing the renderer.'})).toBeDefined();
   expect(await pane.find({type:'Markdown',text:'Final findings'})).toBeDefined();
   expect(await pane.find({type:'Text',text:'✗ lint · exit 1'})).toBeDefined();
   expect(await pane.find({type:'Text',text:'src/a.ts: unused import'})).toBeDefined();

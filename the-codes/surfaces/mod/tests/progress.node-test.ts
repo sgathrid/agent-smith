@@ -34,6 +34,11 @@ test('classify understands agy, claude, opencode and codex tool calls', () => {
     assert.deepEqual([c.kind, c.label], [kind, label], `${tool} ${input ?? ''}`);
   }
   assert.equal(unwrapShell(`/bin/zsh -lc 'ls -la'`), 'ls -la');
+  // A stored preview is cut short and loses its closing quote.
+  assert.equal(unwrapShell(`/bin/zsh -lc 'git diff 5e7ac74 895fa82 -- the-codes/surf`), 'git diff 5e7ac74 895fa82 -- the-codes/surf');
+  assert.equal(classify(`/bin/zsh -lc '/Library/Developer/CommandLineTools/usr/bin/git show 895fa82:the-codes/cli/cli.ts | nl`, null).label, 'checking git');
+  // An unmapped program run by full path is named by its basename.
+  assert.equal(classify(`/bin/zsh -lc '/opt/homebrew/bin/jq .version package.json'`, null).label, 'jq .version');
 });
 
 test('a truncated input still yields its path, and nothing throws on garbage', () => {
