@@ -378,3 +378,5 @@ the flags their adapters use. It reports compatible, incompatible, or unknown,
 with a reason. This checks CLI features; it does not verify authentication,
 account quota, model access, or a real model invocation. Set
 `AGENT_SMITH_PROBE_TIMEOUT_MS` (default 2000) to give each probe longer on a slow or loaded machine.
+
+Each git call behind a job's baseline and `changedFiles` is capped at 2 s; set `AGENT_SMITH_GIT_TIMEOUT_MS` to raise it on a slow or loaded machine, where a capped-out call leaves `changedFiles` unknown.

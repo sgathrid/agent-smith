@@ -11,11 +11,11 @@
  * translator, result assembly and cancellation are all exercised unchanged.
  */
 import assert from 'node:assert/strict';
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { scaled } from '../forge/testing/time.ts';
+import { scaled, waitFor } from '../forge/testing/time.ts';
 
 const fixtureDir = mkdtempSync(path.join(os.tmpdir(), 'agent-smith-kimi-fixture-'));
 const fixtureScript = path.join(fixtureDir, 'fake-kimi.mjs');
@@ -40,6 +40,7 @@ if (scenario === 'bad-exit') {
   process.exit(2);
 }
 if (scenario === 'slow') {
+  if (process.env.KIMI_FIXTURE_STARTED) (await import('node:fs')).writeFileSync(process.env.KIMI_FIXTURE_STARTED, 'started');
   setTimeout(() => { out({ role: 'assistant', content: 'late' }); hint(); process.exit(0); }, 60000);
 } else {
   out({ role: 'meta', type: 'system.version', version: 'fixture-1' });
@@ -170,9 +171,14 @@ test('kimi spawn maps a non-zero exit and stderr to error', async () => {
 test('kimi spawn honours cancellation and timeout', async () => {
   process.env['KIMI_FIXTURE_SCENARIO'] = 'slow';
   try {
+    const started = path.join(fixtureDir, 'slow-started');
+    process.env['KIMI_FIXTURE_STARTED'] = started;
     const cancelled = await kimiProvider.spawn(spec());
-    setTimeout(() => cancelled.cancel(), 50);
-    for await (const _event of cancelled.events) { /* drain */ }
+    const drained = (async () => { for await (const _event of cancelled.events) { /* drain */ } })();
+    // Cancel once the worker is demonstrably running, not after a guessed delay.
+    await waitFor(() => existsSync(started), { message: 'the slow fixture to start' });
+    cancelled.cancel();
+    await drained;
     const cancelledResult = await cancelled.waitForResult();
     assert.equal(cancelledResult.status, 'cancelled');
 
@@ -181,6 +187,7 @@ test('kimi spawn honours cancellation and timeout', async () => {
     const timeoutResult = await timedOut.waitForResult();
     assert.equal(timeoutResult.status, 'timeout');
   } finally {
+    delete process.env['KIMI_FIXTURE_STARTED'];
     delete process.env['KIMI_FIXTURE_SCENARIO'];
   }
 });

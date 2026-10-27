@@ -54,7 +54,15 @@ test('watched brief files: copies into worktree cwd, excludes unmodified copy fr
   writeFileSync(path.join(repo, 'ARCHITECTURE.md'), '# Architecture v3\nUpdated export.\n');
 
   // Live detail() while running detects staleReads!
-  const runningDetail = await service.detail(ack.jobId);
+  // The manifest only reads 'running' once the 'started' event is persisted (async under load), and
+  // live staleness is only computed for a running job, so wait for that state, then assert.
+  const runningDetail = await waitFor(
+    async () => {
+      const d = await service.detail(ack.jobId);
+      return d.status === 'running' && d.staleReads !== undefined ? d : null;
+    },
+    { message: 'running detail with staleReads' },
+  );
   assert.deepEqual(runningDetail.staleReads, ['ARCHITECTURE.md']);
 
   // Queue a steer that also adds a new watched file docs/extra.md
@@ -71,7 +79,9 @@ test('watched brief files: copies into worktree cwd, excludes unmodified copy fr
 
   const turn2 = await turn2Ready;
   // Parent turn finished before re-sync: parent's changedFiles must include src.ts and MUST NOT include ARCHITECTURE.md!
-  const parentDetail = await service.detail(ack.jobId);
+  // The parent's changedFiles land when its finish is persisted, which can trail the continuation's start.
+  const parentDetail = await waitFor(async () => { const d = await service.detail(ack.jobId); return d.changedFiles !== undefined ? d : null; },
+    { message: 'the parent turn to record its changedFiles' });
   assert.deepEqual(parentDetail.changedFiles, ['src.ts']);
   assert.deepEqual(parentDetail.staleReads, ['ARCHITECTURE.md']);
 
@@ -149,7 +159,9 @@ test('watched brief files in same-root cwd (cwd === repo): reading ARCHITECTURE.
   // Orchestrator edits ARCHITECTURE.md in repo while worker is running.
   writeFileSync(path.join(repo, 'ARCHITECTURE.md'), '# Architecture v2\nOrchestrator update.\n');
 
-  const liveDetail = await service.detail(ack.jobId);
+  // Live staleReads are computed only once the manifest reads running, which trails the started event.
+  const liveDetail = await waitFor(async () => { const d = await service.detail(ack.jobId); return d.status === 'running' && d.staleReads !== undefined ? d : null; },
+    { message: 'live staleReads while running' });
   assert.deepEqual(liveDetail.staleReads, ['ARCHITECTURE.md']);
 
   turn.finish({ status: 'success', response: 'Implemented based on ARCHITECTURE.md v1.' });

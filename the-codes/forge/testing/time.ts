@@ -23,8 +23,12 @@ export function scaled(ms: number): number {
   return Math.round(ms * SCALE);
 }
 
-/** Default deadline for waitFor: generous, because it only bounds failure time. */
-export const WAIT_DEADLINE_MS = 10_000;
+/**
+ * Default deadline for waitFor. It is a hang guard, not a wait: a passing test
+ * returns the moment its condition holds, so only a broken one ever reaches it.
+ * Generous enough for a heavily loaded runner (real child processes, MCP reloads).
+ */
+export const WAIT_DEADLINE_MS = 60_000;
 
 /**
  * Resolve with the first truthy value `check` returns, polling every `intervalMs`.

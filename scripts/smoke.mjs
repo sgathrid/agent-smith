@@ -44,8 +44,8 @@ try {
   const barrierRoot = path.join(scratch, 'barriers');
   const fakeCodex = path.join(scratch, 'fake-codex.cjs');
   const fakeAgy = path.join(scratch, 'fake-agy.cjs');
-  writeFileSync(fakeCodex, `#!${process.execPath}\nconst fs=require('node:fs'),path=require('node:path'),a=process.argv.slice(2),p=a.at(-1)||'';\nconst emit=()=>{const f=/Write your full answer to (.+?)\\. /.exec(p)?.[1];if(f){if(!fs.statSync(path.dirname(f)).isDirectory())process.exit(22);fs.writeFileSync(f,'FAKE IMPLEMENTATION ARTIFACT\\n');}if(p.includes('Review the implementation artifact')&&!p.includes('FAKE IMPLEMENTATION ARTIFACT'))process.exit(21);console.log(JSON.stringify({type:'thread.started',thread_id:'smoke-thread'}));console.log(JSON.stringify({type:'item.completed',item:{id:'answer',type:'agent_message',text:'Fake provider review: smoke passed.'}}));console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:8,output_tokens:4}}));};const bar=/SMOKE_BARRIER:([\\w-]+):(\\d+)/.exec(p);const meet=(go)=>{const fs=require('node:fs'),path=require('node:path'),d=path.join(${JSON.stringify(barrierRoot)},bar[1]);fs.mkdirSync(d,{recursive:true});fs.writeFileSync(path.join(d,String(process.pid)),'');const end=Date.now()+Number(bar[2]);const tick=()=>{if(fs.readdirSync(d).length>=2||Date.now()>end)go();else setTimeout(tick,20);};tick();};if(bar)meet(emit);else if(p.includes('SMOKE_SLOW'))setTimeout(emit,12000);else emit();\n`);
-  writeFileSync(fakeAgy, `#!${process.execPath}\nconst a=process.argv.slice(2),p=a.find(x=>x.includes('Write your full answer to'))||'';const m=/Write your full answer to (.+?)\\. /.exec(p);if(m){const fs=require('node:fs'),path=require('node:path');if(!fs.statSync(path.dirname(m[1])).isDirectory())process.exit(22);fs.writeFileSync(m[1],'FAKE IMPLEMENTATION ARTIFACT\\n');}\nconst emit=()=>{console.log(JSON.stringify({event:'init',init:{model:'smoke-fixture',conversation_id:'smoke-agy'}}));console.log(JSON.stringify({event:'step_update',step_index:1,state:'DONE',step_type:'agent_response',text:'Fake implementation complete.'}));console.log(JSON.stringify({event:'result',result:{conversation_id:'smoke-agy',status:'SUCCESS',response:'Fake implementation complete.',usage:{input_tokens:8,output_tokens:4}}}));};const bar=/SMOKE_BARRIER:([\\w-]+):(\\d+)/.exec(p);const meet=(go)=>{const fs=require('node:fs'),path=require('node:path'),d=path.join(${JSON.stringify(barrierRoot)},bar[1]);fs.mkdirSync(d,{recursive:true});fs.writeFileSync(path.join(d,String(process.pid)),'');const end=Date.now()+Number(bar[2]);const tick=()=>{if(fs.readdirSync(d).length>=2||Date.now()>end)go();else setTimeout(tick,20);};tick();};if(bar)meet(emit);else emit();\n`);
+  writeFileSync(fakeCodex, `#!${process.execPath}\nconst fs=require('node:fs'),path=require('node:path'),a=process.argv.slice(2),p=a.at(-1)||'';\nconst emit=()=>{const f=/Write your full answer to (.+?)\\. /.exec(p)?.[1];if(f){if(!fs.statSync(path.dirname(f)).isDirectory())process.exit(22);fs.writeFileSync(f,'FAKE IMPLEMENTATION ARTIFACT\\n');}if(p.includes('Review the implementation artifact')&&!p.includes('FAKE IMPLEMENTATION ARTIFACT'))process.exit(21);console.log(JSON.stringify({type:'thread.started',thread_id:'smoke-thread'}));console.log(JSON.stringify({type:'item.completed',item:{id:'answer',type:'agent_message',text:'Fake provider review: smoke passed.'}}));console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:8,output_tokens:4}}));};const bar=/SMOKE_BARRIER:([\\w-]+):(\\d+)/.exec(p);const meet=(go)=>{const fs=require('node:fs'),path=require('node:path'),d=path.join(${JSON.stringify(barrierRoot)},bar[1]);fs.mkdirSync(d,{recursive:true});fs.writeFileSync(path.join(d,String(process.pid)),'');const gate=Number(bar[2])===0;const end=Date.now()+(gate?120000:Number(bar[2]));const tick=()=>{if((gate?fs.existsSync(path.join(d,'release')):fs.readdirSync(d).length>=2)||Date.now()>end)go();else setTimeout(tick,20);};tick();};if(bar)meet(emit);else if(p.includes('SMOKE_SLOW'))setTimeout(emit,12000);else emit();\n`);
+  writeFileSync(fakeAgy, `#!${process.execPath}\nconst a=process.argv.slice(2),p=a.find(x=>x.includes('Write your full answer to'))||'';const m=/Write your full answer to (.+?)\\. /.exec(p);if(m){const fs=require('node:fs'),path=require('node:path');if(!fs.statSync(path.dirname(m[1])).isDirectory())process.exit(22);fs.writeFileSync(m[1],'FAKE IMPLEMENTATION ARTIFACT\\n');}\nconst emit=()=>{console.log(JSON.stringify({event:'init',init:{model:'smoke-fixture',conversation_id:'smoke-agy'}}));console.log(JSON.stringify({event:'step_update',step_index:1,state:'DONE',step_type:'agent_response',text:'Fake implementation complete.'}));console.log(JSON.stringify({event:'result',result:{conversation_id:'smoke-agy',status:'SUCCESS',response:'Fake implementation complete.',usage:{input_tokens:8,output_tokens:4}}}));};const bar=/SMOKE_BARRIER:([\\w-]+):(\\d+)/.exec(p);const meet=(go)=>{const fs=require('node:fs'),path=require('node:path'),d=path.join(${JSON.stringify(barrierRoot)},bar[1]);fs.mkdirSync(d,{recursive:true});fs.writeFileSync(path.join(d,String(process.pid)),'');const gate=Number(bar[2])===0;const end=Date.now()+(gate?120000:Number(bar[2]));const tick=()=>{if((gate?fs.existsSync(path.join(d,'release')):fs.readdirSync(d).length>=2)||Date.now()>end)go();else setTimeout(tick,20);};tick();};if(bar)meet(emit);else emit();\n`);
   chmodSync(fakeCodex, 0o755); chmodSync(fakeAgy, 0o755);
   let stderr = '';
   const openClient = async (name, env) => {
@@ -141,20 +141,34 @@ try {
     return { status: terminal.status, reason: 'timeout' };
   });
   await record('concurrency limit', async () => {
-    // The two fixtures rendezvous through marker files instead of sleeping: at
-    // limit 2 each waits (up to a generous deadline) until it sees the other, so
-    // overlap is proven, not likely. At limit 1 the first waits a short fixed time
-    // for a partner that must not appear; slowness can only hide that bug.
+    // Event-driven, no fixed waits. At limit 2 the two fixtures rendezvous through marker
+    // files: each waits (up to a generous deadline) until it sees the other, so overlap is
+    // proven. At limit 1 (waitMs 0) the first fixture blocks until this script releases it;
+    // we release only after a single pipeline_status read shows one stage running and the
+    // other not started, so a second concurrent stage cannot be missed by waiting too briefly.
     const run = async (name, concurrency, waitMs) => {
       const tag = `${concurrency}-${Date.now()}`;
       const started = await data(await client.callTool({ name: 'run_pipeline', arguments: { spec: { name, workDir: repo, concurrency, stages: [
         { name: 'agy-worker', provider: 'agy', prompt: `SMOKE_BARRIER:${tag}:${waitMs} independent fixture A`, model: 'smoke-fixture' },
         { name: 'codex-worker', provider: 'codex', prompt: `SMOKE_BARRIER:${tag}:${waitMs} independent fixture B`, model: 'smoke-fixture' },
       ] } } }));
+      if (waitMs === 0) {
+        const end = Date.now() + scaled(60_000);
+        for (;;) {
+          const status = await data(await client.callTool({ name: 'pipeline_status', arguments: { runId: started.runId, response_format: 'detailed' } }));
+          const stages = Object.values(status.stageResults ?? {});
+          if (stages.length > 1) throw new Error(`Limit 1 started a second stage while the first was blocked: ${JSON.stringify(status)}`);
+          if (stages.length === 1 && stages[0].status === 'running') break;
+          if (status.status !== 'running' || Date.now() > end) throw new Error(`Serial run never showed a lone running stage: ${JSON.stringify(status)}`);
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        mkdirSync(path.join(barrierRoot, tag), { recursive: true });
+        writeFileSync(path.join(barrierRoot, tag, 'release'), '');
+      }
       return waitStatus('pipeline_status', 'runId', started.runId, 120_000);
     };
     const parallel = await run('smoke concurrency two', 2, scaled(60_000));
-    const serial = await run('smoke concurrency one', 1, 750);
+    const serial = await run('smoke concurrency one', 1, 0);
     const intervals = (run) => Object.values(run.stageResults ?? {}).map((stage) => ({ startedAt: stage.startedAt, finishedAt: stage.finishedAt }));
     const parallelTimes = intervals(parallel), serialTimes = intervals(serial);
     const overlap = parallelTimes.length === 2 && Math.max(...parallelTimes.map((v) => v.startedAt)) < Math.min(...parallelTimes.map((v) => v.finishedAt));

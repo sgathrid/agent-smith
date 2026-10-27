@@ -16,6 +16,10 @@ import { trackedTempDirs } from '../forge/testing/tmp.ts';
 
 const tempDir = trackedTempDirs('agent-smith-provider-test-');
 
+const pidAlive = (pid: number): boolean => {
+  try { process.kill(pid, 0); return true; } catch (err) { return (err as NodeJS.ErrnoException).code === 'EPERM'; }
+};
+
 test('Codex model-refresh timeout is informational; unrelated stderr errors remain warnings', () => {
   assert.equal(codexStderrLevel('ERROR codex_core::models_manager: failed to refresh available models: request timed out'), 'info');
   assert.equal(codexStderrLevel('ERROR failed to refresh available models: unauthorized'), 'warn');
@@ -170,7 +174,7 @@ test('cancellation kills a worker process group including a surviving descendant
   const dir = tempDir();
   const delayedMarker = path.join(dir, 'descendant-survived');
   const childPidFile = path.join(dir, 'child.pid');
-  const descendantCode = `process.on('SIGTERM',()=>{}); setTimeout(()=>require('node:fs').writeFileSync(${JSON.stringify(delayedMarker)},'alive'),900); setInterval(()=>{},1000)`;
+  const descendantCode = `process.on('SIGTERM',()=>{}); setTimeout(()=>require('node:fs').writeFileSync(${JSON.stringify(delayedMarker)},'alive'),600000); setInterval(()=>{},1000)`;
   const workerCode = [
     "const {spawn}=require('node:child_process');",
     "const fs=require('node:fs');",
@@ -193,18 +197,21 @@ test('cancellation kills a worker process group including a surviving descendant
   });
 
   // Wait until the grandchild is live before asking the worker to stop.
-  await waitFor(() => existsSync(childPidFile), { message: 'fake worker to start its descendant' });
-  const descendantPid = Number(readFileSync(childPidFile, 'utf8'));
+  // The pid file can exist before its contents land; only a positive pid identifies the descendant.
+  const descendantPid = await waitFor(() => {
+    const pid = existsSync(childPidFile) ? Number(readFileSync(childPidFile, 'utf8')) : 0;
+    return Number.isInteger(pid) && pid > 0 ? pid : 0;
+  }, { message: 'fake worker to record its descendant pid' });
   worker.terminate('cancelled');
   const exit = await worker.exited;
   worker.closeLog();
   assert.equal(worker.killReason, 'cancelled');
   assert.ok(exit.signal === 'SIGTERM' || exit.signal === 'SIGKILL');
 
-  // Absence cannot be polled for: wait past the descendant's 900 ms marker delay.
   // The descendant ignores SIGTERM and has no inherited pipes to keep close
-  // pending, so this proves the delayed SIGKILL reaches the whole group.
-  await new Promise((resolve) => setTimeout(resolve, 1_000));
+  // pending, so it can only die if the delayed SIGKILL reaches the whole group.
+  // Once it is provably dead it can never write its marker (a far-off cap).
+  await waitFor(() => !pidAlive(descendantPid), { message: `descendant ${descendantPid} to die with its group` });
   assert.equal(existsSync(delayedMarker), false, `descendant ${descendantPid} survived cancellation`);
 });
 
@@ -240,13 +247,21 @@ test('a cancelled supervisor does not abandon detached-stdio descendants', async
   const marker = path.join(dir, 'orphan-alive');
   const workerScript = path.join(dir, 'worker.cjs');
   const supervisor = path.join(dir, 'supervisor.mjs');
-  const descendant = `process.on('SIGTERM',()=>{});setTimeout(()=>require('node:fs').writeFileSync(${JSON.stringify(marker)},'alive'),800);setInterval(()=>{},1000)`;
-  writeFileSync(workerScript, `const {spawn}=require('node:child_process');spawn(process.execPath,['-e',${JSON.stringify(descendant)}],{stdio:'ignore'});console.log('ready');setInterval(()=>{},1000)`);
+  const pidFile = path.join(dir, 'descendant.pid');
+  // The descendant records its pid once its SIGTERM handler is installed; the marker delay is only a cap.
+  const descendant = `process.on('SIGTERM',()=>{});require('node:fs').writeFileSync(${JSON.stringify(pidFile)},String(process.pid));setTimeout(()=>require('node:fs').writeFileSync(${JSON.stringify(marker)},'alive'),600000);setInterval(()=>{},1000)`;
+  // The worker reports 'ready' only after the descendant is up, so the cancel below always meets a live SIGTERM-ignoring descendant.
+  writeFileSync(workerScript, `const fs=require('node:fs'),{spawn}=require('node:child_process');spawn(process.execPath,['-e',${JSON.stringify(descendant)}],{stdio:'ignore'});const t=setInterval(()=>{if(fs.existsSync(${JSON.stringify(pidFile)})){clearInterval(t);console.log('ready');}},10);setInterval(()=>{},1000)`);
   const moduleUrl = new URL('./ndjson.ts', import.meta.url).href;
   writeFileSync(supervisor, `import {spawnWorker} from ${JSON.stringify(moduleUrl)};
-const proc=await spawnWorker({provider:'fixture',binary:process.execPath,argv:[${JSON.stringify(workerScript)}],cwd:${JSON.stringify(dir)},timeoutMs:30000,killGraceMs:150,stateDir:${JSON.stringify(dir)},jobId:'fixture',mode:'fixture',onStdoutLine(){setTimeout(()=>proc.terminate('cancelled'),100)},onStderr(){}});await proc.exited;proc.closeLog();`);
+const proc=await spawnWorker({provider:'fixture',binary:process.execPath,argv:[${JSON.stringify(workerScript)}],cwd:${JSON.stringify(dir)},timeoutMs:30000,killGraceMs:150,stateDir:${JSON.stringify(dir)},jobId:'fixture',mode:'fixture',onStdoutLine(){proc.terminate('cancelled')},onStderr(){}});await proc.exited;proc.closeLog();`);
   await promisify(execFile)(process.execPath, ['--experimental-strip-types', supervisor], { timeout: scaled(60_000) });
-  await new Promise(resolve => setTimeout(resolve, 900));
+  const descendantPid = await waitFor(() => {
+    const pid = existsSync(pidFile) ? Number(readFileSync(pidFile, 'utf8')) : 0;
+    return Number.isInteger(pid) && pid > 0 ? pid : 0;
+  }, { message: 'the descendant to record its pid' });
+  // A dead descendant can never write its marker; a survivor means the supervisor abandoned it.
+  await waitFor(() => !pidAlive(descendantPid), { message: `descendant ${descendantPid} to die with the cancelled supervisor` });
   assert.equal(existsSync(marker), false, 'the supervisor exited while its tool continued running');
 });
 
@@ -697,17 +712,23 @@ for (const name of ['agy', 'codex', 'claude', 'opencode'] as const) {
 test('spawnWorker heartbeats while the child runs (pid included), stops at exit, and writes nothing to events.jsonl', async () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'agent-smith-heartbeat-'));
   const beats: { at: string; pid: number | undefined }[] = [];
+  // The child lives until the test releases it, so beat count depends on events, not on how long the child lasts.
+  const release = path.join(dir, 'release');
+  const child = `setInterval(()=>{if(require('node:fs').existsSync(${JSON.stringify(release)})){process.exit(0)}},20);setTimeout(()=>process.exit(0),120000)`;
   const worker = await spawnWorker({
-    provider: 'fake', binary: process.execPath, argv: ['-e', 'setTimeout(()=>{}, 1200)'],
+    provider: 'fake', binary: process.execPath, argv: ['-e', child],
     cwd: dir, timeoutMs: scaled(60_000), stateDir: dir, jobId: 'heartbeat', mode: 'test',
     heartbeatMs: 50, onHeartbeat: (at, pid) => beats.push({ at, pid }),
     onStdoutLine() {}, onStderr() {},
   });
+  await waitFor(() => beats.length >= 3, { message: 'three heartbeats while the child runs' });
+  writeFileSync(release, '');
   await worker.exited;
   worker.closeLog();
   const atExit = beats.length;
-  assert.ok(atExit >= 3, `expected several beats over ~1200 ms, got ${atExit}`);
+  assert.ok(atExit >= 3, `expected several beats while the child ran, got ${atExit}`);
   assert.ok(beats.every((b) => b.pid === worker.child.pid && Number.isFinite(Date.parse(b.at))));
+  // No positive observable exists for "a timer that was cleared never fires"; slowness can only hide a late beat (false pass), never fail a correct run.
   await new Promise((resolve) => setTimeout(resolve, 150));
   assert.equal(beats.length, atExit, 'no beats after exit');
   assert.equal(existsSync(path.join(dir, 'events.jsonl')), false, 'heartbeats are liveness, not events');
@@ -721,11 +742,13 @@ test('spawnWorker stops heartbeats when the worker exits, even while a descendan
   // stdout, then exits: `close` waits for the grandchild, `exit` does not.
   // The grandchild lives until the test releases it, so load cannot end it early.
   const release = path.join(dir, 'release');
+  const workerRelease = path.join(dir, 'worker-release');
   const grandchild = `setInterval(()=>{ if (require('node:fs').existsSync(${JSON.stringify(release)})) process.exit(0); }, 20); setTimeout(()=>process.exit(0), 120000)`;
   const script = [
     "const { spawn } = require('node:child_process');",
     `spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}], { detached: true, stdio: ['ignore', 'inherit', 'ignore'] }).unref();`,
-    'setTimeout(() => process.exit(0), 150);',
+    // The worker exits only when the test says so, after it has seen heartbeats.
+    `const t = setInterval(() => { if (require('node:fs').existsSync(${JSON.stringify(workerRelease)})) process.exit(0); }, 20);`,
   ].join('\n');
   const worker = await spawnWorker({
     provider: 'fake', binary: process.execPath, argv: ['-e', script],
@@ -735,9 +758,12 @@ test('spawnWorker stops heartbeats when the worker exits, even while a descendan
   });
   let closed = false;
   void worker.exited.then(() => { closed = true; });
+  await waitFor(() => beats.length >= 1, { message: 'a heartbeat while the worker runs' });
+  writeFileSync(workerRelease, '');
   await once(worker.child, 'exit');
   const atExit = beats.length;
   assert.ok(atExit >= 1, 'beats while the worker ran');
+  // The heartbeat timer is cleared on exit and no positive observable exists for "never fires again"; slowness can only hide a late beat (false pass), never fail a correct run.
   await new Promise((resolve) => setTimeout(resolve, 300));
   assert.equal(closed, false, 'stdout is still held open by the grandchild');
   assert.equal(beats.length, atExit, 'no heartbeat after the worker exited');

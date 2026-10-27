@@ -805,7 +805,11 @@ export class JobWriter {
 
 /* ── git baseline helpers ─────────────────────────────────────────────────── */
 
-const GIT_CAP_MS = 2_000;
+/** Per git call. AGENT_SMITH_GIT_TIMEOUT_MS raises it on slow or loaded machines, where a capped-out snapshot loses changedFiles. */
+function gitCapMs(): number {
+  const n = Number(process.env['AGENT_SMITH_GIT_TIMEOUT_MS']);
+  return Number.isFinite(n) && n > 0 ? n : 2_000;
+}
 const TOOL_INPUTS_CAP = 200_000;
 const CHANGED_FILES_SIG_CAP = 500;
 
@@ -814,7 +818,7 @@ function git(cwd: string, args: string[]): Promise<string> {
     execFile(
       'git',
       args,
-      { cwd, timeout: GIT_CAP_MS, maxBuffer: 8 * 1024 * 1024, env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' } },
+      { cwd, timeout: gitCapMs(), maxBuffer: 8 * 1024 * 1024, env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' } },
       (err, stdout) => (err ? reject(err) : resolve(stdout)),
     );
   });

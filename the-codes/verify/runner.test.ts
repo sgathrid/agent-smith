@@ -180,20 +180,22 @@ test('the process GROUP is killed, so grandchildren do not survive', async () =>
     // returns quickly with the grandchild still alive.
     const command = `( sleep 30 ) >/dev/null 2>&1 & echo $! > ${pidFile}; sleep 30`;
 
-    const startedAt = Date.now();
-    const verdict = await runCheck(check({ command, timeoutMs: 200 }, cwd));
-    const elapsed = Date.now() - startedAt;
-
-    assert.equal(verdict.timedOut, true);
-    assert.ok(elapsed < scaled(25_000), `verdict must resolve promptly, took ${elapsed}ms`);
-
-    assert.ok(existsSync(pidFile), 'grandchild should have started and recorded its pid');
-    const pid = Number(readFileSync(pidFile, 'utf8').trim());
-    assert.ok(Number.isInteger(pid) && pid > 0);
+    // Abort only once the pid file is complete, so load cannot kill the shell
+    // before it has started the grandchild. Abort takes the same group-kill path
+    // as the timeout (the timeout verdict is covered by the test above).
+    const controller = new AbortController();
+    const promise = runCheck(check({ command, timeoutMs: 0 }, cwd), { signal: controller.signal, killGraceMs: 100 });
+    const pid = await waitFor(() => {
+      const n = Number(readFileSync(pidFile, 'utf8').trim());
+      return Number.isInteger(n) && n > 0 ? n : 0;
+    }, { message: 'the grandchild to record its pid' });
+    controller.abort();
+    const verdict = await promise;
+    assert.equal(verdict.passed, false);
 
     // SIGTERM goes to the shell; the SIGKILL escalation follows. Give the group a
     // moment to be reaped before asserting.
-    await waitFor(() => !isAlive(pid), { timeoutMs: 15_000, message: `grandchild pid ${pid} to be reaped (the group was not killed)` });
+    await waitFor(() => !isAlive(pid), { message: `grandchild pid ${pid} to be reaped (the group was not killed)` });
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
@@ -214,14 +216,17 @@ test('an abort signal terminates the check', async () => {
   const cwd = scratch();
   const controller = new AbortController();
   try {
-    const promise = runCheck(check({ command: 'sleep 30', timeoutMs: 0 }, cwd), {
+    const promise = runCheck(check({ command: 'touch started; sleep 30', timeoutMs: 0 }, cwd), {
       signal: controller.signal,
       killGraceMs: 100,
     });
-    setTimeout(() => controller.abort(), 100);
+    // Abort once the check's shell has demonstrably started, not after a guessed delay.
+    await waitFor(() => existsSync(join(cwd, 'started')), { message: 'the check to start' });
+    controller.abort();
     const verdict = await promise;
     assert.equal(verdict.passed, false);
-    assert.match(verdict.reason, /killed by SIG|killed process group|timed out/);
+    // The shell may be reaped by the signal (killed by SIG...) or exit 128+SIGTERM itself once its sleep dies.
+    assert.match(verdict.reason, /killed by SIG|killed process group|timed out|exit 143/);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

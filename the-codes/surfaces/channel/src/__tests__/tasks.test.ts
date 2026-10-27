@@ -38,10 +38,11 @@ function rawTransport(tasks = true) {
   let conversation: string | null = 'thread-1';
   let launches = 0;
   let cancels = 0;
+  let terminalReads = 0;
   const service = withWorkerLookup({
     repo,
     spawnedIds: new Set<string>(),
-    detail: async (jobId: string): Promise<JobDetail> => ({
+    detail: async (jobId: string): Promise<JobDetail> => (status === 'succeeded' && terminalReads++, {
       jobId,
       name: workerName,
       workerId: 'worker-1',
@@ -131,6 +132,7 @@ function rawTransport(tasks = true) {
     request,
     launches: () => launches,
     cancels: () => cancels,
+    terminalReads: () => terminalReads,
     setStatus: (next: JobDetail['status']) => { status = next; },
     setWorkerName: (next: string) => { workerName = next; },
     setConversation: (next: string | null) => { conversation = next; },
@@ -223,8 +225,8 @@ test('ext-tasks V2 client negotiates Tasks, polls tasks/get, and receives comple
       // Hold completion behind pending acceptance first, then settle acceptance.
       writeAcceptance(h.repo, 'review-smith-00000001', { state: 'unchecked', checks: [], pending: true });
       h.setStatus('succeeded');
-      // Only gives the poller a chance to wrongly complete early; a slow machine cannot make the test fail.
-      await new Promise(resolve => setTimeout(resolve, 40));
+      // Wait until the client's poll has read the terminal status; the poll reads acceptance synchronously after that, so it has seen it pending and must not complete.
+      await waitFor(() => h.terminalReads() >= 1, { intervalMs: 5, message: 'a poll to observe the terminal status while acceptance is pending' });
       writeAcceptance(h.repo, 'review-smith-00000001', {
         state: 'accepted',
         checks: [{ name: 'unit', ok: true, exitCode: 0, durationMs: 4, outputTail: 'ok', blocking: true, timedOut: false, signal: null }],

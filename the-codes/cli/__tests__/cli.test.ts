@@ -146,7 +146,7 @@ test('background CLI returns a statusable run id, exposes the canonical job, and
 
     const canceled = cancelPipeline(repo, runId);
     assert.equal(canceled.requested, true);
-    await waitFor(() => readPipeline(repo, runId)?.status !== 'running', { timeoutMs: 30_000, message: 'the run to settle after cancel' });
+    await waitFor(() => readPipeline(repo, runId)?.status !== 'running', { message: 'the run to settle after cancel' });
     assert.notEqual(readPipeline(repo, runId)?.status, 'running', 'the detached supervisor must settle the run after cancellation');
     const detail = await service.detail(jobs[0]!.jobId);
     assert.equal(detail.status, 'canceled');

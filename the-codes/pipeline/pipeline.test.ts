@@ -68,6 +68,7 @@ function boom(ctx: StageContext, extra: Partial<StageResult> = {}): StageResult 
 /** A runner whose stages block until the test opens the gate. */
 function gatedRunner() {
   const started: string[] = [];
+  const inFlight = { now: 0, peak: 0 };
   const contexts: StageContext[] = [];
   let open: () => void = () => {};
   const gate = new Promise<void>((resolve) => {
@@ -78,11 +79,13 @@ function gatedRunner() {
     async run(ctx: StageContext): Promise<StageResult> {
       started.push(ctx.stage.name);
       contexts.push(ctx);
+      inFlight.peak = Math.max(inFlight.peak, ++inFlight.now);
       await gate;
+      inFlight.now--;
       return ok(ctx);
     },
   };
-  return { runner, started, contexts, open: () => open() };
+  return { runner, started, contexts, inFlight, open: () => open() };
 }
 
 async function waitFor(predicate: () => boolean, label: string): Promise<void> {
@@ -150,18 +153,18 @@ test('independent stages run concurrently, not in order', async () => {
 });
 
 test('the concurrency cap is respected exactly', async () => {
-  const { runner, started, open } = gatedRunner();
+  const { runner, started, inFlight, open } = gatedRunner();
   const stages = ['a', 'b', 'c', 'd', 'e'].map((n) => stage(n));
   const run = runPipeline(spec('capped', stages), { runner, workDir: WORKDIR, concurrency: 2 });
 
   await waitFor(() => started.length === 2, 'two stages to start');
-  // Negative check: any over-dispatch happens in microtasks right after the second start; a slow machine can only hide it, never fail a correct run.
-  await new Promise((r) => setTimeout(r, 40));
+  // Over-dispatch is caught deterministically below: the runner's own in-flight peak must stay at the cap.
   assert.equal(started.length, 2, 'must not exceed the cap');
 
   open();
   const result = await run;
   assert.equal(result.peakConcurrency, 2);
+  assert.equal(inFlight.peak, 2, 'runner never saw more than the cap in flight');
   assert.equal(Object.keys(result.outcomes).length, 5);
 });
 
