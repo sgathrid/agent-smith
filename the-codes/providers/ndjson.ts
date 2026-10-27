@@ -294,7 +294,18 @@ export interface SpawnWorkerOptions extends WorkerPumps {
   stateDir: string;
   jobId: string;
   mode: string;
+  /**
+   * Called while the child runs: once right after spawn, then every
+   * `heartbeatMs`. Adapters hand it to `bus.emit` as a `heartbeat` event (never
+   * to events.jsonl), so the job writer can record `lastAliveAt`.
+   */
+  onHeartbeat?: (at: string, pid: number | undefined) => void;
+  /** Heartbeat interval. Defaults to HEARTBEAT_MS; overridable for tests. */
+  heartbeatMs?: number;
 }
+
+/** Default heartbeat interval; mirrors surfaces/mod/hooks/stale.ts HEARTBEAT_MS. */
+export const HEARTBEAT_MS = 30_000;
 
 /**
  * The concrete child type we actually get: stdin is null (stdio[0]='ignore'),
@@ -351,6 +362,8 @@ export function spawnWorker(opts: SpawnWorkerOptions): Promise<WorkerProcess> {
   let killReason: 'cancelled' | 'timeout' | undefined;
   let killTimer: NodeJS.Timeout | undefined;
   let timeoutTimer: NodeJS.Timeout | undefined;
+  let heartbeatTimer: NodeJS.Timeout | undefined;
+  let firstBeat: NodeJS.Timeout | undefined;
   const killGraceMs = Math.max(0, opts.killGraceMs ?? 5_000);
 
   function signalTree(signal: NodeJS.Signals): void {
@@ -402,12 +415,28 @@ export function spawnWorker(opts: SpawnWorkerOptions): Promise<WorkerProcess> {
     timeoutTimer.unref?.();
   }
 
+  // Liveness from the process owner. Provider events stop during a long tool
+  // call; this does not. The first beat waits one macrotask so the caller has
+  // subscribed to the adapter's bus (spawn resolves first).
+  const onHeartbeat = opts.onHeartbeat;
+  if (onHeartbeat !== undefined && handle.pid !== undefined) {
+    const beat = (): void => {
+      try { onHeartbeat(nowIso(), handle.pid); } catch { /* a listener must not kill the worker */ }
+    };
+    firstBeat = setTimeout(beat, 0);
+    firstBeat.unref?.();
+    heartbeatTimer = setInterval(beat, Math.max(1, opts.heartbeatMs ?? HEARTBEAT_MS));
+    heartbeatTimer.unref?.();
+  }
+
   const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
     let settled = false;
     const finish = (code: number | null, signal: NodeJS.Signals | null): void => {
       if (settled) return;
       settled = true;
       if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
+      if (firstBeat !== undefined) clearTimeout(firstBeat);
+      if (heartbeatTimer !== undefined) clearInterval(heartbeatTimer);
       if (killTimer !== undefined) {
         clearTimeout(killTimer);
         killTimer = undefined;

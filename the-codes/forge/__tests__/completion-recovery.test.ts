@@ -1,7 +1,7 @@
 /** Provider completion can reach disk before the supervisor's terminal anchor. */
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -130,4 +130,21 @@ test('invalid recovered identity retains the existing conversation', () => {
   writeResultFile(result.stateDir, { ...result, raw: { conversation_id: {} } });
   assert.equal(reconcileOrphan(repo, jobId), true);
   assert.equal(JSON.parse(readFileSync(file, 'utf8')).conversation, 'existing-session');
+});
+
+test('recovery fails a writing job whose cwd is gone, keeps a review, and summarises from the end', () => {
+  for (const [mode, expected] of [['implement', 'failed'], ['review', 'succeeded']] as const) {
+    const { repo, jobId, file, result } = fixture();
+    const gone = mkdtempSync(path.join(tmpdir(), 'completion-recovery-cwd-'));
+    rmSync(gone, { recursive: true, force: true });
+    writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, 'utf8')), mode, cwd: gone }));
+    const tail = 'Verdict: merge.';
+    writeResultFile(result.stateDir, { ...result, response: `${'Long preamble. '.repeat(120)}\n\n${tail}` });
+    assert.equal(reconcileOrphan(repo, jobId), true);
+    const recovered = JSON.parse(readFileSync(file, 'utf8'));
+    assert.equal(recovered.status, expected, mode);
+    assert.equal(recovered.cwdMissingAtFinish, true);
+    assert.equal(recovered.changedFilesUnknown, true);
+    assert.match(recovered.latestSummary, /Verdict: merge\.$/);
+  }
 });

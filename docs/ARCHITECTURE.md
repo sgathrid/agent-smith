@@ -36,9 +36,9 @@ State lives in `<repo>/.agent-smith/jobs/<jobId>/` (gitignored). `FILES` in `for
 
 | File | Writer | Meaning |
 |---|---|---|
-| `job.json` | `JobWriter`; service-owned orphan recovery; atomic whole-file rewrite | The anchor and only mandatory file. Schema v1 manifest: identity, provider/mode/model (requested, resolved, source), sandbox, status, timestamps, `ownerPid`, `exitCode`, `error`, `deniedActions`, `usage`, `gitBaseline`, `changedFiles`. Never deleted. A reader refuses a manifest with a higher `schema`. Holds `task` (first prompt line, 200 chars), not the full prompt. |
-| `progress.json` | `JobWriter`, coalesced to `PROGRESS_FLUSH_MS` = 250 ms | Advisory liveness: `lastEventAt`, live `toolCalls`, recent activities, `lastActivity` (including completed tools), `latestText`, `latestSummary` (source `worker`), warnings, and `digest`: what the worker has done so far, from its tool calls (`phase`, files read, searches, files edited through visible edit tools, commands, test runs and whether the last one explicitly failed, a repeated call). One classifier in `surfaces/mod/hooks/progress.ts` serves every provider and both the writer and the UI. It never reports a passing test or zero edits, because exit codes and shell edits are not always visible. |
-| `events.jsonl` | `providers/ndjson.ts` | Normalized `ProviderEvent` stream. |
+| `job.json` | `JobWriter`; service-owned orphan recovery; atomic whole-file rewrite | The anchor and only mandatory file. Schema v1 manifest: identity, provider/mode/model (requested, resolved, source), sandbox, status, timestamps, `ownerPid`, `exitCode`, `error`, `deniedActions`, `usage`, `gitBaseline`, `changedFiles`, and finish evidence when it applies: `toolErrors` (tool calls that ended in an error), `failedEarly`, `changedFilesUnknown`, `cwdMissingAtFinish` (see Status derivation). Never deleted. A reader refuses a manifest with a higher `schema`. Holds `task` (first prompt line, 200 chars), not the full prompt. |
+| `progress.json` | `JobWriter`, coalesced to `PROGRESS_FLUSH_MS` = 250 ms | Advisory liveness: `lastEventAt` (last provider event), `lastAliveAt` and `workerPid` (the process owner's heartbeat, see Liveness), live `toolCalls` and `toolErrors`, recent activities, `lastActivity` (including completed tools), `latestText`, `latestSummary` (source `worker`: the current assistant message only, reset at each tool call; at finish the last 1 000 chars of the final response, cut at a paragraph or line boundary), warnings, and `digest`: what the worker has done so far, from its tool calls (`phase`, files read, searches, files edited through visible edit tools, commands, test runs and whether the last one explicitly failed, a repeated call). One classifier in `surfaces/mod/hooks/progress.ts` serves every provider and both the writer and the UI. It never reports a passing test or zero edits, because exit codes and shell edits are not always visible. |
+| `events.jsonl` | `providers/ndjson.ts` | Normalized `ProviderEvent` stream. Heartbeats are not written here. |
 | `argv.json` | `providers/ndjson.ts` | Exact argv and cwd. |
 | `stderr.log` | `providers/ndjson.ts` | Child stderr, verbatim. |
 | `result.json` | `providers/ndjson.ts` | Verbatim adapter `JobResult`, written once at completion. Its presence stops orphan derivation. |
@@ -49,6 +49,7 @@ State lives in `<repo>/.agent-smith/jobs/<jobId>/` (gitignored). `FILES` in `for
 | `steer.head` | `ForgeService.pump` | Child job ID written after the continuation anchor exists and before the parent stamps `supersededBy`; lets `resolveHead` (cancel/status) cross that finish window. |
 | `orphaned` | legacy marker | Existing markers remain readable. New readers do not write markers; service recovery persists terminal state in `job.json`. |
 | `acceptance.json` | `forge/checks.ts` (only when `spawn_job` got `checks`) | Sidecar, see Acceptance. Not in `FILES`. |
+| `env-keys.json` | `ForgeService` (only when the spawn got `env`) | The names of the worker's extra environment variables. Values are never written anywhere (`ENV_KEYS_FILE`, `service.ts`). |
 
 Pipeline runs sit beside jobs, not inside them: `.agent-smith/pipelines/<runId>.json`
 (`PipelineRecord`: `running|passed|partial|failed`, per-stage results), `<runId>.cancel`
@@ -101,6 +102,27 @@ with warning > other `deniedActions` non-empty =
 `succeeded` > no verdict = `running`. A job that exited 0 and delivered nothing is
 failed, never a quiet success.
 
+The cwd rule sits after the denial rules: when the job's cwd no longer exists at finish
+(`cwdMissing`) and the job is a writing one (`implement`/`verify` mode, or its own edit tool
+calls show edits), the verdict is `failed` + suspicious with `CWD_GONE_REASON` "working
+directory gone; nothing could be verified" (short reason "working directory gone"). A
+read-only job keeps its verdict and gets a warning instead: its report is the deliverable.
+Either way the manifest records `cwdMissingAtFinish: true`. `JobWriter.verdictFacts()` (via
+`format.ts` `cwdFacts`) supplies these inputs to `finish()` and to the steer chain, so a
+cwd-gone writing turn never chains a queued steer; orphan recovery (`reconcile.ts`) uses the
+mode, the cwd and the progress digest's edit count, and records `changedFilesUnknown` when it
+recovers a persisted result (it never runs the finish-time diff).
+
+Finish evidence, recorded only when true (`writer.ts`): `changedFilesUnknown` when
+`changedFiles` could not be computed (no git baseline, git failed or timed out, cwd gone), so
+an absent `changedFiles` means unknown, never "no edits"; `toolErrors` counts tool calls that
+ended in an error state, a warning and not a verdict (opencode no longer fails a job that
+delivered its report after one failed `read`; an `error`/`session.error` event, a denial,
+a nonzero exit or an empty report still fails it); `failedEarly` when a failed job
+made no tool call and either ended within `FAILED_EARLY_MS` = 20 s or its first substantive
+event was an error, keeping the provider's text in `error` (a route problem: model not
+available in the region, account out of funds).
+
 `AgentSmithReader.read` (`harness/agent-smith.ts`) then applies, only to a `running`
 manifest with no `result.json`, not canceled:
 
@@ -121,14 +143,43 @@ manifest with no `result.json`, not canceled:
   manifest does. With a live owner, the owner's poll signals the worker's process group and
   records the result.
 
-The channel adds `attention` (a `running` job whose `updatedAt` is older than
-`STALL_GRACE_MS` = 15 min, or has none) in `watch-source.ts`; the mod shares that constant.
+### Liveness
+
+`updatedAt`/`lastEventAt` move only on provider events, so a worker running one long command
+(`cargo test`) or a coordinator waiting on its team emits nothing. The process owner adds a
+heartbeat: `providers/ndjson.ts` `spawnWorker` calls `onHeartbeat` once right after spawn and
+every `HEARTBEAT_MS` = 30 s while the child runs; each adapter puts it on its bus as a
+`{kind:'heartbeat', at, pid}` `ProviderEvent` (never in `events.jsonl`), and
+`JobWriter.heartbeat` writes `progress.json` `lastAliveAt`/`workerPid` only, without moving
+`lastEventAt`, `updatedAt`, the timeline or the mirror.
+
+`livenessOf` (`mod/hooks/stale.ts`) is the one rule; the channel (`views.ts`, `tools.ts`,
+`watch-source.ts`) and the mod (`canonical.ts`, `jobs.ts`) both call it. A job that is not
+running has none. Otherwise, in order:
+
+| State | When |
+|---|---|
+| `dead` | `lastAliveAt` older than `ALIVE_GRACE_MS` = 2 min while still running |
+| `silent` | no event time at all; or no `lastAliveAt` (a job from an older build) and no event for `STALL_GRACE_MS` = 15 min |
+| `in-tool` | the latest activity is still open (`lastActivity.status === 'active'`: started, not ended); a long command is not a stall |
+| `active` | an event within 15 min |
+| `silent` | no event for 15 min, heartbeat fresh |
+| `waiting` | reserved for known live children (agy team members, Claude subagents); not produced |
+
+The result carries `silentForMs` (since the last event), `since`, `forMs` and, for an open
+call, `tool` (the first command of a shell call, else the tool name). `attention` (channel
+`WatchStatus`, mod `RadarStatus`) means `silent` or `dead`; `status` and `list_jobs` expose
+`liveness {state, silentForMs, tool?}` and keep `stalled` as a derived alias (silent or dead)
+for one release. kimi reports a tool call only when it ends, so a kimi job in a long command
+reads `silent`, not `in-tool`.
 
 `nextActionFor` derives (never stores) an imperative for the orchestrator on
 `failed`/`canceled` jobs: canceled -> nothing to do; orphaned -> `resume_job` if it has a
 conversation handle else rerun; denied -> use an approved path or ask authorization before
 retrying unrestricted; authentication/quota -> resolve the account problem; rate limit ->
 wait or reduce concurrency; incompatible arguments -> run `doctor` and check capabilities;
+`failedEarly` -> pick another model from `list_capabilities` or fix the account (after the
+specific diagnoses, before the generic ones; never for a timeout);
 timeout -> raise `timeoutMs`/split; network-ish error -> retry once;
 empty output -> ask via `resume_job`; otherwise read `error` and `warnings`. `null` for
 running/succeeded. Surfaced in `list_jobs` and `status`.
@@ -222,7 +273,10 @@ prompt starts with the brief; `view.json` (and the mirrored spec) keep the prepe
 
 ## Model discovery and validation
 
-`providers/catalog.ts`; lazy, nothing runs at startup or on the spawn path.
+`providers/catalog.ts`. The MCP server warms every catalog in the background at startup
+(`ForgeService.warmCatalogs`, fire and forget; `AGENT_SMITH_NO_CATALOG_WARMUP=1` skips it), so
+the first spawn usually finds them cached. A pipeline supervisor child is its own process with
+its own cold cache.
 
 - `getCatalogs({providers?, refresh?, timeoutMs?})`: PATH-probes `available()` for each
   provider, fans out `listModels()` in parallel (10 s per provider, guard +1 s), never
@@ -240,8 +294,10 @@ prompt starts with the brief; `view.json` (and the mirrored spec) keep the prepe
   `<codexHome>/config.toml` top-level `model` and `model_reasoning_effort`; claude
   `<claudeHome>/settings.json` top-level `model`; kimi `<kimiHome>/config.toml` top-level
   `default_model`. agy and opencode have none.
-- Spawn path: a catalog is consulted only if the request names `model` or `effort`, with a
-  hard `CATALOG_WAIT_MS` = 2 s race; on timeout/error it is treated as absent. With no
+- Spawn path: a catalog is consulted only if the request names `model` or `effort`, raced
+  against `CATALOG_COLD_WAIT_MS` = 5 s until any catalog lookup has completed in the process,
+  then `CATALOG_WAIT_MS` = 2 s (a spawn joins a warm-up still in flight rather than starting a
+  second discovery); on timeout/error it is treated as absent. With no
   `model`, `modelResolved` comes from `harnessDefaults().model` (`modelSource`
   `harness-config`); a provider-reported model on the `started` event upgrades an unknown to
   `reported`. Effort defaults are not resolved at spawn.
@@ -278,8 +334,13 @@ blocking checks pass -> `accepted`; a blocking failure -> `rejected`. `blocking:
 checks are recorded but never gate, including missing-directory/spawn failures. A mandatory
 declared check with an empty command rejects acceptance; optional absent commands remain
 informational. Verdicts preserve timeout, signal, skipped reason and diagnostic reason.
-A pending `{state:'unchecked', pending:true}` placeholder
-is written at spawn; the real verdict replaces it atomically. Check output tails are capped
+A pending `{state:'unchecked', pending:true, budgetMs}` placeholder is written at spawn
+(`pendingAcceptance`; `budgetMs` = the checks' timeouts summed + 30 s, capped at 30 min). While
+checks run, `runAcceptance` rewrites it with `startedAt` and `running` (the names of the checks
+running now, comma separated); `status` shows `acceptance.running`. The real verdict replaces
+it atomically. `cancel` on a job whose checks are running in this MCP process aborts them: the
+result carries `checksCanceled: true` and acceptance becomes `unchecked` with reason
+`checks canceled`. Check output tails are capped
 at 2000 chars; default per-check timeout 60 s; `cwd` resolves against the job's cwd.
 `status` merges the sidecar (`unchecked` when absent or unreadable). The gate lives in the
 MCP server process: if it exits before the job finishes, the placeholder stays. Pipeline
@@ -288,7 +349,10 @@ stages use the same rules (`StageResult.acceptance` `passed|failed|unchecked`, r
 
 Completion notices lead with execution status and truncate worker prose at a sentence
 or word boundary. They include provider, elapsed time, changed-file count and the
-check tally only when recorded evidence exists. One renderer, `mod/hooks/notice.ts`,
+check tally only when recorded evidence exists. A notice waits for a pending verdict up to
+the placeholder's `budgetMs` (`ACCEPTANCE_HOLD_MS` = 5 min without one). If it must fire
+first it says `… <worker> <time> · exited · checks running: <name>`, never `done`, and a
+second notice announces the verdict when it lands. One renderer, `mod/hooks/notice.ts`,
 writes them for both announcers (see Notifications).
 
 ## Changed files
@@ -331,8 +395,10 @@ Claude                MCP server (dist/server.js)      Claude Code hooks        
   modules, so `tool.call` is the only path. A `status`/`pipeline_status` read of a
   settled job on the main loop (`tool.call` with no `agentId`) retires its notice.
   It declines (calls `next`) in legacy mode, after a read error, or when the ack's
-  repo is not the one it polls. Each 3 s poll announces claimed jobs that ended (or
-  stalled, once), holding a pending acceptance verdict up to 5 min, with one
+  repo is not the one it polls. Each 3 s poll announces claimed jobs that ended, or
+  went quiet (once: `no output for 16m`, with `(in \`npm test\`)` when a call is open), or
+  whose process is gone (once more: `process gone 3m`); the text states the fact and never
+  asks for an interrupt. It holds a pending acceptance verdict for the checks' budget, with one
   `$.prompt.submit` turn credited to the plugin. Claude Code shows that message to
   the user in full, so it is the only notice: one line per job, no worker summary. Only claimed ids are announced, so two sessions on one repo
   never wake each other. A claimed run is announced with its stage jobs when the
@@ -375,8 +441,9 @@ Claude                MCP server (dist/server.js)      Claude Code hooks        
 - **One path per session**: the plugin's MCP server is configured with
   `AGENT_SMITH_CHANNEL=0` (no `claude/channel` capability, no poll loop, no startup
   baseline), so the hook is the only notifier. The channel (`poller.ts`: 5 s poll, first
-  poll is a silent baseline, per-job dedupe key `id#status#epoch`, one batched notification
-  per tick, only `finished|failed|attention|cancelled`) runs only when the server starts
+  poll is a silent baseline, per-job dedupe key `id#status[#dead][#checks]#epoch`, one batched
+  notification per tick, only `finished|failed|attention|cancelled`; `attention` for a silent
+  job needs an event time, for a dead one it does not) runs only when the server starts
   without `AGENT_SMITH_CHANNEL=0`, e.g. `dev.sh --channels` (which loads the mod via
   `--plugin-dir`, hence no hook).
 - **Unverified**: exit-dialog behavior of async hooks, hook timeout cap for 45-minute jobs,
@@ -386,9 +453,9 @@ Claude                MCP server (dist/server.js)      Claude Code hooks        
 
 Every tool answers fast so the MCP server and the session are never blocked by a
 long-running job: `spawn_job`/`resume_job`/`run_pipeline` return once the anchor is on disk
-(`run_pipeline` persists the run record first); discovery runs only on `list_capabilities` or when a
-model/effort is named, bounded to 2 s on the spawn path; harness defaults are file reads, not
-CLI calls. The intentional waits are `status wait_ms` (1-60 000 ms, polling every 500 ms),
+(`run_pipeline` persists the run record first); discovery runs in the background at server
+start, on `list_capabilities`, or when a model/effort is named, bounded on the spawn path to 5 s
+before any catalog has been seen and 2 s after; harness defaults are file reads, not CLI calls. The intentional waits are `status wait_ms` (1-60 000 ms, polling every 500 ms),
 meant for when the hook is unavailable, and an unrestricted confirmation, which waits on the
 user (up to 10 minutes) before anything launches.
 
@@ -405,6 +472,10 @@ user (up to 10 minutes) before anything launches.
   read-only is not enforceable for kimi. Each harness
   owns its sandbox (see CONFIGURATION.md); the ack echoes `sandbox`, `sandboxFlags`,
   `readOnlyRequested`, `readOnlyEnforced`.
+- `env` on `spawn_job`, `resume_job` and pipeline stages adds worker environment variables
+  (keys `^[A-Za-z_][A-Za-z0-9_]*$`, string values without NUL; `validateEnv`). Values live in
+  memory only: `env-keys.json` and the ack's `envKeys` carry names. `resume_job` does not
+  inherit env; when the original had some, its ack warns that they were not passed again.
 - Worker-authored fields (`report`, `latestSummary`) are untrusted data; `latestSummary`
   is bounded assistant output with source `worker`, never thinking or generic tool output.
   Verify with checks or the diff.

@@ -737,6 +737,8 @@ export const kimiProvider: Provider = {
       stateDir,
       jobId,
       mode: spec.mode,
+      // Liveness only: on the bus, never in events.jsonl (see ProviderEvent 'heartbeat').
+      onHeartbeat: (at, pid) => bus.emit({ kind: 'heartbeat', at, ...(pid === undefined ? {} : { pid }) }),
       ...(spec.env !== undefined ? { env: spec.env } : {}),
       onStdoutLine(line) {
         const raw = tryParseObject(line);

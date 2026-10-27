@@ -1,6 +1,6 @@
 /** Pure rules for the Forge sidebar: which workers it lists and how it labels them. */
 import type { ActivityEvent, RadarAcceptance, RadarJob } from '../types/index.d.ts';
-import { countSummary, elapsed, elapsedCell, failedChecks, failureWords, isTerminal, jobLabel, oneLine, pickGlyph } from './format.ts';
+import { countSummary, elapsed, elapsedCell, failedChecks, failureWords, isTerminal, jobLabel, livenessWords, oneLine, pickGlyph } from './format.ts';
 import { classify } from './progress.ts';
 
 /** A settled failure or rejection stops asking for attention this long after it ended. */
@@ -62,7 +62,7 @@ export function commandTerminalColumns(presentation: unknown): number | undefine
 
 /**
  * Settled (terminal, checks not pending) work ages out of attention so a stale
- * failure stops being drawn as one. Running, pending and stalled (`attention`)
+ * failure stops being drawn as one. Running, pending and quiet (`attention`)
  * jobs never expire. Without `now` or a timestamp nothing expires.
  */
 function expired(job: RadarJob, now?: number): boolean {
@@ -120,10 +120,10 @@ export function workerStatus(job: RadarJob): string {
   } else if (job.acceptance?.state === 'rejected') {
     base = `${job.status} · checks failed`;
   } else if (job.status === 'running') {
-    const act = oneLine(job.activity);
+    const act = livenessWords(job) || oneLine(job.activity);
     return act ? `Running · ${act}` : 'Running';
   } else if (job.status === 'attention') {
-    return 'stalled';
+    return livenessWords(job) || 'no output';
   } else {
     base = job.status === 'succeeded' ? 'done' : job.status;
   }

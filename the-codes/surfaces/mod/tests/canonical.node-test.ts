@@ -139,3 +139,18 @@ test('canonical: a job with a recorded short reason uses it; an old long error i
   assert.equal((await read({ reason: 'denied view_file', error: 'a very long text' }))?.failureReason, 'denied view_file');
   assert.equal((await read({ error: 'worker soft-denied 1 tool action(s) (view_file) — exited 0' }))?.failureReason, 'worker soft-denied 1 tool action(s) (view_file) — exited 0');
 });
+test('canonical liveness: a long open command stays running, a stopped heartbeat is attention (dead)', async () => {
+  const at = (ms: number) => new Date(ms).toISOString();
+  const later = now + 20 * 60_000;
+  const quiet = { lastEventAt: manifest.updatedAt, toolCalls: 1,
+    lastActivity: { stepIndex: 1, tool: 'Bash', input: '{"command":"cargo test --workspace"}', status: 'active' } };
+  const inTool = (await readForgeJobs(memoryFs({ [`${base}/job.json`]: JSON.stringify(manifest),
+    [`${base}/progress.json`]: JSON.stringify({ ...quiet, lastAliveAt: at(later - 10_000) }) }), '/repo', later))[0];
+  assert.equal(inTool?.status, 'running');
+  assert.equal(inTool?.liveness?.state, 'in-tool');
+  assert.equal(inTool?.liveness?.tool, 'cargo test --workspace');
+  const dead = (await readForgeJobs(memoryFs({ [`${base}/job.json`]: JSON.stringify(manifest),
+    [`${base}/progress.json`]: JSON.stringify({ ...quiet, lastAliveAt: at(later - 3 * 60_000) }) }), '/repo', later))[0];
+  assert.equal(dead?.status, 'attention');
+  assert.equal(dead?.liveness?.state, 'dead');
+});

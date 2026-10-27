@@ -44,7 +44,7 @@ import {
   FAILED_EARLY_MS,
   FILES,
   PROGRESS_FLUSH_MS,
-  isWritingMode,
+  cwdFacts,
   attributeChanged,
   failureFields,
   diffChangedFiles,
@@ -140,6 +140,10 @@ export class JobWriter {
   private currentMessage = '';
   /** Steps whose tool call ended in an error state. */
   private toolErrorSteps = new Set<number>();
+  /** Last heartbeat and the worker pid it named; carried through every progress rebuild. */
+  private lastAliveAt: string | null = null;
+  private workerPid: number | undefined;
+  private lastHeartbeatFlushMs = 0;
   /** Whether the first substantive event (not `started`/`usage`) was an error notice. */
   private firstEventSeen = false;
   private firstEventWasError = false;
@@ -336,10 +340,32 @@ export class JobWriter {
     } catch { /* best effort */ }
   }
 
+  /**
+   * Record that the worker's process is alive: progress.json `lastAliveAt` (and
+   * `workerPid`). Not activity: `updatedAt`, `lastEventAt`, the timeline and the
+   * mirror's events stay untouched, and only progress.json is rewritten.
+   */
+  heartbeat(at: string, pid?: number): void {
+    if (this.finished || this.manifest === null || this.progress === null) return;
+    this.lastAliveAt = at;
+    if (typeof pid === 'number') this.workerPid = pid;
+    this.progress = { ...this.progress, lastAliveAt: at, ...(this.workerPid === undefined ? {} : { workerPid: this.workerPid }) };
+    // Coalesced like every progress write; heartbeats are HEARTBEAT_MS apart, so in practice each lands.
+    const nowMs = Date.parse(at);
+    if (!shouldFlush(this.lastHeartbeatFlushMs, Number.isNaN(nowMs) ? Date.now() : nowMs, this.flushMs)) return;
+    this.lastHeartbeatFlushMs = Number.isNaN(nowMs) ? Date.now() : nowMs;
+    writeJsonAtomic(jobFile(this.repo, this.jobId, FILES.progress), this.progress);
+  }
+
   /** Feed one normalized provider event into the snapshot. */
   onEvent(event: ProviderEvent): void {
     if (this.finished || this.manifest === null) return;
     const at = event.at;
+
+    if (event.kind === 'heartbeat') {
+      this.heartbeat(at, event.pid);
+      return;
+    }
 
     if (event.kind === 'started') {
       if (typeof event.conversationId === 'string' && event.conversationId.trim() !== '') {
@@ -502,6 +528,16 @@ export class JobWriter {
    * a throw from the adapter. A job that never gets a terminal write stays
    * `running` forever, which is a lie with a very long fuse.
    */
+  /**
+   * The cwd facts deriveStatus needs: is the cwd gone, and was this job meant
+   * to write (mode) or seen editing (its own edit tool calls). Every verdict
+   * for this job (finish, the steer chain) reads them from here.
+   */
+  verdictFacts(): { cwdMissing: boolean; writing: boolean } {
+    const edited = this.editToolInputs !== '' || this.tracker.editedPaths(this.cwd).length > 0;
+    return cwdFacts(this.cwd, this.manifest?.mode, edited);
+  }
+
   finish(result: JobResult, report: string | null): ForgeManifest {
     if (this.finished || this.manifest === null) {
       // A second terminal write is a bug in the caller, but returning the
@@ -515,8 +551,7 @@ export class JobWriter {
     // adapter's terminal cancellation verdict can make the job canceled.
     const alreadyTerminal: ForgeStatus | null = result.status === 'cancelled' ? 'canceled' : null;
 
-    const cwdMissing = this.cwd !== '' && !existsSync(this.cwd);
-    const writing = isWritingMode(this.manifest.mode) || this.editToolInputs !== '' || this.tracker.editedPaths(this.cwd).length > 0;
+    const { cwdMissing, writing } = this.verdictFacts();
     const verdict = deriveStatus({
       alreadyTerminal,
       ok: result.ok,
@@ -713,6 +748,8 @@ export class JobWriter {
       latestText: this.latestText,
       toolCalls: this.toolCalls,
       ...(this.toolErrorSteps.size === 0 ? {} : { toolErrors: this.toolErrorSteps.size }),
+      ...(this.lastAliveAt === null ? {} : { lastAliveAt: this.lastAliveAt }),
+      ...(this.workerPid === undefined ? {} : { workerPid: this.workerPid }),
       warnings: this.progress?.warnings ?? [],
       digest: this.tracker.digest(this.cwd),
       ...(this.progress?.pendingSteers !== undefined ? { pendingSteers: this.progress.pendingSteers } : {}),

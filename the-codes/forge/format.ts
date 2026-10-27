@@ -98,6 +98,7 @@ import {
 } from '../surfaces/mod/hooks/reasons.ts';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
+import { existsSync } from 'node:fs';
 
 /** Per-repo job root, relative to the repo. Ours; nothing else reads it as truth. */
 export const JOBS_DIR_SEGMENTS = ['.agent-smith', 'jobs'] as const;
@@ -389,6 +390,14 @@ export interface ForgeProgress {
   readonly toolCalls: number;
   /** Tool calls that ended in an error state so far. Absent until the first one. */
   readonly toolErrors?: number;
+  /**
+   * Last heartbeat from the process owner (providers/ndjson.ts): the worker's
+   * CLI process was running at this time. Moves without events; never moves
+   * lastEventAt. Absent for jobs from builds before heartbeats, and until the first beat.
+   */
+  readonly lastAliveAt?: string;
+  /** The worker CLI's pid (its process group leader), from the heartbeat. */
+  readonly workerPid?: number;
   readonly warnings: readonly string[];
   /** What the worker has done so far, from its tool calls. */
   readonly digest?: ProgressDigest;
@@ -513,6 +522,15 @@ export const FAILED_EARLY_MS = 20_000;
 /** Writing modes: a vanished cwd makes their success unverifiable. */
 export function isWritingMode(mode: string | null | undefined): boolean {
   return mode === 'implement' || mode === 'verify';
+}
+
+/**
+ * deriveStatus's cwd inputs, from what the caller can prove: whether `cwd`
+ * still exists, and whether the job was meant to write (its mode) or is known
+ * to have edited. An empty or absent cwd is never "missing" (nothing to check).
+ */
+export function cwdFacts(cwd: string | null | undefined, mode: string | null | undefined, edited = false): { cwdMissing: boolean; writing: boolean } {
+  return { cwdMissing: typeof cwd === 'string' && cwd !== '' && !existsSync(cwd), writing: isWritingMode(mode) || edited };
 }
 
 export interface StatusVerdict {

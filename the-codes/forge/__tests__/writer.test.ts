@@ -923,3 +923,43 @@ test('a fast failure with no tool calls is marked failedEarly; a slow or busy on
   const timedOut = startIn(r, r, 'review', 'review-smith-early005');
   assert.equal(timedOut.finish(result({ ok: false, status: 'timeout', error: 'timed out', durationMs: 1_000, response: '' }), '').failedEarly, undefined);
 });
+
+/* ── liveness: the process owner's heartbeat ───────────────────────────────── */
+
+test('a heartbeat records lastAliveAt and workerPid without moving lastEventAt, updatedAt or the timeline', async () => {
+  const r = repo();
+  const w = start(r);
+  const t0 = new Date(Date.now() + 1_000).toISOString();
+  w.onEvent({ kind: 'activity-start', at: t0, activity: { stepIndex: 1, tool: 'run_command', input: 'cargo test' } });
+  const before = readManifest(r, w.jobId);
+  const view = readFileSync(jobFile(r, w.jobId, FILES.view), 'utf8');
+  const beat = new Date(Date.now() + 60_000).toISOString();
+  w.onEvent({ kind: 'heartbeat', at: beat, pid: 4242 });
+  const p = JSON.parse(readFileSync(jobFile(r, w.jobId, FILES.progress), 'utf8')) as Record<string, unknown>;
+  assert.equal(p['lastAliveAt'], beat);
+  assert.equal(p['workerPid'], 4242);
+  assert.equal(p['lastEventAt'], t0, 'a heartbeat is not activity');
+  assert.equal(readManifest(r, w.jobId).updatedAt, before.updatedAt);
+  assert.equal(readFileSync(jobFile(r, w.jobId, FILES.view), 'utf8'), view, 'not in the timeline');
+  // The next event keeps the heartbeat; the reader exposes it.
+  const t1 = new Date(Date.now() + 90_000).toISOString();
+  w.onEvent({ kind: 'activity-end', at: t1, activity: { stepIndex: 1, tool: 'run_command' }, status: 'done' });
+  const after = JSON.parse(readFileSync(jobFile(r, w.jobId, FILES.progress), 'utf8')) as Record<string, unknown>;
+  assert.equal(after['lastAliveAt'], beat);
+  assert.equal(after['lastEventAt'], t1);
+  const raw = await new AgentSmithReader().read(r, w.jobId);
+  assert.equal(raw?.payload['last_alive_at'], beat);
+  assert.equal(raw?.payload['workerPid'], 4242);
+});
+
+test('verdictFacts: the steer chain and finish read the same cwd rule', () => {
+  const r = repo();
+  const cwd = mkdtempSync(path.join(tmpdir(), 'agent-smith-cwd-'));
+  const impl = startIn(r, cwd, 'implement');
+  const review = startIn(r, cwd, 'review', 'review-smith-abcd1234');
+  assert.deepEqual(impl.verdictFacts(), { cwdMissing: false, writing: true });
+  assert.deepEqual(review.verdictFacts(), { cwdMissing: false, writing: false });
+  rmSync(cwd, { recursive: true, force: true });
+  assert.deepEqual(impl.verdictFacts(), { cwdMissing: true, writing: true });
+  assert.deepEqual(review.verdictFacts(), { cwdMissing: true, writing: false });
+});

@@ -70,6 +70,12 @@ export interface RadarJob {
   readonly failureReason?: string | null;
   readonly failureDetail?: string | null;
   readonly lastEventAt?: number | null;
+  /**
+   * hooks/stale.ts livenessOf, for a live job: active, in-tool (a call still
+   * open), silent (no output past the grace period) or dead (heartbeat stopped).
+   * `attention` means silent or dead. Absent once terminal.
+   */
+  readonly liveness?: { readonly state: 'active' | 'in-tool' | 'waiting' | 'silent' | 'dead'; readonly silentForMs: number; readonly since: number | null; readonly forMs: number; readonly tool?: string } | null;
   readonly pipeline?: string | null;
   readonly stage?: string | null;
   readonly attempt?: number | null;

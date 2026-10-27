@@ -344,3 +344,42 @@ test('the status union the policy reasons over covers every reader outcome', () 
   const kinds: PushKind[] = ['finished', 'failed', 'attention', 'cancelled'];
   assert.equal(new Set(kinds).size, 4);
 });
+
+// ── liveness: silent vs dead ────────────────────────────────────────────────
+
+test('attention text is a fact: "no output for", and a dead process is "process gone"', () => {
+  const silent = job({ status: 'attention', lastEventAt: new Date(NOW - 16 * 60_000).toISOString(),
+    liveness: { state: 'silent', silentForMs: 16 * 60_000, since: NOW - 16 * 60_000, tool: 'npm test' } });
+  const text = buildBatch([cand(silent)], NOW).content!;
+  assert.match(text, /no output for 16m \(in `npm test`\)/);
+  assert.doesNotMatch(text, /stalled/);
+  const dead = job({ status: 'attention', lastEventAt: null,
+    liveness: { state: 'dead', silentForMs: 0, since: NOW - 3 * 60_000 } });
+  assert.match(buildBatch([cand(dead)], NOW).content!, /process gone 3m/);
+});
+
+test('a silent job that then dies is pushed again; a dead one is pushed once', () => {
+  const silent = job({ status: 'attention', liveness: { state: 'silent', silentForMs: 16 * 60_000, since: NOW - 16 * 60_000 } });
+  const dead = job({ status: 'attention', liveness: { state: 'dead', silentForMs: 18 * 60_000, since: NOW - 3 * 60_000 } });
+  assert.notEqual(dedupeKey(silent), dedupeKey(dead));
+  assert.equal(shouldPush(cand(dead, [dedupeKey(silent)]), NOW), true, 'dead is news after silent');
+  assert.equal(shouldPush(cand(dead, [dedupeKey(silent), dedupeKey(dead)]), NOW), false, 'said once');
+  // Dead is a fact of its own: no event time does not silence it.
+  assert.equal(shouldPush(cand(job({ ...dead, lastEventAt: null })), NOW), true);
+  assert.equal(shouldPush(cand(job({ ...silent, lastEventAt: null })), NOW), false);
+});
+
+test('toWatchStatus: a long open command is running; a stopped heartbeat is attention', async () => {
+  const { toWatchStatus } = await import('../watch-source.ts');
+  const obs = (raw: Record<string, unknown>) => ({
+    provider: 'agent-smith', jobId: 'j', status: 'running' as const, warnings: [], output: null, startedAt: null,
+    updatedAt: new Date(NOW - 40 * 60_000).toISOString(), finishedAt: null, mode: 'implement', model: null, label: null,
+    outputTruncated: false, usage: null, partial: false, raw,
+  });
+  const open = { stepIndex: 1, tool: 'Bash', input: '{"command":"cargo test"}', status: 'active' };
+  assert.equal(toWatchStatus(obs({ last_activity: open, last_alive_at: new Date(NOW - 10_000).toISOString() }), NOW), 'running');
+  assert.equal(toWatchStatus(obs({ last_activity: open, last_alive_at: new Date(NOW - 3 * 60_000).toISOString() }), NOW), 'attention');
+  // An older build's job (no heartbeat): the old 15-minute silence rule.
+  assert.equal(toWatchStatus(obs({ last_activity: open }), NOW), 'attention');
+  assert.equal(toWatchStatus({ ...obs({}), updatedAt: null }, NOW), 'attention');
+});

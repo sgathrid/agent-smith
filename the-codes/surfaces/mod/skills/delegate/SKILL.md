@@ -99,8 +99,9 @@ When a job fails, its `nextAction` field suggests one next step. In short:
 - orphaned: `resume_job` if it has a conversation handle, otherwise rerun.
 - denied: see Permissions above, or narrow the task if it was already unrestricted.
 - timeout: raise `timeoutMs` or split the task.
-- stalled: kimi reports a tool call only when it finishes, so a quiet kimi job is often just a
-  long command; check again before intervening.
+- quiet (`liveness.state` silent): no event for 15 minutes but the worker process is running.
+  kimi reports a tool call only when it finishes, so a silent kimi job is often a long command.
+  `dead` means the process is gone while the job still reads running.
 - network-like error: retry once.
 - empty output: ask the worker what happened with `resume_job`.
 

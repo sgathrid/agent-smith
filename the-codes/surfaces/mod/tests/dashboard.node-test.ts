@@ -79,7 +79,11 @@ test('a denial, and an old job with only the long error, read as the same short 
   const long='worker soft-denied 1 tool action(s) (view_file) — it exited 0 and reported success while doing nothing.';
   assert.equal(workerStatus(job('d',{status:'failed',failureReason:long})),'failed · denied view_file');
   assert.equal(workerStatus(job('s',{status:'succeeded',acceptance:{state:'rejected',checks:[{name:'lint',ok:false,outputTail:''}]}})),'checks failed: lint');
-  assert.equal(workerStatus(job('t',{status:'attention'})),'stalled');
+  assert.equal(workerStatus(job('t',{status:'attention'})),'no output');
+  assert.equal(workerStatus(job('t',{status:'attention',liveness:{state:'silent',silentForMs:16*60_000,since:0,forMs:16*60_000}})),'no output 16m');
+  assert.equal(workerStatus(job('t',{status:'attention',liveness:{state:'dead',silentForMs:16*60_000,since:0,forMs:3*60_000}})),'process gone 3m');
+  assert.equal(workerStatus(job('t',{status:'running',activity:'running tests',liveness:{state:'in-tool',silentForMs:16*60_000,since:0,forMs:16*60_000,tool:'cargo test'}})),'Running · in `cargo test` 16m');
+  assert.equal(workerStatus(job('t',{status:'running',activity:'running tests',liveness:{state:'in-tool',silentForMs:5_000,since:0,forMs:5_000,tool:'cargo test'}})),'Running · running tests');
 });
 
 test('measurePaneTerminalColumns reconstructs terminal width from docked pane geometry and leaves fullscreen/non-docked viewports intact', () => {

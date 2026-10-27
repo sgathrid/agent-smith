@@ -6,7 +6,7 @@ import type { RadarJob, RadarStatus, ToolEntry, RadarAcceptance, ActivityEvent }
 import { toEpoch, type FsLike } from './jobs.ts';
 import type { ProgressDigest } from '../types/index.d.ts';
 import { classify, progressPhrase } from './progress.ts';
-import { STALL_GRACE_MS } from './stale.ts';
+import { isStalled, livenessOf } from './stale.ts';
 import { REASONS, STEER_NOT_APPLIED_RE, reasonFromText } from './reasons.ts';
 
 type RecordValue = Record<string, unknown>;
@@ -72,7 +72,13 @@ export async function readForgeJob(fs: FsLike, repo: string, id: string, now: nu
     // The supervisor is gone; its spawn-time placeholder cannot settle itself.
     a = { ...a, pending: false };
     if (!canceled) warnings.unshift({ code: 'orphaned', message: REASONS.serverStopped });
-  } else if (live && (lastSeen === null || now - lastSeen > STALL_GRACE_MS)) status = 'attention';
+  }
+  // One liveness rule for band, pane, notices and the channel (stale.ts):
+  // attention is silent or dead; a long open tool call stays running.
+  const liveness = live && status !== 'failed' && status !== 'canceled'
+    ? livenessOf({ status: 'running', lastEventAt: lastSeen, lastAliveAt: text(p?.lastAliveAt), lastActivity: record(p?.lastActivity), now })
+    : null;
+  if (liveness !== null) status = isStalled(liveness) ? 'attention' : 'running';
   if (typeof m.error === 'string' && m.error !== '') warnings.unshift({ code: 'tool_error', message: m.error });
   const activities = Array.isArray(p?.recentActivities) ? p.recentActivities.map(record).filter(v => v !== null) : [];
   const recent = activities.reduce<RecordValue | null>((last, row) =>
@@ -88,7 +94,7 @@ export async function readForgeJob(fs: FsLike, repo: string, id: string, now: nu
     id, name: text(m.name, resolved?.name, p?.name), workerId: text(m.workerId, resolved?.workerId, p?.workerId) ?? id,
     role: text(m.role, resolved?.role, p?.role, resolved?.mode, m.mode),
     provider: text(m.provider), model: text(m.modelResolved, m.model),
-    lastEventAt: lastSeen, pipeline: text(m.pipeline), stage: text(m.stage), attempt: number(m.attempt),
+    lastEventAt: lastSeen, ...(liveness !== null ? { liveness } : {}), pipeline: text(m.pipeline), stage: text(m.stage), attempt: number(m.attempt),
     status, startedAt: toEpoch(text(m.startedAt, m.createdAt)), endedAt: toEpoch(text(m.finishedAt)) ?? (status === 'failed' && live ? lastSeen : null),
     toolCount: number(p?.toolCalls) ?? number(m.toolCalls),
     activity: progress && (status === 'running' || status === 'attention') ? progressPhrase(progress, now0) : now0,

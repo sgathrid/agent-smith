@@ -39,6 +39,8 @@ export interface NoticeRow {
   readonly warnings?: readonly { readonly code: string }[] | null;
   readonly staleReads?: readonly string[] | null;
   readonly acceptance?: { readonly pending?: boolean; readonly budgetMs?: number; readonly running?: string; readonly checks: readonly { readonly ok: boolean; readonly name?: string }[] };
+  /** stale.ts livenessOf, for a running job. */
+  readonly liveness?: { readonly state: string; readonly silentForMs: number; readonly since: number | null; readonly tool?: string } | null;
 }
 
 // ── vocabulary ──────────────────────────────────────────────────────────────
@@ -63,7 +65,7 @@ export interface NoticeJob {
   readonly role?: string | null;
   /** `agy-staff` only for legacy interop jobs, which have no Forge identity. */
   readonly source?: 'agy-staff' | null;
-  /** Start to end for a terminal job; time since the last event for `attention`. */
+  /** Start to end for a terminal job; for `attention`, time since the last event (silent) or the last heartbeat (dead). */
   readonly durationMs?: number | null;
   readonly changedFiles?: number | null;
   readonly checks?: { readonly passed: number; readonly total: number; /** Names of the failed checks. */ readonly failed?: readonly string[] } | null;
@@ -84,6 +86,11 @@ export interface NoticeJob {
    * those running (true when unnamed). The notice must not say "done".
    */
   readonly checksRunning?: string | true;
+  /**
+   * For `attention`: why. `dead` = the worker process stopped while the job is
+   * still running; otherwise silent (no output). `tool` = a call still open.
+   */
+  readonly liveness?: { readonly state: 'silent' | 'dead'; readonly tool?: string };
 }
 
 const GLYPH: Record<NoticeKind, string> = { finished: '✓', failed: '✗', cancelled: '■', attention: '!' };
@@ -141,7 +148,10 @@ function rejected(job: NoticeJob): boolean {
  *   ✗ Cy (codex implement) 3m · checks failed: lint
  *   ✓ Ed (codex review) 6s · done · after steer
  *   ✗ Flo (codex review) 4s · failed: timed out · queued steer not applied
- *   ! Di (opencode research) · stalled 16m
+ *   ! Di (opencode research) · no output for 16m
+ *   ! Di (opencode research) · no output for 16m (in `npm test`)
+ *   ! Di (opencode research) · process gone 3m
+ * A quiet job is stated as a fact, never as a prompt to interrupt it.
  */
 export function headline(job: NoticeJob): string {
   const d = durationWords(job.durationMs);
@@ -163,7 +173,10 @@ export function headline(job: NoticeJob): string {
       break;
     case 'failed': parts.push(job.run ? reason || 'failed' : `failed${reason ? `: ${reason}` : ''}`); break;
     case 'cancelled': parts.push('canceled'); break;
-    case 'attention': parts.push(`stalled${d ? ` ${d}` : ''}`); break;
+    case 'attention':
+      if (job.liveness?.state === 'dead') parts.push(`process gone${d ? ` ${d}` : ''}`);
+      else parts.push(`no output${d ? ` for ${d}` : ''}${job.liveness?.tool ? ` (in \`${job.liveness.tool}\`)` : ''}`);
+      break;
   }
   if (job.steered) parts.push('after steer');
   if (job.steerNotApplied) parts.push('queued steer not applied');
@@ -190,7 +203,8 @@ export function claudeText(jobs: readonly NoticeJob[]): string {
   if (!one) {
     const counts = new Map<string, number>();
     for (const job of jobs) {
-      const label = rejected(job) ? 'failed' : job.checksRunning !== undefined && job.kind === 'finished' && !job.run ? 'exited' : STATE[job.kind];
+      const label = rejected(job) ? 'failed' : job.checksRunning !== undefined && job.kind === 'finished' && !job.run ? 'exited'
+        : job.kind === 'attention' && job.liveness?.state === 'dead' ? 'process gone' : STATE[job.kind];
       counts.set(label, (counts.get(label) ?? 0) + 1);
     }
     lines.push(`Agent Smith · ${jobs.length} jobs: ${[...shown(counts)].map(([k, n]) => `${n} ${k}`).join(', ')}`);
@@ -206,7 +220,7 @@ export function claudeText(jobs: readonly NoticeJob[]): string {
 
 /** Counts in the order a reader scans them: done first, then what needs a look. */
 function shown(counts: ReadonlyMap<string, number>): [string, number][] {
-  return ['done', 'exited', 'failed', 'canceled', 'stalled'].flatMap((k) => (counts.has(k) ? [[k, counts.get(k)!] as [string, number]] : []));
+  return ['done', 'exited', 'failed', 'canceled', 'no output', 'process gone'].flatMap((k) => (counts.has(k) ? [[k, counts.get(k)!] as [string, number]] : []));
 }
 
 /**
@@ -236,7 +250,7 @@ export function displayNoticeText(text: string): string {
 }
 
 const STATE: Record<NoticeKind, string> = {
-  finished: 'done', failed: 'failed', cancelled: 'canceled', attention: 'stalled',
+  finished: 'done', failed: 'failed', cancelled: 'canceled', attention: 'no output',
 };
 
 // ── launch acks ─────────────────────────────────────────────────────────────
@@ -373,9 +387,12 @@ export function kindOf(status: string): NoticeKind | null {
 /** A Forge row (canonical.ts) as a notice. */
 export function noticeFromRadar(job: NoticeRow, kind: NoticeKind, now: number): NoticeJob {
   const checks = job.acceptance?.checks ?? [];
-  const span = kind === 'attention'
-    ? (job.lastEventAt != null ? now - job.lastEventAt : null)
-    : (job.endedAt != null && job.startedAt != null ? job.endedAt - job.startedAt : null);
+  const dead = kind === 'attention' && job.liveness?.state === 'dead';
+  const span = dead
+    ? (job.liveness?.since != null ? now - job.liveness.since : null)
+    : kind === 'attention'
+      ? (job.liveness ? job.liveness.silentForMs : job.lastEventAt != null ? now - job.lastEventAt : null)
+      : (job.endedAt != null && job.startedAt != null ? job.endedAt - job.startedAt : null);
   return {
     id: job.id, kind, name: job.name, provider: job.provider, role: job.role,
     durationMs: span,
@@ -389,6 +406,7 @@ export function noticeFromRadar(job: NoticeRow, kind: NoticeKind, now: number): 
     ...(job.steeredFrom ? { steered: true } : {}),
     ...(job.warnings?.some((w) => w.code === 'steer_not_applied') ? { steerNotApplied: true } : {}),
     ...(kind === 'finished' && job.acceptance?.pending === true ? { checksRunning: job.acceptance.running ?? true } : {}),
+    ...(kind === 'attention' ? { liveness: { state: dead ? 'dead' as const : 'silent' as const, ...(job.liveness?.tool ? { tool: job.liveness.tool } : {}) } } : {}),
   };
 }
 
@@ -465,8 +483,10 @@ export interface Owned {
   readonly at: number;
   /** Give up silently after this (the job's budget plus an hour): it can no longer be news. */
   readonly until: number;
-  /** True once its stall was announced; a stall is said once. */
+  /** True once its silence was announced; silence is said once. */
   readonly saidAttention?: boolean;
+  /** True once "process gone" was announced; said once, even after a silence notice. */
+  readonly saidDead?: boolean;
   /** True once "exited, checks running" was announced; the verdict is announced again when it lands. */
   readonly saidExited?: boolean;
   readonly saidStageAttention?: readonly string[];
@@ -519,6 +539,7 @@ export function due(
         ...prev,
         until: Math.max(prev.until, entry.until),
         ...(prev.saidAttention || entry.saidAttention ? { saidAttention: true } : {}),
+        ...(prev.saidDead || entry.saidDead ? { saidDead: true } : {}),
         ...(prev.saidExited || entry.saidExited ? { saidExited: true } : {}),
       };
     } else {
@@ -570,9 +591,10 @@ export function due(
     }
     const kind = job ? kindOf(job.status) : null;
     if (job && kind === 'attention') {
-      if (!currentOwned.saidAttention) {
+      const dead = job.liveness?.state === 'dead';
+      if (!currentOwned.saidAttention || (dead && !currentOwned.saidDead)) {
         pushNotice(noticeFromRadar(job, kind, now));
-        pushKeep({ ...currentOwned, saidAttention: true });
+        pushKeep({ ...currentOwned, saidAttention: true, ...(dead ? { saidDead: true } : {}) });
       } else {
         pushKeep(currentOwned);
       }

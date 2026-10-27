@@ -3,7 +3,7 @@
  */
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -1104,4 +1104,23 @@ test('steer ack reports the job timeoutMs from the manifest when another process
   t1.finish({ status: 'success', response: 'Done.' });
   (await t2Ready).finish({ status: 'success', response: 'Done.' });
   await done;
+});
+
+test('a writing turn whose cwd vanished does not chain its queued steer', async () => {
+  const ctrl = controlledProvider();
+  const { service } = makeService(ctrl.provider);
+  const cwd = mkdtempSync(path.join(tmpdir(), 'agent-smith-steer-cwd-'));
+  const t1Ready = ctrl.nextTurn();
+  const { ack, done } = await service.spawnTracked({ mode: 'implement', name: 'cwd-gone', prompt: 'Work.', cwd });
+  const t1 = await t1Ready;
+  await service.steer({ worker: ack.jobId, prompt: 'Then this.', delivery: 'queue' });
+  rmSync(cwd, { recursive: true, force: true });
+  t1.finish({ status: 'success' });
+  const finalManifest = await done;
+  assert.equal(finalManifest.jobId, ack.jobId);
+  assert.equal(finalManifest.status, 'failed');
+  assert.equal(finalManifest.cwdMissingAtFinish, true);
+  assert.equal(ctrl.turns.length, 1, 'no continuation on an unverifiable turn');
+  const detail = await service.detail(ack.jobId);
+  assert.ok(detail.warnings.some((w) => /queued steer not applied/.test(w.message)));
 });

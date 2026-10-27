@@ -673,3 +673,30 @@ test('opencode: step_finish counters accumulate across steps without per-step no
     cacheWriteTokens: 20,
   });
 });
+
+test('spawnWorker heartbeats while the child runs (pid included), stops at exit, and writes nothing to events.jsonl', async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'agent-smith-heartbeat-'));
+  const beats: { at: string; pid: number | undefined }[] = [];
+  const worker = await spawnWorker({
+    provider: 'fake', binary: process.execPath, argv: ['-e', 'setTimeout(()=>{}, 400)'],
+    cwd: dir, timeoutMs: 10_000, stateDir: dir, jobId: 'heartbeat', mode: 'test',
+    heartbeatMs: 50, onHeartbeat: (at, pid) => beats.push({ at, pid }),
+    onStdoutLine() {}, onStderr() {},
+  });
+  await worker.exited;
+  worker.closeLog();
+  const atExit = beats.length;
+  assert.ok(atExit >= 3, `expected several beats over ~400 ms, got ${atExit}`);
+  assert.ok(beats.every((b) => b.pid === worker.child.pid && Number.isFinite(Date.parse(b.at))));
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(beats.length, atExit, 'no beats after exit');
+  assert.equal(existsSync(path.join(dir, 'events.jsonl')), false, 'heartbeats are liveness, not events');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('every adapter routes heartbeats to the bus, never to the event log', () => {
+  for (const name of ['agy', 'claude', 'codex', 'kimi', 'opencode']) {
+    const src = readFileSync(new URL(`./${name}.ts`, import.meta.url), 'utf8');
+    assert.match(src, /onHeartbeat: \(at, pid\) => bus\.emit\(\{ kind: 'heartbeat'/, name);
+  }
+});

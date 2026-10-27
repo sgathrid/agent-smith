@@ -69,7 +69,7 @@ import { readAcceptance } from '../../../forge/checks.ts';
 // constant the channel also needs. One owner, two importers, no drift. The same
 // reasoning puts the dedupe rules in ./policy.ts rather than in the server: the
 // server is the only thing that could not be reused.
-import { STALL_GRACE_MS } from '../../mod/hooks/stale.ts';
+import { isStalled, livenessOf, type Liveness } from '../../mod/hooks/stale.ts';
 import { ACCEPTANCE_HOLD_MS, pipelineOutcome } from '../../mod/hooks/notice.ts';
 import type { WatchableJob, WatchStatus } from './policy.ts';
 
@@ -274,6 +274,7 @@ async function readOne(
     ...(source === 'agy-staff' ? { source } : {}),
     summarySource: observed.raw['summarySource'] === 'worker' ? 'worker' : null,
     status: toWatchStatus(observed, now),
+    ...livenessField(watchLiveness(observed, now)),
     lastEventAt: observed.updatedAt,
     finishedAt: observed.finishedAt,
     warned,
@@ -287,11 +288,31 @@ async function readOne(
 }
 
 /**
- * ObservedStatus → WatchStatus, plus the stall escalation.
+ * The shared liveness rule (mod/hooks/stale.ts) over an observed job: event
+ * silence, the open tool call and the process owner's heartbeat. Null unless running.
+ */
+export function watchLiveness(observed: ObservedJob, now: number): Liveness | null {
+  const raw = observed.raw;
+  const activity = raw['last_activity'];
+  return livenessOf({
+    status: observed.status, updatedAt: observed.updatedAt, now,
+    lastEventAt: typeof raw['last_event_at'] === 'string' ? raw['last_event_at'] : null,
+    lastAliveAt: typeof raw['last_alive_at'] === 'string' ? raw['last_alive_at'] : null,
+    lastActivity: activity !== null && typeof activity === 'object' ? activity as { tool?: unknown; input?: unknown; status?: unknown } : null,
+  });
+}
+
+/** Only the quiet states travel to the notice: they are what `attention` means. */
+function livenessField(l: Liveness | null): { liveness?: { state: 'silent' | 'dead'; silentForMs: number; since: number | null; tool?: string } } {
+  if (l === null || (l.state !== 'silent' && l.state !== 'dead')) return {};
+  return { liveness: { state: l.state, silentForMs: l.silentForMs, since: l.since, ...(l.tool ? { tool: l.tool } : {}) } };
+}
+
+/**
+ * ObservedStatus → WatchStatus, plus the liveness escalation.
  *
- * The stall threshold is imported from ./stale.ts rather than duplicated, so the
- * pane and the channel cannot disagree about when a job counts as stalled. The
- * number itself matches core/liveness.ts's DEFAULT_GRACE_MS (15 min).
+ * The rule is mod/hooks/stale.ts livenessOf, shared with the pane, so the two
+ * cannot disagree about when a job needs attention (silent or dead).
  *
  * WHY ESCALATE HERE AND NOT IN THE POLICY: a stall is a fact about the job, and
  * a fact belongs to the reader. The policy's job is only to decide whether a fact
@@ -299,13 +320,7 @@ async function readOne(
  */
 export function toWatchStatus(observed: ObservedJob, now: number): WatchStatus {
   if (observed.status !== 'running') return observed.status;
-  if (observed.updatedAt === null) {
-    // No evidence of progress at all. Treat as needing eyes rather than healthy:
-    // "we do not know" must never be drawn as "fine" (the asymmetry
-    // core/liveness.ts documents).
-    return 'attention';
-  }
-  const then = Date.parse(observed.updatedAt);
-  if (Number.isNaN(then)) return 'attention';
-  return now - then > STALL_GRACE_MS ? 'attention' : 'running';
+  // silent or dead needs eyes; active and in-tool (a long command) do not. No
+  // event time at all is `silent`: "we do not know" is never drawn as "fine".
+  return isStalled(watchLiveness(observed, now)) ? 'attention' : 'running';
 }

@@ -255,6 +255,18 @@ export interface JobSummary {
   readonly digest?: ProgressDigest | null;
   /** Acceptance results attached to the job, when checks have been configured or have run. */
   readonly acceptance?: Acceptance | null;
+  /** Tool calls that ended in an error state; evidence, not a verdict. Absent when none. */
+  readonly toolErrors?: number;
+  /** Failed before any tool call (route, model or account). Absent otherwise. */
+  readonly failedEarly?: boolean;
+  /** changedFiles could not be computed at finish; absent changedFiles then means unknown, not none. */
+  readonly changedFilesUnknown?: boolean;
+  /** The cwd no longer existed at finish. */
+  readonly cwdMissingAtFinish?: boolean;
+  /** Last provider event (progress.json lastEventAt). */
+  readonly lastEventAt?: string | null;
+  /** Last heartbeat from the worker's process owner; null for jobs from older builds. */
+  readonly lastAliveAt?: string | null;
 }
 
 export interface JobDetail extends JobSummary {
@@ -983,6 +995,9 @@ export class ForgeService {
           jobStatus: result.status,
           deniedActions: result.deniedActions ?? [],
           report: report === '' ? null : report,
+          // Same cwd rule as finish(): a writing turn whose cwd vanished failed,
+          // so a queued steer must not chain onto it.
+          ...currentWriter.verdictFacts(),
         });
 
         const shouldChain =
@@ -1641,6 +1656,7 @@ export function toSummary(observed: ObservedJob, source: 'agent-smith' | 'agy-st
       deniedCount: Array.isArray(raw['denied_actions']) ? raw['denied_actions'].length : 0,
       unrestricted: raw['unrestricted'] === true,
       steerNotApplied: observed.warnings.some((w) => w.code === 'steer_not_applied'),
+      failedEarly: raw['failedEarly'] === true,
     }),
     mode: observed.mode,
     model: observed.model,
@@ -1664,6 +1680,12 @@ export function toSummary(observed: ObservedJob, source: 'agent-smith' | 'agy-st
       : {}),
     ...(Array.isArray(changedFiles) ? { changedFileCount: changedFiles.length } : {}),
     ...(digest !== null ? { digest } : {}),
+    ...(typeof raw['toolErrors'] === 'number' && raw['toolErrors'] > 0 ? { toolErrors: raw['toolErrors'] } : {}),
+    ...(raw['failedEarly'] === true ? { failedEarly: true } : {}),
+    ...(raw['changedFilesUnknown'] === true ? { changedFilesUnknown: true } : {}),
+    ...(raw['cwdMissingAtFinish'] === true ? { cwdMissingAtFinish: true } : {}),
+    ...(typeof raw['last_event_at'] === 'string' ? { lastEventAt: raw['last_event_at'] } : {}),
+    ...(typeof raw['last_alive_at'] === 'string' ? { lastAliveAt: raw['last_alive_at'] } : {}),
   };
 }
 

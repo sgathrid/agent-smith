@@ -97,6 +97,21 @@ function firstString(params: Record<string, unknown>, keys: readonly string[], r
 }
 
 /**
+ * A short name for an in-flight tool call, as a reader would type it: the
+ * command line's first step for a shell tool (`cargo test`), else the tool
+ * name. Used for liveness text ("in `cargo test` 16m").
+ */
+export function toolLabel(tool: string, input: string | null | undefined, max = 40): string {
+  const lower = tool.trim().toLowerCase();
+  if (COMMAND_TOOLS.has(lower)) {
+    const command = unwrapShell(firstString(parseInputPreview(input), COMMAND_KEYS, input ?? '')).replace(/\s+/g, ' ').trim();
+    const first = command.split(/\s*(?:&&|\|\||;|\|)\s*/).find((s) => s !== '') ?? '';
+    if (first !== '') return oneLine(first, max);
+  }
+  return oneLine(tool, max);
+}
+
+/**
  * One tool call → its kind and a phrase. Every provider's tool vocabulary:
  * agy (view_file, run_command, …), claude (Read, Edit, Bash, …), opencode (read,
  * edit, bash, …), codex (a shell command line as the tool, or file_change) and
