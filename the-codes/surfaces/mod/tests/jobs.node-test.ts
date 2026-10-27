@@ -303,7 +303,7 @@ test('a job with progress.json and no status.json is running', async () => {
 });
 
 test('a job silent past the grace period escalates to attention, not to stalled-looking', async () => {
-  // core/liveness.ts's 15-minute grace, via stale.ts so the band and the channel
+  // the 15-minute grace, via stale.ts so the band and the channel
   // cannot disagree about when "stalled" begins. `!` cyan is TERMINAL-UI.md's own
   // "needs you" row.
   const fs = fsFrom({

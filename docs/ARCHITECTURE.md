@@ -1,7 +1,7 @@
 # Agent Smith architecture
 
 Agent Smith owns external harness execution. Claude drives it through MCP tools; the
-CLI (`agent-smith run|resume|ls|status|cancel|doctor`) is a second adapter over the
+CLI (`agent-smith setup|uninstall|run|resume|ls|status|cancel|gc|doctor`) is a second adapter over the
 same `ForgeService`. Knobs and tool parameters are in [CONFIGURATION.md](CONFIGURATION.md).
 
 ## Layers
@@ -19,11 +19,10 @@ providers/  -> forge/ runtime -> surfaces/channel (MCP + hook watcher) -> surfac
 | `forge/` | Job directory format and status rules (`format.ts`), the single-writer `JobWriter` (`writer.ts`), `ForgeService` (spawn/list/detail/cancel, `service.ts`), closed modes (`modes.ts`), executable acceptance (`checks.ts`), pipeline runner and persistence (`runner.ts`, `execute.ts`), compat mirror (`mirror.ts`). |
 | `pipeline/` | DAG validation, bounded scheduling (1-32), failure propagation, routing/escalation. Does not interpret prose. |
 | `verify/` | Runs acceptance commands against the real working tree; exit codes decide, not worker text. |
-| `harness/` | Readers. `AgentSmithReader` (primary, `.agent-smith/jobs`) and `AgyStaffReader` (read-only interop for `.agy-staff/jobs`). Readers derive the final status (orphan/cancel rules below). |
+| `harness/` | Readers. `AgentSmithReader` (primary, `.agent-smith/jobs`) and `AgyStaffReader` (read-only interop for `.agy-staff/jobs`), behind `readObservedJob` in `registry.ts`. Readers derive the final status (orphan/cancel rules below). |
 | `surfaces/channel/` | MCP server (`server.ts`, `tools.ts`), optional channel push (`poller.ts`, `policy.ts`, `watch-source.ts`), job-scoped hook watcher (`watch-hook.ts`) and CLI monitor (`monitor.ts`). |
-| `surfaces/mod/` | Claude Code mod: band, `/forge` pane, native task-list projection. A UI projection, not an execution runtime. It cannot import outside its plugin folder, so it restates the reader rules and reads the compat mirror (`hooks/jobs.ts`) plus `.agent-smith/jobs/<id>/orphaned` (`hooks/native.ts`). |
+| `surfaces/mod/` | Claude Code mod: band, `/forge` pane, native task-list projection. A UI projection, not an execution runtime. It cannot import outside its plugin folder, so it restates the reader rules. Its default reader is `hooks/canonical.ts` over `.agent-smith/jobs`; `hooks/jobs.ts` reads the `.agy-staff` mirror only when `AGENT_SMITH_LEGACY_JOBS=1`. `hooks/native.ts` reads `.agent-smith/jobs/<id>/orphaned`. |
 | `cli/` | Argument parsing and detached supervisor (`supervise`), same forge APIs. |
-| `core/` | Legacy SQLite library; not the execution store. |
 
 `.agy-staff/jobs/` is a one-way projection (`forge/mirror.ts`, default on) written so the
 unmodified mod can render forge jobs. Nothing reads it for a verdict: `AgentSmithReader`

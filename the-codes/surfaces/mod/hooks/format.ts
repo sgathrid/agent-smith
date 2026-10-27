@@ -11,7 +11,7 @@
  * file and does nothing but lay out what these functions return.
  *
  * NOTHING in here reads the clock, the filesystem, or any atom. "Now" is always
- * a parameter, for the same reason core/liveness.ts does it: a formatter that
+ * a parameter, for the same reason the stall check does it: a formatter that
  * called Date.now() itself could not be tested at a boundary.
  *
  * THE RULES ENCODED BELOW come from agent-configs/shared/TERMINAL-UI.md. Where a
@@ -78,7 +78,7 @@ import { REASONS, checksReason, reasonFromText } from './reasons.ts';
  *      monochrome reader could not tell a cancelled job from a separator.
  *
  * `canceled` is deliberately NOT `✗`. A cancelled job is not a bug —
- * core/types.ts says so explicitly, and adds that alerting on one trains people
+ * alerting on one trains people
  * to ignore alerts. `unknown` keeps ASCII `?`: neutral width, distinct from all
  * five, and honest about the fact that we do not know.
  */

@@ -480,16 +480,15 @@ Deleting the band leaves the pane working unchanged.
 the mod is standalone. That is a hard constraint of the mod API, not a
 preference, and it is why three small helpers (`stripSystemNotifications`, the
 stall grace, the activity phrasing) are restated inside `hooks/` rather than
-imported from `harness/` and `core/`.
+imported from `harness/`.
 
 The coupling that *does* exist is one-directional and written down:
 
 | in the mod | must stay in step with | if it drifts |
 |---|---|---|
 | `hooks/jobs.ts stripSystemNotifications` | `harness/agy-staff.ts` | one says a report is empty and the other does not |
-| `hooks/stale.ts STALL_GRACE_MS` | `core/liveness.ts DEFAULT_GRACE_MS` | the band says healthy while the channel says stalled — the exact contradiction this project exists to prevent |
+| `hooks/stale.ts STALL_GRACE_MS` | `surfaces/channel/src/watch-source.ts` (imports it) | the band says healthy while the channel says stalled — the exact contradiction this project exists to prevent |
 | `hooks/jobs.ts resolve()` | `harness/normalize.ts` | the band draws `✓` where the channel draws `failed` |
-| `types/index.d.ts RadarJob` | `core/types.ts Job` | two row shapes, one UI |
 
 Each restatement says so at the point of use and names the counterpart.
 `hooks/stale.ts` is a whole file for one constant, which is the honest shape of

@@ -1,13 +1,8 @@
 /**
  * service.ts — the composition root that can START a worker.
  *
- * This is the file the repo was missing. Until now:
- *   - providers/ (3,643 lines) was never imported by anything
- *   - pipeline/ had no StageRunner
- *   - core/store.ts was unused
- *   - surfaces/mod read somebody else's state and could not create any
- *
- * This module wires those together and answers four questions: spawn a job, list
+ * It wires providers/ (adapters) and pipeline/ (StageRunner) to the job
+ * directory (forge/format.ts, writer.ts), and answers four questions: spawn a job, list
  * them, describe one, cancel one. `surfaces/channel` exposes exactly these as
  * MCP tools; nothing else in the repo may call a provider directly.
  *
@@ -1394,8 +1389,7 @@ export class ForgeService {
     }
     if (source === 'agy-staff' || source === 'all') {
       // The interop source. Our own ids are filtered out because the compat
-      // mirror makes them visible there too, and one job must have one verdict —
-      // see harness/registry.ts for the same rule applied to the registry sweep.
+      // mirror makes them visible there too, and one job must have one verdict.
       out.push(...(await this.readSource('agy-staff', new AgyStaffReader(), isForgeJobId)));
     }
 

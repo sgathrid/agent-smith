@@ -38,7 +38,7 @@
  * cached -> cacheReadTokens and cache_write -> cacheWriteTokens. There is no
  * `total_tokens`; we leave it undefined rather than inventing one. (Note also
  * that codex's input_tokens already appears to INCLUDE cached tokens in this
- * run — 22319 in, 12288 cached. We report what the CLI says and let core/
+ * run — 22319 in, 12288 cached. We report what the CLI says and let consumers
  * decide the accounting policy; silently double-subtracting would be worse.)
  *
  * UNVERIFIED (documented in --help or upstream docs but NOT observed locally):
@@ -83,23 +83,17 @@
  */
 
 import {
-  appendEventLog,
-  binaryOnPath,
-  createEventBus,
-  newJobId,
+  binaryAvailable,
+  earlyVerdict,
+  jobResult,
   num,
   nowIso,
   obj,
   preview,
-  spawnWorker,
-  stderrTailOf,
+  runNdjsonWorker,
   str,
-  tryParseObject,
-  truncate,
-  writeArgv,
-  writeResultFile,
-  writeStateDir,
 } from './ndjson.ts';
+import type { ExitInfo } from './ndjson.ts';
 import type {
   ActivityRef,
   ActivityStatus,
@@ -115,7 +109,7 @@ import type { ListModelsOptions, ModelCatalog, ModelInfo, SandboxInfo } from './
 import { DEFAULT_DISCOVERY_TIMEOUT_MS, configDir, errMessage, parseTomlTopLevel, readTextSafe, runCapture } from './discovery.ts';
 import type { RunFn } from './discovery.ts';
 import path from 'node:path';
-import { noResultText, stderrClause, timedOutText } from './failure-text.ts';
+import { noResultText, stderrClause } from './failure-text.ts';
 
 export const CODEX_BINARY = process.env['AGENT_SMITH_CODEX_BIN'] ?? 'codex';
 
@@ -151,15 +145,7 @@ export type CodexSandbox = 'read-only' | 'workspace-write' | 'danger-full-access
  * filesystem reach but leaves approval prompts in the loop, which in headless
  * mode means a stall. Combining them is strictly worse than the bypass alone.
  */
-export function sandboxFor(unrestricted: boolean): { argv: string[]; note: string } {
-  if (unrestricted) {
-    return {
-      argv: ['--dangerously-bypass-approvals-and-sandbox'],
-      note: 'unrestricted -> bypass approvals and sandbox',
-    };
-  }
-  return { argv: ['-s', 'workspace-write'], note: 'restricted -> sandbox workspace-write' };
-}
+const UNRESTRICTED_FLAGS = ['--dangerously-bypass-approvals-and-sandbox'];
 
 /** Valid AGENT_SMITH_CODEX_SANDBOX value, if any. */
 function envSandbox(): CodexSandbox | undefined {
@@ -187,7 +173,7 @@ export function sandboxPlan(
     return { ...info, sandbox: `${info.sandbox} (AGENT_SMITH_CODEX_SANDBOX)` };
   }
   if (spec.unrestricted) {
-    const flags = sandboxFor(true).argv;
+    const flags = UNRESTRICTED_FLAGS;
     return { sandbox: `codex ${flags[0]} (unrestricted)`, flags, readOnlyEnforced: false };
   }
   if (spec.readOnly === true && spec.artifactPath !== undefined) {
@@ -213,7 +199,7 @@ function tomlInlineTable(entries: Record<string, string>): string {
 
 /**
  * SpawnSpec has no field for arbitrary CLI config overrides, and inventing one
- * here would fork the shared interface while core/types.ts is still in flight.
+ * here would widen the shared SpawnSpec interface for one provider.
  * So: pass through the two config overrides that actually matter, read from the
  * environment with an AGENT_SMITH_ prefix. Documented in the README.
  */
@@ -303,7 +289,7 @@ function toTokenUsage(u: CodexUsage | undefined): TokenUsage | undefined {
   if (u.output_tokens !== undefined) out.outputTokens = u.output_tokens;
   if (u.reasoning_output_tokens !== undefined) out.thinkingTokens = u.reasoning_output_tokens;
   // codex names its cache-read counter `cached_input_tokens`. Mapping it to the
-  // same field agy calls cache_read_tokens is what lets core/ total them
+  // same field agy calls cache_read_tokens is what lets consumers total them
   // without caring which provider a row came from.
   if (u.cached_input_tokens !== undefined) out.cacheReadTokens = u.cached_input_tokens;
   if (u.cache_write_input_tokens !== undefined) out.cacheWriteTokens = u.cache_write_input_tokens;
@@ -347,7 +333,7 @@ interface CodexTranslator {
  *
  * WHY NOT THE item.id: `item_0` is per-turn, not per-job — a second turn resets
  * numbering. Our ProviderEvent.activity.stepIndex must be monotonic within a
- * job because core/ uses it as the activity key. So we mint our own.
+ * job because consumers use it as the activity key. So we mint our own.
  */
 export function createCodexTranslator(maxChars: number): CodexTranslator {
   let step = 0;
@@ -569,13 +555,6 @@ export function createCodexTranslator(maxChars: number): CodexTranslator {
 // Result
 // ---------------------------------------------------------------------------
 
-interface ExitInfo {
-  code: number | null;
-  signal: NodeJS.Signals | null;
-  killReason: 'cancelled' | 'timeout' | undefined;
-  stderr: string;
-}
-
 function buildResult(args: {
   jobId: string;
   startedAtMs: number;
@@ -584,18 +563,14 @@ function buildResult(args: {
   tx: CodexTranslator;
 }): JobResult {
   const { jobId, startedAtMs, stateDir, exit, tx } = args;
-  const finishedAt = nowIso();
   const durationMs = Date.now() - startedAtMs;
 
   let status: JobStatus;
   let error: string | undefined;
 
-  if (exit.killReason === 'cancelled') {
-    status = 'cancelled';
-    error = 'canceled';
-  } else if (exit.killReason === 'timeout') {
-    status = 'timeout';
-    error = timedOutText(durationMs);
+  const early = earlyVerdict(exit, durationMs);
+  if (early !== undefined) {
+    ({ status, error } = early);
   } else if (!tx.sawTurnCompleted) {
     // The reachable case in practice is the untrusted-directory refusal, which
     // writes NOTHING to stdout and prints only to stderr. Guessing 'success'
@@ -611,22 +586,9 @@ function buildResult(args: {
     status = 'success';
   }
 
-  const out: JobResult = {
-    jobId,
-    provider: 'codex',
-    ok: status === 'success',
-    status,
-    exitCode: exit.code,
-    signal: exit.signal,
-    // codex has no single "response" field; the concatenated agent_message items
-    // are the equivalent. If there were none, this is legitimately "".
-    response: tx.finalText,
-    durationMs,
-    startedAt: new Date(startedAtMs).toISOString(),
-    finishedAt,
-    stateDir,
-  };
-  if (error !== undefined) out.error = error;
+  // codex has no single "response" field; the concatenated agent_message items
+  // are the equivalent. If there were none, this is legitimately "".
+  const out = jobResult({ provider: 'codex', jobId, status, error, exit, response: tx.finalText, startedAtMs, durationMs, stateDir });
   if (tx.usage !== undefined) out.usage = tx.usage;
   if (tx.threadId !== undefined) out.raw = { threadId: tx.threadId };
   return out;
@@ -637,7 +599,7 @@ function buildResult(args: {
 // ---------------------------------------------------------------------------
 
 /** Codex home: AGENT_SMITH_CODEX_HOME, then CODEX_HOME, then ~/.codex. */
-export function codexHome(): string {
+function codexHome(): string {
   return configDir(['AGENT_SMITH_CODEX_HOME', 'CODEX_HOME'], '.codex');
 }
 
@@ -714,13 +676,10 @@ export async function listCodexModels(
     }
     cat.models = models;
     if (models.length === 0) cat.error = error;
-    const cfgText = readTextSafe(path.join(home, 'config.toml'));
-    if (cfgText !== undefined) {
-      const cfg = parseTomlTopLevel(cfgText);
-      if (cfg['model']) cat.defaultModel = cfg['model'];
-      if (cfg['model_reasoning_effort']) cat.defaultEffort = cfg['model_reasoning_effort'];
-      if (cat.defaultModel !== undefined || cat.defaultEffort !== undefined) cat.defaultSource = 'harness-config';
-    }
+    const defaults = codexHarnessDefaults(home);
+    if (defaults.model !== undefined) cat.defaultModel = defaults.model;
+    if (defaults.effort !== undefined) cat.defaultEffort = defaults.effort;
+    if (defaults.model !== undefined || defaults.effort !== undefined) cat.defaultSource = 'harness-config';
   } catch (e) {
     cat.error = errMessage(e);
   }
@@ -728,7 +687,7 @@ export async function listCodexModels(
 }
 
 /** Default model/effort from <home>/config.toml. Sync file read only. */
-export function codexHarnessDefaults(home: string = codexHome()): { model?: string; effort?: string } {
+function codexHarnessDefaults(home: string = codexHome()): { model?: string; effort?: string } {
   const cfgText = readTextSafe(path.join(home, 'config.toml'));
   if (cfgText === undefined) return {};
   const cfg = parseTomlTopLevel(cfgText);
@@ -750,99 +709,25 @@ export const codexProvider: Provider = {
   name: 'codex',
   harnessDefaults: () => codexHarnessDefaults(),
 
-  async available(): Promise<boolean> {
-    try {
-      return await binaryOnPath(CODEX_BINARY);
-    } catch {
-      return false;
-    }
-  },
+  available: () => binaryAvailable(CODEX_BINARY),
 
-  describeSandbox: (spec) => sandboxPlan(spec),
+  describeSandbox: sandboxPlan,
 
   listModels: (options) => listCodexModels(runCapture, options),
 
-  async spawn(spec: SpawnSpec): Promise<WorkerHandle> {
-    const jobId = spec.jobId ?? newJobId();
-    const stateDir = writeStateDir('codex', jobId, spec.stateDir);
-    const argv = buildArgv(spec);
-    writeArgv(stateDir, argv, spec.cwd);
-
-    const maxChars = spec.maxOutputChars ?? 2000;
-    const bus = createEventBus();
-    const tx = createCodexTranslator(maxChars);
-
-    const publish = (events: ProviderEvent[]): void => {
-      for (const e of events) {
-        bus.emit(e);
-        appendEventLog(stateDir, e);
-      }
-    };
-
-    const startedAtMs = Date.now();
-
-    const proc = await spawnWorker({
+  spawn(spec: SpawnSpec): Promise<WorkerHandle> {
+    const tx = createCodexTranslator(spec.maxOutputChars ?? 2000);
+    return runNdjsonWorker({
       provider: 'codex',
       binary: CODEX_BINARY,
-      argv,
-      cwd: spec.cwd,
-      timeoutMs: spec.timeoutMs,
-      stateDir,
-      jobId,
-      mode: spec.mode,
-      ...(spec.env !== undefined ? { env: spec.env } : {}),
-      onStdoutLine(line) {
-        const raw = tryParseObject(line);
-        if (raw === undefined) {
-          bus.emit({
-            kind: 'notice',
-            at: nowIso(),
-            level: 'warn',
-            message: `codex stdout (non-JSON): ${truncate(line, 400).text}`,
-          });
-          return;
-        }
-        publish(tx.onEvent(raw));
-      },
-      onStderr(chunk) {
-        const text = chunk.trim();
-        if (text === '') return;
-        // "Not inside a trusted directory..." is the single most useful line
-        // codex emits and it is INFO-level, not an error — but it means the job
-        // is dead. Level is about presentation, not job status.
-        const level = codexStderrLevel(text);
-        bus.emit({ kind: 'notice', at: nowIso(), level, message: truncate(text, 800).text });
-      },
+      spec,
+      buildArgv,
+      translate: tx.onEvent,
+      // "Not inside a trusted directory..." is the single most useful line
+      // codex emits and it is INFO-level, not an error — but it means the job
+      // is dead. Level is about presentation, not job status.
+      stderrLevel: codexStderrLevel,
+      buildResult: (ctx) => buildResult({ ...ctx, tx }),
     });
-
-    let resolveResult: (r: JobResult) => void = () => {};
-    const resultPromise = new Promise<JobResult>((resolve) => {
-      resolveResult = resolve;
-    });
-
-    void proc.exited.then(({ code, signal }) => {
-      proc.closeLog();
-      const final = buildResult({
-        jobId,
-        startedAtMs,
-        stateDir,
-        tx,
-        exit: { code, signal, killReason: proc.killReason, stderr: stderrTailOf(proc) },
-      });
-      bus.close();
-      writeResultFile(stateDir, final);
-      resolveResult(final);
-    });
-
-    return {
-      id: jobId,
-      stateDir,
-      cancel: () => proc.terminate('cancelled'),
-      waitForResult: () => resultPromise,
-      onEvent: (listener) => bus.onEvent(listener),
-      events: bus.events,
-    };
   },
 };
-
-export const codex = codexProvider;

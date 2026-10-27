@@ -422,7 +422,7 @@ test('the DAG runs and each stage becomes a real fixture-backed job', async () =
 
   // And every stage is a real job on disk, which is what the pane draws and what
   // the channel announces. No new notification vocabulary was needed.
-  const { readAllObservedJobs } = await import('../../harness/registry.ts');
+  const { readAllObservedJobs } = await import('./observe.ts');
   const jobs = await readAllObservedJobs(r);
   assert.equal(jobs.length, 3);
   assert.deepEqual(jobs.map((j) => j.mode).sort(), ['implement', 'moderate', 'review']);

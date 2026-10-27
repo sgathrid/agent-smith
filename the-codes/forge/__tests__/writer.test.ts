@@ -23,7 +23,7 @@ import { test } from 'node:test';
 
 import { AgentSmithReader } from '../../harness/agent-smith.ts';
 import { normalize } from '../../harness/normalize.ts';
-import { readAllObservedJobs } from '../../harness/registry.ts';
+import { readAllObservedJobs } from './observe.ts';
 import { writeAtomic, writeJsonAtomic, appendLine, createMarker } from '../atomic.ts';
 import { FILES, SCHEMA_VERSION, jobDir, jobFile, type ForgeManifest } from '../format.ts';
 import { JobWriter, appendBounded } from '../writer.ts';

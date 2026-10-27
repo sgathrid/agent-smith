@@ -8,7 +8,8 @@ import { test } from 'node:test';
 
 assertFakeProviderActive();
 
-const { main, cmdStatus, cmdUninstall } = await import('../cli.ts');
+const { main, cmdStatus } = await import('../cli.ts');
+const { cmdUninstall } = await import('../install.ts');
 const { cancelPipeline, readPipeline } = await import('../../forge/execute.ts');
 const { ForgeService } = await import('../../forge/service.ts');
 const { archivedJobsDir, jobDir } = await import('../../forge/format.ts');

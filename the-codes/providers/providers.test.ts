@@ -617,3 +617,32 @@ test('opencode: step_finish counters accumulate across steps without per-step no
     cacheWriteTokens: 20,
   });
 });
+
+for (const name of ['agy', 'codex', 'claude', 'opencode'] as const) {
+  test(`${name}: a missing binary yields spawn-failed with the spawn error`, async () => {
+    const dir = tempDir();
+    const missing = path.join(dir, 'missing-worker');
+    const key = `AGENT_SMITH_${name.toUpperCase()}_BIN`;
+    const saved = process.env[key];
+    process.env[key] = missing;
+    try {
+      // Binary names are captured at module scope, so load a fresh copy of the adapter.
+      const mod = (await import(`./${name}.ts?missing=${name}`)) as Record<string, import('./types.ts').Provider>;
+      const handle = await mod[`${name}Provider`]!.spawn({
+        mode: 'test',
+        prompt: 'x',
+        cwd: dir,
+        timeoutMs: 5_000,
+        unrestricted: true,
+        stateDir: dir,
+      });
+      const result = await handle.waitForResult();
+      assert.equal(result.status, 'spawn-failed');
+      assert.equal(result.ok, false);
+      assert.match(result.error ?? '', /^spawn error: .*ENOENT/);
+    } finally {
+      if (saved === undefined) delete process.env[key];
+      else process.env[key] = saved;
+    }
+  });
+}

@@ -573,8 +573,7 @@ export function planInitialRouting(
  * escalating is an agent that never returns. Two is enough to survive a stall
  * shape and one failed remedy; past that, more of the same medicine is not a
  * strategy. When we stop, we stop with the evidence attached so a human can see
- * what the worker actually did — see verify/gate.ts, where the parallel rule is
- * "never auto-retry more than once, because a loop is worse than a stop".
+ * what the worker actually did: a loop is worse than a stop.
  */
 export function nextRouting(
   current: StageRouting,

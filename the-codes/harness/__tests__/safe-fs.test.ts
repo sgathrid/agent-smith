@@ -13,7 +13,6 @@ import { test } from "node:test";
 
 import {
   existsSafe,
-  readPrefixSafe,
   readJsonSafe,
   readTextSafe,
   readdirSafe,
@@ -68,33 +67,6 @@ test("readTextSafe returns null after a file is deleted mid-session", async () =
     await rm(f);
     // This is literally hazard A: gone between one read and the next.
     assert.equal(await readTextSafe(f), null);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test("readPrefixSafe spans multiple lines and tolerates a cut mid-record", async () => {
-  const root = await mkdtemp(path.join(tmpdir(), "safefs-"));
-  try {
-    const f = path.join(root, "stream.jsonl");
-    await writeFile(f, '{"n":1}\n{"n":2}\n{"n":3}\n');
-    // 16 bytes covers line 1 plus part of line 2 — we need MORE than the first
-    // line, because fork subagents carry no `cwd` on their first record.
-    const prefix = await readPrefixSafe(f, 16);
-    assert.ok(prefix);
-    assert.ok(prefix.length > 0);
-    // The first record must still be intact and parseable.
-    const firstLine = prefix.split("\n")[0] ?? "";
-    assert.deepEqual(JSON.parse(firstLine), { n: 1 });
-    // A line that was cut mid-record simply fails to parse — it must not throw.
-    for (const line of prefix.split("\n")) {
-      if (line.trim() === "") continue;
-      try {
-        JSON.parse(line);
-      } catch {
-        // expected for the truncated tail
-      }
-    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }

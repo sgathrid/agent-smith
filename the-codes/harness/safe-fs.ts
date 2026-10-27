@@ -39,7 +39,7 @@ const TRANSIENT_CODES = new Set([
  * viewer that OOMs on a long job is worse than one that truncates. Callers
  * that genuinely need everything pass a bigger number.
  */
-export const DEFAULT_MAX_BYTES = 2 * 1024 * 1024;
+const DEFAULT_MAX_BYTES = 2 * 1024 * 1024;
 
 function isTransient(err: unknown): boolean {
   if (typeof err !== "object" || err === null) return true; // be paranoid
@@ -137,28 +137,4 @@ export async function readdirSafe(path: string): Promise<string[]> {
     if (!isTransient(err)) throw err;
     return [];
   }
-}
-
-/**
- * Read a byte-capped prefix of a text file, spanning MULTIPLE lines.
- *
- * WHY: Claude Code subagent transcripts are append-only NDJSON up to ~500KB.
- * To discover which project a subagent belongs to we only need a `cwd` from its
- * leading records — reading whole files across 696 subagents to find one field
- * would be absurd.
- *
- * WHY "prefix" and not "first line": fork subagents do not begin with a
- * conversation record. They begin with a `{"type":"fork-context-ref", ...}`
- * header that has NO `cwd`; the first record that has one is a line later. A
- * single-line head read therefore makes every fork subagent invisible. Callers
- * scan the lines themselves and stop when they have what they need.
- *
- * The final line may be cut mid-record; that is fine and expected — consumers
- * parse line-by-line and skip anything that does not parse.
- */
-export async function readPrefixSafe(
-  path: string,
-  maxBytes: number = 16 * 1024,
-): Promise<string | null> {
-  return readTextSafe(path, maxBytes);
 }

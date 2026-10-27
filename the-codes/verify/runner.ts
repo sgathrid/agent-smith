@@ -402,15 +402,3 @@ export async function runChecks(
     incomplete: present.some((v) => v.skipped !== undefined),
   };
 }
-
-/**
- * Re-run checks after a worker acted on them.
- *
- * This exists so the caller cannot accidentally keep the OLD verdicts: the whole
- * point of an escalation is that the previous verdict is invalidated, and
- * re-running through one function makes "the verdict belongs to the current tree"
- * a property of the code rather than of the caller's discipline.
- */
-export async function recheck(checks: readonly Check[], options: RunChecksOptions = {}): Promise<CheckReport> {
-  return runChecks(checks, options);
-}

@@ -125,23 +125,19 @@
  */
 
 import {
-  appendEventLog,
-  binaryOnPath,
-  createEventBus,
-  newJobId,
+  binaryAvailable,
+  earlyVerdict,
+  jobResult,
   nowIso,
   num,
   obj,
   preview,
-  spawnWorker,
-  stderrTailOf,
+  runNdjsonWorker,
   str,
   truncate,
   tryParseObject,
-  writeArgv,
-  writeResultFile,
-  writeStateDir,
 } from './ndjson.ts';
+import type { ExitInfo } from './ndjson.ts';
 import type {
   ActivityRef,
   ActivityStatus,
@@ -163,13 +159,13 @@ import {
   runCapture,
 } from './discovery.ts';
 import type { RunFn } from './discovery.ts';
-import { noResultText, stderrClause, timedOutText } from './failure-text.ts';
+import { noResultText, stderrClause } from './failure-text.ts';
 import path from 'node:path';
 
 export const KIMI_BINARY = process.env['AGENT_SMITH_KIMI_BIN'] ?? 'kimi';
 
 /** Kimi config dir: AGENT_SMITH_KIMI_HOME, then KIMI_CODE_HOME, then ~/.kimi-code. */
-export function kimiHome(): string {
+function kimiHome(): string {
   return configDir(['AGENT_SMITH_KIMI_HOME', 'KIMI_CODE_HOME'], '.kimi-code');
 }
 
@@ -505,15 +501,6 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
 // Result
 // ---------------------------------------------------------------------------
 
-interface ExitInfo {
-  code: number | null;
-  signal: NodeJS.Signals | null;
-  killReason: 'cancelled' | 'timeout' | undefined;
-  stderr: string;
-  /** Set when spawnWorker reports that the binary could not be started. */
-  spawnError?: string;
-}
-
 export function buildResult(args: {
   jobId: string;
   startedAtMs: number;
@@ -522,7 +509,6 @@ export function buildResult(args: {
   tx: KimiTranslator;
 }): JobResult {
   const { jobId, startedAtMs, stateDir, exit, tx } = args;
-  const finishedAt = nowIso();
   const durationMs = Date.now() - startedAtMs;
   const unrecognised = tx.unrecognised.size > 0
     ? ` · unrecognised lines: ${[...tx.unrecognised].join(', ')}`
@@ -530,20 +516,12 @@ export function buildResult(args: {
 
   let status: JobStatus;
   let error: string | undefined;
-  if (exit.killReason === 'cancelled') {
-    status = 'cancelled';
-    error = 'canceled';
-  } else if (exit.killReason === 'timeout') {
-    status = 'timeout';
-    error = timedOutText(durationMs);
+  const early = earlyVerdict(exit, durationMs);
+  if (early !== undefined) {
+    ({ status, error } = early);
   } else if (tx.sawError) {
     status = 'error';
     error = `${tx.error ?? 'worker error'}${unrecognised}${stderrClause(exit.stderr)}`;
-  } else if (exit.spawnError !== undefined) {
-    // spawnWorker reports ENOENT/bad-cwd through onStderr and resolves with a
-    // null exit code. Without this branch the operator sees "exited null".
-    status = 'spawn-failed';
-    error = `${exit.spawnError}${unrecognised}`;
   } else if (exit.code !== 0) {
     status = 'error';
     error = exit.code === null
@@ -561,20 +539,7 @@ export function buildResult(args: {
     status = 'success';
   }
 
-  const out: JobResult = {
-    jobId,
-    provider: 'kimi',
-    ok: status === 'success',
-    status,
-    exitCode: exit.code,
-    signal: exit.signal,
-    response: tx.finalText,
-    durationMs,
-    startedAt: new Date(startedAtMs).toISOString(),
-    finishedAt,
-    stateDir,
-  };
-  if (error !== undefined) out.error = error;
+  const out = jobResult({ provider: 'kimi', jobId, status, error, exit, response: tx.finalText, startedAtMs, durationMs, stateDir });
   if (tx.usage !== undefined) out.usage = tx.usage;
   const raw: Record<string, unknown> = {};
   if (tx.sessionId !== undefined) raw['sessionId'] = tx.sessionId;
@@ -650,13 +615,10 @@ export async function listKimiModels(
 
     // The top-level default_model is not part of `provider list --json`; it is
     // read from the same config file the CLI reads.
-    const cfg = readTextSafe(path.join(home, 'config.toml'));
-    if (cfg !== undefined) {
-      const model = parseTomlTopLevel(cfg)['default_model'];
-      if (model !== undefined && model !== '') {
-        cat.defaultModel = model;
-        cat.defaultSource = 'harness-config';
-      }
+    const { model } = kimiHarnessDefaults(home);
+    if (model !== undefined) {
+      cat.defaultModel = model;
+      cat.defaultSource = 'harness-config';
     }
   } catch (e) {
     cat.error = errMessage(e);
@@ -665,7 +627,7 @@ export async function listKimiModels(
 }
 
 /** Default model from <home>/config.toml top-level `default_model`. Sync, no CLI, never throws. */
-export function kimiHarnessDefaults(home: string = kimiHome()): { model?: string; effort?: string } {
+function kimiHarnessDefaults(home: string = kimiHome()): { model?: string; effort?: string } {
   const text = readTextSafe(path.join(home, 'config.toml'));
   if (text === undefined) return {};
   const model = parseTomlTopLevel(text)['default_model'];
@@ -684,112 +646,31 @@ export const kimiProvider: Provider = {
 
   harnessDefaults: () => kimiHarnessDefaults(),
 
-  async available(): Promise<boolean> {
-    try {
-      return await binaryOnPath(KIMI_BINARY);
-    } catch {
-      return false;
-    }
-  },
+  available: () => binaryAvailable(KIMI_BINARY),
 
-  describeSandbox: (spec) => sandboxPlan(spec),
+  describeSandbox: sandboxPlan,
 
   listModels: (options) => listKimiModels(runCapture, options),
 
-  async spawn(spec: SpawnSpec): Promise<WorkerHandle> {
-    const jobId = spec.jobId ?? newJobId();
-    const stateDir = writeStateDir('kimi', jobId, spec.stateDir);
-    const argv = buildArgv(spec);
-    writeArgv(stateDir, argv, spec.cwd);
-
-    const maxChars = spec.maxOutputChars ?? 2000;
-    const bus = createEventBus();
-    const tx = createKimiTranslator(maxChars);
-
-    const publish = (events: ProviderEvent[]): void => {
-      for (const e of events) {
-        bus.emit(e);
-        appendEventLog(stateDir, e);
-      }
-    };
-
-    if (spec.effort !== undefined && spec.effort !== '') {
-      // Do not silently pretend the effort was applied. The CLI reads effort
-      // from config.toml, not from a flag.
-      publish([{
-        kind: 'notice',
-        at: nowIso(),
-        level: 'warn',
-        message: `kimi has no per-run effort flag; ignoring effort "${spec.effort}". ` +
-          'Set [thinking].effort or a model alias default_effort in config.toml instead.',
-      }]);
-    }
-
-    const startedAtMs = Date.now();
-    let spawnError: string | undefined;
-
-    const proc = await spawnWorker({
+  spawn(spec: SpawnSpec): Promise<WorkerHandle> {
+    const tx = createKimiTranslator(spec.maxOutputChars ?? 2000);
+    return runNdjsonWorker({
       provider: 'kimi',
       binary: KIMI_BINARY,
-      argv,
-      cwd: spec.cwd,
-      timeoutMs: spec.timeoutMs,
-      stateDir,
-      jobId,
-      mode: spec.mode,
-      ...(spec.env !== undefined ? { env: spec.env } : {}),
-      onStdoutLine(line) {
-        const raw = tryParseObject(line);
-        if (raw === undefined) {
-          // stream-json is one object per line; a banner or a future format
-          // change must be visible rather than silently dropped. publish() also
-          // puts it in events.jsonl, not only in the live bus.
-          publish([{
-            kind: 'notice',
-            at: nowIso(),
-            level: 'warn',
-            message: `kimi stdout (non-JSON): ${truncate(line, 400).text}`,
-          }]);
-          return;
-        }
-        publish(tx.onEvent(raw));
-      },
-      onStderr(chunk) {
-        const text = chunk.trim();
-        if (text === '') return;
-        if (text.startsWith('spawn error:')) spawnError = text;
-        publish([{ kind: 'notice', at: nowIso(), level: 'info', message: truncate(text, 800).text }]);
-      },
+      spec,
+      buildArgv,
+      translate: tx.onEvent,
+      // Do not silently pretend the effort was applied. The CLI reads effort
+      // from config.toml, not from a flag.
+      ...(spec.effort !== undefined && spec.effort !== '' ? { preamble: [{
+        kind: 'notice' as const,
+        at: nowIso(),
+        level: 'warn' as const,
+        message: `kimi has no per-run effort flag; ignoring effort "${spec.effort}". ` +
+          'Set [thinking].effort or a model alias default_effort in config.toml instead.',
+      }] } : {}),
+      buildResult: (ctx) => buildResult({ ...ctx, tx }),
     });
-
-    let resolveResult: (r: JobResult) => void = () => {};
-    const resultPromise = new Promise<JobResult>((resolve) => {
-      resolveResult = resolve;
-    });
-
-    void proc.exited.then(({ code, signal }) => {
-      proc.closeLog();
-      const final = buildResult({
-        jobId,
-        startedAtMs,
-        stateDir,
-        tx,
-        exit: { code, signal, killReason: proc.killReason, stderr: stderrTailOf(proc), ...(spawnError === undefined ? {} : { spawnError }) },
-      });
-      bus.close();
-      writeResultFile(stateDir, final);
-      resolveResult(final);
-    });
-
-    return {
-      id: jobId,
-      stateDir,
-      cancel: () => proc.terminate('cancelled'),
-      waitForResult: () => resultPromise,
-      onEvent: (listener) => bus.onEvent(listener),
-      events: bus.events,
-    };
   },
 };
 
-export const kimi = kimiProvider;

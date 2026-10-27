@@ -1,8 +1,0 @@
-{
-  "agentType": "general-purpose",
-  "description": "Verify other harness claims",
-  "toolUseId": "toolu_vrtx_01KQycCha6HXBfjkeJWVBThu",
-  "spawnDepth": 1,
-  "requestShape": "background",
-  "requestNonInteractive": true
-}

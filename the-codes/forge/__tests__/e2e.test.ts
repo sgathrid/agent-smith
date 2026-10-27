@@ -129,7 +129,7 @@ test('ACCEPTANCE: a job spawned through the tool appears in the mod pane, unmodi
   const r = repo();
 
   const { ForgeService } = await import('../service.ts');
-  const { readAllObservedJobs } = await import('../../harness/registry.ts');
+  const { readAllObservedJobs } = await import('./observe.ts');
   const mod = await import('../../surfaces/mod/hooks/jobs.ts');
 
   const service = new ForgeService({ repo: r });
@@ -427,7 +427,7 @@ test('a missing binary produces a FAILED job, not a rejected promise', async () 
   // and the job itself carries the failure. A rejected promise would have given
   // the caller nothing to draw and nothing to retry.
   assert.equal(got.status, 'failed');
-  assert.equal(got.jobStatus, 'error');
+  assert.equal(got.jobStatus, 'spawn-failed');
   // The adapter's own evidence is preserved verbatim BENEATH our verdict, which is
   // the whole reason the writer joins the two strings. Without it the error is the
   // useless half-sentence "worker reported failure (error)"; with it the cause is

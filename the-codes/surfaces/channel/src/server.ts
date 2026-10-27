@@ -28,7 +28,7 @@
  * premise was false. It assumed something ELSE provided the spawn path. Nothing
  * did. The repo could watch workers and could not start one: providers/ was
  * 3,643 lines of adapters nothing imported, pipeline/ had a `StageRunner`
- * injection point with no injection, core/store.ts was unused, and the mod drew
+ * injection point with no injection, an unused SQLite store, and the mod drew
  * twenty real jobs it had no way to create. So the premise was not "a channel
  * would duplicate a tool" — it was "a channel with no tools duplicates nothing,
  * because there is no first implementation to duplicate".

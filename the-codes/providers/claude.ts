@@ -87,23 +87,17 @@
  */
 
 import {
-  appendEventLog,
-  binaryOnPath,
-  createEventBus,
-  newJobId,
+  binaryAvailable,
+  earlyVerdict,
+  jobResult,
   nowIso,
   num,
   obj,
   preview,
-  spawnWorker,
-  stderrTailOf,
+  runNdjsonWorker,
   str,
-  tryParseObject,
-  truncate,
-  writeArgv,
-  writeResultFile,
-  writeStateDir,
 } from './ndjson.ts';
+import type { ExitInfo } from './ndjson.ts';
 import type {
   ActivityRef,
   ActivityStatus,
@@ -119,17 +113,9 @@ import type { ListModelsOptions, ModelCatalog, ModelInfo, SandboxInfo } from './
 import { DEFAULT_DISCOVERY_TIMEOUT_MS, configDir, errMessage, readTextSafe, runCapture } from './discovery.ts';
 import type { RunFn } from './discovery.ts';
 import path from 'node:path';
-import { deniedText, noResultText, stderrClause, timedOutText } from './failure-text.ts';
+import { deniedText, noResultText, stderrClause } from './failure-text.ts';
 
 export const CLAUDE_BINARY = process.env['AGENT_SMITH_CLAUDE_BIN'] ?? 'claude';
-
-export type ClaudePermissionMode =
-  | 'acceptEdits'
-  | 'auto'
-  | 'bypassPermissions'
-  | 'manual'
-  | 'dontAsk'
-  | 'plan';
 
 /**
  * Build the exact argv for one claude worker.
@@ -152,13 +138,13 @@ export type ClaudePermissionMode =
  *   read-only is NOT enforced: user allow rules may still permit writes.
  */
 /** Tools a read-only worker may use. Shell is limited to inspection commands. */
-export const READ_ONLY_ALLOWED: readonly string[] = [
+const READ_ONLY_ALLOWED: readonly string[] = [
   'Read', 'Grep', 'Glob',
   ...['cat', 'head', 'tail', 'wc', 'xxd', 'od', 'ls', 'file', 'stat', 'rg', 'grep', 'diff',
     'git diff', 'git show', 'git log', 'git status', 'git blame'].map((c) => `Bash(${c}:*)`),
 ];
 /** Tools a read-only worker may never use, even if user settings would allow them. */
-export const READ_ONLY_DENIED: readonly string[] = ['Edit', 'Write', 'NotebookEdit'];
+const READ_ONLY_DENIED: readonly string[] = ['Edit', 'Write', 'NotebookEdit'];
 
 /**
  * Allow rule for the one file a read-only pipeline stage may write.
@@ -168,7 +154,7 @@ export const READ_ONLY_DENIED: readonly string[] = ['Edit', 'Write', 'NotebookEd
  * the rule that matches, and it covers the Write tool for exactly that file;
  * `//` marks a filesystem-absolute path. A bare `Edit` deny does not shadow it.
  */
-export function artifactWriteRule(artifactPath: string): string {
+function artifactWriteRule(artifactPath: string): string {
   return `Edit(/${path.resolve(artifactPath)})`;
 }
 
@@ -230,9 +216,8 @@ export function buildArgv(spec: SpawnSpec): string[] {
   }
 
   if (spec.effort !== undefined && spec.effort !== '') {
-    const supported = ['low', 'medium', 'high', 'xhigh', 'max'];
-    if (!supported.includes(spec.effort)) {
-      throw new RangeError(`claude does not support effort '${spec.effort}'; expected one of ${supported.join(', ')}`);
+    if (!CLAUDE_EFFORTS.includes(spec.effort)) {
+      throw new RangeError(`claude does not support effort '${spec.effort}'; expected one of ${CLAUDE_EFFORTS.join(', ')}`);
     }
     argv.push('--effort', spec.effort);
   }
@@ -301,13 +286,13 @@ function toTokenUsage(usage: Record<string, unknown> | undefined): TokenUsage | 
   if (read !== undefined) out.cacheReadTokens = read;
   const write = num(usage, 'cache_creation_input_tokens');
   if (write !== undefined) out.cacheWriteTokens = write;
-  // Anthropic does not send a total. Left undefined on purpose — core/ decides
+  // Anthropic does not send a total. Left undefined on purpose — consumers decide
   // the accounting policy; providers do not invent numbers.
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /** Is this a tool_result block reporting a permission refusal? */
-export function isPermissionDenial(text: string | undefined): boolean {
+function isPermissionDenial(text: string | undefined): boolean {
   if (text === undefined) return false;
   const hay = text.toLowerCase();
   return (
@@ -581,13 +566,6 @@ export function createClaudeTranslator(maxChars: number): ClaudeTranslator {
 // Result
 // ---------------------------------------------------------------------------
 
-interface ExitInfo {
-  code: number | null;
-  signal: NodeJS.Signals | null;
-  killReason: 'cancelled' | 'timeout' | undefined;
-  stderr: string;
-}
-
 export function buildResult(args: {
   jobId: string;
   startedAtMs: number;
@@ -596,20 +574,16 @@ export function buildResult(args: {
   tx: ClaudeTranslator;
 }): JobResult {
   const { jobId, startedAtMs, stateDir, exit, tx } = args;
-  const finishedAt = nowIso();
   const durationMs = Date.now() - startedAtMs;
 
   let status: JobStatus;
   let error: string | undefined;
 
-  if (exit.killReason === 'cancelled') {
-    status = 'cancelled';
-    error = 'canceled';
-  } else if (exit.killReason === 'timeout') {
-    status = 'timeout';
-    // NOTE: claude has no --print-timeout. This kill is entirely ours, which is
-    // why we must never infer success from "it produced a lot of output".
-    error = timedOutText(durationMs);
+  // claude has no --print-timeout, so a timeout kill is entirely ours: never
+  // infer success from "it produced a lot of output".
+  const early = earlyVerdict(exit, durationMs);
+  if (early !== undefined) {
+    ({ status, error } = early);
   } else if (tx.deniedTools.length > 0 && !(tx.sawResult && !tx.sawErrorResult && exit.code === 0 && tx.finalText.trim() !== '')) {
     // Same discipline as agy. A moderator whose tools were denied has not
     // moderated anything, and claude may still report subtype "success".
@@ -629,20 +603,7 @@ export function buildResult(args: {
     status = 'success';
   }
 
-  const out: JobResult = {
-    jobId,
-    provider: 'claude',
-    ok: status === 'success',
-    status,
-    exitCode: exit.code,
-    signal: exit.signal,
-    response: tx.finalText,
-    durationMs,
-    startedAt: new Date(startedAtMs).toISOString(),
-    finishedAt,
-    stateDir,
-  };
-  if (error !== undefined) out.error = error;
+  const out = jobResult({ provider: 'claude', jobId, status, error, exit, response: tx.finalText, startedAtMs, durationMs, stateDir });
   // A report was delivered despite denied calls: the job succeeded, but the
   // orchestrator must know some checks did not run (normalize.ts turns this
   // into a warning).
@@ -664,17 +625,24 @@ export function buildResult(args: {
 // ---------------------------------------------------------------------------
 
 /** Aliases documented by `claude --help`. */
-export const CLAUDE_ALIASES: ReadonlyArray<{ id: string; label: string }> = [
+const CLAUDE_ALIASES: ReadonlyArray<{ id: string; label: string }> = [
   { id: 'fable', label: 'Fable' },
   { id: 'opus', label: 'Opus' },
   { id: 'sonnet', label: 'Sonnet' },
   { id: 'haiku', label: 'Haiku' },
 ];
-export const CLAUDE_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+const CLAUDE_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
 /** Claude config dir: AGENT_SMITH_CLAUDE_HOME, CLAUDE_CONFIG_DIR, then ~/.claude. */
 export function claudeHome(): string {
   return configDir(['AGENT_SMITH_CLAUDE_HOME', 'CLAUDE_CONFIG_DIR'], '.claude');
+}
+
+/** Top-level `model` from <home>/settings.json. Throws on malformed JSON; callers decide how loud to be. */
+function readDefaultModel(home: string): string | undefined {
+  const text = readTextSafe(path.join(home, 'settings.json'));
+  const model = text === undefined ? undefined : (JSON.parse(text) as { model?: unknown } | null)?.model;
+  return typeof model === 'string' && model !== '' ? model : undefined;
 }
 
 /** Static alias catalog; default model from <home>/settings.json top-level `model`. Never throws. */
@@ -688,13 +656,10 @@ export async function listClaudeModels(_options?: ListModelsOptions, home: strin
     verified: true,
   };
   try {
-    const text = readTextSafe(path.join(home, 'settings.json'));
-    if (text !== undefined) {
-      const model = (JSON.parse(text) as { model?: unknown } | null)?.model;
-      if (typeof model === 'string' && model !== '') {
-        cat.defaultModel = model;
-        cat.defaultSource = 'harness-config';
-      }
+    const model = readDefaultModel(home);
+    if (model !== undefined) {
+      cat.defaultModel = model;
+      cat.defaultSource = 'harness-config';
     }
   } catch (e) {
     cat.error = `could not parse settings.json: ${errMessage(e)}`;
@@ -703,11 +668,10 @@ export async function listClaudeModels(_options?: ListModelsOptions, home: strin
 }
 
 /** Default model from <home>/settings.json. Sync file read only; never throws. */
-export function claudeHarnessDefaults(home: string = claudeHome()): { model?: string; effort?: string } {
+function claudeHarnessDefaults(home: string = claudeHome()): { model?: string; effort?: string } {
   try {
-    const text = readTextSafe(path.join(home, 'settings.json'));
-    const model = text === undefined ? undefined : (JSON.parse(text) as { model?: unknown } | null)?.model;
-    return typeof model === 'string' && model !== '' ? { model } : {};
+    const model = readDefaultModel(home);
+    return model === undefined ? {} : { model };
   } catch {
     return {};
   }
@@ -717,95 +681,21 @@ export const claudeProvider: Provider = {
   harnessDefaults: () => claudeHarnessDefaults(),
   name: 'claude',
 
-  async available(): Promise<boolean> {
-    try {
-      return await binaryOnPath(CLAUDE_BINARY);
-    } catch {
-      return false;
-    }
-  },
+  available: () => binaryAvailable(CLAUDE_BINARY),
 
-  describeSandbox: (spec) => sandboxPlan(spec),
+  describeSandbox: sandboxPlan,
 
   listModels: (options) => listClaudeModels(options),
 
-  async spawn(spec: SpawnSpec): Promise<WorkerHandle> {
-    const jobId = spec.jobId ?? newJobId();
-    const stateDir = writeStateDir('claude', jobId, spec.stateDir);
-    const argv = buildArgv(spec);
-    writeArgv(stateDir, argv, spec.cwd);
-
-    const maxChars = spec.maxOutputChars ?? 2000;
-    const bus = createEventBus();
-    const tx = createClaudeTranslator(maxChars);
-
-    const publish = (events: ProviderEvent[]): void => {
-      for (const e of events) {
-        bus.emit(e);
-        appendEventLog(stateDir, e);
-      }
-    };
-
-    const startedAtMs = Date.now();
-
-    const proc = await spawnWorker({
+  spawn(spec: SpawnSpec): Promise<WorkerHandle> {
+    const tx = createClaudeTranslator(spec.maxOutputChars ?? 2000);
+    return runNdjsonWorker({
       provider: 'claude',
       binary: CLAUDE_BINARY,
-      argv,
-      cwd: spec.cwd,
-      timeoutMs: spec.timeoutMs,
-      stateDir,
-      jobId,
-      mode: spec.mode,
-      ...(spec.env !== undefined ? { env: spec.env } : {}),
-      onStdoutLine(line) {
-        const raw = tryParseObject(line);
-        if (raw === undefined) {
-          bus.emit({
-            kind: 'notice',
-            at: nowIso(),
-            level: 'warn',
-            message: `claude stdout (non-JSON): ${truncate(line, 400).text}`,
-          });
-          return;
-        }
-        publish(tx.onEvent(raw));
-      },
-      onStderr(chunk) {
-        const text = chunk.trim();
-        if (text === '') return;
-        bus.emit({ kind: 'notice', at: nowIso(), level: 'info', message: truncate(text, 800).text });
-      },
+      spec,
+      buildArgv,
+      translate: tx.onEvent,
+      buildResult: (ctx) => buildResult({ ...ctx, tx }),
     });
-
-    let resolveResult: (r: JobResult) => void = () => {};
-    const resultPromise = new Promise<JobResult>((resolve) => {
-      resolveResult = resolve;
-    });
-
-    void proc.exited.then(({ code, signal }) => {
-      proc.closeLog();
-      const final = buildResult({
-        jobId,
-        startedAtMs,
-        stateDir,
-        tx,
-        exit: { code, signal, killReason: proc.killReason, stderr: stderrTailOf(proc) },
-      });
-      bus.close();
-      writeResultFile(stateDir, final);
-      resolveResult(final);
-    });
-
-    return {
-      id: jobId,
-      stateDir,
-      cancel: () => proc.terminate('cancelled'),
-      waitForResult: () => resultPromise,
-      onEvent: (listener) => bus.onEvent(listener),
-      events: bus.events,
-    };
   },
 };
-
-export const claude = claudeProvider;

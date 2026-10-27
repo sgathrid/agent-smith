@@ -16,7 +16,6 @@ import { test } from 'node:test';
 
 import {
   DEFAULT_TAIL_BYTES,
-  recheck,
   runCheck,
   runChecks,
 } from './runner.ts';
@@ -325,20 +324,6 @@ test('checks run concurrently', async () => {
     );
     const elapsed = Date.now() - started;
     assert.ok(elapsed < 1_200, `expected concurrent execution, took ${elapsed}ms`);
-  } finally {
-    rmSync(cwd, { recursive: true, force: true });
-  }
-});
-
-test('recheck runs the checks again rather than reusing verdicts', async () => {
-  const cwd = scratch();
-  try {
-    const marker = join(cwd, 'fixed');
-    const checks = [check({ name: 'test', command: `test -f ${marker}` }, cwd)];
-    assert.equal((await recheck(checks)).passed, false);
-    // The worker "fixes" it; the next verification must see the new tree.
-    writeFileSync(marker, 'ok');
-    assert.equal((await recheck(checks)).passed, true);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

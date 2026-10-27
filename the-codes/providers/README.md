@@ -1,7 +1,7 @@
 # providers/ — spawning and observing workers
 
 This directory owns **how workers are started and watched**. It is the only
-layer that speaks CLI dialects. `core/` is provider-agnostic and `harness/`
+layer that speaks CLI dialects. Everything else is provider-agnostic and `harness/`
 reads state that workers write themselves; neither parses agy/Codex/OpenCode/
 Kimi/Anthropic JSON.
 
@@ -152,7 +152,7 @@ Events observed live: `thread.started` (`thread_id`), `turn.started`,
 `item.completed` (`item:{id,type:'agent_message',text}`),
 `turn.completed` (`usage:{input_tokens,cached_input_tokens,cache_write_input_tokens,
 output_tokens,reasoning_output_tokens}`). `cached_input_tokens` maps to
-`cacheReadTokens` so core/ can sum across providers. No `total_tokens` — left
+`cacheReadTokens` so consumers can sum across providers. No `total_tokens` — left
 undefined rather than invented.
 
 Two verified gotchas:
@@ -316,7 +316,7 @@ deliberately not passed; `--project` has no `SpawnSpec` field and is a harness
 concern.
 
 **Not tested at all:** concurrent spawn of many workers per provider (the
-registry's concurrency cap lives in `core/`), and behaviour when a worker ignores
+concurrency cap lives outside this layer), and behaviour when a worker ignores
 SIGTERM mid-tool-call (escalation to SIGKILL after 5 s is implemented but only
 exercised by the orphan-descendant test).
 
@@ -353,22 +353,21 @@ consumer can tail immediately:
 agy additionally has agy-staff's own `<cwd>/.agy-staff/jobs/<jobId>.*` tree,
 which `harness/` reads. This layer does not touch it.
 
-## Reconciliation debt with core/types.ts
+## Event contract
 
-`providers/types.ts` defines a **local minimal** `ProviderEvent`, `TokenUsage`,
-`JobStatus` and `JobResult` because `core/types.ts` is being written
-concurrently. `ProviderEvent` is deliberately a union of six variants
+`providers/types.ts` defines a **self-contained** `ProviderEvent`, `TokenUsage`,
+`JobStatus` and `JobResult`. `ProviderEvent` is deliberately a union of six variants
 (`started` / `text` / `activity-start` / `activity-update` / `activity-end` /
 `usage` / `notice`) with tool input and output already truncated to
 `SpawnSpec.maxOutputChars`, so the store never receives a multi-megabyte cargo-clip
 dump.
 
-Two deliberate choices to revisit during reconciliation:
+Two deliberate choices:
 
 - **There is no `'finished'` event.** `waitForResult()` is the single completion
   channel, so a consumer cannot disagree with itself about whether a job ended.
-  If `core/` wants a terminal event on the bus too, add it in core rather than
-  here.
+  A consumer that wants a terminal event on the bus should synthesise it
+  rather than have providers emit one.
 - **`notice` level is about presentation, not job status.** A `level:'error'`
   notice can accompany a successful job (e.g. a retried API call). Only
   `JobResult.status` decides success.

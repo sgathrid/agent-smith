@@ -125,12 +125,6 @@ export async function detectAvailable(): Promise<ProviderAvailability[]> {
   );
 }
 
-/** Just the names that resolved. Convenience for a gate: `if (await availableNames()).has('agy')`. */
-export async function availableNames(): Promise<Set<string>> {
-  const all = await detectAvailable();
-  return new Set(all.filter((a) => a.available).map((a) => a.name));
-}
-
 /**
  * Can this plan actually be staffed?
  *
@@ -154,7 +148,7 @@ export function missingProviders(required: readonly string[]): string[] {
  * point at a non-PATH install without editing code. Surfaced here so the
  * "provider not found" message tells you which command was looked for.
  */
-export function binaryFor(providerName: string): string {
+function binaryFor(providerName: string): string {
   switch (providerName) {
     case 'agy':
       return AGY_BINARY;
@@ -172,26 +166,12 @@ export function binaryFor(providerName: string): string {
 }
 
 /**
- * What each provider is FOR, in one line. Not decoration: `moderate` stages
- * pick a provider by role, and a role that is not written down gets picked
- * wrong (using agy to moderate agy is the correlated-agreement mistake
- * ARCHITECTURE.md warns about).
- */
-export const PROVIDER_ROLES: Readonly<Record<string, string>> = Object.freeze({
-  agy: 'cheap implementer / workhorse. Highest throughput, most tool calls.',
-  codex: 'reviewer. Different model family from the implementer, so its agreement is evidence.',
-  opencode: 'generalist. Fast, multi-provider, useful when another vendor is cheaper.',
-  claude: 'prober / moderator. Reads the diff and argues about it; sees subagent work via --forward-subagent-text.',
-  kimi: 'Moonshot Kimi Code workhorse. Print mode always auto-approves and has no per-run effort knob.',
-});
-
-/**
  * Families, for the correlated-agreement check.
  *
  * WHY: "Claude proposes, another model probes." Self-consistency between
  * same-family models is correlated (ICML 2025, 350+ models: 60% agreement when
  * both err), so a moderate stage that runs on the same family as the implement
- * stage is decoration, not verification. This map lets core/ refuse or warn
+ * stage is decoration, not verification. This map lets a caller refuse or warn
  * about a plan that moderates with the implementer's own family.
  *
  * UNVERIFIED / needs testing: whether OpenCode's configured model is in the

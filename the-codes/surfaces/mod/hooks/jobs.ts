@@ -412,7 +412,7 @@ export function reportBody(result: string | null): string | null {
  *      A run that died before writing status.json — a killed process, a full
  *      disk — still has its log. Without this row such a job sits at `?` forever.
  *   6. progress.json present              => running, or attention if silent past
- *      STALL_GRACE_MS (core/liveness.ts's 15 min, from stale.ts, so the band and
+ *      STALL_GRACE_MS (15 min, from stale.ts, so the band and
  *      the channel agree on when "stalled" begins).
  *   7. otherwise                          => unknown
  *
@@ -607,7 +607,7 @@ export async function resolve(
     // Silence past the grace period escalates to `attention`. A missing
     // last_event_at yields Infinity, which escalates: we do not know the job is
     // alive, and "unknown" must never be drawn as healthy — the same asymmetry
-    // core/liveness.ts documents.
+    // as everywhere else: unknown escalates.
     const lastSeen = toEpoch(progress.last_event_at);
     const silence = lastSeen === null ? Number.POSITIVE_INFINITY : now - lastSeen;
     const status2: RadarStatus = silence > STALL_GRACE_MS ? 'attention' : 'running';

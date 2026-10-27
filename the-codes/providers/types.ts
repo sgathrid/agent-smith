@@ -3,18 +3,13 @@
  *
  * WHY THIS FILE IS SELF-CONTAINED
  * ================================
- * The core layer (core/types.ts) is being written concurrently by another
- * engineer. Importing it here would create a build-order dependency on work
- * that does not exist yet, so this file defines its own MINIMAL, structurally
- * compatible versions of Job / Activity / TokenUsage.
- *
- * Once core/types.ts lands, these local types MUST be reconciled with it —
- * either by deleting the duplicates here and re-exporting from core, or by
- * proving structural compatibility. See ../README.md ("Reconciliation debt").
+ * It imports nothing from the rest of the codebase, so adapters build and test
+ * on their own. It defines the MINIMAL Job / Activity / TokenUsage shapes the
+ * rest of the system consumes.
  *
  * The rule for this layer: providers may speak in whatever dialect their CLI
  * emits, but they must translate into ProviderEvent before anything else sees
- * them. core/ never parses agy/Codex/OpenCode/Kimi/Anthropic JSON.
+ * them. Nothing outside providers/ parses agy/Codex/OpenCode/Kimi/Anthropic JSON.
  */
 
 // ---------------------------------------------------------------------------
@@ -189,9 +184,6 @@ export type ProviderEvent =
    */
   | { kind: 'notice'; at: string; level: 'info' | 'warn' | 'error'; message: string; raw?: unknown };
 
-/** Convenience: everything an event bus can carry for a single job. */
-export type AnyProviderEvent = ProviderEvent;
-
 // ---------------------------------------------------------------------------
 // JobResult
 // ---------------------------------------------------------------------------
@@ -316,9 +308,9 @@ export interface Provider {
   available(): Promise<boolean>;
 
   /**
-   * Start a worker. Rejects ONLY if the process could not be spawned at all
-   * (ENOENT, bad cwd). Once the process is running, failures arrive through
-   * the returned handle's waitForResult() — never as a rejection.
+   * Start a worker. Failures, including a binary that cannot be started at all
+   * (ENOENT, bad cwd), arrive through the returned handle's waitForResult()
+   * as status 'spawn-failed' — never as a rejection.
    */
   spawn(spec: SpawnSpec): Promise<WorkerHandle>;
 

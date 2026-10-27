@@ -49,7 +49,6 @@ import {
   ORPHAN_REASON,
   deriveOrphan,
   isPidAlive,
-  isForgeJobId,
   jobFile,
   jobsDir,
   type ForgeManifest,
@@ -286,26 +285,10 @@ export class AgentSmithReader implements JobStateReader {
   }
 }
 
-/**
- * ─────────────────────────────────────────────────────────────────────────────
- * THE ONE RULE ABOUT THE COMPAT MIRROR
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * forge/mirror.ts projects our jobs into `.agy-staff/jobs/` so an unmodified mod
- * can render them. That projection is READ BY NOBODY IN THIS LAYER.
- *
- * If this reader were allowed to also see it, every job we spawn would be
- * reported twice — once by this reader and once by `AgyStaffReader` — with two
- * independently computed verdicts. Two verdicts for one job id is precisely the
- * failure mode docs/ARCHITECTURE.md calls out ("two surfaces cannot disagree
- * about a job's state"), except with the disagreement inside a single sweep
- * instead of across two surfaces. The channel's dedupe would mask it for the
- * notifications; it would not mask it for anything else.
- *
- * So: the mirror is written once and read by exactly one consumer, and that
- * consumer is a plugin we are not allowed to change. `isForgeJobId` exists so
- * every caller can apply the same exclusion without re-deriving the id shape.
+/*
+ * THE ONE RULE ABOUT THE COMPAT MIRROR: forge/mirror.ts projects our jobs into
+ * `.agy-staff/jobs/` so an unmodified mod can render them. This reader never
+ * reads that projection, and `AgyStaffReader` callers skip forge ids
+ * (`isForgeJobId`). Otherwise every spawned job would get two independently
+ * computed verdicts in a single sweep.
  */
-export function isInteropMirrorOfForge(jobId: string): boolean {
-  return isForgeJobId(jobId);
-}

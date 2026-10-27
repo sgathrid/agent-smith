@@ -31,7 +31,7 @@
  * naive concatenation would report every job we spawn TWICE — two independently
  * computed verdicts for one id, inside a single poll. The channel's dedupe map
  * would mask the duplicate for notifications and for nothing else. So the primary
- * reader wins the id, here and in harness/registry.ts, by the same rule.
+ * reader wins the id, here and in forge/service.ts, by the same rule.
  *
  * WHY WE DO NOT IMPORT `claude-code`'s reader HERE: this surface is a channel
  * about WORKERS WE SPAWN. Folding in every Claude Code subagent transcript would
@@ -281,7 +281,7 @@ async function readOne(
  *
  * The stall threshold is imported from ./stale.ts rather than duplicated, so the
  * pane and the channel cannot disagree about when a job counts as stalled. The
- * number itself matches core/liveness.ts's DEFAULT_GRACE_MS (15 min).
+ * number itself is 15 min.
  *
  * WHY ESCALATE HERE AND NOT IN THE POLICY: a stall is a fact about the job, and
  * a fact belongs to the reader. The policy's job is only to decide whether a fact
@@ -291,8 +291,8 @@ export function toWatchStatus(observed: ObservedJob, now: number): WatchStatus {
   if (observed.status !== 'running') return observed.status;
   if (observed.updatedAt === null) {
     // No evidence of progress at all. Treat as needing eyes rather than healthy:
-    // "we do not know" must never be drawn as "fine" (the asymmetry
-    // core/liveness.ts documents).
+    // "we do not know" must never be drawn as "fine" (unknown
+    // escalates).
     return 'attention';
   }
   const then = Date.parse(observed.updatedAt);

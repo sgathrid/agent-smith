@@ -22,14 +22,8 @@ import { fileURLToPath } from 'node:url';
 import { PipelineSpecError } from '../../pipeline/pipeline.ts';
 import { validateSpec } from '../../pipeline/pipeline.ts';
 
-import {
-  loadSpec,
-  parseDuration,
-  parseScalar,
-  parseYaml,
-  specFrom,
-  SpecParseError,
-} from '../spec.ts';
+import { loadSpec, parseDuration, specFrom } from '../spec.ts';
+import { parseScalar, parseYaml, SpecParseError } from '../yaml.ts';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const EXAMPLE = path.resolve(HERE, '../pipeline.example.yaml');
@@ -228,6 +222,8 @@ test('provider-native xhigh and max effort values are accepted, unknown values r
   const max = specFrom(tree('name: p\nstages:\n  - name: a\n    provider: codex\n    effort: max'));
   assert.equal(high.stages[0]?.effort, 'xhigh');
   assert.equal(max.stages[0]?.effort, 'max');
+  const ultra = specFrom(tree('name: p\nstages:\n  - name: a\n    provider: codex\n    effort: ultra'));
+  assert.equal(ultra.stages[0]?.effort, 'ultra');
   assert.throws(
     () =>
       specFrom(

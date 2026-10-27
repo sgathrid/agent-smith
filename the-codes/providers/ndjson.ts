@@ -31,6 +31,8 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import os from 'node:os';
 import readline from 'node:readline';
+import type { JobResult, JobStatus, ProviderEvent, SpawnSpec, WorkerHandle } from './types.ts';
+import { timedOutText } from './failure-text.ts';
 
 /**
  * Minimal `which`: walk PATH, test for X_OK.
@@ -95,7 +97,7 @@ export async function binaryOnPath(bin: string): Promise<boolean> {
 // ---------------------------------------------------------------------------
 
 /** Root for all provider-written state. Overridable for tests / multi-root setups. */
-export function stateRoot(): string {
+function stateRoot(): string {
   return process.env['AGENT_SMITH_STATE_DIR'] ?? path.join(os.homedir(), '.agent-smith', 'state');
 }
 
@@ -195,9 +197,9 @@ export function nowIso(at = Date.now()): string {
 // ---------------------------------------------------------------------------
 
 export interface EventBus {
-  emit(event: import('./types.js').ProviderEvent): void;
-  onEvent(listener: (event: import('./types.js').ProviderEvent) => void): () => void;
-  readonly events: AsyncIterable<import('./types.js').ProviderEvent>;
+  emit(event: ProviderEvent): void;
+  onEvent(listener: (event: ProviderEvent) => void): () => void;
+  readonly events: AsyncIterable<ProviderEvent>;
   close(): void;
 }
 
@@ -210,12 +212,12 @@ export interface EventBus {
  * queued events and record that we did, rather than growing without limit.
  */
 export function createEventBus(maxQueue = 4096): EventBus {
-  const listeners = new Set<(e: import('./types.js').ProviderEvent) => void>();
-  const queue: import('./types.js').ProviderEvent[] = [];
-  let waiting: ((v: IteratorResult<import('./types.js').ProviderEvent>) => void) | undefined;
+  const listeners = new Set<(e: ProviderEvent) => void>();
+  const queue: ProviderEvent[] = [];
+  let waiting: ((v: IteratorResult<ProviderEvent>) => void) | undefined;
   let done = false;
 
-  function emit(event: import('./types.js').ProviderEvent): void {
+  function emit(event: ProviderEvent): void {
     // A throwing listener must not take down the worker pump. Log and continue.
     for (const l of listeners) {
       try {
@@ -243,17 +245,17 @@ export function createEventBus(maxQueue = 4096): EventBus {
       };
     },
     events: {
-      [Symbol.asyncIterator](): AsyncIterator<import('./types.js').ProviderEvent> {
+      [Symbol.asyncIterator](): AsyncIterator<ProviderEvent> {
         return {
-          next(): Promise<IteratorResult<import('./types.js').ProviderEvent>> {
+          next(): Promise<IteratorResult<ProviderEvent>> {
             const q = queue.shift();
             if (q !== undefined) return Promise.resolve({ value: q, done: false });
             if (done) return Promise.resolve({ value: undefined, done: true });
-            return new Promise<IteratorResult<import('./types.js').ProviderEvent>>((resolve) => {
+            return new Promise<IteratorResult<ProviderEvent>>((resolve) => {
               waiting = resolve;
             });
           },
-          return(): Promise<IteratorResult<import('./types.js').ProviderEvent>> {
+          return(): Promise<IteratorResult<ProviderEvent>> {
             done = true;
             waiting?.({ value: undefined, done: true });
             return Promise.resolve({ value: undefined, done: true });
@@ -314,6 +316,8 @@ export interface WorkerProcess {
   closeLog(): void;
   /** The retained stderr tail (capped). Used as a JobResult.error fallback. */
   stderrTail(): string;
+  /** Set when the binary could not be started at all (ENOENT, bad cwd). */
+  spawnError: string | undefined;
 }
 
 const STDERR_CAPTURE_LIMIT = 256 * 1024; // 256 KB retained in memory for JobResult
@@ -322,9 +326,11 @@ const STDERR_LOG_LIMIT = 4 * 1024 * 1024; // 4 MB retained on disk
 /**
  * Spawn a child with piped stdio and wire up the lifecycle.
  *
- * REJECTS only when the process cannot be started at all (ENOENT, bad cwd).
- * After this returns, every outcome — including immediate crash — is delivered
- * through `exited`.
+ * Never rejects for a runtime failure. When the process cannot be started at
+ * all (ENOENT, bad cwd) the promise still resolves: `exited` settles with a
+ * null code, `spawnError` carries the message, and the same text goes to
+ * onStderr. Every outcome, including immediate crash, is delivered through
+ * `exited`.
  */
 export function spawnWorker(opts: SpawnWorkerOptions): Promise<WorkerProcess> {
   const logStream: WriteStream = createWriteStream(path.join(opts.stateDir, 'stderr.log'), { flags: 'w' });
@@ -394,6 +400,7 @@ export function spawnWorker(opts: SpawnWorkerOptions): Promise<WorkerProcess> {
       logStream.end();
     },
     stderrTail: () => state.captured,
+    spawnError: undefined,
   };
 
   if (opts.timeoutMs > 0) {
@@ -420,7 +427,11 @@ export function spawnWorker(opts: SpawnWorkerOptions): Promise<WorkerProcess> {
     handle.on('error', (err: NodeJS.ErrnoException) => {
       // 'error' fires for spawn failures AND for kill failures. ENOENT here
       // means the binary vanished between `which` and spawn.
-      opts.onStderr(`spawn error: ${err.message}\n`);
+      // No pid means the child never started: that is a spawn failure, not a
+      // failed kill.
+      const message = `spawn error: ${err.message}`;
+      if (handle.pid === undefined) proc.spawnError = message;
+      opts.onStderr(`${message}\n`);
       finish(null, null);
     });
     handle.on('close', (code, signal) => finish(code, signal));
@@ -453,11 +464,6 @@ export function spawnWorker(opts: SpawnWorkerOptions): Promise<WorkerProcess> {
   return Promise.resolve(proc);
 }
 
-/** The retained stderr tail for a worker process. See WorkerProcess.stderrTail. */
-export function stderrTailOf(proc: WorkerProcess): string {
-  return proc.stderrTail();
-}
-
 /** Generate a job id when the caller did not supply one. */
 export function newJobId(): string {
   return randomUUID();
@@ -480,4 +486,174 @@ export function writeResultFile(stateDir: string, result: unknown): void {
   } catch {
     /* see appendEventLog */
   }
+}
+
+// ---------------------------------------------------------------------------
+// Shared adapter plumbing: availability, exit verdicts, the whole spawn() body
+// ---------------------------------------------------------------------------
+
+/** PATH probe for `Provider.available()`. Never throws: an unprobeable binary is an absent one. */
+export async function binaryAvailable(binary: string): Promise<boolean> {
+  try {
+    return await binaryOnPath(binary);
+  } catch {
+    return false;
+  }
+}
+
+/** How the worker process ended, as the adapters' buildResult ladders see it. */
+export interface ExitInfo {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  killReason: 'cancelled' | 'timeout' | undefined;
+  stderr: string;
+  /** Set when spawnWorker reports that the binary could not be started. */
+  spawnError?: string;
+}
+
+export interface Verdict {
+  status: JobStatus;
+  error: string;
+}
+
+/**
+ * The verdicts that dominate every adapter's own decision ladder: a job we
+ * killed has no trustworthy terminal state, and a process that never started has
+ * nothing else to interpret (spawnWorker resolves with a null exit code, which
+ * would otherwise read as "exited null"). Undefined means "decide from the
+ * output".
+ */
+export function earlyVerdict(exit: ExitInfo, durationMs: number): Verdict | undefined {
+  if (exit.killReason === 'cancelled') return { status: 'cancelled', error: 'canceled' };
+  if (exit.killReason === 'timeout') return { status: 'timeout', error: timedOutText(durationMs) };
+  if (exit.spawnError !== undefined) return { status: 'spawn-failed', error: exit.spawnError };
+  return undefined;
+}
+
+/** The JobResult envelope every adapter fills the same way; callers add their optional fields. */
+export function jobResult(args: {
+  provider: string;
+  jobId: string;
+  status: JobStatus;
+  error: string | undefined;
+  exit: ExitInfo;
+  response: string;
+  startedAtMs: number;
+  durationMs: number;
+  stateDir: string;
+}): JobResult {
+  const { status, error, exit } = args;
+  const out: JobResult = {
+    jobId: args.jobId,
+    provider: args.provider,
+    ok: status === 'success',
+    status,
+    exitCode: exit.code,
+    signal: exit.signal,
+    response: args.response,
+    durationMs: args.durationMs,
+    startedAt: new Date(args.startedAtMs).toISOString(),
+    finishedAt: nowIso(),
+    stateDir: args.stateDir,
+  };
+  if (error !== undefined) out.error = error;
+  return out;
+}
+
+export interface NdjsonWorkerConfig {
+  provider: string;
+  binary: string;
+  spec: SpawnSpec;
+  buildArgv(spec: SpawnSpec): string[];
+  /** Turn one parsed stdout object into normalized events. */
+  translate(raw: Record<string, unknown>): ProviderEvent[];
+  /** Events to publish before the process starts (e.g. an ignored-effort warning). */
+  preamble?: ProviderEvent[];
+  /** Claim a parsed stdout object before translation; true means it was handled. */
+  intercept?(raw: Record<string, unknown>): boolean;
+  /** Presentation level of a stderr notice. Defaults to 'info'. */
+  stderrLevel?(text: string): 'info' | 'warn' | 'error';
+  /** Called once the process is reaped; the caller applies its own decision ladder. */
+  buildResult(ctx: { jobId: string; startedAtMs: number; stateDir: string; exit: ExitInfo }): JobResult;
+  /** Events to publish after the result is built, before the bus closes. */
+  afterResult?(result: JobResult): ProviderEvent[];
+}
+
+/**
+ * The spawn() body every adapter shares: state dir, argv breadcrumb, event bus,
+ * the stdout/stderr pumps and the result promise. Notices go through `publish`
+ * so they land in events.jsonl as well as on the live bus.
+ */
+export async function runNdjsonWorker(cfg: NdjsonWorkerConfig): Promise<WorkerHandle> {
+  const { provider, spec } = cfg;
+  const jobId = spec.jobId ?? newJobId();
+  const stateDir = writeStateDir(provider, jobId, spec.stateDir);
+  const argv = cfg.buildArgv(spec);
+  writeArgv(stateDir, argv, spec.cwd);
+
+  const bus = createEventBus();
+  const publish = (events: ProviderEvent[]): void => {
+    for (const e of events) {
+      bus.emit(e);
+      appendEventLog(stateDir, e);
+    }
+  };
+  const notice = (level: 'info' | 'warn' | 'error', message: string): void =>
+    publish([{ kind: 'notice', at: nowIso(), level, message }]);
+
+  if (cfg.preamble !== undefined) publish(cfg.preamble);
+
+  const startedAtMs = Date.now();
+  const proc = await spawnWorker({
+    provider,
+    binary: cfg.binary,
+    argv,
+    cwd: spec.cwd,
+    timeoutMs: spec.timeoutMs,
+    stateDir,
+    jobId,
+    mode: spec.mode,
+    ...(spec.env !== undefined ? { env: spec.env } : {}),
+    onStdoutLine(line) {
+      const raw = tryParseObject(line);
+      if (raw === undefined) {
+        // NDJSON is one object per line; a banner, stray print or future format
+        // change must be visible rather than silently dropped.
+        notice('warn', `${provider} stdout (non-JSON): ${truncate(line, 400).text}`);
+        return;
+      }
+      if (cfg.intercept?.(raw)) return;
+      publish(cfg.translate(raw));
+    },
+    onStderr(chunk) {
+      const text = chunk.trim();
+      if (text === '') return;
+      notice(cfg.stderrLevel?.(text) ?? 'info', truncate(text, 800).text);
+    },
+  });
+
+  let resolveResult: (r: JobResult) => void = () => {};
+  const resultPromise = new Promise<JobResult>((resolve) => {
+    resolveResult = resolve;
+  });
+
+  void proc.exited.then(({ code, signal }) => {
+    proc.closeLog();
+    const exit: ExitInfo = { code, signal, killReason: proc.killReason, stderr: proc.stderrTail() };
+    if (proc.spawnError !== undefined) exit.spawnError = proc.spawnError;
+    const final = cfg.buildResult({ jobId, startedAtMs, stateDir, exit });
+    if (cfg.afterResult !== undefined) publish(cfg.afterResult(final));
+    bus.close();
+    writeResultFile(stateDir, final);
+    resolveResult(final);
+  });
+
+  return {
+    id: jobId,
+    stateDir,
+    cancel: () => proc.terminate('cancelled'),
+    waitForResult: () => resultPromise,
+    onEvent: (listener) => bus.onEvent(listener),
+    events: bus.events,
+  };
 }
