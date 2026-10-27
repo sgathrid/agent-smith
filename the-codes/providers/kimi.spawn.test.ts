@@ -15,6 +15,7 @@ import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { scaled } from '../forge/testing/time.ts';
 
 const fixtureDir = mkdtempSync(path.join(os.tmpdir(), 'agent-smith-kimi-fixture-'));
 const fixtureScript = path.join(fixtureDir, 'fake-kimi.mjs');
@@ -39,7 +40,7 @@ if (scenario === 'bad-exit') {
   process.exit(2);
 }
 if (scenario === 'slow') {
-  setTimeout(() => { out({ role: 'assistant', content: 'late' }); hint(); process.exit(0); }, 5000);
+  setTimeout(() => { out({ role: 'assistant', content: 'late' }); hint(); process.exit(0); }, 60000);
 } else {
   out({ role: 'meta', type: 'system.version', version: 'fixture-1' });
   out({ role: 'assistant', content: 'Checking.', tool_calls: [{
@@ -67,7 +68,7 @@ const spec = (overrides: Record<string, unknown> = {}) => ({
   mode: 'implement',
   prompt: 'do the thing',
   cwd: fixtureDir,
-  timeoutMs: 10_000,
+  timeoutMs: scaled(60_000),
   unrestricted: true,
   stateDir: stateDir(),
   ...overrides,

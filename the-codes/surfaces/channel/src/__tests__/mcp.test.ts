@@ -3,6 +3,7 @@ import test from 'node:test';
 import { Client } from '@modelcontextprotocol/client';
 import { InMemoryTransport } from '@modelcontextprotocol/server';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
+import { waitFor } from '../../../../forge/testing/time.ts';
 import { createSmithServer } from '../mcp.ts';
 import { withWorkerLookup } from './service-mock.ts';
 
@@ -53,11 +54,7 @@ test('modern envelope validation and approval state prevent invalid calls from l
   async function request(method: string, params: Record<string, unknown>) {
     const requestId = ++id;
     await h.clientTransport.send({ jsonrpc: '2.0', id: requestId, method, params });
-    const deadline = Date.now() + 3_000;
-    while (!responses.some(r => r.id === requestId)) {
-      if (Date.now() > deadline) throw new Error('protocol response timed out');
-      await new Promise(resolve => setTimeout(resolve, 5));
-    }
+    await waitFor(() => responses.some(r => r.id === requestId), { intervalMs: 5, message: `protocol response ${method}` });
     return responses.find(r => r.id === requestId)!;
   }
   try {

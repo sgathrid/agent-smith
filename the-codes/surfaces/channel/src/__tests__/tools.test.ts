@@ -308,7 +308,9 @@ test('list_jobs: since parses ISO and relative times; session restricts to jobs 
   const ctx = withService({ spawnedIds: spawned, list: async (f: Record<string, unknown>) => { seen.push(f); return []; } });
   const before = Date.now();
   await callTool(ctx, 'list_jobs', { since: '2h', session: true });
-  assert.ok(Math.abs((seen[0]!.sinceMs as number) - (before - 7_200_000)) < 5_000);
+  const after = Date.now();
+  // The tool reads the clock once, somewhere between `before` and `after`; no absolute tolerance to outrun.
+  assert.ok((seen[0]!.sinceMs as number) >= before - 7_200_000 && (seen[0]!.sinceMs as number) <= after - 7_200_000);
   assert.equal(seen[0]!.ids, spawned);
   await callTool(ctx, 'list_jobs', { since: '2026-10-01T00:00:00Z' });
   assert.equal(seen[1]!.sinceMs, Date.parse('2026-10-01T00:00:00Z')); assert.equal(seen[1]!.ids, undefined);

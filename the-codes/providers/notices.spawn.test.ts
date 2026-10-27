@@ -12,6 +12,7 @@ import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { scaled } from '../forge/testing/time.ts';
 import type { Provider, ProviderEvent } from './types.ts';
 
 const fixtureDir = mkdtempSync(path.join(os.tmpdir(), 'agent-smith-notice-fixture-'));
@@ -53,7 +54,7 @@ async function run(provider: Provider, scenario: string): Promise<{ live: Provid
     mode: 'implement',
     prompt: 'do the thing',
     cwd: fixtureDir,
-    timeoutMs: 10_000,
+    timeoutMs: scaled(60_000),
     unrestricted: true,
     stateDir,
   });

@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { acceptanceBudgetMs, evaluateAcceptance, markAcceptancePending, pendingAcceptance, readAcceptance, runAcceptance, settleAcceptance, toVerifyChecks, writeAcceptance } from '../checks.ts';
+import { waitFor } from '../testing/time.ts';
 
 test('toVerifyChecks resolves cwd and applies default timeout', () => {
   const [c] = toVerifyChecks([{ name: 'a', command: 'true', cwd: 'sub' }], '/base');
@@ -105,11 +106,14 @@ test('evaluateAcceptance reports which checks run; runAcceptance keeps the place
   await evaluateAcceptance({ succeeded: true, baseDir, checks: [{ name: 'one', command: 'true' }], onProgress: (r) => seen.push([...r]) });
   assert.deepEqual(seen, [['one'], []]);
   const repo = mkdtempSync(path.join(tmpdir(), 'acceptance-run-'));
-  const checks = [{ name: 'slow', command: 'sleep 0.4' }];
+  // The check blocks on a gate file, so the placeholder stays observable for however long the machine takes.
+  const gate = path.join(repo, 'gate');
+  const checks = [{ name: 'slow', command: `while [ ! -e '${gate}' ]; do sleep 0.05; done` }];
   const run = runAcceptance({ repo, jobId: 'j1', succeeded: true, checks, baseDir });
-  await new Promise(r => setTimeout(r, 200));
+  await waitFor(() => (readAcceptance(repo, 'j1') as { running?: string }).running, { message: 'check to start' });
   const mid = readAcceptance(repo, 'j1') as { pending?: boolean; running?: string; budgetMs?: number };
   assert.equal(mid.pending, true); assert.equal(mid.running, 'slow'); assert.equal(mid.budgetMs, 90_000);
+  writeFileSync(gate, '');
   assert.equal((await run).state, 'accepted');
 });
 
@@ -117,7 +121,8 @@ test('aborting running checks records unchecked, checks canceled', async () => {
   const ac = new AbortController();
   const repo = mkdtempSync(path.join(tmpdir(), 'acceptance-abort-'));
   const run = runAcceptance({ repo, jobId: 'j2', succeeded: true, checks: [{ name: 'hang', command: 'sleep 30' }], baseDir: tmpdir(), signal: ac.signal });
-  setTimeout(() => ac.abort(), 100);
+  await waitFor(() => (readAcceptance(repo, 'j2') as { running?: string }).running, { message: 'check to start' });
+  ac.abort();
   const r = await run;
   assert.equal(r.state, 'unchecked'); assert.equal(r.reason, 'checks canceled'); assert.deepEqual(r.checks, []);
 });

@@ -42,6 +42,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
+import { scaled, waitFor } from '../testing/time.ts';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -113,16 +114,6 @@ async function nodeFs(): Promise<{
  * Everything downstream — buildArgv, the stream-json pump, the denial logic, the
  * exit handling — runs unmodified.
  */
-/** Wait until `predicate` holds, or fail loudly. */
-async function waitFor(predicate: () => boolean, timeoutMs: number): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (predicate()) return;
-    await new Promise((r) => setTimeout(r, 25));
-  }
-  throw new Error(`condition not met within ${timeoutMs}ms`);
-}
-
 /* ── the acceptance test ───────────────────────────────────────────────────── */
 
 test('ACCEPTANCE: a job spawned through the tool appears in the mod pane, unmodified', async () => {
@@ -302,7 +293,7 @@ test('CANCEL: the marker is written first and the pane sees it as canceled', asy
 
   // Let the job actually start, so this is a cancellation mid-flight rather than a
   // cancellation of something that never ran.
-  await waitFor(() => existsSync(path.join(ack.dir, 'progress.json')), 5_000);
+  await waitFor(() => existsSync(path.join(ack.dir, 'progress.json')), { timeoutMs: 60_000, message: 'progress.json' });
 
   const result = service.cancel(ack.jobId);
   assert.equal(result.requested, true);
@@ -328,7 +319,7 @@ test('CANCEL: a second ForgeService marker is observed by the running owner', as
   const owner = new ForgeService({ repo: r });
   const requester = new ForgeService({ repo: r });
   const ack = await owner.spawnJob({ mode: 'implement', name: 'long-worker', workerId: 'stable-worker', prompt: 'slow cross-service cancellation', provider: 'agy', timeoutMs: 30_000 });
-  await waitFor(() => existsSync(path.join(ack.dir, 'progress.json')), 5_000);
+  await waitFor(() => existsSync(path.join(ack.dir, 'progress.json')), { timeoutMs: 60_000, message: 'progress.json' });
   await assert.rejects(
     owner.spawnJob({ mode: 'review', name: 'follow-up', workerId: 'stable-worker', prompt: 'overlapping follow-up', provider: 'agy' }),
     /is busy/,
@@ -407,7 +398,7 @@ test('a missing binary produces a FAILED job, not a rejected promise', async () 
     const svc = new ForgeService({ repo });
     const ack = await svc.spawnJob({ mode: 'implement', prompt: 'x', provider: 'agy' });
     const at = path.join(repo, '.agent-smith', 'jobs', ack.jobId, 'job.json');
-    const deadline = Date.now() + 10000;
+    const deadline = Date.now() + ${scaled(60_000)};
     for (;;) {
       if (fs.existsSync(at)) {
         const m = JSON.parse(fs.readFileSync(at, 'utf8'));
@@ -420,6 +411,7 @@ test('a missing binary produces a FAILED job, not a rejected promise', async () 
   const out = execFileSync(process.execPath, ['--experimental-strip-types', '--input-type=module', '-e', script], {
     env: { ...process.env, AGENT_SMITH_AGY_BIN: path.join(r, 'definitely-not-here') },
     encoding: 'utf8',
+    timeout: scaled(120_000),
   });
   const got = JSON.parse(out.trim().split('\n').pop() ?? '{}') as { status: string; jobStatus?: string; error?: string };
 
@@ -445,7 +437,7 @@ async function waitForTerminal(repoRoot: string, jobId: string, timeoutMs: numbe
       const m = JSON.parse(readFileSync(at, 'utf8')) as { status: string };
       return m.status !== 'running';
     },
-    timeoutMs,
+    { timeoutMs: Math.max(timeoutMs, 60_000), message: `job ${jobId} to reach a terminal status` },
   );
   return JSON.parse(
     readFileSync(path.join(repoRoot, '.agent-smith', 'jobs', jobId, 'job.json'), 'utf8'),

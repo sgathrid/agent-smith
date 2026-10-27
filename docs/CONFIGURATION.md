@@ -376,4 +376,5 @@ completion notice or call cancel.`).
 `doctor` probes installed providers with bounded version/help commands and checks
 the flags their adapters use. It reports compatible, incompatible, or unknown,
 with a reason. This checks CLI features; it does not verify authentication,
-account quota, model access, or a real model invocation.
+account quota, model access, or a real model invocation. Set
+`AGENT_SMITH_PROBE_TIMEOUT_MS` (default 2000) to give each probe longer on a slow or loaded machine.

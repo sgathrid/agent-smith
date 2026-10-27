@@ -6,10 +6,14 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildSmokeServerEnv } from './smoke-env.mjs';
 
+// Failure bound only; scaled like forge/testing/time.ts (.mjs cannot import .ts).
+const scale = Number(process.env.AGENT_SMITH_TEST_TIME_SCALE);
+const scaled = (ms) => Math.round(ms * (Number.isFinite(scale) && scale > 0 ? scale : 1));
+
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
 test('smoke runner exercises isolated MCP scenarios and reports cleanup', () => {
-  const result = spawnSync(process.execPath, ['scripts/smoke.mjs'], { cwd: repo, encoding: 'utf8', timeout: 45_000 });
+  const result = spawnSync(process.execPath, ['scripts/smoke.mjs'], { cwd: repo, encoding: 'utf8', timeout: scaled(180_000) });
   assert.equal(result.error, undefined, result.error?.message);
   assert.equal(result.status, 0, result.stderr || result.stdout);
   const summary = JSON.parse(result.stdout);

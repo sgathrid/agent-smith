@@ -13,6 +13,7 @@ import { callTool } from '../../surfaces/channel/src/tools.ts';
 import { claim, claudeText, due } from '../../surfaces/mod/hooks/notice.ts';
 import { controlledProvider, makeService } from '../testing/steer-harness.ts';
 import { initGitRepo } from '../testing/git-repo.ts';
+import { waitFor } from '../testing/time.ts';
 
 const seedRepo = (dir: string): void =>
   initGitRepo(dir, { 'ARCHITECTURE.md': '# Architecture v1\nShareable export.\n', 'docs/brief.md': 'Initial brief.\n' });
@@ -42,9 +43,7 @@ test('watched brief files: copies into worktree cwd, excludes unmodified copy fr
 
   const turn1 = await turn1Ready;
   // Wait for async gitBaseline capture on start() before simulating worker file edits
-  while (!JSON.parse(readFileSync(jobFile(repo, ack.jobId, FILES.job), 'utf8')).gitBaseline) {
-    await new Promise((r) => setTimeout(r, 10));
-  }
+  await waitFor(() => JSON.parse(readFileSync(jobFile(repo, ack.jobId, FILES.job), 'utf8')).gitBaseline, { message: 'gitBaseline' });
   turn1.emit({ kind: 'started', at: new Date().toISOString(), conversationId: 'thread-f' });
   // Worker reads ARCHITECTURE.md (so toolInputs mentions ARCHITECTURE.md) and edits src.ts
   turn1.emit({ kind: 'activity-start', at: new Date().toISOString(), activity: { stepIndex: 1, tool: 'Read', input: 'ARCHITECTURE.md' } });
@@ -84,9 +83,7 @@ test('watched brief files: copies into worktree cwd, excludes unmodified copy fr
   // In turn 2, wait for turn 2's gitBaseline capture, then worker modifies docs/brief.md in its worktree
   const parentAfterSteer = await service.detail(ack.jobId);
   const turn2JobId = parentAfterSteer.supersededBy!;
-  while (!JSON.parse(readFileSync(jobFile(repo, turn2JobId, FILES.job), 'utf8')).gitBaseline) {
-    await new Promise((r) => setTimeout(r, 10));
-  }
+  await waitFor(() => JSON.parse(readFileSync(jobFile(repo, turn2JobId, FILES.job), 'utf8')).gitBaseline, { message: 'turn 2 gitBaseline' });
   writeFileSync(path.join(worktree, 'docs', 'brief.md'), 'Worker edited brief.\n');
   turn2.emit({ kind: 'activity-start', at: new Date().toISOString(), activity: { stepIndex: 1, tool: 'Write', input: 'docs/brief.md' } });
   turn2.finish({ status: 'success', response: 'Updated implementation to v3 and annotated docs/brief.md.' });
@@ -134,9 +131,7 @@ test('watched brief files in same-root cwd (cwd === repo): reading ARCHITECTURE.
   });
 
   const turn = await turnReady;
-  while (!JSON.parse(readFileSync(jobFile(repo, ack.jobId, FILES.job), 'utf8')).gitBaseline) {
-    await new Promise((r) => setTimeout(r, 10));
-  }
+  await waitFor(() => JSON.parse(readFileSync(jobFile(repo, ack.jobId, FILES.job), 'utf8')).gitBaseline, { message: 'gitBaseline' });
   turn.emit({ kind: 'started', at: new Date().toISOString(), conversationId: 'thread-same-root' });
   // Worker reads ARCHITECTURE.md and edits src.ts in the same repository root (cwd === repo).
   turn.emit({

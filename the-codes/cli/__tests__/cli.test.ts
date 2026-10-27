@@ -5,6 +5,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, ut
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
+import { scaled, waitFor } from '../../forge/testing/time.ts';
 
 assertFakeProviderActive();
 
@@ -122,34 +123,30 @@ test('background CLI returns a statusable run id, exposes the canonical job, and
   const oldScenario = process.env['FAKE_AGY_SCENARIO'];
   const oldDelay = process.env['FAKE_AGY_SLEEP_MS'];
   process.env['FAKE_AGY_SCENARIO'] = 'slow';
-  process.env['FAKE_AGY_SLEEP_MS'] = '8000';
+  // Far longer than any loaded run needs to see the job and cancel it; cancel, not the sleep, ends the worker.
+  process.env['FAKE_AGY_SLEEP_MS'] = '120000';
   try {
     const cliPath = new URL('../cli.ts', import.meta.url).pathname;
     const stdout = execFileSync(process.execPath, ['--experimental-strip-types', cliPath, 'run', 'implement', '--prompt', 'slow fake task', '--repo', repo], {
       encoding: 'utf8',
       env: process.env,
-      timeout: 10_000,
+      timeout: scaled(60_000),
     });
     const runId = stdout.split('\n')[0] ?? '';
     assert.match(runId, /^implement-/);
     assert.equal(readPipeline(repo, runId)?.status, 'running');
 
     const service = new ForgeService({ repo });
-    let jobs = await service.list({ limit: 10 });
-    const jobsDeadline = Date.now() + 8_000;
-    while (jobs.length === 0 && Date.now() < jobsDeadline) {
-      await new Promise((resolve) => setTimeout(resolve, 40));
-      jobs = await service.list({ limit: 10 });
-    }
+    const jobs = await waitFor(async () => {
+      const found = await service.list({ limit: 10 });
+      return found.length > 0 ? found : undefined;
+    }, { message: 'the worker to appear in canonical state' });
     assert.equal(jobs.length, 1, 'the worker must be visible in canonical .agent-smith state');
     assert.equal(jobs[0]?.status, 'running');
 
     const canceled = cancelPipeline(repo, runId);
     assert.equal(canceled.requested, true);
-    const settleDeadline = Date.now() + 8_000;
-    while (readPipeline(repo, runId)?.status === 'running' && Date.now() < settleDeadline) {
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
+    await waitFor(() => readPipeline(repo, runId)?.status !== 'running', { timeoutMs: 30_000, message: 'the run to settle after cancel' });
     assert.notEqual(readPipeline(repo, runId)?.status, 'running', 'the detached supervisor must settle the run after cancellation');
     const detail = await service.detail(jobs[0]!.jobId);
     assert.equal(detail.status, 'canceled');
@@ -262,7 +259,14 @@ function fakeWorkerOnPath(): () => void {
   chmodSync(bin, 0o755);
   const previous = process.env['PATH'];
   process.env['PATH'] = `${dir}${path.delimiter}${previous ?? ''}`;
-  return () => { process.env['PATH'] = previous; };
+  // Doctor probes the worker with a node cold start; the product's default probe budget is too tight under load.
+  const previousProbe = process.env['AGENT_SMITH_PROBE_TIMEOUT_MS'];
+  process.env['AGENT_SMITH_PROBE_TIMEOUT_MS'] = String(scaled(30_000));
+  return () => {
+    process.env['PATH'] = previous;
+    if (previousProbe === undefined) delete process.env['AGENT_SMITH_PROBE_TIMEOUT_MS'];
+    else process.env['AGENT_SMITH_PROBE_TIMEOUT_MS'] = previousProbe;
+  };
 }
 
 test('setup --repo writes local Claude settings, migrates agent-smith-dev, and runs doctor', async () => {

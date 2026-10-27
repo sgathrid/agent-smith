@@ -18,6 +18,7 @@ import { AjvJsonSchemaValidator } from '@modelcontextprotocol/sdk/validation/ajv
 import { InMemoryTransport } from '@modelcontextprotocol/server';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
 import { readAcceptance, writeAcceptance } from '../../../../forge/checks.ts';
+import { scaled, waitFor } from '../../../../forge/testing/time.ts';
 import { FILES, jobFile } from '../../../../forge/format.ts';
 import { ForgeService, type JobDetail } from '../../../../forge/service.ts';
 import { parseLaunch } from '../../../mod/hooks/notice.ts';
@@ -119,11 +120,7 @@ function rawTransport(tasks = true) {
   async function request(method: string, params: Record<string, unknown>) {
     const requestId = ++id;
     await clientTransport.send({ jsonrpc: '2.0', id: requestId, method, params });
-    const deadline = Date.now() + 3_000;
-    while (!responses.some(r => r.id === requestId)) {
-      if (Date.now() > deadline) throw new Error(`protocol response timed out for ${method}`);
-      await new Promise(resolve => setTimeout(resolve, 5));
-    }
+    await waitFor(() => responses.some(r => r.id === requestId), { intervalMs: 5, message: `protocol response ${method}` });
     return responses.find(r => r.id === requestId)!;
   }
   return {
@@ -155,7 +152,7 @@ function makeRawDispatch(client: Client): RawClientDispatch {
       const timer = setTimeout(() => {
         transport.onmessage = prev;
         reject(new Error(`rawDispatch timed out for ${req.method}`));
-      }, options?.context?.requestTimeoutMs ?? 5_000);
+      }, options?.context?.requestTimeoutMs ?? scaled(30_000));
       // Intercept the raw JSON-RPC response for V2 task wire shapes while letting
       // the SDK client process unrelated traffic.
       transport.onmessage = (message, extra) => {
@@ -226,6 +223,7 @@ test('ext-tasks V2 client negotiates Tasks, polls tasks/get, and receives comple
       // Hold completion behind pending acceptance first, then settle acceptance.
       writeAcceptance(h.repo, 'review-smith-00000001', { state: 'unchecked', checks: [], pending: true });
       h.setStatus('succeeded');
+      // Only gives the poller a chance to wrongly complete early; a slow machine cannot make the test fail.
       await new Promise(resolve => setTimeout(resolve, 40));
       writeAcceptance(h.repo, 'review-smith-00000001', {
         state: 'accepted',
@@ -415,11 +413,7 @@ test('truthful cancellation, completion-vs-cancel race, update validation, and r
     await clientTransport2.start();
     try {
       await clientTransport2.send({ jsonrpc: '2.0', id: 99, method: 'tasks/get', params: { taskId: taskId2, _meta: taskMeta } });
-      const deadline = Date.now() + 3_000;
-      while (!responses2.some(r => r.id === 99)) {
-        if (Date.now() > deadline) throw new Error('reconnect response timed out');
-        await new Promise(resolve => setTimeout(resolve, 5));
-      }
+      await waitFor(() => responses2.some(r => r.id === 99), { intervalMs: 5, message: 'reconnect response' });
       const afterRestart = responses2.find(r => r.id === 99)!;
       assert.deepEqual(afterRestart.result, completed2.result);
     } finally {
@@ -468,11 +462,7 @@ test('crash-gap tasks without a readable job fail with -32603, and dead owners r
   async function request(method: string, params: Record<string, unknown>) {
     const reqId = ++id;
     await clientTransport.send({ jsonrpc: '2.0', id: reqId, method, params });
-    const deadline = Date.now() + 3_000;
-    while (!responses.some(r => r.id === reqId)) {
-      if (Date.now() > deadline) throw new Error('timeout');
-      await new Promise(resolve => setTimeout(resolve, 5));
-    }
+    await waitFor(() => responses.some(r => r.id === reqId), { intervalMs: 5, message: `protocol response ${method}` });
     return responses.find(r => r.id === reqId)!;
   }
   try {
@@ -643,14 +633,14 @@ child.on('exit', code => process.exit(code ?? 0));
     const addRes = spawnSync(
       'claude',
       ['mcp', 'add-json', 'smith-probe', JSON.stringify({ type: 'stdio', command: spy, env: { SPY_WIRE_LOG: wireLog, SPY_PID_LOG: pidLog, AGY_WATCH_CWD: tmp } })],
-      { cwd: tmp, env: isolatedEnv, encoding: 'utf8', timeout: 10_000 },
+      { cwd: tmp, env: isolatedEnv, encoding: 'utf8', timeout: scaled(60_000) },
     );
     assert.equal(addRes.status, 0, addRes.stderr);
     const getRes = spawnSync('claude', ['mcp', 'get', 'smith-probe'], {
       cwd: tmp,
       env: isolatedEnv,
       encoding: 'utf8',
-      timeout: 15_000,
+      timeout: scaled(60_000),
     });
     assert.equal(getRes.status, 0, getRes.stderr);
     assert.match(getRes.stdout, /Connected/);
@@ -662,7 +652,7 @@ child.on('exit', code => process.exit(code ?? 0));
   } finally {
     // `claude mcp get` returns before the spy, the server child and claude's own
     // config writes under HOME have finished: deleting at once raced them (ENOTEMPTY).
-    awaitExit(readPids(pidLog), 5_000);
+    awaitExit(readPids(pidLog), scaled(15_000));
     rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   }
 });

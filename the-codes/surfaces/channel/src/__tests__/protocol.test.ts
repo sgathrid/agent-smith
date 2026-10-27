@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { ElicitRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { scaled, waitFor } from '../../../../forge/testing/time.ts';
 
 const server = process.env.SMITH_TEST_SERVER ?? fileURLToPath(new URL('../server.ts', import.meta.url));
 function data(result: unknown): Record<string, any> {
@@ -14,12 +15,9 @@ function data(result: unknown): Record<string, any> {
   return JSON.parse(content[0]!.text!);
 }
 async function until<T>(read: () => Promise<T>, ready: (value: T) => boolean): Promise<T> {
-  const deadline = Date.now() + 10_000;
-  for (;;) {
-    const value = await read(); if (ready(value)) return value;
-    if (Date.now() > deadline) throw new Error(`state did not settle: ${JSON.stringify(value)}`);
-    await new Promise(resolve => setTimeout(resolve, 30));
-  }
+  let last: T | undefined;
+  const hit = await waitFor(async () => { last = await read(); return ready(last) ? { value: last } : null; }, { intervalMs: 30, message: `state to settle (last: ${JSON.stringify(last)})` });
+  return hit.value;
 }
 
 test('MCP delegates, resumes named workers, preserves artifacts and gates acceptance', async () => {

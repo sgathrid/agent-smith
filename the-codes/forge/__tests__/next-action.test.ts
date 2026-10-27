@@ -9,6 +9,7 @@ import { FILES, ORPHAN_REASON, diffChangedFiles, jobFile, nextActionFor, CHANGED
 import { JobWriter, parsePorcelainZ } from '../writer.ts';
 import { initGitRepo } from '../testing/git-repo.ts';
 import type { JobResult } from '../../providers/types.js';
+import { waitFor } from '../testing/time.ts';
 
 const F = { status: 'failed' } as const;
 
@@ -127,11 +128,13 @@ test('read-only job yields []; a non-git cwd records nothing', async () => {
   assert.equal(m.changedFiles, undefined);
 });
 
-test('start() does not wait on git', () => {
+test('start() does not wait on git', async () => {
   const r = gitRepo();
-  const t = performance.now();
   begin(r, r);
-  assert.ok(performance.now() - t < 100, 'sync part of start stays fast');
+  // Structural, not timed: the baseline needs a git child process, so it cannot be in the manifest when start() returns.
+  assert.equal(read(r).gitBaseline, undefined, 'start() returned before git was consulted');
+  const landed = await waitFor(() => read(r).gitBaseline, { message: 'async git baseline to be merged into the manifest' });
+  assert.ok(landed.head, 'baseline lands once git settles');
 });
 
 test('a route that failed before any work names the route, after specific diagnoses', () => {

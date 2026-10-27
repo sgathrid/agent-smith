@@ -10,6 +10,9 @@ import { readFileSync } from 'node:fs';
 import { buildSmokeServerEnv } from './testing/smoke-env.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+// Failure-bound deadlines stretch with AGENT_SMITH_TEST_TIME_SCALE (same knob as forge/testing/time.ts).
+const timeScale = (() => { const n = Number(process.env.AGENT_SMITH_TEST_TIME_SCALE); return Number.isFinite(n) && n > 0 ? n : 1; })();
+const scaled = (ms) => Math.round(ms * timeScale);
 const keep = process.argv.includes('--keep');
 const live = process.argv.includes('--live');
 const providerFlag = process.argv.find((arg) => arg.startsWith('--providers='))?.slice('--providers='.length);
@@ -38,10 +41,11 @@ try {
   const { Client } = await import(pathToFileURL(sdkEsm));
   const { StdioClientTransport } = await import(pathToFileURL(sdkEsm.replace(`${path.sep}client${path.sep}index.js`, `${path.sep}client${path.sep}stdio.js`)));
   const server = path.join(channelRoot, 'src/server.ts');
+  const barrierRoot = path.join(scratch, 'barriers');
   const fakeCodex = path.join(scratch, 'fake-codex.cjs');
   const fakeAgy = path.join(scratch, 'fake-agy.cjs');
-  writeFileSync(fakeCodex, `#!${process.execPath}\nconst fs=require('node:fs'),path=require('node:path'),a=process.argv.slice(2),p=a.at(-1)||'';\nconst emit=()=>{const f=/Write your full answer to (.+?)\\. /.exec(p)?.[1];if(f){if(!fs.statSync(path.dirname(f)).isDirectory())process.exit(22);fs.writeFileSync(f,'FAKE IMPLEMENTATION ARTIFACT\\n');}if(p.includes('Review the implementation artifact')&&!p.includes('FAKE IMPLEMENTATION ARTIFACT'))process.exit(21);console.log(JSON.stringify({type:'thread.started',thread_id:'smoke-thread'}));console.log(JSON.stringify({type:'item.completed',item:{id:'answer',type:'agent_message',text:'Fake provider review: smoke passed.'}}));console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:8,output_tokens:4}}));};const delay=p.includes('SMOKE_SLOW')?12000:p.includes('SMOKE_CONCURRENT')?180:0;if(delay)setTimeout(emit,delay);else emit();\n`);
-  writeFileSync(fakeAgy, `#!${process.execPath}\nconst a=process.argv.slice(2),p=a.find(x=>x.includes('Write your full answer to'))||'';const m=/Write your full answer to (.+?)\\. /.exec(p);if(m){const fs=require('node:fs'),path=require('node:path');if(!fs.statSync(path.dirname(m[1])).isDirectory())process.exit(22);fs.writeFileSync(m[1],'FAKE IMPLEMENTATION ARTIFACT\\n');}\nconst emit=()=>{console.log(JSON.stringify({event:'init',init:{model:'smoke-fixture',conversation_id:'smoke-agy'}}));console.log(JSON.stringify({event:'step_update',step_index:1,state:'DONE',step_type:'agent_response',text:'Fake implementation complete.'}));console.log(JSON.stringify({event:'result',result:{conversation_id:'smoke-agy',status:'SUCCESS',response:'Fake implementation complete.',usage:{input_tokens:8,output_tokens:4}}}));};if(p.includes('SMOKE_CONCURRENT'))setTimeout(emit,180);else emit();\n`);
+  writeFileSync(fakeCodex, `#!${process.execPath}\nconst fs=require('node:fs'),path=require('node:path'),a=process.argv.slice(2),p=a.at(-1)||'';\nconst emit=()=>{const f=/Write your full answer to (.+?)\\. /.exec(p)?.[1];if(f){if(!fs.statSync(path.dirname(f)).isDirectory())process.exit(22);fs.writeFileSync(f,'FAKE IMPLEMENTATION ARTIFACT\\n');}if(p.includes('Review the implementation artifact')&&!p.includes('FAKE IMPLEMENTATION ARTIFACT'))process.exit(21);console.log(JSON.stringify({type:'thread.started',thread_id:'smoke-thread'}));console.log(JSON.stringify({type:'item.completed',item:{id:'answer',type:'agent_message',text:'Fake provider review: smoke passed.'}}));console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:8,output_tokens:4}}));};const bar=/SMOKE_BARRIER:([\\w-]+):(\\d+)/.exec(p);const meet=(go)=>{const fs=require('node:fs'),path=require('node:path'),d=path.join(${JSON.stringify(barrierRoot)},bar[1]);fs.mkdirSync(d,{recursive:true});fs.writeFileSync(path.join(d,String(process.pid)),'');const end=Date.now()+Number(bar[2]);const tick=()=>{if(fs.readdirSync(d).length>=2||Date.now()>end)go();else setTimeout(tick,20);};tick();};if(bar)meet(emit);else if(p.includes('SMOKE_SLOW'))setTimeout(emit,12000);else emit();\n`);
+  writeFileSync(fakeAgy, `#!${process.execPath}\nconst a=process.argv.slice(2),p=a.find(x=>x.includes('Write your full answer to'))||'';const m=/Write your full answer to (.+?)\\. /.exec(p);if(m){const fs=require('node:fs'),path=require('node:path');if(!fs.statSync(path.dirname(m[1])).isDirectory())process.exit(22);fs.writeFileSync(m[1],'FAKE IMPLEMENTATION ARTIFACT\\n');}\nconst emit=()=>{console.log(JSON.stringify({event:'init',init:{model:'smoke-fixture',conversation_id:'smoke-agy'}}));console.log(JSON.stringify({event:'step_update',step_index:1,state:'DONE',step_type:'agent_response',text:'Fake implementation complete.'}));console.log(JSON.stringify({event:'result',result:{conversation_id:'smoke-agy',status:'SUCCESS',response:'Fake implementation complete.',usage:{input_tokens:8,output_tokens:4}}}));};const bar=/SMOKE_BARRIER:([\\w-]+):(\\d+)/.exec(p);const meet=(go)=>{const fs=require('node:fs'),path=require('node:path'),d=path.join(${JSON.stringify(barrierRoot)},bar[1]);fs.mkdirSync(d,{recursive:true});fs.writeFileSync(path.join(d,String(process.pid)),'');const end=Date.now()+Number(bar[2]);const tick=()=>{if(fs.readdirSync(d).length>=2||Date.now()>end)go();else setTimeout(tick,20);};tick();};if(bar)meet(emit);else emit();\n`);
   chmodSync(fakeCodex, 0o755); chmodSync(fakeAgy, 0o755);
   let stderr = '';
   const openClient = async (name, env) => {
@@ -68,8 +72,9 @@ try {
     if (result.isError) throw new Error(JSON.stringify(parsed));
     return parsed;
   };
-  const waitStatus = async (tool, key, id, timeoutMs = 20_000, progressLabel) => {
-    const end = Date.now() + timeoutMs;
+  const waitStatus = async (tool, key, id, timeoutMs = 90_000, progressLabel) => {
+    // Deadline only bounds a broken run; the job's own outcome decides pass/fail.
+    const end = Date.now() + scaled(timeoutMs);
     let progressAt = Date.now() + 10_000;
     while (Date.now() < end) {
       const value = await data(await client.callTool({ name: tool, arguments: { [key]: id, response_format: 'detailed' } }));
@@ -98,7 +103,7 @@ try {
       { name: 'implement', provider: 'agy', prompt: 'Implement the fixture and write the requested artifact', model: 'smoke-fixture', resultPath: 'implementation.md', checks: [{ name: 'executable-check', command: 'node -e "process.exit(0)"', blocking: true }] },
       { name: 'review', provider: 'codex', prompt: 'Review the implementation artifact', model: 'smoke-fixture', dependsOn: ['implement'], consumes: [{ stage: 'implement', path: 'implementation.md', label: 'implementation' }] },
     ] } } }));
-    const done = await waitStatus('pipeline_status', 'runId', result.runId, 30_000);
+    const done = await waitStatus('pipeline_status', 'runId', result.runId, 120_000);
     if (done.status !== 'passed') throw new Error(`Pipeline ended ${done.status}: ${JSON.stringify(done.stageResults)}`);
     const reviewJob = Object.values(done.stageResults ?? {}).find((stage) => stage.stage === 'review')?.jobId;
     const reviewArgv = reviewJob && JSON.parse(readFileSync(path.join(repo, '.agent-smith', 'jobs', reviewJob, 'argv.json'), 'utf8')).argv;
@@ -111,7 +116,7 @@ try {
       { name: 'review', provider: 'codex', prompt: 'Review the build', model: 'smoke-fixture', dependsOn: ['build'] },
       { name: 'fix', continues: 'build', prompt: 'Fix what the review found', model: 'smoke-fixture', dependsOn: ['review'], checks: [{ name: 'executable-check', command: 'node -e "process.exit(0)"', blocking: true }] },
     ] } } }));
-    const done = await waitStatus('pipeline_status', 'runId', result.runId, 30_000);
+    const done = await waitStatus('pipeline_status', 'runId', result.runId, 120_000);
     if (done.status !== 'passed') throw new Error(`Fix loop ended ${done.status}: ${JSON.stringify(done.stageResults)}`);
     const jobOf = (name) => Object.values(done.stageResults ?? {}).find((stage) => stage.stage === name)?.jobId;
     const argvOf = (name) => JSON.parse(readFileSync(path.join(repo, '.agent-smith', 'jobs', jobOf(name), 'argv.json'), 'utf8')).argv;
@@ -131,20 +136,25 @@ try {
   });
   await record('timeout', async () => {
     const ack = await data(await client.callTool({ name: 'spawn_job', arguments: { provider: 'codex', mode: 'review', name: 'Smoke Timeout', task: 'Timeout fixture', prompt: 'SMOKE_SLOW timeout fixture', model: 'smoke-fixture', effort: 'low', timeoutMs: 1_000, cwd: repo } }));
-    const terminal = await waitStatus('status', 'jobId', ack.jobId, 8_000);
+    const terminal = await waitStatus('status', 'jobId', ack.jobId, 60_000);
     if (terminal.status !== 'failed' || !/timeout|timed out/i.test(terminal.error ?? '')) throw new Error(`Timeout did not surface as timeout failure: ${JSON.stringify(terminal)}`);
     return { status: terminal.status, reason: 'timeout' };
   });
   await record('concurrency limit', async () => {
-    const run = async (name, concurrency) => {
+    // The two fixtures rendezvous through marker files instead of sleeping: at
+    // limit 2 each waits (up to a generous deadline) until it sees the other, so
+    // overlap is proven, not likely. At limit 1 the first waits a short fixed time
+    // for a partner that must not appear; slowness can only hide that bug.
+    const run = async (name, concurrency, waitMs) => {
+      const tag = `${concurrency}-${Date.now()}`;
       const started = await data(await client.callTool({ name: 'run_pipeline', arguments: { spec: { name, workDir: repo, concurrency, stages: [
-        { name: 'agy-worker', provider: 'agy', prompt: 'SMOKE_CONCURRENT independent fixture A', model: 'smoke-fixture' },
-        { name: 'codex-worker', provider: 'codex', prompt: 'SMOKE_CONCURRENT independent fixture B', model: 'smoke-fixture' },
+        { name: 'agy-worker', provider: 'agy', prompt: `SMOKE_BARRIER:${tag}:${waitMs} independent fixture A`, model: 'smoke-fixture' },
+        { name: 'codex-worker', provider: 'codex', prompt: `SMOKE_BARRIER:${tag}:${waitMs} independent fixture B`, model: 'smoke-fixture' },
       ] } } }));
-      return waitStatus('pipeline_status', 'runId', started.runId, 30_000);
+      return waitStatus('pipeline_status', 'runId', started.runId, 120_000);
     };
-    const parallel = await run('smoke concurrency two', 2);
-    const serial = await run('smoke concurrency one', 1);
+    const parallel = await run('smoke concurrency two', 2, scaled(60_000));
+    const serial = await run('smoke concurrency one', 1, 750);
     const intervals = (run) => Object.values(run.stageResults ?? {}).map((stage) => ({ startedAt: stage.startedAt, finishedAt: stage.finishedAt }));
     const parallelTimes = intervals(parallel), serialTimes = intervals(serial);
     const overlap = parallelTimes.length === 2 && Math.max(...parallelTimes.map((v) => v.startedAt)) < Math.min(...parallelTimes.map((v) => v.finishedAt));

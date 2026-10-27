@@ -9,6 +9,7 @@
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { test } from 'node:test';
+import { waitFor as waitUntil } from '../forge/testing/time.ts';
 
 import {
   createRunnerRouter,
@@ -84,12 +85,8 @@ function gatedRunner() {
   return { runner, started, contexts, open: () => open() };
 }
 
-async function waitFor(predicate: () => boolean, label: string, timeoutMs = 2000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!predicate()) {
-    if (Date.now() > deadline) throw new Error(`timed out waiting for: ${label}`);
-    await new Promise((r) => setTimeout(r, 2));
-  }
+async function waitFor(predicate: () => boolean, label: string): Promise<void> {
+  await waitUntil(predicate, { message: label, intervalMs: 2 });
 }
 
 /** Three identical errors — the reference 28-minute job had ONE, at tool #34 of 484. */
@@ -158,7 +155,7 @@ test('the concurrency cap is respected exactly', async () => {
   const run = runPipeline(spec('capped', stages), { runner, workDir: WORKDIR, concurrency: 2 });
 
   await waitFor(() => started.length === 2, 'two stages to start');
-  // Give the loop ample opportunity to over-dispatch before asserting.
+  // Negative check: any over-dispatch happens in microtasks right after the second start; a slow machine can only hide it, never fail a correct run.
   await new Promise((r) => setTimeout(r, 40));
   assert.equal(started.length, 2, 'must not exceed the cap');
 
@@ -175,8 +172,8 @@ test('a dependent stage starts only after its dependency passes', async () => {
     id: 'ordered',
     async run(ctx: StageContext): Promise<StageResult> {
       events.push(`start:${ctx.stage.name}`);
-      // A short real delay so an incorrectly-parallel run is observable.
-      await new Promise((r) => setTimeout(r, 20));
+      // A macrotask yield so an incorrectly-parallel run would interleave and be observable.
+      await new Promise((r) => setImmediate(r));
       events.push(`end:${ctx.stage.name}`);
       return ok(ctx);
     },

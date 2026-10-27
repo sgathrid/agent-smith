@@ -16,6 +16,7 @@ import { isLive } from '../../surfaces/mod/hooks/dashboard.ts';
 import { syncNativeTasks, type NativeJob } from '../../surfaces/mod/hooks/native.ts';
 import { claim, due, parseSettledRead } from '../../surfaces/mod/hooks/notice.ts';
 import { controlledProvider, makeService } from '../testing/steer-harness.ts';
+import { waitFor } from '../testing/time.ts';
 
 test('steer(queue): coalesces multiple queued steers, opens child anchor before parent finishes, and resolves done with final manifest', async () => {
   const ctrl = controlledProvider();
@@ -419,11 +420,7 @@ test('checks on a steered worker mark child accepted and leave superseded parent
   t2.finish({ status: 'success', response: 'Completed turn 2 and verified checks.' });
 
   // Wait for gateAcceptance to settle on childJobId
-  for (let i = 0; i < 50; i++) {
-    const childAcc = readAcceptance(repo, childJobId);
-    if (childAcc.state === 'accepted') break;
-    await new Promise((r) => setTimeout(r, 20));
-  }
+  await waitFor(() => readAcceptance(repo, childJobId).state === 'accepted', { message: 'child acceptance to settle' });
 
   const childAcc = readAcceptance(repo, childJobId);
   assert.equal(childAcc.state, 'accepted');
@@ -462,11 +459,7 @@ test('ForgeTasks tracks steered continuation turns through to completion', async
 
   t2.finish({ status: 'success', response: 'Completed turn 2 cleanly via MCP Tasks.' });
   // Wait for pump to finish writing child manifest
-  for (let i = 0; i < 50; i++) {
-    const cur = await tasks.get(taskId);
-    if (cur.status !== 'working') break;
-    await new Promise((r) => setTimeout(r, 20));
-  }
+  await waitFor(async () => (await tasks.get(taskId)).status !== 'working', { message: 'task to leave working' });
   const doneTask = await tasks.get(taskId);
   assert.equal(doneTask.status, 'completed');
 });

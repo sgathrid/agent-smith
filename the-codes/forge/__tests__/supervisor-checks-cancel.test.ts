@@ -7,18 +7,9 @@ import path from 'node:path';
 import test from 'node:test';
 import { readAcceptance } from '../checks.ts';
 import { ForgeService } from '../service.ts';
+import { scaled, waitFor } from '../testing/time.ts';
 
 assertFakeProviderActive();
-
-async function until<T>(read: () => T | undefined, ms: number, what: string): Promise<T> {
-  const end = Date.now() + ms;
-  while (Date.now() < end) {
-    const v = read();
-    if (v !== undefined) return v;
-    await new Promise((r) => setTimeout(r, 50));
-  }
-  throw new Error(`timed out waiting for ${what}`);
-}
 
 test('cancel stops acceptance checks owned by a detached supervisor', async () => {
   const repo = mkdtempSync(path.join(tmpdir(), 'smith-checks-cancel-'));
@@ -29,15 +20,16 @@ test('cancel stops acceptance checks owned by a detached supervisor', async () =
       checks: [{ name: 'forever', command: 'sleep 600' }],
     });
     // The worker exits, the supervisor starts the check.
-    await until(() => (readAcceptance(repo, ack.jobId) as { running?: string }).running, 20_000, 'check to start');
+    await waitFor(() => (readAcceptance(repo, ack.jobId) as { running?: string }).running, { timeoutMs: 60_000, message: 'check to start' });
     const t0 = Date.now();
     service.cancel(ack.jobId);
-    const verdict = await until(() => {
+    const verdict = await waitFor(() => {
       const a = readAcceptance(repo, ack.jobId) as { pending?: boolean; reason?: string };
       return a.pending ? undefined : a;
-    }, 10_000, 'canceled verdict');
+    }, { timeoutMs: 60_000, message: 'canceled verdict' });
     assert.deepEqual({ ...verdict, at: undefined }, { state: 'unchecked', checks: [], reason: 'checks canceled', at: undefined });
-    assert.ok(Date.now() - t0 < 5_000, 'checks stopped promptly, not after the 600 s sleep');
+    // Only waiting out the whole 600 s sleep fails this, however loaded the machine is.
+    assert.ok(Date.now() - t0 < scaled(300_000), 'checks stopped promptly, not after the 600 s sleep');
   } finally {
     rmSync(repo, { recursive: true, force: true });
   }

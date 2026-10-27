@@ -5,6 +5,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { assertFakeProviderActive } from '../testing/shim.ts';
 import { ForgeService } from '../service.ts';
+import { waitFor } from '../testing/time.ts';
 import { cancelPipeline, pipelineCancelPath, pipelineRecordPath, readPipeline, startPipeline } from '../execute.ts';
 
 assertFakeProviderActive();
@@ -38,11 +39,10 @@ test('a running stage shows in the record with its job, then is replaced by its 
   const service = new ForgeService({ repo });
   const spec = { name: 'live', workDir: repo, stages: [{ name: 'slow', provider: 'agy', prompt: 'run slowly' }] } as const;
   const run = startPipeline(service, spec, { runId: 'run-live' });
-  let running = readPipeline(repo, run.runId)?.stageResults['slow'];
-  for (let i = 0; i < 100 && running?.status !== 'running'; i++) {
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    running = readPipeline(repo, run.runId)?.stageResults['slow'];
-  }
+  const running = await waitFor(() => {
+    const r = readPipeline(repo, run.runId)?.stageResults['slow'];
+    return r?.status === 'running' ? r : undefined;
+  }, { message: 'stage to show as running' });
   assert.equal(running?.status, 'running');
   assert.ok(running?.jobId);
   assert.equal(running?.provider, 'agy');

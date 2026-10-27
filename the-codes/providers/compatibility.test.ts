@@ -5,6 +5,7 @@ import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { scaled } from '../forge/testing/time.ts';
 import { checkCompatibility, probeCommand, type ProbeCommand } from './compatibility.ts';
 
 const help = {
@@ -93,7 +94,7 @@ test('real subprocess help/version probes never send a model prompt', async () =
   const binary = path.join(dir, 'fake-opencode');
   writeFileSync(binary, `#!${process.execPath}\nconst args = process.argv.slice(2);\nif (args.join(' ') === '--version') console.log('opencode 2.0.24');\nelse if (args.join(' ') === 'run --help') console.log(${JSON.stringify(help.opencode)});\nelse process.exit(9);\n`);
   chmodSync(binary, 0o755);
-  assert.equal((await checkCompatibility('opencode', binary)).state, 'compatible');
+  assert.equal((await checkCompatibility('opencode', binary, { timeoutMs: scaled(30_000) })).state, 'compatible');
 });
 
 test('real subprocess timeout is bounded and cannot be a compatible result', async () => {
@@ -116,10 +117,11 @@ test('CLI doctor reports adapter compatibility using the configured binaries', (
   const binary = path.join(dir, 'fake-provider');
   writeFileSync(binary, `#!${process.execPath}\nconst args = process.argv.slice(2);\nif (args.join(' ') === '--version') console.log('fake 9.0.0');\nelse if (args.at(-1) === '--help') console.log(${JSON.stringify(Object.values(help).join(' '))});\nelse process.exit(9);\n`);
   chmodSync(binary, 0o755);
-  const env = { ...process.env };
+  // Probes run in parallel node cold starts; the 2 s product default is too tight under load.
+  const env: Record<string, string | undefined> = { ...process.env, AGENT_SMITH_PROBE_TIMEOUT_MS: String(scaled(30_000)) };
   for (const name of ['AGY', 'CODEX', 'CLAUDE', 'OPENCODE', 'KIMI']) env[`AGENT_SMITH_${name}_BIN`] = binary;
   const result = spawnSync(process.execPath, [fileURLToPath(new URL('../../scripts/agent-smith.mjs', import.meta.url)), 'doctor'],
-    { env, encoding: 'utf8', timeout: 10_000 });
+    { env, encoding: 'utf8', timeout: scaled(60_000) });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /agent-smith doctor/);
   for (const provider of Object.keys(help)) assert.match(result.stdout, new RegExp(`${provider} +compatible`));

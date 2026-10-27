@@ -285,19 +285,14 @@ test('HAZARD B: the real canceled fixture resolves as canceled', async () => {
 // ── running, attention, unknown, and the crash row ─────────────────────────
 
 test('a job with progress.json and no status.json is running', async () => {
-  // The clock is pinned to just after the fixture's own last_event_at. With
-  // `Date.now()` this job would (correctly) read as `attention` — the fixture is a
-  // verbatim copy of a real 2026-10-03 job, so it is years silent by now. Passing
-  // the real clock here would be testing the passage of time, not the reader.
+  // The clock is pinned to a minute after the fixture's own last_event_at: the
+  // reader must call it running. Reading the real clock would make this test
+  // assert the passage of time, and flip to `attention` the day it is run.
   const fs = fsFromDir(path.join(FIXTURES, 'agy-running'));
-  const fresh = Date.now();
+  const fresh = Date.parse('2026-10-03T00:55:30.766Z') + 60_000;
   const job = await resolve(fs, jobsDir('/repo'), 'implement-run01-bbbbbbbb', fresh);
   assert.ok(job !== null, 'a live job is found');
-  // Assert the liveness classification against the silence it actually has, so
-  // this test keeps its meaning no matter when it runs.
-  const silence = fresh - Date.parse('2026-10-03T00:55:30.766Z');
-  const expected = silence > 15 * 60_000 ? 'attention' : 'running';
-  assert.equal(job.status, expected, `silence was ${silence}ms`);
+  assert.equal(job.status, 'running');
   assert.equal(job.endedAt, null, 'no finish instant while live');
   assert.ok(job.activity !== '', 'and it says what it is doing');
 });
