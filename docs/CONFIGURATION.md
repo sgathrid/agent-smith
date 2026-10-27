@@ -67,7 +67,7 @@ Only variables the code reads.
 | `AGENT_SMITH_STATE_DIR` | `providers/ndjson.ts` | `~/.agent-smith/state` | Provider state root used only when a spawn gives no `stateDir`. The forge always passes the job directory, so MCP/CLI jobs do not use it. |
 | `AGENT_SMITH_CHANNEL` | `surfaces/channel/src/server.ts` | enabled | `0` disables the `claude/channel` capability, the startup baseline and the 5 s poll loop. The built plugin sets it to `0`; `dev.sh --channels` leaves it unset. |
 | `AGENT_SMITH_TASKS` | `surfaces/channel/src/mcp.ts` | unset (`0`) | `1` advertises `extensions['io.modelcontextprotocol/tasks']` on modern (`2026-07-28`) connections and registers `tasks/get`, `tasks/update` and `tasks/cancel`, returning `resultType: 'task'` for `spawn_job`/`resume_job` requests that advertise client Tasks support. |
-| `AGENT_SMITH_NO_CATALOG_WARMUP` | `surfaces/channel/src/server.ts` | unset | `1` skips the background model discovery the MCP server starts at launch. The first spawn that names a model then waits up to `CATALOG_COLD_WAIT_MS` for a cold catalog. |
+| `AGENT_SMITH_NO_CATALOG_WARMUP` | `surfaces/channel/src/server.ts` | unset | `1` skips the background model discovery the MCP server starts at launch. The first spawn that names a model then waits up to `CATALOG_COLD_WAIT_MS` for a cold catalog, unless a fresh `.agent-smith/catalogs/<provider>.json` already holds it. |
 | `AGENT_SMITH_CONFIRM_UNRESTRICTED` | `surfaces/channel/src/tools.ts` | enabled | `0` stops `spawn_job`/`resume_job` asking the user to confirm an explicit `unrestricted: true` for codex, claude or opencode, and drops the "not confirmed" ack warning. For automation with no one to answer. |
 | `AGY_WATCH_CWD` | `server.ts`, `monitor.ts`, `watch-hook.ts` | `process.cwd()` | Repo to operate on. MCP server order: positional argv path, then this, then cwd. `monitor.js`: `--cwd`, positional first arg, then this. Hook: last resort after payload `repo`/`dir`/`recordPath` and hook `cwd`. `dev.sh` sets it to `--repo`. |
 | `HOME`, `PATH` | `discovery.ts`, `ndjson.ts` | process env | `HOME` roots the default config dirs; `PATH` is probed for provider binaries (cached per binary+PATH). |
@@ -118,7 +118,7 @@ not the Kimi CLI.
 | `wait_ms` (status) | 1 to `MAX_WAIT_MS` = 60 000; polls every 500 ms | `tools.ts` |
 | `CATALOG_TTL_MS` | 300 000 (5 min), per provider, in-process | `providers/catalog.ts` |
 | Discovery timeout | 10 000 per provider (+1 000 guard) | `catalog.ts` |
-| `CATALOG_COLD_WAIT_MS` / `CATALOG_WAIT_MS` | 5 000 until a catalog lookup has completed in the process (warm-up or a spawn), then 2 000; spawn-time catalog race | `service.ts` |
+| `CATALOG_COLD_WAIT_MS` / `CATALOG_WAIT_MS` | 5 000 until a catalog lookup has completed in the process (warm-up or a spawn), then 2 000; spawn-time catalog race. A supervisor's lookup is instant while the disk catalog cache (`CATALOG_TTL_MS` 5 min) is fresh | `service.ts`, `providers/catalog.ts` |
 | `PROGRESS_FLUSH_MS` | 250 | `format.ts` |
 | Cancel marker poll | 200 ms (job), 250 ms (pipeline) | `service.ts`, `execute.ts` |
 | Legacy orphan rule | 2 x default = 90 min silence (no `ownerPid`) | `format.ts` |
@@ -205,7 +205,7 @@ roleDefaults}`, `aliasConfigErrors?`, `modes[{name,description,readOnly,runsComm
 | `files` | array | relative paths of brief/spec files in `repo` (max 32 files, 4 MiB total; symlinks escaping `repo` are rejected); copied into `cwd` when `cwd !== repo`, excluded from `changedFiles` unless modified by the worker, and watched for `staleReads` |
 | `conversation` | string | native conversation handle to resume |
 | `checks` | array | items `{name, command}` required, `cwd`, `timeoutMs` (int >= 1; default 60 000), `blocking` (default true); run after success; also listed in the worker's brief as its definition of done |
-| `env` | object | extra worker environment variables, merged over the server's (e.g. a per-worktree `CARGO_TARGET_DIR`); keys `^[A-Za-z_][A-Za-z0-9_]*$`, string values without NUL. Only the names are stored (`env-keys.json`); values are never written |
+| `env` | object | extra worker environment variables, merged over the server's (e.g. a per-worktree `CARGO_TARGET_DIR`); keys `^[A-Za-z_][A-Za-z0-9_]*$`, string values without NUL. Keys that change how the worker binary is found, loaded or configured are refused, because the env applies before any worker sandbox exists: `PATH`, `HOME`, `SHELL`, `TMPDIR`, `NODE_OPTIONS`, `NODE_PATH`, `PYTHONPATH`, `PYTHONHOME`, and any key starting `LD_`, `DYLD_`, `XDG_`, `AGENT_SMITH_`, `AGY_`, `CLAUDE_`, `CODEX_`, `OPENCODE_` or `KIMI_` (case-insensitive; `ENV_DENYLIST` in `pipeline/types.ts`). Only the names are stored (`env-keys.json`); values are never written |
 
 Result (`SpawnAck`): `jobId, name, workerId, role, provider, status:'running', dir, repo,
 timeoutMs, unrestricted, note, sandbox, sandboxFlags, readOnlyRequested, readOnlyEnforced,
@@ -291,7 +291,9 @@ reason?}`, and with `wait_ms`: `waited:true`, `stillRunning`.
 Params: `jobId` (a job id or a pipeline run id; a run record is tried first). Job result:
 `{jobId, requested, signalled, note}`, plus `checksCanceled: true` when the worker had already
 exited and this process aborted its running acceptance checks (acceptance then reads `unchecked`,
-reason `checks canceled`); `signalled` is true only when this process held the
+reason `checks canceled`). When a detached supervisor owns the checks, the result instead carries
+`checksCanceled: false` and a `checksNote` (the supervisor stops them within about 200 ms, same
+outcome); `signalled` is true only when this process held the
 live worker. Run result: `{requested, runId, note}`. A request does not prove the worker
 stopped; check `status`.
 

@@ -100,6 +100,12 @@ export interface JobWatchOptions {
   readonly readRun?: (cwd: string, id: string) => Promise<{ job: WatchableJob; stageJobIds: string[] } | null>;
   readonly emit?: (line: string, batch: Batch | null) => Promise<void> | void;
   readonly onError?: (error: unknown) => void;
+  /**
+   * Announce each job once. A job that exited with checks still running (its acceptance budget
+   * ran out) is announced as "exited · checks running" and the watch ends, instead of waiting for
+   * the verdict as a second notice. For callers that can wake Claude only once (the fallback hook).
+   */
+  readonly announceOnce?: boolean;
 }
 
 export type JobWatchEnd = 'done' | 'timeout' | 'aborted';
@@ -175,8 +181,8 @@ export async function runJobWatch(options: JobWatchOptions): Promise<JobWatchEnd
           if (want.has(job.supersededBy)) done.add(id);
           continue;
         }
-        // Exited with checks still running: the verdict is a second notice, so keep watching.
-        if (job && TERMINAL.has(job.status) && job.checksRunning === undefined && (seen.get(id)?.has(dedupeKey(job)) ?? false)) done.add(id);
+        // Exited with checks still running: the verdict is a second notice, so keep watching (unless announcing once).
+        if (job && TERMINAL.has(job.status) && (options.announceOnce === true || job.checksRunning === undefined) && (seen.get(id)?.has(dedupeKey(job)) ?? false)) done.add(id);
       }
       if (want.size > 0 && [...want].every((id) => done.has(id))) return 'done';
     } catch (error) {

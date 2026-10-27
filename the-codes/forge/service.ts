@@ -537,7 +537,7 @@ export class ForgeService {
     this.mirrorOn = options.mirror ?? true;
     this.flushMs = options.flushMs;
     this.providerSource = options.providerSource ?? requireProvider;
-    this.catalogSource = options.catalogSource ?? ((providers) => getCatalogs({ providers }));
+    this.catalogSource = options.catalogSource ?? ((providers) => getCatalogs({ providers, repo: this.repo }));
     this.catalogWaitMs = { warm: options.catalogWaitMs?.warm ?? CATALOG_WAIT_MS, cold: options.catalogWaitMs?.cold ?? CATALOG_COLD_WAIT_MS };
     this.harnessDefaults = options.harnessDefaults ?? getHarnessDefaults;
     this.describeSandbox = options.describeSandbox ?? ((p, spec) => p.describeSandbox?.(spec));

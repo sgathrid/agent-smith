@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { once } from 'node:events';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -691,6 +692,35 @@ test('spawnWorker heartbeats while the child runs (pid included), stops at exit,
   await new Promise((resolve) => setTimeout(resolve, 150));
   assert.equal(beats.length, atExit, 'no beats after exit');
   assert.equal(existsSync(path.join(dir, 'events.jsonl')), false, 'heartbeats are liveness, not events');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('spawnWorker stops heartbeats when the worker exits, even while a descendant holds stdout open', async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'agent-smith-heartbeat-orphan-'));
+  const beats: number[] = [];
+  // The worker leaves a detached, unreferenced grandchild that inherits its
+  // stdout, then exits: `close` waits for the grandchild, `exit` does not.
+  const script = [
+    "const { spawn } = require('node:child_process');",
+    "spawn(process.execPath, ['-e', 'setTimeout(()=>{}, 1500)'], { detached: true, stdio: ['ignore', 'inherit', 'ignore'] }).unref();",
+    'setTimeout(() => process.exit(0), 150);',
+  ].join('\n');
+  const worker = await spawnWorker({
+    provider: 'fake', binary: process.execPath, argv: ['-e', script],
+    cwd: dir, timeoutMs: 10_000, stateDir: dir, jobId: 'heartbeat-orphan', mode: 'test',
+    heartbeatMs: 30, onHeartbeat: () => beats.push(Date.now()),
+    onStdoutLine() {}, onStderr() {},
+  });
+  let closed = false;
+  void worker.exited.then(() => { closed = true; });
+  await once(worker.child, 'exit');
+  const atExit = beats.length;
+  assert.ok(atExit >= 1, 'beats while the worker ran');
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(closed, false, 'stdout is still held open by the grandchild');
+  assert.equal(beats.length, atExit, 'no heartbeat after the worker exited');
+  await worker.exited;
+  worker.closeLog();
   rmSync(dir, { recursive: true, force: true });
 });
 

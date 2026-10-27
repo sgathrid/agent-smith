@@ -4,6 +4,9 @@
  * Lazy: nothing runs until getCatalogs() is called. Per-provider TTL cache,
  * stale-on-error, parallel fan-out, never rejects.
  */
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { writeJsonAtomic } from '../forge/atomic.ts';
 import { errMessage } from './discovery.ts';
 import { PROVIDERS, findProvider } from './registry.ts';
 import type { ModelCatalog, Provider } from './types.ts';
@@ -15,6 +18,11 @@ export interface CatalogOptions {
   refresh?: boolean;
   /** Restrict to these providers; default = all registered providers that are available. */
   providers?: readonly string[];
+  /**
+   * Repo whose `.agent-smith/catalogs/<provider>.json` shares discovery across processes
+   * (the MCP server's warm-up, the per-launch supervisor). Without it the cache is in-process only.
+   */
+  repo?: string;
 }
 
 export const CATALOG_TTL_MS = 5 * 60_000;
@@ -23,6 +31,24 @@ const DEFAULT_TIMEOUT_MS = 10_000;
 interface CacheEntry {
   catalog: ModelCatalog;
   at: number;
+}
+
+/** Disk entry: the catalog and when it was discovered (ms). */
+function catalogFile(repo: string, name: string): string {
+  return path.join(repo, '.agent-smith', 'catalogs', `${name.replace(/[^A-Za-z0-9._-]/g, '_')}.json`);
+}
+function readDisk(repo: string | undefined, name: string): CacheEntry | undefined {
+  if (repo === undefined) return undefined;
+  try {
+    const v = JSON.parse(readFileSync(catalogFile(repo, name), 'utf8')) as Partial<CacheEntry>;
+    const c = v.catalog;
+    if (typeof v.at !== 'number' || c === undefined || c === null || c.provider !== name || !Array.isArray(c.models)) return undefined;
+    return { catalog: c, at: v.at };
+  } catch { return undefined; }
+}
+function writeDisk(repo: string | undefined, name: string, entry: CacheEntry): void {
+  if (repo === undefined || entry.catalog.source === 'static') return;
+  try { writeJsonAtomic(catalogFile(repo, name), entry); } catch { /* the disk cache is an optimization */ }
 }
 
 const cache = new Map<string, CacheEntry>();
@@ -46,9 +72,12 @@ function failed(name: string, error: string): ModelCatalog {
   return { provider: name, models: [], defaultSource: 'unknown', source: 'live', stale: false, verified: false, error };
 }
 
-async function discover(provider: Provider, timeoutMs: number, refresh: boolean): Promise<ModelCatalog> {
+async function discover(provider: Provider, timeoutMs: number, refresh: boolean, repo?: string): Promise<ModelCatalog> {
   const name = provider.name;
-  const hit = cache.get(name);
+  // Memory first, then another process's discovery. `refresh` never serves either as fresh, but an
+  // older entry still backs the stale-on-error fallback, and a successful discovery rewrites the file.
+  const hit = cache.get(name) ?? readDisk(repo, name);
+  if (hit !== undefined && !cache.has(name)) cache.set(name, hit);
   if (!refresh && hit !== undefined && clock() - hit.at < CATALOG_TTL_MS) {
     return { ...hit.catalog, source: hit.catalog.source === 'static' ? 'static' : 'cache', stale: false };
   }
@@ -72,7 +101,9 @@ async function discover(provider: Provider, timeoutMs: number, refresh: boolean)
   }
   const usable = fresh.error === undefined || fresh.models.length > 0;
   if (usable) {
-    cache.set(name, { catalog: fresh, at: clock() });
+    const entry = { catalog: fresh, at: clock() };
+    cache.set(name, entry);
+    writeDisk(repo, name, entry);
     return fresh;
   }
   if (hit !== undefined) {
@@ -121,7 +152,7 @@ export async function getCatalogs(options: CatalogOptions = {}): Promise<ModelCa
       targets = all.filter((_, i) => flags[i]);
     }
     const results = await Promise.all(
-      targets.map((p) => discover(p, timeoutMs, refresh).catch((e) => failed(p.name, errMessage(e)))),
+      targets.map((p) => discover(p, timeoutMs, refresh, options.repo).catch((e) => failed(p.name, errMessage(e)))),
     );
     return [...results, ...missing];
   } catch (e) {

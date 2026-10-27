@@ -94,23 +94,27 @@ re-syncs watched files from `repo` into `cwd` and refreshes `watchedFiles`.
 ## Status derivation
 
 `deriveStatus` (`forge/format.ts`) is the one place a terminal verdict is computed.
-Precedence: already terminal (a cancel verdict is final) > successful nonempty report with
-only `nonfatal` denials (any provider; legacy claude `action: 'tool'` counts) = success
-with warning > other `deniedActions` non-empty =
-`failed` + suspicious > `ok === false` = `failed` > `ok === true` with empty report
-(empty after trim, `MIN_USEFUL_CHARS = 1`) = `failed` + suspicious > `ok === true` =
-`succeeded` > no verdict = `running`. A job that exited 0 and delivered nothing is
+Precedence: already terminal (a cancel verdict is final) > no verdict = `running` >
+`deniedActions` non-empty, other than a successful nonempty report with only `nonfatal`
+denials (any provider; legacy claude `action: 'tool'` counts) = `failed` + suspicious >
+`ok === false` = `failed` > cwd gone on a writing job = `failed` + suspicious (below) >
+successful nonempty report with only `nonfatal` denials = success with warning >
+`ok === true` with empty report (empty after trim, `MIN_USEFUL_CHARS = 1`) = `failed` +
+suspicious > `ok === true` = `succeeded`. A job that exited 0 and delivered nothing is
 failed, never a quiet success.
 
-The cwd rule sits after the denial rules: when the job's cwd no longer exists at finish
-(`cwdMissing`) and the job is a writing one (`implement`/`verify` mode, or its own edit tool
-calls show edits), the verdict is `failed` + suspicious with `CWD_GONE_REASON` "working
+The cwd rule sits after the fatal-denial and `ok === false` rules and before the
+nonfatal-denial success, so a denied call never excuses a writing job from it: when the
+job's cwd no longer exists at finish (`cwdMissing`) and the job is a writing one
+(`implement`/`verify` mode, or one of its own edit tool calls completed without error; a
+failed or denied edit does not count), the verdict is `failed` + suspicious with `CWD_GONE_REASON` "working
 directory gone; nothing could be verified" (short reason "working directory gone"). A
 read-only job keeps its verdict and gets a warning instead: its report is the deliverable.
 Either way the manifest records `cwdMissingAtFinish: true`. `JobWriter.verdictFacts()` (via
 `format.ts` `cwdFacts`) supplies these inputs to `finish()` and to the steer chain, so a
 cwd-gone writing turn never chains a queued steer; orphan recovery (`reconcile.ts`) uses the
-mode, the cwd and the progress digest's edit count, and records `changedFilesUnknown` when it
+mode, the cwd and progress.json's `editsCompleted` (edits that ended without error; the
+digest's `editedCount`, which counts at start, only for files that predate it), and records `changedFilesUnknown` when it
 recovers a persisted result (it never runs the finish-time diff).
 
 Finish evidence, recorded only when true (`writer.ts`): `changedFilesUnknown` when
@@ -275,15 +279,20 @@ prompt starts with the brief; `view.json` (and the mirrored spec) keep the prepe
 
 `providers/catalog.ts`. The MCP server warms every catalog in the background at startup
 (`ForgeService.warmCatalogs`, fire and forget; `AGENT_SMITH_NO_CATALOG_WARMUP=1` skips it), so
-the first spawn usually finds them cached. A pipeline supervisor child is its own process with
-its own cold cache.
+the first spawn usually finds them cached. Discovery is also persisted to
+`<repo>/.agent-smith/catalogs/<provider>.json` (`{at, catalog}`, atomic write), because every
+production launch validates in a fresh supervisor process with an empty memory cache: it reads the
+file the warm-up wrote instead of probing the CLI again.
 
 - `getCatalogs({providers?, refresh?, timeoutMs?})`: PATH-probes `available()` for each
   provider, fans out `listModels()` in parallel (10 s per provider, guard +1 s), never
-  rejects. In-process cache per provider, `CATALOG_TTL_MS` = 5 min. A usable result
-  (no error, or models present) is cached. If a refresh fails and an older entry exists, the
-  old catalog is served with `stale: true` and the new `error`. A failure with no prior entry
-  is returned uncached.
+  rejects. Cache per provider, `CATALOG_TTL_MS` = 5 min: in memory, then the repo's disk file above
+  when the caller passes `repo` (the service and `list_capabilities` do), so any process sees
+  another's discovery. `refresh: true` skips both as a source of fresh data and rewrites the file.
+  A usable result (no error, or models present) is cached and persisted. If discovery fails and an
+  older entry exists (memory or disk, any age), the old catalog is served with `stale: true` and
+  the new `error`; the file is left as it was. A failure with no prior entry is returned uncached.
+  An unreadable or malformed file is ignored. `static` catalogs are not persisted.
 - Sources: `agy models` (base ids, `-low|-medium|-high` suffix stripped into efforts);
   `codex debug models`, falling back to `<codexHome>/models_cache.json` marked `stale`;
   `opencode models` (`verified: false`); `kimi provider list --json` (keys of its `models`
@@ -295,7 +304,8 @@ its own cold cache.
   `<claudeHome>/settings.json` top-level `model`; kimi `<kimiHome>/config.toml` top-level
   `default_model`. agy and opencode have none.
 - Spawn path: a catalog is consulted only if the request names `model` or `effort`, raced
-  against `CATALOG_COLD_WAIT_MS` = 5 s until any catalog lookup has completed in the process,
+  against `CATALOG_COLD_WAIT_MS` = 5 s until any catalog lookup has completed in the process
+  (a fresh disk entry makes that lookup immediate, so a supervisor does not wait the cold budget),
   then `CATALOG_WAIT_MS` = 2 s (a spawn joins a warm-up still in flight rather than starting a
   second discovery); on timeout/error it is treated as absent. With no
   `model`, `modelResolved` comes from `harnessDefaults().model` (`modelSource`
@@ -338,9 +348,13 @@ A pending `{state:'unchecked', pending:true, budgetMs}` placeholder is written a
 (`pendingAcceptance`; `budgetMs` = the checks' timeouts summed + 30 s, capped at 30 min). While
 checks run, `runAcceptance` rewrites it with `startedAt` and `running` (the names of the checks
 running now, comma separated); `status` shows `acceptance.running`. The real verdict replaces
-it atomically. `cancel` on a job whose checks are running in this MCP process aborts them: the
-result carries `checksCanceled: true` and acceptance becomes `unchecked` with reason
-`checks canceled`. Check output tails are capped
+it atomically. `cancel` stops running checks on either path and acceptance becomes `unchecked`
+with reason `checks canceled`. In the MCP process an AbortController aborts them and the result
+carries `checksCanceled: true`. In production the detached supervisor owns them: it polls the
+job's `cancel` marker every 200 ms while checks run (and once before they start) and aborts
+through the same signal. There `cancel` cannot know the outcome, so it says `checksCanceled: false`
+with a `checksNote` (the request is recorded and the supervisor will stop the checks) while a
+placeholder shows checks running; `checksCanceled: true` always means something was aborted. Check output tails are capped
 at 2000 chars; default per-check timeout 60 s; `cwd` resolves against the job's cwd.
 `status` merges the sidecar (`unchecked` when absent or unreadable). The gate lives in the
 MCP server process: if it exits before the job finishes, the placeholder stays. Pipeline
@@ -413,8 +427,14 @@ Claude                MCP server (dist/server.js)      Claude Code hooks        
   prints the notice to stderr and exits 2 (Claude Code labels that wake "Stop hook
   feedback" and the label can't be changed, so the notice ends by saying it is not an
   error). Any error or non-matching tool exits 0
-  silently: a hook must never break the session. The hook passes `runJobWatch` a timeout of
-  the job's own `timeoutMs` + 60 s (from the ack; pipelines get the 6 h cap + 60 s); standalone
+  silently: a hook must never break the session. A hook can wake Claude only once, so it
+  announces once (`runJobWatch` `announceOnce`): the verdict, held while the checks run, or, if
+  the acceptance budget runs out first, the "exited · checks running" text, after which it ends.
+  Never both in one write. The mod announcer is different: it sends that early notice and then
+  the verdict as a second notice. The hook passes `runJobWatch` a timeout of the job's own
+  `timeoutMs` (from the ack) + the acceptance `budgetMs` (from the pending placeholder written at
+  spawn) + 60 s, capped at the hook's own timeout less a minute (pipelines: the 6 h cap + 60 s);
+  standalone
   `monitor.js` defaults to `DEFAULT_WATCH_TIMEOUT_MS` = 46 min. On timeout it emits "still
   running; check status <ids>" (exit 2 from the hook).
 - **Tasks-shaped handle and opt-in MCP Tasks**: acks carry `taskHandle {taskId, status:'working', pollIntervalMs}` and
@@ -426,7 +446,7 @@ Claude                MCP server (dist/server.js)      Claude Code hooks        
   never double-announces a Tasks-managed job.
 - **Fallback**: acks carry `notify {mode:'hook', note, fallback {when, use, monitorCommand?,
   monitorTimeoutMs?}}`. `note` says a notice is coming; `fallback.when` names the only cases to
-  wait yourself: no notice by the job's timeout + 2 min (a run: `pipeline_status` shows it
+  wait yourself: no notice by the job's timeout + its checks' budget + 2 min (a run: `pipeline_status` shows it
   ended), a headless session that can't receive messages between turns, or a subagent that
   must return the result. Nothing runnable sits at the top level:
   agents handed `monitorCommand` there ran it at once and heard about each job twice.

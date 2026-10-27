@@ -148,3 +148,23 @@ test('recovery fails a writing job whose cwd is gone, keeps a review, and summar
     assert.match(recovered.latestSummary, /Verdict: merge\.$/);
   }
 });
+
+test('recovery counts only completed edits as writing; the digest is a fallback for old files', () => {
+  for (const [label, progress, expected] of [
+    ['edit attempted, none completed', { editsCompleted: 0, digest: { editedCount: 1 } }, 'succeeded'],
+    ['edit completed', { editsCompleted: 1, digest: { editedCount: 1 } }, 'failed'],
+    ['pre-counter file with a digest edit', { digest: { editedCount: 1 } }, 'failed'],
+  ] as const) {
+    const { repo, jobId, file, result } = fixture();
+    const gone = mkdtempSync(path.join(tmpdir(), 'completion-recovery-cwd-'));
+    rmSync(gone, { recursive: true, force: true });
+    writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, 'utf8')), mode: 'review', cwd: gone }));
+    const progressFile = jobFile(repo, jobId, FILES.progress);
+    const onDisk = JSON.parse(readFileSync(progressFile, 'utf8')) as Record<string, unknown>;
+    delete onDisk['editsCompleted'];
+    writeFileSync(progressFile, JSON.stringify({ ...onDisk, ...progress }));
+    writeResultFile(result.stateDir, { ...result, response: 'Full review.' });
+    assert.equal(reconcileOrphan(repo, jobId), true);
+    assert.equal(JSON.parse(readFileSync(file, 'utf8')).status, expected, label);
+  }
+});

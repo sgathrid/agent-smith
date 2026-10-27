@@ -36,7 +36,7 @@ const checksSchema = { type: 'array', items: {
   type: 'object', required: ['name', 'command'], additionalProperties: false,
   properties: { name: string, command: string, cwd: string, timeoutMs: { type: 'integer', minimum: 1 }, blocking: { type: 'boolean' } },
 } };
-const envSchema = { type: 'object', additionalProperties: { type: 'string' }, description: 'Extra environment variables for the worker, merged over the server\'s (e.g. a per-worktree CARGO_TARGET_DIR). Only the names are recorded; values are not stored.' };
+const envSchema = { type: 'object', additionalProperties: { type: 'string' }, description: 'Extra environment variables for the worker, merged over the server\'s (e.g. a per-worktree CARGO_TARGET_DIR). Only the names are recorded; values are not stored. Names that change which binary runs or how it loads or finds its config are rejected: PATH, HOME, SHELL, TMPDIR, NODE_OPTIONS, NODE_PATH, PYTHONPATH, PYTHONHOME and anything starting with LD_, DYLD_, XDG_, AGENT_SMITH_, AGY_, CLAUDE_, CODEX_, OPENCODE_ or KIMI_.' };
 const stageSchema = {
   type: 'object', required: ['name'], additionalProperties: false,
   properties: {
@@ -289,6 +289,12 @@ export function builtMonitorPath(moduleFile = fileURLToPath(import.meta.url)): s
   return undefined;
 }
 
+/** The acceptance budget written at spawn, 0 without checks: the verdict can land this long after the job ends. */
+function pendingBudgetMs(repo: string, jobId: string): number {
+  const b = (readAcceptance(repo, jobId) as { pending?: boolean; budgetMs?: unknown }).budgetMs;
+  return typeof b === 'number' && b > 0 ? b : 0;
+}
+
 /**
  * The `notify` hint attached to spawn/resume/pipeline acks. Exported for tests.
  *
@@ -301,7 +307,7 @@ export function notifyHint(target: { job: string } | { run: string }, repo: stri
   const job = 'job' in target;
   const note = `You will be notified when this ${job ? 'job' : 'run'} ends. Silence until then is normal: don't poll or start a monitor.`;
   const noNotice = job
-    ? `no notice has arrived ${Math.ceil(((timeoutMs ?? DEFAULT_TIMEOUT_MS) + NOTICE_GRACE_MS) / 60_000)} min after launch`
+    ? `no notice has arrived ${Math.ceil(((timeoutMs ?? DEFAULT_TIMEOUT_MS) + pendingBudgetMs(repo, target.job) + NOTICE_GRACE_MS) / 60_000)} min after launch`
     : 'pipeline_status shows the run ended and no notice arrived';
   const when = `Only if ${noNotice}, this session can't receive messages between turns (headless), ` +
     'or you are a subagent that must return this result before your turn ends.';
@@ -620,8 +626,13 @@ export async function callTool(ctx: HandlerContext, name: string, rawArgs: unkno
         if (readPipeline(ctx.service.repo, id)) return json(cancelPipeline(ctx.service.repo, id));
         const result = ctx.service.cancel(id);
         // A worker that already exited can still have checks running; stop those too.
-        const checksCanceled = abortChecks(id, result.jobId);
-        return json(checksCanceled ? { ...result, checksCanceled: true } : result);
+        // `checksCanceled` is true only when this process aborted them. With a detached supervisor
+        // the marker `cancel` just wrote is the request; the supervisor stops the checks within ~200 ms.
+        if (abortChecks(id, result.jobId)) return json({ ...result, checksCanceled: true });
+        const pending = readAcceptance(ctx.service.repo, result.jobId) as { pending?: boolean; running?: string };
+        return json(pending.pending === true && pending.running !== undefined
+          ? { ...result, checksCanceled: false, checksNote: 'Cancel recorded; the supervisor running the acceptance checks will stop them. Check status for acceptance.' }
+          : result);
       }
       case 'run_pipeline': {
         const raw = record(args.spec, 'spec'); keys(raw, ['name', 'task', 'workDir', 'concurrency', 'unrestricted', 'stages']);
@@ -640,7 +651,7 @@ export async function callTool(ctx: HandlerContext, name: string, rawArgs: unkno
 }
 
 async function listCapabilities(ctx: HandlerContext, refresh: boolean, fmt: ResponseFormat, only: string | undefined) {
-  const cats = ctx.catalogs ? await installedCatalogs(ctx) : await installedCatalogs({ catalogs: () => getCatalogs({ refresh }) });
+  const cats = ctx.catalogs ? await installedCatalogs(ctx) : await installedCatalogs({ catalogs: () => getCatalogs({ refresh, repo: ctx.service.repo }) });
   const installed = new Set(cats.map(c => c.provider));
   const all = [
     ...cats.map(c => ({ name: c.provider, available: true, defaultModel: c.defaultModel, defaultEffort: c.defaultEffort, defaultSource: c.defaultSource,

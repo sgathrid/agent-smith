@@ -844,6 +844,40 @@ test('a review whose events show edits is a writing job: cwd gone fails it', asy
   rmSync(cwd, { recursive: true, force: true });
   await w.prepareFinish();
   assert.equal(w.finish(result({ durationMs: 60_000 }), '# Review\n\nfixed it').status, 'failed');
+  const p = JSON.parse(readFileSync(jobFile(r, w.jobId, FILES.progress), 'utf8')) as { editsCompleted?: number };
+  assert.equal(p.editsCompleted, 1);
+});
+
+test('a review whose edit attempt failed, was denied or never ended is not a writing job', async () => {
+  for (const [i, end] of (['error', 'denied', null] as const).entries()) {
+    const r = repo();
+    const cwd = mkdtempSync(path.join(tmpdir(), 'agent-smith-cwd-'));
+    const w = startIn(r, cwd, 'review', `review-smith-edit000${i}`);
+    w.onEvent({ kind: 'activity-start', at: now(), activity: { stepIndex: 0, tool: 'edit', input: JSON.stringify({ filePath: `${cwd}/a.ts` }) } });
+    if (end !== null) w.onEvent({ kind: 'activity-end', at: now(), activity: { stepIndex: 0, tool: 'edit' }, status: end });
+    assert.equal(w.verdictFacts().writing, false, String(end));
+    rmSync(cwd, { recursive: true, force: true });
+    await w.prepareFinish();
+    const m = w.finish(result({ durationMs: 60_000 }), '# Review\n\nfull findings');
+    assert.equal(m.status, 'succeeded', String(end));
+    assert.equal(m.cwdMissingAtFinish, true);
+    assert.ok(readProgressWarnings(r, w.jobId).some((x) => /was gone at finish/.test(x)), String(end));
+    const p = JSON.parse(readFileSync(jobFile(r, w.jobId, FILES.progress), 'utf8')) as { editsCompleted?: number };
+    assert.equal(p.editsCompleted, 0, 'written even when 0');
+  }
+});
+
+test('an implement job with a completed edit whose cwd vanished fails', async () => {
+  const r = repo();
+  const cwd = mkdtempSync(path.join(tmpdir(), 'agent-smith-cwd-'));
+  const w = startIn(r, cwd, 'implement');
+  w.onEvent({ kind: 'activity-start', at: now(), activity: { stepIndex: 0, tool: 'edit', input: JSON.stringify({ filePath: `${cwd}/a.ts` }) } });
+  w.onEvent({ kind: 'activity-end', at: now(), activity: { stepIndex: 0, tool: 'edit' }, status: 'done' });
+  rmSync(cwd, { recursive: true, force: true });
+  await w.prepareFinish();
+  const m = w.finish(result({ durationMs: 60_000 }), 'Implemented change.');
+  assert.equal(m.status, 'failed');
+  assert.equal(m.reason, 'working directory gone');
 });
 
 test('a cwd that is not a git repo marks changedFiles unknown rather than absent', async () => {

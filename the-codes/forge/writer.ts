@@ -165,6 +165,13 @@ export class JobWriter {
   private toolInputs = '';
   /** Concatenated inputs of edit tool calls only, so read calls never attribute an external edit to the worker. */
   private editToolInputs = '';
+  /**
+   * Steps whose edit tool call ENDED without error. The writing-job evidence
+   * for the cwd rule: an edit that errored or was denied changed nothing, so
+   * it must not turn a review into a writing job. (The progress digest counts
+   * edits at start, which is right for the pane but not for a verdict.)
+   */
+  private readonly editStepsCompleted = new Set<number>();
 
   constructor(options: JobWriterOptions) {
     this.repo = options.repo;
@@ -246,6 +253,7 @@ export class JobWriter {
       lastActivity: null,
       latestText: null,
       toolCalls: 0,
+      editsCompleted: 0,
       warnings: [],
     };
 
@@ -435,6 +443,9 @@ export class JobWriter {
       }
       if (event.kind === 'activity-end') this.tracker.end(ref.stepIndex, row.tool, input, status);
       else this.tracker.start(ref.stepIndex, row.tool, ref.input ?? input);
+      if (event.kind === 'activity-end' && status === 'done' && classify(tool, input).kind === 'edit') {
+        this.editStepsCompleted.add(ref.stepIndex);
+      }
       // A tool call ends the assistant message before it: the next text is a new one.
       if (isStart) this.currentMessage = '';
       if (status === 'error') this.toolErrorSteps.add(ref.stepIndex);
@@ -530,12 +541,12 @@ export class JobWriter {
    */
   /**
    * The cwd facts deriveStatus needs: is the cwd gone, and was this job meant
-   * to write (mode) or seen editing (its own edit tool calls). Every verdict
-   * for this job (finish, the steer chain) reads them from here.
+   * to write (mode) or seen editing (one of its own edit tool calls completed
+   * without error). Every verdict for this job (finish, the steer chain) reads
+   * them from here.
    */
   verdictFacts(): { cwdMissing: boolean; writing: boolean } {
-    const edited = this.editToolInputs !== '' || this.tracker.editedPaths(this.cwd).length > 0;
-    return cwdFacts(this.cwd, this.manifest?.mode, edited);
+    return cwdFacts(this.cwd, this.manifest?.mode, this.editStepsCompleted.size > 0);
   }
 
   finish(result: JobResult, report: string | null): ForgeManifest {
@@ -747,6 +758,8 @@ export class JobWriter {
       lastActivity: this.lastActivity,
       latestText: this.latestText,
       toolCalls: this.toolCalls,
+      // Always written, even 0: recovery must tell "no edit completed" from a pre-counter file.
+      editsCompleted: this.editStepsCompleted.size,
       ...(this.toolErrorSteps.size === 0 ? {} : { toolErrors: this.toolErrorSteps.size }),
       ...(this.lastAliveAt === null ? {} : { lastAliveAt: this.lastAliveAt }),
       ...(this.workerPid === undefined ? {} : { workerPid: this.workerPid }),

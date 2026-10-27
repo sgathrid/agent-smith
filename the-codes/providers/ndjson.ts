@@ -418,10 +418,32 @@ export function spawnWorker(opts: SpawnWorkerOptions): Promise<WorkerProcess> {
   // Liveness from the process owner. Provider events stop during a long tool
   // call; this does not. The first beat waits one macrotask so the caller has
   // subscribed to the adapter's bus (spawn resolves first).
+  //
+  // The beat stops when the CLI process EXITS, not when its stdio closes: a
+  // descendant that inherited stdout can hold it open long after the worker
+  // died, and beats in that window would make a dead pid look alive. Each beat
+  // also probes the pid itself and stops if it is gone.
+  let leaderExited = false;
+  const stopHeartbeat = (): void => {
+    leaderExited = true;
+    if (firstBeat !== undefined) clearTimeout(firstBeat);
+    if (heartbeatTimer !== undefined) clearInterval(heartbeatTimer);
+    firstBeat = undefined;
+    heartbeatTimer = undefined;
+  };
+  handle.on('exit', stopHeartbeat);
   const onHeartbeat = opts.onHeartbeat;
-  if (onHeartbeat !== undefined && handle.pid !== undefined) {
+  const pid = handle.pid;
+  if (onHeartbeat !== undefined && pid !== undefined) {
     const beat = (): void => {
-      try { onHeartbeat(nowIso(), handle.pid); } catch { /* a listener must not kill the worker */ }
+      if (leaderExited) return;
+      try {
+        process.kill(pid, 0);
+      } catch (err) {
+        // EPERM: it exists, we just may not signal it. Anything else: gone.
+        if ((err as NodeJS.ErrnoException).code !== 'EPERM') { stopHeartbeat(); return; }
+      }
+      try { onHeartbeat(nowIso(), pid); } catch { /* a listener must not kill the worker */ }
     };
     firstBeat = setTimeout(beat, 0);
     firstBeat.unref?.();
@@ -435,8 +457,7 @@ export function spawnWorker(opts: SpawnWorkerOptions): Promise<WorkerProcess> {
       if (settled) return;
       settled = true;
       if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
-      if (firstBeat !== undefined) clearTimeout(firstBeat);
-      if (heartbeatTimer !== undefined) clearInterval(heartbeatTimer);
+      stopHeartbeat();
       if (killTimer !== undefined) {
         clearTimeout(killTimer);
         killTimer = undefined;

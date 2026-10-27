@@ -1,9 +1,28 @@
 /** One execution owner per launch; deliberately independent of MCP transport. */
 import { ForgeService } from '../../../forge/service.ts';
 import { startPipeline } from '../../../forge/execute.ts';
+import { existsSync } from 'node:fs';
+import { FILES, jobFile } from '../../../forge/format.ts';
 import { pendingAcceptance, runAcceptance, writeAcceptance } from '../../../forge/checks.ts';
 import type { SupervisorRequest } from '../../../forge/supervisor.ts';
 import type { StageCheck } from '../../../pipeline/types.ts';
+
+/** How often a running check set looks for the job's cancel marker; the pump polls at the same order. */
+const CANCEL_POLL_MS = 200;
+
+/**
+ * Run the checks, aborting them when `cancel` writes the job's marker. The in-process path
+ * aborts through an AbortController; the marker is the only signal a detached supervisor gets.
+ */
+async function runCancelableAcceptance(repo: string, jobId: string, succeeded: boolean, checks: StageCheck[], baseDir: string) {
+  const controller = new AbortController();
+  const marker = jobFile(repo, jobId, FILES.cancel);
+  const check = () => { if (existsSync(marker)) controller.abort(); };
+  check();
+  const timer = setInterval(check, CANCEL_POLL_MS);
+  try { return await runAcceptance({ repo, jobId, succeeded, checks, baseDir, signal: controller.signal }); }
+  finally { clearInterval(timer); }
+}
 
 process.once('message', async (raw) => {
   const payload = raw as SupervisorRequest;
@@ -34,7 +53,7 @@ process.once('message', async (raw) => {
       send({ kind: 'ack', value: tracked.ack });
       const manifest = await tracked.done;
       if (checks?.length) {
-        writeAcceptance(payload.repo, manifest.jobId, await runAcceptance({ repo: payload.repo, jobId: manifest.jobId, succeeded: manifest.status === 'succeeded', checks, baseDir: manifest.cwd }));
+        writeAcceptance(payload.repo, manifest.jobId, await runCancelableAcceptance(payload.repo, manifest.jobId, manifest.status === 'succeeded', checks, manifest.cwd));
         for (const id of prepared) if (id !== manifest.jobId) {
           writeAcceptance(payload.repo, id, { state: 'unchecked', checks: [], reason: 'superseded by steered turn' });
         }

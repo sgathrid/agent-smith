@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { callTool, parseStages, TOOL_DEFS, type HandlerContext } from '../tools.ts';
-import { readAcceptance } from '../../../../forge/checks.ts';
+import { readAcceptance, writeAcceptance } from '../../../../forge/checks.ts';
 
 const body = (r: { content: unknown }) => JSON.parse(((r.content as { text: string }[])[0]!).text);
 function fake(finalStatus: string, runningReads = 0) {
@@ -119,6 +119,21 @@ test('status shows which check is running, and cancel aborts checks of an exited
   const after = readAcceptance(f.repo, 'job-1');
   assert.equal(after.state, 'unchecked'); assert.equal((after as { reason?: string }).reason, 'checks canceled');
   assert.equal((after as { pending?: boolean }).pending, undefined);
+});
+
+test('cancel under a detached supervisor does not claim it aborted the checks', async () => {
+  const f = fake('succeeded');
+  (f.ctx.service as unknown as { cancel: (id: string) => unknown }).cancel = (id: string) => ({ jobId: id, requested: true, signalled: false, note: 'x' });
+  (f.ctx.service as unknown as { supervisorUrl: URL }).supervisorUrl = new URL('file:///unused');
+  writeAcceptance(f.repo, 'job-1', { state: 'unchecked', checks: [], pending: true, budgetMs: 60_000, running: 'hang' });
+  const c = body(await callTool(f.ctx, 'cancel', { jobId: 'job-1' }));
+  assert.equal(c.requested, true);
+  assert.equal(c.checksCanceled, false);
+  assert.match(c.checksNote, /supervisor .* will stop them/);
+  // Checks not running (job still executing): nothing to say about them.
+  writeAcceptance(f.repo, 'job-1', { state: 'unchecked', checks: [], pending: true, budgetMs: 60_000 });
+  const d = body(await callTool(f.ctx, 'cancel', { jobId: 'job-1' }));
+  assert.equal('checksCanceled' in d, false);
 });
 
 test('spawn_job env reaches the service; the ack names keys only; bad env is rejected', async () => {

@@ -388,6 +388,13 @@ export interface ForgeProgress {
   readonly lastActivity?: ForgeActivity | null;
   readonly latestText: string | null;
   readonly toolCalls: number;
+  /**
+   * Edit tool calls that ENDED without error (not started, not failed, not
+   * denied): the cwd rule's evidence that a job wrote. Unlike
+   * `digest.editedCount`, which counts at start for the pane. Absent only on
+   * files written before this counter existed.
+   */
+  readonly editsCompleted?: number;
   /** Tool calls that ended in an error state so far. Absent until the first one. */
   readonly toolErrors?: number;
   /**
@@ -558,9 +565,12 @@ export interface StatusVerdict {
  *      not what happened to the task.
  *   2. deniedActions non-empty    ⇒ failed, suspicious. agy exited 0, said
  *      "SUCCESS", returned "" and did nothing. THE TRAP. Unless every denial
- *      is nonfatal and a report was delivered: then succeeded, with a note.
+ *      is nonfatal and a report was delivered: then succeeded, with a note —
+ *      but only after rule 3b has passed.
  *   3. ok === false               ⇒ failed. The adapter already weighed exit
  *      code against the result event; we do not second-guess it.
+ *   3b. cwd gone, writing job     ⇒ failed, suspicious. Its edits and checks
+ *      cannot be verified; a nonfatal denial does not excuse it.
  *   4. ok === true, report empty  ⇒ failed, suspicious. The net for every
  *      provider that does not report denials. "You asked me nothing and I said
  *      nothing" is only a success when the job also made no tool calls — which
@@ -632,15 +642,8 @@ export function deriveStatus(d: StatusDerivation): StatusVerdict {
   // Denials the adapter marked non-fatal (a delivered report plus denied calls,
   // e.g. a reviewer that wanted a shell) do not fail the job, whatever the
   // provider. `action: 'tool'` is the pre-flag claude encoding, still on disk.
-  if (denials.length > 0 && d.ok === true && !looksEmpty(d.report) && denials.every((x) => x.nonfatal === true || x.action === 'tool')) {
-    return {
-      status: 'succeeded',
-      suspicious: false,
-      reason: null,
-      note: `${denials.length} ${denials.length === 1 ? 'call' : 'calls'} denied` + (deniedNames(denials) === '' ? '' : `: ${deniedNames(denials)}`),
-    };
-  }
-  if (denials.length > 0) {
+  const nonfatalOnly = denials.length > 0 && d.ok === true && !looksEmpty(d.report) && denials.every((x) => x.nonfatal === true || x.action === 'tool');
+  if (denials.length > 0 && !nonfatalOnly) {
     return { status: 'failed', suspicious: true, reason: deniedReason(denialNames(denials)) };
   }
 
@@ -655,8 +658,19 @@ export function deriveStatus(d: StatusDerivation): StatusVerdict {
   // A writing job whose cwd vanished cannot show its edits or pass a check:
   // its "done" is a claim with nothing behind it. A read-only job's report is
   // the deliverable, so it stands (the writer records a warning instead).
+  // Checked before the nonfatal-denial success, which would otherwise let a
+  // denied call excuse a writing job from it.
   if (d.cwdMissing === true && d.writing === true) {
     return { status: 'failed', suspicious: true, reason: CWD_GONE_REASON };
+  }
+
+  if (nonfatalOnly) {
+    return {
+      status: 'succeeded',
+      suspicious: false,
+      reason: null,
+      note: `${denials.length} ${denials.length === 1 ? 'call' : 'calls'} denied` + (deniedNames(denials) === '' ? '' : `: ${deniedNames(denials)}`),
+    };
   }
 
   if (looksEmpty(d.report)) {

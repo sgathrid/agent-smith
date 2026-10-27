@@ -178,6 +178,18 @@ test('notifyHint: a notice is promised; the monitor command waits under fallback
   assert.equal(run.fallback.monitorTimeoutMs, 120_000);
 });
 
+test('notifyHint: the "no notice by" wait includes the acceptance budget written at spawn', async () => {
+  const { notifyHint } = await import('../tools.ts');
+  const { pendingAcceptance, writeAcceptance } = await import('../../../../forge/checks.ts');
+  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-notify-budget-'));
+  try {
+    writeAcceptance(repo, 'j1', pendingAcceptance([{ name: 'slow', command: 'sleep 1', timeoutMs: 10 * 60_000 }]));
+    // 1 min job + (10 min + 30 s grace) checks + 2 min notice grace = 14 min (rounded up).
+    assert.match(notifyHint({ job: 'j1' }, repo, 60_000, undefined).fallback.when, /no notice has arrived 14 min after launch/);
+    assert.match(notifyHint({ job: 'other' }, repo, 60_000, undefined).fallback.when, /arrived 3 min after launch/);
+  } finally { (await import('node:fs')).rmSync(repo, { recursive: true, force: true }); }
+});
+
 test('spawn_job ack carries a notify hint', async () => {
   const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-notify-'));
   const service = { repo, spawnJob: async () => ({ jobId: 'j9', timeoutMs: 1000 }) } as never;

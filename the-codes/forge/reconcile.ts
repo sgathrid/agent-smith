@@ -34,8 +34,8 @@ export function reconcileOrphan(repo: string, jobId: string, now = Date.now()): 
     const cancelSteerFile = jobFile(repo, jobId, FILES.cancelSteer);
     const canceled = existsSync(cancelFile) || existsSync(cancelSteerFile);
     const report = result === null ? null : reportFor(result);
-    // Without the writer, the cwd and the mode (plus the progress digest's
-    // edit count) are all recovery can prove about a writing job.
+    // Without the writer, the cwd and the mode (plus the completed-edit count
+    // in progress.json) are all recovery can prove about a writing job.
     const facts = cwdFacts(manifest.cwd, manifest.mode, editedOnDisk(repo, jobId));
     const verdict = result === null
       ? deriveOrphan(manifest, null, now, undefined, canceled)
@@ -101,10 +101,16 @@ function settleAcceptance(repo: string, jobId: string, at: string): void {
   }
 }
 
-/** The progress digest recorded at least one edit (evidence the job wrote). */
+/**
+ * progress.json recorded at least one completed edit (evidence the job wrote).
+ * `editsCompleted` counts only edits that ended without error; the digest's
+ * `editedCount` counts at start and is read only for files written before the
+ * counter existed.
+ */
 function editedOnDisk(repo: string, jobId: string): boolean {
   try {
-    const p = JSON.parse(readFileSync(jobFile(repo, jobId, FILES.progress), 'utf8')) as { digest?: { editedCount?: unknown } };
+    const p = JSON.parse(readFileSync(jobFile(repo, jobId, FILES.progress), 'utf8')) as { editsCompleted?: unknown; digest?: { editedCount?: unknown } };
+    if (typeof p.editsCompleted === 'number') return p.editsCompleted > 0;
     return typeof p.digest?.editedCount === 'number' && p.digest.editedCount > 0;
   } catch { return false; }
 }
