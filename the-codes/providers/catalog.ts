@@ -45,7 +45,12 @@ function readDisk(repo: string | undefined, name: string): CacheEntry | undefine
     if (typeof v.at !== 'number' || c === undefined || c === null || c.provider !== name || !Array.isArray(c.models)) return undefined;
     // A malformed entry must be ignored and rediscovered, never served as fresh: the spawn path
     // reads model ids from it and a null entry would throw inside validation and block the launch.
-    const wellFormed = c.models.every((m) => m !== null && typeof m === 'object' && typeof (m as { id?: unknown }).id === 'string');
+    const wellFormed = c.models.every((m) => {
+      if (m === null || typeof m !== 'object') return false;
+      const { id, efforts } = m as { id?: unknown; efforts?: unknown };
+      // Validation indexes `efforts`, so a model without a string array there would throw at spawn.
+      return typeof id === 'string' && Array.isArray(efforts) && efforts.every((e) => typeof e === 'string');
+    });
     if (!wellFormed || typeof c.source !== 'string') return undefined;
     return { catalog: c, at: v.at };
   } catch { return undefined; }

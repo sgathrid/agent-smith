@@ -388,5 +388,13 @@ test('catalog: disk cache is shared across processes, honors TTL, refresh rewrit
     const r4 = await getCatalogs({ repo });
     assert.equal(a4.calls, 1, 'rediscovered instead of serving the malformed entry');
     assert.equal(r4[0]!.models[0]!.id, good('a').models[0]!.id);
+    // A model without an efforts array (or with efforts: null) is malformed too: validation indexes it.
+    for (const model of [{ id: 'm1' }, { id: 'm1', efforts: null }]) {
+      writeFileSync(file, JSON.stringify({ at: t + 7 * 60_000, catalog: { provider: 'a', models: [model], defaultSource: 'unknown', source: 'live', stale: false, verified: true } }));
+      const a5 = fakeProvider('a', async () => good('a'));
+      resetCatalogCacheForTest({ now: () => t + 7 * 60_000, providers: () => [a5] });
+      await getCatalogs({ repo });
+      assert.equal(a5.calls, 1, `rediscovered for ${JSON.stringify(model)}`);
+    }
   } finally { rmSync(repo, { recursive: true, force: true }); resetCatalogCacheForTest(); }
 });

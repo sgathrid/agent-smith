@@ -492,9 +492,11 @@ export function checkAgainstCatalog(
   }
   if (effort !== undefined) {
     const target = match ?? (catalog.defaultModel === undefined ? undefined : catalog.models.find((m) => m.id === catalog.defaultModel));
-    if (target !== undefined && target.efforts.length > 0 && !target.efforts.includes(effort)) {
+    // Defensive: a catalog from disk or a provider could carry a model without an efforts array.
+    const efforts = Array.isArray(target?.efforts) ? target!.efforts : [];
+    if (target !== undefined && efforts.length > 0 && !efforts.includes(effort)) {
       throw new Error(
-        `effort "${effort}" is not valid for ${provider} model "${target.id}". Valid efforts: ${target.efforts.join(', ')}.`,
+        `effort "${effort}" is not valid for ${provider} model "${target.id}". Valid efforts: ${efforts.join(', ')}.`,
       );
     }
   }

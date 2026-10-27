@@ -7717,7 +7717,13 @@ function readDisk(repo, name) {
             return undefined;
         // A malformed entry must be ignored and rediscovered, never served as fresh: the spawn path
         // reads model ids from it and a null entry would throw inside validation and block the launch.
-        const wellFormed = c.models.every((m) => m !== null && typeof m === 'object' && typeof m.id === 'string');
+        const wellFormed = c.models.every((m) => {
+            if (m === null || typeof m !== 'object')
+                return false;
+            const { id, efforts } = m;
+            // Validation indexes `efforts`, so a model without a string array there would throw at spawn.
+            return typeof id === 'string' && Array.isArray(efforts) && efforts.every((e) => typeof e === 'string');
+        });
         if (!wellFormed || typeof c.source !== 'string')
             return undefined;
         return { catalog: c, at: v.at };
@@ -8286,8 +8292,10 @@ function checkAgainstCatalog(provider, model, effort, catalog) {
     }
     if (effort !== undefined) {
         const target = match ?? (catalog.defaultModel === undefined ? undefined : catalog.models.find((m) => m.id === catalog.defaultModel));
-        if (target !== undefined && target.efforts.length > 0 && !target.efforts.includes(effort)) {
-            throw new Error(`effort "${effort}" is not valid for ${provider} model "${target.id}". Valid efforts: ${target.efforts.join(', ')}.`);
+        // Defensive: a catalog from disk or a provider could carry a model without an efforts array.
+        const efforts = Array.isArray(target?.efforts) ? target.efforts : [];
+        if (target !== undefined && efforts.length > 0 && !efforts.includes(effort)) {
+            throw new Error(`effort "${effort}" is not valid for ${provider} model "${target.id}". Valid efforts: ${efforts.join(', ')}.`);
         }
     }
     return warnings;
