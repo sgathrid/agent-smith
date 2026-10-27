@@ -94,7 +94,6 @@ export const SMITH_PAYLOAD = {
 } as const;
 
 const CANCELED_ORPHAN = { status: 'canceled', suspicious: false, reason: CANCEL_ORPHAN_REASON } as const;
-const ORPHANED = { status: 'failed', suspicious: true, reason: ORPHAN_REASON } as const;
 
 /**
  * Reads `.agent-smith/jobs`.
@@ -206,7 +205,6 @@ export class AgentSmithReader implements JobStateReader {
     let orphan: ReturnType<typeof deriveOrphan> = null;
     if (manifest !== null && manifest.status === 'running' && !canceled
         && !(await existsSafe(jobFile(cwd, jobId, FILES.result)))) {
-      const markerPath = jobFile(cwd, jobId, FILES.orphaned);
       const lastSeen = Math.max(
         Date.parse(manifest.updatedAt), Date.parse(progress?.lastEventAt ?? ''),
       );
@@ -216,12 +214,6 @@ export class AgentSmithReader implements JobStateReader {
       const cancelAgeMs = cancelAt === null ? NaN : Date.now() - Date.parse(cancelAt);
       const ownerIsAlive = ownerAlive(manifest);
       if (orphan === null && cancelRequested && cancelAgeMs > 60_000 && !ownerIsAlive) orphan = CANCELED_ORPHAN;
-      // The marker is proof the supervisor is gone; a cancel request makes that
-      // a cancellation. A live pid beside a marker plus cancel is still in flight.
-      if (orphan === null && (await existsSafe(markerPath))) {
-        orphan = !cancelRequested ? ORPHANED : ownerIsAlive ? null : CANCELED_ORPHAN;
-      }
-
     }
 
     const payload: Record<string, unknown> = {
@@ -299,9 +291,7 @@ export class AgentSmithReader implements JobStateReader {
 }
 
 /*
- * THE ONE RULE ABOUT THE COMPAT MIRROR: forge/mirror.ts projects our jobs into
- * `.agy-staff/jobs/` so an unmodified mod can render them. This reader never
- * reads that projection, and `AgyStaffReader` callers skip forge ids
- * (`isForgeJobId`). Otherwise every spawned job would get two independently
- * computed verdicts in a single sweep.
+ * Older versions mirrored our jobs into `.agy-staff/jobs/`; copies may remain on
+ * disk. `AgyStaffReader` callers skip forge ids (`isForgeJobId`) so a job never
+ * gets two verdicts in one sweep.
  */

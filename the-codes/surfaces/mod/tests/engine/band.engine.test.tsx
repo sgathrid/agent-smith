@@ -1,30 +1,17 @@
 /**
  * band.engine.test.tsx — the band as the ENGINE draws it.
  *
- * WHY THIS FILE EXISTS WHEN tests/band.test.ts ALREADY EXISTS
- * ────────────────────────────────────────────────────────────
- * Two different runners, two different questions.
- *
- *   `node --test` (tests/band.test.ts, tests/jobs.test.ts) asks: are the RULES
- *   right? Elapsed padding, the 4-row cap, glyph choice, the deleted-progress
- *   case. It cannot load a .tsx at all (Node's type stripping has no JSX
- *   transform), so it can never answer: does this module actually load, and does
- *   the band actually paint?
- *
- *   `claude plugin test` (this file) asks exactly that. It loads the plugin
- *   through the engine's own host, in an environment like the one the hooks run
- *   in, and hands back the drawn elements.
+ * WHY THIS FILE EXISTS
+ * ────────────────────────
+ * `node --test` (tests/*.node-test.ts) asks whether the RULES are right. It
+ * cannot load a .tsx, so it cannot answer whether this module actually loads
+ * and the band actually paints. `claude plugin test` (this file) does: it loads
+ * the plugin through the engine's own host and hands back the drawn elements.
  *
  * Run it with:  claude plugin test the-codes/surfaces/mod
  *
- * NOTE ON THE FIXTURES HERE
- * ─────────────────────────
- * A hooks module may not import `node:fs`, so the file bodies below are
- * INLINED, not read from disk. They are byte-for-byte from the real corpus at
- * /Users/gathrid/Repos/renyi/.agy-staff/jobs — the same values tests/jobs.test.ts
- * reads off disk — and each says which file it came from. A change in agy-staff's
- * layout fails the node --test suite with a real file; this suite catches the
- * remaining class, which is "the band draws the wrong THING".
+ * Hooks may not import `node:fs`, so job files are served from literals over
+ * the engine's fs events.
  */
 
 import { describe, expect, mock, test } from 'claude-code/testing';
@@ -34,38 +21,10 @@ import { BAND_ROWS, buildLine, isShown, noColor, rowBudget } from '../../hooks/b
 import type { RadarJob } from '../../../types/index.d.ts';
 import { proseText } from '../../hooks/views.tsx';
 
-// ── fixtures, verbatim from the corpus ──────────────────────────────────────
+// ── fixtures ────────────────────────────────────────────────────────────────
 
-/** `<id>.log`, real: implement-musm82da-f1dc1fe4.log */
-const REAL_LOG =
-  '[agy-staff] dispatch registered implement-musm82da-f1dc1fe4 at 2026-10-03T16:37:40.991Z\n' +
-  '[agy-staff] worker started implement-musm82da-f1dc1fe4 pid=87142 at 2026-10-03T16:37:41.031Z\n' +
-  '[agy-staff] mode=implement profile=unrestricted model=gemini-3.8-flash-high ' +
-  'agy_status=SUCCESS agy_exit=0 duration=1681.549339s turns=1 ' +
-  'tokens(in 2221077, out 137616, think 88239, cache 20425839)\n';
-
-/** `<id>.spec.json`, real, prompt shortened */
-const REAL_SPEC =
-  '{"resolved":{"mode":"implement","model":"gemini-3.8-flash-high","profile":"unrestricted"},' +
-  '"prompt_source":{"kind":"template","task":"# Task: open an agent-built dashboard with real names"},' +
-  '"cwd":"/Users/gathrid/Repos/renyi"}';
-
-/** `<id>.progress.json`, real shape, one activity */
-const REAL_PROGRESS = JSON.stringify({
-  job_id: 'implement-musm82da-f1dc1fe4',
-  last_event_at: '2026-10-03T16:49:44.766Z',
-  recent_activities: [
-    { step_index: 76, tool: 'run_command', input_preview: '{"CommandLine":"cargo test --workspace"}' },
-  ],
-  warnings: [],
-});
-
-/** `<id>.result.md.status.json`, real */
-const REAL_STATUS = '{"status":"done","warnings":true,"finished_at":"2026-10-03T17:05:44.132Z"}';
-
-const ID = 'implement-musm82da-f1dc1fe4';
-
-/** 12m04s after the real worker-started line. */
+/** The clock the fixtures share. */
+const ID = 'job-1';
 const RUNNING_NOW = Date.parse('2026-10-03T16:49:45.031Z');
 
 const BAND = {
@@ -75,11 +34,8 @@ const BAND = {
 };
 
 /**
- * An engine beneath the plugin: the corpus files, served from literals.
- *
- * `events` is a synthetic stand-in with 200 records at step_index 341, so the
- * drawn count is the real 341 the design's sample line uses. The real file has
- * the same shape at a different scale.
+ * An engine beneath the plugin serving one canonical job, `job-native-1`, whose
+ * files are given by bare name in `options.files`.
  */
 function engine(
   on: (event: string, hook: (...args: never[]) => unknown) => unknown,
@@ -87,29 +43,11 @@ function engine(
     now?: number;
     noColorEnv?: string;
     files?: Record<string, string>;
-    entries?: { name: string; kind: 'file' | 'dir'; size: number }[];
     scrollCalls?: Record<string,unknown>[];
-    nativeTask?: boolean;
     nativeTaskCalls?: { tool: string; input: Record<string, unknown> }[];
   } = {},
 ) {
-  const files: Record<string, string> = {
-    [`${ID}.spec.json`]: REAL_SPEC,
-    [`${ID}.progress.json`]: REAL_PROGRESS,
-    [`${ID}.log`]: REAL_LOG,
-    ...options.files,
-  };
-  const entries =
-    options.entries ??
-    [
-      { name: `${ID}.spec.json`, kind: 'file', size: REAL_SPEC.length },
-      { name: `${ID}.progress.json`, kind: 'file', size: REAL_PROGRESS.length },
-      { name: `${ID}.events.jsonl`, kind: 'file', size: 492_000 },
-      { name: `${ID}.log`, kind: 'file', size: REAL_LOG.length },
-    ];
-  if (files[`${ID}.events.jsonl`] === undefined && !options.entries) {
-    files[`${ID}.events.jsonl`] = '{"event":"step_update","step_index":341}\n'.repeat(200);
-  }
+  const files: Record<string, string> = { ...options.files };
 
   on('session.start', (_$: unknown, e: unknown) => ({
     sessionId: 's',
@@ -121,22 +59,18 @@ function engine(
   const clock = mock.clock(on as never, { now: options.now ?? RUNNING_NOW });
   on('env.get', (_$: unknown, e: unknown) => {
     const name = (e as { name: string }).name;
-    if (name === 'AGY_RADAR_REPO') return { value: options.nativeTask ? '/work' : '/corpus' };
-    if (name === 'AGENT_SMITH_LEGACY_JOBS') return { value: options.nativeTask ? undefined : '1' };
+    if (name === 'AGY_RADAR_REPO') return { value: '/work' };
     if (name === 'NO_COLOR') return { value: options.noColorEnv };
     return { value: undefined };
   });
   on('fs.list', (_$: unknown, e: unknown) => {
-    const path = (e as { path: string }).path;
-    if (options.nativeTask && path === '/work/.agent-smith/jobs') {
-      return { value: [{ name: 'job-native-1', kind: 'dir', size: 0 }] };
-    }
-    return { value: entries };
+    void e;
+    return { value: [{ name: 'job-native-1', kind: 'dir', size: 0 }] };
   });
   on('fs.read', (_$: unknown, e: unknown) => {
     const path = (e as { path: string }).path;
     const name = path.slice(path.lastIndexOf('/') + 1);
-    const body = options.files?.[name] ?? files[name];
+    const body = files[name];
     if (body === undefined) {
       // The real `$.fs.read` rejects with the OS errno; the band must survive it.
       return { deny: `ENOENT: no such file or directory, open '${path}'` };
@@ -144,7 +78,7 @@ function engine(
     return { value: body };
   });
   on('fs.exists', (_$: unknown, e: unknown) => ({
-    value: (options.nativeTask && (e as {path:string}).path === '/work/.agent-smith/jobs') || Object.hasOwn(options.files ?? {}, (e as {path:string}).path.split('/').pop()!) || Object.hasOwn(files, (e as { path: string }).path.slice((e as { path: string }).path.lastIndexOf('/') + 1)),
+    value: (e as {path:string}).path === '/work/.agent-smith/jobs' || Object.hasOwn(files, (e as { path: string }).path.slice((e as { path: string }).path.lastIndexOf('/') + 1)),
   }));
   if (options.nativeTaskCalls) {
     on('tool.call', (_$: unknown, e: unknown) => {
@@ -187,82 +121,45 @@ describe('band helpers (pure)', () => {
 // ── the band as drawn ──────────────────────────────────────────────────────
 
 describe('the band', () => {
-  test('a running job is one yellow bold row, elapsed last', async ($, on) => {
-    engine(on);
-    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
-    const band = await $.ui.mount({
-      plugin: 'agent-smith',
-      surface: 'terminal',
-      ...BAND,
-    } as never);
-
-    // The exact line from the design brief, produced from real corpus files.
-    const line = await band.find({ type: 'Text', text: /⏺ open an agent-built dashboard/ });
-    expect(line).toBeDefined();
-    // …and the clock, which is 12m04s from the real log's worker-started line.
-    expect(await band.find({ type: 'Text', text: '12m04s' })).toBeDefined();
-
-    // The accent, and only the accent, is coloured; the rest is dim.
-    const head = (line as { children?: { props?: Record<string, unknown> }[] }).children?.[0];
-    expect(head?.props?.color).toBe('blue');
-    expect(head?.props?.bold).toBe(true);
-  });
-
   test("the host's own band content survives, as our last child", async ($, on) => {
     // TERMINAL-UI.md L170-173: never replace what Claude Code or another mod
     // drew above the prompt.
-    engine(on);
-    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
+    forgeHost(on, ada(), ['job-ada']);
+    await start($);
+    await launch($, 'job-ada');
     const band = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', ...BAND } as never);
+    expect(await band.find({ key: 'band-job-ada' })).toBeDefined();
     expect(await band.find({ type: 'Text', text: 'REST-OF-BAND' })).toBeDefined();
   });
 
   test('a survey holds the band: we render nothing and return the host alone', async ($, on) => {
-    engine(on);
-    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
+    forgeHost(on, ada(), ['job-ada']);
+    await start($);
+    await launch($, 'job-ada');
     const band = await $.ui.mount({
-      plugin: 'agent-smith',
-      surface: 'terminal',
-      component: 'AbovePrompt',
+      plugin: 'agent-smith', surface: 'terminal', component: 'AbovePrompt', requestId: 'forge-band',
       props: { hasSurvey: true, isWorking: true, maxRows: 10, bodyColumns: 120 },
     } as never);
     // The job IS running, and we still draw no line of our own.
-    expect(await band.find({ type: 'Text', text: /cargo test/ })).toBeUndefined();
+    expect(await band.find({ key: 'band-job-ada' })).toBeUndefined();
     expect(await band.find({ type: 'Text', text: 'REST-OF-BAND' })).toBeDefined();
   });
 
   test('no jobs means nothing drawn, not an empty box', async ($, on) => {
-    // TERMINAL-UI.md L168-171. A band that "appears to say nothing" is noise, and
-    // the row count must drop to zero rather than holding reserved space.
-    engine(on, { entries: [], files: {} });
-    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
+    // TERMINAL-UI.md L168-171: the row count drops to zero rather than holding space.
+    forgeHost(on, {}, []);
+    await start($);
     const band = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', ...BAND } as never);
     expect(await band.find({ type: 'Text', text: /\/forge/ })).toBeUndefined();
     expect(await band.find({ type: 'Text', text: 'REST-OF-BAND' })).toBeDefined();
   });
 
-  test('NO_COLOR drops the colour prop and keeps the glyph and the bold', async ($, on) => {
-    engine(on, { noColorEnv: '1' });
-    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
-    const band = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', ...BAND } as never);
-
-    const line = await band.find({ type: 'Text', text: /⏺ open an agent-built dashboard/ });
-    expect(line).toBeDefined();
-    const head = (line as { children?: { props?: Record<string, unknown> }[] }).children?.[0];
-    // The redundant channel survives: the glyph still says "running".
-    expect(head?.props?.color).toBeUndefined();
-    // Bold is a contrast affordance, not a colour, so it stays.
-    expect(head?.props?.bold).toBe(true);
-  });
-
   test('every Text WE draw carries wrap="truncate-end"', async ($, on) => {
     // TERMINAL-UI.md L124-126: a wrapped status line becomes two rows, the band
-    // grows, and the prompt moves — the one-rule violation this rule exists for.
-    //
-    // The host's own row is excluded: it is the engine's to truncate, and we
-    // return it untouched. Checking it would be checking someone else's code.
-    engine(on);
-    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
+    // grows, and the prompt moves. The host's own row is the engine's to truncate.
+    forgeHost(on, ada(), ['job-ada']);
+    await start($);
+    await launch($, 'job-ada');
     const band = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', ...BAND } as never);
     const texts = await band.findAll({ type: 'Text' });
     const ours = texts.filter((t) => (t as { text?: string }).text !== 'REST-OF-BAND');
@@ -270,137 +167,6 @@ describe('the band', () => {
     for (const t of ours) {
       expect((t as { props?: Record<string, unknown> }).props?.wrap).toBe('truncate-end');
     }
-  });
-});
-
-// ── the deleted-progress case, as drawn ────────────────────────────────────
-
-describe('HAZARD A, as drawn', () => {
-  test('a finished job whose progress.json and events.jsonl are GONE still draws as done', async ($, on) => {
-    // THE case. On a warning-free success agy-staff deletes progress.json AND
-    // events.jsonl. The band must draw `✓ … finished`, not drop the job and not
-    // resurrect it as running.
-    engine(on, {
-      now: Date.parse('2026-10-03T17:05:50.000Z'), // 6s after it finished
-      entries: [
-        { name: `${ID}.spec.json`, kind: 'file', size: REAL_SPEC.length },
-        { name: `${ID}.log`, kind: 'file', size: REAL_LOG.length },
-        { name: `${ID}.result.md`, kind: 'file', size: 900 },
-        { name: `${ID}.result.md.status.json`, kind: 'file', size: REAL_STATUS.length },
-      ],
-      files: {
-        [`${ID}.result.md`]: '## What I changed\n- crates/renyi-core/src/dashboard_decode.rs — decode inside\n',
-        [`${ID}.result.md.status.json`]: '{"status":"done","warnings":false,"finished_at":"2026-10-03T17:05:44.132Z"}',
-      },
-    });
-    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
-    const band = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', ...BAND } as never);
-
-    expect(await band.find({ type: 'Text', text: /✓ open an agent-built dashboard.*done/ })).toBeDefined();
-    // No tool count, because there is genuinely none on disk — omitted, not 0.
-    expect(await band.find({ type: 'Text', text: /0 tools/ })).toBeUndefined();
-    // And it does NOT read as still running.
-    expect(await band.find({ type: 'Text', text: /⏺ open an agent-built dashboard/ })).toBeUndefined();
-  });
-
-  test('empty output + warnings:true draws FAILED, not a green check', async ($, on) => {
-    // THE headline rule. agy-staff exits 0 having delivered nothing when a tool
-    // is soft-denied. A `✓` here is the most expensive lie this project could tell.
-    engine(on, {
-      now: Date.parse('2026-10-03T17:05:45.000Z'),
-      entries: [
-        { name: `${ID}.spec.json`, kind: 'file', size: REAL_SPEC.length },
-        { name: `${ID}.log`, kind: 'file', size: REAL_LOG.length },
-        { name: `${ID}.result.md`, kind: 'file', size: 0 },
-        { name: `${ID}.result.md.status.json`, kind: 'file', size: REAL_STATUS.length },
-      ],
-      files: {
-        [`${ID}.result.md`]: '',
-        [`${ID}.result.md.status.json`]: REAL_STATUS,
-      },
-    });
-    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
-    const band = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', ...BAND } as never);
-
-    expect(await band.find({ type: 'Text', text: /✗ open an agent-built dashboard.*failed/ })).toBeDefined();
-    expect(await band.find({ type: 'Text', text: /✓ open an agent-built dashboard/ })).toBeUndefined();
-    // And the reason reaches the line as a stable code.
-    expect(await band.find({ type: 'Text', text: /no output/ })).toBeDefined();
-  });
-
-  test('a finished job older than the linger is not drawn at all', async ($, on) => {
-    // The real corpus is 20 jobs finished hours ago. Drawing four of them at
-    // session start would be asserting work is in flight when it is not.
-    engine(on, {
-      now: Date.parse('2026-10-03T23:00:00.000Z'), // six hours later
-      entries: [
-        { name: `${ID}.spec.json`, kind: 'file', size: REAL_SPEC.length },
-        { name: `${ID}.log`, kind: 'file', size: REAL_LOG.length },
-        { name: `${ID}.result.md`, kind: 'file', size: 900 },
-        { name: `${ID}.result.md.status.json`, kind: 'file', size: REAL_STATUS.length },
-      ],
-      files: {
-        [`${ID}.result.md`]: '## What I changed\n- a real report\n',
-        [`${ID}.result.md.status.json`]: REAL_STATUS,
-      },
-    });
-    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
-    const band = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', ...BAND } as never);
-    expect(await band.find({ type: 'Text', text: new RegExp(ID) })).toBeUndefined();
-  });
-
-  test('at most four rows, then `+N more`', async ($, on) => {
-    // TERMINAL-UI.md L151. Six jobs, so two are hidden.
-    const names = ['a', 'b', 'c', 'd', 'e', 'f'];
-    const entries = names.flatMap((s) => [
-      { name: `job-${s}.spec.json`, kind: 'file' as const, size: 10 },
-      { name: `job-${s}.progress.json`, kind: 'file' as const, size: 10 },
-      { name: `job-${s}.log`, kind: 'file' as const, size: 10 },
-    ]);
-    engine(on, {
-      entries,
-      files: Object.fromEntries(
-        names.flatMap((s) => [
-          [`job-${s}.spec.json`, REAL_SPEC],
-          [`job-${s}.progress.json`, REAL_PROGRESS],
-          // A distinct start per job, so the clocks differ.
-          [`job-${s}.log`, `[agy-staff] worker started job-${s} pid=1 at 2026-10-03T16:37:41.031Z\n`],
-        ]),
-      ),
-    });
-    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
-    const band = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', ...BAND } as never);
-
-    const overflow = await band.find({ type: 'Text', text: '+2 more' });
-    expect(overflow).toBeDefined();
-    expect((overflow as { text?: string }).text).toContain('/forge');
-  });
-
-  test("the engine's own maxRows is respected", async ($, on) => {
-    // A 3-row band takes 2 job rows and spends the last on the overflow line,
-    // because the engine reserves a row of maxRows for its own.
-    const names = ['a', 'b', 'c', 'd', 'e'];
-    engine(on, {
-      entries: names.flatMap((s) => [
-        { name: `job-${s}.spec.json`, kind: 'file' as const, size: 10 },
-        { name: `job-${s}.log`, kind: 'file' as const, size: 10 },
-      ]),
-      files: Object.fromEntries(
-        names.flatMap((s) => [
-          [`job-${s}.spec.json`, REAL_SPEC],
-          [`job-${s}.log`, `[agy-staff] worker started job-${s} pid=1 at 2026-10-03T16:37:41.031Z\n`],
-        ]),
-      ),
-    });
-    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
-    const band = await $.ui.mount({
-      plugin: 'agent-smith',
-      surface: 'terminal',
-      component: 'AbovePrompt',
-      props: { hasSurvey: false, isWorking: true, maxRows: 3, bodyColumns: 80 },
-    } as never);
-    // 5 jobs, 2 rows + overflow ⇒ +3 more, not +1.
-    expect(await band.find({ type: 'Text', text: '+4 more' })).toBeDefined();
   });
 });
 
@@ -439,7 +205,6 @@ describe('native task-list projection', () => {
   test('uses host TaskCreate/TaskUpdate and preserves truthful worker metadata', async ($, on) => {
     const calls: { tool: string; input: Record<string, unknown> }[] = [];
     const clock = engine(on, {
-      nativeTask: true,
       nativeTaskCalls: calls,
       files: {
         'job.json': JSON.stringify({
@@ -487,15 +252,6 @@ describe('native task-list projection', () => {
   });
 });
 
-test('the last finished band row expires and stops repainting', async ($, on) => {
-  const clock=engine(on,{now:Date.parse('2026-10-03T17:05:45Z'),files:{[`${ID}.result.md`]:'A complete worker report with enough content to pass the output validator.',[`${ID}.result.md.status.json`]:REAL_STATUS}});
-  await $.session.start({surface:'terminal',isInteractive:true,cwd:'/work'} as never);
-  const band=await $.ui.mount({plugin:'agent-smith',surface:'terminal',...BAND} as never);
-  expect(await band.find({type:'Text',text:/open an agent-built dashboard/})).toBeDefined();
-  await clock.advance(60_000);
-  expect(await band.find({type:'Text',text:/open an agent-built dashboard/})).toBeUndefined();
-});
-
 // ── /forge: the band's digits and the command open one focused sidebar ─────
 
 const PANE_TARGET = { plugin: 'agent-smith', surface: 'terminal', component: 'Pane', requestId: 'agent-smith', viewport: { columns: 119, rows: 40, isFullscreen: true }, props: { title: 'Agent Smith', isFocused: true, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} } } as never;
@@ -541,6 +297,16 @@ function forgeHost(on: (...args: any[]) => void, files: Record<string,string>, i
 const start = ($: any) => $.session.start({surface:'terminal',isInteractive:true,cwd:'/work'} as never);
 /** Launch through the ack this session's Claude would get back. */
 const launch = ($: any, id: string, kind: 'job' | 'run' = 'job') => launched($, id, '/work', kind);
+
+test('the last finished band row expires and stops repainting', async ($, on) => {
+  const { clock } = forgeHost(on, failedJob('job-f', RUNNING_NOW), ['job-f']);
+  await start($);
+  await launch($, 'job-f');
+  const band = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', ...BAND } as never);
+  expect(await band.find({ key: 'band-job-f' })).toBeDefined();
+  await clock.advance(60_000);
+  expect(await band.find({ key: 'band-job-f' })).toBeUndefined();
+});
 
 test('the band shows on the main thread only, not while viewing a subagent', async ($, on) => {
   forgeHost(on, ada(), ['job-ada']);
@@ -858,8 +624,9 @@ test('a failure older than 24 h stays in Recent but is no longer drawn as one ne
 
 test('pagination makes the tenth worker selectable', async ($, on) => {
   const ids=Array.from({length:10},(_,i)=>`job-${i}`);
-  engine(on,{entries:ids.map(id=>({name:`${id}.spec.json`,kind:'file',size:10})), files:Object.fromEntries(ids.flatMap(id=>[[`${id}.spec.json`,REAL_SPEC],[`${id}.log`,REAL_LOG],[`${id}.progress.json`,REAL_PROGRESS]]))});
-  await $.session.start({surface:'terminal',isInteractive:true,cwd:'/work'} as never);
+  forgeHost(on, Object.assign({}, ...ids.map(id => canonicalJob(id, {status:'running',name:id}))), ids);
+  await start($);
+  await $.command.run({command:'forge',args:'all'});
   const pane=await $.ui.mount(PANE_TARGET);
   expect(await pane.find({key:'job-job-9'})).toBeUndefined();
   await pane.press({key:'next-page'});

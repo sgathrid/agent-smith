@@ -25,18 +25,11 @@
  * channel that never mentioned the jobs it had just started would be a surface
  * that watches somebody else's work and ignores its own.
  *
- * WHY THE DEDUPE IS EXPLICIT RATHER THAN INHERITED FROM registry.ts:
- * forge/mirror.ts projects our jobs into `.agy-staff/jobs/` so the UNMODIFIED mod
- * plugin can render them. So the interop reader discovers our job ids too, and a
- * naive concatenation would report every job we spawn TWICE — two independently
- * computed verdicts for one id, inside a single poll. The channel's dedupe map
- * would mask the duplicate for notifications and for nothing else. So the primary
- * reader wins the id, here and in forge/service.ts, by the same rule.
- *
- * WHY WE DO NOT IMPORT `claude-code`'s reader HERE: this surface is a channel
- * about WORKERS WE SPAWN. Folding in every Claude Code subagent transcript would
- * turn a 4-event vocabulary into a firehose of the user's own internal reasoning,
- * and it would spend tokens on events nobody asked to hear.
+ * WHY THE DEDUPE IS EXPLICIT: older versions mirrored our jobs into
+ * `.agy-staff/jobs/`, and those copies may still be on disk, so the interop reader
+ * can discover our job ids too. A naive concatenation would report such a job
+ * twice, with two independently computed verdicts. So the primary reader wins the
+ * id, here and in forge/service.ts, by the same rule.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * WHY THE HAZARDS ARE HANDLED BY DELEGATING RATHER THAN REPEATED

@@ -6,7 +6,7 @@
  * after TaskCreate returns one from the host.
  */
 
-import type { FsLike } from './jobs.ts';
+import type { FsLike } from './fs.ts';
 import type { RadarJob, RadarAcceptance } from '../types/index.d.ts';
 import { readForgeJobs, acceptanceLabel } from './canonical.ts';
 import { isLiveStatus } from './format.ts';

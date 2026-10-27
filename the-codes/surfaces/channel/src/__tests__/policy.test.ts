@@ -20,12 +20,9 @@ import {
   type PushKind,
   type WatchableJob,
   type WatchStatus,
-  assertMetaSafe,
   buildBatch,
   dedupeKey,
-  metaFor,
   pushKindFor,
-  safeId,
   shouldPush,
 } from '../policy.ts';
 import { STALL_GRACE_MS } from '../../../mod/hooks/stale.ts';
@@ -117,10 +114,6 @@ test('the dedupe key is id + status, and never a timestamp', () => {
   const b = job({ status: 'failed', finishedAt: '2026-10-03T17:45:00Z' });
   assert.equal(dedupeKey(a), dedupeKey(b), 'a moved timestamp must not create a new event');
 
-  // The key is INTERNAL — it never crosses the MCP boundary, so it is not subject
-  // to the identifier-safe rule that `meta` is. It is a Map key in this process and
-  // hyphens in a job id are fine there. (`meta` is different, and the test below
-  // covers why.)
   assert.equal(dedupeKey(a), `${a.id}#failed#0`);
   assert.equal(dedupeKey(a).split('#').length, 3);
 });
@@ -207,8 +200,6 @@ test('a single event gets the specific message, not a one-item summary', () => {
     [cand(job({ id: 'implement-musm82da-f1dc1fe4', status: 'failed', warned: true, finishedAt: '2026-10-03T16:40:00Z' }))],
     NOW,
   );
-  assert.equal(batch.meta['kind'], 'failed');
-  assert.equal(batch.meta['count'], '1');
   assert.ok(batch.content!.startsWith('Agent Smith · ✗ job implement-musm82da-f1dc1fe4 · failed: worker error\n'), batch.content!);
 });
 
@@ -280,50 +271,6 @@ test('an unwarned success is not dressed up as suspicious', () => {
   assert.ok(!batch.content!.includes('claimed otherwise'), batch.content!);
 });
 
-// ── meta ────────────────────────────────────────────────────────────────────
-
-test('meta keys and values are identifier-safe, and the real job ids are not', () => {
-  // THE CONTRACT: meta keys are [A-Za-z0-9_]. Real agy job ids contain HYPHENS,
-  // so `meta.job = "implement-musm82da-f1dc1fe4"` is illegal and would make the
-  // notification silently undeliverable.
-  const real = 'implement-musm82da-f1dc1fe4';
-  assert.ok(!/^[A-Za-z0-9_]+$/.test(real), 'the premise of this test must hold');
-
-  const meta = metaFor('failed', [job({ id: real, status: 'failed' })]);
-  assert.ok(assertMetaSafe(meta), `meta not safe: ${JSON.stringify(meta)}`);
-  for (const [k] of Object.entries(meta)) {
-    assert.match(k, /^[A-Za-z0-9_]+$/, `illegal key: ${k}`);
-  }
-  assert.equal(meta['jobs'], 'implement_musm82da_f1dc1fe4');
-});
-
-test('the human-readable content keeps the real ids with hyphens', () => {
-  // Only meta is machine-facing. The text is for a person and a model, and neither
-  // cares about a hyphen — sanitising the prose would make it harder to read for
-  // no benefit.
-  const batch = buildBatch(
-    [cand(job({ id: 'implement-musm82da-f1dc1fe4', status: 'failed', finishedAt: '2026-10-03T16:40:00Z' }))],
-    NOW,
-  );
-  assert.ok(batch.content!.includes('implement-musm82da-f1dc1fe4'));
-  assert.equal(batch.meta['jobs'], 'implement_musm82da_f1dc1fe4');
-});
-
-test('assertMetaSafe rejects the shapes that would silently drop a notification', () => {
-  assert.equal(assertMetaSafe({ kind: 'failed', count: '1', jobs: 'a_b' }), true);
-  assert.equal(assertMetaSafe({ 'job-id': 'a' }), false, 'hyphen in a key');
-  assert.equal(assertMetaSafe({ kind: 'failed', jobs: 'a-b' }), false, 'hyphen in a value');
-  assert.equal(assertMetaSafe({ kind: '5 failed' }), false, 'space in a key');
-});
-
-test('safeId is lossy on purpose and that is acceptable', () => {
-  assert.equal(safeId('implement-musm82da-f1dc1fe4'), 'implement_musm82da_f1dc1fe4');
-  // Two distinct ids can collide. Allowed: meta is for coarse filtering and
-  // `content` carries the exact text, so a perfect encoding would cost more tokens
-  // than it is worth.
-  assert.equal(safeId('a-b'), safeId('a_b'));
-});
-
 // ── the shared stall threshold ──────────────────────────────────────────────
 
 test('the stall threshold is 15 minutes, shared with the mod', () => {
@@ -340,7 +287,6 @@ test('the status union the policy reasons over covers every reader outcome', () 
   const pushed = statuses.filter((s) => pushKindFor(job({ status: s, finishedAt: 'x' })) !== null);
   assert.deepEqual(pushed.sort(), ['attention', 'canceled', 'failed', 'succeeded']);
 
-  // And every push kind has a distinct meta value.
   const kinds: PushKind[] = ['finished', 'failed', 'attention', 'cancelled'];
   assert.equal(new Set(kinds).size, 4);
 });

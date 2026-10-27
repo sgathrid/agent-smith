@@ -1,7 +1,7 @@
 /**
  * Test helper: one verdict per job id across the primary and interop readers.
- * The primary (agent-smith) reader claims forge ids first, so the compat mirror
- * in `.agy-staff/jobs/` does not double-count them. Mirrors the production rule
+ * The primary (agent-smith) reader claims forge ids first, so mirrored copies
+ * left in `.agy-staff/jobs/` by older versions are not double-counted. Mirrors the production rule
  * in forge/service.ts and surfaces/channel/src/watch-source.ts.
  */
 import { AgentSmithReader } from '../../harness/agent-smith.ts';

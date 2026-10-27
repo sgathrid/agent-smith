@@ -21,8 +21,8 @@ isolates reader failures (an `unknown` job, never a throw).
 | `agent-smith` (primary) | `<repo>/.agent-smith/jobs/<id>/job.json` and sidecars | `<mode>-smith-<8 hex>` |
 | `agy-staff` (interop, read-only) | `<repo>/.agy-staff/jobs/` | `implement-musm82da-f1dc1fe4` |
 
-The `agent-smith` reader owns forge ids. The compat mirror in `.agy-staff/jobs/`
-makes them visible to the interop reader too, so callers skip forge ids
+The `agent-smith` reader owns forge ids. Older versions mirrored forge jobs into
+`.agy-staff/jobs/` and copies may remain on disk, so callers skip forge ids
 (`isForgeJobId`) when reading `agy-staff`: one job, one verdict.
 
 ## The three agy-staff hazards

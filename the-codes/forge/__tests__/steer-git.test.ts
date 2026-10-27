@@ -388,7 +388,7 @@ test('steer ack reports the job timeoutMs from the manifest when another process
   // A second service on the same repo has no live entry for the job: it is owned elsewhere (ownerPid is this process, alive).
   const other = new ForgeService({
     repo,
-    mirror: false,
+   
     flushMs: 5,
     providerSource: () => ctrl.provider,
     catalogSource: async () => [],

@@ -98,8 +98,8 @@ const GLYPH: Record<NoticeKind, string> = { finished: '✓', failed: '✗', canc
 
 // ── text ────────────────────────────────────────────────────────────────────
 
-/** Bound prose at a sentence or word boundary, never mid-word. Shared with the
- * channel (policy.ts re-exports it); views.ts `trimWords` is its near-twin. */
+/** Bound prose at a sentence or word boundary, never mid-word. The channel's
+ * views.ts `trimWords` is its near-twin. */
 export function compactExcerpt(value: string, max: number): string {
   const text = value.replace(/\s+/g, ' ').trim();
   if (text.length <= max) return text;

@@ -12,10 +12,7 @@
       "command": "node",
       "args": [
         "${CLAUDE_PLUGIN_ROOT}/runtime/dist/server.js"
-      ],
-      "env": {
-        "AGENT_SMITH_CHANNEL": "0"
-      }
+      ]
     }
   },
   "hooks": "./hooks/watch-hooks.json"

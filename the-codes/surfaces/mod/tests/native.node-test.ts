@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { readNativeJobs, syncNativeTasks, type NativeTaskClient } from '../hooks/native.ts';
-import type { FsLike } from '../hooks/jobs.ts';
+import type { FsLike } from '../hooks/fs.ts';
 
 function fsFrom(files: Record<string, string>, names: readonly { name: string; kind: string }[] = []) : FsLike {
   return {
@@ -98,15 +98,6 @@ test('a finished job native task is deleted after the close delay, once', async 
   const n = calls.length;
   await syncNativeTasks([job], closed, client, t0 + 60_000);
   assert.equal(calls.length, n, 'a deleted task is never touched again');
-});
-
-test('an orphaned running job is projected as failed, not live', async () => {
-  const base = '/repo/.agent-smith/jobs/job-o';
-  const jobs = await readNativeJobs(fsFrom({
-    [`${base}/job.json`]: JSON.stringify({ schema: 1, jobId: 'job-o', status: 'running', task: 'x' }),
-    [`${base}/orphaned`]: 'x',
-  }, [{ name: 'job-o', kind: 'dir' }] as never), '/repo');
-  assert.equal(jobs[0]?.status, 'failed');
 });
 
 test('acceptance settlement starts the native close delay, while failed outcomes remain inspectable', async () => {

@@ -4,8 +4,7 @@
  * This is the module that makes the two halves of this repo one system. It takes
  * a `WorkerHandle` from providers/, translates its event stream into OUR state
  * format (format.ts), computes the verdict (format.deriveStatus), writes the
- * anchor, and projects the result into the compat mirror (mirror.ts) so an
- * unmodified mod can draw it.
+ * anchor.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * WHY THE WRITER, AND NOT THE SURFACE, OWNS THE FILES
@@ -23,7 +22,7 @@
  * ─────────────────────────────────────────────────────────────────────────────
  *
  * The reference job made 484 tool calls. Naively, that is 484 progress.json
- * rewrites and 484 mirror progress rewrites. Both are invisible — the band polls
+ * rewrites. That is invisible — the band polls
  * at 3 s, the channel at 5 s — so we coalesce: at most one progress flush every
  * PROGRESS_FLUSH_MS, with a trailing flush on every terminal transition so the
  * last state is never lost.
@@ -64,7 +63,6 @@ import {
   type ForgeViewEvent,
   type WatchedFileSigs,
 } from './format.ts';
-import { MirrorWriter } from './mirror.ts';
 import type { JobResult, ProviderEvent, WorkerHandle } from '../providers/types.ts';
 
 /** How many recent activities we keep. Matches the pane's rendering cap. */
@@ -79,8 +77,6 @@ const SUMMARY_CHARS = 1_000;
 export interface JobWriterOptions {
   readonly repo: string;
   readonly jobId: string;
-  /** Project into the agy-staff-shaped compat mirror. Default true. */
-  readonly mirror?: boolean;
   /** Progress coalescing window, ms. Overridable so tests need not sleep. */
   readonly flushMs?: number;
 }
@@ -125,8 +121,6 @@ export class JobWriter {
   readonly jobId: string;
   private readonly repo: string;
   private readonly flushMs: number;
-  private readonly mirror: MirrorWriter;
-  private readonly mirrorOn: boolean;
 
   private manifest: ForgeManifest | null = null;
   private progress: ForgeProgress | null = null;
@@ -177,8 +171,6 @@ export class JobWriter {
     this.repo = options.repo;
     this.jobId = options.jobId;
     this.flushMs = options.flushMs ?? PROGRESS_FLUSH_MS;
-    this.mirrorOn = options.mirror ?? true;
-    this.mirror = new MirrorWriter(options.repo, { enabled: options.mirror ?? true });
   }
 
   /**
@@ -257,9 +249,7 @@ export class JobWriter {
       warnings: [],
     };
 
-    this.mirror.claim(this.jobId);
     this.writeManifest();
-    this.mirror.writeSpec(manifest, input.prompt, input.preamble);
     this.flushProgress(this.manifest.createdAt);
     // Fire and forget: spawn never waits on git. Merged into the manifest when it lands.
     this.cwd = input.cwd;
@@ -350,8 +340,8 @@ export class JobWriter {
 
   /**
    * Record that the worker's process is alive: progress.json `lastAliveAt` (and
-   * `workerPid`). Not activity: `updatedAt`, `lastEventAt`, the timeline and the
-   * mirror's events stay untouched, and only progress.json is rewritten.
+   * `workerPid`). Not activity: `updatedAt`, `lastEventAt` and the timeline
+   * stay untouched, and only progress.json is rewritten.
    */
   heartbeat(at: string, pid?: number): void {
     if (this.finished || this.manifest === null || this.progress === null) return;
@@ -496,14 +486,12 @@ export class JobWriter {
     const bounded = boundTimeline(timeline);
     this.view = { ...this.view, timeline: bounded.events, truncated: this.view.truncated || bounded.truncated };
 
-    this.mirror.appendEvent(this.jobId, event as unknown as Record<string, unknown>);
     this.touch(at);  }
 
   private onText(event: Extract<ProviderEvent, { kind: 'text' }>): void {
     if (this.manifest === null) return;
     const at = event.at;
     if (event.stream !== 'assistant') return;
-    this.mirror.appendEvent(this.jobId, event as unknown as Record<string, unknown>);
     const joinDelta = event.delta === true && this.deltaOpen;
     const transcript = [...this.view.transcript];
     if (event.delta && this.deltaOpen && transcript.length > 0) transcript[transcript.length - 1] += event.text;
@@ -630,7 +618,6 @@ export class JobWriter {
     writeAtomic(jobFile(this.repo, this.jobId, FILES.report), body);
     this.writeManifest();
     this.flushProgress(finishedAt);
-    this.mirror.finish(manifest, body, verdict.suspicious);
 
     if (verdict.suspicious) this.addWarning(verdict.reason ?? 'suspicious success');
     return manifest;
@@ -663,7 +650,6 @@ export class JobWriter {
     this.addWarning(reason);
     this.writeManifest();
     this.flushProgress(now);
-    this.mirror.finish(manifest, reportText(this.repo, this.jobId), false);
     return manifest;
   }
 
@@ -797,7 +783,6 @@ export class JobWriter {
     this.writeManifest();
     writeJsonAtomic(jobFile(this.repo, this.jobId, FILES.progress), progress);
     writeJsonAtomic(jobFile(this.repo, this.jobId, FILES.view), this.view);
-    this.mirror.writeProgress(this.manifest ?? emptyManifest(this.jobId), progress);
     const ms = Date.parse(at);
     this.lastFlushMs = Number.isNaN(ms) ? Date.now() : ms;
   }

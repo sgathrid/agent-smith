@@ -136,8 +136,6 @@ export const FILES = {
    * for `resolveHead` readers (cancel/status) during a chained turn.
    */
   steerHead: 'steer.head',
-  /** Written by the first reader to prove the owner is dead. Never edits job.json. */
-  orphaned: 'orphaned',
   /** The acceptance checks a job was spawned with, so resume_job can inherit them. */
   checksSpec: 'checks-spec.json',
 } as const;
@@ -474,9 +472,8 @@ export function readManifest(repo: string, jobId: string): ForgeManifest {
 /**
  * A fresh job id: `<mode>-smith-<8 hex>`.
  *
- * The mode is sanitised to `[a-z0-9]` because the id becomes a directory name
- * and, through the compat mirror, a filename in somebody else's directory. A
- * mode of `Review/Docs` must not be able to escape.
+ * The mode is sanitised to `[a-z0-9]` because the id becomes a directory name.
+ * A mode of `Review/Docs` must not be able to escape.
  */
 export function newJobId(mode: string): string {
   const safeMode = mode.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 120).replace(/-+$/g, '');

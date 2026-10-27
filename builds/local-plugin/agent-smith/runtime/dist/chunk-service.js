@@ -83,9 +83,9 @@ async function launchPipeline(service, spec, options) {
  *
  *   "agent-smith"  PRIMARY.  Every job this repo spawned. Authoritative.
  *   "agy-staff"    INTEROP.  Somebody else's layout, read-only. Callers skip
- *                            forge ids here: forge/mirror.ts projects our jobs
- *                            into `.agy-staff/jobs/`, so this reader also sees
- *                            them, and two verdicts for one id must never exist.
+ *                            forge ids here: older versions mirrored our jobs
+ *                            into `.agy-staff/jobs/` and copies may remain, so
+ *                            two verdicts for one id must never exist.
  *
  * WHY FAULT ISOLATION MATTERS: readers read other people's mutable state. A
  * reader that throws (bad symlink, exotic errno) must degrade to an `unknown`
@@ -1139,7 +1139,6 @@ class ForgeService {
     /** Job IDs spawned by this process, for `list_jobs session`. */
     spawnedIds = new Set();
     spawnedRuns = new Set();
-    mirrorOn;
     flushMs;
     catalogSource;
     catalogWaitMs;
@@ -1152,7 +1151,6 @@ class ForgeService {
     constructor(options) {
         this.repo = options.repo;
         this.supervisorUrl = options.supervisorUrl;
-        this.mirrorOn = options.mirror ?? true;
         this.flushMs = options.flushMs;
         this.providerSource = options.providerSource ?? requireProvider;
         this.catalogSource = options.catalogSource ?? ((providers) => getCatalogs({ providers, repo: this.repo }));
@@ -1174,7 +1172,6 @@ class ForgeService {
         return new JobWriter({
             repo: this.repo,
             jobId,
-            mirror: this.mirrorOn,
             ...(this.flushMs === undefined ? {} : { flushMs: this.flushMs }),
         });
     }
@@ -1947,8 +1944,7 @@ class ForgeService {
             out.push(...(await this.readSource('agent-smith', new AgentSmithReader())));
         }
         if (source === 'agy-staff' || source === 'all') {
-            // The interop source. Our own ids are filtered out because the compat
-            // mirror makes them visible there too, and one job must have one verdict.
+            // Genuine agy-staff jobs. Forge ids are skipped: older versions mirrored them here, and copies may remain on disk.
             out.push(...(await this.readSource('agy-staff', new AgyStaffReader(), isForgeJobId)));
         }
         const touched = (j) => Date.parse(j.finishedAt ?? j.updatedAt ?? j.startedAt ?? '');

@@ -110,7 +110,7 @@ function rawTransport(tasks = true) {
   }) as unknown as ForgeService;
 
   const handle = serveStdio(
-    ({ era }) => createSmithServer({ service, pollMs: 20, catalogs: async () => [] }, { era, tasks, channel: true }),
+    ({ era }) => createSmithServer({ service, pollMs: 20, catalogs: async () => [] }, { era, tasks }),
     { transport: serverTransport },
   );
   const responses: Array<Record<string, any>> = [];
@@ -539,7 +539,7 @@ setTimeout(()=>{
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: ['--experimental-strip-types', serverEntry],
-    env: { ...env, AGY_WATCH_CWD: repo, AGENT_SMITH_CODEX_BIN: fake, AGENT_SMITH_TASKS: '1', AGENT_SMITH_CHANNEL: '0' },
+    env: { ...env, AGY_WATCH_CWD: repo, AGENT_SMITH_CODEX_BIN: fake, AGENT_SMITH_TASKS: '1' },
     stderr: 'pipe',
   });
   const clientCapabilities = { extensions: { [TASKS_EXTENSION_ID_V2]: {} } };
@@ -613,7 +613,7 @@ import { spawn } from 'node:child_process';
 import { appendFileSync } from 'node:fs';
 const log = process.env.SPY_WIRE_LOG;
 const child = spawn(process.execPath, ['--experimental-strip-types', ${JSON.stringify(serverEntry)}], {
-  env: { ...process.env, AGENT_SMITH_TASKS: '1', AGENT_SMITH_CHANNEL: '0' },
+  env: { ...process.env, AGENT_SMITH_TASKS: '1' },
   stdio: ['pipe', 'pipe', 'pipe'],
 });
 // The test deletes this directory after \`claude mcp get\` returns; it waits for these pids first.

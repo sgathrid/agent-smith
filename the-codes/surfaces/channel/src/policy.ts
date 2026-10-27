@@ -38,10 +38,8 @@
 
 // The words live in the mod (hooks/notice.ts), which announces the same jobs
 // when it is loaded: one renderer, so the hook and the mod cannot drift apart.
-import { type NoticeJob, claudeText, compactExcerpt } from '../../mod/hooks/notice.ts';
+import { type NoticeJob, claudeText } from '../../mod/hooks/notice.ts';
 import { reasonFromText } from '../../mod/hooks/reasons.ts';
-
-export { compactExcerpt };
 
 // ── what we are allowed to say ──────────────────────────────────────────────
 
@@ -239,8 +237,6 @@ export function shouldPush(candidate: Candidate, now: number): boolean {
 export interface Batch {
   /** The notification to send, or null if there is nothing to say. */
   readonly content: string | null;
-  /** Identifier-safe metadata. Keys are [A-Za-z0-9_] only — see assertMetaSafe. */
-  readonly meta: Record<string, string>;
   /** Keys to add to `seen` AFTER a successful send. */
   readonly keys: readonly string[];
 }
@@ -259,19 +255,13 @@ export function buildBatch(candidates: readonly Candidate[], now: number): Batch
   const pushable = candidates.filter((c) => shouldPush(c, now));
 
   if (pushable.length === 0) {
-    return { content: null, meta: {}, keys: [] };
+    return { content: null, keys: [] };
   }
 
   const keys = pushable.map((c) => dedupeKey(c.job));
   const content = claudeText(pushable.map((c) => toNotice(c.job, pushKindFor(c.job)!, now)));
 
-  // Single event: its own kind. Several at once: the batch is one notice, and
-  // its meta lists every job.
-  if (pushable.length === 1) {
-    const only = pushable[0]!;
-    return { content, meta: metaFor(pushKindFor(only.job)!, [only.job]), keys };
-  }
-  return { content, meta: metaFor('failed', pushable.map((c) => c.job)), keys };
+  return { content, keys };
 }
 
 /**
@@ -300,50 +290,4 @@ export function toNotice(job: WatchableJob, kind: PushKind, now: number): Notice
     ...(kind === 'finished' && job.checksRunning !== undefined ? { checksRunning: job.checksRunning } : {}),
     ...(kind === 'attention' && job.liveness ? { liveness: { state: job.liveness.state, ...(job.liveness.tool ? { tool: job.liveness.tool } : {}) } } : {}),
   };
-}
-
-// ── meta ────────────────────────────────────────────────────────────────────
-
-/**
- * Identifier-safe `meta` for the notification.
- *
- * THE CONTRACT: meta keys must match [A-Za-z0-9_]+. Values are strings.
- *
- * Job ids contain hyphens (`implement-musm82da-f1dc1fe4`), which are NOT
- * identifier-safe. The `jobs` value is therefore sanitised by replacing every
- * illegal character with `_`. The human-readable `content` keeps the real ids
- * with their hyphens, because that text is for a person and a model, and neither
- * cares about a metacharacter. Only `meta` is machine-facing, so only `meta` is
- * sanitised.
- */
-export function metaFor(kind: PushKind, jobs: readonly WatchableJob[]): Record<string, string> {
-  return {
-    kind,
-    count: String(jobs.length),
-    jobs: jobs.map((j) => safeId(j.id)).join(','),
-  };
-}
-
-/**
- * Make an identifier safe for a `meta` value.
- *
- * Note this is deliberately lossy and deliberately NOT injective: two different
- * job ids could sanitise to the same string. That is acceptable, because `meta` is
- * for coarse filtering ("which jobs?") and `content` carries the exact text. A
- * perfect encoding here would cost more tokens than it is worth.
- */
-export function safeId(id: string): string {
-  return id.replace(/[^A-Za-z0-9_]/g, '_');
-}
-
-/**
- * Assert a meta object is identifier-safe. Exported for tests and for the
- * startup self-check: a malformed meta makes the notification undeliverable, and
- * an undeliverable notification fails SILENTLY, which is the worst possible
- * failure for a channel whose entire value is being reliably heard.
- */
-export function assertMetaSafe(meta: Record<string, string>): boolean {
-  return Object.entries(meta).every(
-    ([k, v]) => /^[A-Za-z0-9_]+$/.test(k) && typeof v === 'string' && /^[A-Za-z0-9_,]*$/.test(v),
-  );
 }

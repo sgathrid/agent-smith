@@ -3,7 +3,7 @@
  * Kept inside the plugin because the mod loader forbids imports from forge/.
  */
 import type { RadarJob, RadarStatus, ToolEntry, RadarAcceptance, ActivityEvent } from '../types/index.d.ts';
-import { toEpoch, type FsLike } from './jobs.ts';
+import { toEpoch, type FsLike } from './fs.ts';
 import type { ProgressDigest } from '../types/index.d.ts';
 import { classify, progressPhrase } from './progress.ts';
 import { isStalled, livenessOf } from './stale.ts';

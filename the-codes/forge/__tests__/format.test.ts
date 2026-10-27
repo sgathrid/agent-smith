@@ -53,7 +53,6 @@ test('every file name in the format is one the writer and the reader share', () 
     'checks-spec.json',
     'events.jsonl',
     'job.json',
-    'orphaned',
     'progress.json',
     'result.json',
     'result.md',

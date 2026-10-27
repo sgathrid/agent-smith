@@ -1,4 +1,4 @@
-import path from'node:path';import {readFileSync,existsSync,constants,mkdirSync,writeFileSync,createWriteStream,renameSync,unlinkSync,openSync,fsyncSync,closeSync,appendFileSync,statSync,copyFileSync}from'node:fs';import {readdir,open,access,constants as constants$1}from'node:fs/promises';import {randomBytes,randomUUID,createHash}from'node:crypto';import {spawn,execFile}from'node:child_process';import os from'node:os';import readline from'node:readline';/**
+import path from'node:path';import {readFileSync,existsSync,constants,mkdirSync,writeFileSync,createWriteStream,renameSync,unlinkSync,openSync,fsyncSync,closeSync,statSync,copyFileSync}from'node:fs';import {open,readdir,access,constants as constants$1}from'node:fs/promises';import {randomBytes,randomUUID,createHash}from'node:crypto';import {spawn,execFile}from'node:child_process';import os from'node:os';import readline from'node:readline';/**
  * reasons.ts — every failure, in two to four words.
  *
  * One vocabulary for every surface: the completion notice, the band, the pane,
@@ -239,8 +239,6 @@ const FILES = {
      * for `resolveHead` readers (cancel/status) during a chained turn.
      */
     steerHead: 'steer.head',
-    /** Written by the first reader to prove the owner is dead. Never edits job.json. */
-    orphaned: 'orphaned',
     /** The acceptance checks a job was spawned with, so resume_job can inherit them. */
     checksSpec: 'checks-spec.json',
 };
@@ -335,9 +333,8 @@ function readManifest(repo, jobId) {
 /**
  * A fresh job id: `<mode>-smith-<8 hex>`.
  *
- * The mode is sanitised to `[a-z0-9]` because the id becomes a directory name
- * and, through the compat mirror, a filename in somebody else's directory. A
- * mode of `Review/Docs` must not be able to escape.
+ * The mode is sanitised to `[a-z0-9]` because the id becomes a directory name.
+ * A mode of `Review/Docs` must not be able to escape.
  */
 function newJobId$1(mode) {
     const safeMode = mode.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 120).replace(/-+$/g, '');
@@ -873,7 +870,6 @@ const SMITH_PAYLOAD = {
     schema: 'schema',
 };
 const CANCELED_ORPHAN = { status: 'canceled', suspicious: false, reason: CANCEL_ORPHAN_REASON };
-const ORPHANED = { status: 'failed', suspicious: true, reason: ORPHAN_REASON };
 /**
  * Reads `.agent-smith/jobs`.
  *
@@ -965,7 +961,6 @@ class AgentSmithReader {
         let orphan = null;
         if (manifest !== null && manifest.status === 'running' && !canceled
             && !(await existsSafe(jobFile(cwd, jobId, FILES.result)))) {
-            const markerPath = jobFile(cwd, jobId, FILES.orphaned);
             const lastSeen = Math.max(Date.parse(manifest.updatedAt), Date.parse(progress?.lastEventAt ?? ''));
             orphan = deriveOrphan(manifest, Number.isFinite(lastSeen) ? lastSeen : null, Date.now(), undefined, cancelRequested);
             // A live supervisor honours a cancel request within seconds. A request that
@@ -974,11 +969,6 @@ class AgentSmithReader {
             const ownerIsAlive = ownerAlive(manifest);
             if (orphan === null && cancelRequested && cancelAgeMs > 60_000 && !ownerIsAlive)
                 orphan = CANCELED_ORPHAN;
-            // The marker is proof the supervisor is gone; a cancel request makes that
-            // a cancellation. A live pid beside a marker plus cancel is still in flight.
-            if (orphan === null && (await existsSafe(markerPath))) {
-                orphan = !cancelRequested ? ORPHANED : ownerIsAlive ? null : CANCELED_ORPHAN;
-            }
         }
         const payload = {
             [SMITH_PAYLOAD.schema]: manifest?.schema ?? null,
@@ -1053,11 +1043,9 @@ class AgentSmithReader {
     }
 }
 /*
- * THE ONE RULE ABOUT THE COMPAT MIRROR: forge/mirror.ts projects our jobs into
- * `.agy-staff/jobs/` so an unmodified mod can render them. This reader never
- * reads that projection, and `AgyStaffReader` callers skip forge ids
- * (`isForgeJobId`). Otherwise every spawned job would get two independently
- * computed verdicts in a single sweep.
+ * Older versions mirrored our jobs into `.agy-staff/jobs/`; copies may remain on
+ * disk. `AgyStaffReader` callers skip forge ids (`isForgeJobId`) so a job never
+ * gets two verdicts in one sweep.
  *//**
  * agy-staff.ts — reads agy-staff's job state from `<repo>/.agy-staff/jobs/`.
  *
@@ -6955,11 +6943,6 @@ function writeAtomic(filePath, body) {
 function writeJsonAtomic(filePath, value) {
     writeAtomic(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }
-/** Append one line to an NDJSON log. Creates the file and its parents. */
-function appendLine(filePath, value) {
-    mkdirSync(path.dirname(filePath), { recursive: true });
-    appendFileSync(filePath, `${JSON.stringify(value)}\n`);
-}
 /**
  * Create a marker file, writing `body` into it.
  *
@@ -7425,425 +7408,12 @@ class ProgressTracker {
         return 'exploring';
     }
 }/**
- * mirror.ts — the compat projection, and the only reason it is allowed to exist.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * THE PROBLEM
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * The acceptance criterion for this whole change is:
- *
- *     a job spawned through our MCP tool appears in the mod's pane,
- *     with no change to the rendering code.
- *
- * The mod's reader (surfaces/mod/hooks/jobs.ts) is a STANDALONE PLUGIN. It
- * cannot import anything outside its own folder — the loader refuses it at load
- * time, verified against 2.1.292:
- *
- *     "cannot import '../../../harness/agy-staff.ts': it is outside the
- *      plugin's folder"
- *
- * And another engineer is redesigning that UI right now, so it is off limits.
- * Which leaves exactly one way to put a job in the pane without touching the
- * pane: write the job somewhere the pane already looks.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * THE ANSWER: WE WRITE OUR OWN STATE, AND PROJECT IT
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * `.agent-smith/jobs/<jobId>/` is the truth (see format.ts). This module
- * renders that truth into agy-staff's file shapes under `.agy-staff/jobs/`, so
- * an unmodified pane finds it. Three properties make this a projection rather
- * than a fork:
- *
- *   1. IT IS ONE-WAY AND DERIVED. Nothing reads the mirror for a verdict. There
- *      is exactly one reader per job id in this system — forge's own — and it
- *      reads `.agent-smith`. The mirror exists for exactly one consumer: a reader
- *      we are not allowed to change.
- *   2. IT IS NAMESPACED. Our ids carry the `-smith-` marker and our spec.json
- *      carries a marker field, and the writer REFUSES to write over a file that
- *      is not ours (see MirrorWriter.claim). We never delete, never truncate and
- *      never read an agy-staff job. The 20 real jobs in renyi/.agy-staff/jobs
- *      are test data, not territory.
- *   3. IT IS SMALL. Seven files, all derivable from job.json + progress.json +
- *      result.md. If forge/format.ts is redesigned, this file is thrown away and
- *      rewritten in an afternoon; no history depends on it.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * WHAT THE PANE ACTUALLY READS, AND WHY EACH FIELD IS HERE
- * ─────────────────────────────────────────────────────────────────────────────
- *
- *   .spec.json              prompt_source.task → the task cell.
- *                           resolved.mode/model → provider readout.
- *   .progress.json          recent_activities → the activity phrase (highest
- *                           step_index wins, because a rewritten array is not
- *                           guaranteed sorted and showing a 4-steps-ago tool as
- *                           "now" is the quiet wrongness a band exists to
- *                           prevent). last_event_at → the stall clock.
- *   .events.jsonl           max step_index → the tool COUNT. DONE records only →
- *                           the tool HISTORY.
- *   .result.md              emptiness → the status (hazard A/C); contents → the
- *                           report in the detail view.
- *   .result.md.status.json  THE terminal anchor.
- *   .log                    `dispatch registered … at ISO` → the start time,
- *                           which exists nowhere else; and `agy_exit` → the
- *                           "died before writing a status" fallback row.
- *   .spec.json.cancel       written the INSTANT cancel is requested, so it can
- *                           outrank the status file. Hazard B.
- */
-/** agy-staff's jobs directory. Relative to the same repo as ours. */
-const MIRROR_DIR_SEGMENTS = ['.agy-staff', 'jobs'];
-const SPEC = '.spec.json';
-const PROGRESS = '.progress.json';
-const STATUS = '.result.md.status.json';
-const RESULT = '.result.md';
-const LOG = '.log';
-const EVENTS = '.events.jsonl';
-const CANCEL = '.spec.json.cancel';
-/** Written into every spec.json we mirror. The ownership claim. */
-const MIRROR_MARKER = 'agent-smith';
-function mirrorDir(repo) {
-    return path.join(repo, ...MIRROR_DIR_SEGMENTS);
-}
-function mirrorAt(repo, jobId, suffix) {
-    return path.join(mirrorDir(repo), `${jobId}${suffix}`);
-}
-/* ────────────────────────────────────────────────────────────────────────────
- * Pure builders. Everything the mirror writes is computed here, with no I/O, so
- * a reviewer can check the shape without running anything.
- * ──────────────────────────────────────────────────────────────────────────── */
-/** `.spec.json`. The `task` is what the band and pane show as the job's title. */
-/** Cap on the prompt copy kept in the spec; the pane shows it, nothing else reads it. */
-const MIRROR_PROMPT_CAP = 64_000;
-function mirrorSpec(m, prompt, preamble) {
-    return {
-        [MIRROR_MARKER]: true,
-        job_id: m.jobId,
-        name: m.name,
-        workerId: m.workerId,
-        role: m.role,
-        cwd: m.cwd,
-        prompt_source: {
-            kind: MIRROR_MARKER,
-            task: m.task,
-            ...(prompt === undefined ? {} : { prompt: prompt.slice(0, MIRROR_PROMPT_CAP) }),
-            ...(preamble === undefined || preamble === '' ? {} : { preamble }),
-        },
-        resolved: {
-            name: m.name,
-            workerId: m.workerId,
-            role: m.role,
-            mode: m.mode,
-            model: m.model,
-            // agy-staff's `profile` is its permission profile; ours is the honest
-            // equivalent, and it is the one field an operator must never have to
-            // guess at from the outside.
-            profile: m.unrestricted ? 'unrestricted' : 'default',
-            background: true,
-        },
-    };
-}
-/**
- * `.progress.json`.
- *
- * `recent_activities` is capped at 5 for the same reason agy-staff caps it: the
- * band renders one phrase, and carrying 484 of them costs bytes on every repaint
- * to display five characters.
- */
-function mirrorProgress(p, recent = p.recentActivities.slice(-5)) {
-    return {
-        job_id: p.jobId,
-        name: p.name,
-        workerId: p.workerId,
-        role: p.role,
-        latestSummary: p.latestSummary,
-        summarySource: p.summarySource,
-        last_event_at: p.lastEventAt,
-        tool_calls: p.toolCalls,
-        recent_activities: recent.map((a) => ({
-            step_index: a.stepIndex,
-            tool: a.tool,
-            ...(a.input === undefined ? {} : { input_preview: a.input }),
-            status: a.status,
-        })),
-        latest_text: p.latestText === null
-            ? null
-            : { text: p.latestText, updated_at: p.lastEventAt, incomplete: true },
-        warnings: [...p.warnings],
-    };
-}
-/**
- * `.result.md.status.json` — the terminal anchor.
- *
- * `status` is derived from OUR verdict, which `deriveStatus` already downgraded
- * when the report was empty. So the pane's own headline rule ("done + empty
- * output ⇒ failed") is a second line of defence behind ours rather than the only
- * one: by the time the pane applies it, `done` genuinely means we had output.
- *
- * `warnings: true` is carried from the verdict's `suspicious` flag. The pane
- * treats a non-empty report with warnings as still succeeded (correct — it did
- * produce work) but says so in words, which is the honest middle ground between
- * a green tick and a red row.
- */
-function mirrorStatus(m, suspicious) {
-    const status = m.status === 'succeeded' ? 'done' : m.status === 'canceled' ? 'canceled' : 'error';
-    const out = {
-        status,
-        warnings: suspicious,
-        finished_at: m.finishedAt ?? m.updatedAt,
-    };
-    const reason = m.reason ?? m.error;
-    if (reason !== null && reason !== undefined && reason !== '')
-        out['reason'] = reason;
-    else if (suspicious)
-        out['reason'] = 'no output';
-    return out;
-}
-/**
- * `.log`. Appended, never rewritten.
- *
- * The `dispatch registered` line exists for ONE reason: `startedAt` comes from
- * nowhere else. Every other field in agy-staff's layout is end-anchored, and
- * without a start there is no elapsed time to draw and no way to answer "is it
- * moving?".
- *
- * We write no `worker started … pid=N` line because we do not have the child's
- * pid: `WorkerHandle` does not expose it and adding it to the four adapters is a
- * change to a verified contract for one cosmetic field. The pane's `parseLog`
- * falls back to the dispatch line, which carries the same instant, so nothing is
- * lost — we state the omission rather than writing a pid we did not observe.
- */
-function mirrorDispatchLine(m) {
-    return `[${MIRROR_MARKER}] dispatch registered ${m.jobId} at ${m.createdAt}\n`;
-}
-/**
- * The terminal `.log` line.
- *
- * `agy_status` / `agy_exit` are agy-staff's field names, kept verbatim because
- * the pane greps for them by name. They are what makes a job that died BEFORE
- * this module could write a status file still read as `failed` rather than
- * sitting at `?` forever.
- */
-function mirrorTerminalLine(m) {
-    const ok = m.status === 'succeeded';
-    const seconds = durationSeconds(m);
-    const tokens = tokenWords(m.usage);
-    return (`[${MIRROR_MARKER}] mode=${m.mode} provider=${m.provider} job_status=${m.jobStatus ?? m.status} ` +
-        `agy_status=${ok ? 'SUCCESS' : 'ERROR'} agy_exit=${m.exitCode ?? -1} ` +
-        `duration=${seconds.toFixed(3)}s${tokens}\n`);
-}
-/**
- * Runtime in seconds, from the two timestamps, or 0 when either is missing.
- *
- * Derived rather than stored: a stored duration can disagree with the timestamps
- * that produced it, and then two readers of the same job print different
- * runtimes. One source.
- */
-function durationSeconds(m) {
-    if (m.startedAt === null || m.finishedAt === null)
-        return 0;
-    const ms = Date.parse(m.finishedAt) - Date.parse(m.startedAt);
-    if (Number.isNaN(ms) || ms < 0)
-        return 0;
-    return ms / 1000;
-}
-/** `tokens(in N, out N, think N, cache N)`, or '' when there is no usage. Absent is not zero. */
-function tokenWords(usage) {
-    if (usage === null)
-        return '';
-    const i = usage['inputTokens'];
-    const o = usage['outputTokens'];
-    if (i === undefined && o === undefined)
-        return '';
-    return ` tokens(in ${i ?? 0}, out ${o ?? 0}, think ${usage['thinkingTokens'] ?? 0}, cache ${usage['cacheReadTokens'] ?? 0})`;
-}
-/**
- * One agy-shaped `step_update` line, from a normalized provider event.
- *
- * We emit BOTH the ACTIVE and the DONE record, exactly as agy-staff does,
- * because the pane was built against that corpus: `toolCountFromEvents` takes
- * the max `step_index` (identical either way) and `toolHistoryFromEvents` keeps
- * only `state: 'DONE'` records. Emitting only the DONE record would work too,
- * but emitting the shape the readers were verified against is one fewer thing to
- * be wrong about.
- */
-function mirrorEventLine(event) {
-    const kind = event['kind'];
-    // Assistant prose, for the pane's live transcript. A separate top-level key so
-    // tool-count/tool-history readers (which only look at `step_update`) ignore it.
-    if (kind === 'text') {
-        const text = event['text'];
-        if (event['stream'] !== 'assistant' || typeof text !== 'string' || text === '' || (event['delta'] !== true && text.trim() === ''))
-            return null;
-        return { agent_text: { at: event['at'] ?? null, text: text.slice(0, 16_000), delta: event['delta'] === true } };
-    }
-    if (kind !== 'activity-start' && kind !== 'activity-end')
-        return null;
-    const activity = event['activity'];
-    if (activity === undefined)
-        return null;
-    const tool = activity['tool'];
-    if (typeof tool !== 'string')
-        return null;
-    const end = kind === 'activity-end';
-    const activityStatus = event['status'];
-    const state = !end
-        ? 'ACTIVE'
-        : activityStatus === 'error' || activityStatus === 'denied'
-            ? 'ERROR'
-            : 'DONE';
-    const parameters = typeof activity['input'] === 'string' ? { input: activity['input'] } : {};
-    const toolInfo = { ...parameters };
-    if (end) {
-        if (typeof activity['output'] === 'string')
-            toolInfo['output'] = activity['output'];
-        if (activity['denied'] === true || activityStatus === 'error' || activityStatus === 'denied') {
-            toolInfo['error'] = { type: 'TOOL_ERROR', message: `tool ${tool} did not complete` };
-        }
-    }
-    return {
-        step_update: {
-            conversation_id: event['conversationId'] ?? null,
-            step_index: activity['stepIndex'] ?? 0,
-            state,
-            step_type: 'tool',
-            tool_name: tool,
-            tool_info: toolInfo,
-        },
-    };
-}
-/* ────────────────────────────────────────────────────────────────────────────
- * The writer
- * ──────────────────────────────────────────────────────────────────────────── */
-/** Thrown when a mirror target exists and is not ours. See MirrorWriter.claim. */
-class MirrorClaimError extends Error {
-    // Explicit field, not a constructor parameter property: `node --test
-    // --experimental-strip-types` cannot erase one and fails at LOAD time, so a
-    // tsconfig that allows it is not enough — the syntax itself is unavailable.
-    filePath;
-    constructor(filePath) {
-        super(`refusing to mirror over a job that is not ours: ${filePath}. ` +
-            'agent-smith never writes a file it did not create.');
-        this.name = 'MirrorClaimError';
-        this.filePath = filePath;
-    }
-}
-/**
- * Writes the agy-staff-shaped projection for ONE of our jobs.
- *
- * The ownership claim is checked once, on the first write, and is the reason
- * this class is safe to point at a directory full of somebody else's history:
- *
- *   - If our spec.json already exists (we wrote it earlier), fine.
- *   - If NO spec.json exists, we create it and we own the id from then on.
- *   - If a spec.json exists and does NOT carry our marker, we throw. That is
- *     not a recoverable condition — it means an id collision, and the only
- *     correct response to "I am about to overwrite an agy-staff job" is to stop.
- */
-class MirrorWriter {
-    enabled;
-    // Explicit fields, not constructor parameter properties: this repo runs under
-    // `node --experimental-strip-types`, which cannot erase a parameter property
-    // and fails at load time rather than at typecheck. pipeline/pipeline.ts's
-    // Scheduler makes the same choice.
-    repo;
-    constructor(repo, options = {}) {
-        this.repo = repo;
-        this.enabled = options.enabled ?? true;
-    }
-    /** Verify we may write this job's mirror. Throws MirrorClaimError otherwise. */
-    claim(jobId) {
-        if (!this.enabled)
-            return;
-        const specPath = mirrorAt(this.repo, jobId, SPEC);
-        // existsSync via a read: no new import needed, and a read of a file we are
-        // about to check ownership of is cheaper than a failed open() syscall.
-        let existing = null;
-        try {
-            existing = readTextFile(specPath);
-        }
-        catch {
-            existing = null;
-        }
-        if (existing === null)
-            return; // nobody has claimed it; we will
-        if (parseMarkedSpec(existing))
-            return; // ours
-        throw new MirrorClaimError(specPath);
-    }
-    writeSpec(m, prompt, preamble) {
-        if (!this.enabled)
-            return;
-        writeJsonAtomic(mirrorAt(this.repo, m.jobId, SPEC), mirrorSpec(m, prompt, preamble));
-        appendLine(mirrorAt(this.repo, m.jobId, LOG), mirrorDispatchLine(m).trimEnd());
-    }
-    writeProgress(m, p) {
-        if (!this.enabled)
-            return;
-        writeJsonAtomic(mirrorAt(this.repo, m.jobId, PROGRESS), mirrorProgress(p));
-    }
-    appendEvent(jobId, event) {
-        if (!this.enabled)
-            return;
-        const line = mirrorEventLine(event);
-        if (line !== null)
-            appendLine(mirrorAt(this.repo, jobId, EVENTS), line);
-    }
-    /**
-     * Write the terminal anchor, the report, and the terminal log line.
-     *
-     * ORDER MATTERS and is not incidental:
-     *   result.md FIRST, then the log line, THEN status.json.
-     * A reader that samples between the first and the last sees no status file and
-     * still reads `running`, which is the correct conservative answer. The
-     * reverse order would open a window where `status: 'done'` exists and
-     * `result.md` does not — and "done with no report" is precisely the
-     * suspicious-success state we spend this whole codebase trying to prevent.
-     */
-    finish(m, report, suspicious) {
-        if (!this.enabled)
-            return;
-        writeAtomic(mirrorAt(this.repo, m.jobId, RESULT), report);
-        appendLine(mirrorAt(this.repo, m.jobId, LOG), mirrorTerminalLine(m).trimEnd());
-        writeJsonAtomic(mirrorAt(this.repo, m.jobId, STATUS), mirrorStatus(m, suspicious));
-    }
-    /** Write the cancel marker. First writer wins; the body is the instant. */
-    cancel(jobId, at) {
-        if (!this.enabled)
-            return false;
-        return createMarker(mirrorAt(this.repo, jobId, CANCEL), at);
-    }
-}
-/* ── local helpers, kept private so this module's public surface is the
- * builders + the writer, and the two cannot disagree ─────────────────────── */
-function readTextFile(p) {
-    try {
-        return readFileSync(p, 'utf8');
-    }
-    catch {
-        return null;
-    }
-}
-function parseMarkedSpec(body) {
-    try {
-        const parsed = JSON.parse(body);
-        if (parsed === null || typeof parsed !== 'object')
-            return false;
-        return parsed[MIRROR_MARKER] === true;
-    }
-    catch {
-        // A spec.json we cannot parse is not ours. Treating it as ours would let us
-        // overwrite a file we know nothing about, which is the whole thing we refuse.
-        return false;
-    }
-}/**
  * writer.ts — one job, from `spawn()` to the terminal anchor.
  *
  * This is the module that makes the two halves of this repo one system. It takes
  * a `WorkerHandle` from providers/, translates its event stream into OUR state
  * format (format.ts), computes the verdict (format.deriveStatus), writes the
- * anchor, and projects the result into the compat mirror (mirror.ts) so an
- * unmodified mod can draw it.
+ * anchor.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * WHY THE WRITER, AND NOT THE SURFACE, OWNS THE FILES
@@ -7861,7 +7431,7 @@ function parseMarkedSpec(body) {
  * ─────────────────────────────────────────────────────────────────────────────
  *
  * The reference job made 484 tool calls. Naively, that is 484 progress.json
- * rewrites and 484 mirror progress rewrites. Both are invisible — the band polls
+ * rewrites. That is invisible — the band polls
  * at 3 s, the channel at 5 s — so we coalesce: at most one progress flush every
  * PROGRESS_FLUSH_MS, with a trailing flush on every terminal transition so the
  * last state is never lost.
@@ -7886,8 +7456,6 @@ class JobWriter {
     jobId;
     repo;
     flushMs;
-    mirror;
-    mirrorOn;
     manifest = null;
     progress = null;
     recent = [];
@@ -7936,8 +7504,6 @@ class JobWriter {
         this.repo = options.repo;
         this.jobId = options.jobId;
         this.flushMs = options.flushMs ?? PROGRESS_FLUSH_MS;
-        this.mirrorOn = options.mirror ?? true;
-        this.mirror = new MirrorWriter(options.repo, { enabled: options.mirror ?? true });
     }
     /**
      * Write the initial snapshot, BEFORE the process is spawned.
@@ -8014,9 +7580,7 @@ class JobWriter {
             editsCompleted: 0,
             warnings: [],
         };
-        this.mirror.claim(this.jobId);
         this.writeManifest();
-        this.mirror.writeSpec(manifest, input.prompt, input.preamble);
         this.flushProgress(this.manifest.createdAt);
         // Fire and forget: spawn never waits on git. Merged into the manifest when it lands.
         this.cwd = input.cwd;
@@ -8111,8 +7675,8 @@ class JobWriter {
     }
     /**
      * Record that the worker's process is alive: progress.json `lastAliveAt` (and
-     * `workerPid`). Not activity: `updatedAt`, `lastEventAt`, the timeline and the
-     * mirror's events stay untouched, and only progress.json is rewritten.
+     * `workerPid`). Not activity: `updatedAt`, `lastEventAt` and the timeline
+     * stay untouched, and only progress.json is rewritten.
      */
     heartbeat(at, pid) {
         if (this.finished || this.manifest === null || this.progress === null)
@@ -8277,7 +7841,6 @@ class JobWriter {
             timeline.push(item);
         const bounded = boundTimeline(timeline);
         this.view = { ...this.view, timeline: bounded.events, truncated: this.view.truncated || bounded.truncated };
-        this.mirror.appendEvent(this.jobId, event);
         this.touch(at);
     }
     onText(event) {
@@ -8286,7 +7849,6 @@ class JobWriter {
         const at = event.at;
         if (event.stream !== 'assistant')
             return;
-        this.mirror.appendEvent(this.jobId, event);
         const joinDelta = event.delta === true && this.deltaOpen;
         const transcript = [...this.view.transcript];
         if (event.delta && this.deltaOpen && transcript.length > 0)
@@ -8409,7 +7971,6 @@ class JobWriter {
         writeAtomic(jobFile(this.repo, this.jobId, FILES.report), body);
         this.writeManifest();
         this.flushProgress(finishedAt);
-        this.mirror.finish(manifest, body, verdict.suspicious);
         if (verdict.suspicious)
             this.addWarning(verdict.reason ?? 'suspicious success');
         return manifest;
@@ -8442,7 +8003,6 @@ class JobWriter {
         this.addWarning(reason);
         this.writeManifest();
         this.flushProgress(now);
-        this.mirror.finish(manifest, reportText(this.repo, this.jobId), false);
         return manifest;
     }
     /**
@@ -8572,7 +8132,6 @@ class JobWriter {
         this.writeManifest();
         writeJsonAtomic(jobFile(this.repo, this.jobId, FILES.progress), progress);
         writeJsonAtomic(jobFile(this.repo, this.jobId, FILES.view), this.view);
-        this.mirror.writeProgress(this.manifest ?? emptyManifest(this.jobId), progress);
         const ms = Date.parse(at);
         this.lastFlushMs = Number.isNaN(ms) ? Date.now() : ms;
     }
@@ -8696,15 +8255,6 @@ function summaryTail(text, max) {
             return tail.slice(i).trim();
     }
     return tail.trim();
-}
-/** Read back a report we wrote. Used by abort(), where we never had one. */
-function reportText(repo, jobId) {
-    try {
-        return readFileSync(jobFile(repo, jobId, FILES.report), 'utf8');
-    }
-    catch {
-        return '';
-    }
 }
 function emptyManifest(jobId) {
     const now = new Date().toISOString();
@@ -10060,4 +9610,4 @@ function startPipeline(service, spec, options = {}) {
         throw error;
     }).finally(() => clearInterval(poll));
     return { runId, recordPath, done, cancel: () => { cancelPipeline(service.repo, runId); } };
-}export{checksReason as $,AgentSmithReader as A,deriveStatus as B,writeAtomic as C,DEFAULT_TIMEOUT_MS as D,summaryTail as E,FILES as F,failureFields as G,writeAcceptance as H,getProvider as I,nextActionFor as J,jobDir as K,fileSig as L,MODES as M,jobsDir as N,JobWriter as O,PROVIDERS as P,isMode as Q,REASONS as R,STAGE_PROMPTS as S,newJobId$1 as T,humanDuration as U,pipeEvents as V,pipelineRecordPath as W,isForgeJobId as X,computeStaleReads as Y,SMITH_PAYLOAD as Z,isForgeStatus as _,MODE_PRESETS as a,toolLabel as a0,readJsonSafe as a1,readdirSafe as a2,existsSafe as a3,readAcceptance as b,readPipeline as c,cancelPipeline as d,settleAcceptance as e,markAcceptanceSuperseded as f,isTerminalForgeStatus as g,readManifest as h,inheritContinuedProviders as i,jobFile as j,AgyStaffReader as k,errMessage as l,markAcceptancePending as m,normalize as n,findProvider as o,providerNames as p,SCHEMA_VERSION as q,reasonFromText as r,startPipeline as s,validOwnerPid as t,ownerAlive as u,validateSpec as v,writeJsonAtomic as w,reportFor as x,cwdFacts as y,deriveOrphan as z};
+}export{checksReason as $,AgentSmithReader as A,deriveStatus as B,writeAtomic as C,DEFAULT_TIMEOUT_MS as D,summaryTail as E,FILES as F,failureFields as G,writeAcceptance as H,getProvider as I,nextActionFor as J,jobDir as K,fileSig as L,MODES as M,jobsDir as N,JobWriter as O,PROVIDERS as P,isMode as Q,REASONS as R,STAGE_PROMPTS as S,newJobId$1 as T,humanDuration as U,pipeEvents as V,pipelineRecordPath as W,isForgeJobId as X,computeStaleReads as Y,SMITH_PAYLOAD as Z,isForgeStatus as _,MODE_PRESETS as a,readJsonSafe as a0,toolLabel as a1,readAcceptance as b,readPipeline as c,cancelPipeline as d,settleAcceptance as e,markAcceptanceSuperseded as f,isTerminalForgeStatus as g,readManifest as h,inheritContinuedProviders as i,jobFile as j,AgyStaffReader as k,errMessage as l,markAcceptancePending as m,normalize as n,findProvider as o,providerNames as p,SCHEMA_VERSION as q,reasonFromText as r,startPipeline as s,validOwnerPid as t,ownerAlive as u,validateSpec as v,writeJsonAtomic as w,reportFor as x,cwdFacts as y,deriveOrphan as z};

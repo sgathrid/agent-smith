@@ -8,8 +8,7 @@ sidebar on the worker list; `/forge <name or job id>` opens one worker.
 Like Claude Code's own sub-agents, the band, `/forge` and native tasks show only
 the workers **this session** launched (and the stage jobs of pipelines it ran),
 and `/clear`, `/resume` and `/branch` start that list afresh. `/forge all` lists
-every job in the repository. Legacy `.agy-staff` jobs have no session owner, so
-legacy mode always shows the repository.
+every job in the repository.
 
 ```
  ● implement-musm82da-f1dc1fe4 cargo test --workspace · 341 tools ·     12m04s
@@ -19,11 +18,6 @@ legacy mode always shows the repository.
  ✓ research-muroabc-f1dc1fe4 finished, warnings ·  8 tools ·      48s
    +2 more · /forge
 ```
-
-This file covers tracking and the band. Legacy adapter notes follow the current
-canonical contract below.
-
----
 
 ## What it does
 
@@ -94,8 +88,7 @@ claude          # launched IN the repo; .agent-smith/jobs is found there
 ```
 
 The band needs no flags, no channels, and no model tokens. It reads
-`<repo>/.agent-smith/jobs/` by default. To view legacy jobs, set
-`AGENT_SMITH_LEGACY_JOBS=1` before launching Claude.
+`<repo>/.agent-smith/jobs/`.
 
 To watch a *different* repo from the one you launched in:
 
@@ -109,7 +102,6 @@ claude
 | variable | default | meaning |
 |---|---|---|
 | `AGY_RADAR_REPO` | the session's cwd | the repo whose `.agent-smith/jobs/` to read |
-| `AGENT_SMITH_LEGACY_JOBS` | unset | `1` selects the legacy `.agy-staff/jobs/` reader |
 | `NO_COLOR` | unset | any non-empty value drops all colour (glyphs remain) |
 | `FORCE_COLOR` | unset | `0` or `false` treated as `NO_COLOR` |
 | `TERM` | unset | `dumb` treated as `NO_COLOR` |
@@ -124,7 +116,7 @@ path would make the mod report another machine's jobs.
 is refused at compile time), which is why they are spelled out rather than
 looped over.
 
-**`DEFAULT_REPO` in `hooks/jobs.ts` is now the empty string.** It used to be
+**`DEFAULT_REPO` in `hooks/register.tsx` is the empty string.** It used to be
 `/Users/gathrid/Repos/renyi`, which is not a thing a shipped plugin should
 contain: on another machine that path is either absent or — worse — someone
 else's repo, and the band would confidently draw their jobs. It is empty now, and
@@ -195,53 +187,6 @@ live launches. Pending acceptance keeps them in progress.
 Successful settled tasks close after ten seconds; failed, canceled or rejected
 tasks remain completed with an explicit outcome in their subject.
 
-## Legacy adapter evidence
-
-The remaining sections document the opt-in `.agy-staff` adapter and its original
-corpus investigation. They do not describe the default canonical reader.
-
-## What it reads
-
-Nothing is spawned. agy-staff already writes a continuously-updated snapshot for
-every job; the band reads it. Verified against 20 real jobs in
-`/Users/gathrid/Repos/renyi/.agy-staff/jobs/`:
-
-```
-<id>.spec.json              mode, model, profile, task title
-<id>.progress.json          recent_activities[≤5], last_event_at, warnings   (~100ms)
-<id>.events.jsonl           tool counts from the highest step_index; tool history
-                            (pane's detail view only, DONE records only)
-<id>.log                    the ONLY start time: "worker started … at ISO"
-<id>.result.md.status.json  status, warnings, finished_at      <- the terminal anchor
-<id>.result.md              EMPTINESS decides status, always; the CONTENTS are
-                            read only when the pane's detail view asks
-<id>.spec.json.cancel       the cancellation instant
-```
-
-### The three hazards, and where each is handled
-
-| hazard | what happens | where |
-|---|---|---|
-| **A** | on a warning-free success agy-staff **deletes** `progress.json` and `events.jsonl`. A missing progress file means FINISHED, never "missing". | `jobs.ts resolve()` — no status row reads terminal state out of an absent file; `band.ts reconcile()` — a terminal row never un-finishes on weaker evidence |
-| **B** | a `.spec.json.cancel` marker can be written *before* `status.json` is finalised | `jobs.ts resolve()` row 1, outranking `status.json` |
-| **C** | some `result.md` carry leading `<system_notification>` blocks (12 in one real job) | `jobs.ts stripSystemNotifications()` — called by both `looksEmpty()` (status) and `reportBody()` (the pane's rendered report), so the two cannot disagree |
-
-### The headline rule
-
-> An empty response with warnings is **not** a clean success.
-
-agy-staff writes `{status:'done', warnings:true}` and an empty `result.md` when a
-tool is soft-denied, then exits 0 having done nothing. `resolve()` maps that to
-`failed`, so the band draws `✗ … failed · suspicious success`, never a green ✓.
-
-The downgrade fires on **emptiness regardless of the `warnings` flag** — an empty
-result is empty whether or not agy-staff noticed, and a rule gated on its
-self-report is a rule it can forget to apply.
-
-The converse is also honoured: a **non-empty** result with `warnings:true` stays
-`succeeded` and says `finished, warnings` *in words*. Recolouring it would
-contradict `harness/normalize.ts`, and red is reserved for real failures.
-
 ## Layout
 
 ```
@@ -249,7 +194,8 @@ contradict `harness/normalize.ts`, and red is reserved for real failures.
 hooks/hooks.json            { "modules": ["./register.tsx"] }   — exactly, max 1
 hooks/register.tsx          § BAND (band author) + § PANE (pane author)
 hooks/band.ts               the band's pure rules
-hooks/jobs.ts               THE READER — one, over an injected filesystem
+hooks/canonical.ts          THE READER — over `.agent-smith/jobs`, via an injected filesystem
+hooks/fs.ts                 `FsLike` and `toEpoch`, shared by the readers
 hooks/format.ts             pure formatting, shared by band and pane
 hooks/stale.ts              livenessOf and its thresholds, shared by band and channel
 hooks/notice.ts             completion notice words and who may announce
@@ -266,92 +212,34 @@ JSX transform, so **any `.tsx` import is a hard parse error under
 `node --test`**. Logic living in `register.tsx` would therefore be untestable —
 which defeats the point of making it pure. So:
 
-- `band.ts` — glyphs, NO_COLOR, linger, the row cap, the anti-flicker fold, the
+- `band.ts` — glyphs, NO_COLOR, linger, the row cap, the
   line. Imports `./format.ts` (the shared vocabulary), not `claude-code`.
-- `jobs.ts` — takes an `FsLike` and is handed `$.fs`. Imports no `node:` builtin
-  and no `claude-code`.
+- `canonical.ts` — takes an `FsLike` (`fs.ts`) and is handed `$.fs`. Imports no
+  `node:` builtin and no `claude-code`.
 
 `register.tsx` then does nothing but register hooks and lay out what those
 return.
-
-## One reader
-
-**`hooks/jobs.ts` is the only file in the mod that reads `.agy-staff/jobs/`, and
-`resolve()` is the only function that decides a job's status.** § BAND and § PANE
-both call it, so the band above the prompt and the list inside `/forge` cannot
-report different states for the same job. Two readers would mean two answers to
-"is this job still running", which is the drift this project exists to eliminate.
-
-This was not free. The pane used to have its own reader, `hooks/job-source.ts`,
-and it could not load — it imported `node:path`, `node:fs/promises` and
-`../../../harness/`, all of which the mod loader refuses:
-
-```
-agy-radar: hooks module did not load: cannot import "node:path" (from hooks/job-source.ts):
-  a hooks module imports its own files by relative path and "claude-code", nothing else
-```
-
-It was deleted rather than repaired, and its capability came here instead:
-
-| capability | where it lives now | note |
-|---|---|---|
-| status, elapsed, tool count, activity, task, warnings | `jobs.ts resolve()` | was already here — **this was the drift** |
-| `result.md` contents for the detail view | `jobs.ts`, behind `withReport` | `reportBody()` strips hazard C first |
-| tool history for the detail view | `jobs.ts readToolHistory()` | reads `DONE` records only |
-| `stripSystemNotifications` | `jobs.ts`, exported | one de-polluter, not two |
-| `sortJobs`, `countSummary` | `format.ts` | pure presentation, never touched the disk |
-
-### Why it was not vendored instead
-
-The alternative was copying `harness/agy-staff.ts`'s reader and
-`harness/normalize.ts`'s rules into the plugin folder. That would have made the
-mod *load* while leaving two readers with two precedence tables and two answers
-to the same question — a slower, better-documented version of the problem. Vendoring
-the one genuinely-shared pure helper (`stripSystemNotifications`, 10 lines) is
-where the boundary belongs.
-
-### The cost of the merge, stated plainly
-
-`readToolHistory` used to tail-read the last 256 KB of `events.jsonl` with
-`node:fs`'s `open()`. `$.fs` has no partial read, so it now reads the whole file:
-**803 KB worst case in the real corpus, against a verified 4 MiB `$.fs` limit.**
-A file over the cap rejects, is caught, and yields no history. That is fine today
-and is the thing to revisit if jobs ever get long enough to matter.
-
-Two smaller notes, both verified against the 2.1.292 loader rather than assumed:
-
-- **`$.cwd` is refused**: "`$.cwd` is used as a value … `$` is always spelled
-  `$.noun.event(...)`". The repo comes from `session.start`'s `e.cwd`, folded into
-  the `bandConfig` atom once at start, and **§ PANE reads it from that same atom**
-  so the two halves cannot be pointed at different repos.
-- **`$.fs.ancestors` is not directory ancestry.** It resolves names for the host's
-  own `.md` files and rejects anything else. `AGY_RADAR_REPO` → session cwd is the
-  whole resolution chain, and there is no third fallback to reach for.
 
 ## Tests
 
 **Two runners, two questions. Both are needed.**
 
 ```bash
-# the RULES — 63 tests
+# the RULES
 npm test                                  # from the repo root
 node --test --experimental-strip-types "the-codes/surfaces/mod/tests/*.test.ts"
 
-# the RENDERING — 13 tests
+# the RENDERING
 claude plugin test the-codes/surfaces/mod
 ```
 
-`tests/band.test.ts` and `tests/jobs.test.ts` are the ones the brief asks for:
-pure functions, no TUI, no engine — elapsed padding, truncation, the 4-row cap,
-glyph choice, `noColor`, the anti-flicker fold, and a filesystem assembled from
-the **real corpus files** so a layout change in agy-staff fails a test rather
-than silently emptying the band.
+`tests/*.node-test.ts` are pure functions, no TUI, no engine: elapsed padding,
+truncation, the 4-row cap, glyph choice, `noColor`, and the canonical reader over
+an in-memory filesystem.
 
 `tests/engine/band.engine.test.tsx` loads the plugin through the engine's own
-host and asserts on the drawn elements: the running row is `yellow`+`bold` and
-reads `12m04s` from the real log's timestamp, every `<Text>` carries
-`wrap="truncate-end"`, `hasSurvey` yields to the host, and the deleted-progress
-case draws `✓ … finished` rather than disappearing.
+host and asserts on the drawn elements: every `<Text>` carries
+`wrap="truncate-end"`, `hasSurvey` yields to the host, and a finished row expires.
 
 **`claude plugin test` reports the two `node --test` files as "did not load",
 and that is expected.** It refuses `node:assert` / `node:test` outright
@@ -386,19 +274,6 @@ only in-place redraw is the 1 Hz tick, which changes the clock and nothing else.
 Both orderings use the same 6-column cell, so the two surfaces agree on how much
 room the clock takes. They differ in order only.
 
-## Pushback: `341 tools` is not knowable for most finished jobs
-
-The mock's `341 tools` comes from `events.jsonl`. agy-staff **deletes
-`events.jsonl` on a warning-free success** — the same hazard A that applies to
-`progress.json`. In the real 20-job corpus all 20 have `warnings: true`, so all
-20 still have their events file and all 20 produce a real count. A warning-free
-success would not.
-
-So the band omits the segment when there is no count, rather than printing `0`
-(a fabrication about a job that ran hundreds of steps) or `?` (which implies we
-looked and failed). A `0 tools` on a line the user has read is worse than a
-slightly shorter line.
-
 ## Pushback: the design mock is not internally aligned
 
 ```
@@ -425,9 +300,8 @@ cannot import "node:path" (from hooks/job-source.ts): a hooks module
 cannot import "../../../harness/agy-staff.ts": it is outside the plugin's folder
 ```
 
-So the mod did not load at all, and nothing in it worked. It is now one reader
-with one status function — see [§ One reader](#one-reader) for what happened to
-its capability and why vendoring was the wrong fix.
+So the mod did not load at all, and nothing in it worked. It is now one reader,
+`hooks/canonical.ts`, over `.agent-smith/jobs`.
 
 The acceptance test is a real run, not `plugin validate`, because the failure
 mode is a load-time refusal that a typechecker cannot see:
@@ -468,7 +342,7 @@ All VERIFIED against the 2.1.292 binary by running it, not assumed:
 
 ## Scope boundary
 
-The band owns `hooks/band.ts`, `hooks/jobs.ts`, and § BAND of `hooks/register.tsx`
+The band owns `hooks/band.ts` and § BAND of `hooks/register.tsx`
 (plus the four `PluginState` atoms it adds). It does **not** touch
 `hooks/format.ts`, `hooks/stale.ts`, `hooks/__tests__/format.test.ts`, or
 § PANE. The band↔pane coupling is three statements in `register`:
@@ -489,17 +363,15 @@ Deleting the band leaves the pane working unchanged.
 
 **None at runtime.** A hooks module cannot import from outside its folder, so
 the mod is standalone. That is a hard constraint of the mod API, not a
-preference, and it is why three small helpers (`stripSystemNotifications`, the
-stall grace, the activity phrasing) are restated inside `hooks/` rather than
+preference, and it is why small helpers (the stall grace, the activity phrasing) are restated inside `hooks/` rather than
 imported from `harness/`.
 
 The coupling that *does* exist is one-directional and written down:
 
 | in the mod | must stay in step with | if it drifts |
 |---|---|---|
-| `hooks/jobs.ts stripSystemNotifications` | `harness/agy-staff.ts` | one says a report is empty and the other does not |
 | `hooks/stale.ts STALL_GRACE_MS` | `surfaces/channel/src/watch-source.ts` (imports it) | the band says healthy while the channel says stalled — the exact contradiction this project exists to prevent |
-| `hooks/jobs.ts resolve()` | `harness/normalize.ts` | the band draws `✓` where the channel draws `failed` |
+| `hooks/canonical.ts readForgeJob()` | `harness/normalize.ts` | the band draws `✓` where the channel draws `failed` |
 
 Each restatement says so at the point of use and names the counterpart.
 `hooks/stale.ts` is a whole file for one constant, which is the honest shape of

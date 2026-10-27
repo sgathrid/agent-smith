@@ -99,7 +99,7 @@ export function makeService(provider: Provider) {
   const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-steer-'));
   const service = new ForgeService({
     repo,
-    mirror: false,
+   
     flushMs: 5,
     providerSource: () => provider,
     catalogSource: async () => [],

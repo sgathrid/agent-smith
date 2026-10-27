@@ -8,7 +8,6 @@ import { fileURLToPath } from 'node:url';
 
 import { ForgeService } from '../forge/service.ts';
 import { isForgeJobId, jobsDir, ownerAlive } from '../forge/format.ts';
-import { MIRROR_MARKER, mirrorDir } from '../forge/mirror.ts';
 import { cancelPipeline, readPipeline } from '../forge/execute.ts';
 import { checkCompatibility } from '../providers/compatibility.ts';
 import { detectAvailable, providerNames } from '../providers/registry.ts';
@@ -146,6 +145,10 @@ function scrubClaudeSettingsFile(settingsFile: string): boolean {
   }
   return true;
 }
+
+/** Older versions marked every mirrored spec.json with this key. */
+const MIRROR_MARKER = 'agent-smith';
+const mirrorDir = (repo: string): string => path.join(repo, '.agy-staff', 'jobs');
 
 /** Remove only Agent Smith's own mirrored files from `<repo>/.agy-staff/jobs/`, leaving genuine agy-staff jobs untouched. */
 function scrubMirrorDir(repo: string): number {

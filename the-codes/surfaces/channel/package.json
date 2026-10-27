@@ -2,7 +2,7 @@
   "name": "agent-smith-channel",
   "version": "0.2.0",
   "private": true,
-  "description": "Agent Smith MCP server: runs external coding agents and pushes job state changes into Claude's context.",
+  "description": "Agent Smith MCP server: runs external coding agents.",
   "license": "MIT",
   "type": "module",
   "engines": {

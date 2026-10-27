@@ -84,7 +84,7 @@ function result(): JobResult {
   };
 }
 function begin(r: string, cwd: string): JobWriter {
-  const w = new JobWriter({ repo: r, jobId: 'implement-smith-abcd1234', mirror: false, flushMs: 0 });
+  const w = new JobWriter({ repo: r, jobId: 'implement-smith-abcd1234', flushMs: 0 });
   w.start({
     provider: 'agy', mode: 'implement', model: null, effort: null, cwd, prompt: 'x', unrestricted: false,
     conversation: null, timeoutMs: 1000, pipeline: null, stage: null, attempt: null,

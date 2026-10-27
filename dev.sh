@@ -3,14 +3,12 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$PWD"
-CHANNELS=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --repo) REPO="$2"; shift 2 ;;
-    --channels) CHANNELS=1; shift ;;
     --help)
-      echo 'Usage: /path/to/agent-smith/dev.sh [--repo /path/to/workspace] [--channels] [Claude flags]'
-      echo 'MCP tools and /forge are always loaded. --channels opts into development completion notifications.'
+      echo 'Usage: /path/to/agent-smith/dev.sh [--repo /path/to/workspace] [Claude flags]'
+      echo 'MCP tools and /forge are always loaded.'
       exit 0 ;;
     *) break ;;
   esac
@@ -26,8 +24,5 @@ console.log(JSON.stringify({mcpServers:{'agent-smith':{command:process.execPath,
 JS
 )"
 ARGS=(--plugin-dir "$HERE/the-codes/surfaces/mod" --mcp-config "$MCP_CONFIG")
-if [[ "$CHANNELS" == 1 ]]; then
-  ARGS+=(--dangerously-load-development-channels server:agent-smith)
-fi
 cd "$REPO"
 exec claude "${ARGS[@]}" "$@"

@@ -6,9 +6,9 @@
  *
  *   "agent-smith"  PRIMARY.  Every job this repo spawned. Authoritative.
  *   "agy-staff"    INTEROP.  Somebody else's layout, read-only. Callers skip
- *                            forge ids here: forge/mirror.ts projects our jobs
- *                            into `.agy-staff/jobs/`, so this reader also sees
- *                            them, and two verdicts for one id must never exist.
+ *                            forge ids here: older versions mirrored our jobs
+ *                            into `.agy-staff/jobs/` and copies may remain, so
+ *                            two verdicts for one id must never exist.
  *
  * WHY FAULT ISOLATION MATTERS: readers read other people's mutable state. A
  * reader that throws (bad symlink, exotic errno) must degrade to an `unknown`

@@ -172,8 +172,6 @@ export interface ForgeOptions {
   readonly supervisorUrl?: URL;
   /** Repo whose `.agent-smith/jobs/` this service owns. */
   readonly repo: string;
-  /** Write the agy-staff-shaped compat mirror. Default true. */
-  readonly mirror?: boolean | undefined;
   /** Progress coalescing window, ms. Overridable so tests need not sleep. */
   readonly flushMs?: number | undefined;
   /** Model catalog source. Default: providers/catalog.ts getCatalogs. Injectable for tests. */
@@ -218,7 +216,6 @@ export class ForgeService {
   /** Job IDs spawned by this process, for `list_jobs session`. */
   readonly spawnedIds = new Set<string>();
   readonly spawnedRuns = new Set<string>();
-  private readonly mirrorOn: boolean;
   private readonly flushMs: number | undefined;
   private readonly catalogSource: (providers?: string[]) => Promise<ModelCatalog[]>;
   private readonly catalogWaitMs: { readonly warm: number; readonly cold: number };
@@ -232,7 +229,6 @@ export class ForgeService {
   constructor(options: ForgeOptions) {
     this.repo = options.repo;
     this.supervisorUrl = options.supervisorUrl;
-    this.mirrorOn = options.mirror ?? true;
     this.flushMs = options.flushMs;
     this.providerSource = options.providerSource ?? requireProvider;
     this.catalogSource = options.catalogSource ?? ((providers) => getCatalogs({ providers, repo: this.repo }));
@@ -253,7 +249,6 @@ export class ForgeService {
     return new JobWriter({
       repo: this.repo,
       jobId,
-      mirror: this.mirrorOn,
       ...(this.flushMs === undefined ? {} : { flushMs: this.flushMs }),
     });
   }
@@ -1098,8 +1093,7 @@ export class ForgeService {
       out.push(...(await this.readSource('agent-smith', new AgentSmithReader())));
     }
     if (source === 'agy-staff' || source === 'all') {
-      // The interop source. Our own ids are filtered out because the compat
-      // mirror makes them visible there too, and one job must have one verdict.
+      // Genuine agy-staff jobs. Forge ids are skipped: older versions mirrored them here, and copies may remain on disk.
       out.push(...(await this.readSource('agy-staff', new AgyStaffReader(), isForgeJobId)));
     }
 

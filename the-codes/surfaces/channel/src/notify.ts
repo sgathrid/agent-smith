@@ -3,8 +3,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DEFAULT_TIMEOUT_MS } from '../../../forge/service.ts';
 import { readAcceptance } from '../../../forge/checks.ts';
-import { POLL_MS } from './poller.ts';
 
+/** Advertised Tasks poll cadence. */
+const POLL_MS = 5_000;
 const MONITOR_CAP_MS = 1_800_000;
 /** Past the job's own timeout, a missing notice means none is coming (the hook watches timeout + 60 s). */
 const NOTICE_GRACE_MS = 120_000;

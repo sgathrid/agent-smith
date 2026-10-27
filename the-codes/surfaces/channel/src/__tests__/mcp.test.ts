@@ -16,7 +16,7 @@ function fixture() {
     detail: async () => ({ jobId: 'fixture-job', status: 'succeeded', provider: 'codex', mode: 'review', name: workerName, workerId: 'worker', conversation: 'thread', cwd: '/private/tmp', unrestricted: false }),
     spawnJob: async () => { launches++; return { jobId: 'fixture-job', name: 'Ada', status: 'running', timeoutMs: 1_000, warnings: [] }; },
   }) as never;
-  const handle = serveStdio(({ era }) => createSmithServer({ service, catalogs: async () => [] }, { era, channel: true }), { transport: serverTransport });
+  const handle = serveStdio(({ era }) => createSmithServer({ service, catalogs: async () => [] }, { era }), { transport: serverTransport });
   return { clientTransport, handle, launches: () => launches, renameWorker: (name: string) => { workerName = name; } };
 }
 
@@ -32,7 +32,6 @@ for (const modern of [false, true]) {
     try {
       await client.connect(h.clientTransport);
       assert.equal(client.getNegotiatedProtocolVersion(), modern ? '2026-07-28' : '2025-11-25');
-      assert.equal(Boolean(client.getServerCapabilities()?.experimental?.['claude/channel']), !modern);
       assert.equal(client.getServerCapabilities()?.extensions?.['io.modelcontextprotocol/tasks'], undefined);
       assert.ok((await client.listTools()).tools.some(t => t.name === 'spawn_job'));
       const result = await client.callTool({ name: 'spawn_job', arguments: { provider: 'codex', mode: 'review', prompt: 'review', unrestricted: true } });

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { readForgeJobs, readForgeDetail } from '../hooks/canonical.ts';
-import type { FsLike } from '../hooks/jobs.ts';
+import type { FsLike } from '../hooks/fs.ts';
 
 function memoryFs(files: Record<string, string>, reads: string[] = []): FsLike {
   return {
@@ -31,33 +31,10 @@ test('canonical list ignores legacy jobs and never reads report, view or event l
   assert.equal(jobs[0]?.status, 'running');
   assert.deepEqual(reads, [`${base}/job.json`, `${base}/progress.json`]);
 });
-test('canonical silence and orphan markers have distinct truthful outcomes', async () => {
+test('canonical silence is attention, not failure', async () => {
   const files = { [`${base}/job.json`]: JSON.stringify(manifest) };
   assert.equal((await readForgeJobs(memoryFs(files), '/repo', now + 1_000_000))[0]?.status, 'attention');
-  const orphan = (await readForgeJobs(memoryFs({ ...files, [`${base}/orphaned`]: '',
-    [`${base}/acceptance.json`]: JSON.stringify({state:'unchecked',pending:true,checks:[]}) }), '/repo', now))[0];
-  assert.equal(orphan?.status, 'failed');
-  assert.equal(orphan?.failureReason, 'server stopped');
-  assert.equal(orphan?.acceptance?.pending, false, 'an exited supervisor cannot run its pending checks');
-  assert.equal(orphan?.acceptance?.state, 'unchecked');
-});
-test('canonical: a cancel request beside the orphan marker is canceled; without the marker it is not orphaned', async () => {
-  const files = { [`${base}/job.json`]: JSON.stringify(manifest), [`${base}/cancel`]: new Date(now).toISOString() };
-  const canceled = (await readForgeJobs(memoryFs({ ...files, [`${base}/orphaned`]: '',
-    [`${base}/acceptance.json`]: JSON.stringify({state:'unchecked',pending:true,checks:[]}) }), '/repo', now))[0];
-  assert.equal(canceled?.status, 'canceled');
-  assert.equal(canceled?.acceptance?.pending, false);
-  assert.ok(!canceled?.warnings.some(w => w.code === 'orphaned'));
-  assert.equal((await readForgeJobs(memoryFs(files), '/repo', now))[0]?.status, 'running', 'cancel alone leaves the supervisor to settle it');
-  assert.equal((await readForgeJobs(memoryFs({ [`${base}/job.json`]: JSON.stringify(manifest), [`${base}/orphaned`]: '' }), '/repo', now))[0]?.status, 'failed');
-});
-test('canonical result snapshot prevents a stale orphan marker from overriding a live job', async () => {
-  const job = (await readForgeJobs(memoryFs({
-    [`${base}/job.json`]: JSON.stringify(manifest),
-    [`${base}/orphaned`]: '',
-    [`${base}/result.json`]: JSON.stringify({status:'running'}),
-  }),'/repo',now))[0];
-  assert.equal(job?.status,'running');
+  assert.equal((await readForgeJobs(memoryFs({ ...files, [`${base}/cancel`]: new Date(now).toISOString() }), '/repo', now))[0]?.status, 'running', 'cancel alone leaves the supervisor to settle it');
 });
 
 test('canonical legacy jobs use createdAt when startedAt is absent', async () => {

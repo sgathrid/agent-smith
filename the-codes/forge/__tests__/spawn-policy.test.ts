@@ -64,7 +64,7 @@ function svc(
   const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-policy-'));
   const service = new ForgeService({
     repo,
-    mirror: false,
+   
     flushMs: 1,
     providerSource: () => fake.provider,
     catalogSource: typeof cat === 'function' ? cat : async () => (cat === undefined ? [] : [cat]),
@@ -391,11 +391,16 @@ test('first spawn waits the cold catalog budget, later spawns the short one', as
   // Resolves on the next macrotask: the cold budget is huge, so only a real regression (not waiting) can fail it.
   const slow = async () => { calls++; await new Promise(r => setImmediate(r)); return [catalog()]; };
   const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-policy-'));
-  const service = new ForgeService({ repo, mirror: false, flushMs: 1, providerSource: () => f.provider, catalogSource: slow, harnessDefaults: () => ({}), catalogWaitMs: { warm: 20, cold: scaled(30_000) } });
+  const service = new ForgeService({ repo, flushMs: 1, providerSource: () => f.provider, catalogSource: slow, harnessDefaults: () => ({}), catalogWaitMs: { warm: 20, cold: scaled(30_000) } });
   const first = await service.spawnJob({ mode: 'implement', prompt: 'x', provider: 'fake', model: 'm1' });
   assert.equal(first.warnings, undefined, 'the cold wait outlasts the slow catalog');
-  const slower = new ForgeService({ repo, mirror: false, flushMs: 1, providerSource: () => f.provider, catalogSource: () => new Promise<never>(() => {}) /* never settles, so the 20 ms budget always wins */, harnessDefaults: () => ({}), catalogWaitMs: { warm: 20, cold: 20 } });
+  // A catalog that stays pending until the test releases it, so the 20 ms budget always wins. The
+  // service's budget timer is unref'd; the keep-alive stops Node from exiting the file mid-test.
+  let release: (v: ReturnType<typeof catalog>[]) => void = () => {};
+  const keepAlive = setInterval(() => {}, 1_000);
+  const slower = new ForgeService({ repo, flushMs: 1, providerSource: () => f.provider, catalogSource: () => new Promise((r) => { release = r; }), harnessDefaults: () => ({}), catalogWaitMs: { warm: 20, cold: 20 } });
   const lost = await slower.spawnJob({ mode: 'implement', prompt: 'x', provider: 'fake', model: 'm1', name: 'other' });
+  release([]); clearInterval(keepAlive);
   assert.match(lost.warnings?.[0] ?? '', /no catalog available/);
   assert.equal(calls, 1);
 });
@@ -404,12 +409,12 @@ test('warmCatalogs discovers once in the background and a spawn joins it instead
   const f = fakeProvider('fake');
   let calls = 0;
   const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-policy-'));
-  const service = new ForgeService({ repo, mirror: false, flushMs: 1, providerSource: () => f.provider, catalogSource: async () => { calls++; await new Promise(r => setImmediate(r)); return [catalog()]; }, harnessDefaults: () => ({}), catalogWaitMs: { warm: 20, cold: scaled(30_000) } });
+  const service = new ForgeService({ repo, flushMs: 1, providerSource: () => f.provider, catalogSource: async () => { calls++; await new Promise(r => setImmediate(r)); return [catalog()]; }, harnessDefaults: () => ({}), catalogWaitMs: { warm: 20, cold: scaled(30_000) } });
   service.warmCatalogs(); service.warmCatalogs();
   const ack = await service.spawnJob({ mode: 'implement', prompt: 'x', provider: 'fake', model: 'm1' });
   assert.equal(ack.warnings, undefined);
   assert.equal(calls, 1);
-  const rejecting = new ForgeService({ repo, mirror: false, providerSource: () => f.provider, catalogSource: async () => { throw new Error('boom'); } });
+  const rejecting = new ForgeService({ repo, providerSource: () => f.provider, catalogSource: async () => { throw new Error('boom'); } });
   rejecting.warmCatalogs();
   // A failing source settles within the microtask queue, so one macrotask turn is enough for it to have run (and been swallowed).
   await new Promise(r => setImmediate(r));
