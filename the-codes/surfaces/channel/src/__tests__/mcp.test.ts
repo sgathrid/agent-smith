@@ -4,16 +4,17 @@ import { Client } from '@modelcontextprotocol/client';
 import { InMemoryTransport } from '@modelcontextprotocol/server';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
 import { createSmithServer } from '../mcp.ts';
+import { withWorkerLookup } from './service-mock.ts';
 
 function fixture() {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   let launches = 0;
   let workerName = 'Ada';
-  const service = {
+  const service = withWorkerLookup({
     repo: '/private/tmp',
     detail: async () => ({ jobId: 'fixture-job', status: 'succeeded', provider: 'codex', mode: 'review', name: workerName, workerId: 'worker', conversation: 'thread', cwd: '/private/tmp', unrestricted: false }),
     spawnJob: async () => { launches++; return { jobId: 'fixture-job', name: 'Ada', status: 'running', timeoutMs: 1_000, warnings: [] }; },
-  } as never;
+  }) as never;
   const handle = serveStdio(({ era }) => createSmithServer({ service, catalogs: async () => [] }, { era, channel: true }), { transport: serverTransport });
   return { clientTransport, handle, launches: () => launches, renameWorker: (name: string) => { workerName = name; } };
 }

@@ -11,6 +11,7 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { isTerminalForgeStatus } from '../../../forge/format.ts';
 import { pollOnce, resetPoller } from './poller.ts';
 import { type Batch, type WatchableJob, buildBatch, dedupeKey } from './policy.ts';
 import { readAll, readJob, readPipelineRecord } from './watch-source.ts';
@@ -86,7 +87,7 @@ async function emitStdout(line: string): Promise<void> {
   });
 }
 
-export const DEFAULT_WATCH_TIMEOUT_MS = 45 * 60_000 + 60_000;
+const DEFAULT_WATCH_TIMEOUT_MS = 45 * 60_000 + 60_000;
 
 export interface JobWatchOptions {
   readonly cwd: string;
@@ -104,7 +105,6 @@ export interface JobWatchOptions {
 
 export type JobWatchEnd = 'done' | 'timeout' | 'aborted';
 
-const TERMINAL = new Set(['succeeded', 'failed', 'canceled']);
 
 /**
  * Watch specific jobs/runs until each is terminal. Unlike the full-scan monitor
@@ -175,7 +175,7 @@ export async function runJobWatch(options: JobWatchOptions): Promise<JobWatchEnd
           if (want.has(job.supersededBy)) done.add(id);
           continue;
         }
-        if (job && TERMINAL.has(job.status) && (seen.get(id)?.has(dedupeKey(job)) ?? false)) done.add(id);
+        if (job && isTerminalForgeStatus(job.status) && (seen.get(id)?.has(dedupeKey(job)) ?? false)) done.add(id);
       }
       if (want.size > 0 && [...want].every((id) => done.has(id))) return 'done';
     } catch (error) {

@@ -24,6 +24,7 @@ import { parseLaunch } from '../../../mod/hooks/notice.ts';
 import { createSmithServer } from '../mcp.ts';
 import { TASK_RESULT_META } from '../tasks.ts';
 import { TOOL_DEFS } from '../tools.ts';
+import { withWorkerLookup } from './service-mock.ts';
 
 const serverEntry = process.env.SMITH_TEST_SERVER ?? fileURLToPath(new URL('../server.ts', import.meta.url));
 const validator = new AjvJsonSchemaValidator();
@@ -36,7 +37,7 @@ function rawTransport(tasks = true) {
   let conversation: string | null = 'thread-1';
   let launches = 0;
   let cancels = 0;
-  const service = {
+  const service = withWorkerLookup({
     repo,
     spawnedIds: new Set<string>(),
     detail: async (jobId: string): Promise<JobDetail> => ({
@@ -104,7 +105,7 @@ function rawTransport(tasks = true) {
       cancels++;
       return { jobId, requested: true, signalled: true, note: 'signalled' };
     },
-  } as unknown as ForgeService;
+  }) as unknown as ForgeService;
 
   const handle = serveStdio(
     ({ era }) => createSmithServer({ service, pollMs: 20, catalogs: async () => [] }, { era, tasks, channel: true }),

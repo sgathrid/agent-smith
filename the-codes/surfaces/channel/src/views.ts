@@ -3,18 +3,18 @@ import { execFile } from 'node:child_process';
 import type { JobDetail, JobSummary } from '../../../forge/service.ts';
 import type { Acceptance } from '../../../forge/checks.ts';
 import type { PipelineRecord } from '../../../forge/execute.ts';
-import { STALL_GRACE_MS } from '../../mod/hooks/stale.ts';
+import { isStalled } from '../../mod/hooks/stale.ts';
 import { reasonFromText } from '../../mod/hooks/reasons.ts';
 
 export type ResponseFormat = 'concise' | 'detailed';
 export const CONCISE_LIST_LIMIT = 20;
-export const CONCISE_SUMMARY_CHARS = 200;
-export const CONCISE_REPORT_CHARS = 2_000;
-export const CONCISE_FILES_CAP = 20;
+const CONCISE_SUMMARY_CHARS = 200;
+const CONCISE_REPORT_CHARS = 2_000;
+const CONCISE_FILES_CAP = 20;
 export const EARLIER_TURNS_CAP = 5;
-export const EARLIER_REPORT_CHARS = 600;
-export const OUTPUT_TAIL_CHARS = 500;
-export const DIFF_MAX_CHARS = 40_000;
+const EARLIER_REPORT_CHARS = 600;
+const OUTPUT_TAIL_CHARS = 500;
+const DIFF_MAX_CHARS = 40_000;
 const DETAIL_HINT = 'use response_format: "detailed"';
 const flat = (s: string): string => s.replace(/\s+/g, ' ').trim();
 
@@ -36,7 +36,7 @@ export function taskStatus(status: JobSummary['status']): TaskStatus {
 }
 
 /** Cut at a word boundary within max chars, marking the cut with an ellipsis. */
-export function trimWords(text: string, max: number): string {
+function trimWords(text: string, max: number): string {
   const t = flat(text);
   if (t.length <= max) return t;
   const cut = t.slice(0, max - 1);
@@ -81,7 +81,7 @@ export function conciseRow(j: JobSummary, now = Date.now()) {
     supersededBy: j.supersededBy ?? null, steeredFrom: j.steeredFrom ?? null,
     pendingSteers: j.pendingSteers ? j.pendingSteers : null,
     nextAction: j.nextAction, warningCount: j.warnings.length || null,
-    stalled: j.status === 'running' && j.updatedAt !== null && now - Date.parse(j.updatedAt) > STALL_GRACE_MS ? true : null,
+    stalled: isStalled(j.status, j.updatedAt, now) ? true : null,
     changedFileCount: typeof j.changedFileCount === 'number' ? j.changedFileCount : null,
     acceptance: j.acceptance && (j.acceptance.state !== 'unchecked' || j.acceptance.pending || j.acceptance.checks.length > 0)
       ? checkVerdicts(j.acceptance) : null,
@@ -115,7 +115,7 @@ export function conciseStatus(d: JobDetail, acceptance: AcceptanceView | null, e
   return compact({
     jobId: d.jobId, name: d.name, provider: d.provider, model: d.model, mode: d.mode, status: d.status, taskStatus: taskStatus(d.status),
     resumable: Boolean(d.conversation),
-    stalled: d.status === 'running' && d.updatedAt !== null && Date.now() - Date.parse(d.updatedAt) > STALL_GRACE_MS,
+    stalled: isStalled(d.status, d.updatedAt, Date.now()),
     acceptance: checkVerdicts(acceptance),
     startedAt: d.startedAt, finishedAt: d.finishedAt, durationMs: Number.isNaN(started) ? null : Math.max(0, ended - started),
     toolCalls: d.toolCalls, lastActivity: lastActivity(d.lastActivity),

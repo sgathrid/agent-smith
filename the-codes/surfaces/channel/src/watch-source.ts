@@ -60,16 +60,16 @@ import { AgentSmithReader } from '../../../harness/agent-smith.ts';
 import { AgyStaffReader } from '../../../harness/agy-staff.ts';
 import { normalize } from '../../../harness/normalize.ts';
 import { existsSafe, readdirSafe, readJsonSafe } from '../../../harness/safe-fs.ts';
-import type { PipelineRecord } from '../../../forge/execute.ts';
+import { pipelineRecordPath, type PipelineRecord } from '../../../forge/execute.ts';
 import type { JobStateReader, ObservedJob } from '../../../harness/types.ts';
-import { isForgeJobId } from '../../../forge/format.ts';
+import { isForgeJobId, isTerminalForgeStatus } from '../../../forge/format.ts';
 import { readAcceptance } from '../../../forge/checks.ts';
 // Cross-surface import, and deliberately so. The mod ships as a STANDALONE plugin
 // directory — it cannot reach outside its own folder — so it has to own any
 // constant the channel also needs. One owner, two importers, no drift. The same
 // reasoning puts the dedupe rules in ./policy.ts rather than in the server: the
 // server is the only thing that could not be reused.
-import { STALL_GRACE_MS } from '../../mod/hooks/stale.ts';
+import { isStalled } from '../../mod/hooks/stale.ts';
 import { ACCEPTANCE_HOLD_MS, pipelineOutcome } from '../../mod/hooks/notice.ts';
 import type { WatchableJob, WatchStatus } from './policy.ts';
 
@@ -108,7 +108,7 @@ function acceptancePending(cwd: string, job: WatchableJob, now: number): boolean
 }
 
 const isTerminal = (job: WatchableJob): boolean =>
-  (job.status === 'succeeded' || job.status === 'failed' || job.status === 'canceled') && job.finishedAt !== null;
+  isTerminalForgeStatus(job.status) && job.finishedAt !== null;
 
 function cacheKey(cwd: string, id: string): string {
   return `${cwd}\0${id}`;
@@ -133,8 +133,7 @@ export function pipelineToWatchable(run: PipelineRecord | null): WatchableJob | 
 
 /** Read one pipeline record by run id (file name is the sanitized id). */
 export async function readPipelineRecord(cwd: string, runId: string): Promise<{ job: WatchableJob; stageJobIds: string[] } | null> {
-  const file = path.join(cwd, '.agent-smith', 'pipelines', `${runId.replace(/[^A-Za-z0-9._-]+/g, '-').slice(0, 100) || 'pipeline'}.json`);
-  const run = await readJsonSafe<PipelineRecord>(file);
+  const run = await readJsonSafe<PipelineRecord>(pipelineRecordPath(cwd, runId));
   const job = pipelineToWatchable(run);
   if (job === null || run === null) return null;
   const stageJobIds = Object.values(run.stageResults).flatMap(s => (s && typeof s.jobId === 'string' ? [s.jobId] : []));
@@ -289,13 +288,6 @@ async function readOne(
  */
 export function toWatchStatus(observed: ObservedJob, now: number): WatchStatus {
   if (observed.status !== 'running') return observed.status;
-  if (observed.updatedAt === null) {
-    // No evidence of progress at all. Treat as needing eyes rather than healthy:
-    // "we do not know" must never be drawn as "fine" (unknown
-    // escalates).
-    return 'attention';
-  }
-  const then = Date.parse(observed.updatedAt);
-  if (Number.isNaN(then)) return 'attention';
-  return now - then > STALL_GRACE_MS ? 'attention' : 'running';
+  // No evidence of progress counts as stalled: "we do not know" must never be drawn as "fine".
+  return isStalled(observed.status, observed.updatedAt, now) ? 'attention' : 'running';
 }

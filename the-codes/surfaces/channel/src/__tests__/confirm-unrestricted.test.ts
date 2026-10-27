@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { ClientCapabilities, ElicitResult } from '@modelcontextprotocol/server';
 import { DECLINED_UNRESTRICTED, UNCONFIRMED_UNRESTRICTED, callTool, type HandlerContext } from '../tools.ts';
+import { withWorkerLookup } from './service-mock.ts';
 
 // The prompt is the behaviour under test; an outer AGENT_SMITH_CONFIRM_UNRESTRICTED=0 would hide it (each test file runs in its own process).
 delete process.env.AGENT_SMITH_CONFIRM_UNRESTRICTED;
@@ -16,11 +17,11 @@ const text = (r: { content: unknown }) => ((r.content as { text: string }[])[0]!
 function harness(opts: { caps?: ClientCapabilities; action?: ElicitResult['action'] | 'throw'; server?: boolean } = {}) {
   const repo = mkdtempSync(path.join(tmpdir(), 'smith-confirm-'));
   const spawned: Array<Record<string, unknown>> = []; const asked: string[] = [];
-  const service = {
+  const service = withWorkerLookup({
     repo,
     spawnJob: async (r: Record<string, unknown>) => { spawned.push(r); return { jobId: `job-${spawned.length}`, name: r.name ?? 'w', timeoutMs: 1_000, warnings: [] }; },
     detail: async () => ({ jobId: 'fixture-job', status: 'succeeded', provider: 'codex', mode: 'review', name: 'Ada', workerId: 'Ada', conversation: 'thread', cwd: repo, unrestricted: false }),
-  } as never;
+  }) as never;
   const server: HandlerContext['server'] = {
     getClientCapabilities: () => opts.caps,
     elicitInput: async (params) => {

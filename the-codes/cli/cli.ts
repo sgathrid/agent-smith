@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 
 import { ForgeService, WorkerLookupError } from '../forge/service.ts';
 import { taskTitle } from '../forge/format.ts';
+import { STAGE_PROMPTS } from '../forge/modes.ts';
 import { startPipeline, cancelPipeline, pipelineRecordPath, readPipeline, writePipelineRecord } from '../forge/execute.ts';
 import { EFFORTS, type PipelineRun, type PipelineSpec, type Stage } from '../pipeline/types.ts';
 import { detectAvailable, missingProviders } from '../providers/registry.ts';
@@ -39,9 +40,8 @@ interface RunArgs {
   readonly routingPinned?: boolean;
 }
 
-function rolePrompt(role: string, name: string): string {
-  if (role === 'review') return `Review the work of the '${name}' stage. Report defects, missed cases, and unsupported claims. Do not rewrite the work.`;
-  if (role === 'moderate') return 'Probe the prior work independently. Report findings only.';
+function rolePrompt(role: string): string {
+  if (role === 'review' || role === 'moderate') return STAGE_PROMPTS[role];
   if (role === 'verify') return 'Run the checks and report what actually happened.';
   return 'Do the work and report what you changed and found.';
 }
@@ -57,7 +57,7 @@ function singleStageSpec(args: RunArgs, repo: string): PipelineSpec {
     name: args.target,
     provider: args.provider ?? 'agy',
     role: args.target,
-    prompt: `${rolePrompt(args.target, args.target)}\n\n${args.prompt}`,
+    prompt: `${rolePrompt(args.target)}\n\n${args.prompt}`,
     title: taskTitle(args.prompt),
   };
   if (args.name !== undefined) stage['agentName'] = args.name;
