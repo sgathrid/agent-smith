@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { evaluateAcceptance, readAcceptance, toVerifyChecks, writeAcceptance } from '../checks.ts';
+import { evaluateAcceptance, markAcceptancePending, readAcceptance, settleAcceptance, toVerifyChecks, writeAcceptance } from '../checks.ts';
 
 test('toVerifyChecks resolves cwd and applies default timeout', () => {
   const [c] = toVerifyChecks([{ name: 'a', command: 'true', cwd: 'sub' }], '/base');
@@ -74,4 +74,20 @@ test('optional spawn failure never gates; actual timeout diagnostics survive the
   assert.equal(persisted.checks[0]!.timedOut, true);
   assert.notEqual(persisted.checks[0]!.signal, null);
   assert.match(persisted.checks[0]!.reason!, /timed out/);
+});
+
+test('settleAcceptance records the verdict on the final turn and supersedes the others', async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-settle-'));
+  for (const id of ['turn-1', 'turn-2']) markAcceptancePending(repo, id);
+  assert.equal((readAcceptance(repo, 'turn-1') as { pending?: boolean }).pending, true);
+  const verdict = await settleAcceptance({
+    repo, finalJobId: 'turn-2', preparedJobIds: ['turn-1', 'turn-2'],
+    succeeded: true, checks: [{ name: 'ok', command: 'true' }], baseDir: repo,
+  });
+  assert.equal(verdict.state, 'accepted');
+  assert.equal(readAcceptance(repo, 'turn-2').state, 'accepted');
+  const first = readAcceptance(repo, 'turn-1') as { state: string; reason?: string; pending?: boolean };
+  assert.equal(first.state, 'unchecked');
+  assert.equal(first.reason, 'superseded by steered turn');
+  assert.equal(first.pending, undefined);
 });

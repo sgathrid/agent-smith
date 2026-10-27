@@ -1,7 +1,7 @@
 /** One execution owner per launch; deliberately independent of MCP transport. */
 import { ForgeService } from '../../../forge/service.ts';
 import { startPipeline } from '../../../forge/execute.ts';
-import { evaluateAcceptance, writeAcceptance } from '../../../forge/checks.ts';
+import { markAcceptancePending, settleAcceptance } from '../../../forge/checks.ts';
 import type { SupervisorRequest } from '../../../forge/supervisor.ts';
 import type { StageCheck } from '../../../pipeline/types.ts';
 
@@ -24,7 +24,7 @@ process.once('message', async (raw) => {
       const checks = payload.request.checks as StageCheck[] | undefined;
       const tracked = await service.spawnTracked({ ...payload.request, onPrepared: async (jobId) => {
         prepared.push(jobId);
-        if (checks?.length) writeAcceptance(payload.repo, jobId, { state: 'unchecked', checks: [], pending: true });
+        if (checks?.length) markAcceptancePending(payload.repo, jobId);
         if (started) return; // Continuations rebind through resolveHead, without an MCP owner.
         await new Promise<void>((resolve) => {
           process.once('message', () => { started = true; resolve(); });
@@ -34,10 +34,10 @@ process.once('message', async (raw) => {
       send({ kind: 'ack', value: tracked.ack });
       const manifest = await tracked.done;
       if (checks?.length) {
-        writeAcceptance(payload.repo, manifest.jobId, await evaluateAcceptance({ succeeded: manifest.status === 'succeeded', checks, baseDir: manifest.cwd }));
-        for (const id of prepared) if (id !== manifest.jobId) {
-          writeAcceptance(payload.repo, id, { state: 'unchecked', checks: [], reason: 'superseded by steered turn' });
-        }
+        await settleAcceptance({
+          repo: payload.repo, finalJobId: manifest.jobId, preparedJobIds: prepared,
+          succeeded: manifest.status === 'succeeded', checks, baseDir: manifest.cwd,
+        });
       }
     }
   } catch (error) {

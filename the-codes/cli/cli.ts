@@ -6,10 +6,9 @@ import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { fileURLToPath } from 'node:url';
 
-import { ForgeService, pipelineRecordPath } from '../forge/service.ts';
-import { writeJsonAtomic } from '../forge/atomic.ts';
+import { ForgeService, WorkerLookupError } from '../forge/service.ts';
 import { taskTitle } from '../forge/format.ts';
-import { startPipeline, cancelPipeline, readPipeline } from '../forge/execute.ts';
+import { startPipeline, cancelPipeline, pipelineRecordPath, readPipeline, writePipelineRecord } from '../forge/execute.ts';
 import { EFFORTS, type PipelineRun, type PipelineSpec, type Stage } from '../pipeline/types.ts';
 import { detectAvailable, missingProviders } from '../providers/registry.ts';
 import { allLadders } from './ladders.ts';
@@ -128,7 +127,7 @@ export async function cmdRun(args: RunArgs): Promise<number> {
 
   const payload: SupervisePayload = { kind: 'supervise', spec, repo, runId, unrestricted: args.unrestricted === true };
   const recordPath = pipelineRecordPath(repo, runId);
-  writeJsonAtomic(recordPath, { runId, pipeline: spec.name, status: 'running', startedAt: Date.now(), finishedAt: null, stageResults: {} });
+  writePipelineRecord(repo, runId, { runId, pipeline: spec.name, status: 'running', startedAt: Date.now(), finishedAt: null, stageResults: {} });
   const child = spawn(process.execPath, [...process.execArgv, '--experimental-strip-types', path.join(HERE, 'cli.ts'), 'supervise', JSON.stringify(payload)], {
     cwd: repo, stdio: 'ignore', detached: true, env: process.env,
   });
@@ -164,19 +163,15 @@ export async function cmdResume(identifier: string, args: RunArgs): Promise<numb
   if (args.prompt === undefined || args.prompt.trim() === '') throw new UsageError('resume needs --prompt "…"');
   const repo = path.resolve(args.repo ?? process.cwd());
   const service = new ForgeService({ repo });
-  let selected: NamedJobDetail | undefined;
+  let selected: NamedJobDetail;
   try {
-    selected = await service.detail(identifier) as unknown as NamedJobDetail;
-  } catch {
-    const matches = (await service.list({ limit: 1000 })).filter((job) => job.name === identifier)
-      .sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? ''));
-    const workerIds = new Set(matches.map((job) => job.workerId));
-    if (workerIds.size > 1) throw new UsageError(`worker name '${identifier}' is ambiguous; use a job id: ${matches.map((job) => job.jobId).join(', ')}`);
-    const active = matches.find((job) => job.status === 'running');
-    if (active !== undefined) throw new UsageError(`worker '${identifier}' is still running; cancel or wait before resuming`);
-    if (matches[0] !== undefined) selected = await service.detail(matches[0].jobId) as unknown as NamedJobDetail;
+    selected = await service.resolveWorker(identifier) as unknown as NamedJobDetail;
+  } catch (error) {
+    if (!(error instanceof WorkerLookupError)) throw error;
+    throw new UsageError(error.kind === 'ambiguous'
+      ? `worker name '${identifier}' is ambiguous; use a job id: ${error.jobIds.join(', ')}`
+      : `no worker '${identifier}' in ${repo}/.agent-smith/jobs`);
   }
-  if (selected === undefined) throw new UsageError(`no worker '${identifier}' in ${repo}/.agent-smith/jobs`);
   if (selected.status === 'running') throw new UsageError(`worker '${identifier}' is still running; cancel or wait before resuming`);
   if (selected.conversation === null || selected.conversation === '') throw new UsageError(`worker '${identifier}' has no conversation id to resume`);
   if (args.provider !== undefined && args.provider !== selected.provider) throw new UsageError(`resume cannot change provider from '${selected.provider ?? 'unknown'}'; conversation handles belong to their provider`);

@@ -1,6 +1,5 @@
 /** Detached execution, with one preparation barrier before a worker may start. */
-import { readFileSync } from 'node:fs';
-import { FILES, jobFile } from './format.ts';
+import { readManifest } from './format.ts';
 import { fork } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import type { ForgeService, SpawnRequest, TrackedSpawn } from './service.ts';
@@ -60,7 +59,7 @@ export async function launchJob(service: ForgeService, request: SpawnRequest): P
       const detail = await service.detail(head);
       if (detail.status !== 'running' && !detail.supersededBy) {
         // Read the canonical manifest, not the surface projection.
-        return JSON.parse(readFileSync(jobFile(service.repo, head, FILES.job), 'utf8')) as Awaited<TrackedSpawn['done']>;
+        return readManifest(service.repo, head) as Awaited<TrackedSpawn['done']>;
       }
       await delay(100);
     }

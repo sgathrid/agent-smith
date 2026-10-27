@@ -39,7 +39,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 
-import { appendLine, createMarker, writeAtomic, writeJsonAtomic } from './atomic.ts';
+import { createMarker, writeAtomic, writeJsonAtomic } from './atomic.ts';
 import {
   FILES,
   PROGRESS_FLUSH_MS,
@@ -324,152 +324,154 @@ export class JobWriter {
   /** Feed one normalized provider event into the snapshot. */
   onEvent(event: ProviderEvent): void {
     if (this.finished || this.manifest === null) return;
-    const at = event.at;
-
-    if (event.kind === 'started') {
-      if (typeof event.conversationId === 'string' && event.conversationId.trim() !== '') {
-        this.conversation = event.conversationId;
-        this.manifest = { ...this.manifest, conversation: this.conversation };
-        // Resume identity must survive a supervisor crash even inside the
-        // progress coalescing window, before finish() can publish it.
-        this.writeManifest();
-      }
-      if (typeof event.model === 'string' && this.manifest.model === null) {
-        // Provider-reported (structured event, never worker text) beats "unknown"/harness-config guesses.
-        this.manifest = {
-          ...this.manifest,
-          model: event.model,
-          modelResolved: event.model,
-          modelSource: 'reported',
-        };
-      }
-      this.touch(at);
-      return;
-    }
-
-    if (event.kind === 'activity-start' || event.kind === 'activity-update' || event.kind === 'activity-end') {
-      this.deltaOpen = false;
-      const ref = event.activity;
-      const isStart = event.kind === 'activity-start';
-      // An update is an in-flight call: it keeps the row active and must NOT
-      // count as a new tool call when its step was already registered.
-      const status =
-        isStart || event.kind === 'activity-update'
-          ? ('active' as const)
-          : event.status === 'denied'
-            ? ('denied' as const)
-            : event.status === 'error'
-              ? ('error' as const)
-              : ('done' as const);
-
-      if (!this.toolSteps.has(ref.stepIndex)) {
-        this.toolSteps.add(ref.stepIndex);
-        this.toolCalls += 1;
-      }
-
-      // A tool's DONE record frequently carries no `input` (the provider split
-      // ACTIVE and DONE for the same step_index, and only ACTIVE had the
-      // parameters — 14,900 archived records confirm it). So the DONE row
-      // INHERITS the input from the ACTIVE row rather than dropping it, which is
-      // what keeps the pane's activity phrase readable on a finished job. The
-      // same applies to an update, and to a later update that finally names the
-      // parameters the start did not have.
-      const idx = this.recent.findIndex((a) => a.stepIndex === ref.stepIndex);
-      const previousRow = idx >= 0 ? this.recent[idx] : undefined;
-      const input = ref.input ?? previousRow?.input;
-      const tool = ref.tool === 'tool_result' ? previousRow?.tool ?? ref.tool : ref.tool;
-      const row: ForgeActivity = {
-        stepIndex: ref.stepIndex,
-        tool,
-        status,
-        ...(input === undefined ? {} : { input }),
-      };
-      // Only an input that arrived AFTER a start without one is "new" evidence:
-      // re-sent parameters on every update must not fill the attribution buffer.
-      if (ref.input !== undefined && previousRow?.input === undefined) {
-        if (this.toolInputs.length < TOOL_INPUTS_CAP) this.toolInputs += ref.input + '\n';
-        if (classify(tool, input).kind === 'edit' && this.editToolInputs.length < TOOL_INPUTS_CAP) {
-          this.editToolInputs += ref.input + '\n';
+    switch (event.kind) {
+      case 'started': this.onStarted(event); return;
+      case 'activity-start':
+      case 'activity-update':
+      case 'activity-end': this.onActivity(event); return;
+      case 'text': this.onText(event); return;
+      case 'notice':
+        if (event.level === 'warn' || event.level === 'error') {
+          this.addWarning(event.message.slice(0, 400));
+          this.touch(event.at);
         }
-      }
-      if (event.kind === 'activity-end') this.tracker.end(ref.stepIndex, row.tool, input, status);
-      else this.tracker.start(ref.stepIndex, row.tool, ref.input ?? input);
-      this.lastActivity = row;
-      if (idx >= 0) this.recent[idx] = row;
-      else this.recent.push(row);
-      // The pane picks the HIGHEST step_index, not the last entry, because a
-      // rewritten array mid-poll is not guaranteed sorted. Keeping the array
-      // short is what stops that from mattering.
-      if (this.recent.length > RECENT_ACTIVITIES) this.recent = this.recent.slice(-RECENT_ACTIVITIES);
-
-      const tools = [...this.view.tools];
-      const toolIndex = tools.findIndex(t => t.stepIndex === ref.stepIndex);
-      const previous = tools[toolIndex];
-      const detail = { stepIndex: ref.stepIndex, at, tool: (ref.tool === 'tool_result' ? previous?.tool ?? ref.tool : ref.tool).slice(0, 120),
-        input: (ref.input ?? previous?.input ?? '').slice(0, 1_000),
-        output: (ref.output ?? previous?.output ?? '').slice(0, 2_000),
-        state: status === 'active' ? 'active' as const : status === 'done' ? 'done' as const : 'error' as const };
-      if (toolIndex >= 0) tools[toolIndex] = detail;
-      else tools.push(detail);
-      this.view = { ...this.view, tools: tools.slice(-60), truncated: this.view.truncated || tools.length > 60 ||
-        (ref.input?.length ?? 0) > 1_000 || (ref.output?.length ?? 0) > 2_000 || ref.tool.length > 120 };
-
-      const timeline = [...this.view.timeline ?? []];
-      const eventIndex = timeline.findIndex(e => e.kind === 'tool' && e.stepIndex === ref.stepIndex);
-      const oldEvent = timeline[eventIndex];
-      const item: ForgeViewEvent = { ...detail, kind: 'tool', sequence: oldEvent?.sequence ?? this.viewSequence++,
-        at: oldEvent?.at ?? at };
-      if (eventIndex >= 0) timeline[eventIndex] = item;
-      else timeline.push(item);
-      const bounded = boundTimeline(timeline);
-      this.view = { ...this.view, timeline: bounded.events, truncated: this.view.truncated || bounded.truncated };
-
-      this.mirror.appendEvent(this.jobId, event as unknown as Record<string, unknown>);
-      this.touch(at);
-      return;
-    }
-
-    if (event.kind === 'text') {
-      if (event.stream !== 'assistant') return;
-      this.mirror.appendEvent(this.jobId, event as unknown as Record<string, unknown>);
-      const joinDelta = event.delta === true && this.deltaOpen;
-      const transcript = [...this.view.transcript];
-      if (event.delta && this.deltaOpen && transcript.length > 0) transcript[transcript.length - 1] += event.text;
-      else transcript.push(event.text);
-      this.deltaOpen = event.delta === true;
-      let truncated = this.view.truncated;
-      let chars = transcript.reduce((n, t) => n + t.length, 0);
-      while (transcript.length > 1 && (chars > 64_000 || transcript.length > 200)) {
-        chars -= transcript.shift()!.length;
-        truncated = true;
-      }
-      if (chars > 64_000) { transcript[0] = transcript[0]!.slice(-64_000); truncated = true; }
-      this.view = { ...this.view, transcript, truncated };
-      const timeline = [...this.view.timeline ?? []];
-      const last = timeline.at(-1);
-      if (joinDelta && last?.kind === 'assistant') timeline[timeline.length - 1] = { ...last, text: last.text + event.text };
-      else timeline.push({ kind: 'assistant', sequence: this.viewSequence++, at, text: event.text });
-      const bounded = boundTimeline(timeline);
-      this.view = { ...this.view, timeline: bounded.events, truncated: this.view.truncated || bounded.truncated };
-      this.latestText = appendBounded(this.latestText ?? '', event.text, LATEST_TEXT_CHARS);
-      this.manifest = { ...this.manifest, latestSummary: this.latestText.trim().slice(-1_000) || this.manifest.latestSummary || null, summarySource: 'worker' };
-      this.touch(at);
-      return;
-    }
-
-    if (event.kind === 'notice') {
-      if (event.level === 'warn' || event.level === 'error') {
-        this.addWarning(event.message.slice(0, 400));
-        this.touch(at);
-      }
-      return;
-    }
-
-    if (event.kind === 'usage') {
-      this.touch(at);
-      return;
+        return;
+      case 'usage': this.touch(event.at); return;
+      default: return;
     }
   }
+
+  private onStarted(event: Extract<ProviderEvent, { kind: 'started' }>): void {
+    if (this.manifest === null) return;
+    const at = event.at;
+    if (typeof event.conversationId === 'string' && event.conversationId.trim() !== '') {
+      this.conversation = event.conversationId;
+      this.manifest = { ...this.manifest, conversation: this.conversation };
+      // Resume identity must survive a supervisor crash even inside the
+      // progress coalescing window, before finish() can publish it.
+      this.writeManifest();
+    }
+    if (typeof event.model === 'string' && this.manifest.model === null) {
+      // Provider-reported (structured event, never worker text) beats "unknown"/harness-config guesses.
+      this.manifest = {
+        ...this.manifest,
+        model: event.model,
+        modelResolved: event.model,
+        modelSource: 'reported',
+      };
+    }
+    this.touch(at);
+  }
+
+  private onActivity(event: Extract<ProviderEvent, { kind: 'activity-start' | 'activity-update' | 'activity-end' }>): void {
+    if (this.manifest === null) return;
+    const at = event.at;
+    this.deltaOpen = false;
+    const ref = event.activity;
+    const isStart = event.kind === 'activity-start';
+    // An update is an in-flight call: it keeps the row active and must NOT
+    // count as a new tool call when its step was already registered.
+    const status =
+      isStart || event.kind === 'activity-update'
+        ? ('active' as const)
+        : event.status === 'denied'
+          ? ('denied' as const)
+          : event.status === 'error'
+            ? ('error' as const)
+            : ('done' as const);
+
+    if (!this.toolSteps.has(ref.stepIndex)) {
+      this.toolSteps.add(ref.stepIndex);
+      this.toolCalls += 1;
+    }
+
+    // A tool's DONE record frequently carries no `input` (the provider split
+    // ACTIVE and DONE for the same step_index, and only ACTIVE had the
+    // parameters — 14,900 archived records confirm it). So the DONE row
+    // INHERITS the input from the ACTIVE row rather than dropping it, which is
+    // what keeps the pane's activity phrase readable on a finished job. The
+    // same applies to an update, and to a later update that finally names the
+    // parameters the start did not have.
+    const idx = this.recent.findIndex((a) => a.stepIndex === ref.stepIndex);
+    const previousRow = idx >= 0 ? this.recent[idx] : undefined;
+    const input = ref.input ?? previousRow?.input;
+    const tool = ref.tool === 'tool_result' ? previousRow?.tool ?? ref.tool : ref.tool;
+    const row: ForgeActivity = {
+      stepIndex: ref.stepIndex,
+      tool,
+      status,
+      ...(input === undefined ? {} : { input }),
+    };
+    // Only an input that arrived AFTER a start without one is "new" evidence:
+    // re-sent parameters on every update must not fill the attribution buffer.
+    if (ref.input !== undefined && previousRow?.input === undefined) {
+      if (this.toolInputs.length < TOOL_INPUTS_CAP) this.toolInputs += ref.input + '\n';
+      if (classify(tool, input).kind === 'edit' && this.editToolInputs.length < TOOL_INPUTS_CAP) {
+        this.editToolInputs += ref.input + '\n';
+      }
+    }
+    if (event.kind === 'activity-end') this.tracker.end(ref.stepIndex, row.tool, input, status);
+    else this.tracker.start(ref.stepIndex, row.tool, ref.input ?? input);
+    this.lastActivity = row;
+    if (idx >= 0) this.recent[idx] = row;
+    else this.recent.push(row);
+    // The pane picks the HIGHEST step_index, not the last entry, because a
+    // rewritten array mid-poll is not guaranteed sorted. Keeping the array
+    // short is what stops that from mattering.
+    if (this.recent.length > RECENT_ACTIVITIES) this.recent = this.recent.slice(-RECENT_ACTIVITIES);
+
+    const tools = [...this.view.tools];
+    const toolIndex = tools.findIndex(t => t.stepIndex === ref.stepIndex);
+    const previous = tools[toolIndex];
+    const detail = { stepIndex: ref.stepIndex, at, tool: (ref.tool === 'tool_result' ? previous?.tool ?? ref.tool : ref.tool).slice(0, 120),
+      input: (ref.input ?? previous?.input ?? '').slice(0, 1_000),
+      output: (ref.output ?? previous?.output ?? '').slice(0, 2_000),
+      state: status === 'active' ? 'active' as const : status === 'done' ? 'done' as const : 'error' as const };
+    if (toolIndex >= 0) tools[toolIndex] = detail;
+    else tools.push(detail);
+    this.view = { ...this.view, tools: tools.slice(-60), truncated: this.view.truncated || tools.length > 60 ||
+      (ref.input?.length ?? 0) > 1_000 || (ref.output?.length ?? 0) > 2_000 || ref.tool.length > 120 };
+
+    const timeline = [...this.view.timeline ?? []];
+    const eventIndex = timeline.findIndex(e => e.kind === 'tool' && e.stepIndex === ref.stepIndex);
+    const oldEvent = timeline[eventIndex];
+    const item: ForgeViewEvent = { ...detail, kind: 'tool', sequence: oldEvent?.sequence ?? this.viewSequence++,
+      at: oldEvent?.at ?? at };
+    if (eventIndex >= 0) timeline[eventIndex] = item;
+    else timeline.push(item);
+    const bounded = boundTimeline(timeline);
+    this.view = { ...this.view, timeline: bounded.events, truncated: this.view.truncated || bounded.truncated };
+
+    this.mirror.appendEvent(this.jobId, event as unknown as Record<string, unknown>);
+    this.touch(at);  }
+
+  private onText(event: Extract<ProviderEvent, { kind: 'text' }>): void {
+    if (this.manifest === null) return;
+    const at = event.at;
+    if (event.stream !== 'assistant') return;
+    this.mirror.appendEvent(this.jobId, event as unknown as Record<string, unknown>);
+    const joinDelta = event.delta === true && this.deltaOpen;
+    const transcript = [...this.view.transcript];
+    if (event.delta && this.deltaOpen && transcript.length > 0) transcript[transcript.length - 1] += event.text;
+    else transcript.push(event.text);
+    this.deltaOpen = event.delta === true;
+    let truncated = this.view.truncated;
+    let chars = transcript.reduce((n, t) => n + t.length, 0);
+    while (transcript.length > 1 && (chars > 64_000 || transcript.length > 200)) {
+      chars -= transcript.shift()!.length;
+      truncated = true;
+    }
+    if (chars > 64_000) { transcript[0] = transcript[0]!.slice(-64_000); truncated = true; }
+    this.view = { ...this.view, transcript, truncated };
+    const timeline = [...this.view.timeline ?? []];
+    const last = timeline.at(-1);
+    if (joinDelta && last?.kind === 'assistant') timeline[timeline.length - 1] = { ...last, text: last.text + event.text };
+    else timeline.push({ kind: 'assistant', sequence: this.viewSequence++, at, text: event.text });
+    const bounded = boundTimeline(timeline);
+    this.view = { ...this.view, timeline: bounded.events, truncated: this.view.truncated || bounded.truncated };
+    this.latestText = appendBounded(this.latestText ?? '', event.text, LATEST_TEXT_CHARS);
+    this.manifest = { ...this.manifest, latestSummary: this.latestText.trim().slice(-1_000) || this.manifest.latestSummary || null, summarySource: 'worker' };
+    this.touch(at);  }
 
   /**
    * Write the terminal state.
@@ -879,11 +881,6 @@ export function pipeEvents(writer: JobWriter, handle: WorkerHandle): () => void 
 export function reportFor(result: JobResult): string {
   if (typeof result.response === 'string' && !looksEmpty(result.response)) return result.response;
   return '';
-}
-
-/** Append one normalized event straight to our own event log. Used by tests. */
-export function appendOwnEvent(repo: string, jobId: string, event: ProviderEvent): void {
-  appendLine(jobFile(repo, jobId, FILES.events), event);
 }
 
 /** Ordered previews use the same bounded budget as the other detail fields. */

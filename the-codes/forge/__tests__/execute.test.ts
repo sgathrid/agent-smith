@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import { assertFakeProviderActive } from '../testing/shim.ts';
 import { ForgeService } from '../service.ts';
-import { cancelPipeline, pipelineCancelPath, readPipeline, startPipeline } from '../execute.ts';
+import { cancelPipeline, pipelineCancelPath, pipelineRecordPath, readPipeline, startPipeline } from '../execute.ts';
 
 assertFakeProviderActive();
 
@@ -52,4 +52,33 @@ test('a running stage shows in the record with its job, then is replaced by its 
   const final = readPipeline(repo, run.runId)?.stageResults['slow'];
   assert.notEqual(final?.status, 'running');
   assert.equal(final?.jobId, running?.jobId);
+});
+
+test('a run id of 90 characters keeps its record, cancel marker and lookups on one name', async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-execute-'));
+  const service = new ForgeService({ repo });
+  const spec = { name: 'long-id', workDir: repo, stages: [{ name: 'slow', provider: 'agy', prompt: 'run slowly' }] } as const;
+  const runId = `run-${'x'.repeat(86)}`;
+  assert.equal(runId.length, 90);
+
+  const run = startPipeline(service, spec, { runId });
+  assert.equal(run.runId, runId);
+  assert.equal(run.recordPath, pipelineRecordPath(repo, runId));
+  // Record and cancel marker share one sanitised stem; the old record path cut it at 80.
+  assert.equal(path.basename(run.recordPath, '.json'), path.basename(pipelineCancelPath(repo, runId), '.cancel'));
+  assert.equal(path.basename(run.recordPath), `${runId}.json`);
+  assert.equal(readPipeline(repo, runId)?.runId, runId);
+  assert.equal(cancelPipeline(repo, runId).requested, true);
+  assert.ok(existsSync(pipelineCancelPath(repo, runId)));
+  await run.done;
+  assert.notEqual(readPipeline(repo, runId)?.status, 'running');
+});
+
+test('a record written under the old 80-character name is still found by its 90-character run id', () => {
+  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-execute-'));
+  const runId = `legacy-${'y'.repeat(83)}`;
+  const legacy = path.join(repo, '.agent-smith', 'pipelines', `${runId.slice(0, 80)}.json`);
+  mkdirSync(path.dirname(legacy), { recursive: true });
+  writeFileSync(legacy, JSON.stringify({ runId, pipeline: 'p', status: 'passed', startedAt: 1, finishedAt: 2, stageResults: {} }));
+  assert.equal(readPipeline(repo, runId)?.status, 'passed');
 });

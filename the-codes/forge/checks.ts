@@ -13,11 +13,12 @@
  *   - job succeeded, a blocking check fails   -> 'rejected'
  *   Non-blocking checks (blocking: false) are reported but never gate.
  */
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { runChecks } from '../verify/runner.ts';
 import type { Check, CheckReport, CheckSkipReason, Verdict } from '../verify/types.ts';
 import type { StageCheck } from '../pipeline/types.ts';
+import { writeJsonAtomic } from './atomic.ts';
 import { jobDir } from './format.ts';
 
 export const ACCEPTANCE_FILE = 'acceptance.json';
@@ -101,30 +102,58 @@ export function toVerifyChecks(checks: readonly StageCheck[], baseDir: string): 
   }));
 }
 
-export async function evaluateAcceptance(input: {
+/**
+ * Run the checks once and return both the persisted verdict and the raw report.
+ * Pipeline stages need the report (its verdicts become stage evidence); every
+ * other caller only wants the Acceptance, via `evaluateAcceptance`.
+ */
+export async function runAcceptance(input: {
   readonly succeeded: boolean; readonly checks: readonly StageCheck[] | undefined;
   readonly baseDir: string; readonly signal?: AbortSignal; readonly now?: () => Date;
-}): Promise<Acceptance> {
-  const at = (input.now ?? (() => new Date()))().toISOString();
-  if (!input.checks?.length) return { state: 'unchecked', checks: [], at };
-  if (!input.succeeded) return { state: 'rejected', checks: [], at, reason: 'job did not succeed; checks not run' };
+}): Promise<{ readonly acceptance: Acceptance; readonly report: CheckReport | null }> {
+  const stamp = (): string => (input.now ?? (() => new Date()))().toISOString();
+  if (!input.checks?.length) return { acceptance: { state: 'unchecked', checks: [], at: stamp() }, report: null };
+  if (!input.succeeded) {
+    return { acceptance: { state: 'rejected', checks: [], at: stamp(), reason: 'job did not succeed; checks not run' }, report: null };
+  }
   const rawReport = await runChecks(toVerifyChecks(input.checks, input.baseDir), { signal: input.signal });
   const report = normalizeAcceptanceReport(rawReport, input.checks);
   const checks = acceptanceChecksFromReport(report, input.checks);
-  return {
-    state: acceptanceState(checks),
-    at,
-    checks,
-  };
+  return { acceptance: { state: acceptanceState(checks), at: stamp(), checks }, report };
+}
+
+export async function evaluateAcceptance(input: Parameters<typeof runAcceptance>[0]): Promise<Acceptance> {
+  return (await runAcceptance(input)).acceptance;
 }
 
 export function writeAcceptance(repo: string, jobId: string, acceptance: Acceptance): void {
-  const dir = jobDir(repo, jobId);
-  mkdirSync(dir, { recursive: true });
-  const target = path.join(dir, ACCEPTANCE_FILE);
-  const tmp = `${target}.${process.pid}.tmp`;
-  writeFileSync(tmp, `${JSON.stringify(acceptance, null, 2)}\n`);
-  renameSync(tmp, target);
+  writeJsonAtomic(path.join(jobDir(repo, jobId), ACCEPTANCE_FILE), acceptance);
+}
+
+/**
+ * The placeholder written when a job is prepared, before it is terminal, so a
+ * reader can tell "checks still to run" from "no checks attached".
+ */
+export function markAcceptancePending(repo: string, jobId: string): void {
+  writeAcceptance(repo, jobId, { state: 'unchecked', checks: [], pending: true });
+}
+
+/** A steered job's earlier turns never get checks of their own; the final turn carries the verdict. */
+export function markAcceptanceSuperseded(repo: string, jobId: string): void {
+  writeAcceptance(repo, jobId, { state: 'unchecked', checks: [], reason: 'superseded by steered turn' });
+}
+
+/**
+ * Evaluate the finished job, record the verdict on its final turn, and mark
+ * every other prepared turn superseded. Returns the verdict written.
+ */
+export async function settleAcceptance(input: Parameters<typeof runAcceptance>[0] & {
+  readonly repo: string; readonly finalJobId: string; readonly preparedJobIds: readonly string[];
+}): Promise<Acceptance> {
+  const acceptance = await evaluateAcceptance(input);
+  writeAcceptance(input.repo, input.finalJobId, acceptance);
+  for (const id of input.preparedJobIds) if (id !== input.finalJobId) markAcceptanceSuperseded(input.repo, id);
+  return acceptance;
 }
 
 /** Sidecar contents, or {state:'unchecked'} when absent or unreadable. */

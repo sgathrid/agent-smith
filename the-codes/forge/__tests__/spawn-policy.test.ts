@@ -342,3 +342,26 @@ test('a provider without per-run effort control records no effort and warns', as
   assert.equal(job.effort, null, 'an effort that was not applied must not be recorded as if it was');
   assert.equal(fake.specs[0]?.effort, undefined, 'the adapter is not asked to honor an impossible knob');
 });
+
+test('resolveWorker takes a job id or a name, newest turn first, and refuses an ambiguous name', async () => {
+  const fake = fakeProvider('fake');
+  const now = new Date().toISOString();
+  const finished = { ok: true, status: 'success', response: 'done', exitCode: 0, startedAt: now, finishedAt: now } as unknown as JobResult;
+  fake.provider.spawn = async (spec: SpawnSpec) => ({
+    cancel() {}, onEvent: () => () => {}, waitForResult: async () => ({ ...finished, jobId: spec.jobId, provider: 'fake' }),
+  }) as never;
+  const { service } = svc(fake);
+  const { ack: first, done: firstDone } = await service.spawnTracked({ mode: 'review', prompt: 'x', name: 'solo' });
+  await firstDone;
+  assert.equal((await service.resolveWorker(first.jobId)).jobId, first.jobId);
+  assert.equal((await service.resolveWorker('solo')).jobId, first.jobId);
+  const { ack: second, done: secondDone } = await service.spawnTracked({ mode: 'review', prompt: 'x', name: 'solo', workerId: 'another-identity' });
+  await secondDone;
+  assert.notEqual(second.jobId, first.jobId);
+  await assert.rejects(service.resolveWorker('solo'), (e: Error) => {
+    assert.equal(e.name, 'WorkerLookupError');
+    assert.match(e.message, /matches 2 workers/);
+    return true;
+  });
+  await assert.rejects(service.resolveWorker('nobody'), /No worker "nobody"/);
+});

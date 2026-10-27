@@ -7,7 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { ForgeService } from '../forge/service.ts';
-import { isForgeJobId, isPidAlive, jobsDir } from '../forge/format.ts';
+import { isForgeJobId, jobsDir, ownerAlive } from '../forge/format.ts';
 import { MIRROR_MARKER, mirrorDir } from '../forge/mirror.ts';
 import { cancelPipeline, readPipeline } from '../forge/execute.ts';
 import { checkCompatibility } from '../providers/compatibility.ts';
@@ -182,8 +182,7 @@ function liveJobs(repo: string): string[] {
     for (const entry of readdirSync(jobsDir(repo), { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
       const job = readJobRecord(repo, entry.name);
-      const owner = job?.['ownerPid'];
-      if (job?.['status'] === 'running' && typeof owner === 'number' && isPidAlive(owner)) live.push(entry.name);
+      if (job?.['status'] === 'running' && ownerAlive(job)) live.push(entry.name);
     }
   } catch { /* no jobs dir */ }
   return live;

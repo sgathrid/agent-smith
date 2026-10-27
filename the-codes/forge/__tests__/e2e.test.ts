@@ -453,7 +453,7 @@ async function waitForTerminal(repoRoot: string, jobId: string, timeoutMs: numbe
 }
 
 test('humanDuration reads at a glance', async () => {
-  const { humanDuration } = await import('../service.ts');
+  const { humanDuration } = await import('../../providers/failure-text.ts');
   assert.equal(humanDuration(30_000), '30s');
   assert.equal(humanDuration(45 * 60_000), '45m');
   assert.equal(humanDuration(65 * 60_000), '1h05m');

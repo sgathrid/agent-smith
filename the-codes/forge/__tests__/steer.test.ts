@@ -1024,7 +1024,7 @@ test('watched brief files: rejects symlink escaping repo, enforces 32-file cap, 
 });
 
 test('watched destinations reject escaped file and parent symlinks before any copy', async () => {
-  const { syncWatchedFiles } = await import('../service.ts');
+  const { syncWatchedFiles } = await import('../watched-files.ts');
   for (const parent of [false, true]) {
     const repo = mkdtempSync(path.join(tmpdir(), 'smith-src-'));
     const cwd = mkdtempSync(path.join(tmpdir(), 'smith-dst-'));
@@ -1040,7 +1040,7 @@ test('watched destinations reject escaped file and parent symlinks before any co
 });
 
 test('unresolved worker edits survive repeated syncs until explicitly reconciled', async () => {
-  const { syncWatchedFiles } = await import('../service.ts');
+  const { syncWatchedFiles } = await import('../watched-files.ts');
   const repo = mkdtempSync(path.join(tmpdir(), 'smith-src-'));
   const cwd = mkdtempSync(path.join(tmpdir(), 'smith-dst-'));
   const writeRepo = (s: string) => writeFileSync(path.join(repo, 'brief.md'), s);

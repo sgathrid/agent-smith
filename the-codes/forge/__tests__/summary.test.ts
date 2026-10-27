@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { ObservedJob } from '../../harness/types.ts';
-import { toSummary } from '../service.ts';
+import { toSummary } from '../summary.ts';
 
 function observed(raw: Record<string, unknown>, status: ObservedJob['status'] = 'running'): ObservedJob {
   return {

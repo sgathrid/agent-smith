@@ -67,15 +67,13 @@ import type {
   StageResult,
   StageRunner,
 } from '../pipeline/types.ts';
-import { FILES, jobDir, jobFile } from './format.ts';
+import { FILES, jobFile } from './format.ts';
 import type { ForgeService, SpawnRequest } from './service.ts';
 import type { ForgeActivity, ForgeManifest } from './format.ts';
 import { appendBounded } from './writer.ts';
 import { isMode, MODE_PRESETS } from './modes.ts';
-import { runChecks } from '../verify/runner.ts';
-import { acceptanceChecksFromReport, acceptanceState, normalizeAcceptanceReport, toVerifyChecks, writeAcceptance } from './checks.ts';
+import { markAcceptancePending, runAcceptance, writeAcceptance } from './checks.ts';
 import type { Acceptance } from './checks.ts';
-import type { Check } from '../verify/types.ts';
 
 /**
  * How much of each upstream artifact we inline into the prompt.
@@ -372,7 +370,7 @@ export function createForgeRunner(deps: RunnerDeps): StageRunner {
       const tracked = await deps.service.spawnTracked(request);
       jobId = tracked.ack.jobId;
       // As spawn_job does: the job reads "checks pending" until a verdict exists.
-      if (stage.checks?.length) recordAcceptance(deps.service.repo, jobId, { state: 'unchecked', checks: [], pending: true });
+      if (stage.checks?.length) recordAcceptance(deps.service.repo, jobId, 'pending');
       deps.onStageRunning?.({
         stage: stage.name, jobId, status: 'running', provider: ctx.routing.provider,
         ...(ctx.routing.model === undefined ? {} : { model: ctx.routing.model }),
@@ -405,15 +403,12 @@ export function createForgeRunner(deps: RunnerDeps): StageRunner {
       publishArtifact(deps.service.repo, jobId, stage, artifactRoot);
       const result = toStageResult(stage, ctx, manifest, observations, startedAt, artifactRoot);
       if (!stage.checks?.length) return manifest.status === 'succeeded' ? { ...result, acceptance: 'unchecked' } : result;
-      if (manifest.status !== 'succeeded') {
-        recordAcceptance(deps.service.repo, jobId, { state: 'rejected', checks: [], at: new Date().toISOString(), reason: 'job did not succeed; checks not run' });
-        return result;
-      }
-
-      const checks: Check[] = toVerifyChecks(stage.checks, ctx.workDir);
-      const report = normalizeAcceptanceReport(await runChecks(checks, { signal: ctx.signal }), stage.checks);
-      const acceptanceChecks = acceptanceChecksFromReport(report, stage.checks);
-      recordAcceptance(deps.service.repo, jobId, { state: acceptanceState(acceptanceChecks), checks: acceptanceChecks, at: new Date().toISOString() });
+      const { acceptance, report } = await runAcceptance({
+        succeeded: manifest.status === 'succeeded', checks: stage.checks, baseDir: ctx.workDir, signal: ctx.signal,
+      });
+      recordAcceptance(deps.service.repo, jobId, acceptance);
+      // No report means the job did not succeed, so no checks ran.
+      if (report === null) return result;
       const checkEvidence = report.verdicts.map((verdict) =>
         `${verdict.passed ? 'PASS' : 'FAIL'} ${verdict.check.name}: ${verdict.reason}`,
       ).join('\n');
@@ -455,8 +450,8 @@ export function createForgeRunner(deps: RunnerDeps): StageRunner {
 }
 
 /** Persist the stage job's acceptance beside its record. A failed write must not fail the stage. */
-function recordAcceptance(repo: string, jobId: string, acceptance: Acceptance): void {
-  try { writeAcceptance(repo, jobId, acceptance); } catch (err) { process.stderr.write(`agent-smith acceptance ${jobId}: ${String(err)}\n`); }
+function recordAcceptance(repo: string, jobId: string, acceptance: Acceptance | 'pending'): void {
+  try { if (acceptance === 'pending') markAcceptancePending(repo, jobId); else writeAcceptance(repo, jobId, acceptance); } catch (err) { process.stderr.write(`agent-smith acceptance ${jobId}: ${String(err)}\n`); }
 }
 
 /* ── observation collection ──────────────────────────────────────────────── */
@@ -644,7 +639,3 @@ export function readTail(file: string, max = OUTPUT_TAIL_CHARS): string | null {
   return trimmed.length <= max ? trimmed : trimmed.slice(trimmed.length - max);
 }
 
-/** Where a stage's job directory lives. Exported so tests can assert on it. */
-export function stageJobDir(repo: string, jobId: string): string {
-  return jobDir(repo, jobId);
-}

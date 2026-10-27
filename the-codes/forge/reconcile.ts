@@ -1,7 +1,7 @@
 /** Service-owned recovery of abandoned jobs. Readers never write job records. */
 import { existsSync, readFileSync } from 'node:fs';
 import { REASONS } from '../surfaces/mod/hooks/reasons.ts';
-import { FILES, SCHEMA_VERSION, deriveOrphan, failureFields, deriveStatus, isPidAlive, jobFile, type ForgeManifest } from './format.ts';
+import { FILES, SCHEMA_VERSION, deriveOrphan, failureFields, deriveStatus, isTerminalForgeStatus, jobFile, ownerAlive, validOwnerPid, type ForgeManifest } from './format.ts';
 import { writeAtomic, writeJsonAtomic } from './atomic.ts';
 import { readAcceptance, writeAcceptance } from './checks.ts';
 import { reportFor } from './writer.ts';
@@ -20,11 +20,10 @@ export function reconcileOrphan(repo: string, jobId: string, now = Date.now()): 
     const before = readFileSync(file, 'utf8');
     const manifest = JSON.parse(before) as ForgeManifest;
     if (manifest.schema !== SCHEMA_VERSION || manifest.jobId !== jobId
-        || !Number.isInteger(manifest.ownerPid) || typeof manifest.ownerPid !== 'number' || manifest.ownerPid <= 0
-        || isPidAlive(manifest.ownerPid)) return false;
+        || validOwnerPid(manifest) === null || ownerAlive(manifest)) return false;
     if (manifest.status !== 'running') {
-      if (['succeeded', 'failed', 'canceled'].includes(manifest.status)
-          && typeof manifest.finishedAt === 'string') settleAcceptance(repo, jobId, manifest.finishedAt);
+      if (isTerminalForgeStatus(manifest.status)
+          && typeof manifest.finishedAt === 'string') abandonPendingAcceptance(repo, jobId, manifest.finishedAt);
       return false;
     }
     const resultFile = jobFile(repo, jobId, FILES.result);
@@ -42,7 +41,7 @@ export function reconcileOrphan(repo: string, jobId: string, now = Date.now()): 
         deniedActions: result.deniedActions ?? [], report,
       });
     if (verdict === null) return false;
-    if (readFileSync(file, 'utf8') !== before || isPidAlive(manifest.ownerPid)
+    if (readFileSync(file, 'utf8') !== before || ownerAlive(manifest)
         || readOptional(resultFile) !== resultBefore
         || (existsSync(cancelFile) || existsSync(cancelSteerFile)) !== canceled) return false;
     if (result !== null) {
@@ -50,7 +49,7 @@ export function reconcileOrphan(repo: string, jobId: string, now = Date.now()): 
       // anchor. Restore the same report/verdict, without replaying checks or
       // claiming that finish-time git attribution was captured.
       writeAtomic(jobFile(repo, jobId, FILES.report), report ?? '');
-      if (readFileSync(file, 'utf8') !== before || isPidAlive(manifest.ownerPid)
+      if (readFileSync(file, 'utf8') !== before || ownerAlive(manifest)
           || readOptional(resultFile) !== resultBefore
           || (existsSync(cancelFile) || existsSync(cancelSteerFile)) !== canceled) return false;
       writeJsonAtomic(file, {
@@ -69,7 +68,7 @@ export function reconcileOrphan(repo: string, jobId: string, now = Date.now()): 
         latestSummary: result.response.trim().slice(0, 1_000) || manifest.latestSummary || null,
         summarySource: result.response.trim() || manifest.latestSummary ? 'worker' : null,
       });
-      settleAcceptance(repo, jobId, result.finishedAt);
+      abandonPendingAcceptance(repo, jobId, result.finishedAt);
       return true;
     }
     const at = new Date(now).toISOString();
@@ -78,12 +77,12 @@ export function reconcileOrphan(repo: string, jobId: string, now = Date.now()): 
       reason: verdict.status === 'failed' ? REASONS.serverStopped : null, jobStatus: 'orphaned',
       updatedAt: at, finishedAt: at,
     });
-    settleAcceptance(repo, jobId, at);
+    abandonPendingAcceptance(repo, jobId, at);
     return true;
   } catch { return false; } // An unreadable anchor remains unknown; do not invent it.
 }
 
-function settleAcceptance(repo: string, jobId: string, at: string): void {
+function abandonPendingAcceptance(repo: string, jobId: string, at: string): void {
   const acceptance = readAcceptance(repo, jobId);
   if ('pending' in acceptance && acceptance.pending === true) {
     writeAcceptance(repo, jobId, {

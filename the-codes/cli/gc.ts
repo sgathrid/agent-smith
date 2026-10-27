@@ -1,9 +1,9 @@
 /** `agent-smith gc`: archive or delete settled jobs older than a threshold. */
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from 'node:fs';
 import path from 'node:path';
 
-import { archivedJobsDir, FILES, jobFile, jobsDir } from '../forge/format.ts';
+import { archivedJobsDir, isTerminalForgeStatus, jobsDir, readManifest } from '../forge/format.ts';
 import { EXIT, UsageError } from './common.ts';
 
 export interface GcArgs {
@@ -14,7 +14,6 @@ export interface GcArgs {
 }
 
 const GC_DEFAULT_AGE = '14d';
-const GC_SETTLED_STATUSES = new Set(['succeeded', 'failed', 'canceled']);
 const GC_UNIT_HOURS: Readonly<Record<'h' | 'd' | 'w', number>> = { h: 1, d: 24, w: 168 };
 
 /** Parses gc ages such as 12h, 14d or 2w. */
@@ -26,7 +25,7 @@ function parseGcAge(raw: string): number {
 
 export function readJobRecord(repo: string, jobId: string): Record<string, unknown> | null {
   try {
-    const parsed: unknown = JSON.parse(readFileSync(jobFile(repo, jobId, FILES.job), 'utf8'));
+    const parsed: unknown = readManifest(repo, jobId);
     return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null;
   } catch { return null; }
 }
@@ -75,7 +74,7 @@ export async function cmdGc(args: GcArgs = {}): Promise<number> {
       continue;
     }
     if (job['status'] === 'running') { kept += 1; continue; }
-    if (typeof job['status'] !== 'string' || !GC_SETTLED_STATUSES.has(job['status'])) {
+    if (!isTerminalForgeStatus(job['status'])) {
       process.stderr.write(`agent-smith: skipped ${jobId}: unknown status ${JSON.stringify(job['status'])}\n`);
       skipped += 1;
       continue;

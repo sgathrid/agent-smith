@@ -48,7 +48,7 @@ import {
   CANCEL_ORPHAN_REASON,
   ORPHAN_REASON,
   deriveOrphan,
-  isPidAlive,
+  ownerAlive,
   jobFile,
   jobsDir,
   type ForgeManifest,
@@ -210,12 +210,12 @@ export class AgentSmithReader implements JobStateReader {
       // A live supervisor honours a cancel request within seconds. A request that
       // is a minute old and still has no terminal state means nobody is listening.
       const cancelAgeMs = cancelAt === null ? NaN : Date.now() - Date.parse(cancelAt);
-      const ownerAlive = typeof manifest.ownerPid === 'number' && isPidAlive(manifest.ownerPid);
-      if (orphan === null && cancelRequested && cancelAgeMs > 60_000 && !ownerAlive) orphan = CANCELED_ORPHAN;
+      const ownerIsAlive = ownerAlive(manifest);
+      if (orphan === null && cancelRequested && cancelAgeMs > 60_000 && !ownerIsAlive) orphan = CANCELED_ORPHAN;
       // The marker is proof the supervisor is gone; a cancel request makes that
       // a cancellation. A live pid beside a marker plus cancel is still in flight.
       if (orphan === null && (await existsSafe(markerPath))) {
-        orphan = !cancelRequested ? ORPHANED : ownerAlive ? null : CANCELED_ORPHAN;
+        orphan = !cancelRequested ? ORPHANED : ownerIsAlive ? null : CANCELED_ORPHAN;
       }
 
     }
