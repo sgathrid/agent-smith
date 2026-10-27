@@ -7,13 +7,11 @@
  * That contradiction is the exact failure this project exists to eliminate, so the
  * number is stated once.
  *
- * WHY IT IS NOT IMPORTED FROM core/liveness.ts: that module's DEFAULT_GRACE_MS is
- * the right number, but it is a sibling package the mod cannot resolve a bare
- * specifier for, and duplicating the literal in two files is how they drift. So:
- * one constant, here, imported by both surfaces, with a comment tying it to
- * core/liveness.ts so a future change there has an obvious counterpart here.
+ * WHY ONE CONSTANT HERE: the mod cannot resolve a bare specifier for a sibling
+ * package, and duplicating the literal in two files is how they drift. So: one
+ * constant, here, imported by both surfaces.
  *
- * Value: core/liveness.ts's DEFAULT_GRACE_MS, 15 minutes.
+ * Value: 15 minutes.
  * Reasoning that number is defensible: agy-staff's own default timeout is 60m
  * (every real spec.json in the corpus says `timeout: "60m"`), so 15m of silence
  * is a quarter of the budget gone with nothing to show, while still leaving ample
@@ -21,3 +19,15 @@
  * cold target directory.
  */
 export const STALL_GRACE_MS = 15 * 60 * 1000;
+
+/**
+ * The one stall rule. Only a `running` job can stall (a settled job has nothing
+ * left to be silent about). No evidence of progress at all, or a timestamp that
+ * does not parse, counts as STALLED: "we do not know" must never be drawn as
+ * "fine". `updatedAt` is an ISO string or epoch ms, as each caller holds it.
+ */
+export function isStalled(status: string, updatedAt: string | number | null | undefined, now: number): boolean {
+  if (status !== 'running') return false;
+  const then = typeof updatedAt === 'number' ? updatedAt : typeof updatedAt === 'string' ? Date.parse(updatedAt) : NaN;
+  return Number.isNaN(then) || now - then > STALL_GRACE_MS;
+}

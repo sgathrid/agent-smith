@@ -9,6 +9,8 @@
 import type { FsLike } from './jobs.ts';
 import type { RadarJob, RadarAcceptance } from '../types/index.d.ts';
 import { readForgeJobs, acceptanceLabel } from './canonical.ts';
+import { isLiveStatus } from './format.ts';
+import { firstTrimmed, record } from './guards.ts';
 
 export type NativeJobStatus = 'running' | 'attention' | 'succeeded' | 'failed' | 'canceled';
 
@@ -53,19 +55,6 @@ export interface NativeTaskClient {
     activeForm?: string;
     status: 'in_progress' | 'completed' | 'deleted';
   }): Promise<unknown>;
-}
-
-function record(value: unknown): Record<string, unknown> | null {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : null;
-}
-
-function text(...values: unknown[]): string | null {
-  for (const value of values) {
-    if (typeof value === 'string' && value.trim() !== '') return value.trim();
-  }
-  return null;
 }
 
 /** Both native tasks and /forge use the same canonical projection and liveness. */
@@ -121,7 +110,7 @@ function nativeId(result: unknown): string | null {
   if (outer === null || outer.isError === true || typeof outer.deny === 'string') return null;
   const output = record(outer.result);
   const task = record(output?.task);
-  return text(task?.id);
+  return firstTrimmed(task?.id);
 }
 
 function updateSucceeded(result: unknown): boolean {
@@ -132,10 +121,10 @@ function updateSucceeded(result: unknown): boolean {
 }
 
 /** How long a finished job's task stays in the host list before it is closed. */
-export const CLOSE_DELAY_MS = 10_000;
+const CLOSE_DELAY_MS = 10_000;
 
 function taskStatus(job: NativeJob): 'in_progress' | 'completed' {
-  return job.status === 'running' || job.status === 'attention' || job.acceptance?.pending ? 'in_progress' : 'completed';
+  return isLiveStatus(job.status) || job.acceptance?.pending ? 'in_progress' : 'completed';
 }
 
 function fingerprint(job: NativeJob): string {
@@ -182,7 +171,7 @@ export async function syncNativeTasks(
     if (job.supersededBy) continue;
     const old = next[job.id];
     if (old?.status === 'deleted') continue;
-    const live = job.status === 'running' || job.status === 'attention' || job.acceptance?.pending === true;
+    const live = isLiveStatus(job.status) || job.acceptance?.pending === true;
     if (old === undefined && (!live || !owned(job.id))) continue;
 
     const subject = subjectFor(job);

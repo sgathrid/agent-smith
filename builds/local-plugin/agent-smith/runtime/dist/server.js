@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import process$1 from'node:process';import {randomUUID,randomBytes}from'node:crypto';import path from'node:path';import {readFileSync,statSync,mkdirSync,writeFileSync,linkSync,unlinkSync,existsSync,renameSync,readdirSync}from'node:fs';import {fileURLToPath}from'node:url';import {M as MODES$1,a as MODE_PRESETS,b as MAX_WATCHED_FILES,v as validateSpec,l as launchPipeline,s as startPipeline,r as readPipeline,c as cancelPipeline,g as getInstalledProviders,i as inheritContinuedProviders,d as getCatalogs,p as providerNames,F as ForgeService}from'./chunk-service.js';import {r as reasonFromText,D as DEFAULT_TIMEOUT_MS,j as jobFile,F as FILES,a as readAcceptance,w as writeAcceptance,e as evaluateAcceptance}from'./chunk-checks.js';import os from'node:os';import {execFile}from'node:child_process';import {S as STALL_GRACE_MS,P as POLL_MS,p as pollOnce,s as scheduleLoop}from'./chunk-poller.js';import'node:fs/promises';import'node:readline';import'node:timers/promises';//#region rolldown:runtime
+import process$1 from'node:process';import {randomUUID,randomBytes}from'node:crypto';import {readFileSync,statSync,mkdirSync,writeFileSync,linkSync,unlinkSync,existsSync,renameSync,readdirSync}from'node:fs';import {r as reasonFromText,M as MODES$1,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS,i as inheritContinuedProviders,S as STAGE_PROMPTS,v as validateSpec,s as startPipeline,b as readPipeline,c as cancelPipeline,j as jobFile,F as FILES,d as readAcceptance,m as markAcceptancePending,e as settleAcceptance,f as markAcceptanceSuperseded,p as providerNames,g as isTerminalForgeStatus}from'./chunk-execute.js';import {M as MAX_WATCHED_FILES,g as getCatalogs,l as launchPipeline,a as getInstalledProviders,F as ForgeService}from'./chunk-service.js';import path from'node:path';import'node:fs/promises';import {execFile}from'node:child_process';import os from'node:os';import {i as isStalled,P as POLL_MS,p as pollOnce,s as scheduleLoop}from'./chunk-poller.js';import {fileURLToPath}from'node:url';import'node:timers/promises';import'node:readline';//#region rolldown:runtime
 var __create = Object.create;
 var __defProp = Object.defineProperty;
 var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
@@ -25067,7 +25067,33 @@ function createRequestStateCodec(options) {
 			return envelope.p;
 		}
 	};
-}// Optional user-defined model aliases. No built-in presets: everything comes from models.json.
+}/**
+ * pipeline/types.ts — vocabulary for mixed-provider stage pipelines.
+ *
+ * The headline feature this file exists for:
+ *
+ *     implement → gemini   ·   review → codex   ·   moderate → claude-sonnet
+ *
+ * One task, a different worker per stage. Nothing in this file knows how to
+ * talk to any worker; `StageRunner` (below) is the seam, and it is injected.
+ *
+ * WHY NO IMPORT FROM providers/
+ * providers/ is written concurrently by another engineer. If pipeline/ imported
+ * a concrete provider client we would have a compile-order dependency on work
+ * that does not exist yet, and pipeline/ could not be tested without spawning
+ * real agents. So the dependency points *inward*: pipeline/ declares the shape
+ * it needs, forge/ supplies an implementation over providers/ at the composition
+ * root (forge/runner.ts, forge/execute.ts). See `createRunnerRouter` in pipeline.ts for the wiring point.
+ */
+/**
+ * Reasoning effort, where the worker supports it.
+ *
+ * Evidence (measured on this user's own jobs): raising effort to `high` cost
+ * **+50% wall clock and 1.9x thinking tokens for ZERO accuracy gain** on an
+ * in-band task. That is why `low` is the default everywhere in this codebase
+ * and why escalation — not the default — is what buys effort.
+ */
+const EFFORTS$1 = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];// Optional user-defined model aliases. No built-in presets: everything comes from models.json.
 // Files: <repo>/.agent-smith/models.json (project) and <home>/.agent-smith/models.json (user).
 // A project alias replaces a user alias of the same name wholesale (no field merging).
 const PROVIDERS$1 = ['agy', 'codex', 'opencode', 'claude', 'kimi'];
@@ -25286,7 +25312,7 @@ function conciseRow(j, now = Date.now()) {
         supersededBy: j.supersededBy ?? null, steeredFrom: j.steeredFrom ?? null,
         pendingSteers: j.pendingSteers ? j.pendingSteers : null,
         nextAction: j.nextAction, warningCount: j.warnings.length || null,
-        stalled: j.status === 'running' && j.updatedAt !== null && now - Date.parse(j.updatedAt) > STALL_GRACE_MS ? true : null,
+        stalled: isStalled(j.status, j.updatedAt, now) ? true : null,
         changedFileCount: typeof j.changedFileCount === 'number' ? j.changedFileCount : null,
         acceptance: j.acceptance && (j.acceptance.state !== 'unchecked' || j.acceptance.pending || j.acceptance.checks.length > 0)
             ? checkVerdicts(j.acceptance) : null,
@@ -25318,7 +25344,7 @@ function conciseStatus(d, acceptance, extra = {}) {
     return compact({
         jobId: d.jobId, name: d.name, provider: d.provider, model: d.model, mode: d.mode, status: d.status, taskStatus: taskStatus(d.status),
         resumable: Boolean(d.conversation),
-        stalled: d.status === 'running' && d.updatedAt !== null && Date.now() - Date.parse(d.updatedAt) > STALL_GRACE_MS,
+        stalled: isStalled(d.status, d.updatedAt, Date.now()),
         acceptance: checkVerdicts(acceptance),
         startedAt: d.startedAt, finishedAt: d.finishedAt, durationMs: Number.isNaN(started) ? null : Math.max(0, ended - started),
         toolCalls: d.toolCalls, lastActivity: lastActivity(d.lastActivity),
@@ -25456,10 +25482,9 @@ function commonEfforts(lists) {
         if (best === undefined || entry.n > best.n)
             best = entry;
     return best?.list;
-}/** MCP control surface over the canonical forge runtime. */
-const REPORT_HEAD_CHARS = 8_000;
+}/** MCP tool definitions: input schemas, output schemas and the TOOL_DEFS list Claude reads. */
 const PROVIDERS = ['agy', 'codex', 'opencode', 'claude', 'kimi'];
-const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+const EFFORTS = [...EFFORTS$1];
 const string = { type: 'string', minLength: 1 };
 const FORMATS = ['concise', 'detailed'];
 const responseFormat = { type: 'string', enum: FORMATS, default: 'concise', description: 'concise (default) or detailed (full record).' };
@@ -25483,7 +25508,6 @@ const stageSchema = {
     },
 };
 const MAX_WAIT_MS = 60_000;
-const WAIT_POLL_MS = 500;
 function schema(properties, required = []) {
     return { type: 'object', properties, required, additionalProperties: false };
 }
@@ -25634,163 +25658,7 @@ const RAW_TOOL_DEFS = [
             } }, ['spec']) },
     { name: 'pipeline_status', annotations: { title: 'Pipeline status', ...READ_ONLY }, description: 'Read one pipeline run by runId: per-stage status, acceptance (check results), duration, artifact and output tail. response_format detailed returns the full record, including observations.', inputSchema: schema({ runId: string, response_format: responseFormat }, ['runId']) },
 ];
-const TOOL_DEFS = RAW_TOOL_DEFS.map(t => OUTPUT_SCHEMAS[t.name] ? { ...t, outputSchema: OUTPUT_SCHEMAS[t.name] } : t);
-Object.freeze(Object.fromEntries(PROVIDERS.map(p => [p, { label: p }])));
-const STAGE_PREFERENCE = [['implement', 'agy'], ['review', 'codex'], ['moderate', 'claude']];
-const STAGE_PROMPTS = {
-    review: 'Review the implementation and its supplied artifacts. Report defects with evidence; do not edit code.',
-    moderate: 'Probe the implementation and reviewer findings against the original task. Report unresolved defects with evidence; do not edit code.',
-};
-async function installedCatalogs(ctx, refresh = false) {
-    try {
-        return await (ctx.catalogs ?? (() => getCatalogs({ refresh })))();
-    }
-    catch {
-        return [];
-    }
-}
-/** Pick a provider per stage from what is installed: preferred if present, else an unused one, else any. */
-function assignStageProviders(installed) {
-    if (installed.length === 0)
-        throw new Error(`No providers installed. Install at least one of: ${PROVIDERS.join(', ')}.`);
-    const out = {};
-    const used = new Set();
-    for (const [stage, preferred] of STAGE_PREFERENCE) {
-        const pick = installed.includes(preferred) ? preferred : (installed.find(p => !used.has(p)) ?? installed[0]);
-        out[stage] = pick;
-        used.add(pick);
-    }
-    return out;
-}
-function defaultProvider(installed) {
-    if (installed.length === 0)
-        throw new Error(`No providers installed. Install at least one of: ${PROVIDERS.join(', ')}.`);
-    return installed.includes('agy') ? 'agy' : installed[0];
-}
-/** Default implement/review/moderate pipeline from installed providers; explicit `stages` pass through unchanged. */
-async function defaultMixedPipeline(input, catalogs) {
-    if (input.stages) {
-        const stages = input.modelConfig
-            ? input.stages.map(st => { const r = resolveRequest({ provider: st.provider, model: st.model, effort: st.effort, mode: st.role ?? st.name }, input.modelConfig); return { ...st, provider: r.provider ?? st.provider, model: r.model, effort: r.effort }; })
-            : input.stages;
-        return { name: input.name, stages, workDir: input.workDir, concurrency: input.concurrency };
-    }
-    const cats = await installedCatalogs({ catalogs });
-    const assign = assignStageProviders(cats.map(c => c.provider));
-    const stage = (name, extra) => {
-        const rd = input.modelConfig ? resolveRequest({ mode: name }, input.modelConfig) : undefined;
-        if (rd?.source === 'roleDefault' && rd.provider) {
-            return { name, provider: rd.provider, model: input.models?.[name] ?? rd.model, effort: input.efforts?.[name] ?? rd.effort, role: name, routingPinned: true, ...extra };
-        }
-        const provider = assign[name];
-        const cat = cats.find(c => c.provider === provider);
-        const cfg = cat?.defaultSource === 'harness-config';
-        return { name, provider, model: input.models?.[provider] ?? input.models?.[name] ?? (cfg ? cat?.defaultModel : undefined),
-            effort: input.efforts?.[name] ?? (cfg ? cat?.defaultEffort : undefined), role: name, routingPinned: true, ...extra };
-    };
-    const stages = [
-        stage('implement', { prompt: input.task }),
-        stage('review', { dependsOn: ['implement'], prompt: STAGE_PROMPTS.review }),
-        stage('moderate', { dependsOn: ['implement', 'review'], prompt: STAGE_PROMPTS.moderate }),
-    ];
-    return { name: input.name, stages, workDir: input.workDir, concurrency: input.concurrency };
-}
-// ── completion notice hint ───────────────────────────────────────────────────
-const MONITOR_CAP_MS = 1_800_000;
-/** Past the job's own timeout, a missing notice means none is coming (the hook watches timeout + 60 s). */
-const NOTICE_GRACE_MS = 120_000;
-/** monitor.js sits at dist/monitor.js; resolvable only when running from the built dist/. */
-function builtMonitorPath(moduleFile = fileURLToPath(import.meta.url)) {
-    const marker = `${path.sep}dist${path.sep}surfaces${path.sep}channel${path.sep}src${path.sep}`;
-    const at = moduleFile.lastIndexOf(marker);
-    if (at >= 0)
-        return path.join(moduleFile.slice(0, at), 'dist', 'monitor.js');
-    const dir = path.dirname(moduleFile);
-    if (path.basename(dir) === 'dist' && path.basename(moduleFile) === 'server.js') {
-        return path.join(dir, 'monitor.js');
-    }
-    return undefined;
-}
-/**
- * The `notify` hint attached to spawn/resume/pipeline acks. Exported for tests.
- *
- * It states that a notice is coming and keeps the monitor command under
- * `fallback`, behind the one condition that calls for it: an agent handed a
- * runnable command at the top level of an ack runs it at once, and then hears
- * about the job twice.
- */
-function notifyHint(target, repo, timeoutMs, monitorFile = builtMonitorPath()) {
-    const job = 'job' in target;
-    const note = `You will be notified when this ${job ? 'job' : 'run'} ends. Silence until then is normal: don't poll or start a monitor.`;
-    const noNotice = job
-        ? `no notice has arrived ${Math.ceil(((timeoutMs ?? DEFAULT_TIMEOUT_MS) + NOTICE_GRACE_MS) / 60_000)} min after launch`
-        : 'pipeline_status shows the run ended and no notice arrived';
-    const when = `Only if ${noNotice}, this session can't receive messages between turns (headless), ` +
-        'or you are a subagent that must return this result before your turn ends.';
-    const read = job ? 'Call status with wait_ms until it settles' : 'Call pipeline_status until the run ends';
-    if (!monitorFile)
-        return { mode: 'hook', note, fallback: { when, use: `${read}.` } };
-    const flag = job ? `--job ${target.job}` : `--run ${target.run}`;
-    return { mode: 'hook', note, fallback: { when, use: `${read}, or run monitorCommand in the background (it stops after monitorTimeoutMs; run it again if the ${job ? 'job' : 'run'} has not ended).`,
-            monitorCommand: `node "${monitorFile}" ${flag} --cwd "${repo}"`, monitorTimeoutMs: Math.min(timeoutMs ?? MONITOR_CAP_MS, MONITOR_CAP_MS) } };
-}
-/**
- * Tasks-shaped handle for a launch ack (vocabulary in views.ts taskStatus). pollIntervalMs is the
- * server's own poll cadence: job state changes are not observed faster than that, so checking more often gains nothing.
- */
-function launchTask(taskId) { return { taskId, status: 'working', pollIntervalMs: POLL_MS }; }
-// ── unrestricted confirmation ────────────────────────────────────────────────
-/** Providers that run restricted unless asked. agy and kimi are unrestricted by design: headless they cannot prompt (kimi's print mode forces auto). */
-const RESTRICTED_BY_DEFAULT = new Set(['codex', 'claude', 'opencode']);
-/** Long enough for a person to read the prompt and answer; the SDK default (60 s) is not. */
-const CONFIRM_TIMEOUT_MS = 10 * 60_000;
-const DECLINED_UNRESTRICTED = 'The user declined unrestricted access; rerun without unrestricted, or ask the user.';
-const UNCONFIRMED_UNRESTRICTED = 'unrestricted: true was not confirmed with the user: this client cannot show a confirmation prompt (no MCP elicitation support).';
-/**
- * Ask the user before an explicit unrestricted:true escalates a provider that runs restricted by default.
- * Returns `refused` to stop the call, or a `warning` for the ack when no prompt was possible.
- * Skipped for agy, for unrestricted false/absent, and when AGENT_SMITH_CONFIRM_UNRESTRICTED=0 (automation).
- */
-async function confirmUnrestricted(ctx, req) {
-    if (req.unrestricted !== true || !RESTRICTED_BY_DEFAULT.has(req.provider) || process.env['AGENT_SMITH_CONFIRM_UNRESTRICTED'] === '0')
-        return {};
-    if (!ctx.server?.getClientCapabilities()?.elicitation?.form)
-        return { warning: UNCONFIRMED_UNRESTRICTED };
-    const who = req.worker ? `${req.provider} worker "${req.worker}"` : `a new ${req.provider} worker`;
-    try {
-        const answer = await ctx.server.elicitInput({ mode: 'form', message: `Allow ${who} to run without approval prompts in ${req.cwd}? It will be able to run any command.`, requestedSchema: { type: 'object', properties: {} } }, { timeout: CONFIRM_TIMEOUT_MS });
-        return answer.action === 'accept' ? {} : { refused: failure(DECLINED_UNRESTRICTED) };
-    }
-    catch (err) {
-        // No answer is not consent: fail closed.
-        return { refused: failure(`Could not confirm unrestricted access with the user (${err instanceof Error ? err.message : String(err)}); rerun without unrestricted, or ask the user.`) };
-    }
-}
-function json(value) { return { content: [{ type: 'text', text: JSON.stringify(value, null, 2) }] }; }
-/** json plus structuredContent (arrays wrapped as {items}). */
-function structured(value, { compact = false } = {}) {
-    const out = compact ? { content: [{ type: 'text', text: JSON.stringify(value) }] } : json(value);
-    const sc = Array.isArray(value) ? { items: value } : value;
-    return sc !== null && typeof sc === 'object' ? { ...out, structuredContent: sc } : out;
-}
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-/** Detached, tools-layer-owned: await terminal state, run checks, write acceptance.json. Never throws. */
-function gateAcceptance(ctx, jobId, done, checks, preparedJobIds) {
-    if (ctx.service.supervisorUrl)
-        return; // The execution owner runs checks across server reloads.
-    void (async () => {
-        const manifest = await done;
-        const finalJobId = manifest.jobId ?? jobId;
-        const acceptance = await evaluateAcceptance({ succeeded: manifest.status === 'succeeded', checks, baseDir: manifest.cwd ?? ctx.service.repo });
-        writeAcceptance(ctx.service.repo, finalJobId, acceptance);
-        for (const id of preparedJobIds) {
-            if (id !== finalJobId) {
-                writeAcceptance(ctx.service.repo, id, { state: 'unchecked', checks: [], reason: 'superseded by steered turn' });
-            }
-        }
-    })().catch(err => process.stderr.write(`agent-smith acceptance ${jobId}: ${String(err)}\n`));
-}
-function failure(message, detail) { return { isError: true, content: [{ type: 'text', text: message + ('' ) }] }; }
+const TOOL_DEFS = RAW_TOOL_DEFS.map(t => OUTPUT_SCHEMAS[t.name] ? { ...t, outputSchema: OUTPUT_SCHEMAS[t.name] } : t);/** Argument parsing for tool calls: each helper validates one field and throws the message Claude sees. */
 function record(value, label) {
     if (value === null || typeof value !== 'object' || Array.isArray(value))
         throw new Error(`${label} must be an object.`);
@@ -25889,13 +25757,361 @@ function parseStages(raw) {
                 throw new Error('consumes must be an array.');
             consumes = s.consumes.map(v => { const a = record(v, 'artifact'); keys(a, ['stage', 'path', 'label']); return { stage: text(a, 'stage', true), path: text(a, 'path', true), label: text(a, 'label') }; });
         }
-        return { name: text(s, 'name', true), agentName: text(s, 'agentName'), workerId: text(s, 'workerId'), conversation: text(s, 'conversation'), continues: text(s, 'continues'), provider: allowed(s, 'provider', PROVIDERS), model: text(s, 'model'), effort: allowed(s, 'effort', EFFORTS), prompt: text(s, 'prompt'), context: contextText(s), title: text(s, 'title'), role: text(s, 'role'), dependsOn, consumes, workDir: text(s, 'workDir'), resultPath: text(s, 'resultPath'), timeoutMs: number(s, 'timeoutMs'), routingPinned: boolean(s, 'routingPinned'), checks: parseChecks(s.checks) };
+        return { name: text(s, 'name', true), agentName: text(s, 'agentName'), workerId: text(s, 'workerId'), conversation: text(s, 'conversation'), continues: text(s, 'continues'), provider: allowed(s, 'provider', PROVIDERS), model: text(s, 'model'), effort: allowed(s, 'effort', EFFORTS$1), prompt: text(s, 'prompt'), context: contextText(s), title: text(s, 'title'), role: text(s, 'role'), dependsOn, consumes, workDir: text(s, 'workDir'), resultPath: text(s, 'resultPath'), timeoutMs: number(s, 'timeoutMs'), routingPinned: boolean(s, 'routingPinned'), checks: parseChecks(s.checks) };
     }));
+}/** Default providers and the default implement/review/moderate pipeline, chosen from what is installed. */
+const STAGE_PREFERENCE = [['implement', 'agy'], ['review', 'codex'], ['moderate', 'claude']];
+async function installedCatalogs(ctx, refresh = false) {
+    try {
+        return await (ctx.catalogs ?? (() => getCatalogs({ refresh })))();
+    }
+    catch {
+        return [];
+    }
 }
+/** Pick a provider per stage from what is installed: preferred if present, else an unused one, else any. */
+function assignStageProviders(installed) {
+    if (installed.length === 0)
+        throw new Error(`No providers installed. Install at least one of: ${PROVIDERS.join(', ')}.`);
+    const out = {};
+    const used = new Set();
+    for (const [stage, preferred] of STAGE_PREFERENCE) {
+        const pick = installed.includes(preferred) ? preferred : (installed.find(p => !used.has(p)) ?? installed[0]);
+        out[stage] = pick;
+        used.add(pick);
+    }
+    return out;
+}
+function defaultProvider(installed) {
+    if (installed.length === 0)
+        throw new Error(`No providers installed. Install at least one of: ${PROVIDERS.join(', ')}.`);
+    return installed.includes('agy') ? 'agy' : installed[0];
+}
+/** Default implement/review/moderate pipeline from installed providers; explicit `stages` pass through unchanged. */
+async function defaultMixedPipeline(input, catalogs) {
+    if (input.stages) {
+        const stages = input.modelConfig
+            ? input.stages.map(st => { const r = resolveRequest({ provider: st.provider, model: st.model, effort: st.effort, mode: st.role ?? st.name }, input.modelConfig); return { ...st, provider: r.provider ?? st.provider, model: r.model, effort: r.effort }; })
+            : input.stages;
+        return { name: input.name, stages, workDir: input.workDir, concurrency: input.concurrency };
+    }
+    const cats = await installedCatalogs({ catalogs });
+    const assign = assignStageProviders(cats.map(c => c.provider));
+    const stage = (name, extra) => {
+        const rd = input.modelConfig ? resolveRequest({ mode: name }, input.modelConfig) : undefined;
+        if (rd?.source === 'roleDefault' && rd.provider) {
+            return { name, provider: rd.provider, model: input.models?.[name] ?? rd.model, effort: input.efforts?.[name] ?? rd.effort, role: name, routingPinned: true, ...extra };
+        }
+        const provider = assign[name];
+        const cat = cats.find(c => c.provider === provider);
+        const cfg = cat?.defaultSource === 'harness-config';
+        return { name, provider, model: input.models?.[provider] ?? input.models?.[name] ?? (cfg ? cat?.defaultModel : undefined),
+            effort: input.efforts?.[name] ?? (cfg ? cat?.defaultEffort : undefined), role: name, routingPinned: true, ...extra };
+    };
+    const stages = [
+        stage('implement', { prompt: input.task }),
+        stage('review', { dependsOn: ['implement'], prompt: STAGE_PROMPTS.review }),
+        stage('moderate', { dependsOn: ['implement', 'review'], prompt: STAGE_PROMPTS.moderate }),
+    ];
+    return { name: input.name, stages, workDir: input.workDir, concurrency: input.concurrency };
+}/** The completion-notice hint and Tasks handle attached to launch acks. */
+const MONITOR_CAP_MS = 1_800_000;
+/** Past the job's own timeout, a missing notice means none is coming (the hook watches timeout + 60 s). */
+const NOTICE_GRACE_MS = 120_000;
+/** monitor.js sits at dist/monitor.js; resolvable only when running from the built dist/. */
+function builtMonitorPath(moduleFile = fileURLToPath(import.meta.url)) {
+    const marker = `${path.sep}dist${path.sep}surfaces${path.sep}channel${path.sep}src${path.sep}`;
+    const at = moduleFile.lastIndexOf(marker);
+    if (at >= 0)
+        return path.join(moduleFile.slice(0, at), 'dist', 'monitor.js');
+    const dir = path.dirname(moduleFile);
+    if (path.basename(dir) === 'dist' && path.basename(moduleFile) === 'server.js') {
+        return path.join(dir, 'monitor.js');
+    }
+    return undefined;
+}
+/**
+ * The `notify` hint attached to spawn/resume/pipeline acks. Exported for tests.
+ *
+ * It states that a notice is coming and keeps the monitor command under
+ * `fallback`, behind the one condition that calls for it: an agent handed a
+ * runnable command at the top level of an ack runs it at once, and then hears
+ * about the job twice.
+ */
+function notifyHint(target, repo, timeoutMs, monitorFile = builtMonitorPath()) {
+    const job = 'job' in target;
+    const note = `You will be notified when this ${job ? 'job' : 'run'} ends. Silence until then is normal: don't poll or start a monitor.`;
+    const noNotice = job
+        ? `no notice has arrived ${Math.ceil(((timeoutMs ?? DEFAULT_TIMEOUT_MS) + NOTICE_GRACE_MS) / 60_000)} min after launch`
+        : 'pipeline_status shows the run ended and no notice arrived';
+    const when = `Only if ${noNotice}, this session can't receive messages between turns (headless), ` +
+        'or you are a subagent that must return this result before your turn ends.';
+    const read = job ? 'Call status with wait_ms until it settles' : 'Call pipeline_status until the run ends';
+    if (!monitorFile)
+        return { mode: 'hook', note, fallback: { when, use: `${read}.` } };
+    const flag = job ? `--job ${target.job}` : `--run ${target.run}`;
+    return { mode: 'hook', note, fallback: { when, use: `${read}, or run monitorCommand in the background (it stops after monitorTimeoutMs; run it again if the ${job ? 'job' : 'run'} has not ended).`,
+            monitorCommand: `node "${monitorFile}" ${flag} --cwd "${repo}"`, monitorTimeoutMs: Math.min(timeoutMs ?? MONITOR_CAP_MS, MONITOR_CAP_MS) } };
+}
+/**
+ * Tasks-shaped handle for a launch ack (vocabulary in views.ts taskStatus). pollIntervalMs is the
+ * server's own poll cadence: job state changes are not observed faster than that, so checking more often gains nothing.
+ */
+function launchTask(taskId) { return { taskId, status: 'working', pollIntervalMs: POLL_MS }; }/** MCP control surface over the canonical forge runtime. */
+const REPORT_HEAD_CHARS = 8_000;
+const WAIT_POLL_MS = 500;
+// ── unrestricted confirmation ────────────────────────────────────────────────
+/** Providers that run restricted unless asked. agy and kimi are unrestricted by design: headless they cannot prompt (kimi's print mode forces auto). */
+const RESTRICTED_BY_DEFAULT = new Set(['codex', 'claude', 'opencode']);
+/** Long enough for a person to read the prompt and answer; the SDK default (60 s) is not. */
+const CONFIRM_TIMEOUT_MS = 10 * 60_000;
+const DECLINED_UNRESTRICTED = 'The user declined unrestricted access; rerun without unrestricted, or ask the user.';
+const UNCONFIRMED_UNRESTRICTED = 'unrestricted: true was not confirmed with the user: this client cannot show a confirmation prompt (no MCP elicitation support).';
+/**
+ * Ask the user before an explicit unrestricted:true escalates a provider that runs restricted by default.
+ * Returns `refused` to stop the call, or a `warning` for the ack when no prompt was possible.
+ * Skipped for agy, for unrestricted false/absent, and when AGENT_SMITH_CONFIRM_UNRESTRICTED=0 (automation).
+ */
+async function confirmUnrestricted(ctx, req) {
+    if (req.unrestricted !== true || !RESTRICTED_BY_DEFAULT.has(req.provider) || process.env['AGENT_SMITH_CONFIRM_UNRESTRICTED'] === '0')
+        return {};
+    if (!ctx.server?.getClientCapabilities()?.elicitation?.form)
+        return { warning: UNCONFIRMED_UNRESTRICTED };
+    const who = req.worker ? `${req.provider} worker "${req.worker}"` : `a new ${req.provider} worker`;
+    try {
+        const answer = await ctx.server.elicitInput({ mode: 'form', message: `Allow ${who} to run without approval prompts in ${req.cwd}? It will be able to run any command.`, requestedSchema: { type: 'object', properties: {} } }, { timeout: CONFIRM_TIMEOUT_MS });
+        return answer.action === 'accept' ? {} : { refused: failure(DECLINED_UNRESTRICTED) };
+    }
+    catch (err) {
+        // No answer is not consent: fail closed.
+        return { refused: failure(`Could not confirm unrestricted access with the user (${err instanceof Error ? err.message : String(err)}); rerun without unrestricted, or ask the user.`) };
+    }
+}
+function json(value) { return { content: [{ type: 'text', text: JSON.stringify(value, null, 2) }] }; }
+/** json plus structuredContent (arrays wrapped as {items}). */
+function structured(value, { compact = false } = {}) {
+    const out = compact ? { content: [{ type: 'text', text: JSON.stringify(value) }] } : json(value);
+    const sc = Array.isArray(value) ? { items: value } : value;
+    return sc !== null && typeof sc === 'object' ? { ...out, structuredContent: sc } : out;
+}
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+/** Detached, tools-layer-owned: await terminal state, run checks, write acceptance.json. Never throws. */
+function gateAcceptance(ctx, jobId, done, checks, preparedJobIds) {
+    if (ctx.service.supervisorUrl)
+        return; // The execution owner runs checks across server reloads.
+    void (async () => {
+        const manifest = await done;
+        await settleAcceptance({ succeeded: manifest.status === 'succeeded', checks, baseDir: manifest.cwd ?? ctx.service.repo, repo: ctx.service.repo, finalJobId: manifest.jobId ?? jobId, preparedJobIds });
+    })().catch(err => process.stderr.write(`agent-smith acceptance ${jobId}: ${String(err)}\n`));
+}
+function failure(message, detail) { return { isError: true, content: [{ type: 'text', text: message + ('' ) }] }; }
 /** The full `status` view of one job; Tasks results reuse it. */
 function fullStatus(detail, acceptance) {
-    return { ...detail, resumable: Boolean(detail.conversation), stalled: detail.status === 'running' && detail.updatedAt !== null && Date.now() - Date.parse(detail.updatedAt) > STALL_GRACE_MS, taskStatus: taskStatus(detail.status), report: detail.report?.slice(0, REPORT_HEAD_CHARS) ?? null, reportTruncated: (detail.report?.length ?? 0) > REPORT_HEAD_CHARS, acceptance };
+    return { ...detail, resumable: Boolean(detail.conversation), stalled: isStalled(detail.status, detail.updatedAt, Date.now()), taskStatus: taskStatus(detail.status), report: detail.report?.slice(0, REPORT_HEAD_CHARS) ?? null, reportTruncated: (detail.report?.length ?? 0) > REPORT_HEAD_CHARS, acceptance };
 }
+const resolveHead = (ctx, id) => typeof ctx.service.resolveHead === 'function' ? ctx.service.resolveHead(id) : id;
+const listCapabilitiesTool = async (ctx, args) => {
+    const fmt = format(args);
+    // Read before nearly every spawn, so its concise text is sent unindented.
+    return structured(await listCapabilities(ctx, boolean(args, 'refresh') ?? false, fmt, allowed(args, 'provider', PROVIDERS)), { compact: fmt === 'concise' });
+};
+const spawnJob = async (ctx, args) => {
+    const mode = allowed(args, 'mode', MODES$1);
+    if (mode === undefined)
+        throw new Error(`mode is required; one of ${MODES$1.join(', ')}.`);
+    const cfg = loadModelConfig({ repo: ctx.service.repo });
+    const resolved = resolveRequest({ provider: allowed(args, 'provider', PROVIDERS), model: text(args, 'model'), effort: allowed(args, 'effort', EFFORTS$1), mode }, cfg);
+    const provider = resolved.provider ?? defaultProvider(ctx.catalogs ? (await installedCatalogs(ctx)).map(c => c.provider) : await getInstalledProviders());
+    const notes = [...resolved.warnings, ...cfg.errors.map(e => `models.json: ${e}`)];
+    const withNotes = (ack) => ({ ...ack, ...(ack.jobId ? { taskHandle: launchTask(ack.jobId), notify: notifyHint({ job: ack.jobId }, ctx.service.repo, ack.timeoutMs) } : {}), ...(resolved.appliedAlias ? { aliasApplied: resolved.appliedAlias, aliasSource: resolved.source } : {}), ...(notes.length ? { warnings: [...(ack.warnings ?? []), ...notes] } : {}) });
+    const checks = parseChecks(args.checks);
+    const preparedJobIds = [];
+    const onPrepared = (jobId) => {
+        if (preparedJobIds.length === 0) {
+            // First: if it throws, the job is aborted and must not be left with checks pending.
+            ctx.onJobPrepared?.(jobId);
+        }
+        else {
+            try {
+                ctx.onJobPrepared?.(jobId);
+            }
+            catch { /* best-effort rebind on continuation turn */ }
+        }
+        const prevId = preparedJobIds.at(-1);
+        preparedJobIds.push(jobId);
+        if (checks?.length) {
+            if (prevId) {
+                try {
+                    markAcceptanceSuperseded(ctx.service.repo, prevId);
+                }
+                catch { /* ignore */ }
+            }
+            try {
+                markAcceptancePending(ctx.service.repo, jobId);
+            }
+            catch (err) {
+                process.stderr.write(`agent-smith acceptance ${jobId}: ${String(err)}\n`);
+            }
+        }
+    };
+    const request = { mode, prompt: text(args, 'prompt', true), context: contextText(args), files: filesList(args), checks, cwd: workingDirectory(args), name: text(args, 'name'), task: text(args, 'task'), provider, model: resolved.model, effort: resolved.effort, timeoutMs: number(args, 'timeoutMs'), conversation: text(args, 'conversation'), unrestricted: boolean(args, 'unrestricted'), onPrepared };
+    // After every argument is validated, so the user is never asked about a call that then fails.
+    const gate = await confirmUnrestricted(ctx, { unrestricted: request.unrestricted, provider, worker: request.name, cwd: request.cwd ?? ctx.service.repo });
+    if (gate.refused)
+        return gate.refused;
+    if (gate.warning)
+        notes.push(gate.warning);
+    if (!checks?.length)
+        return structured({ ...withNotes(await ctx.service.spawnJob(request)), provider });
+    const { ack, done } = await ctx.service.spawnTracked(request);
+    if (!preparedJobIds.includes(ack.jobId)) {
+        preparedJobIds.push(ack.jobId);
+        try {
+            markAcceptancePending(ctx.service.repo, ack.jobId);
+        }
+        catch (err) {
+            process.stderr.write(`agent-smith acceptance ${ack.jobId}: ${String(err)}\n`);
+        }
+    }
+    gateAcceptance(ctx, ack.jobId, done, checks, preparedJobIds);
+    return structured({ ...withNotes(ack), provider, checks: checks.map(c => c.name) });
+};
+const resumeJob = async (ctx, args) => {
+    const worker = text(args, 'worker', true);
+    const detail = await ctx.service.resolveWorker(worker);
+    if (detail.status === 'running')
+        throw new Error(`"${detail.name}" is still running; use steer_job with delivery: "queue" or "interrupt", or wait.`);
+    if (!detail.conversation)
+        throw new Error(`"${detail.name}" has no conversation to resume: the provider did not save a conversation before it stopped. Use spawn_job with the full original brief; on-disk edits remain in ${detail.cwd ?? ctx.service.repo}.`);
+    const resumeModel = resolveRequest({ provider: detail.provider ?? undefined, model: text(args, 'model'), effort: allowed(args, 'effort', EFFORTS$1) }, loadModelConfig({ repo: ctx.service.repo }));
+    let inheritedChecks;
+    if (args.checks === undefined) {
+        try {
+            inheritedChecks = parseChecks(JSON.parse(readFileSync(jobFile(ctx.service.repo, detail.jobId, FILES.checksSpec), 'utf8')));
+        }
+        catch (error) {
+            if (error.code !== 'ENOENT')
+                throw error;
+        }
+    }
+    const checks = args.checks === undefined ? inheritedChecks : parseChecks(args.checks);
+    const preparedJobIds = [];
+    const onPrepared = (id) => {
+        ctx.onJobPrepared?.(id);
+        preparedJobIds.push(id);
+        if (checks?.length)
+            markAcceptancePending(ctx.service.repo, id);
+    };
+    const prompt = text(args, 'prompt', true);
+    const cwd = workingDirectory(args) ?? detail.cwd ?? ctx.service.repo;
+    const timeoutMs = number(args, 'timeoutMs');
+    const unrestricted = boolean(args, 'unrestricted');
+    const inheritedFiles = Object.keys(detail.watchedFiles ?? {});
+    const mergedFiles = [...new Set([...inheritedFiles, ...(filesList(args) ?? [])])];
+    // Only an explicit unrestricted:true asks; an inherited setting was the original job's.
+    const gate = await confirmUnrestricted(ctx, { unrestricted, provider: detail.provider ?? '', worker: detail.name, cwd });
+    if (gate.refused)
+        return gate.refused;
+    const request = { checks, mode: detail.mode ?? 'task', prompt, files: mergedFiles.length > 0 ? mergedFiles : undefined, ...(detail.watchedFiles ? { previousWatchedFiles: detail.watchedFiles } : {}), provider: detail.provider ?? undefined, model: resumeModel.model ?? detail.model ?? undefined, effort: resumeModel.effort ?? detail.effort ?? undefined, name: detail.name, workerId: detail.workerId, task: detail.task ?? undefined, cwd, conversation: detail.conversation, timeoutMs, unrestricted: unrestricted ?? detail.unrestricted, onPrepared };
+    const tracked = checks?.length ? await ctx.service.spawnTracked(request) : null;
+    const resumed = tracked?.ack ?? await ctx.service.spawnJob(request);
+    if (tracked && checks)
+        gateAcceptance(ctx, resumed.jobId, tracked.done, checks, preparedJobIds);
+    const allWarnings = [...(resumed.warnings ?? []), ...(gate.warning ? [gate.warning] : [])];
+    return structured({ ...resumed, taskHandle: launchTask(resumed.jobId), notify: notifyHint({ job: resumed.jobId }, ctx.service.repo, resumed.timeoutMs), ...(allWarnings.length > 0 ? { warnings: allWarnings } : {}) });
+};
+const steerJob = async (ctx, args) => {
+    const worker = text(args, 'worker', true);
+    const prompt = text(args, 'prompt', true);
+    const context = contextText(args);
+    const files = filesList(args);
+    const delivery = allowed(args, 'delivery', ['queue', 'interrupt']);
+    if (delivery === undefined)
+        throw new Error('delivery is required: choose "queue" (after current turn) or "interrupt" (stop current turn now).');
+    const ack = await ctx.service.steer({ worker, prompt, context, files, delivery });
+    const idNote = ` The continuation gets a new job ID; status and cancel on ${ack.jobId} follow it.`;
+    return structured({ ...ack, note: `${ack.note}${idNote}`, taskHandle: launchTask(ack.jobId), notify: notifyHint({ job: ack.jobId }, ctx.service.repo, ack.timeoutMs) });
+};
+const listJobs = async (ctx, args) => {
+    const fmt = format(args);
+    const since = text(args, 'since');
+    const limit = number(args, 'limit', 500) ?? (fmt === 'concise' ? CONCISE_LIST_LIMIT : undefined);
+    // Concise asks for one extra row so a cut list says so instead of looking complete.
+    const jobs = await ctx.service.list({ provider: allowed(args, 'provider', ['agent-smith', 'agy-staff', 'all']), status: allowed(args, 'status', ['running', 'succeeded', 'failed', 'canceled']),
+        limit: fmt === 'concise' && limit !== undefined ? limit + 1 : limit, sinceMs: since === undefined ? undefined : parseSince(since), ids: boolean(args, 'session') ? ctx.service.spawnedIds : undefined });
+    // A turn a steer replaced is not a worker; its continuation's row stands for it.
+    const workers = jobs.filter(j => !j.supersededBy);
+    if (fmt !== 'concise')
+        return structured(workers.map(j => ({ ...j, taskStatus: taskStatus(j.status) })));
+    const rows = workers.slice(0, limit).map(j => conciseRow(j));
+    return structured(workers.length > rows.length
+        ? { items: rows, more: `More than ${rows.length} jobs match; narrow with since, status or session, or raise limit.` }
+        : rows);
+};
+const jobStatus = async (ctx, args) => {
+    const jobId = text(args, 'jobId', true);
+    const waitMs = number(args, 'wait_ms', MAX_WAIT_MS);
+    const fmt = format(args);
+    const wantDiff = boolean(args, 'include_diff') ?? false;
+    let detail = await ctx.service.detail(resolveHead(ctx, jobId));
+    let waited = false;
+    if (waitMs !== undefined) {
+        waited = true;
+        const deadline = Date.now() + waitMs;
+        const step = ctx.pollMs ?? WAIT_POLL_MS;
+        while ((detail.status === 'running' || Boolean(detail.supersededBy)) && Date.now() < deadline) {
+            await sleep(Math.min(step, Math.max(0, deadline - Date.now())));
+            detail = await ctx.service.detail(resolveHead(ctx, detail.jobId));
+        }
+    }
+    const reportPath = jobFile(ctx.service.repo, detail.jobId, FILES.report);
+    if (boolean(args, 'report_only'))
+        return structured({ jobId: detail.jobId, status: detail.status, taskStatus: taskStatus(detail.status), report: detail.report, reportPath });
+    const acceptance = readAcceptance(ctx.service.repo, detail.jobId);
+    const wait = waited ? { waited: true, stillRunning: detail.status === 'running' || Boolean(detail.supersededBy) } : {};
+    const diff = wantDiff ? await jobDiff(detail) : {};
+    // Oldest first, so the turns read in the order the worker took them.
+    const earlier = [];
+    for (let id = detail.steeredFrom; id && earlier.length < EARLIER_TURNS_CAP;) {
+        const turn = await ctx.service.detail(id).catch(() => null);
+        if (turn === null)
+            break;
+        earlier.unshift(turn);
+        id = turn.steeredFrom;
+    }
+    const turns = earlier.length > 0 ? { earlierTurns: earlier.map(t => earlierTurn(t, jobFile(ctx.service.repo, t.jobId, FILES.report), fmt)) } : {};
+    if (fmt === 'concise')
+        return structured({ ...conciseStatus(detail, acceptance, wait), reportPath, resumable: Boolean(detail.conversation), ...turns, ...diff });
+    return structured({ ...fullStatus(detail, acceptance), reportPath, resumable: Boolean(detail.conversation), ...turns, ...wait, ...diff });
+};
+const pipelineStatus = async (ctx, args) => {
+    const runId = text(args, 'runId', true);
+    const r = readPipeline(ctx.service.repo, runId);
+    if (!r)
+        throw new Error(`No pipeline run "${runId}".`);
+    return json(format(args) === 'concise' ? concisePipeline(r) : r);
+};
+const cancelJob = async (ctx, args) => {
+    const id = text(args, 'jobId', true);
+    return json(readPipeline(ctx.service.repo, id) ? cancelPipeline(ctx.service.repo, id) : ctx.service.cancel(id));
+};
+const runPipeline = async (ctx, args) => {
+    const raw = record(args.spec, 'spec');
+    keys(raw, ['name', 'task', 'workDir', 'concurrency', 'unrestricted', 'stages']);
+    const stages = parseStages(raw.stages);
+    const task = text(raw, 'task', stages === undefined);
+    const spec = await defaultMixedPipeline({ name: text(raw, 'name', true), task: task ?? '', stages, workDir: text(raw, 'workDir') ?? ctx.service.repo, concurrency: number(raw, 'concurrency', 32), modelConfig: loadModelConfig({ repo: ctx.service.repo }) }, ctx.catalogs);
+    validateSpec(spec);
+    const run = ctx.service.supervisorUrl
+        ? await launchPipeline(ctx.service, spec, { unrestricted: boolean(raw, 'unrestricted') })
+        : startPipeline(ctx.service, spec, { unrestricted: boolean(raw, 'unrestricted') });
+    void run.done.catch(err => process.stderr.write(`agent-smith pipeline ${run.runId}: ${String(err)}\n`));
+    return json({ runId: run.runId, recordPath: run.recordPath, stages: spec.stages.map(s => ({ name: s.name, provider: s.provider, dependsOn: s.dependsOn ?? [] })), started: true, taskHandle: launchTask(run.runId), notify: notifyHint({ run: run.runId }, ctx.service.repo, Math.max(0, ...spec.stages.map(st => st.timeoutMs ?? 0)) || undefined) });
+};
+const HANDLERS = {
+    list_capabilities: listCapabilitiesTool, spawn_job: spawnJob, resume_job: resumeJob, steer_job: steerJob,
+    list_jobs: listJobs, status: jobStatus, pipeline_status: pipelineStatus, cancel: cancelJob, run_pipeline: runPipeline,
+};
 async function callTool(ctx, name, rawArgs) {
     try {
         const def = TOOL_DEFS.find(t => t.name === name);
@@ -25903,222 +26119,10 @@ async function callTool(ctx, name, rawArgs) {
             throw new Error(`Unknown tool ${name}; available: ${TOOL_DEFS.map(t => t.name).join(', ')}.`);
         const args = record(rawArgs ?? {}, 'arguments');
         keys(args, Object.keys(def.inputSchema.properties));
-        switch (name) {
-            case 'list_capabilities': {
-                const fmt = format(args);
-                // Read before nearly every spawn, so its concise text is sent unindented.
-                return structured(await listCapabilities(ctx, boolean(args, 'refresh') ?? false, fmt, allowed(args, 'provider', PROVIDERS)), { compact: fmt === 'concise' });
-            }
-            case 'spawn_job': {
-                const mode = allowed(args, 'mode', MODES$1);
-                if (mode === undefined)
-                    throw new Error(`mode is required; one of ${MODES$1.join(', ')}.`);
-                const cfg = loadModelConfig({ repo: ctx.service.repo });
-                const resolved = resolveRequest({ provider: allowed(args, 'provider', PROVIDERS), model: text(args, 'model'), effort: allowed(args, 'effort', EFFORTS), mode }, cfg);
-                const provider = resolved.provider ?? defaultProvider(ctx.catalogs ? (await installedCatalogs(ctx)).map(c => c.provider) : await getInstalledProviders());
-                const notes = [...resolved.warnings, ...cfg.errors.map(e => `models.json: ${e}`)];
-                const withNotes = (ack) => ({ ...ack, ...(ack.jobId ? { taskHandle: launchTask(ack.jobId), notify: notifyHint({ job: ack.jobId }, ctx.service.repo, ack.timeoutMs) } : {}), ...(resolved.appliedAlias ? { aliasApplied: resolved.appliedAlias, aliasSource: resolved.source } : {}), ...(notes.length ? { warnings: [...(ack.warnings ?? []), ...notes] } : {}) });
-                const checks = parseChecks(args.checks);
-                const preparedJobIds = [];
-                const onPrepared = (jobId) => {
-                    if (preparedJobIds.length === 0) {
-                        // First: if it throws, the job is aborted and must not be left with checks pending.
-                        ctx.onJobPrepared?.(jobId);
-                    }
-                    else {
-                        try {
-                            ctx.onJobPrepared?.(jobId);
-                        }
-                        catch { /* best-effort rebind on continuation turn */ }
-                    }
-                    const prevId = preparedJobIds.at(-1);
-                    preparedJobIds.push(jobId);
-                    if (checks?.length) {
-                        if (prevId) {
-                            try {
-                                writeAcceptance(ctx.service.repo, prevId, { state: 'unchecked', checks: [], reason: 'superseded by steered turn' });
-                            }
-                            catch { /* ignore */ }
-                        }
-                        try {
-                            writeAcceptance(ctx.service.repo, jobId, { state: 'unchecked', checks: [], pending: true });
-                        }
-                        catch (err) {
-                            process.stderr.write(`agent-smith acceptance ${jobId}: ${String(err)}\n`);
-                        }
-                    }
-                };
-                const request = { mode, prompt: text(args, 'prompt', true), context: contextText(args), files: filesList(args), checks, cwd: workingDirectory(args), name: text(args, 'name'), task: text(args, 'task'), provider, model: resolved.model, effort: resolved.effort, timeoutMs: number(args, 'timeoutMs'), conversation: text(args, 'conversation'), unrestricted: boolean(args, 'unrestricted'), onPrepared };
-                // After every argument is validated, so the user is never asked about a call that then fails.
-                const gate = await confirmUnrestricted(ctx, { unrestricted: request.unrestricted, provider, worker: request.name, cwd: request.cwd ?? ctx.service.repo });
-                if (gate.refused)
-                    return gate.refused;
-                if (gate.warning)
-                    notes.push(gate.warning);
-                if (!checks?.length)
-                    return structured({ ...withNotes(await ctx.service.spawnJob(request)), provider });
-                const { ack, done } = await ctx.service.spawnTracked(request);
-                if (!preparedJobIds.includes(ack.jobId)) {
-                    preparedJobIds.push(ack.jobId);
-                    try {
-                        writeAcceptance(ctx.service.repo, ack.jobId, { state: 'unchecked', checks: [], pending: true });
-                    }
-                    catch (err) {
-                        process.stderr.write(`agent-smith acceptance ${ack.jobId}: ${String(err)}\n`);
-                    }
-                }
-                gateAcceptance(ctx, ack.jobId, done, checks, preparedJobIds);
-                return structured({ ...withNotes(ack), provider, checks: checks.map(c => c.name) });
-            }
-            case 'resume_job': {
-                const worker = text(args, 'worker', true);
-                const resolveHead = (id) => typeof ctx.service.resolveHead === 'function' ? ctx.service.resolveHead(id) : id;
-                let detail;
-                try {
-                    detail = await ctx.service.detail(resolveHead(worker));
-                }
-                catch {
-                    const candidates = (await ctx.service.list({ limit: 500 })).filter(j => j.name === worker);
-                    const identities = new Set(candidates.map(j => j.workerId));
-                    if (candidates.length === 0)
-                        throw new Error(`No worker "${worker}"; see list_jobs.`);
-                    if (identities.size !== 1)
-                        throw new Error(`"${worker}" matches ${identities.size} workers; pass a job ID from list_jobs.`);
-                    candidates.sort((a, b) => Date.parse(b.startedAt ?? b.updatedAt ?? '') - Date.parse(a.startedAt ?? a.updatedAt ?? ''));
-                    detail = await ctx.service.detail(resolveHead(candidates[0].jobId));
-                }
-                if (detail.status === 'running')
-                    throw new Error(`"${detail.name}" is still running; use steer_job with delivery: "queue" or "interrupt", or wait.`);
-                if (!detail.conversation)
-                    throw new Error(`"${detail.name}" has no conversation to resume: the provider did not save a conversation before it stopped. Use spawn_job with the full original brief; on-disk edits remain in ${detail.cwd ?? ctx.service.repo}.`);
-                const resumeModel = resolveRequest({ provider: detail.provider ?? undefined, model: text(args, 'model'), effort: allowed(args, 'effort', EFFORTS) }, loadModelConfig({ repo: ctx.service.repo }));
-                let inheritedChecks;
-                if (args.checks === undefined) {
-                    try {
-                        inheritedChecks = parseChecks(JSON.parse(readFileSync(jobFile(ctx.service.repo, detail.jobId, 'checks-spec.json'), 'utf8')));
-                    }
-                    catch (error) {
-                        if (error.code !== 'ENOENT')
-                            throw error;
-                    }
-                }
-                const checks = args.checks === undefined ? inheritedChecks : parseChecks(args.checks);
-                const preparedJobIds = [];
-                const onPrepared = (id) => {
-                    ctx.onJobPrepared?.(id);
-                    preparedJobIds.push(id);
-                    if (checks?.length)
-                        writeAcceptance(ctx.service.repo, id, { state: 'unchecked', checks: [], pending: true });
-                };
-                const prompt = text(args, 'prompt', true);
-                const cwd = workingDirectory(args) ?? detail.cwd ?? ctx.service.repo;
-                const timeoutMs = number(args, 'timeoutMs');
-                const unrestricted = boolean(args, 'unrestricted');
-                const inheritedFiles = Object.keys(detail.watchedFiles ?? {});
-                const mergedFiles = [...new Set([...inheritedFiles, ...(filesList(args) ?? [])])];
-                // Only an explicit unrestricted:true asks; an inherited setting was the original job's.
-                const gate = await confirmUnrestricted(ctx, { unrestricted, provider: detail.provider ?? '', worker: detail.name, cwd });
-                if (gate.refused)
-                    return gate.refused;
-                const request = { checks, mode: detail.mode ?? 'task', prompt, files: mergedFiles.length > 0 ? mergedFiles : undefined, ...(detail.watchedFiles ? { previousWatchedFiles: detail.watchedFiles } : {}), provider: detail.provider ?? undefined, model: resumeModel.model ?? detail.model ?? undefined, effort: resumeModel.effort ?? detail.effort ?? undefined, name: detail.name, workerId: detail.workerId, task: detail.task ?? undefined, cwd, conversation: detail.conversation, timeoutMs, unrestricted: unrestricted ?? detail.unrestricted, onPrepared };
-                const tracked = checks?.length ? await ctx.service.spawnTracked(request) : null;
-                const resumed = tracked?.ack ?? await ctx.service.spawnJob(request);
-                if (tracked && checks)
-                    gateAcceptance(ctx, resumed.jobId, tracked.done, checks, preparedJobIds);
-                const allWarnings = [...(resumed.warnings ?? []), ...(gate.warning ? [gate.warning] : [])];
-                return structured({ ...resumed, taskHandle: launchTask(resumed.jobId), notify: notifyHint({ job: resumed.jobId }, ctx.service.repo, resumed.timeoutMs), ...(allWarnings.length > 0 ? { warnings: allWarnings } : {}) });
-            }
-            case 'steer_job': {
-                const worker = text(args, 'worker', true);
-                const prompt = text(args, 'prompt', true);
-                const context = contextText(args);
-                const files = filesList(args);
-                const delivery = allowed(args, 'delivery', ['queue', 'interrupt']);
-                if (delivery === undefined)
-                    throw new Error('delivery is required: choose "queue" (after current turn) or "interrupt" (stop current turn now).');
-                const ack = await ctx.service.steer({ worker, prompt, context, files, delivery });
-                const idNote = ` The continuation gets a new job ID; status and cancel on ${ack.jobId} follow it.`;
-                return structured({ ...ack, note: `${ack.note}${idNote}`, taskHandle: launchTask(ack.jobId), notify: notifyHint({ job: ack.jobId }, ctx.service.repo, ack.timeoutMs) });
-            }
-            case 'list_jobs': {
-                const fmt = format(args);
-                const since = text(args, 'since');
-                const limit = number(args, 'limit', 500) ?? (fmt === 'concise' ? CONCISE_LIST_LIMIT : undefined);
-                // Concise asks for one extra row so a cut list says so instead of looking complete.
-                const jobs = await ctx.service.list({ provider: allowed(args, 'provider', ['agent-smith', 'agy-staff', 'all']), status: allowed(args, 'status', ['running', 'succeeded', 'failed', 'canceled']),
-                    limit: fmt === 'concise' && limit !== undefined ? limit + 1 : limit, sinceMs: since === undefined ? undefined : parseSince(since), ids: boolean(args, 'session') ? ctx.service.spawnedIds : undefined });
-                // A turn a steer replaced is not a worker; its continuation's row stands for it.
-                const workers = jobs.filter(j => !j.supersededBy);
-                if (fmt !== 'concise')
-                    return structured(workers.map(j => ({ ...j, taskStatus: taskStatus(j.status) })));
-                const rows = workers.slice(0, limit).map(j => conciseRow(j));
-                return structured(workers.length > rows.length
-                    ? { items: rows, more: `More than ${rows.length} jobs match; narrow with since, status or session, or raise limit.` }
-                    : rows);
-            }
-            case 'status': {
-                const jobId = text(args, 'jobId', true);
-                const waitMs = number(args, 'wait_ms', MAX_WAIT_MS);
-                const fmt = format(args);
-                const wantDiff = boolean(args, 'include_diff') ?? false;
-                const resolveHead = (id) => typeof ctx.service.resolveHead === 'function' ? ctx.service.resolveHead(id) : id;
-                let detail = await ctx.service.detail(resolveHead(jobId));
-                let waited = false;
-                if (waitMs !== undefined) {
-                    waited = true;
-                    const deadline = Date.now() + waitMs;
-                    const step = ctx.pollMs ?? WAIT_POLL_MS;
-                    while ((detail.status === 'running' || Boolean(detail.supersededBy)) && Date.now() < deadline) {
-                        await sleep(Math.min(step, Math.max(0, deadline - Date.now())));
-                        detail = await ctx.service.detail(resolveHead(detail.jobId));
-                    }
-                }
-                const reportPath = jobFile(ctx.service.repo, detail.jobId, FILES.report);
-                if (boolean(args, 'report_only'))
-                    return structured({ jobId: detail.jobId, status: detail.status, taskStatus: taskStatus(detail.status), report: detail.report, reportPath });
-                const acceptance = readAcceptance(ctx.service.repo, detail.jobId);
-                const wait = waited ? { waited: true, stillRunning: detail.status === 'running' || Boolean(detail.supersededBy) } : {};
-                const diff = wantDiff ? await jobDiff(detail) : {};
-                // Oldest first, so the turns read in the order the worker took them.
-                const earlier = [];
-                for (let id = detail.steeredFrom; id && earlier.length < EARLIER_TURNS_CAP;) {
-                    const turn = await ctx.service.detail(id).catch(() => null);
-                    if (turn === null)
-                        break;
-                    earlier.unshift(turn);
-                    id = turn.steeredFrom;
-                }
-                const turns = earlier.length > 0 ? { earlierTurns: earlier.map(t => earlierTurn(t, jobFile(ctx.service.repo, t.jobId, FILES.report), fmt)) } : {};
-                if (fmt === 'concise')
-                    return structured({ ...conciseStatus(detail, acceptance, wait), reportPath, resumable: Boolean(detail.conversation), ...turns, ...diff });
-                return structured({ ...fullStatus(detail, acceptance), reportPath, resumable: Boolean(detail.conversation), ...turns, ...wait, ...diff });
-            }
-            case 'pipeline_status': {
-                const runId = text(args, 'runId', true);
-                const r = readPipeline(ctx.service.repo, runId);
-                if (!r)
-                    throw new Error(`No pipeline run "${runId}".`);
-                return json(format(args) === 'concise' ? concisePipeline(r) : r);
-            }
-            case 'cancel': {
-                const id = text(args, 'jobId', true);
-                return json(readPipeline(ctx.service.repo, id) ? cancelPipeline(ctx.service.repo, id) : ctx.service.cancel(id));
-            }
-            case 'run_pipeline': {
-                const raw = record(args.spec, 'spec');
-                keys(raw, ['name', 'task', 'workDir', 'concurrency', 'unrestricted', 'stages']);
-                const stages = parseStages(raw.stages);
-                const task = text(raw, 'task', stages === undefined);
-                const spec = await defaultMixedPipeline({ name: text(raw, 'name', true), task: task ?? '', stages, workDir: text(raw, 'workDir') ?? ctx.service.repo, concurrency: number(raw, 'concurrency', 32), modelConfig: loadModelConfig({ repo: ctx.service.repo }) }, ctx.catalogs);
-                validateSpec(spec);
-                const run = ctx.service.supervisorUrl
-                    ? await launchPipeline(ctx.service, spec, { unrestricted: boolean(raw, 'unrestricted') })
-                    : startPipeline(ctx.service, spec, { unrestricted: boolean(raw, 'unrestricted') });
-                void run.done.catch(err => process.stderr.write(`agent-smith pipeline ${run.runId}: ${String(err)}\n`));
-                return json({ runId: run.runId, recordPath: run.recordPath, stages: spec.stages.map(s => ({ name: s.name, provider: s.provider, dependsOn: s.dependsOn ?? [] })), started: true, taskHandle: launchTask(run.runId), notify: notifyHint({ run: run.runId }, ctx.service.repo, Math.max(0, ...spec.stages.map(st => st.timeoutMs ?? 0)) || undefined) });
-            }
-            default: throw new Error(`Unknown tool ${name}.`);
-        }
+        const handler = HANDLERS[name];
+        if (!handler)
+            throw new Error(`Unknown tool ${name}.`);
+        return await handler(ctx, args);
     }
     catch (err) {
         return failure(err instanceof Error ? err.message : String(err));
@@ -26147,7 +26151,7 @@ async function listCapabilities(ctx, refresh, fmt, only) {
         aliases,
         ...(modelConfig.errors.length ? { aliasConfigErrors: modelConfig.errors } : {}),
         modes: MODES$1.map(name => ({ name, description: MODE_PRESETS[name].description, readOnly: MODE_PRESETS[name].readOnly, runsCommands: MODE_PRESETS[name].runsCommands })),
-        efforts: `Effort is one of ${EFFORTS.join(', ')}; each model lists the efforts it actually accepts (providers may use native names). Omit model/effort to use the harness's own configured default.`,
+        efforts: `Effort is one of ${EFFORTS$1.join(', ')}; each model lists the efforts it actually accepts (providers may use native names). Omit model/effort to use the harness's own configured default.`,
     };
 }/** Normalizes an arbitrary JavaScript value through JSON stringify/parse semantics. */
 function isJsonObject(candidate, visit) {
@@ -26881,7 +26885,7 @@ class ForgeTasks {
                 }
                 if (detail) {
                     const acceptance = readAcceptance(this.context.service.repo, detail.jobId);
-                    if (['succeeded', 'failed', 'canceled'].includes(detail.status) && !detail.supersededBy && !('pending' in acceptance && acceptance.pending)) {
+                    if (isTerminalForgeStatus(detail.status) && !detail.supersededBy && !('pending' in acceptance && acceptance.pending)) {
                         if (detail.status === 'canceled')
                             task = this.store.cancel(taskId);
                         else {
@@ -27018,7 +27022,7 @@ function createSmithServer(context, options) {
  * premise was false. It assumed something ELSE provided the spawn path. Nothing
  * did. The repo could watch workers and could not start one: providers/ was
  * 3,643 lines of adapters nothing imported, pipeline/ had a `StageRunner`
- * injection point with no injection, core/store.ts was unused, and the mod drew
+ * injection point with no injection, an unused SQLite store, and the mod drew
  * twenty real jobs it had no way to create. So the premise was not "a channel
  * would duplicate a tool" — it was "a channel with no tools duplicates nothing,
  * because there is no first implementation to duplicate".

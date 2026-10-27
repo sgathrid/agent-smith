@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import path from'node:path';import {fileURLToPath}from'node:url';import {existsSync,realpathSync}from'node:fs';import {a as parseLaunch,c as claimMarkerPath}from'./chunk-poller.js';import {r as runJobWatch}from'./chunk-monitor.js';import'./chunk-checks.js';import'node:fs/promises';import'node:os';import'node:child_process';import'node:crypto';/**
+import path from'node:path';import {fileURLToPath}from'node:url';import {existsSync,realpathSync}from'node:fs';import {a as parseLaunch,c as claimMarkerPath}from'./chunk-poller.js';import {r as runJobWatch}from'./chunk-monitor.js';import'./chunk-execute.js';import'node:fs/promises';import'node:crypto';import'node:child_process';import'node:os';import'node:readline';/**
  * PostToolUse (asyncRewake) hook entrypoint.
  *
  * Reads the hook JSON from stdin; for spawn_job / resume_job / run_pipeline it

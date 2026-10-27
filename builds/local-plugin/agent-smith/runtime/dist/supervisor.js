@@ -1,4 +1,4 @@
-import {F as ForgeService,s as startPipeline}from'./chunk-service.js';import {w as writeAcceptance,e as evaluateAcceptance}from'./chunk-checks.js';import'node:crypto';import'node:fs';import'node:path';import'node:child_process';import'node:fs/promises';import'node:os';import'node:readline';import'node:url';import'node:timers/promises';/** One execution owner per launch; deliberately independent of MCP transport. */
+import {F as ForgeService}from'./chunk-service.js';import {s as startPipeline,m as markAcceptancePending,e as settleAcceptance}from'./chunk-execute.js';import'node:child_process';import'node:url';import'node:timers/promises';import'node:fs';import'node:path';import'node:fs/promises';import'node:crypto';import'node:os';import'node:readline';/** One execution owner per launch; deliberately independent of MCP transport. */
 process.once('message', async (raw) => {
     const payload = raw;
     let started = false;
@@ -22,7 +22,7 @@ process.once('message', async (raw) => {
             const tracked = await service.spawnTracked({ ...payload.request, onPrepared: async (jobId) => {
                     prepared.push(jobId);
                     if (checks?.length)
-                        writeAcceptance(payload.repo, jobId, { state: 'unchecked', checks: [], pending: true });
+                        markAcceptancePending(payload.repo, jobId);
                     if (started)
                         return; // Continuations rebind through resolveHead, without an MCP owner.
                     await new Promise((resolve) => {
@@ -33,11 +33,10 @@ process.once('message', async (raw) => {
             send({ kind: 'ack', value: tracked.ack });
             const manifest = await tracked.done;
             if (checks?.length) {
-                writeAcceptance(payload.repo, manifest.jobId, await evaluateAcceptance({ succeeded: manifest.status === 'succeeded', checks, baseDir: manifest.cwd }));
-                for (const id of prepared)
-                    if (id !== manifest.jobId) {
-                        writeAcceptance(payload.repo, id, { state: 'unchecked', checks: [], reason: 'superseded by steered turn' });
-                    }
+                await settleAcceptance({
+                    repo: payload.repo, finalJobId: manifest.jobId, preparedJobIds: prepared,
+                    succeeded: manifest.status === 'succeeded', checks, baseDir: manifest.cwd,
+                });
             }
         }
     }

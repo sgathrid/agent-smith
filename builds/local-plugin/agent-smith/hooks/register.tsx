@@ -462,7 +462,7 @@ async function pollNativeTasks($: EngineInterface, rows: readonly RadarJob[]): P
  * The band registers NO `command.run` handler: `/forge` belongs to the pane
  * half. Its rows' digit hotkeys open the pane through `openForge`.
  */
-export function registerBand(on: Parameters<Register>[0]): void {
+function registerBand(on: Parameters<Register>[0]): void {
   // A Bash call that looks like a dispatch: refresh NOW, not in up to 3 s.
   // TERMINAL-UI.md L22-35 says nothing moves unless the user caused it, and the
   // user causing it here is dispatching a job. Making them wait 3 s to see the
@@ -814,6 +814,3 @@ async function renderForge($: EngineInterface, e: UiRenderEvent): Promise<JSX.El
   }
   return error ? <Box flexDirection="column"><Text wrap="wrap">{sanitizeText(error)}</Text>{content}</Box> : content;
 }
-
-export { EMPTY_STATE, describeTool, elapsed, elapsedCell, formatHeaderLine, formatJobLine,
-  pickGlyph, pickColor, isRecessive, isTerminal, countSummary, oneLine, sanitizeText } from './format.ts';

@@ -1,4 +1,4 @@
-import path from'node:path';import {fileURLToPath}from'node:url';import {r as readJob,b as readPipelineRecord,d as buildBatch,e as dedupeKey,f as resetPoller,p as pollOnce,g as readAll}from'./chunk-poller.js';/**
+import path from'node:path';import {fileURLToPath}from'node:url';import {g as isTerminalForgeStatus}from'./chunk-execute.js';import {r as readJob,b as readPipelineRecord,d as buildBatch,e as dedupeKey,f as resetPoller,p as pollOnce,g as readAll}from'./chunk-poller.js';/**
  * Native Claude monitor entrypoint.
  *
  * This process is deliberately separate from the MCP server: Claude Code can
@@ -69,7 +69,6 @@ async function emitStdout(line) {
     });
 }
 const DEFAULT_WATCH_TIMEOUT_MS = 45 * 60_000 + 60_000;
-const TERMINAL = new Set(['succeeded', 'failed', 'canceled']);
 /**
  * Watch specific jobs/runs until each is terminal. Unlike the full-scan monitor
  * there is NO silent baseline: a job that already finished before the watcher
@@ -147,7 +146,7 @@ async function runJobWatch(options) {
                         done.add(id);
                     continue;
                 }
-                if (job && TERMINAL.has(job.status) && (seen.get(id)?.has(dedupeKey(job)) ?? false))
+                if (job && isTerminalForgeStatus(job.status) && (seen.get(id)?.has(dedupeKey(job)) ?? false))
                     done.add(id);
             }
             if (want.size > 0 && [...want].every((id) => done.has(id)))

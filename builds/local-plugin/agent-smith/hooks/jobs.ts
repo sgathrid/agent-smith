@@ -74,7 +74,7 @@
  * that to `failed`, never to `succeeded`.
  */
 
-import { describeActivity, describeTool, parseInputPreview } from './format.ts';
+import { describeActivity, describeTool } from './tools-describe.ts';
 import { STALL_GRACE_MS } from './stale.ts';
 import { REASONS } from './reasons.ts';
 import type { RadarJob, RadarStatus, ToolEntry } from '../types/index.d.ts';
@@ -98,7 +98,7 @@ export interface FsLike {
 }
 
 /** agy-staff's jobs directory, relative to a repo root. */
-export const JOBS_SUFFIX = ['.agy-staff', 'jobs'] as const;
+const JOBS_SUFFIX = ['.agy-staff', 'jobs'] as const;
 
 const SPEC = '.spec.json';
 const PROGRESS = '.progress.json';
@@ -117,7 +117,7 @@ export function jobsDir(repo: string): string {
 const ORPHAN_REASON = REASONS.serverStopped;
 
 /** `<repo>/.agent-smith/jobs/<id>/orphaned`, from `<repo>/.agy-staff/jobs`. */
-export function orphanMarker(dir: string, id: string): string {
+function orphanMarker(dir: string, id: string): string {
   return `${dir.replace(/\/\.agy-staff\/jobs$/, '/.agent-smith/jobs')}/${id}/orphaned`;
 }
 
@@ -412,7 +412,7 @@ export function reportBody(result: string | null): string | null {
  *      A run that died before writing status.json — a killed process, a full
  *      disk — still has its log. Without this row such a job sits at `?` forever.
  *   6. progress.json present              => running, or attention if silent past
- *      STALL_GRACE_MS (core/liveness.ts's 15 min, from stale.ts, so the band and
+ *      STALL_GRACE_MS (15 min, from stale.ts, so the band and
  *      the channel agree on when "stalled" begins).
  *   7. otherwise                          => unknown
  *
@@ -607,7 +607,7 @@ export async function resolve(
     // Silence past the grace period escalates to `attention`. A missing
     // last_event_at yields Infinity, which escalates: we do not know the job is
     // alive, and "unknown" must never be drawn as healthy — the same asymmetry
-    // core/liveness.ts documents.
+    // as everywhere else: unknown escalates.
     const lastSeen = toEpoch(progress.last_event_at);
     const silence = lastSeen === null ? Number.POSITIVE_INFINITY : now - lastSeen;
     const status2: RadarStatus = silence > STALL_GRACE_MS ? 'attention' : 'running';

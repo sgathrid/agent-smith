@@ -1,4 +1,58 @@
-import {r as reasonFromText,H as checksReason,I as readJsonSafe,J as readdirSafe,q as normalize,a as readAcceptance,K as existsSafe,A as AgentSmithReader,p as AgyStaffReader,B as isForgeJobId}from'./chunk-checks.js';import path from'node:path';/**
+import {r as reasonFromText,Z as checksReason,_ as readJsonSafe,U as pipelineRecordPath,$ as readdirSafe,n as normalize,d as readAcceptance,a0 as existsSafe,g as isTerminalForgeStatus,A as AgentSmithReader,k as AgyStaffReader,V as isForgeJobId}from'./chunk-execute.js';import path from'node:path';/**
+ * format.ts — PURE presentation logic for the /forge pane and the band.
+ *
+ * WHY THIS FILE IS NOT `register.tsx`:
+ * `node --test --experimental-strip-types` CANNOT load a .tsx file — TypeScript's
+ * type stripping has no JSX transform (verified: any JSX element in an imported
+ * .tsx is a hard parse error). So if the formatters lived next to the render
+ * code they would be untestable under the repo's own test runner, which defeats
+ * the point of making them pure in the first place. Everything testable lives
+ * here, in a module with zero imports and zero I/O. `register.tsx` imports this
+ * file and does nothing but lay out what these functions return.
+ *
+ * NOTHING in here reads the clock, the filesystem, or any atom. "Now" is always
+ * a parameter, for the same reason the stall check does it: a formatter that
+ * called Date.now() itself could not be tested at a boundary.
+ *
+ * THE RULES ENCODED BELOW come from agent-configs/shared/TERMINAL-UI.md. Where a
+ * rule needed interpretation the reasoning is inline.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * THE ROW, IN ONE PLACE
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Every job row in either surface is these four segments, in this order:
+ *
+ *     {glyph} {label} {detail} {elapsed}
+ *       1        2       3        4
+ *
+ *   1 glyph     EAW=Neutral, one column, always drawn. Never colour alone.
+ *   2 label     THE TASK, from `prompt_source.task`. Fixed-width cell.
+ *   3 detail    what it is doing (live) or how it ended (terminal). Fixed cell.
+ *   4 elapsed   fixed 6 columns, RIGHT-aligned, and LAST — see ELAPSED_WIDTH.
+ *
+ * WHY THE JOB ID IS NOT ON THE ROW ANY MORE. Measured against the real 20-job
+ * corpus in .agy-staff/jobs: every id is `implement-musm82da-f1dc1fe4`. That is
+ * 30 columns of which the mode is constant (`implement`, 100% of the corpus, so
+ * it is not information) and `-f1dc1fe4` is a UUID fragment that distinguishes
+ * nothing a reader can act on. The request the job was actually given sits in
+ * `prompt_source.task` and reads "open an agent-built dashboard with real names,
+ * decoded inside Renyi". That is the identity. The id survives in the DETAIL
+ * view, where it is what you would paste into `agy` to talk about the job.
+ *
+ * WHY ELAPSED IS LAST AND FIXED-WIDTH. TERMINAL-UI.md §Width: "put the volatile
+ * field last — elapsed time ticks every second; if it sits mid-line, everything
+ * after it shifts horizontally each tick." The pane used to put the clock second
+ * and rely on right-alignment; that is safe (see ELAPSED_WIDTH) but it is a
+ * weaker version of the same guarantee than simply putting the field last, and
+ * the band already did the latter. Both surfaces now agree, so there is no
+ * band/pane ordering deviation left to document.
+ */
+/** True for the states that have stopped and will never move again.
+ * Takes any string so wire payloads (notice.ts) can ask without a cast; only
+ * the three settled names count, so 'unknown' and unrecognised words are not. */
+function isTerminal$1(status) {
+    return status === 'succeeded' || status === 'failed' || status === 'canceled';
+}/**
  * notice.ts: the words Agent Smith uses to say a job finished, and which jobs
  * this session may announce. Pure; no host API, no `node:` imports.
  *
@@ -20,7 +74,8 @@ import {r as reasonFromText,H as checksReason,I as readJsonSafe,J as readdirSafe
 const ACCEPTANCE_HOLD_MS = 5 * 60_000;
 const GLYPH = { finished: '✓', failed: '✗', cancelled: '■', attention: '!' };
 // ── text ────────────────────────────────────────────────────────────────────
-/** Bound prose at a sentence or word boundary, never mid-word. */
+/** Bound prose at a sentence or word boundary, never mid-word. Shared with the
+ * channel (policy.ts re-exports it); views.ts `trimWords` is its near-twin. */
 function compactExcerpt(value, max) {
     const text = value.replace(/\s+/g, ' ').trim();
     if (text.length <= max)
@@ -222,7 +277,7 @@ function parseLaunch(toolName, response) {
         return null;
     const id = kind === 'job' ? payload['jobId'] : payload['runId'];
     // Hosts may expose only structuredContent and omit the outer MCP metadata.
-    if (kind === 'job' && ['succeeded', 'failed', 'canceled'].includes(String(payload['status'])))
+    if (kind === 'job' && isTerminal$1(String(payload['status'])))
         return null;
     if (typeof id !== 'string' || id.length === 0)
         return null;
@@ -491,20 +546,30 @@ function assertMetaSafe(meta) {
  * That contradiction is the exact failure this project exists to eliminate, so the
  * number is stated once.
  *
- * WHY IT IS NOT IMPORTED FROM core/liveness.ts: that module's DEFAULT_GRACE_MS is
- * the right number, but it is a sibling package the mod cannot resolve a bare
- * specifier for, and duplicating the literal in two files is how they drift. So:
- * one constant, here, imported by both surfaces, with a comment tying it to
- * core/liveness.ts so a future change there has an obvious counterpart here.
+ * WHY ONE CONSTANT HERE: the mod cannot resolve a bare specifier for a sibling
+ * package, and duplicating the literal in two files is how they drift. So: one
+ * constant, here, imported by both surfaces.
  *
- * Value: core/liveness.ts's DEFAULT_GRACE_MS, 15 minutes.
+ * Value: 15 minutes.
  * Reasoning that number is defensible: agy-staff's own default timeout is 60m
  * (every real spec.json in the corpus says `timeout: "60m"`), so 15m of silence
  * is a quarter of the budget gone with nothing to show, while still leaving ample
  * room for a genuinely long single command like `cargo test --workspace` on a
  * cold target directory.
  */
-const STALL_GRACE_MS = 15 * 60 * 1000;/**
+const STALL_GRACE_MS = 15 * 60 * 1000;
+/**
+ * The one stall rule. Only a `running` job can stall (a settled job has nothing
+ * left to be silent about). No evidence of progress at all, or a timestamp that
+ * does not parse, counts as STALLED: "we do not know" must never be drawn as
+ * "fine". `updatedAt` is an ISO string or epoch ms, as each caller holds it.
+ */
+function isStalled(status, updatedAt, now) {
+    if (status !== 'running')
+        return false;
+    const then = typeof updatedAt === 'number' ? updatedAt : typeof updatedAt === 'string' ? Date.parse(updatedAt) : NaN;
+    return Number.isNaN(then) || now - then > STALL_GRACE_MS;
+}/**
  * watch-source.ts — what the channel reads.
  *
  * Deliberately a thin adapter over the same harness readers the mod pane is built
@@ -537,7 +602,7 @@ const STALL_GRACE_MS = 15 * 60 * 1000;/**
  * naive concatenation would report every job we spawn TWICE — two independently
  * computed verdicts for one id, inside a single poll. The channel's dedupe map
  * would mask the duplicate for notifications and for nothing else. So the primary
- * reader wins the id, here and in harness/registry.ts, by the same rule.
+ * reader wins the id, here and in forge/service.ts, by the same rule.
  *
  * WHY WE DO NOT IMPORT `claude-code`'s reader HERE: this surface is a channel
  * about WORKERS WE SPAWN. Folding in every Claude Code subagent transcript would
@@ -577,7 +642,7 @@ function acceptancePending(cwd, job, now) {
         return false;
     return readAcceptance(cwd, job.id).pending === true;
 }
-const isTerminal = (job) => (job.status === 'succeeded' || job.status === 'failed' || job.status === 'canceled') && job.finishedAt !== null;
+const isTerminal = (job) => isTerminalForgeStatus(job.status) && job.finishedAt !== null;
 function cacheKey(cwd, id) {
     return `${cwd}\0${id}`;
 }
@@ -600,8 +665,7 @@ function pipelineToWatchable(run) {
 }
 /** Read one pipeline record by run id (file name is the sanitized id). */
 async function readPipelineRecord(cwd, runId) {
-    const file = path.join(cwd, '.agent-smith', 'pipelines', `${runId.replace(/[^A-Za-z0-9._-]+/g, '-').slice(0, 100) || 'pipeline'}.json`);
-    const run = await readJsonSafe(file);
+    const run = await readJsonSafe(pipelineRecordPath(cwd, runId));
     const job = pipelineToWatchable(run);
     if (job === null || run === null)
         return null;
@@ -740,7 +804,7 @@ async function readOne(reader, source, cwd, jobId, now) {
  *
  * The stall threshold is imported from ./stale.ts rather than duplicated, so the
  * pane and the channel cannot disagree about when a job counts as stalled. The
- * number itself matches core/liveness.ts's DEFAULT_GRACE_MS (15 min).
+ * number itself is 15 min.
  *
  * WHY ESCALATE HERE AND NOT IN THE POLICY: a stall is a fact about the job, and
  * a fact belongs to the reader. The policy's job is only to decide whether a fact
@@ -749,16 +813,8 @@ async function readOne(reader, source, cwd, jobId, now) {
 function toWatchStatus(observed, now) {
     if (observed.status !== 'running')
         return observed.status;
-    if (observed.updatedAt === null) {
-        // No evidence of progress at all. Treat as needing eyes rather than healthy:
-        // "we do not know" must never be drawn as "fine" (the asymmetry
-        // core/liveness.ts documents).
-        return 'attention';
-    }
-    const then = Date.parse(observed.updatedAt);
-    if (Number.isNaN(then))
-        return 'attention';
-    return now - then > STALL_GRACE_MS ? 'attention' : 'running';
+    // No evidence of progress counts as stalled: "we do not know" must never be drawn as "fine".
+    return isStalled(observed.status, observed.updatedAt, now) ? 'attention' : 'running';
 }/**
  * poller.ts — the poll loop's BRAIN, with no transport attached.
  *
@@ -919,4 +975,4 @@ function scheduleLoop(cwd, intervalMs, send, onError) {
         timer.unref?.();
     };
     tick();
-}export{POLL_MS as P,STALL_GRACE_MS as S,parseLaunch as a,readPipelineRecord as b,claimMarkerPath as c,buildBatch as d,dedupeKey as e,resetPoller as f,readAll as g,pollOnce as p,readJob as r,scheduleLoop as s};
+}export{POLL_MS as P,parseLaunch as a,readPipelineRecord as b,claimMarkerPath as c,buildBatch as d,dedupeKey as e,resetPoller as f,readAll as g,isStalled as i,pollOnce as p,readJob as r,scheduleLoop as s};

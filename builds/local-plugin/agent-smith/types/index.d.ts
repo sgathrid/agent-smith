@@ -29,7 +29,7 @@
  *
  * Deliberately NOT the same union as harness's ObservedStatus: the pane adds
  * `attention` (a running job that has gone silent, surfaced from
- * core/liveness.ts's stall verdict) because "needs you" is a thing a human must
+ * the stall verdict) because "needs you" is a thing a human must
  * be able to tell apart from "still working", and the pane has no other way to
  * say it. The mapping is total and lives in projectRadarJob().
  */
