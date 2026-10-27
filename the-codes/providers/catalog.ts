@@ -43,6 +43,10 @@ function readDisk(repo: string | undefined, name: string): CacheEntry | undefine
     const v = JSON.parse(readFileSync(catalogFile(repo, name), 'utf8')) as Partial<CacheEntry>;
     const c = v.catalog;
     if (typeof v.at !== 'number' || c === undefined || c === null || c.provider !== name || !Array.isArray(c.models)) return undefined;
+    // A malformed entry must be ignored and rediscovered, never served as fresh: the spawn path
+    // reads model ids from it and a null entry would throw inside validation and block the launch.
+    const wellFormed = c.models.every((m) => m !== null && typeof m === 'object' && typeof (m as { id?: unknown }).id === 'string');
+    if (!wellFormed || typeof c.source !== 'string') return undefined;
     return { catalog: c, at: v.at };
   } catch { return undefined; }
 }

@@ -7715,6 +7715,11 @@ function readDisk(repo, name) {
         const c = v.catalog;
         if (typeof v.at !== 'number' || c === undefined || c === null || c.provider !== name || !Array.isArray(c.models))
             return undefined;
+        // A malformed entry must be ignored and rediscovered, never served as fresh: the spawn path
+        // reads model ids from it and a null entry would throw inside validation and block the launch.
+        const wellFormed = c.models.every((m) => m !== null && typeof m === 'object' && typeof m.id === 'string');
+        if (!wellFormed || typeof c.source !== 'string')
+            return undefined;
         return { catalog: c, at: v.at };
     }
     catch {
@@ -8077,6 +8082,15 @@ const ENV_DENYLIST = {
     NODE_PATH: 'would change which modules the worker loads',
     PYTHONPATH: 'would change which modules the worker loads',
     PYTHONHOME: 'would change which runtime the worker loads',
+    PYTHONSTARTUP: 'would run code before the worker starts',
+    // Shell startup files: a shell-based launcher sources these before the worker body runs.
+    BASH_ENV: 'would run code before the worker starts',
+    ENV: 'would run code before the worker starts',
+    ZDOTDIR: 'would run code before the worker starts',
+    SHELLOPTS: 'would change how the shell runs the worker',
+    PROMPT_COMMAND: 'would run code before the worker starts',
+    PERL5OPT: 'would run code before the worker starts',
+    RUBYOPT: 'would run code before the worker starts',
 };
 /**
  * Key prefixes refused for the same reason: the dynamic loader (`LD_`, `DYLD_`),

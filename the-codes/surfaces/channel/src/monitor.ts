@@ -166,7 +166,12 @@ export async function runJobWatch(options: JobWatchOptions): Promise<JobWatchEnd
           if (sj) jobs.set(sj.id, sj);
         }
       }
-      const batch = buildBatch([...jobs.values()].map((job) => ({ job, seen: seen.get(job.id) ?? new Set<string>(), knownBefore: true })), t);
+      // Announcing once: a stage that exited with its checks still running waits for its verdict
+      // rather than contributing a "checks running" line that the one write would carry twice.
+      const announce = options.announceOnce === true
+        ? [...jobs.values()].filter((job) => job.checksRunning === undefined || want.has(job.id))
+        : [...jobs.values()];
+      const batch = buildBatch(announce.map((job) => ({ job, seen: seen.get(job.id) ?? new Set<string>(), knownBefore: true })), t);
       if (batch.content !== null) {
         await emit(batch.content.replace(/\s+/g, ' ').trim(), batch);
         for (const key of batch.keys) {

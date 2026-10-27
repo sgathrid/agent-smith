@@ -380,5 +380,13 @@ test('catalog: disk cache is shared across processes, honors TTL, refresh rewrit
     resetCatalogCacheForTest({ now: () => t + 7 * 60_000, providers: () => [a3] });
     await getCatalogs({ repo });
     assert.equal(a3.calls, 1);
+    // A well-formed file with a malformed model entry is ignored too: served as fresh, a null
+    // entry would throw inside spawn-time validation and block an otherwise valid launch.
+    writeFileSync(file, JSON.stringify({ at: t + 7 * 60_000, catalog: { provider: 'a', models: [null], defaultSource: 'unknown', source: 'live', stale: false, verified: true } }));
+    const a4 = fakeProvider('a', async () => good('a'));
+    resetCatalogCacheForTest({ now: () => t + 7 * 60_000, providers: () => [a4] });
+    const r4 = await getCatalogs({ repo });
+    assert.equal(a4.calls, 1, 'rediscovered instead of serving the malformed entry');
+    assert.equal(r4[0]!.models[0]!.id, good('a').models[0]!.id);
   } finally { rmSync(repo, { recursive: true, force: true }); resetCatalogCacheForTest(); }
 });

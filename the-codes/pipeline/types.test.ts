@@ -7,6 +7,11 @@ test('validateEnv refuses keys that change how the worker binary is found or loa
   assert.throws(() => validateEnv({ PATH: '/tmp/shims' }), /env\.PATH would change which worker binary runs/);
   assert.throws(() => validateEnv({ NODE_OPTIONS: '--import=data:text/javascript,1' }), /env\.NODE_OPTIONS would run code before the worker starts/);
   assert.throws(() => validateEnv({ DYLD_INSERT_LIBRARIES: '/tmp/x.dylib' }), /env\.DYLD_INSERT_LIBRARIES would change which libraries/);
+  // Shell startup files run before a shell-based launcher reaches the worker body.
+  assert.throws(() => validateEnv({ BASH_ENV: '$(printf PRELOAD >&2)' }), /env\.BASH_ENV would run code before the worker starts/);
+  assert.throws(() => validateEnv({ ENV: '/tmp/rc' }), /env\.ENV would run code/);
+  assert.throws(() => validateEnv({ ZDOTDIR: '/tmp' }), /env\.ZDOTDIR would run code/);
+  assert.throws(() => validateEnv({ PROMPT_COMMAND: 'id' }), /env\.PROMPT_COMMAND would run code/);
   assert.throws(() => validateEnv({ AGENT_SMITH_X: '1' }), /env\.AGENT_SMITH_X is Agent Smith's own setting/);
   assert.throws(() => validateEnv({ CODEX_HOME: '/tmp/c' }, 'stages[0].env'), /stages\[0\]\.env\.CODEX_HOME would change the provider's config/);
   for (const key of ['HOME', 'SHELL', 'TMPDIR', 'NODE_PATH', 'LD_PRELOAD', 'CLAUDE_CONFIG_DIR', 'KIMI_CODE_HOME', 'OPENCODE_CONFIG', 'AGY_X', 'XDG_CONFIG_HOME']) {

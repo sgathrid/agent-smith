@@ -273,6 +273,24 @@ function hookRepo(budgetMs: number | undefined, extra: object, finishedAgoMs: nu
 const launchInput = (repo: string, timeoutMs = 60_000) =>
   JSON.stringify({ tool_name: 'mcp__x__spawn_job', tool_response: { jobId: 'j-1', repo, timeoutMs } });
 
+test('announceOnce: a pipeline stage that exited with checks running contributes no "checks running" line; its verdict comes with the run', async () => {
+  const stage = [job('s1', 'succeeded', { checksRunning: 'slow' }), job('s1', 'succeeded', { checksRunning: 'slow' }), job('s1', 'failed', { outcome: 'checks failed: slow' })];
+  const run = [job('r1', 'running', { role: 'pipeline' }), job('r1', 'running', { role: 'pipeline' }), job('r1', 'failed', { role: 'pipeline', outcome: 'Pipeline failed; s1.' })];
+  const go = (announceOnce: boolean) => {
+    const lines: string[] = []; const tick: Record<string, number> = {}; let clock = T0;
+    const seq = (id: string) => { const s = id === 's1' ? stage : run; const i = Math.min(tick[id] ?? 0, s.length - 1); tick[id] = (tick[id] ?? 0) + 1; return s[i]!; };
+    return runJobWatch({ cwd: '/repo', runIds: ['r1'], intervalMs: 20, now: () => (clock += 1000), announceOnce,
+      readJob: async (_c, id) => seq(id), readRun: async (_c, id) => ({ job: seq(id), stageJobIds: ['s1'] }), emit: (l) => { lines.push(l); } }).then((r) => ({ r, lines }));
+  };
+  const twice = await go(false);
+  assert.equal(twice.r, 'done');
+  assert.ok(twice.lines.some((l) => /checks running: slow/.test(l)), 'default behaviour still reports the stage exited with checks running');
+  const once = await go(true);
+  assert.equal(once.r, 'done');
+  assert.ok(once.lines.every((l) => !/checks running/.test(l)), `no "checks running" line: ${once.lines.join(' | ')}`);
+  assert.ok(once.lines.some((l) => /checks failed: slow|Pipeline failed/.test(l)), 'the verdict is still announced');
+});
+
 test('hook deadline = job timeout + acceptance budget + grace, capped below the hook timeout', () => {
   const { repo } = hookRepo(10 * 60_000, { running: 'slow' }, 0);
   try {

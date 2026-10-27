@@ -25498,7 +25498,7 @@ const checksSchema = { type: 'array', items: {
         type: 'object', required: ['name', 'command'], additionalProperties: false,
         properties: { name: string, command: string, cwd: string, timeoutMs: { type: 'integer', minimum: 1 }, blocking: { type: 'boolean' } },
     } };
-const envSchema = { type: 'object', additionalProperties: { type: 'string' }, description: 'Extra environment variables for the worker, merged over the server\'s (e.g. a per-worktree CARGO_TARGET_DIR). Only the names are recorded; values are not stored. Names that change which binary runs or how it loads or finds its config are rejected: PATH, HOME, SHELL, TMPDIR, NODE_OPTIONS, NODE_PATH, PYTHONPATH, PYTHONHOME and anything starting with LD_, DYLD_, XDG_, AGENT_SMITH_, AGY_, CLAUDE_, CODEX_, OPENCODE_ or KIMI_.' };
+const envSchema = { type: 'object', additionalProperties: { type: 'string' }, description: 'Extra environment variables for the worker, merged over the server\'s (e.g. a per-worktree CARGO_TARGET_DIR). Only the names are recorded; values are not stored. Names that change which binary runs or how it loads or finds its config are rejected: PATH, HOME, SHELL, TMPDIR, NODE_OPTIONS, NODE_PATH, PYTHONPATH, PYTHONHOME, PYTHONSTARTUP, BASH_ENV, ENV, ZDOTDIR, SHELLOPTS, PROMPT_COMMAND, PERL5OPT, RUBYOPT and anything starting with LD_, DYLD_, XDG_, AGENT_SMITH_, AGY_, CLAUDE_, CODEX_, OPENCODE_ or KIMI_.' };
 const stageSchema = {
     type: 'object', required: ['name'], additionalProperties: false,
     properties: {

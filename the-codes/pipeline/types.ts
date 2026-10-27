@@ -168,6 +168,15 @@ export const ENV_DENYLIST: Readonly<Record<string, string>> = {
   NODE_PATH: 'would change which modules the worker loads',
   PYTHONPATH: 'would change which modules the worker loads',
   PYTHONHOME: 'would change which runtime the worker loads',
+  PYTHONSTARTUP: 'would run code before the worker starts',
+  // Shell startup files: a shell-based launcher sources these before the worker body runs.
+  BASH_ENV: 'would run code before the worker starts',
+  ENV: 'would run code before the worker starts',
+  ZDOTDIR: 'would run code before the worker starts',
+  SHELLOPTS: 'would change how the shell runs the worker',
+  PROMPT_COMMAND: 'would run code before the worker starts',
+  PERL5OPT: 'would run code before the worker starts',
+  RUBYOPT: 'would run code before the worker starts',
 };
 
 /**
