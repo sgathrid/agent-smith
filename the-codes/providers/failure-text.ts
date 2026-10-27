@@ -43,3 +43,15 @@ export function deniedText(names: readonly string[], stderr: string): string {
   const list = [...new Set(names.filter((n) => n !== ''))].join(', ');
   return `${list === '' ? 'denied' : `denied ${list}`}${stderrClause(stderr)}`;
 }
+
+/**
+ * `recovered from a provider connection error at 21:11 UTC: ECONNRESET …`.
+ * The warning a job carries when a worker hit an error, kept working and still
+ * delivered its report. `at` is an ISO timestamp; `label` names the kind of error.
+ */
+export function recoveredErrorText(label: string, message: string, at: string): string {
+  const flat = message.replace(/\s+/g, ' ').trim();
+  const detail = flat.length > 140 ? `${flat.slice(0, 139)}…` : flat;
+  const clock = /^\d{4}-\d\d-\d\dT(\d\d:\d\d)/.exec(at)?.[1];
+  return `recovered from ${label}${clock === undefined ? '' : ` at ${clock} UTC`}${detail === '' ? '' : `: ${detail}`}`;
+}

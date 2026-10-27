@@ -32,7 +32,7 @@ import path from 'node:path';
 import os from 'node:os';
 import readline from 'node:readline';
 import type { JobResult, JobStatus, ProviderEvent, SpawnSpec, WorkerHandle } from './types.ts';
-import { timedOutText } from './failure-text.ts';
+import { recoveredErrorText, timedOutText } from './failure-text.ts';
 
 /**
  * Minimal `which`: walk PATH, test for X_OK.
@@ -578,6 +578,50 @@ export function earlyVerdict(exit: ExitInfo, durationMs: number): Verdict | unde
   if (exit.killReason === 'timeout') return { status: 'timeout', error: timedOutText(durationMs) };
   if (exit.spawnError !== undefined) return { status: 'spawn-failed', error: exit.spawnError };
   return undefined;
+}
+
+/**
+ * Did the worker get past an error event? A transient error (a dropped
+ * connection the CLI retries) is followed by more work and a final report, yet
+ * the CLI may still exit non-zero. An adapter that treats any error event as
+ * terminal then fails a job that completed.
+ *
+ * The rule is deliberately narrow. The LAST error is recovered only when
+ * assistant text arrived after it (tool activity alone is not a report), so an
+ * error that is the final meaningful event, or that comes after the last text,
+ * stays a failure. A later error replaces an earlier one and must itself be
+ * followed by text.
+ */
+export class ErrorRecovery {
+  private last: { message: string; at: string; label: string; textAfter: boolean } | undefined;
+
+  /** Record an error event. `label` names it in the warning, e.g. "a provider connection error". */
+  noteError(label: string, message: string, at: string): void {
+    this.last = { label, message, at, textAfter: false };
+  }
+
+  /** Feed the events the translator just produced. */
+  observe(events: readonly ProviderEvent[]): void {
+    if (this.last === undefined) return;
+    for (const e of events) {
+      if (e.kind === 'text' && e.stream !== 'thinking' && e.text.trim() !== '') this.last.textAfter = true;
+    }
+  }
+
+  /** The recovered error, when the run delivered a non-empty report after it. */
+  recovered(finalText: string): { label: string; message: string; at: string } | undefined {
+    const l = this.last;
+    return l !== undefined && l.textAfter && finalText.trim() !== '' ? l : undefined;
+  }
+}
+
+/** The warning notice for a run judged a success despite a recovered error. Issued after the verdict. */
+export function recoveredErrorNotice(
+  recovered: { label: string; message: string; at: string } | undefined,
+  final: JobResult,
+): ProviderEvent | undefined {
+  if (recovered === undefined || final.status !== 'success') return undefined;
+  return { kind: 'notice', at: final.finishedAt, level: 'warn', message: recoveredErrorText(recovered.label, recovered.message, recovered.at) };
 }
 
 /** The JobResult envelope every adapter fills the same way; callers add their optional fields. */
