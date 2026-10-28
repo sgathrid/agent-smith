@@ -4,8 +4,7 @@
  * This is the module that makes the two halves of this repo one system. It takes
  * a `WorkerHandle` from providers/, translates its event stream into OUR state
  * format (format.ts), computes the verdict (format.deriveStatus), writes the
- * anchor, and projects the result into the compat mirror (mirror.ts) so an
- * unmodified mod can draw it.
+ * anchor.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * WHY THE WRITER, AND NOT THE SURFACE, OWNS THE FILES
@@ -23,7 +22,7 @@
  * ─────────────────────────────────────────────────────────────────────────────
  *
  * The reference job made 484 tool calls. Naively, that is 484 progress.json
- * rewrites and 484 mirror progress rewrites. Both are invisible — the band polls
+ * rewrites. That is invisible — the band polls
  * at 3 s, the channel at 5 s — so we coalesce: at most one progress flush every
  * PROGRESS_FLUSH_MS, with a trailing flush on every terminal transition so the
  * last state is never lost.
@@ -39,7 +38,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 
-import { appendLine, createMarker, writeAtomic, writeJsonAtomic } from './atomic.ts';
+import { createMarker, writeAtomic, writeJsonAtomic } from './atomic.ts';
 import {
   FAILED_EARLY_MS,
   FILES,
@@ -64,7 +63,6 @@ import {
   type ForgeViewEvent,
   type WatchedFileSigs,
 } from './format.ts';
-import { MirrorWriter } from './mirror.ts';
 import type { JobResult, ProviderEvent, WorkerHandle } from '../providers/types.ts';
 
 /** How many recent activities we keep. Matches the pane's rendering cap. */
@@ -79,8 +77,6 @@ const SUMMARY_CHARS = 1_000;
 export interface JobWriterOptions {
   readonly repo: string;
   readonly jobId: string;
-  /** Project into the agy-staff-shaped compat mirror. Default true. */
-  readonly mirror?: boolean;
   /** Progress coalescing window, ms. Overridable so tests need not sleep. */
   readonly flushMs?: number;
 }
@@ -125,8 +121,6 @@ export class JobWriter {
   readonly jobId: string;
   private readonly repo: string;
   private readonly flushMs: number;
-  private readonly mirror: MirrorWriter;
-  private readonly mirrorOn: boolean;
 
   private manifest: ForgeManifest | null = null;
   private progress: ForgeProgress | null = null;
@@ -177,8 +171,6 @@ export class JobWriter {
     this.repo = options.repo;
     this.jobId = options.jobId;
     this.flushMs = options.flushMs ?? PROGRESS_FLUSH_MS;
-    this.mirrorOn = options.mirror ?? true;
-    this.mirror = new MirrorWriter(options.repo, { enabled: options.mirror ?? true });
   }
 
   /**
@@ -257,9 +249,7 @@ export class JobWriter {
       warnings: [],
     };
 
-    this.mirror.claim(this.jobId);
     this.writeManifest();
-    this.mirror.writeSpec(manifest, input.prompt, input.preamble);
     this.flushProgress(this.manifest.createdAt);
     // Fire and forget: spawn never waits on git. Merged into the manifest when it lands.
     this.cwd = input.cwd;
@@ -350,8 +340,8 @@ export class JobWriter {
 
   /**
    * Record that the worker's process is alive: progress.json `lastAliveAt` (and
-   * `workerPid`). Not activity: `updatedAt`, `lastEventAt`, the timeline and the
-   * mirror's events stay untouched, and only progress.json is rewritten.
+   * `workerPid`). Not activity: `updatedAt`, `lastEventAt` and the timeline
+   * stay untouched, and only progress.json is rewritten.
    */
   heartbeat(at: string, pid?: number): void {
     if (this.finished || this.manifest === null || this.progress === null) return;
@@ -368,177 +358,165 @@ export class JobWriter {
   /** Feed one normalized provider event into the snapshot. */
   onEvent(event: ProviderEvent): void {
     if (this.finished || this.manifest === null) return;
-    const at = event.at;
-
-    if (event.kind === 'heartbeat') {
-      this.heartbeat(at, event.pid);
-      return;
-    }
-
-    if (event.kind === 'started') {
-      if (typeof event.conversationId === 'string' && event.conversationId.trim() !== '') {
-        this.conversation = event.conversationId;
-        this.manifest = { ...this.manifest, conversation: this.conversation };
-        // Resume identity must survive a supervisor crash even inside the
-        // progress coalescing window, before finish() can publish it.
-        this.writeManifest();
-      }
-      if (typeof event.model === 'string' && this.manifest.model === null) {
-        // Provider-reported (structured event, never worker text) beats "unknown"/harness-config guesses.
-        this.manifest = {
-          ...this.manifest,
-          model: event.model,
-          modelResolved: event.model,
-          modelSource: 'reported',
-        };
-      }
-      this.touch(at);
-      return;
-    }
-
-    if (event.kind === 'activity-start' || event.kind === 'activity-update' || event.kind === 'activity-end') {
-      this.deltaOpen = false;
-      const ref = event.activity;
-      const isStart = event.kind === 'activity-start';
-      // An update is an in-flight call: it keeps the row active and must NOT
-      // count as a new tool call when its step was already registered.
-      const status =
-        isStart || event.kind === 'activity-update'
-          ? ('active' as const)
-          : event.status === 'denied'
-            ? ('denied' as const)
-            : event.status === 'error'
-              ? ('error' as const)
-              : ('done' as const);
-
-      if (!this.toolSteps.has(ref.stepIndex)) {
-        this.toolSteps.add(ref.stepIndex);
-        this.toolCalls += 1;
-      }
-
-      // A tool's DONE record frequently carries no `input` (the provider split
-      // ACTIVE and DONE for the same step_index, and only ACTIVE had the
-      // parameters — 14,900 archived records confirm it). So the DONE row
-      // INHERITS the input from the ACTIVE row rather than dropping it, which is
-      // what keeps the pane's activity phrase readable on a finished job. The
-      // same applies to an update, and to a later update that finally names the
-      // parameters the start did not have.
-      const idx = this.recent.findIndex((a) => a.stepIndex === ref.stepIndex);
-      const previousRow = idx >= 0 ? this.recent[idx] : undefined;
-      const input = ref.input ?? previousRow?.input;
-      const tool = ref.tool === 'tool_result' ? previousRow?.tool ?? ref.tool : ref.tool;
-      const row: ForgeActivity = {
-        stepIndex: ref.stepIndex,
-        tool,
-        status,
-        ...(input === undefined ? {} : { input }),
-      };
-      // Only an input that arrived AFTER a start without one is "new" evidence:
-      // re-sent parameters on every update must not fill the attribution buffer.
-      if (ref.input !== undefined && previousRow?.input === undefined) {
-        if (this.toolInputs.length < TOOL_INPUTS_CAP) this.toolInputs += ref.input + '\n';
-        if (classify(tool, input).kind === 'edit' && this.editToolInputs.length < TOOL_INPUTS_CAP) {
-          this.editToolInputs += ref.input + '\n';
+    switch (event.kind) {
+      case 'heartbeat': this.heartbeat(event.at, event.pid); return;
+      case 'started': this.onStarted(event); return;
+      case 'activity-start':
+      case 'activity-update':
+      case 'activity-end': this.onActivity(event); return;
+      case 'text': this.onText(event); return;
+      case 'notice':
+        // Info notices (lifecycle chatter) are not "the first thing that happened".
+        if (event.level !== 'info') this.noteFirstEvent(event.level === 'error');
+        if (event.level === 'warn' || event.level === 'error') {
+          this.addWarning(event.message.slice(0, 400));
+          this.touch(event.at);
         }
-      }
-      if (event.kind === 'activity-end') this.tracker.end(ref.stepIndex, row.tool, input, status);
-      else this.tracker.start(ref.stepIndex, row.tool, ref.input ?? input);
-      if (event.kind === 'activity-end' && status === 'done' && classify(tool, input).kind === 'edit') {
-        this.editStepsCompleted.add(ref.stepIndex);
-      }
-      // A tool call ends the assistant message before it: the next text is a new one.
-      if (isStart) this.currentMessage = '';
-      if (status === 'error') this.toolErrorSteps.add(ref.stepIndex);
-      this.noteFirstEvent(false);
-      this.lastActivity = row;
-      if (idx >= 0) this.recent[idx] = row;
-      else this.recent.push(row);
-      // The pane picks the HIGHEST step_index, not the last entry, because a
-      // rewritten array mid-poll is not guaranteed sorted. Keeping the array
-      // short is what stops that from mattering.
-      if (this.recent.length > RECENT_ACTIVITIES) this.recent = this.recent.slice(-RECENT_ACTIVITIES);
-
-      const tools = [...this.view.tools];
-      const toolIndex = tools.findIndex(t => t.stepIndex === ref.stepIndex);
-      const previous = tools[toolIndex];
-      const detail = { stepIndex: ref.stepIndex, at, tool: (ref.tool === 'tool_result' ? previous?.tool ?? ref.tool : ref.tool).slice(0, 120),
-        input: (ref.input ?? previous?.input ?? '').slice(0, 1_000),
-        output: (ref.output ?? previous?.output ?? '').slice(0, 2_000),
-        state: status === 'active' ? 'active' as const : status === 'done' ? 'done' as const : 'error' as const };
-      if (toolIndex >= 0) tools[toolIndex] = detail;
-      else tools.push(detail);
-      this.view = { ...this.view, tools: tools.slice(-60), truncated: this.view.truncated || tools.length > 60 ||
-        (ref.input?.length ?? 0) > 1_000 || (ref.output?.length ?? 0) > 2_000 || ref.tool.length > 120 };
-
-      const timeline = [...this.view.timeline ?? []];
-      const eventIndex = timeline.findIndex(e => e.kind === 'tool' && e.stepIndex === ref.stepIndex);
-      const oldEvent = timeline[eventIndex];
-      const item: ForgeViewEvent = { ...detail, kind: 'tool', sequence: oldEvent?.sequence ?? this.viewSequence++,
-        at: oldEvent?.at ?? at };
-      if (eventIndex >= 0) timeline[eventIndex] = item;
-      else timeline.push(item);
-      const bounded = boundTimeline(timeline);
-      this.view = { ...this.view, timeline: bounded.events, truncated: this.view.truncated || bounded.truncated };
-
-      this.mirror.appendEvent(this.jobId, event as unknown as Record<string, unknown>);
-      this.touch(at);
-      return;
-    }
-
-    if (event.kind === 'text') {
-      if (event.stream !== 'assistant') return;
-      this.mirror.appendEvent(this.jobId, event as unknown as Record<string, unknown>);
-      const joinDelta = event.delta === true && this.deltaOpen;
-      const transcript = [...this.view.transcript];
-      if (event.delta && this.deltaOpen && transcript.length > 0) transcript[transcript.length - 1] += event.text;
-      else transcript.push(event.text);
-      this.deltaOpen = event.delta === true;
-      let truncated = this.view.truncated;
-      let chars = transcript.reduce((n, t) => n + t.length, 0);
-      while (transcript.length > 1 && (chars > 64_000 || transcript.length > 200)) {
-        chars -= transcript.shift()!.length;
-        truncated = true;
-      }
-      if (chars > 64_000) { transcript[0] = transcript[0]!.slice(-64_000); truncated = true; }
-      this.view = { ...this.view, transcript, truncated };
-      const timeline = [...this.view.timeline ?? []];
-      const last = timeline.at(-1);
-      if (joinDelta && last?.kind === 'assistant') timeline[timeline.length - 1] = { ...last, text: last.text + event.text };
-      else timeline.push({ kind: 'assistant', sequence: this.viewSequence++, at, text: event.text });
-      const bounded = boundTimeline(timeline);
-      this.view = { ...this.view, timeline: bounded.events, truncated: this.view.truncated || bounded.truncated };
-      this.latestText = appendBounded(this.latestText ?? '', event.text, LATEST_TEXT_CHARS);
-      this.currentMessage = appendBounded(this.currentMessage, event.text, LATEST_TEXT_CHARS);
-      this.noteFirstEvent(false);
-      this.manifest = { ...this.manifest, latestSummary: summaryTail(this.currentMessage, SUMMARY_CHARS) || this.manifest.latestSummary || null, summarySource: 'worker' };
-      this.touch(at);
-      return;
-    }
-
-    if (event.kind === 'notice') {
-      // Info notices (lifecycle chatter) are not "the first thing that happened".
-      if (event.level !== 'info') this.noteFirstEvent(event.level === 'error');
-      if (event.level === 'warn' || event.level === 'error') {
-        this.addWarning(event.message.slice(0, 400));
-        this.touch(at);
-      }
-      return;
-    }
-
-    if (event.kind === 'usage') {
-      this.touch(at);
-      return;
+        return;
+      case 'usage': this.touch(event.at); return;
+      default: return;
     }
   }
 
-  /**
-   * Write the terminal state.
-   *
-   * Every path out of a job goes through here, including the ones where the
-   * process died without producing a JobResult — a cancel that raced the exit,
-   * a throw from the adapter. A job that never gets a terminal write stays
-   * `running` forever, which is a lie with a very long fuse.
-   */
+  private onStarted(event: Extract<ProviderEvent, { kind: 'started' }>): void {
+    if (this.manifest === null) return;
+    const at = event.at;
+    if (typeof event.conversationId === 'string' && event.conversationId.trim() !== '') {
+      this.conversation = event.conversationId;
+      this.manifest = { ...this.manifest, conversation: this.conversation };
+      // Resume identity must survive a supervisor crash even inside the
+      // progress coalescing window, before finish() can publish it.
+      this.writeManifest();
+    }
+    if (typeof event.model === 'string' && this.manifest.model === null) {
+      // Provider-reported (structured event, never worker text) beats "unknown"/harness-config guesses.
+      this.manifest = {
+        ...this.manifest,
+        model: event.model,
+        modelResolved: event.model,
+        modelSource: 'reported',
+      };
+    }
+    this.touch(at);
+  }
+
+  private onActivity(event: Extract<ProviderEvent, { kind: 'activity-start' | 'activity-update' | 'activity-end' }>): void {
+    if (this.manifest === null) return;
+    const at = event.at;
+    this.deltaOpen = false;
+    const ref = event.activity;
+    const isStart = event.kind === 'activity-start';
+    // An update is an in-flight call: it keeps the row active and must NOT
+    // count as a new tool call when its step was already registered.
+    const status =
+      isStart || event.kind === 'activity-update'
+        ? ('active' as const)
+        : event.status === 'denied'
+          ? ('denied' as const)
+          : event.status === 'error'
+            ? ('error' as const)
+            : ('done' as const);
+
+    if (!this.toolSteps.has(ref.stepIndex)) {
+      this.toolSteps.add(ref.stepIndex);
+      this.toolCalls += 1;
+    }
+
+    // A tool's DONE record frequently carries no `input` (the provider split
+    // ACTIVE and DONE for the same step_index, and only ACTIVE had the
+    // parameters — 14,900 archived records confirm it). So the DONE row
+    // INHERITS the input from the ACTIVE row rather than dropping it, which is
+    // what keeps the pane's activity phrase readable on a finished job. The
+    // same applies to an update, and to a later update that finally names the
+    // parameters the start did not have.
+    const idx = this.recent.findIndex((a) => a.stepIndex === ref.stepIndex);
+    const previousRow = idx >= 0 ? this.recent[idx] : undefined;
+    const input = ref.input ?? previousRow?.input;
+    const tool = ref.tool === 'tool_result' ? previousRow?.tool ?? ref.tool : ref.tool;
+    const row: ForgeActivity = {
+      stepIndex: ref.stepIndex,
+      tool,
+      status,
+      ...(input === undefined ? {} : { input }),
+    };
+    // Only an input that arrived AFTER a start without one is "new" evidence:
+    // re-sent parameters on every update must not fill the attribution buffer.
+    if (ref.input !== undefined && previousRow?.input === undefined) {
+      if (this.toolInputs.length < TOOL_INPUTS_CAP) this.toolInputs += ref.input + '\n';
+      if (classify(tool, input).kind === 'edit' && this.editToolInputs.length < TOOL_INPUTS_CAP) {
+        this.editToolInputs += ref.input + '\n';
+      }
+    }
+    if (event.kind === 'activity-end') this.tracker.end(ref.stepIndex, row.tool, input, status);
+    else this.tracker.start(ref.stepIndex, row.tool, ref.input ?? input);
+    if (event.kind === 'activity-end' && status === 'done' && classify(tool, input).kind === 'edit') {
+      this.editStepsCompleted.add(ref.stepIndex);
+    }
+    // A tool call ends the assistant message before it: the next text is a new one.
+    if (isStart) this.currentMessage = '';
+    if (status === 'error') this.toolErrorSteps.add(ref.stepIndex);
+    this.noteFirstEvent(false);
+    this.lastActivity = row;
+    if (idx >= 0) this.recent[idx] = row;
+    else this.recent.push(row);
+    // The pane picks the HIGHEST step_index, not the last entry, because a
+    // rewritten array mid-poll is not guaranteed sorted. Keeping the array
+    // short is what stops that from mattering.
+    if (this.recent.length > RECENT_ACTIVITIES) this.recent = this.recent.slice(-RECENT_ACTIVITIES);
+
+    const tools = [...this.view.tools];
+    const toolIndex = tools.findIndex(t => t.stepIndex === ref.stepIndex);
+    const previous = tools[toolIndex];
+    const detail = { stepIndex: ref.stepIndex, at, tool: (ref.tool === 'tool_result' ? previous?.tool ?? ref.tool : ref.tool).slice(0, 120),
+      input: (ref.input ?? previous?.input ?? '').slice(0, 1_000),
+      output: (ref.output ?? previous?.output ?? '').slice(0, 2_000),
+      state: status === 'active' ? 'active' as const : status === 'done' ? 'done' as const : 'error' as const };
+    if (toolIndex >= 0) tools[toolIndex] = detail;
+    else tools.push(detail);
+    this.view = { ...this.view, tools: tools.slice(-60), truncated: this.view.truncated || tools.length > 60 ||
+      (ref.input?.length ?? 0) > 1_000 || (ref.output?.length ?? 0) > 2_000 || ref.tool.length > 120 };
+
+    const timeline = [...this.view.timeline ?? []];
+    const eventIndex = timeline.findIndex(e => e.kind === 'tool' && e.stepIndex === ref.stepIndex);
+    const oldEvent = timeline[eventIndex];
+    const item: ForgeViewEvent = { ...detail, kind: 'tool', sequence: oldEvent?.sequence ?? this.viewSequence++,
+      at: oldEvent?.at ?? at };
+    if (eventIndex >= 0) timeline[eventIndex] = item;
+    else timeline.push(item);
+    const bounded = boundTimeline(timeline);
+    this.view = { ...this.view, timeline: bounded.events, truncated: this.view.truncated || bounded.truncated };
+
+    this.touch(at);  }
+
+  private onText(event: Extract<ProviderEvent, { kind: 'text' }>): void {
+    if (this.manifest === null) return;
+    const at = event.at;
+    if (event.stream !== 'assistant') return;
+    const joinDelta = event.delta === true && this.deltaOpen;
+    const transcript = [...this.view.transcript];
+    if (event.delta && this.deltaOpen && transcript.length > 0) transcript[transcript.length - 1] += event.text;
+    else transcript.push(event.text);
+    this.deltaOpen = event.delta === true;
+    let truncated = this.view.truncated;
+    let chars = transcript.reduce((n, t) => n + t.length, 0);
+    while (transcript.length > 1 && (chars > 64_000 || transcript.length > 200)) {
+      chars -= transcript.shift()!.length;
+      truncated = true;
+    }
+    if (chars > 64_000) { transcript[0] = transcript[0]!.slice(-64_000); truncated = true; }
+    this.view = { ...this.view, transcript, truncated };
+    const timeline = [...this.view.timeline ?? []];
+    const last = timeline.at(-1);
+    if (joinDelta && last?.kind === 'assistant') timeline[timeline.length - 1] = { ...last, text: last.text + event.text };
+    else timeline.push({ kind: 'assistant', sequence: this.viewSequence++, at, text: event.text });
+    const bounded = boundTimeline(timeline);
+    this.view = { ...this.view, timeline: bounded.events, truncated: this.view.truncated || bounded.truncated };
+    this.latestText = appendBounded(this.latestText ?? '', event.text, LATEST_TEXT_CHARS);
+    this.currentMessage = appendBounded(this.currentMessage, event.text, LATEST_TEXT_CHARS);
+    this.noteFirstEvent(false);
+    this.manifest = { ...this.manifest, latestSummary: summaryTail(this.currentMessage, SUMMARY_CHARS) || this.manifest.latestSummary || null, summarySource: 'worker' };
+    this.touch(at);  }
+
   /**
    * The cwd facts deriveStatus needs: is the cwd gone, and was this job meant
    * to write (mode) or seen editing (one of its own edit tool calls completed
@@ -549,6 +527,14 @@ export class JobWriter {
     return cwdFacts(this.cwd, this.manifest?.mode, this.editStepsCompleted.size > 0);
   }
 
+  /**
+   * Write the terminal state.
+   *
+   * Every path out of a job goes through here, including the ones where the
+   * process died without producing a JobResult — a cancel that raced the exit,
+   * a throw from the adapter. A job that never gets a terminal write stays
+   * `running` forever, which is a lie with a very long fuse.
+   */
   finish(result: JobResult, report: string | null): ForgeManifest {
     if (this.finished || this.manifest === null) {
       // A second terminal write is a bug in the caller, but returning the
@@ -632,7 +618,6 @@ export class JobWriter {
     writeAtomic(jobFile(this.repo, this.jobId, FILES.report), body);
     this.writeManifest();
     this.flushProgress(finishedAt);
-    this.mirror.finish(manifest, body, verdict.suspicious);
 
     if (verdict.suspicious) this.addWarning(verdict.reason ?? 'suspicious success');
     return manifest;
@@ -665,7 +650,6 @@ export class JobWriter {
     this.addWarning(reason);
     this.writeManifest();
     this.flushProgress(now);
-    this.mirror.finish(manifest, reportText(this.repo, this.jobId), false);
     return manifest;
   }
 
@@ -799,7 +783,6 @@ export class JobWriter {
     this.writeManifest();
     writeJsonAtomic(jobFile(this.repo, this.jobId, FILES.progress), progress);
     writeJsonAtomic(jobFile(this.repo, this.jobId, FILES.view), this.view);
-    this.mirror.writeProgress(this.manifest ?? emptyManifest(this.jobId), progress);
     const ms = Date.parse(at);
     this.lastFlushMs = Number.isNaN(ms) ? Date.now() : ms;
   }
@@ -807,7 +790,11 @@ export class JobWriter {
 
 /* ── git baseline helpers ─────────────────────────────────────────────────── */
 
-const GIT_CAP_MS = 2_000;
+/** Per git call. AGENT_SMITH_GIT_TIMEOUT_MS raises it on slow or loaded machines, where a capped-out snapshot loses changedFiles. */
+function gitCapMs(): number {
+  const n = Number(process.env['AGENT_SMITH_GIT_TIMEOUT_MS']);
+  return Number.isFinite(n) && n > 0 ? n : 2_000;
+}
 const TOOL_INPUTS_CAP = 200_000;
 const CHANGED_FILES_SIG_CAP = 500;
 
@@ -816,7 +803,7 @@ function git(cwd: string, args: string[]): Promise<string> {
     execFile(
       'git',
       args,
-      { cwd, timeout: GIT_CAP_MS, maxBuffer: 8 * 1024 * 1024, env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' } },
+      { cwd, timeout: gitCapMs(), maxBuffer: 8 * 1024 * 1024, env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' } },
       (err, stdout) => (err ? reject(err) : resolve(stdout)),
     );
   });
@@ -992,11 +979,6 @@ export function pipeEvents(writer: JobWriter, handle: WorkerHandle): () => void 
 export function reportFor(result: JobResult): string {
   if (typeof result.response === 'string' && !looksEmpty(result.response)) return result.response;
   return '';
-}
-
-/** Append one normalized event straight to our own event log. Used by tests. */
-export function appendOwnEvent(repo: string, jobId: string, event: ProviderEvent): void {
-  appendLine(jobFile(repo, jobId, FILES.events), event);
 }
 
 /** Ordered previews use the same bounded budget as the other detail fields. */

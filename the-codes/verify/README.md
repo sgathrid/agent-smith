@@ -1,4 +1,4 @@
-# verify/ — executable verification gates
+# verify/ — executable verification
 
 The orchestrator consumes **a boolean**, never prose.
 
@@ -19,23 +19,13 @@ report would re-implement the exact step that failed.
   (`passed` + `exitCode` + bounded `stdoutTail`/`stderrTail`).
 - `runner.ts` — runs checks against the **working tree**, not a summary. 8KB
   tails, marked when truncated. Always kills on timeout.
-- `gate.ts` — `decideGate` is the whole policy in three lines, exported pure so it
-  can be read and tested on its own.
-- `checks/typescript.ts` — typecheck/test/lint presets; configurable, and they
-  read `package.json` rather than guessing script names.
 
-## Gate decision
-
-```
-checks pass   → ACCEPT
-checks fail   → ESCALATE once (rerun worker, failing command + output as context)
-still failing → STOP, surface the exact failing command to a human
-```
-
-`ESCALATION_CEILING = 1`, not a default — a limit. A loop is worse than a stop.
-The rerun gets the failing command and its bounded output as **context, not
+Policy (accept, retry, stop) lives with the callers: `forge/checks.ts` runs
+acceptance checks and `pipeline/` decides what a failure means. Escalation is
+capped (see `pipeline/routing.ts`) because a loop is worse than a stop; any
+rerun gets the failing command and its bounded output as **context, not
 instruction** ("fix this" reproduces the 5/10 generic self-check). Timeouts are
-reported separately from failures: "it hung" ≠ "it failed".
+reported separately from failures: "it hung" is not "it failed".
 
 ## Two honesty rules
 
@@ -48,4 +38,4 @@ reported separately from failures: "it hung" ≠ "it failed".
 `-pid`. `kill(pid)` reaps only the shell and orphans grandchildren — which keep
 writing into the tree we just declared broken. SIGTERM, then SIGKILL after grace.
 
-Tests: `node --test the-codes/verify/` — 52 tests.
+Tests: `node --test the-codes/verify/`.

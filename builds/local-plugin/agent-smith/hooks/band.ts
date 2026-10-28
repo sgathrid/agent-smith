@@ -22,7 +22,7 @@
  * the band and the pane stop agreeing about what a job looks like.
  *
  * HERE, because they are band-specific and the pane has no use for them:
- *   noColor · isShown · rowBudget · reconcile · LINGER_MS
+ *   noColor · isShown · rowBudget · LINGER_MS
  *
  * THE RULES THIS FILE ENCODES (agent-configs/shared/TERMINAL-UI.md)
  * ───────────────────────────────────────────────────────────────────
@@ -50,7 +50,6 @@ import {
 import type { RadarJob } from '../types/index.d.ts';
 
 export { elapsedCell, isTerminal, pickColor, pickGlyph } from './format.ts';
-export { fitCell, formatJobLine, formatJobRow, paneColumns } from './format.ts';
 
 /* ────────────────────────────────────────────────────────────────────────────
  * TIMING (TERMINAL-UI.md L147-162)
@@ -227,68 +226,4 @@ export function rowBudget(shown: readonly RadarJob[], maxRows?: number): BandBud
 /** The overflow line. Dim, and it names the command that opens the rest. */
 export function overflowLine(hidden: number): string {
   return `   +${hidden} more ∙ /forge`;
-}
-
-/**
- * Fold a fresh reading of a job over what we already knew, so a transient read
- * failure cannot make a line blink out and back.
- *
- * THE HAZARD. agy-staff rewrites progress.json every ~100ms and DELETES it on a
- * warning-free success (HAZARD A in the-codes/harness/agy-staff.ts). A reader
- * that infers "job gone" from "progress.json gone" makes the row vanish for a
- * few hundred milliseconds and reappear as done — the flicker TERMINAL-UI.md's
- * one rule forbids, arriving through visibility instead of row count.
- *
- * THE FIX HAS TWO HALVES, and this function is only the second.
- *
- *   a) Terminal state is anchored ONLY on `<id>.result.md.status.json`, which
- *      agy-staff always writes. Nothing in ./jobs.ts reads terminal state out of
- *      an absent file. That half is the load-bearing one and it lives there.
- *
- *   b) Even so, a poll can fail for reasons unrelated to the job (EBUSY on the
- *      directory, a half-written JSON body). So a terminal status we have
- *      already established is STICKY here: once done/failed/canceled, only a
- *      fresh terminal reading may move it, and a reading that says nothing
- *      leaves it exactly as it was.
- *
- * The stickiness is deliberately ONE-WAY. Upgrading running → done on new
- * evidence is correct and must happen. Downgrading done → running or
- * done → unknown on absent evidence is the flicker, and is refused.
- */
-export function reconcile(previous: RadarJob | undefined, next: RadarJob): RadarJob {
-  if (previous === undefined) return next;
-
-  if (
-    isTerminal(previous.status) && previous.status === next.status &&
-    previous.endedAt !== null && next.endedAt !== null && next.endedAt > previous.endedAt
-  ) {
-    // A terminal row whose end was inferred ("now") on each read would otherwise
-    // linger forever; the first instant we saw it finish is the end.
-    return { ...next, endedAt: previous.endedAt };
-  }
-
-  if (isTerminal(previous.status) && !isTerminal(next.status)) {
-    // Rule (b): a terminal row never un-finishes on weaker evidence.
-    return previous;
-  }
-
-  if (isTerminal(previous.status) && previous.endedAt !== null && next.endedAt === null) {
-    // A fresh reading that could not parse status.json this tick. Keeping the
-    // old instant is what stops the row's clock restarting from zero while it
-    // still has LINGER_MS left to live.
-    return { ...next, startedAt: previous.startedAt, endedAt: previous.endedAt };
-  }
-
-  if (next.activity === '' && previous.activity !== '') {
-    // progress.json mid-write: the activity clause is absent, not "idle".
-    return { ...next, activity: previous.activity };
-  }
-
-  // A tool count is monotonic for the life of a job. A partial read that cannot
-  // see events.jsonl must not walk the number backwards.
-  if (previous.toolCount !== null && (next.toolCount === null || next.toolCount < previous.toolCount)) {
-    return { ...next, toolCount: previous.toolCount };
-  }
-
-  return next;
 }

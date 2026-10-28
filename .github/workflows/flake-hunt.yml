@@ -1,0 +1,47 @@
+name: Flake hunt
+
+# Runs the suite several times at once on a CPU-loaded runner. A test that
+# passes here does not depend on timing; one that fails is a flake to fix,
+# not to retry. Nightly and on demand, so it never blocks a PR.
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: Concurrent suite runs
+        default: '4'
+
+permissions:
+  contents: read
+
+jobs:
+  stress:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      RUNS: ${{ inputs.runs || '4' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22.18
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            the-codes/surfaces/channel/package-lock.json
+      - run: npm ci
+      - run: npm --prefix the-codes/surfaces/channel ci
+      - name: Suite x RUNS under CPU load
+        run: |
+          for i in 1 2; do yes > /dev/null & done
+          pids=()
+          for i in $(seq "$RUNS"); do npm test > "run-$i.log" 2>&1 & pids+=($!); done
+          status=0
+          for p in "${pids[@]}"; do wait "$p" || status=1; done
+          kill $(jobs -p) 2>/dev/null || true
+          grep -h '^✖ ' run-*.log | grep -v 'failing tests' | sort | uniq -c | sort -rn || true
+          exit $status

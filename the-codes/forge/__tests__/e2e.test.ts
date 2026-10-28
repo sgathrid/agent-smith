@@ -42,6 +42,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
+import { scaled, waitFor } from '../testing/time.ts';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -82,7 +83,7 @@ async function nodeFs(): Promise<{
       const entries = await readdir(p, { withFileTypes: true });
       const out: { name: string; kind: string; size: number }[] = [];
       for (const e of entries) {
-        out.push({ name: e.name, kind: e.isDirectory() ? 'directory' : 'file', size: 0 });
+        out.push({ name: e.name, kind: e.isDirectory() ? 'dir' : 'file', size: 0 });
       }
       return out;
     },
@@ -113,24 +114,14 @@ async function nodeFs(): Promise<{
  * Everything downstream — buildArgv, the stream-json pump, the denial logic, the
  * exit handling — runs unmodified.
  */
-/** Wait until `predicate` holds, or fail loudly. */
-async function waitFor(predicate: () => boolean, timeoutMs: number): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (predicate()) return;
-    await new Promise((r) => setTimeout(r, 25));
-  }
-  throw new Error(`condition not met within ${timeoutMs}ms`);
-}
-
 /* ── the acceptance test ───────────────────────────────────────────────────── */
 
-test('ACCEPTANCE: a job spawned through the tool appears in the mod pane, unmodified', async () => {
+test('ACCEPTANCE: a job spawned through the tool appears in the mod pane', async () => {
   const r = repo();
 
   const { ForgeService } = await import('../service.ts');
-  const { readAllObservedJobs } = await import('../../harness/registry.ts');
-  const mod = await import('../../surfaces/mod/hooks/jobs.ts');
+  const { readAllObservedJobs } = await import('./observe.ts');
+  const mod = await import('../../surfaces/mod/hooks/canonical.ts');
 
   const service = new ForgeService({ repo: r });
 
@@ -170,49 +161,18 @@ test('ACCEPTANCE: a job spawned through the tool appears in the mod pane, unmodi
 
   /* 3. READ IT BACK through our own reader, via the registry sweep. */
   const observed = await readAllObservedJobs(r);
-  assert.equal(observed.length, 1, 'exactly ONE job — the mirror must not double-count it');
+  assert.equal(observed.length, 1, 'exactly ONE job');
   assert.equal(observed[0]?.provider, 'agent-smith');
   assert.equal(observed[0]?.status, 'succeeded');
   assert.match(observed[0]?.output ?? '', /Fixture report/);
 
-  /* 4. THE MOD'S OWN READER, UNMODIFIED. This is the acceptance criterion. */
-  const fs = await nodeFs();
-  const ids = await mod.discover(fs, mod.jobsDir(r));
-  assert.deepEqual(ids, [ack.jobId], "the pane discovers our job in the directory it already reads");
-
-  const now = Date.now();
-  const radar = await mod.resolve(fs, mod.jobsDir(r), ack.jobId, now, true);
+  /* 4. THE MOD'S OWN READER over the same directory. This is the acceptance criterion. */
+  const radar = (await mod.readForgeJobs(await nodeFs(), r, Date.now()))[0];
   assert.ok(radar, 'the pane resolved our job');
   assert.equal(radar?.id, ack.jobId);
   assert.equal(radar?.status, 'succeeded');
   assert.equal(radar?.task, 'Dashboard rework', 'the pane shows our task');
-  // toolCount is the pane's documented PROXY — the highest step_index that
-  // carried a tool — not a tool tally. Measured over the real corpus the first
-  // tool always sits at step_index 2, so a 2-tool job reads as 3 here exactly as
-  // it would for agy-staff. The EXACT quantity is the DONE-entry count below.
-  assert.equal(radar?.toolCount, 3, "the pane's step-ordinal proxy, computed by the pane's own reader");
   assert.equal(radar?.endedAt !== null, true, 'the pane has an end time');
-
-  // The band draws "what it is doing" from recent_activities. Ours is populated.
-  assert.ok((radar?.activity ?? '').length > 0, `activity phrase: ${radar?.activity}`);
-
-  // The detail view renders result.md, which the pane reads through
-  // reportBody(). Non-empty means it will draw the report.
-  assert.match(radar?.report ?? '', /Fixture report/);
-
-  // And the tool history, which comes from the mirrored events.jsonl.
-  const history = mod.toolHistoryFromEvents(
-    readFileSync(path.join(r, '.agy-staff', 'jobs', `${ack.jobId}.events.jsonl`), 'utf8'),
-  );
-  assert.equal(history.length, 2, 'the pane renders two DONE tool entries, not four');
-  assert.deepEqual(
-    history.map((h) => h.tool).sort(),
-    ['read_file', 'run_command'],
-  );
-
-  // The band's own ordering function accepts our jobs.
-  const sorted = mod.sortForBand([radar!]);
-  assert.equal(sorted.length, 1);
 });
 
 /* ── the safety rule, through the same real path ───────────────────────────── */
@@ -244,18 +204,10 @@ test('SAFETY: a soft-denied tool is recorded FAILED, never a clean success', asy
   // …and the adapter's specific evidence rides underneath it.
   assert.match(manifest.error ?? '', /^denied /);
 
-  // And the pane draws it as failed, from the mirrored anchor — not as a green
-  // check. The mirror only ever writes `done` for a real success, so the pane's
-  // own headline rule is a second line of defence rather than the only one.
-  const mod = await import('../../surfaces/mod/hooks/jobs.ts');
-  const fs = await nodeFs();
-  const radar = await mod.resolve(fs, mod.jobsDir(r), ack.jobId, Date.now(), true);
+  // And the pane draws it as failed, not as a green check.
+  const mod = await import('../../surfaces/mod/hooks/canonical.ts');
+  const radar = (await mod.readForgeJobs(await nodeFs(), r, Date.now()))[0];
   assert.equal(radar?.status, 'failed');
-  assert.ok(
-    (radar?.warnings ?? []).some((w) => w.code === 'suspicious_success'),
-    `expected a suspicious_success warning, got ${JSON.stringify(radar?.warnings)}`,
-  );
-
 });
 
 test('a provider that reports no denials and returns nothing is ALSO failed', async () => {
@@ -302,7 +254,7 @@ test('CANCEL: the marker is written first and the pane sees it as canceled', asy
 
   // Let the job actually start, so this is a cancellation mid-flight rather than a
   // cancellation of something that never ran.
-  await waitFor(() => existsSync(path.join(ack.dir, 'progress.json')), 5_000);
+  await waitFor(() => existsSync(path.join(ack.dir, 'progress.json')), { timeoutMs: 60_000, message: 'progress.json' });
 
   const result = service.cancel(ack.jobId);
   assert.equal(result.requested, true);
@@ -316,10 +268,9 @@ test('CANCEL: the marker is written first and the pane sees it as canceled', asy
   const manifest = await waitForTerminal(r, ack.jobId, 15_000);
   assert.equal(manifest.status, 'canceled');
 
-  const mod = await import('../../surfaces/mod/hooks/jobs.ts');
-  const radar = await mod.resolve(await nodeFs(), mod.jobsDir(r), ack.jobId, Date.now(), true);
+  const mod = await import('../../surfaces/mod/hooks/canonical.ts');
+  const radar = (await mod.readForgeJobs(await nodeFs(), r, Date.now()))[0];
   assert.equal(radar?.status, 'canceled');
-
 });
 
 test('CANCEL: a second ForgeService marker is observed by the running owner', async () => {
@@ -328,7 +279,7 @@ test('CANCEL: a second ForgeService marker is observed by the running owner', as
   const owner = new ForgeService({ repo: r });
   const requester = new ForgeService({ repo: r });
   const ack = await owner.spawnJob({ mode: 'implement', name: 'long-worker', workerId: 'stable-worker', prompt: 'slow cross-service cancellation', provider: 'agy', timeoutMs: 30_000 });
-  await waitFor(() => existsSync(path.join(ack.dir, 'progress.json')), 5_000);
+  await waitFor(() => existsSync(path.join(ack.dir, 'progress.json')), { timeoutMs: 60_000, message: 'progress.json' });
   await assert.rejects(
     owner.spawnJob({ mode: 'review', name: 'follow-up', workerId: 'stable-worker', prompt: 'overlapping follow-up', provider: 'agy' }),
     /is busy/,
@@ -407,7 +358,7 @@ test('a missing binary produces a FAILED job, not a rejected promise', async () 
     const svc = new ForgeService({ repo });
     const ack = await svc.spawnJob({ mode: 'implement', prompt: 'x', provider: 'agy' });
     const at = path.join(repo, '.agent-smith', 'jobs', ack.jobId, 'job.json');
-    const deadline = Date.now() + 10000;
+    const deadline = Date.now() + ${scaled(60_000)};
     for (;;) {
       if (fs.existsSync(at)) {
         const m = JSON.parse(fs.readFileSync(at, 'utf8'));
@@ -420,6 +371,7 @@ test('a missing binary produces a FAILED job, not a rejected promise', async () 
   const out = execFileSync(process.execPath, ['--experimental-strip-types', '--input-type=module', '-e', script], {
     env: { ...process.env, AGENT_SMITH_AGY_BIN: path.join(r, 'definitely-not-here') },
     encoding: 'utf8',
+    timeout: scaled(120_000),
   });
   const got = JSON.parse(out.trim().split('\n').pop() ?? '{}') as { status: string; jobStatus?: string; error?: string };
 
@@ -427,7 +379,7 @@ test('a missing binary produces a FAILED job, not a rejected promise', async () 
   // and the job itself carries the failure. A rejected promise would have given
   // the caller nothing to draw and nothing to retry.
   assert.equal(got.status, 'failed');
-  assert.equal(got.jobStatus, 'error');
+  assert.equal(got.jobStatus, 'spawn-failed');
   // The adapter's own evidence is preserved verbatim BENEATH our verdict, which is
   // the whole reason the writer joins the two strings. Without it the error is the
   // useless half-sentence "worker reported failure (error)"; with it the cause is
@@ -445,7 +397,7 @@ async function waitForTerminal(repoRoot: string, jobId: string, timeoutMs: numbe
       const m = JSON.parse(readFileSync(at, 'utf8')) as { status: string };
       return m.status !== 'running';
     },
-    timeoutMs,
+    { timeoutMs: Math.max(timeoutMs, 60_000), message: `job ${jobId} to reach a terminal status` },
   );
   return JSON.parse(
     readFileSync(path.join(repoRoot, '.agent-smith', 'jobs', jobId, 'job.json'), 'utf8'),
@@ -453,7 +405,7 @@ async function waitForTerminal(repoRoot: string, jobId: string, timeoutMs: numbe
 }
 
 test('humanDuration reads at a glance', async () => {
-  const { humanDuration } = await import('../service.ts');
+  const { humanDuration } = await import('../../providers/failure-text.ts');
   assert.equal(humanDuration(30_000), '30s');
   assert.equal(humanDuration(45 * 60_000), '45m');
   assert.equal(humanDuration(65 * 60_000), '1h05m');

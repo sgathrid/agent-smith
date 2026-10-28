@@ -277,7 +277,7 @@ describe('agy stale and recovered error handling', () => {
       events.push(recovered!);
 
       // Verify the notice -> progress.warnings path via JobWriter.
-      const writer = new JobWriter({ repo, jobId: 'implement-smith-615fa42d', flushMs: 0, mirror: false });
+      const writer = new JobWriter({ repo, jobId: 'implement-smith-615fa42d', flushMs: 0 });
       writer.start({
         provider: 'agy',
         mode: 'implement',
@@ -338,7 +338,7 @@ describe('agy stale and recovered error handling', () => {
       assert.equal(recovered?.kind === 'notice' && recovered.message, 'recovered: the stream was interrupted');
       events.push(recovered!);
 
-      const writer = new JobWriter({ repo, jobId: 'implement-smith-431a1f0e', flushMs: 0, mirror: false });
+      const writer = new JobWriter({ repo, jobId: 'implement-smith-431a1f0e', flushMs: 0 });
       writer.start({
         provider: 'agy',
         mode: 'implement',

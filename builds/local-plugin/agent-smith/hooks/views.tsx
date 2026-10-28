@@ -67,9 +67,14 @@ export function renderWorker(W: UiComponents, d: ForgeDetail, o: ViewOptions, a:
   const span=job.startedAt===null?null:(job.endedAt??o.now)-job.startedAt;
   const meta=oneLine([[job.provider,job.model].filter(Boolean).join('·'),runs.length>0?`turn ${runs.length+1}`:'',span===null?'':elapsed(span),checksLabel(job.acceptance)].filter(Boolean).join(' · '));
   const failing=job.acceptance?.checks.filter(check => !check.ok) ?? [];
-  // A live worker's own words, one line, when it wrote any.
-  const note=job.status==='running'||job.status==='attention'
+  // A live worker's own words, one line, when it wrote any and the timeline
+  // below does not already show them in full.
+  const timelineProse=d.timeline?.some(event => event.kind==='assistant')??false;
+  const note=(job.status==='running'||job.status==='attention')&&!timelineProse
     ? (job.reasoning?oneLine(job.reasoning,Math.max(1,o.width-6)):'') : '';
+  // A running worker's progress block opens with the same phase and test verdict
+  // `workerStatus` would print, so the status row only stands alone without it.
+  const statusRow=!(job.status==='running'&&job.progress);
   // A shell-edited worker (codex) has no edit tool calls to count, so its
   // changedFiles manifest is the only evidence of what it touched.
   const changedFiles=isTerminal(job.status)&&job.changedFileCount!=null&&job.changedFileCount>0&&(job.progress?.editedCount??0)===0
@@ -77,7 +82,7 @@ export function renderWorker(W: UiComponents, d: ForgeDetail, o: ViewOptions, a:
   return <Box flexDirection="column">
     <Text bold color={o.colour?pickColor(job.status):undefined} wrap="truncate-end">{`${pickGlyph(job.status)} ${workerHeading(job)}`}</Text>
     {meta!=='' && <Text dimColor wrap="truncate-end">{meta}</Text>}
-    <Text wrap="truncate-end">{workerStatus(job)}</Text>
+    {statusRow && <Text wrap="truncate-end">{workerStatus(job)}</Text>}
     {changedFiles>0 && <Text dimColor wrap="truncate-end">{`Changed: ${changedFiles} ${changedFiles===1?'file':'files'}`}</Text>}
     {(job.progress||note!=='') && <Box flexDirection="column">
       {job.progress && progressLines(job.progress, job.toolCount).map((line,i) => <Text key={`progress-${i}`} dimColor={i>0} wrap="truncate-end">{sanitizeText(line)}</Text>)}
@@ -90,11 +95,17 @@ export function renderWorker(W: UiComponents, d: ForgeDetail, o: ViewOptions, a:
     {o.taskOpen && <Markdown text={sanitizeText(job.preamble?`${job.preamble}\n\n${prompt}`:prompt)} />}
     {o.taskOpen && <Text dimColor wrap="wrap">{sanitizeText(`${oneLine(job.id)}\nWorker: ${oneLine(job.workerId??job.id)}${job.pipeline?`\nPipeline: ${oneLine(job.pipeline)} · ${oneLine(job.stage??'stage unknown')}`:''}${job.attempt!=null?`\nAttempt: ${job.attempt}`:''}`)}</Text>}
     {d.timeline===null && <Text dimColor wrap="wrap">Older snapshot: output and tools are separate; their original order is unavailable.</Text>}
-    {d.timeline && condenseTimeline(d.timeline).map(item => item.kind==='group'
-      ? timelineGroup(W,item,o,a)
-      : item.event.kind==='assistant'
-        ? <Markdown key={`event-${item.event.sequence}`} text={sanitizeText(item.event.text)} />
-        : toolRow(W,`event-${item.event.sequence}`,item.event.tool,item.event.input,item.event.output,item.event.state,o,a))}
+    {d.timeline && condenseTimeline(d.timeline).flatMap((item,i,items) => {
+      const row=item.kind==='group'
+        ? timelineGroup(W,item,o,a)
+        : item.event.kind==='assistant'
+          ? <Markdown key={`event-${item.event.sequence}`} text={proseText(item.event.text)} />
+          : toolRow(W,`event-${item.event.sequence}`,item.event.tool,item.event.input,item.event.output,item.event.state,o,a);
+      // A blank row where the worker turns from talking to working or back;
+      // a run of tool rows stays one tight block.
+      return i>0&&isProse(items[i-1]!)!==isProse(item)
+        ? [<Box key={`gap-${timelineKey(item)}`}><Text> </Text></Box>,row] : [row];
+    })}
     {d.timeline===null && <>
       {d.transcript.length>0 && <Markdown text={sanitizeText(d.transcript.join('\n\n'))} />}
       {d.history.map((tool,i) => toolRow(W,`legacy-tool-${i}`,tool.tool,tool.label,tool.output,tool.state,o,a))}
@@ -124,7 +135,7 @@ function toolRow(W: UiComponents,key:string,tool:string,input:string,output:stri
   const {Box,Text,Button}=W;
   const expanded=o.tools.includes(key)||state==='error';
   return <Box key={`row-${key}`} flexDirection="column">
-    <Button key={key} plain label={`${state==='active'?'›':state==='error'?'✗':'✓'} ${oneLine(classify(tool,input).label,Math.max(1,o.width-3))}`} onPress={() => a.tool(key)} />
+    <Button key={key} plain dimColor={state!=='error'} label={`${state==='active'?activeGlyph(o.now):state==='error'?'✗':'✓'} ${oneLine(classify(tool,input).label,Math.max(1,o.width-3))}`} onPress={() => a.tool(key)} />
     {expanded&&<Text dimColor wrap="wrap">{sanitizeText(`${oneLine(tool)} ${input}${output?`\n${output}`:''}`)}</Text>}
   </Box>;
 }
@@ -137,9 +148,34 @@ function toolRow(W: UiComponents,key:string,tool:string,input:string,output:stri
 function timelineGroup(W: UiComponents, item: Extract<TimelineItem,{kind:'group'}>, o: ViewOptions, a: ViewActions): JSX.Element {
   const {Box,Button,Markdown}=W;
   return <Box key={`row-${item.key}`} flexDirection="column">
-    <Button key={item.key} plain label={`✓ ${timelineGroupLabel(item.reads,item.searches)}`} onPress={() => a.tool(item.key)} />
+    <Button key={item.key} plain dimColor label={`✓ ${timelineGroupLabel(item.reads,item.searches,item.commands)}`} onPress={() => a.tool(item.key)} />
     {o.tools.includes(item.key) && item.events.map(event => event.kind==='tool'
       ? toolRow(W,`event-${event.sequence}`,event.tool,event.input,event.output,event.state,o,a)
-      : <Markdown key={`event-${event.sequence}`} text={sanitizeText(event.text)} />)}
+      : <Markdown key={`event-${event.sequence}`} text={proseText(event.text)} />)}
   </Box>;
+}
+
+/**
+ * The in-progress call's marker: a dim `●` that is on one second and off the
+ * next, like Claude Code's own running tool. The pane already redraws every
+ * second while open, so the blink needs no timer of its own; the blank keeps
+ * the label from shifting.
+ */
+export const activeGlyph=(now: number): string => Math.floor(now/1000)%2===0?'●':' ';
+
+const isProse=(item: TimelineItem): boolean => item.kind==='event'&&item.event.kind==='assistant';
+const timelineKey=(item: TimelineItem): string => item.kind==='group'?item.key:`event-${item.event.sequence}`;
+
+/**
+ * The worker's words, marked `●` like Claude Code's own transcript so they stand
+ * apart from the dimmed tool rows. A text that opens with a heading, list, quote,
+ * fence, table, rule, HTML block or indented code block is left unmarked and
+ * keeps its indentation: a prefix would break its markdown.
+ */
+export function proseText(text: string): string {
+  const clean=sanitizeText(text).replace(/^(?:[ \t]*\n)+/,'');
+  if (/^(?: {4}|\t)/.test(clean)) return clean;
+  const body=clean.replace(/^\s+/,'');
+  const firstLine=body.split('\n',1)[0]!;
+  return /^(?:#|[-*+]\s|\d+[.)]\s|>|`{3}|~{3}|\||<)/.test(body) || /^(?:[-*_][ \t]*){3,}$/.test(firstLine) ? body : `● ${body}`;
 }

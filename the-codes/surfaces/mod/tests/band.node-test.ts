@@ -15,7 +15,7 @@
  * Node's type stripping has no JSX transform, so ANY .tsx import is a hard parse
  * error under `node --test`. Logic living in register.tsx would therefore be
  * untestable, which defeats the point of making it pure. hooks/band.ts and
- * hooks/jobs.ts import no `claude-code` and no `node:` builtin, so they load
+ * hooks/fs.ts import no `claude-code` and no `node:` builtin, so they load
  * here; register.tsx only lays out what they return.
  *
  * Test names cite the rule being enforced and, where the rule came from measured
@@ -38,7 +38,6 @@ import {
   overflowLine,
   pickColor,
   pickGlyph,
-  reconcile,
   rowBudget,
 } from '../hooks/band.ts';
 import type { RadarJob, RadarStatus } from '../types/index.d.ts';
@@ -436,79 +435,4 @@ test('the engine\'s own maxRows wins, and leaves us a row for the overflow line'
   // A nonsense or absent maxRows falls back to BAND_ROWS.
   assert.equal(rowBudget(many, Number.NaN).rows.length, BAND_ROWS);
   assert.equal(rowBudget(many, undefined).rows.length, BAND_ROWS);
-});
-
-// ── not flickering (TERMINAL-UI.md L22-35) ─────────────────────────────────
-
-test('a terminal row never un-finishes on weaker evidence', () => {
-  // THE HAZARD. agy-staff deletes progress.json on a warning-free success, so a
-  // poll that cannot see the terminal file would otherwise report `running` for a
-  // job that finished, and the line would blink back to yellow.
-  const done = job({ status: 'succeeded', startedAt: 0, endedAt: 5_000 });
-  const stale = job({ status: 'running', startedAt: 0, endedAt: null });
-  assert.equal(reconcile(done, stale).status, 'succeeded');
-  assert.equal(reconcile(done, stale).endedAt, 5_000);
-});
-
-test('a fresh terminal reading DOES move a live row — the stickiness is one-way', () => {
-  // Upgrading running → done on new evidence is correct and must happen, or the
-  // band would never show anything finishing.
-  const running = job({ status: 'running', startedAt: 0 });
-  const done = job({ status: 'succeeded', startedAt: 0, endedAt: 5_000 });
-  const next = reconcile(running, done);
-  assert.equal(next.status, 'succeeded');
-  assert.equal(next.endedAt, 5_000);
-});
-
-test('a terminal row keeps its finish instant when a tick cannot re-read it', () => {
-  // Otherwise the clock restarts from zero mid-linger and the user sees a job
-  // visibly rewind.
-  const done = job({ status: 'succeeded', startedAt: 0, endedAt: 5_000 });
-  const unreadable = job({ status: 'succeeded', startedAt: 99_000, endedAt: null });
-  assert.equal(reconcile(done, unreadable).endedAt, 5_000);
-  assert.equal(reconcile(done, unreadable).startedAt, 0);
-});
-
-test('a missing activity clause is a mid-write read, not an idle job', () => {
-  const busy = job({ status: 'running', activity: 'cargo test --workspace' });
-  const blank = job({ status: 'running', activity: '' });
-  assert.equal(reconcile(busy, blank).activity, 'cargo test --workspace');
-});
-
-test('a tool count never walks backwards', () => {
-  // events.jsonl can be unreadable for one tick (EBUSY, a half-written tail).
-  // A count that dropped from 341 to a stale 22 would read as the job undoing work.
-  const many = job({ status: 'running', toolCount: 341 });
-  assert.equal(reconcile(many, job({ status: 'running', toolCount: null })).toolCount, 341);
-  assert.equal(reconcile(many, job({ status: 'running', toolCount: 22 })).toolCount, 341);
-  // And a real decrease (impossible in practice) is not silently hidden upward.
-  assert.equal(reconcile(job({ toolCount: 5 }), job({ toolCount: 7 })).toolCount, 7);
-});
-
-test('with no previous reading, the fresh one is taken as-is', () => {
-  const fresh = job({ status: 'running' });
-  assert.equal(reconcile(undefined, fresh), fresh);
-});
-
-test('an orphaned (failed) job is not an active band row once its end is old', async () => {
-  const { isShown } = await import('../hooks/band.ts');
-  const { resolve } = await import('../hooks/jobs.ts');
-  const dir = '/repo/.agy-staff/jobs';
-  const files: Record<string, string> = {
-    [`${dir}/j-smith-1.spec.json`]: JSON.stringify({ prompt_source: { task: 't' } }),
-    [`${dir}/j-smith-1.progress.json`]: JSON.stringify({ last_event_at: '2026-10-07T10:00:00Z' }),
-    '/repo/.agent-smith/jobs/j-smith-1/orphaned': 'x',
-  };
-  const fs = {
-    async read(p: string) { if (files[p] === undefined) throw new Error('ENOENT'); return files[p]; },
-    async exists(p: string) { return files[p] !== undefined; },
-    async list() { return []; },
-  };
-  const now = Date.parse('2026-10-07T12:00:00Z');
-  const job = await resolve(fs as never, dir, 'j-smith-1', now);
-  assert.equal(job?.status, 'failed');
-  assert.equal(isShown(job!, now), false);
-  // freshly orphaned: lingers like any finished job, then goes
-  const fresh = await resolve(fs as never, dir, 'j-smith-1', Date.parse('2026-10-07T10:00:05Z'));
-  assert.equal(isShown(fresh!, Date.parse('2026-10-07T10:00:05Z')), true);
 });

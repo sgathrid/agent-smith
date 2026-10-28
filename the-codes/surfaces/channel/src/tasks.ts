@@ -10,6 +10,7 @@ import {
   type CreateTaskResultV2, type GetTaskResultV2,
 } from '@modelcontextprotocol/ext-tasks/core/v2';
 import { readAcceptance } from '../../../forge/checks.ts';
+import { isTerminalForgeStatus } from '../../../forge/format.ts';
 import { TaskStore, type TaskRecord } from './task-store.ts';
 import { callTool, fullStatus, structured, type HandlerContext } from './tools.ts';
 
@@ -72,7 +73,7 @@ export class ForgeTasks {
         }
         if (detail) {
           const acceptance = readAcceptance(this.context.service.repo, detail.jobId);
-          if (['succeeded', 'failed', 'canceled'].includes(detail.status) && !detail.supersededBy && !('pending' in acceptance && acceptance.pending)) {
+          if (isTerminalForgeStatus(detail.status) && !detail.supersededBy && !('pending' in acceptance && acceptance.pending)) {
             if (detail.status === 'canceled') task = this.store.cancel(taskId);
             else {
               const result = structured(fullStatus(detail, acceptance));

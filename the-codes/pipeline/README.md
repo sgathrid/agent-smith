@@ -7,7 +7,7 @@ moderate → claude-sonnet`.
 
 `StageRunner` in `types.ts` is the only seam:
 `run(ctx: StageContext): Promise<StageResult>`. `pipeline/` never imports
-`providers/`. Wire it at the composition root in `core/`:
+`providers/`. Wire it at the composition root (`forge/runner.ts` and `forge/execute.ts` connect it to `providers/`). The shape of that wiring:
 
 ```ts
 const runner = createRunnerRouter({ gemini: makeGeminiRunner(c), codex: makeCodexRunner(c) });

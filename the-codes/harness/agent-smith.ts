@@ -48,8 +48,7 @@ import {
   CANCEL_ORPHAN_REASON,
   ORPHAN_REASON,
   deriveOrphan,
-  isPidAlive,
-  isForgeJobId,
+  ownerAlive,
   jobFile,
   jobsDir,
   type ForgeManifest,
@@ -95,7 +94,6 @@ export const SMITH_PAYLOAD = {
 } as const;
 
 const CANCELED_ORPHAN = { status: 'canceled', suspicious: false, reason: CANCEL_ORPHAN_REASON } as const;
-const ORPHANED = { status: 'failed', suspicious: true, reason: ORPHAN_REASON } as const;
 
 /**
  * Reads `.agent-smith/jobs`.
@@ -207,7 +205,6 @@ export class AgentSmithReader implements JobStateReader {
     let orphan: ReturnType<typeof deriveOrphan> = null;
     if (manifest !== null && manifest.status === 'running' && !canceled
         && !(await existsSafe(jobFile(cwd, jobId, FILES.result)))) {
-      const markerPath = jobFile(cwd, jobId, FILES.orphaned);
       const lastSeen = Math.max(
         Date.parse(manifest.updatedAt), Date.parse(progress?.lastEventAt ?? ''),
       );
@@ -215,14 +212,8 @@ export class AgentSmithReader implements JobStateReader {
       // A live supervisor honours a cancel request within seconds. A request that
       // is a minute old and still has no terminal state means nobody is listening.
       const cancelAgeMs = cancelAt === null ? NaN : Date.now() - Date.parse(cancelAt);
-      const ownerAlive = typeof manifest.ownerPid === 'number' && isPidAlive(manifest.ownerPid);
-      if (orphan === null && cancelRequested && cancelAgeMs > 60_000 && !ownerAlive) orphan = CANCELED_ORPHAN;
-      // The marker is proof the supervisor is gone; a cancel request makes that
-      // a cancellation. A live pid beside a marker plus cancel is still in flight.
-      if (orphan === null && (await existsSafe(markerPath))) {
-        orphan = !cancelRequested ? ORPHANED : ownerAlive ? null : CANCELED_ORPHAN;
-      }
-
+      const ownerIsAlive = ownerAlive(manifest);
+      if (orphan === null && cancelRequested && cancelAgeMs > 60_000 && !ownerIsAlive) orphan = CANCELED_ORPHAN;
     }
 
     const payload: Record<string, unknown> = {
@@ -299,26 +290,8 @@ export class AgentSmithReader implements JobStateReader {
   }
 }
 
-/**
- * ─────────────────────────────────────────────────────────────────────────────
- * THE ONE RULE ABOUT THE COMPAT MIRROR
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * forge/mirror.ts projects our jobs into `.agy-staff/jobs/` so an unmodified mod
- * can render them. That projection is READ BY NOBODY IN THIS LAYER.
- *
- * If this reader were allowed to also see it, every job we spawn would be
- * reported twice — once by this reader and once by `AgyStaffReader` — with two
- * independently computed verdicts. Two verdicts for one job id is precisely the
- * failure mode docs/ARCHITECTURE.md calls out ("two surfaces cannot disagree
- * about a job's state"), except with the disagreement inside a single sweep
- * instead of across two surfaces. The channel's dedupe would mask it for the
- * notifications; it would not mask it for anything else.
- *
- * So: the mirror is written once and read by exactly one consumer, and that
- * consumer is a plugin we are not allowed to change. `isForgeJobId` exists so
- * every caller can apply the same exclusion without re-deriving the id shape.
+/*
+ * Older versions mirrored our jobs into `.agy-staff/jobs/`; copies may remain on
+ * disk. `AgyStaffReader` callers skip forge ids (`isForgeJobId`) so a job never
+ * gets two verdicts in one sweep.
  */
-export function isInteropMirrorOfForge(jobId: string): boolean {
-  return isForgeJobId(jobId);
-}

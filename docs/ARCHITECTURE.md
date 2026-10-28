@@ -1,7 +1,7 @@
 # Agent Smith architecture
 
 Agent Smith owns external harness execution. Claude drives it through MCP tools; the
-CLI (`agent-smith run|resume|ls|status|cancel|doctor`) is a second adapter over the
+CLI (`agent-smith setup|uninstall|run|resume|ls|status|cancel|gc|doctor`) is a second adapter over the
 same `ForgeService`. Knobs and tool parameters are in [CONFIGURATION.md](CONFIGURATION.md).
 
 ## Layers
@@ -16,19 +16,18 @@ providers/  -> forge/ runtime -> surfaces/channel (MCP + hook watcher) -> surfac
 | Layer | Owns |
 |---|---|
 | `providers/` | `agy`, `codex`, `opencode`, `claude`, `kimi` adapters: argv, process groups, timeouts, NDJSON-to-`ProviderEvent` translation, sandbox description, model discovery (`listModels`) and harness-config defaults (`harnessDefaults`), `models.json` aliases (`aliases.ts`), the lazy catalog cache (`catalog.ts`). |
-| `forge/` | Job directory format and status rules (`format.ts`), the single-writer `JobWriter` (`writer.ts`), `ForgeService` (spawn/list/detail/cancel, `service.ts`), closed modes (`modes.ts`), executable acceptance (`checks.ts`), pipeline runner and persistence (`runner.ts`, `execute.ts`), compat mirror (`mirror.ts`). |
+| `forge/` | Job directory format and status rules (`format.ts`), the single-writer `JobWriter` (`writer.ts`), `ForgeService` (spawn/list/detail/cancel, `service.ts`), closed modes (`modes.ts`), executable acceptance (`checks.ts`), pipeline runner and persistence (`runner.ts`, `execute.ts`). |
 | `pipeline/` | DAG validation, bounded scheduling (1-32), failure propagation, routing/escalation. Does not interpret prose. |
 | `verify/` | Runs acceptance commands against the real working tree; exit codes decide, not worker text. |
-| `harness/` | Readers. `AgentSmithReader` (primary, `.agent-smith/jobs`) and `AgyStaffReader` (read-only interop for `.agy-staff/jobs`). Readers derive the final status (orphan/cancel rules below). |
-| `surfaces/channel/` | MCP server (`server.ts`, `tools.ts`), optional channel push (`poller.ts`, `policy.ts`, `watch-source.ts`), job-scoped hook watcher (`watch-hook.ts`) and CLI monitor (`monitor.ts`). |
-| `surfaces/mod/` | Claude Code mod: band, `/forge` pane, native task-list projection. A UI projection, not an execution runtime. It cannot import outside its plugin folder, so it restates the reader rules and reads the compat mirror (`hooks/jobs.ts`) plus `.agent-smith/jobs/<id>/orphaned` (`hooks/native.ts`). |
+| `harness/` | Readers. `AgentSmithReader` (primary, `.agent-smith/jobs`) and `AgyStaffReader` (read-only interop for `.agy-staff/jobs`), behind `readObservedJob` in `registry.ts`. Readers derive the final status (orphan/cancel rules below). |
+| `surfaces/channel/` | MCP server (`server.ts`, `tools.ts`), job-scoped hook watcher (`watch-hook.ts`, reading jobs via `watch-source.ts` and batching notices via `policy.ts`) and the job-scoped CLI monitor (`monitor.ts`). |
+| `surfaces/mod/` | Claude Code mod: band, `/forge` pane, native task-list projection. A UI projection, not an execution runtime. It cannot import outside its plugin folder, so it restates the reader rules. Its one reader is `hooks/canonical.ts` over `.agent-smith/jobs` (`FsLike` and `toEpoch` live in `hooks/fs.ts`). |
 | `cli/` | Argument parsing and detached supervisor (`supervise`), same forge APIs. |
-| `core/` | Legacy SQLite library; not the execution store. |
 
-`.agy-staff/jobs/` is a one-way projection (`forge/mirror.ts`, default on) written so the
-unmodified mod can render forge jobs. Nothing reads it for a verdict: `AgentSmithReader`
-claims forge ids (`<mode>-smith-<8 hex>`, `isForgeJobId`), and the interop reader skips them.
-Genuine agy-staff jobs remain visible read-only via `list_jobs provider=agy-staff|all`.
+Forge writes only `.agent-smith/jobs/`. Older versions also mirrored jobs into `.agy-staff/jobs/`,
+so copies may remain on disk: `AgentSmithReader` claims forge ids (`<mode>-smith-<8 hex>`,
+`isForgeJobId`) and the interop reader skips them. Genuine agy-staff jobs remain visible
+read-only via `list_jobs provider=agy-staff|all`.
 
 ## Job lifecycle and on-disk layout
 
@@ -47,9 +46,8 @@ State lives in `<repo>/.agent-smith/jobs/<jobId>/` (gitignored). `FILES` in `for
 | `cancel.steer` | `ForgeService.steer` (`delivery: 'interrupt'`) | Marker telling the owning pump to abort the active turn and immediately chain the queued steer turn. Cleared by `ForgeService.cancel` if user cancellation wins. |
 | `steer.jsonl` | `ForgeService.steer` | Append-only JSONL log of `SteerEntry` records consumed by the owning `pump` loop. |
 | `steer.head` | `ForgeService.pump` | Child job ID written after the continuation anchor exists and before the parent stamps `supersededBy`; lets `resolveHead` (cancel/status) cross that finish window. |
-| `orphaned` | legacy marker | Existing markers remain readable. New readers do not write markers; service recovery persists terminal state in `job.json`. |
 | `acceptance.json` | `forge/checks.ts` (only when `spawn_job` got `checks`) | Sidecar, see Acceptance. Not in `FILES`. |
-| `env-keys.json` | `ForgeService` (only when the spawn got `env`) | The names of the worker's extra environment variables. Values are never written anywhere (`ENV_KEYS_FILE`, `service.ts`). |
+| `env-keys.json` | `ForgeService` (only when the spawn got `env`) | The names of the worker's extra environment variables. Values are never written anywhere (`ENV_KEYS_FILE`, `spawn-request.ts`). |
 
 Pipeline runs sit beside jobs, not inside them: `.agent-smith/pipelines/<runId>.json`
 (`PipelineRecord`: `running|passed|partial|failed`, per-stage results), `<runId>.cancel`
@@ -155,7 +153,7 @@ heartbeat: `providers/ndjson.ts` `spawnWorker` calls `onHeartbeat` once right af
 every `HEARTBEAT_MS` = 30 s while the child runs; each adapter puts it on its bus as a
 `{kind:'heartbeat', at, pid}` `ProviderEvent` (never in `events.jsonl`), and
 `JobWriter.heartbeat` writes `progress.json` `lastAliveAt`/`workerPid` only, without moving
-`lastEventAt`, `updatedAt`, the timeline or the mirror.
+`lastEventAt`, `updatedAt` or the timeline.
 
 `livenessOf` (`mod/hooks/stale.ts`) is the one rule; the channel (`views.ts`, `tools.ts`,
 `watch-source.ts`) and the mod (`canonical.ts`, `jobs.ts`) both call it. A job that is not
@@ -272,7 +270,7 @@ A resume (`conversation` set) already holds the brief, so it gets only the conte
 check lines, and only when that request supplies them; otherwise nothing is prepended.
 Pipeline retries that continue the same conversation pass neither. The brief is not
 prepended when the prompt already starts with it. `preambleApplied` is true when the sent
-prompt starts with the brief; `view.json` (and the mirrored spec) keep the prepended brief as
+prompt starts with the brief; `view.json` keeps the prepended brief as
 `preamble`, so the `/forge` pane's "Show preamble" shows exactly what was added.
 
 ## Model discovery and validation
@@ -439,7 +437,7 @@ Claude                MCP server (dist/server.js)      Claude Code hooks        
   running; check status <ids>" (exit 2 from the hook).
 - **Tasks-shaped handle and opt-in MCP Tasks**: acks carry `taskHandle {taskId, status:'working', pollIntervalMs}` and
   `status`/`list_jobs` add `taskStatus` (`views.ts` `taskStatus`), the MCP Tasks extension's
-  vocabulary (`pollIntervalMs` is `poller.ts` `POLL_MS`). When `AGENT_SMITH_TASKS=1` is enabled and a
+  vocabulary (`pollIntervalMs` is `notify.ts` `POLL_MS`). When `AGENT_SMITH_TASKS=1` is enabled and a
   modern (`2026-07-28`) `spawn_job` or `resume_job` request advertises `io.modelcontextprotocol/tasks`,
   the server returns a protocol `resultType: 'task'` handle (`tasks.ts`) and stamps
   `_meta['io.agent-smith/task-result']: true` on the terminal result so `notice.ts` (`parseLaunch`)
@@ -453,19 +451,11 @@ Claude                MCP server (dist/server.js)      Claude Code hooks        
   `monitorCommand` (only when running from the built `dist/`) is `node .../monitor.js
   --job <id>|--run <id> --cwd <repo>`, to run in the background
   (`monitorTimeoutMs` = min(job timeout, 30 min); re-arm on expiry). Or `status wait_ms`.
-  `monitor.js` with no `--job/--run` is the legacy full-scan monitor (silent baseline,
-  polls every 5 s); the plugin no longer registers it.
 - **Why the always-on monitor was removed**: a `when: always` monitor polled every job dir
   every 5 s for the whole session and appeared in Claude's exit dialog. The hook is scoped
   to one job and gone when it finishes.
-- **One path per session**: the plugin's MCP server is configured with
-  `AGENT_SMITH_CHANNEL=0` (no `claude/channel` capability, no poll loop, no startup
-  baseline), so the hook is the only notifier. The channel (`poller.ts`: 5 s poll, first
-  poll is a silent baseline, per-job dedupe key `id#status[#dead][#checks]#epoch`, one batched
-  notification per tick, only `finished|failed|attention|cancelled`; `attention` for a silent
-  job needs an event time, for a dead one it does not) runs only when the server starts
-  without `AGENT_SMITH_CHANNEL=0`, e.g. `dev.sh --channels` (which loads the mod via
-  `--plugin-dir`, hence no hook).
+- **One notifier**: completion notices come only from the mod and the job-scoped hook; the
+  MCP server has no push channel.
 - **Unverified**: exit-dialog behavior of async hooks, hook timeout cap for 45-minute jobs,
   and wake while Claude is mid-turn.
 

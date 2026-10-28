@@ -14,12 +14,12 @@
  * The pane needs three things ObservedJob does not have:
  *   - toolCount, counted from events.jsonl (a real quantity, shown as-is)
  *   - activity, one terse phrase for the most recent tool
- *   - a start time, derived from the worker-started line in .log
+ *   - a start time
  *
- * So `resolve()` (hooks/jobs.ts) is the single place that turns one job on disk
+ * So `readForgeJob` (hooks/canonical.ts) is the single place that turns one job on disk
  * into one drawable row. Keeping the mapping in one function is what makes the
  * band and the pane incapable of disagreeing about what a job looks like — and
- * `resolve()` is the ONLY function that decides status, for either surface.
+ * it is the ONLY function that decides status, for either surface.
  */
 
 // ── the pane's row shape ────────────────────────────────────────────────────
@@ -29,7 +29,7 @@
  *
  * Deliberately NOT the same union as harness's ObservedStatus: the pane adds
  * `attention` (a running job that has gone silent, surfaced from
- * core/liveness.ts's stall verdict) because "needs you" is a thing a human must
+ * the stall verdict) because "needs you" is a thing a human must
  * be able to tell apart from "still working", and the pane has no other way to
  * say it. The mapping is total and lives in projectRadarJob().
  */
@@ -241,7 +241,7 @@ declare module 'claude-code' {
        * folded in here; the pane reading the result means the band and the pane
        * cannot end up pointed at different repos.
        */
-      bandConfig: { repo: string; colour: boolean; legacy: boolean };
+      bandConfig: { repo: string; colour: boolean };
       /**
        * Launches this session claimed at `tool.call`, until announced.
        * Session state on purpose: another session's jobs are never in it.

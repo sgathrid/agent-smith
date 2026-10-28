@@ -219,31 +219,33 @@ export function sessionBoard(jobs: readonly RadarJob[], scope: 'session' | 'all'
 
 /**
  * One row of the detail timeline: a single event, or a condensed run of
- * completed read/search tool calls (see `condenseTimeline`).
+ * completed read/search/command tool calls (see `condenseTimeline`).
  */
 export type TimelineItem =
   | { readonly kind: 'event'; readonly event: ActivityEvent }
   | { readonly kind: 'group'; readonly key: string; readonly events: readonly ActivityEvent[];
-      readonly reads: number; readonly searches: number };
+      readonly reads: number; readonly searches: number; readonly commands: number };
 
 /** A run shorter than this is not worth a group; three rows already read fine. */
 const RUN_MIN = 3;
 
-/** 'read' | 'search' for a completed read/search tool call, else null. */
-function condensableKind(event: ActivityEvent): 'read' | 'search' | null {
+type Condensable = 'read' | 'search' | 'command';
+
+/** The kind of a completed read, search or plain shell call, else null. */
+function condensableKind(event: ActivityEvent): Condensable | null {
   if (event.kind !== 'tool' || event.state !== 'done') return null;
   const kind = classify(event.tool, event.input).kind;
-  return kind === 'read' || kind === 'search' ? kind : null;
+  return kind === 'read' || kind === 'search' || kind === 'command' ? kind : null;
 }
 
 /**
- * Fold long stretches of finished read/search calls into one expandable row.
+ * Fold long stretches of finished read/search/command calls into one expandable row.
  *
- * Only runs of three or more CONSECUTIVE completed read/search calls fold, and
+ * Only runs of three or more CONSECUTIVE completed read/search/command calls fold, and
  * the last event of the timeline never joins a run: it is where an active or
  * errored call lives, and folding it would hide the newest thing that happened.
  * Active and errored calls therefore always break a run. Everything else — edits,
- * tests, commands, assistant prose — is left exactly where it was.
+ * tests, assistant prose — is left exactly where it was.
  */
 export function condenseTimeline(events: readonly ActivityEvent[]): TimelineItem[] {
   const items: TimelineItem[] = [];
@@ -252,7 +254,7 @@ export function condenseTimeline(events: readonly ActivityEvent[]): TimelineItem
   let i = 0;
   while (i < events.length) {
     const start = i;
-    const kinds: ('read' | 'search')[] = [];
+    const kinds: Condensable[] = [];
     while (i < limit) {
       const kind = condensableKind(events[i]!);
       if (kind === null) break;
@@ -266,8 +268,9 @@ export function condenseTimeline(events: readonly ActivityEvent[]): TimelineItem
     }
     const run = events.slice(start, i);
     if (kinds.length >= RUN_MIN) {
-      const reads = kinds.filter((kind) => kind === 'read').length;
-      items.push({ kind: 'group', key: `group-${run[0]!.sequence}`, events: run, reads, searches: kinds.length - reads });
+      const count = (k: Condensable) => kinds.filter((kind) => kind === k).length;
+      items.push({ kind: 'group', key: `group-${run[0]!.sequence}`, events: run,
+        reads: count('read'), searches: count('search'), commands: count('command') });
     } else {
       for (const event of run) items.push({ kind: 'event', event });
     }
@@ -275,11 +278,12 @@ export function condenseTimeline(events: readonly ActivityEvent[]): TimelineItem
   return items;
 }
 
-/** `read 5 files · 2 searches` for a condensed run. Both counts are real. */
-export function timelineGroupLabel(reads: number, searches: number): string {
+/** `read 5 files · 2 searches · 3 commands` for a condensed run. Every count is real. */
+export function timelineGroupLabel(reads: number, searches: number, commands = 0): string {
   const parts: string[] = [];
   if (reads > 0) parts.push(`read ${reads} ${reads === 1 ? 'file' : 'files'}`);
   if (searches > 0) parts.push(`${searches} ${searches === 1 ? 'search' : 'searches'}`);
+  if (commands > 0) parts.push(`${commands} ${commands === 1 ? 'command' : 'commands'}`);
   return parts.join(' · ');
 }
 

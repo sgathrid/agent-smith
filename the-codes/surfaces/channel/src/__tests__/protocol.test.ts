@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { ElicitRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { scaled, waitFor } from '../../../../forge/testing/time.ts';
 
 const server = process.env.SMITH_TEST_SERVER ?? fileURLToPath(new URL('../server.ts', import.meta.url));
 function data(result: unknown): Record<string, any> {
@@ -14,11 +15,12 @@ function data(result: unknown): Record<string, any> {
   return JSON.parse(content[0]!.text!);
 }
 async function until<T>(read: () => Promise<T>, ready: (value: T) => boolean): Promise<T> {
-  const deadline = Date.now() + 10_000;
-  for (;;) {
-    const value = await read(); if (ready(value)) return value;
-    if (Date.now() > deadline) throw new Error(`state did not settle: ${JSON.stringify(value)}`);
-    await new Promise(resolve => setTimeout(resolve, 30));
+  let last: T | undefined;
+  try {
+    const hit = await waitFor(async () => { last = await read(); return ready(last) ? { value: last } : null; }, { intervalMs: 30, message: 'state to settle' });
+    return hit.value;
+  } catch (err) {
+    throw new Error(`${(err as Error).message} (last: ${JSON.stringify(last)})`);
   }
 }
 
@@ -109,7 +111,9 @@ const prompt=process.argv.at(-1);
 if(process.argv.includes('debug'))process.exit(0);
 console.log(JSON.stringify({type:'thread.started',thread_id:'reload-thread'}));
 fs.appendFileSync(${JSON.stringify(path.join(repo, 'starts'))},prompt+'\\n');
-setTimeout(()=>{console.log(JSON.stringify({type:'item.completed',item:{id:'a',type:'agent_message',text:'Reload-safe full report '+ 'x'.repeat(9000)}}));console.log(JSON.stringify({type:'turn.completed'}));},prompt.includes('wait-long')?20000:1800);
+const finish=()=>{console.log(JSON.stringify({type:'item.completed',item:{id:'a',type:'agent_message',text:'Reload-safe full report '+ 'x'.repeat(9000)}}));console.log(JSON.stringify({type:'turn.completed'}));};
+if(prompt.includes('first turn')||prompt.includes('wait-long')){const release=${JSON.stringify(path.join(repo, 'release-first-turn'))};const end=Date.now()+120000;const t=setInterval(()=>{if(fs.existsSync(release)||Date.now()>end){clearInterval(t);finish();}},20);}
+else setTimeout(finish,1800);
 `);
   chmodSync(fake, 0o755);
   const env = Object.fromEntries(Object.entries(process.env).filter((e): e is [string, string] => e[1] !== undefined));
@@ -149,7 +153,9 @@ setTimeout(()=>{console.log(JSON.stringify({type:'item.completed',item:{id:'a',t
     assert.equal((await until(() => call('status', { jobId: canceled.jobId }), r => r.status !== 'running')).status, 'canceled');
     const queued = await call('spawn_job', { mode: 'review', provider: 'codex', prompt: 'first turn', name: 'queue-me' });
     await call('steer_job', { worker: queued.jobId, prompt: 'queued continuation', delivery: 'queue' });
-    const queuedResult = await until(() => call('status', { jobId: queued.jobId }), r => r.status === 'succeeded');
+    // The first turn ends only once the continuation is queued, however slow this call was.
+    writeFileSync(path.join(repo, 'release-first-turn'), '');
+    const queuedResult = await until(() => call('status', { jobId: queued.jobId }), r => r.jobId !== queued.jobId && r.status === 'succeeded');
     assert.notEqual(queuedResult.jobId, queued.jobId);
     const listed = await call('list_jobs', { session: true });
     assert.ok((listed.items ?? listed).some((j: any) => j.jobId === queuedResult.jobId));

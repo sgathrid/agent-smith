@@ -8,7 +8,7 @@ import { runJobWatch } from '../monitor.ts';
 import { toNotice, type WatchableJob } from '../policy.ts';
 import { parseHookInput, runHook } from '../watch-hook.ts';
 import { claimMarkerPath, headline } from '../../../mod/hooks/notice.ts';
-import { clearReadCache, readAll } from '../watch-source.ts';
+import { clearReadCache, readAll, readJob as readJobFile } from '../watch-source.ts';
 
 const T0 = Date.parse('2026-10-07T12:00:00.000Z');
 const job = (id: string, status: WatchableJob['status'], extra: Partial<WatchableJob> = {}): WatchableJob => ({
@@ -312,9 +312,14 @@ test('hook with checks: one write at the verdict, never "checks running" and the
   const { repo, dir } = hookRepo(20 * 60_000, { running: 'slow' }, 5_000);
   try {
     let out = '';
-    // The verdict lands while the hook is still holding the job.
-    setTimeout(() => fs.writeFileSync(path.join(dir, 'acceptance.json'), JSON.stringify({ state: 'accepted', checks: [{ name: 'slow', ok: true, blocking: true }] })), 300);
-    const code = await runHook(launchInput(repo), (s) => { out += s; }, { intervalMs: 50 });
+    // The verdict lands while the hook is still holding the job: it is written when the hook
+    // starts its SECOND read, i.e. after the first read (checks pending) was fully handled.
+    let reads = 0;
+    const readJob: NonNullable<Parameters<typeof runHook>[2]>['readJob'] = (cwd, id, now) => {
+      if (++reads === 2) fs.writeFileSync(path.join(dir, 'acceptance.json'), JSON.stringify({ state: 'accepted', checks: [{ name: 'slow', ok: true, blocking: true }] }));
+      return readJobFile(cwd, id, now);
+    };
+    const code = await runHook(launchInput(repo), (s) => { out += s; }, { intervalMs: 50, readJob });
     assert.equal(code, 2);
     assert.match(out, /done · checks 1\/1/);
     assert.doesNotMatch(out, /checks running/);

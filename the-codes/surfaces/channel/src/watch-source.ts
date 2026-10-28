@@ -25,18 +25,11 @@
  * channel that never mentioned the jobs it had just started would be a surface
  * that watches somebody else's work and ignores its own.
  *
- * WHY THE DEDUPE IS EXPLICIT RATHER THAN INHERITED FROM registry.ts:
- * forge/mirror.ts projects our jobs into `.agy-staff/jobs/` so the UNMODIFIED mod
- * plugin can render them. So the interop reader discovers our job ids too, and a
- * naive concatenation would report every job we spawn TWICE — two independently
- * computed verdicts for one id, inside a single poll. The channel's dedupe map
- * would mask the duplicate for notifications and for nothing else. So the primary
- * reader wins the id, here and in harness/registry.ts, by the same rule.
- *
- * WHY WE DO NOT IMPORT `claude-code`'s reader HERE: this surface is a channel
- * about WORKERS WE SPAWN. Folding in every Claude Code subagent transcript would
- * turn a 4-event vocabulary into a firehose of the user's own internal reasoning,
- * and it would spend tokens on events nobody asked to hear.
+ * WHY THE DEDUPE IS EXPLICIT: older versions mirrored our jobs into
+ * `.agy-staff/jobs/`, and those copies may still be on disk, so the interop reader
+ * can discover our job ids too. A naive concatenation would report such a job
+ * twice, with two independently computed verdicts. So the primary reader wins the
+ * id, here and in forge/service.ts, by the same rule.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * WHY THE HAZARDS ARE HANDLED BY DELEGATING RATHER THAN REPEATED
@@ -60,9 +53,9 @@ import { AgentSmithReader } from '../../../harness/agent-smith.ts';
 import { AgyStaffReader } from '../../../harness/agy-staff.ts';
 import { normalize } from '../../../harness/normalize.ts';
 import { existsSafe, readdirSafe, readJsonSafe } from '../../../harness/safe-fs.ts';
-import type { PipelineRecord } from '../../../forge/execute.ts';
+import { pipelineRecordPath, type PipelineRecord } from '../../../forge/execute.ts';
 import type { JobStateReader, ObservedJob } from '../../../harness/types.ts';
-import { isForgeJobId } from '../../../forge/format.ts';
+import { isForgeJobId, isTerminalForgeStatus } from '../../../forge/format.ts';
 import { readAcceptance } from '../../../forge/checks.ts';
 // Cross-surface import, and deliberately so. The mod ships as a STANDALONE plugin
 // directory — it cannot reach outside its own folder — so it has to own any
@@ -112,7 +105,7 @@ function acceptancePending(cwd: string, job: WatchableJob, now: number): boolean
 type PendingAcceptance = { pending?: boolean; budgetMs?: unknown; running?: unknown };
 
 const isTerminal = (job: WatchableJob): boolean =>
-  (job.status === 'succeeded' || job.status === 'failed' || job.status === 'canceled') && job.finishedAt !== null;
+  isTerminalForgeStatus(job.status) && job.finishedAt !== null;
 
 function cacheKey(cwd: string, id: string): string {
   return `${cwd}\0${id}`;
@@ -137,8 +130,7 @@ export function pipelineToWatchable(run: PipelineRecord | null): WatchableJob | 
 
 /** Read one pipeline record by run id (file name is the sanitized id). */
 export async function readPipelineRecord(cwd: string, runId: string): Promise<{ job: WatchableJob; stageJobIds: string[] } | null> {
-  const file = path.join(cwd, '.agent-smith', 'pipelines', `${runId.replace(/[^A-Za-z0-9._-]+/g, '-').slice(0, 100) || 'pipeline'}.json`);
-  const run = await readJsonSafe<PipelineRecord>(file);
+  const run = await readJsonSafe<PipelineRecord>(pipelineRecordPath(cwd, runId));
   const job = pipelineToWatchable(run);
   if (job === null || run === null) return null;
   const stageJobIds = Object.values(run.stageResults).flatMap(s => (s && typeof s.jobId === 'string' ? [s.jobId] : []));

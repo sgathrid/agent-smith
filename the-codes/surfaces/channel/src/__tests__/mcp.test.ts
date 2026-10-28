@@ -3,18 +3,20 @@ import test from 'node:test';
 import { Client } from '@modelcontextprotocol/client';
 import { InMemoryTransport } from '@modelcontextprotocol/server';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
+import { waitFor } from '../../../../forge/testing/time.ts';
 import { createSmithServer } from '../mcp.ts';
+import { withWorkerLookup } from './service-mock.ts';
 
 function fixture() {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   let launches = 0;
   let workerName = 'Ada';
-  const service = {
+  const service = withWorkerLookup({
     repo: '/private/tmp',
     detail: async () => ({ jobId: 'fixture-job', status: 'succeeded', provider: 'codex', mode: 'review', name: workerName, workerId: 'worker', conversation: 'thread', cwd: '/private/tmp', unrestricted: false }),
     spawnJob: async () => { launches++; return { jobId: 'fixture-job', name: 'Ada', status: 'running', timeoutMs: 1_000, warnings: [] }; },
-  } as never;
-  const handle = serveStdio(({ era }) => createSmithServer({ service, catalogs: async () => [] }, { era, channel: true }), { transport: serverTransport });
+  }) as never;
+  const handle = serveStdio(({ era }) => createSmithServer({ service, catalogs: async () => [] }, { era }), { transport: serverTransport });
   return { clientTransport, handle, launches: () => launches, renameWorker: (name: string) => { workerName = name; } };
 }
 
@@ -30,7 +32,6 @@ for (const modern of [false, true]) {
     try {
       await client.connect(h.clientTransport);
       assert.equal(client.getNegotiatedProtocolVersion(), modern ? '2026-07-28' : '2025-11-25');
-      assert.equal(Boolean(client.getServerCapabilities()?.experimental?.['claude/channel']), !modern);
       assert.equal(client.getServerCapabilities()?.extensions?.['io.modelcontextprotocol/tasks'], undefined);
       assert.ok((await client.listTools()).tools.some(t => t.name === 'spawn_job'));
       const result = await client.callTool({ name: 'spawn_job', arguments: { provider: 'codex', mode: 'review', prompt: 'review', unrestricted: true } });
@@ -52,11 +53,7 @@ test('modern envelope validation and approval state prevent invalid calls from l
   async function request(method: string, params: Record<string, unknown>) {
     const requestId = ++id;
     await h.clientTransport.send({ jsonrpc: '2.0', id: requestId, method, params });
-    const deadline = Date.now() + 3_000;
-    while (!responses.some(r => r.id === requestId)) {
-      if (Date.now() > deadline) throw new Error('protocol response timed out');
-      await new Promise(resolve => setTimeout(resolve, 5));
-    }
+    await waitFor(() => responses.some(r => r.id === requestId), { intervalMs: 5, message: `protocol response ${method}` });
     return responses.find(r => r.id === requestId)!;
   }
   try {

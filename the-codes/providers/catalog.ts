@@ -25,7 +25,7 @@ export interface CatalogOptions {
   repo?: string;
 }
 
-export const CATALOG_TTL_MS = 5 * 60_000;
+const CATALOG_TTL_MS = 5 * 60_000;
 const DEFAULT_TIMEOUT_MS = 10_000;
 
 interface CacheEntry {

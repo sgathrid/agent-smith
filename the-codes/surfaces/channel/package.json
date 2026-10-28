@@ -2,14 +2,11 @@
   "name": "agent-smith-channel",
   "version": "0.2.0",
   "private": true,
-  "description": "Claude Code channel that pushes agy job state CHANGES into Claude's context.",
+  "description": "Agent Smith MCP server: runs external coding agents.",
   "license": "MIT",
   "type": "module",
   "engines": {
     "node": ">=22"
-  },
-  "bin": {
-    "agy-watch": "./dist/server.js"
   },
   "main": "./dist/server.js",
   "files": [

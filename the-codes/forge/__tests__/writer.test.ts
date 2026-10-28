@@ -24,7 +24,7 @@ import { test } from 'node:test';
 
 import { AgentSmithReader } from '../../harness/agent-smith.ts';
 import { normalize } from '../../harness/normalize.ts';
-import { readAllObservedJobs } from '../../harness/registry.ts';
+import { readAllObservedJobs } from './observe.ts';
 import { writeAtomic, writeJsonAtomic, appendLine, createMarker } from '../atomic.ts';
 import { FILES, SCHEMA_VERSION, jobDir, jobFile, type ForgeManifest } from '../format.ts';
 import { JobWriter, appendBounded, summaryTail } from '../writer.ts';
@@ -40,8 +40,8 @@ function now(): string {
   return new Date().toISOString();
 }
 
-function start(r: string, jobId = 'implement-smith-abcd1234', mirror = true): JobWriter {
-  const w = new JobWriter({ repo: r, jobId, mirror, flushMs: 0 });
+function start(r: string, jobId = 'implement-smith-abcd1234'): JobWriter {
+  const w = new JobWriter({ repo: r, jobId, flushMs: 0 });
   w.start({
     provider: 'agy',
     mode: 'implement',
@@ -383,7 +383,6 @@ test('a running job reads as running, and a started job is discoverable', async 
   assert.deepEqual(ids, [w.jobId]);
   const raw = await new AgentSmithReader().read(r, w.jobId);
   assert.equal(normalize(raw!).status, 'running');
-  assert.equal(existsSync(path.join(r, '.agy-staff', 'jobs', `${w.jobId}.spec.json.cancel`)), false);
 });
 
 test('a FINISHED job whose anchor is lost reads as unknown, never as succeeded', async () => {
@@ -518,26 +517,18 @@ test('events after the terminal state are ignored', async () => {
 
 /* ── the registry sweep ────────────────────────────────────────────────────── */
 
-test('one job, one verdict — the sweep does not count the mirror twice', async () => {
+test('one job, one verdict — a mirrored copy left by an older version is not counted twice', async () => {
   const r = repo();
   const w = start(r);
   w.finish(result(), '# Report\n\nthe deliverable text');
-  // The compat mirror puts the SAME job into .agy-staff/jobs, where the interop
-  // reader also discovers it. The primary reader must claim the id, or every
-  // spawned job is reported twice from two independently computed states.
-  assert.ok(existsSync(path.join(r, '.agy-staff', 'jobs', `${w.jobId}.spec.json`)));
+  // Older versions mirrored the job into .agy-staff/jobs; the primary reader
+  // must claim the id or the job is reported twice.
+  const dir = path.join(r, '.agy-staff', 'jobs');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, `${w.jobId}.spec.json`), JSON.stringify({ prompt_source: { task: 'mirrored' } }));
   const all = await readAllObservedJobs(r);
   assert.equal(all.length, 1);
   assert.equal(all[0]?.provider, 'agent-smith');
-});
-
-test('with the mirror off, only our own reader sees the job', async () => {
-  const r = repo();
-  start(r, 'implement-smith-22222222', false);
-  assert.equal(existsSync(path.join(r, '.agy-staff')), false);
-  const all = await readAllObservedJobs(r);
-  assert.equal(all.length, 1);
-  assert.equal(all[0]?.status, 'running');
 });
 
 test('an interop job from another harness is still visible, and still once', async () => {
@@ -604,10 +595,6 @@ test('bounded canonical detail round-trips text fragments, tool identity and act
   assert.equal(detail?.history[0]?.label, 'source.ts');
   assert.equal(detail?.history[0]?.state, 'done');
   assert.match(detail?.job.prompt ?? '', /Dashboard rework/);
-  const mirror = readFileSync(path.join(r, '.agy-staff/jobs', `${id}.events.jsonl`), 'utf8');
-  const { transcriptFromEvents } = await import('../../surfaces/mod/hooks/jobs.ts');
-  assert.deepEqual(transcriptFromEvents(mirror), ['Found the edge case.']);
-  assert.doesNotMatch(mirror, /PRIVATE THINKING/);
 });
 
 test('detail snapshot stays under the mod file limit and marks truncation', () => {
@@ -686,7 +673,7 @@ test('changed file counts are available only from complete recorded evidence', a
 
 test('started conversation survives inside the progress coalescing window', () => {
   const r = repo();
-  const w = new JobWriter({ repo: r, jobId: 'implement-smith-abcd1234', mirror: false, flushMs: 60_000 });
+  const w = new JobWriter({ repo: r, jobId: 'implement-smith-abcd1234', flushMs: 60_000 });
   w.start({ provider: 'agy', mode: 'implement', model: null, effort: null,
     cwd: r, prompt: 'work', timeoutMs: 1000, unrestricted: false, conversation: null,
     pipeline: null, stage: null, attempt: null });
@@ -717,7 +704,7 @@ test('progress.json carries a digest of what the worker has done', () => {
 
 function failedManifest(over: Partial<JobResult>, report = ''): ForgeManifest {
   const r = repo();
-  const w = start(r, 'implement-smith-abcd1234', false);
+  const w = start(r, 'implement-smith-abcd1234');
   w.finish(result(over), report);
   return JSON.parse(readFileSync(jobFile(r, 'implement-smith-abcd1234', FILES.job), 'utf8')) as ForgeManifest;
 }
@@ -743,7 +730,7 @@ test('timeout, empty report and success set reason from the cause', () => {
 
 test('abort stores the short reason before the detail', () => {
   const r = repo();
-  const w = start(r, 'implement-smith-abcd1234', false);
+  const w = start(r, 'implement-smith-abcd1234');
   w.abort('failed', "couldn't start · ENOENT");
   const m = JSON.parse(readFileSync(jobFile(r, 'implement-smith-abcd1234', FILES.job), 'utf8')) as ForgeManifest;
   assert.equal(m.reason, "couldn't start");
@@ -773,7 +760,7 @@ test('an unrelated error still shows beside a denial warning', async () => {
 /* ── honest state: cwd gone, tool errors, summary, early failure ───────────── */
 
 function startIn(r: string, cwd: string, mode: string, jobId = `${mode}-smith-abcd1234`): JobWriter {
-  const w = new JobWriter({ repo: r, jobId, mirror: false, flushMs: 0 });
+  const w = new JobWriter({ repo: r, jobId, flushMs: 0 });
   w.start({
     provider: 'opencode', mode, model: 'm', effort: null, cwd, prompt: 'do it', unrestricted: false,
     conversation: null, timeoutMs: 1000, pipeline: null, stage: null, attempt: null,
@@ -806,10 +793,10 @@ test('an implement job whose cwd vanished before finish fails as unverifiable', 
   assert.deepEqual(readManifest(r, w.jobId).cwdMissingAtFinish, true);
 });
 
-test('a cwd-gone implement job reads back as failed through the reader, mirror on', async () => {
+test('a cwd-gone implement job reads back as failed through the reader', async () => {
   const r = repo();
   const cwd = mkdtempSync(path.join(tmpdir(), 'agent-smith-cwd-'));
-  const w = new JobWriter({ repo: r, jobId: 'implement-smith-cwdgone1', mirror: true, flushMs: 0 });
+  const w = new JobWriter({ repo: r, jobId: 'implement-smith-cwdgone1', flushMs: 0 });
   w.start({
     provider: 'opencode', mode: 'implement', model: 'm', effort: null, cwd, prompt: 'do it', unrestricted: false,
     conversation: null, timeoutMs: 1000, pipeline: null, stage: null, attempt: null,

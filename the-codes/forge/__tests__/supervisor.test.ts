@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { ForgeService } from '../service.ts';
+import { waitFor } from '../testing/time.ts';
 
 test('detached preparation failure never starts the provider', async () => {
   const repo = mkdtempSync(path.join(tmpdir(), 'smith-prepare-'));
@@ -23,9 +24,11 @@ test('detached preparation failure never starts the provider', async () => {
     assert.ok(id);
     const manifest = JSON.parse(readFileSync(path.join(repo, '.agent-smith/jobs', id, 'job.json'), 'utf8'));
     assert.notEqual(manifest.ownerPid, process.pid);
-    await new Promise(resolve => setTimeout(resolve, 100));
-    assert.equal(existsSync(marker), false);
-    assert.equal((await service.detail(id)).status, 'failed');
+    // The job turns failed once its detached supervisor exits and the service
+    // reconciles the orphan; on a loaded machine that process can outlive the check.
+    await waitFor(async () => (await service.detail(id)).status === 'failed', { message: 'prepared job to settle as failed' });
+    // The job settled as failed. runNdjsonWorker writes argv.json before it spawns the provider, so its absence proves no spawn was attempted.
+    assert.equal(existsSync(path.join(repo, '.agent-smith/jobs', id, 'argv.json')), false);
   } finally {
     if (previous === undefined) delete process.env.AGENT_SMITH_CODEX_BIN;
     else process.env.AGENT_SMITH_CODEX_BIN = previous;

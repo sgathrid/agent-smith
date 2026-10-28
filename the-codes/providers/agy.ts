@@ -94,22 +94,17 @@
  */
 
 import {
-  appendEventLog,
-  binaryOnPath,
-  createEventBus,
-  newJobId,
+  binaryAvailable,
+  earlyVerdict,
+  jobResult,
   nowIso,
   obj,
   preview,
-  spawnWorker,
-  stderrTailOf,
+  runNdjsonWorker,
   str,
-  tryParseObject,
   truncate,
-  writeArgv,
-  writeResultFile,
-  writeStateDir,
 } from './ndjson.ts';
+import type { ExitInfo } from './ndjson.ts';
 import type {
   ActivityRef,
   ActivityStatus,
@@ -126,7 +121,7 @@ import type { ListModelsOptions, ModelCatalog, ModelInfo, SandboxInfo } from './
 import { DEFAULT_DISCOVERY_TIMEOUT_MS, errMessage, runCapture } from './discovery.ts';
 import type { RunFn } from './discovery.ts';
 import { exitReason } from '../surfaces/mod/hooks/reasons.ts';
-import { deniedText, noResultText, stderrClause, timedOutText } from './failure-text.ts';
+import { deniedText, noResultText, stderrClause } from './failure-text.ts';
 
 export const AGY_BINARY = process.env['AGENT_SMITH_AGY_BIN'] ?? 'agy';
 
@@ -190,7 +185,7 @@ interface AgyResultEvent {
  * i.e. the same grammar. Verified that `20s` is accepted.
  * NOTE: Go durations have no day component; >24h wraps. We clamp to hours.
  */
-export function toGoDuration(ms: number): string {
+function toGoDuration(ms: number): string {
   const totalSeconds = Math.max(0, Math.floor(ms / 1000));
   const h = Math.floor(totalSeconds / 3600);
   const m = Math.floor((totalSeconds % 3600) / 60);
@@ -198,19 +193,6 @@ export function toGoDuration(ms: number): string {
   if (h > 0) return `${h}h${m}m${s}s`;
   if (m > 0) return `${m}m${s}s`;
   return `${s}s`;
-}
-
-/**
- * Does this agy model id already encode a reasoning effort?
- *
- * WHY: `agy --help` exposes BOTH `--effort <low|medium|high|xhigh|max>` and
- * `--model <id>`, but ag-staff's resolved specs use effort-SUFFIXED ids
- * ("gemini-3.8-flash-high", "gemini-3.8-flash-low") rather than a separate
- * effort flag. Passing both is at best redundant and at worst contradictory,
- * so we only add --effort when the id does not already carry one.
- */
-export function modelCarriesEffort(model: string): boolean {
-  return /-(low|medium|high|xhigh|max)$/i.test(model);
 }
 
 const COMPOSABLE_EFFORTS = ['low', 'medium', 'high'];
@@ -222,7 +204,7 @@ const COMPOSABLE_EFFORTS = ['low', 'medium', 'high'];
  * passed. Other efforts (xhigh/max) keep the separate --effort flag. An id that
  * already carries a suffix is used as-is; a conflicting effort throws.
  */
-export function resolveModelAndEffort(spec: Pick<SpawnSpec, 'model' | 'effort'>): {
+function resolveModelAndEffort(spec: Pick<SpawnSpec, 'model' | 'effort'>): {
   model?: string;
   effortFlag?: string;
 } {
@@ -362,8 +344,6 @@ interface StepMemory {
   tool?: string;
   input?: string;
   truncated?: boolean;
-  denied?: boolean;
-  startedAt?: string;
 }
 
 /**
@@ -462,7 +442,6 @@ export function createAgyTranslator(maxChars: number) {
 
         if (state === 'ACTIVE') {
           mem.tool = toolName;
-          mem.startedAt = at;
           const input = preview(info?.parameters, maxChars);
           if (input !== undefined) {
             mem.input = input.text;
@@ -478,7 +457,6 @@ export function createAgyTranslator(maxChars: number) {
         // DONE / ERROR
         const denied = state === 'ERROR' && isDenialError(info?.error);
         if (denied) {
-          mem.denied = true;
           noteDenial({
             action: toolName,
             displayName: toolName,
@@ -541,7 +519,6 @@ export function createAgyTranslator(maxChars: number) {
   return {
     onEvent,
     denials,
-    toolCallCount: () => steps.size,
     stepsWereTools: (): boolean => [...steps.values()].some((m) => m.tool !== undefined),
     errorIsStale,
   };
@@ -550,13 +527,6 @@ export function createAgyTranslator(maxChars: number) {
 // ---------------------------------------------------------------------------
 // JobResult construction
 // ---------------------------------------------------------------------------
-
-interface ExitInfo {
-  code: number | null;
-  signal: NodeJS.Signals | null;
-  killReason: 'cancelled' | 'timeout' | undefined;
-  stderr: string;
-}
 
 export function buildResult(args: {
   jobId: string;
@@ -571,7 +541,6 @@ export function buildResult(args: {
 }): JobResult {
   const { jobId, resultEvent, exit, startedAtMs, stateDir, denials, sawAnyToolCall } = args;
   const { errorIsStale } = args;
-  const finishedAt = nowIso();
   const durationMs = Date.now() - startedAtMs;
 
   const response = resultEvent?.response ?? '';
@@ -603,12 +572,9 @@ export function buildResult(args: {
 
   // ORDER MATTERS. Kill reasons dominate everything: a job we killed has no
   // trustworthy terminal state, whatever agy managed to flush first.
-  if (exit.killReason === 'cancelled') {
-    status = 'cancelled';
-    error = 'canceled';
-  } else if (exit.killReason === 'timeout') {
-    status = 'timeout';
-    error = timedOutText(durationMs);
+  const early = earlyVerdict(exit, durationMs);
+  if (early !== undefined) {
+    ({ status, error } = early);
   } else if (distinctDenials.length > 0 && reportedStatus === 'SUCCESS' && exit.code === 0 && response.trim() !== '') {
     // Denied calls, but agy finished and delivered a report: a success with a
     // warning, exactly as claude reports it. The forge verdict keeps the
@@ -655,20 +621,7 @@ export function buildResult(args: {
     error = exit.code === null ? `exited on ${exit.signal ?? 'a signal'}` : exitReason(exit.code);
   }
 
-  const out: JobResult = {
-    jobId,
-    provider: 'agy',
-    ok: status === 'success',
-    status,
-    exitCode: exit.code,
-    signal: exit.signal,
-    response,
-    durationMs,
-    startedAt: new Date(startedAtMs).toISOString(),
-    finishedAt,
-    stateDir,
-  };
-  if (error !== undefined) out.error = error;
+  const out = jobResult({ provider: 'agy', jobId, status, error, exit, response, startedAtMs, durationMs, stateDir });
   if (distinctDenials.length > 0) out.deniedActions = distinctDenials;
   if (usage !== undefined) out.usage = usage;
   if (resultEvent !== undefined) out.raw = resultEvent;
@@ -739,122 +692,46 @@ export const agyProvider: Provider = {
    * would make startup slow and flaky. A resolvable binary is the contract;
    * auth problems surface as a job error instead.
    */
-  async available(): Promise<boolean> {
-    try {
-      return await binaryOnPath(AGY_BINARY);
-    } catch {
-      return false;
-    }
-  },
+  available: () => binaryAvailable(AGY_BINARY),
 
-  describeSandbox: (spec) => sandboxPlan(spec),
+  describeSandbox: sandboxPlan,
 
   listModels: (options) => listAgyModels(runCapture, options),
 
-  async spawn(spec: SpawnSpec): Promise<WorkerHandle> {
-    const jobId = spec.jobId ?? newJobId();
-    const stateDir = writeStateDir('agy', jobId, spec.stateDir);
-    const argv = buildArgv(spec);
-    writeArgv(stateDir, argv, spec.cwd);
-
-    const maxChars = spec.maxOutputChars ?? 2000;
-    const bus = createEventBus();
-    const translator = createAgyTranslator(maxChars);
-
+  spawn(spec: SpawnSpec): Promise<WorkerHandle> {
+    const translator = createAgyTranslator(spec.maxOutputChars ?? 2000);
     let resultEvent: AgyResultEvent | undefined;
-    let startedAtMs = Date.now();
 
-    const publish = (events: ProviderEvent[]): void => {
-      for (const e of events) {
-        bus.emit(e);
-        appendEventLog(stateDir, e);
-      }
-    };
-
-    const proc = await spawnWorker({
+    return runNdjsonWorker({
       provider: 'agy',
       binary: AGY_BINARY,
-      argv,
-      cwd: spec.cwd,
-      timeoutMs: spec.timeoutMs,
-      stateDir,
-      jobId,
-      mode: spec.mode,
-      // Liveness only: on the bus, never in events.jsonl (see ProviderEvent 'heartbeat').
-      onHeartbeat: (at, pid) => bus.emit({ kind: 'heartbeat', at, ...(pid === undefined ? {} : { pid }) }),
-      ...(spec.env !== undefined ? { env: spec.env } : {}),
-      onStdoutLine(line) {
-        const raw = tryParseObject(line);
-        if (raw === undefined) {
-          // agy is supposed to emit only NDJSON on stdout. A bare line here
-          // means either a stray print or a CLI change. Surface, do not crash.
-          bus.emit({ kind: 'notice', at: nowIso(), level: 'warn', message: `agy stdout: ${truncate(line, 400).text}` });
-          return;
-        }
-        if (raw['event'] === 'result') {
-          const r = obj(raw, 'result');
-          if (r !== undefined) resultEvent = r as AgyResultEvent;
-          return;
-        }
-        publish(translator.onEvent(raw));
+      spec,
+      buildArgv,
+      translate: translator.onEvent,
+      // The result event is the verdict, not progress: hold it for buildResult
+      // instead of translating it into an activity.
+      intercept(raw) {
+        if (raw['event'] !== 'result') return false;
+        const r = obj(raw, 'result');
+        if (r !== undefined) resultEvent = r as AgyResultEvent;
+        return true;
       },
-      onStderr(chunk) {
-        // agy writes human-facing warnings to stderr, most importantly the
-        // auto-denial notice quoted at the top of this file. That notice is our
-        // earliest operator-facing hint that a job is going to come back empty.
-        const text = chunk.trim();
-        if (text === '') return;
-        const level: 'info' | 'warn' | 'error' =
-          text.includes('auto-denied') || text.includes('denied') || text.includes('permission')
-            ? 'warn'
-            : 'info';
-        bus.emit({ kind: 'notice', at: nowIso(), level, message: truncate(text, 800).text });
+      // agy writes human-facing warnings to stderr, most importantly the
+      // auto-denial notice quoted at the top of this file. That notice is our
+      // earliest operator-facing hint that a job is going to come back empty.
+      stderrLevel: (text) => (text.includes('denied') || text.includes('permission') ? 'warn' : 'info'),
+      buildResult: (ctx) =>
+        buildResult({
+          ...ctx,
+          resultEvent,
+          denials: translator.denials,
+          sawAnyToolCall: translator.stepsWereTools(),
+          errorIsStale: translator.errorIsStale(),
+        }),
+      afterResult(final) {
+        const recovered = recoveredNotice(final, resultEvent);
+        return recovered === undefined ? [] : [recovered];
       },
     });
-
-    startedAtMs = Date.now();
-
-    let resolveResult: (r: JobResult) => void = () => {};
-    const resultPromise = new Promise<JobResult>((resolve) => {
-      resolveResult = resolve;
-    });
-
-    const exit = proc.exited.then<ExitInfo>(({ code, signal }) => ({
-      code,
-      signal,
-      killReason: proc.killReason,
-      stderr: stderrTailOf(proc),
-    }));
-
-    void exit.then((info) => {
-      proc.closeLog();
-      const final = buildResult({
-        jobId,
-        resultEvent,
-        exit: info,
-        startedAtMs,
-        stateDir,
-        denials: translator.denials,
-        sawAnyToolCall: translator.stepsWereTools(),
-        errorIsStale: translator.errorIsStale(),
-      });
-      const recovered = recoveredNotice(final, resultEvent);
-      if (recovered !== undefined) bus.emit(recovered);
-      bus.close();
-      writeResultFile(stateDir, final);
-      resolveResult(final);
-    });
-
-    return {
-      id: jobId,
-      stateDir,
-      cancel: () => proc.terminate('cancelled'),
-      waitForResult: () => resultPromise,
-      onEvent: (listener) => bus.onEvent(listener),
-      events: bus.events,
-    };
   },
 };
-
-/** Convenience alias so `import { agy } from './providers/agy.js'` reads well. */
-export const agy = agyProvider;

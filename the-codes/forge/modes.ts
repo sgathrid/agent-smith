@@ -49,6 +49,16 @@ export const MODE_PRESETS: Readonly<Record<Mode, ModePreset>> = Object.freeze({
   },
 });
 
+/**
+ * The stage prompt a pipeline gives a review or moderate stage when the caller
+ * supplies none. The MCP default pipeline and the CLI's single-stage run both
+ * use it, so a stage is briefed the same way from either surface.
+ */
+export const STAGE_PROMPTS: Readonly<Record<'review' | 'moderate', string>> = Object.freeze({
+  review: 'Review the implementation and its supplied artifacts. Report defects with evidence; do not edit code.',
+  moderate: 'Probe the implementation and reviewer findings against the original task. Report unresolved defects with evidence; do not edit code.',
+});
+
 export function isMode(value: string): value is Mode {
   return (MODES as readonly string[]).includes(value);
 }

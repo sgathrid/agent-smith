@@ -12,6 +12,7 @@ import type { JobResult, ModelCatalog, Provider, SpawnSpec } from '../../provide
 import { buildBrief } from '../brief.ts';
 import { MODE_PRESETS } from '../modes.ts';
 import { ForgeService } from '../service.ts';
+import { scaled, waitFor } from '../testing/time.ts';
 
 interface Fake {
   provider: Provider;
@@ -63,7 +64,7 @@ function svc(
   const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-policy-'));
   const service = new ForgeService({
     repo,
-    mirror: false,
+   
     flushMs: 1,
     providerSource: () => fake.provider,
     catalogSource: typeof cat === 'function' ? cat : async () => (cat === undefined ? [] : [cat]),
@@ -343,11 +344,34 @@ test('a provider without per-run effort control records no effort and warns', as
   assert.equal(fake.specs[0]?.effort, undefined, 'the adapter is not asked to honor an impossible knob');
 });
 
+test('resolveWorker takes a job id or a name, newest turn first, and refuses an ambiguous name', async () => {
+  const fake = fakeProvider('fake');
+  const now = new Date().toISOString();
+  const finished = { ok: true, status: 'success', response: 'done', exitCode: 0, startedAt: now, finishedAt: now } as unknown as JobResult;
+  fake.provider.spawn = async (spec: SpawnSpec) => ({
+    cancel() {}, onEvent: () => () => {}, waitForResult: async () => ({ ...finished, jobId: spec.jobId, provider: 'fake' }),
+  }) as never;
+  const { service } = svc(fake);
+  const { ack: first, done: firstDone } = await service.spawnTracked({ mode: 'review', prompt: 'x', name: 'solo' });
+  await firstDone;
+  assert.equal((await service.resolveWorker(first.jobId)).jobId, first.jobId);
+  assert.equal((await service.resolveWorker('solo')).jobId, first.jobId);
+  const { ack: second, done: secondDone } = await service.spawnTracked({ mode: 'review', prompt: 'x', name: 'solo', workerId: 'another-identity' });
+  await secondDone;
+  assert.notEqual(second.jobId, first.jobId);
+  await assert.rejects(service.resolveWorker('solo'), (e: Error) => {
+    assert.equal(e.name, 'WorkerLookupError');
+    assert.match(e.message, /matches 2 workers/);
+    return true;
+  });
+  await assert.rejects(service.resolveWorker('nobody'), /No worker "nobody"/);
+});
+
 test('env reaches the provider spec; only the keys are written to disk and acked', async () => {
   const f = fakeProvider('fake');
   const { service, repo } = svc(f);
   const ack = await service.spawnJob({ mode: 'implement', prompt: 'x', provider: 'fake', env: { CARGO_TARGET_DIR: '/secret/target', TOKEN: 'hunter2' } });
-  await new Promise(r => setTimeout(r, 50));
+  await waitFor(() => f.specs[0], { message: 'provider to receive the spec' });
   assert.deepEqual(f.specs[0]!.env, { CARGO_TARGET_DIR: '/secret/target', TOKEN: 'hunter2' });
   assert.deepEqual(ack.envKeys, ['CARGO_TARGET_DIR', 'TOKEN']);
   const dir = path.join(repo, '.agent-smith/jobs', ack.jobId);
@@ -364,13 +388,19 @@ test('env reaches the provider spec; only the keys are written to disk and acked
 test('first spawn waits the cold catalog budget, later spawns the short one', async () => {
   const f = fakeProvider('fake');
   let calls = 0;
-  const slow = async () => { calls++; await new Promise(r => setTimeout(r, 120)); return [catalog()]; };
+  // Resolves on the next macrotask: the cold budget is huge, so only a real regression (not waiting) can fail it.
+  const slow = async () => { calls++; await new Promise(r => setImmediate(r)); return [catalog()]; };
   const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-policy-'));
-  const service = new ForgeService({ repo, mirror: false, flushMs: 1, providerSource: () => f.provider, catalogSource: slow, harnessDefaults: () => ({}), catalogWaitMs: { warm: 20, cold: 1000 } });
+  const service = new ForgeService({ repo, flushMs: 1, providerSource: () => f.provider, catalogSource: slow, harnessDefaults: () => ({}), catalogWaitMs: { warm: 20, cold: scaled(30_000) } });
   const first = await service.spawnJob({ mode: 'implement', prompt: 'x', provider: 'fake', model: 'm1' });
   assert.equal(first.warnings, undefined, 'the cold wait outlasts the slow catalog');
-  const slower = new ForgeService({ repo, mirror: false, flushMs: 1, providerSource: () => f.provider, catalogSource: async () => { await new Promise(r => setTimeout(r, 200)); return [catalog()]; }, harnessDefaults: () => ({}), catalogWaitMs: { warm: 20, cold: 20 } });
+  // A catalog that stays pending until the test releases it, so the 20 ms budget always wins. The
+  // service's budget timer is unref'd; the keep-alive stops Node from exiting the file mid-test.
+  let release: (v: ReturnType<typeof catalog>[]) => void = () => {};
+  const keepAlive = setInterval(() => {}, 1_000);
+  const slower = new ForgeService({ repo, flushMs: 1, providerSource: () => f.provider, catalogSource: () => new Promise((r) => { release = r; }), harnessDefaults: () => ({}), catalogWaitMs: { warm: 20, cold: 20 } });
   const lost = await slower.spawnJob({ mode: 'implement', prompt: 'x', provider: 'fake', model: 'm1', name: 'other' });
+  release([]); clearInterval(keepAlive);
   assert.match(lost.warnings?.[0] ?? '', /no catalog available/);
   assert.equal(calls, 1);
 });
@@ -379,12 +409,13 @@ test('warmCatalogs discovers once in the background and a spawn joins it instead
   const f = fakeProvider('fake');
   let calls = 0;
   const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-policy-'));
-  const service = new ForgeService({ repo, mirror: false, flushMs: 1, providerSource: () => f.provider, catalogSource: async () => { calls++; await new Promise(r => setTimeout(r, 60)); return [catalog()]; }, harnessDefaults: () => ({}), catalogWaitMs: { warm: 20, cold: 1000 } });
+  const service = new ForgeService({ repo, flushMs: 1, providerSource: () => f.provider, catalogSource: async () => { calls++; await new Promise(r => setImmediate(r)); return [catalog()]; }, harnessDefaults: () => ({}), catalogWaitMs: { warm: 20, cold: scaled(30_000) } });
   service.warmCatalogs(); service.warmCatalogs();
   const ack = await service.spawnJob({ mode: 'implement', prompt: 'x', provider: 'fake', model: 'm1' });
   assert.equal(ack.warnings, undefined);
   assert.equal(calls, 1);
-  const rejecting = new ForgeService({ repo, mirror: false, providerSource: () => f.provider, catalogSource: async () => { throw new Error('boom'); } });
+  const rejecting = new ForgeService({ repo, providerSource: () => f.provider, catalogSource: async () => { throw new Error('boom'); } });
   rejecting.warmCatalogs();
-  await new Promise(r => setTimeout(r, 20));
+  // A failing source settles within the microtask queue, so one macrotask turn is enough for it to have run (and been swallowed).
+  await new Promise(r => setImmediate(r));
 });

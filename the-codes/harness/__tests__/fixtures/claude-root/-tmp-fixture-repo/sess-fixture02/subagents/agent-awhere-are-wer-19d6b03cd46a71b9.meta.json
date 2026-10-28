@@ -1,9 +1,0 @@
-{
-  "agentType": "fork",
-  "description": "continue from fork",
-  "toolUseId": "toolu_x",
-  "spawnDepth": 1,
-  "requestShape": "background",
-  "isFork": true,
-  "parentAgentId": "a13ddc0eb936964c9"
-}

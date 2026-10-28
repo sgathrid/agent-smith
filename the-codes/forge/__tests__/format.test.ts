@@ -21,6 +21,9 @@ import {
   deriveStatus,
   isForgeJobId,
   isForgeStatus,
+  isTerminalForgeStatus,
+  ownerAlive,
+  validOwnerPid,
   jobDir,
   jobFile,
   jobsDir,
@@ -47,9 +50,9 @@ test('every file name in the format is one the writer and the reader share', () 
     'argv.json',
     'cancel',
     'cancel.steer',
+    'checks-spec.json',
     'events.jsonl',
     'job.json',
-    'orphaned',
     'progress.json',
     'result.json',
     'result.md',
@@ -325,4 +328,18 @@ test('changed files are attributed to the job whose tool inputs mention them', (
   assert.deepEqual(r.other, ['smoketest/b.txt']);
   // No captured input: nothing to attribute against, so nothing is disowned.
   assert.deepEqual(attributeChanged(['x'], ''), { mine: ['x'], other: [] });
+});
+
+test('isTerminalForgeStatus is every status but running', () => {
+  for (const s of ['succeeded', 'failed', 'canceled']) assert.equal(isTerminalForgeStatus(s), true);
+  for (const s of ['running', 'unknown', '', null, undefined, 3]) assert.equal(isTerminalForgeStatus(s), false);
+});
+
+test('ownerAlive needs a usable pid that is running', () => {
+  assert.equal(ownerAlive({ ownerPid: process.pid }), true);
+  for (const ownerPid of [undefined, null, 0, -1, 1.5, '12', Number.MAX_SAFE_INTEGER]) {
+    assert.equal(ownerAlive({ ownerPid }), false);
+  }
+  assert.equal(validOwnerPid({ ownerPid: 7 }), 7);
+  assert.equal(validOwnerPid({ ownerPid: 0 }), null);
 });

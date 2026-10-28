@@ -65,7 +65,6 @@ Only variables the code reads.
 | `AGENT_SMITH_KIMI_HOME`, then `KIMI_CODE_HOME` | `providers/kimi.ts` | `~/.kimi-code` | Kimi config dir: `config.toml` top-level `default_model` (and `[thinking].effort`, model alias `default_effort`). |
 | `AGENT_SMITH_HOME` | `providers/aliases.ts` | `os.homedir()` | Where the user-level `.agent-smith/models.json` is looked up. |
 | `AGENT_SMITH_STATE_DIR` | `providers/ndjson.ts` | `~/.agent-smith/state` | Provider state root used only when a spawn gives no `stateDir`. The forge always passes the job directory, so MCP/CLI jobs do not use it. |
-| `AGENT_SMITH_CHANNEL` | `surfaces/channel/src/server.ts` | enabled | `0` disables the `claude/channel` capability, the startup baseline and the 5 s poll loop. The built plugin sets it to `0`; `dev.sh --channels` leaves it unset. |
 | `AGENT_SMITH_TASKS` | `surfaces/channel/src/mcp.ts` | unset (`0`) | `1` advertises `extensions['io.modelcontextprotocol/tasks']` on modern (`2026-07-28`) connections and registers `tasks/get`, `tasks/update` and `tasks/cancel`, returning `resultType: 'task'` for `spawn_job`/`resume_job` requests that advertise client Tasks support. |
 | `AGENT_SMITH_NO_CATALOG_WARMUP` | `surfaces/channel/src/server.ts` | unset | `1` skips the background model discovery the MCP server starts at launch. The first spawn that names a model then waits up to `CATALOG_COLD_WAIT_MS` for a cold catalog, unless a fresh `.agent-smith/catalogs/<provider>.json` already holds it. |
 | `AGENT_SMITH_CONFIRM_UNRESTRICTED` | `surfaces/channel/src/tools.ts` | enabled | `0` stops `spawn_job`/`resume_job` asking the user to confirm an explicit `unrestricted: true` for codex, claude or opencode, and drops the "not confirmed" ack warning. For automation with no one to answer. |
@@ -73,7 +72,7 @@ Only variables the code reads.
 | `HOME`, `PATH` | `discovery.ts`, `ndjson.ts` | process env | `HOME` roots the default config dirs; `PATH` is probed for provider binaries (cached per binary+PATH). |
 
 Name note: `AGY_WATCH_CWD` is a legacy name from the agy-staff watcher but is the live
-repo-selection variable for the channel server, hook and monitor.
+repo-selection variable for the MCP server, hook and monitor.
 
 ## Harness default sources
 
@@ -141,7 +140,6 @@ not the Kimi CLI.
 The server uses MCP TypeScript SDK `server`/`core` 2.3.1 and supports the
 2026-07-28 protocol plus legacy clients through the SDK's stdio dispatcher.
 Modern approval uses `input_required`; legacy clients use form elicitation.
-Claude channel notifications are available on legacy connections only.
 
 All tools reject unknown fields. Failures return `isError` with a sentence to act on.
 Efforts (`EFFORTS`): `low|medium|high|xhigh|max|ultra`; each model lists the efforts it
@@ -354,7 +352,6 @@ completion notice or call cancel.`).
 | `<repo>/.agent-smith/tasks/` | durable MCP Tasks records (`<taskId>.json`, `<taskId>.terminal`; 24 h TTL, max 1 000) | ignored |
 | `<repo>/.agent-smith/pipelines/` | run records, `.cancel` markers, `<runId>/artifacts/` | ignored |
 | `<repo>/.agent-smith/models.json` | project aliases | ignored by this repo's `.gitignore`; in a consuming repo, commit it or ignore it as you prefer |
-| `<repo>/.agy-staff/jobs/` | compat mirror for the mod | ignored (`.agy-staff/`) |
 | `~/.agent-smith/models.json` | user aliases | n/a |
 | `~/.agent-smith/state` (`AGENT_SMITH_STATE_DIR`) | provider state when no `stateDir` is given | n/a |
 | `builds/local-plugin/agent-smith/` | self-contained built plugin (bundled runtime, hooks, types, skills) | tracked |
@@ -367,13 +364,15 @@ completion notice or call cancel.`).
 - `npm run build` builds the channel (`dist/server.js`, `monitor.js`, `watch-hook.js`), installing channel dependencies first if missing.
 - `npm run build:plugin`: builds the channel and bundles the self-contained plugin (`builds/local-plugin/agent-smith`, with the MCP v2 runtime bundled into `runtime/dist/` and no `node_modules`).
 - `npm run setup:claude`: runs `build:plugin`, validates `builds/local-plugin/agent-smith`, and enables it in `.claude/settings.local.json` via a directory marketplace. No global config is touched.
-- `dev.sh [--repo DIR] [--channels] [claude flags]`: session-scoped launch with
-  `--plugin-dir the-codes/surfaces/mod` and an inline MCP config (`AGY_WATCH_CWD=<repo>`);
-  `--channels` adds `--dangerously-load-development-channels server:agent-smith`.
+- `dev.sh [--repo DIR] [claude flags]`: session-scoped launch with
+  `--plugin-dir the-codes/surfaces/mod` and an inline MCP config (`AGY_WATCH_CWD=<repo>`).
 - CLI: `agent-smith setup|run|resume|ls|status|cancel|gc|doctor` (`scripts/agent-smith.mjs`; Node
   >= 22.18 with native TypeScript stripping).
 
 `doctor` probes installed providers with bounded version/help commands and checks
 the flags their adapters use. It reports compatible, incompatible, or unknown,
 with a reason. This checks CLI features; it does not verify authentication,
-account quota, model access, or a real model invocation.
+account quota, model access, or a real model invocation. Set
+`AGENT_SMITH_PROBE_TIMEOUT_MS` (default 2000) to give each probe longer on a slow or loaded machine.
+
+Each git call behind a job's baseline and `changedFiles` is capped at 2 s; set `AGENT_SMITH_GIT_TIMEOUT_MS` to raise it on a slow or loaded machine, where a capped-out call leaves `changedFiles` unknown.

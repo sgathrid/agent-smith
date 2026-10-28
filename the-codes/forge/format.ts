@@ -98,7 +98,7 @@ import {
 } from '../surfaces/mod/hooks/reasons.ts';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 
 /** Per-repo job root, relative to the repo. Ours; nothing else reads it as truth. */
 export const JOBS_DIR_SEGMENTS = ['.agent-smith', 'jobs'] as const;
@@ -136,8 +136,8 @@ export const FILES = {
    * for `resolveHead` readers (cancel/status) during a chained turn.
    */
   steerHead: 'steer.head',
-  /** Written by the first reader to prove the owner is dead. Never edits job.json. */
-  orphaned: 'orphaned',
+  /** The acceptance checks a job was spawned with, so resume_job can inherit them. */
+  checksSpec: 'checks-spec.json',
 } as const;
 
 export type SteerDelivery = 'queue' | 'interrupt';
@@ -174,6 +174,11 @@ export type ForgeStatus = 'running' | 'succeeded' | 'failed' | 'canceled';
 
 export function isForgeStatus(v: unknown): v is ForgeStatus {
   return v === 'running' || v === 'succeeded' || v === 'failed' || v === 'canceled';
+}
+
+/** The statuses a job never leaves. `running` is the only non-terminal one. */
+export function isTerminalForgeStatus(s: unknown): s is Exclude<ForgeStatus, 'running'> {
+  return s === 'succeeded' || s === 'failed' || s === 'canceled';
 }
 
 /** One tool call, as the writer remembers it between events. */
@@ -455,6 +460,11 @@ export function jobFile(repo: string, jobId: string, name: string): string {
   return path.join(jobDir(repo, jobId), name);
 }
 
+/** The anchor, parsed. Throws when absent or malformed: callers decide what that means. */
+export function readManifest(repo: string, jobId: string): ForgeManifest {
+  return JSON.parse(readFileSync(jobFile(repo, jobId, FILES.job), 'utf8')) as ForgeManifest;
+}
+
 /* ────────────────────────────────────────────────────────────────────────────
  * Ids
  * ──────────────────────────────────────────────────────────────────────────── */
@@ -462,9 +472,8 @@ export function jobFile(repo: string, jobId: string, name: string): string {
 /**
  * A fresh job id: `<mode>-smith-<8 hex>`.
  *
- * The mode is sanitised to `[a-z0-9]` because the id becomes a directory name
- * and, through the compat mirror, a filename in somebody else's directory. A
- * mode of `Review/Docs` must not be able to escape.
+ * The mode is sanitised to `[a-z0-9]` because the id becomes a directory name.
+ * A mode of `Review/Docs` must not be able to escape.
  */
 export function newJobId(mode: string): string {
   const safeMode = mode.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 120).replace(/-+$/g, '');
@@ -732,6 +741,18 @@ export function isPidAlive(pid: number): boolean {
   } catch (err) {
     return (err as NodeJS.ErrnoException).code === 'EPERM';
   }
+}
+
+/** The recorded owner pid when it is a usable one (positive integer), else null (legacy or malformed). */
+export function validOwnerPid(m: { readonly ownerPid?: unknown }): number | null {
+  const pid = m.ownerPid;
+  return typeof pid === 'number' && Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+
+/** True when the manifest names an owner process that is still running. */
+export function ownerAlive(m: { readonly ownerPid?: unknown }): boolean {
+  const pid = validOwnerPid(m);
+  return pid !== null && isPidAlive(pid);
 }
 
 /**

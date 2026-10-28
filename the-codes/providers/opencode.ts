@@ -80,23 +80,17 @@
  */
 
 import {
-  appendEventLog,
-  binaryOnPath,
-  createEventBus,
-  newJobId,
+  binaryAvailable,
+  earlyVerdict,
+  jobResult,
   num,
   nowIso,
   obj,
   preview,
-  spawnWorker,
-  stderrTailOf,
+  runNdjsonWorker,
   str,
-  tryParseObject,
-  truncate,
-  writeArgv,
-  writeResultFile,
-  writeStateDir,
 } from './ndjson.ts';
+import type { ExitInfo } from './ndjson.ts';
 import type {
   ActivityRef,
   ActivityStatus,
@@ -111,7 +105,7 @@ import type {
 import type { ListModelsOptions, ModelCatalog, ModelInfo, SandboxInfo } from './types.ts';
 import { DEFAULT_DISCOVERY_TIMEOUT_MS, errMessage, runCapture } from './discovery.ts';
 import type { RunFn } from './discovery.ts';
-import { deniedText, stderrClause, timedOutText } from './failure-text.ts';
+import { deniedText, stderrClause } from './failure-text.ts';
 
 
 export const OPENCODE_BINARY = process.env['AGENT_SMITH_OPENCODE_BIN'] ?? 'opencode';
@@ -174,7 +168,7 @@ export function buildArgv(spec: SpawnSpec): string[] {
   // Emitting a flag that the binary rejects is strictly worse than not emitting
   // it, so we drop the request rather than pretending the directories were
   // widened. `run` has no sandbox to widen anyway: it works from the cwd we
-  // spawn it in, which spawnWorker already sets to spec.cwd. core/ should treat
+  // spawn it in, which spawnWorker already sets to spec.cwd. callers should treat
   // opencode as having no addDirs support rather than assume otherwise.
 
   // Trailing positional message, last.
@@ -194,7 +188,7 @@ export function buildArgv(spec: SpawnSpec): string[] {
  * variant names are legal per provider. If the CLI rejects one, the job fails
  * with a clear error and no side effects — acceptable for a flag we cannot test.
  */
-export function withEffortVariant(model: string, effort: string | undefined): string {
+function withEffortVariant(model: string, effort: string | undefined): string {
   if (effort === undefined || effort === '') return model;
   if (model.includes('#')) return model; // caller already encoded it
   return `${model}#${effort}`;
@@ -601,13 +595,6 @@ const KNOWN_TYPES = new Set([
 // Result
 // ---------------------------------------------------------------------------
 
-interface ExitInfo {
-  code: number | null;
-  signal: NodeJS.Signals | null;
-  killReason: 'cancelled' | 'timeout' | undefined;
-  stderr: string;
-}
-
 export function buildResult(args: {
   jobId: string;
   startedAtMs: number;
@@ -616,7 +603,6 @@ export function buildResult(args: {
   tx: OpencodeTranslator;
 }): JobResult {
   const { jobId, startedAtMs, stateDir, exit, tx } = args;
-  const finishedAt = nowIso();
   const durationMs = Date.now() - startedAtMs;
 
   let status: JobStatus;
@@ -625,12 +611,9 @@ export function buildResult(args: {
   // Event types the parser did not know: the clue when a run looks empty or broken.
   const unrecognised = tx.unrecognised.size > 0 ? ` · unrecognised events: ${[...tx.unrecognised].join(', ')}` : '';
   const toolErrors = tx.toolErrors > 0 ? ` · ${tx.toolErrors} tool error(s)` : '';
-  if (exit.killReason === 'cancelled') {
-    status = 'cancelled';
-    error = 'canceled';
-  } else if (exit.killReason === 'timeout') {
-    status = 'timeout';
-    error = timedOutText(durationMs);
+  const early = earlyVerdict(exit, durationMs);
+  if (early !== undefined) {
+    ({ status, error } = early);
   } else if (tx.sawError) {
     // An `error` or `session.error` event (never a failed tool call: see
     // toolErrors). opencode's provider.quota 402 exits 1 with an error event
@@ -658,20 +641,7 @@ export function buildResult(args: {
     status = 'success';
   }
 
-  const out: JobResult = {
-    jobId,
-    provider: 'opencode',
-    ok: status === 'success',
-    status,
-    exitCode: exit.code,
-    signal: exit.signal,
-    response: tx.finalText,
-    durationMs,
-    startedAt: new Date(startedAtMs).toISOString(),
-    finishedAt,
-    stateDir,
-  };
-  if (error !== undefined) out.error = error;
+  const out = jobResult({ provider: 'opencode', jobId, status, error, exit, response: tx.finalText, startedAtMs, durationMs, stateDir });
   if (tx.usage !== undefined) out.usage = tx.usage;
   if (tx.unrecognised.size > 0) out.raw = { unrecognisedEventTypes: [...tx.unrecognised] };
   if (tx.sessionId !== undefined) {
@@ -685,7 +655,7 @@ export function buildResult(args: {
 // ---------------------------------------------------------------------------
 
 /** Parse `opencode models` lines (`provider/model`, optionally `#variant` is not expected). */
-export function parseOpencodeModels(stdout: string): ModelInfo[] {
+function parseOpencodeModels(stdout: string): ModelInfo[] {
   const seen = new Set<string>();
   const out: ModelInfo[] = [];
   for (const raw of stdout.split(/\r?\n/)) {
@@ -724,100 +694,24 @@ export async function listOpencodeModels(run: RunFn, options?: ListModelsOptions
 export const opencodeProvider: Provider = {
   name: 'opencode',
 
-  async available(): Promise<boolean> {
-    try {
-      return await binaryOnPath(OPENCODE_BINARY);
-    } catch {
-      return false;
-    }
-  },
+  available: () => binaryAvailable(OPENCODE_BINARY),
 
-  describeSandbox: (spec) => sandboxPlan(spec),
+  describeSandbox: sandboxPlan,
 
   listModels: (options) => listOpencodeModels(runCapture, options),
 
-  async spawn(spec: SpawnSpec): Promise<WorkerHandle> {
-    const jobId = spec.jobId ?? newJobId();
-    const stateDir = writeStateDir('opencode', jobId, spec.stateDir);
-    const argv = buildArgv(spec);
-    writeArgv(stateDir, argv, spec.cwd);
-
-    const maxChars = spec.maxOutputChars ?? 2000;
-    const bus = createEventBus();
-    const tx = createOpencodeTranslator(maxChars);
-
-    const publish = (events: ProviderEvent[]): void => {
-      for (const e of events) {
-        bus.emit(e);
-        appendEventLog(stateDir, e);
-      }
-    };
-
-    const startedAtMs = Date.now();
-
-    const proc = await spawnWorker({
+  spawn(spec: SpawnSpec): Promise<WorkerHandle> {
+    const tx = createOpencodeTranslator(spec.maxOutputChars ?? 2000);
+    return runNdjsonWorker({
       provider: 'opencode',
       binary: OPENCODE_BINARY,
-      argv,
-      cwd: spec.cwd,
-      timeoutMs: spec.timeoutMs,
-      stateDir,
-      jobId,
-      mode: spec.mode,
-      // Liveness only: on the bus, never in events.jsonl (see ProviderEvent 'heartbeat').
-      onHeartbeat: (at, pid) => bus.emit({ kind: 'heartbeat', at, ...(pid === undefined ? {} : { pid }) }),
-      ...(spec.env !== undefined ? { env: spec.env } : {}),
-      onStdoutLine(line) {
-        const raw = tryParseObject(line);
-        if (raw === undefined) {
-          // `run --format json` is documented as raw JSON events, but --format
-          // default prints human text, and a future version could add banner
-          // lines. Either way: surface, never crash, never silently drop.
-          bus.emit({
-            kind: 'notice',
-            at: nowIso(),
-            level: 'warn',
-            message: `opencode stdout (non-JSON): ${truncate(line, 400).text}`,
-          });
-          return;
-        }
-        publish(tx.onEvent(raw));
-      },
-      onStderr(chunk) {
-        const text = chunk.trim();
-        if (text === '') return;
-        bus.emit({ kind: 'notice', at: nowIso(), level: 'info', message: truncate(text, 800).text });
-      },
+      spec,
+      buildArgv,
+      // `run --format json` is documented as raw JSON events, but --format
+      // default prints human text, and a future version could add banner lines;
+      // the runner surfaces those rather than dropping them.
+      translate: tx.onEvent,
+      buildResult: (ctx) => buildResult({ ...ctx, tx }),
     });
-
-    let resolveResult: (r: JobResult) => void = () => {};
-    const resultPromise = new Promise<JobResult>((resolve) => {
-      resolveResult = resolve;
-    });
-
-    void proc.exited.then(({ code, signal }) => {
-      proc.closeLog();
-      const final = buildResult({
-        jobId,
-        startedAtMs,
-        stateDir,
-        tx,
-        exit: { code, signal, killReason: proc.killReason, stderr: stderrTailOf(proc) },
-      });
-      bus.close();
-      writeResultFile(stateDir, final);
-      resolveResult(final);
-    });
-
-    return {
-      id: jobId,
-      stateDir,
-      cancel: () => proc.terminate('cancelled'),
-      waitForResult: () => resultPromise,
-      onEvent: (listener) => bus.onEvent(listener),
-      events: bus.events,
-    };
   },
 };
-
-export const opencode = opencodeProvider;

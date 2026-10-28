@@ -11,8 +11,14 @@ import { buildArgv as buildOpencodeArgv, buildResult as buildOpencodeResult, cre
 import { buildArgv as buildKimiArgv, buildResult as buildKimiResult, createKimiTranslator } from './kimi.ts';
 import { spawnWorker } from './ndjson.ts';
 import type { ProviderEvent, SpawnSpec } from './types.ts';
+import { scaled, waitFor } from '../forge/testing/time.ts';
+import { trackedTempDirs } from '../forge/testing/tmp.ts';
 
-const tmpDirs: string[] = [];
+const tempDir = trackedTempDirs('agent-smith-provider-test-');
+
+const pidAlive = (pid: number): boolean => {
+  try { process.kill(pid, 0); return true; } catch (err) { return (err as NodeJS.ErrnoException).code === 'EPERM'; }
+};
 
 test('Codex model-refresh timeout is informational; unrelated stderr errors remain warnings', () => {
   assert.equal(codexStderrLevel('ERROR codex_core::models_manager: failed to refresh available models: request timed out'), 'info');
@@ -21,12 +27,6 @@ test('Codex model-refresh timeout is informational; unrelated stderr errors rema
   assert.equal(codexStderrLevel('ERROR authentication failed; failed to refresh available models: request timed out'), 'warn');
   assert.equal(codexStderrLevel('Not inside a trusted directory'), 'warn');
 });
-
-function tempDir(): string {
-  const dir = mkdtempSync(path.join(os.tmpdir(), 'agent-smith-provider-test-'));
-  tmpDirs.push(dir);
-  return dir;
-}
 
 function spec(overrides: Partial<SpawnSpec> = {}): SpawnSpec {
   return {
@@ -38,10 +38,6 @@ function spec(overrides: Partial<SpawnSpec> = {}): SpawnSpec {
     ...overrides,
   };
 }
-
-test.after(() => {
-  for (const dir of tmpDirs) rmSync(dir, { recursive: true, force: true });
-});
 
 test('Codex argv applies effort and resumes the supplied thread', () => {
   const argv = buildCodexArgv(spec({
@@ -178,7 +174,7 @@ test('cancellation kills a worker process group including a surviving descendant
   const dir = tempDir();
   const delayedMarker = path.join(dir, 'descendant-survived');
   const childPidFile = path.join(dir, 'child.pid');
-  const descendantCode = `process.on('SIGTERM',()=>{}); setTimeout(()=>require('node:fs').writeFileSync(${JSON.stringify(delayedMarker)},'alive'),900); setInterval(()=>{},1000)`;
+  const descendantCode = `process.on('SIGTERM',()=>{}); setTimeout(()=>require('node:fs').writeFileSync(${JSON.stringify(delayedMarker)},'alive'),600000); setInterval(()=>{},1000)`;
   const workerCode = [
     "const {spawn}=require('node:child_process');",
     "const fs=require('node:fs');",
@@ -191,7 +187,7 @@ test('cancellation kills a worker process group including a surviving descendant
     binary: process.execPath,
     argv: ['-e', workerCode],
     cwd: dir,
-    timeoutMs: 10_000,
+    timeoutMs: scaled(60_000),
     killGraceMs: 100,
     stateDir: dir,
     jobId: 'group-kill',
@@ -201,11 +197,11 @@ test('cancellation kills a worker process group including a surviving descendant
   });
 
   // Wait until the grandchild is live before asking the worker to stop.
-  for (let i = 0; i < 100 && !existsSync(childPidFile); i++) {
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  assert.ok(existsSync(childPidFile), 'fake worker started its descendant');
-  const descendantPid = Number(readFileSync(childPidFile, 'utf8'));
+  // The pid file can exist before its contents land; only a positive pid identifies the descendant.
+  const descendantPid = await waitFor(() => {
+    const pid = existsSync(childPidFile) ? Number(readFileSync(childPidFile, 'utf8')) : 0;
+    return Number.isInteger(pid) && pid > 0 ? pid : 0;
+  }, { message: 'fake worker to record its descendant pid' });
   worker.terminate('cancelled');
   const exit = await worker.exited;
   worker.closeLog();
@@ -213,8 +209,9 @@ test('cancellation kills a worker process group including a surviving descendant
   assert.ok(exit.signal === 'SIGTERM' || exit.signal === 'SIGKILL');
 
   // The descendant ignores SIGTERM and has no inherited pipes to keep close
-  // pending, so this proves the delayed SIGKILL reaches the whole group.
-  await new Promise((resolve) => setTimeout(resolve, 1_000));
+  // pending, so it can only die if the delayed SIGKILL reaches the whole group.
+  // Once it is provably dead it can never write its marker (a far-off cap).
+  await waitFor(() => !pidAlive(descendantPid), { message: `descendant ${descendantPid} to die with its group` });
   assert.equal(existsSync(delayedMarker), false, `descendant ${descendantPid} survived cancellation`);
 });
 
@@ -235,7 +232,7 @@ test('spawn failures settle through exited instead of hanging', async () => {
   });
   const exit = await Promise.race([
     worker.exited,
-    new Promise<never>((_, reject) => setTimeout(() => reject(new Error('spawn failure did not settle')), 1_000)),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error('spawn failure did not settle')), scaled(30_000))),
   ]);
   worker.closeLog();
   assert.equal(exit.code, null);
@@ -250,13 +247,21 @@ test('a cancelled supervisor does not abandon detached-stdio descendants', async
   const marker = path.join(dir, 'orphan-alive');
   const workerScript = path.join(dir, 'worker.cjs');
   const supervisor = path.join(dir, 'supervisor.mjs');
-  const descendant = `process.on('SIGTERM',()=>{});setTimeout(()=>require('node:fs').writeFileSync(${JSON.stringify(marker)},'alive'),800);setInterval(()=>{},1000)`;
-  writeFileSync(workerScript, `const {spawn}=require('node:child_process');spawn(process.execPath,['-e',${JSON.stringify(descendant)}],{stdio:'ignore'});console.log('ready');setInterval(()=>{},1000)`);
+  const pidFile = path.join(dir, 'descendant.pid');
+  // The descendant records its pid once its SIGTERM handler is installed; the marker delay is only a cap.
+  const descendant = `process.on('SIGTERM',()=>{});require('node:fs').writeFileSync(${JSON.stringify(pidFile)},String(process.pid));setTimeout(()=>require('node:fs').writeFileSync(${JSON.stringify(marker)},'alive'),600000);setInterval(()=>{},1000)`;
+  // The worker reports 'ready' only after the descendant is up, so the cancel below always meets a live SIGTERM-ignoring descendant.
+  writeFileSync(workerScript, `const fs=require('node:fs'),{spawn}=require('node:child_process');spawn(process.execPath,['-e',${JSON.stringify(descendant)}],{stdio:'ignore'});const t=setInterval(()=>{if(fs.existsSync(${JSON.stringify(pidFile)})){clearInterval(t);console.log('ready');}},10);setInterval(()=>{},1000)`);
   const moduleUrl = new URL('./ndjson.ts', import.meta.url).href;
   writeFileSync(supervisor, `import {spawnWorker} from ${JSON.stringify(moduleUrl)};
-const proc=await spawnWorker({provider:'fixture',binary:process.execPath,argv:[${JSON.stringify(workerScript)}],cwd:${JSON.stringify(dir)},timeoutMs:3000,killGraceMs:150,stateDir:${JSON.stringify(dir)},jobId:'fixture',mode:'fixture',onStdoutLine(){setTimeout(()=>proc.terminate('cancelled'),100)},onStderr(){}});await proc.exited;proc.closeLog();`);
-  await promisify(execFile)(process.execPath, ['--experimental-strip-types', supervisor], { timeout: 5000 });
-  await new Promise(resolve => setTimeout(resolve, 900));
+const proc=await spawnWorker({provider:'fixture',binary:process.execPath,argv:[${JSON.stringify(workerScript)}],cwd:${JSON.stringify(dir)},timeoutMs:30000,killGraceMs:150,stateDir:${JSON.stringify(dir)},jobId:'fixture',mode:'fixture',onStdoutLine(){proc.terminate('cancelled')},onStderr(){}});await proc.exited;proc.closeLog();`);
+  await promisify(execFile)(process.execPath, ['--experimental-strip-types', supervisor], { timeout: scaled(60_000) });
+  const descendantPid = await waitFor(() => {
+    const pid = existsSync(pidFile) ? Number(readFileSync(pidFile, 'utf8')) : 0;
+    return Number.isInteger(pid) && pid > 0 ? pid : 0;
+  }, { message: 'the descendant to record its pid' });
+  // A dead descendant can never write its marker; a survivor means the supervisor abandoned it.
+  await waitFor(() => !pidAlive(descendantPid), { message: `descendant ${descendantPid} to die with the cancelled supervisor` });
   assert.equal(existsSync(marker), false, 'the supervisor exited while its tool continued running');
 });
 
@@ -675,20 +680,55 @@ test('opencode: step_finish counters accumulate across steps without per-step no
   });
 });
 
+for (const name of ['agy', 'codex', 'claude', 'opencode'] as const) {
+  test(`${name}: a missing binary yields spawn-failed with the spawn error`, async () => {
+    const dir = tempDir();
+    const missing = path.join(dir, 'missing-worker');
+    const key = `AGENT_SMITH_${name.toUpperCase()}_BIN`;
+    const saved = process.env[key];
+    process.env[key] = missing;
+    try {
+      // Binary names are captured at module scope, so load a fresh copy of the adapter.
+      const mod = (await import(`./${name}.ts?missing=${name}`)) as Record<string, import('./types.ts').Provider>;
+      const handle = await mod[`${name}Provider`]!.spawn({
+        mode: 'test',
+        prompt: 'x',
+        cwd: dir,
+        timeoutMs: 5_000,
+        unrestricted: true,
+        stateDir: dir,
+      });
+      const result = await handle.waitForResult();
+      assert.equal(result.status, 'spawn-failed');
+      assert.equal(result.ok, false);
+      assert.match(result.error ?? '', /^spawn error: .*ENOENT/);
+    } finally {
+      if (saved === undefined) delete process.env[key];
+      else process.env[key] = saved;
+    }
+  });
+}
+
 test('spawnWorker heartbeats while the child runs (pid included), stops at exit, and writes nothing to events.jsonl', async () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'agent-smith-heartbeat-'));
   const beats: { at: string; pid: number | undefined }[] = [];
+  // The child lives until the test releases it, so beat count depends on events, not on how long the child lasts.
+  const release = path.join(dir, 'release');
+  const child = `setInterval(()=>{if(require('node:fs').existsSync(${JSON.stringify(release)})){process.exit(0)}},20);setTimeout(()=>process.exit(0),120000)`;
   const worker = await spawnWorker({
-    provider: 'fake', binary: process.execPath, argv: ['-e', 'setTimeout(()=>{}, 400)'],
-    cwd: dir, timeoutMs: 10_000, stateDir: dir, jobId: 'heartbeat', mode: 'test',
+    provider: 'fake', binary: process.execPath, argv: ['-e', child],
+    cwd: dir, timeoutMs: scaled(60_000), stateDir: dir, jobId: 'heartbeat', mode: 'test',
     heartbeatMs: 50, onHeartbeat: (at, pid) => beats.push({ at, pid }),
     onStdoutLine() {}, onStderr() {},
   });
+  await waitFor(() => beats.length >= 3, { message: 'three heartbeats while the child runs' });
+  writeFileSync(release, '');
   await worker.exited;
   worker.closeLog();
   const atExit = beats.length;
-  assert.ok(atExit >= 3, `expected several beats over ~400 ms, got ${atExit}`);
+  assert.ok(atExit >= 3, `expected several beats while the child ran, got ${atExit}`);
   assert.ok(beats.every((b) => b.pid === worker.child.pid && Number.isFinite(Date.parse(b.at))));
+  // No positive observable exists for "a timer that was cleared never fires"; slowness can only hide a late beat (false pass), never fail a correct run.
   await new Promise((resolve) => setTimeout(resolve, 150));
   assert.equal(beats.length, atExit, 'no beats after exit');
   assert.equal(existsSync(path.join(dir, 'events.jsonl')), false, 'heartbeats are liveness, not events');
@@ -700,33 +740,44 @@ test('spawnWorker stops heartbeats when the worker exits, even while a descendan
   const beats: number[] = [];
   // The worker leaves a detached, unreferenced grandchild that inherits its
   // stdout, then exits: `close` waits for the grandchild, `exit` does not.
+  // The grandchild lives until the test releases it, so load cannot end it early.
+  const release = path.join(dir, 'release');
+  const workerRelease = path.join(dir, 'worker-release');
+  const grandchild = `setInterval(()=>{ if (require('node:fs').existsSync(${JSON.stringify(release)})) process.exit(0); }, 20); setTimeout(()=>process.exit(0), 120000)`;
   const script = [
     "const { spawn } = require('node:child_process');",
-    "spawn(process.execPath, ['-e', 'setTimeout(()=>{}, 1500)'], { detached: true, stdio: ['ignore', 'inherit', 'ignore'] }).unref();",
-    'setTimeout(() => process.exit(0), 150);',
+    `spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}], { detached: true, stdio: ['ignore', 'inherit', 'ignore'] }).unref();`,
+    // The worker exits only when the test says so, after it has seen heartbeats.
+    `const t = setInterval(() => { if (require('node:fs').existsSync(${JSON.stringify(workerRelease)})) process.exit(0); }, 20);`,
   ].join('\n');
   const worker = await spawnWorker({
     provider: 'fake', binary: process.execPath, argv: ['-e', script],
-    cwd: dir, timeoutMs: 10_000, stateDir: dir, jobId: 'heartbeat-orphan', mode: 'test',
+    cwd: dir, timeoutMs: scaled(60_000), stateDir: dir, jobId: 'heartbeat-orphan', mode: 'test',
     heartbeatMs: 30, onHeartbeat: () => beats.push(Date.now()),
     onStdoutLine() {}, onStderr() {},
   });
   let closed = false;
   void worker.exited.then(() => { closed = true; });
+  await waitFor(() => beats.length >= 1, { message: 'a heartbeat while the worker runs' });
+  writeFileSync(workerRelease, '');
   await once(worker.child, 'exit');
   const atExit = beats.length;
   assert.ok(atExit >= 1, 'beats while the worker ran');
+  // The heartbeat timer is cleared on exit and no positive observable exists for "never fires again"; slowness can only hide a late beat (false pass), never fail a correct run.
   await new Promise((resolve) => setTimeout(resolve, 300));
   assert.equal(closed, false, 'stdout is still held open by the grandchild');
   assert.equal(beats.length, atExit, 'no heartbeat after the worker exited');
+  writeFileSync(release, '');
   await worker.exited;
   worker.closeLog();
   rmSync(dir, { recursive: true, force: true });
 });
 
-test('every adapter routes heartbeats to the bus, never to the event log', () => {
+test('runNdjsonWorker routes heartbeats to the bus, never to the event log', () => {
+  const src = readFileSync(new URL('./ndjson.ts', import.meta.url), 'utf8');
+  assert.match(src, /onHeartbeat: \(at, pid\) => bus\.emit\(\{ kind: 'heartbeat'/);
   for (const name of ['agy', 'claude', 'codex', 'kimi', 'opencode']) {
-    const src = readFileSync(new URL(`./${name}.ts`, import.meta.url), 'utf8');
-    assert.match(src, /onHeartbeat: \(at, pid\) => bus\.emit\(\{ kind: 'heartbeat'/, name);
+    const adapter = readFileSync(new URL(`./${name}.ts`, import.meta.url), 'utf8');
+    assert.match(adapter, /runNdjsonWorker\(/, name);
   }
 });

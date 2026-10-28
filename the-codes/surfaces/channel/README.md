@@ -1,8 +1,7 @@
-# Agent Smith MCP and channel
+# Agent Smith MCP server
 
 This server is the control surface for the forge runtime. It directly launches
-external harnesses; it does not invoke agy-staff. The optional channel sends
-completion and attention changes with bounded worker-authored output excerpts.
+external harnesses; it does not invoke agy-staff.
 
 Build from the repository root with `npm run build`. TypeScript errors fail the
 build; the executable entrypoint is `dist/server.js`.
@@ -11,7 +10,6 @@ The session-scoped launcher loads both the server and the UI:
 
 ```sh
 /path/to/agent-smith/dev.sh --repo /path/to/workspace
-/path/to/agent-smith/dev.sh --repo /path/to/workspace --channels
 ```
 
 For manual MCP configuration:
@@ -34,21 +32,15 @@ Schema validation rejects malformed settings before execution.
 
 The runtime uses the official MCP TypeScript SDK v2 (`server` and `core` 2.3.1).
 Its stdio dispatcher serves the 2026-07-28 protocol and legacy clients through
-the same Forge handlers. Claude channel capability is advertised only on the
-legacy connection. Setting `AGENT_SMITH_TASKS=1` enables the opt-in 2026-07-28
+the same Forge handlers. Setting `AGENT_SMITH_TASKS=1` enables the opt-in 2026-07-28
 MCP Tasks (`io.modelcontextprotocol/tasks`) receiver for `spawn_job` and
 `resume_job` when a modern request advertises client Tasks support; otherwise
 launch `taskHandle` fields remain ordinary tool-result data.
 
-Custom development channels require
-`--dangerously-load-development-channels server:agent-smith`. Organization policy
-may disable channel delivery; MCP execution and status tools remain useful without
-notifications. Do not treat a connected MCP server as proof of channel delivery.
-
 The server resolves the workspace from an explicit positional argument, then
 `AGY_WATCH_CWD`, then its process cwd. stdout is exclusively MCP JSON-RPC; logs go
-to stderr. State transitions are deduplicated after successful delivery, and the
-initial poll is a silent baseline. Progress ticks never enter Claude's context.
+to stderr. Completion notices come from the mod and the job-scoped watch hook, not
+the server.
 
 Follow-up messages use the worker's native conversation handle and preserve its
 stable identity. They start a new invocation; these CLI adapters do not steer a

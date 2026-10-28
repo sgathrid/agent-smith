@@ -9,24 +9,15 @@ import { renderList, renderWorker, type ViewActions, type ViewOptions } from './
 import type { ForgeDetail } from './canonical.ts';
 // ── BAND IMPORTS (band author) ────────────────────────────────────────────────
 // § PANE reads through this module too, and for the same reason the band does: it
-// is the mod's only reader, it takes an FsLike, and it is handed `$.fs`. See the
-// merge note at the top of this file.
+// reads through the same FsLike, handed `$.fs`.
 import {
   buildLine,
   isShown,
   noColor,
   overflowLine,
-  reconcile,
   rowBudget,
 } from './band.ts';
-import {
-  DEFAULT_REPO,
-  readAllJobs,
-  readJob,
-  readToolHistory,
-  readTranscript,
-  type FsLike,
-} from './jobs.ts';
+import type { FsLike } from './fs.ts';
 import { sortForBand } from './format.ts';
 import { readForgeJobs, readForgeDetail } from './canonical.ts';
 import {
@@ -116,13 +107,15 @@ const nativeTaskLinks = atom(
 // ── BAND STATE (band author) ──────────────────────────────────────────────────
 // The band, pane list and native task projection share this polled snapshot.
 // Detail reads the selected job's bounded view on demand. Configuration is
-// resolved once at session start, including explicit legacy-view opt-in.
+// resolved once at session start.
+
+/** No default repository: a hardcoded path would show another machine's jobs. */
+const DEFAULT_REPO = '';
 
 const bandJobs = atom({ plugin: 'agent-smith', key: 'bandJobs' } as const, [] as RadarJob[]);
 const bandConfig = atom({ plugin: 'agent-smith', key: 'bandConfig' } as const, {
   repo: DEFAULT_REPO,
   colour: true,
-  legacy: false,
 });
 
 /**
@@ -143,18 +136,16 @@ const listScope = atom({ plugin: 'agent-smith', key: 'listScope' } as const, 'se
 
 /**
  * The rows the band, the session list and native tasks show: this session's
- * launches. Legacy jobs are started outside the launch tools, so ownership is
- * unknowable there and the legacy view stays the whole repository.
+ * launches.
  */
 async function sessionRows($: EngineInterface): Promise<RadarJob[]> {
-  const cfg = await read($, bandConfig);
   const jobs = await read($, bandJobs);
   const mine = await read($, launched);
-  return cfg.legacy ? jobs : sessionJobs(jobs, mine);
+  return sessionJobs(jobs, mine);
 }
 
 // =============================================================================
-// § BAND — band author. See MERGE NOTE above.
+// § BAND — band author.
 //
 // The band is the 1–4 line strip between the transcript and the prompt. It owns:
 //   - the `ui.render` matcher for component 'AbovePrompt'
@@ -179,7 +170,7 @@ const BAND_TICK_MS = 1000;
 /** Data poll: 3 s. TERMINAL-UI.md L148 — file reads are not free. */
 const POLL_MS = 3000;
 
-/** `$.fs` narrowed to what ./jobs.ts asks of it. */
+/** `$.fs` narrowed to what the readers ask of it. */
 const fsOf = ($: EngineInterface): FsLike => ({
   read: (p) => $.fs.read(p),
   list: (p) => $.fs.list(p),
@@ -194,9 +185,9 @@ const fsOf = ($: EngineInterface): FsLike => ({
 async function pollBand($: EngineInterface): Promise<void> {
   const cfg = await read($, bandConfig);
   const at = await $.clock.now();
-  let fresh: RadarJob[];
+  let next: RadarJob[];
   try {
-    fresh = cfg.legacy ? await readAllJobs(fsOf($), cfg.repo, at) : await readForgeJobs(fsOf($), cfg.repo, at);
+    next = await readForgeJobs(fsOf($), cfg.repo, at);
     if (await read($, readError) !== null) await update($, readError, () => null);
   } catch (error) {
     const message = `Can't read job state: ${String(error).slice(0, 200)}`;
@@ -205,18 +196,16 @@ async function pollBand($: EngineInterface): Promise<void> {
   }
 
 
-  // The legacy adapter reconciles partial files. Canonical records are atomic
-  // and authoritative; all three surfaces receive exactly that projection.
+  // Canonical records are atomic and authoritative; all three surfaces receive
+  // exactly that projection.
   const previous = await read($, bandJobs);
-  const byId = new Map(previous.map((j) => [j.id, j]));
-  const next = cfg.legacy ? fresh.map((job) => reconcile(byId.get(job.id), job)) : fresh;
 
   // Only write when something actually changed. A 3 s poll that rewrites an
   // identical list would invalidate the band on every tick for no reason, and
   // `ui.invalidate` is rate-limited by the engine for good cause.
   const before = JSON.stringify(previous);
   if (before !== JSON.stringify(next)) await update($, bandJobs, () => next);
-  if (!cfg.legacy) await pollNativeTasks($, next);
+  await pollNativeTasks($, next);
 }
 
 // ── completion notices ───────────────────────────────────────────────────────
@@ -248,9 +237,9 @@ async function takeLaunch($: EngineInterface, launch: Launch, cwd: string): Prom
   // Whether this session shows the job is a separate question from who
   // announces it: any launch in this repo is shown, even one the hook keeps.
   if (cfg.repo !== '' && sameRepo(repo, cfg.repo)) await update($, launched, (l) => recordLaunch(l, launch));
-  // Legacy mode reads the agy-staff layout, and a read error means no rows: the
-  // mod could not see this job finish, so the hook keeps it.
-  if (cfg.legacy || cfg.repo === '' || await read($, readError) !== null) return false;
+  // A read error means no rows: the mod could not see this job finish, so the
+  // hook keeps it.
+  if (cfg.repo === '' || await read($, readError) !== null) return false;
   if (!sameRepo(repo, cfg.repo)) return false;
   const at = await $.clock.now();
   await update($, notices, (owned) => claim(owned, launch, at));
@@ -364,12 +353,11 @@ export async function startBand($: EngineInterface, cwd?: string): Promise<void>
   // refused at compile time, "so the variables a module reads and writes can be
   // listed"), so each is spelled out. no-color.org: present AND non-empty means
   // no colour; FORCE_COLOR=0/false and TERM=dumb are the same request.
-  const [nc, force, term, repo, legacy] = await Promise.all([
+  const [nc, force, term, repo] = await Promise.all([
     $.env.get('NO_COLOR').catch(() => undefined),
     $.env.get('FORCE_COLOR').catch(() => undefined),
     $.env.get('TERM').catch(() => undefined),
     $.env.get('AGY_RADAR_REPO').catch(() => undefined),
-    $.env.get('AGENT_SMITH_LEGACY_JOBS').catch(() => undefined),
   ]);
   await update($, bandConfig, () => ({
     // Precedence: explicit AGY_RADAR_REPO, else the session cwd, else
@@ -378,7 +366,6 @@ export async function startBand($: EngineInterface, cwd?: string): Promise<void>
     repo: repo !== undefined && repo.trim() !== '' ? repo.trim()
       : (cwd !== undefined && cwd !== '' ? cwd : DEFAULT_REPO),
     colour: !noColor({ NO_COLOR: nc, FORCE_COLOR: force, TERM: term }),
-    legacy: legacy === '1',
   }));
 
   // First read is immediate and warm. TERMINAL-UI.md L140-146 INVERTS the web
@@ -416,7 +403,7 @@ export async function startBand($: EngineInterface, cwd?: string): Promise<void>
     void (async () => {
       await pollBand($);
       const cfg = await read($, bandConfig);
-      if (cfg.legacy || await read($, readError) !== null) return;
+      if (await read($, readError) !== null) return;
       await announce($, cfg.repo, await read($, bandJobs), await $.clock.now());
     })().catch(() => {});
   });
@@ -462,7 +449,7 @@ async function pollNativeTasks($: EngineInterface, rows: readonly RadarJob[]): P
  * The band registers NO `command.run` handler: `/forge` belongs to the pane
  * half. Its rows' digit hotkeys open the pane through `openForge`.
  */
-export function registerBand(on: Parameters<Register>[0]): void {
+function registerBand(on: Parameters<Register>[0]): void {
   // A Bash call that looks like a dispatch: refresh NOW, not in up to 3 s.
   // TERMINAL-UI.md L22-35 says nothing moves unless the user caused it, and the
   // user causing it here is dispatching a job. Making them wait 3 s to see the
@@ -684,8 +671,7 @@ export const register: Register = (on) => {
     const rest = isRecap ? tokens.filter((token) => token !== 'recap') : tokens;
     const word = rest[0] ?? '';
     // `/forge pane` is the session list, kept because people have typed it.
-    // Legacy jobs have no session owner, so legacy is always the repository.
-    const scope = word === 'all' || cfg.legacy ? 'all' : 'session';
+    const scope = word === 'all' ? 'all' : 'session';
     const query = isRecap || word === 'pane' || word === 'all' ? '' : rest.join(' ');
     // This session's worker first; then the repository's, so an older one still opens by name.
     const job = query === '' ? undefined : findWorker(mine, query) ?? findWorker(jobs, query);
@@ -754,15 +740,10 @@ async function scrollEnd($: EngineInterface): Promise<void> {
 
 // Clock and control redraws reuse the bounded detail until the next data cadence.
 let detailCache: { key: string; at: number; detail: ForgeDetail | null } | null = null;
-async function loadDetail($: EngineInterface, repo: string, legacy: boolean, id: string, t: number): Promise<ForgeDetail | null> {
-  const key = `${repo}:${legacy}:${id}`;
+async function loadDetail($: EngineInterface, repo: string, id: string, t: number): Promise<ForgeDetail | null> {
+  const key = `${repo}:${id}`;
   if (detailCache?.key === key && t >= detailCache.at && t - detailCache.at < POLL_MS) return detailCache.detail;
-  const fs = fsOf($);
-  let detail: ForgeDetail | null;
-  if (legacy) {
-    const job = await readJob(fs,repo,id,t);
-    detail = job ? { job, history:await readToolHistory(fs,repo,id), transcript:await readTranscript(fs,repo,id), timeline:null } : null;
-  } else detail = await readForgeDetail(fs,repo,id,t);
+  const detail = await readForgeDetail(fsOf($),repo,id,t);
   detailCache = { key, at:t, detail };
   return detail;
 }
@@ -774,8 +755,7 @@ async function renderForge($: EngineInterface, e: UiRenderEvent): Promise<JSX.El
   const t = await read($, now);
   const jobs = await read($, bandJobs);
   const mine = await sessionRows($);
-  const chosen = await read($, listScope);
-  const scope = cfg.legacy ? 'all' : chosen;
+  const scope = await read($, listScope);
   const pick = await read($, selected);
   const error = await read($, readError);
   const o: ViewOptions = {
@@ -783,8 +763,7 @@ async function renderForge($: EngineInterface, e: UiRenderEvent): Promise<JSX.El
     following: await read($, follow), taskOpen: await read($, taskOpen), tools: await read($, expandedTools),
   };
   const a: ViewActions = {
-    // Legacy has no session to switch to.
-    ...(cfg.legacy ? {} : { scope: async (next: 'session' | 'all') => { await update($, listScope, () => next); await update($, listPage, () => 0); } }),
+    scope: async (next: 'session' | 'all') => { await update($, listScope, () => next); await update($, listPage, () => 0); },
     pick: (job) => show($, job.id),
     page: async (page) => { await update($, listPage, () => page); },
     back: () => show($, null),
@@ -795,7 +774,7 @@ async function renderForge($: EngineInterface, e: UiRenderEvent): Promise<JSX.El
   let content = renderList(W, scope === 'all' ? jobs : mine, o, a);
   if (pick !== null) {
     try {
-      const detail = await loadDetail($, cfg.repo, cfg.legacy, pick, t);
+      const detail = await loadDetail($, cfg.repo, pick, t);
       if (detail) {
         content = renderWorker(W, detail, o, a, jobs.filter((job) => job.id !== pick && job.workerId != null && job.workerId === detail.job.workerId));
         if (o.following && followingSite !== pick) {
@@ -814,6 +793,3 @@ async function renderForge($: EngineInterface, e: UiRenderEvent): Promise<JSX.El
   }
   return error ? <Box flexDirection="column"><Text wrap="wrap">{sanitizeText(error)}</Text>{content}</Box> : content;
 }
-
-export { EMPTY_STATE, describeTool, elapsed, elapsedCell, formatHeaderLine, formatJobLine,
-  pickGlyph, pickColor, isRecessive, isTerminal, countSummary, oneLine, sanitizeText } from './format.ts';

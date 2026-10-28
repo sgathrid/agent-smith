@@ -44,8 +44,8 @@ import type {
   StageContext,
   StageContinuation,
   StageResult,
+  StageRouting,
   StageRunner,
-  StageStatus,
 } from './types.ts';
 import path from 'node:path';
 
@@ -264,9 +264,9 @@ class Scheduler {
  * THE INJECTION POINT, concretely.
  *
  * Builds a StageRunner that dispatches by `stage.provider`, so a spec can mix
- * providers per stage while the pipeline sees exactly one runner. core/ (or the
- * binary) constructs the provider runners and calls this at the composition
- * root; pipeline/ and verify/ stay ignorant of every worker's API.
+ * providers per stage while the pipeline sees exactly one runner. the forge
+ * (forge/runner.ts, forge/execute.ts) constructs the provider runners and wires
+ * them at the composition root; pipeline/ and verify/ stay ignorant of every worker's API.
  *
  *     const runner = createRunnerRouter({
  *       gemini: makeGeminiRunner(clients),
@@ -289,7 +289,7 @@ export function createRunnerRouter(runners: Readonly<Record<string, StageRunner>
           message:
             `no StageRunner registered for provider '${ctx.stage.provider}' ` +
             `(registered: ${Object.keys(runners).sort().join(', ') || 'none'}). ` +
-            'This is a wiring gap in core/, not a provider failure.',
+            'This is a wiring gap in the composition root (forge/), not a provider failure.',
           retryable: false,
         });
       }
@@ -343,31 +343,22 @@ function failedResult(
 /* The runner                                                                  */
 /* -------------------------------------------------------------------------- */
 
-export async function runPipeline(
-  spec: PipelineSpec,
-  options: RunOptions,
-): Promise<PipelineRun> {
-  validateSpec(spec);
-
-  const now = options.now ?? Date.now;
-  const startedAt = now();
-  const workDir = options.workDir ?? spec.workDir ?? process.cwd();
-  const limit = normalizeConcurrency(options.concurrency ?? spec.concurrency);
-  const policy = options.policy ?? DEFAULT_STALL_POLICY;
-
-  const abort = new AbortController();
-  const parentSignal = options.signal;
-  if (parentSignal) {
-    // Captured in a local: narrowing on `options.signal` does not survive into
-    // the closure below, and `exactOptionalPropertyTypes` keeps it optional.
-    const onAbort = () => abort.abort(parentSignal.reason);
-    if (parentSignal.aborted) onAbort();
-    else parentSignal.addEventListener('abort', onAbort, { once: true });
-  }
-
-  const stages = new Map<string, Stage>(spec.stages.map((s) => [s.name, s]));
-  const outcomes = new Map<string, StageResult>();
-  const skipped = new Set<string>();
+/**
+ * The mutable state of one `runPipeline` call, and the steps that act on it.
+ *
+ * A class rather than closures so each step is a named method that can be read
+ * on its own. It holds no behaviour `runPipeline` did not already have.
+ */
+class PipelineExecution {
+  private readonly spec: PipelineSpec;
+  private readonly options: RunOptions;
+  private readonly now: () => number;
+  private readonly workDir: string;
+  private readonly policy: StallPolicy;
+  private readonly abort = new AbortController();
+  private readonly stages: Map<string, Stage>;
+  private readonly outcomes = new Map<string, StageResult>();
+  private readonly skipped = new Set<string>();
   /**
    * Stages that have been dispatched at least once.
    *
@@ -377,26 +368,48 @@ export async function runPipeline(
    * "is there a result" — conflating the two is how a DAG runner ends up
    * running `implement` eight times in a row.
    */
-  const started = new Set<string>();
+  private readonly started = new Set<string>();
   /** Stages currently in flight, so a timeout can abort exactly one attempt. */
-  const inflight = new Map<string, AbortController>();
-  const scheduler = new Scheduler(limit);
-  const order: string[] = [];
-  let peakConcurrency = 0;
-  let aborted = false;
+  private readonly inflight = new Map<string, AbortController>();
+  private readonly scheduler: Scheduler;
+  private readonly order: string[] = [];
+  private peakConcurrency = 0;
+  private aborted = false;
 
-  const depsOf = (stage: Stage): readonly string[] => stage.dependsOn ?? [];
+  constructor(spec: PipelineSpec, options: RunOptions) {
+    this.spec = spec;
+    this.options = options;
+    this.now = options.now ?? Date.now;
+    this.workDir = options.workDir ?? spec.workDir ?? process.cwd();
+    this.policy = options.policy ?? DEFAULT_STALL_POLICY;
+    this.scheduler = new Scheduler(normalizeConcurrency(options.concurrency ?? spec.concurrency));
+    this.stages = new Map(spec.stages.map((s) => [s.name, s]));
+
+    const parentSignal = options.signal;
+    if (parentSignal) {
+      // Captured in a local: narrowing on `options.signal` does not survive into
+      // the closure below, and `exactOptionalPropertyTypes` keeps it optional.
+      const onAbort = () => this.abort.abort(parentSignal.reason);
+      if (parentSignal.aborted) onAbort();
+      else parentSignal.addEventListener('abort', onAbort, { once: true });
+    }
+  }
+
+  private depsOf(stage: Stage): readonly string[] {
+    return stage.dependsOn ?? [];
+  }
+
   /** A continuing stage works where its target worked unless it names its own workDir. */
-  const workDirOf = (stage: Stage): string => {
-    const own = stage.workDir ?? (stage.continues === undefined ? undefined : stages.get(stage.continues)?.workDir);
-    return own ? path.resolve(workDir, own) : workDir;
-  };
+  private workDirOf(stage: Stage): string {
+    const own = stage.workDir ?? (stage.continues === undefined ? undefined : this.stages.get(stage.continues)?.workDir);
+    return own ? path.resolve(this.workDir, own) : this.workDir;
+  }
 
   /** A stage is dispatchable when it is unstarted, not skipped, and every dep passed. */
-  const isDispatchable = (stage: Stage): boolean => {
-    if (started.has(stage.name) || outcomes.has(stage.name) || skipped.has(stage.name)) return false;
-    return depsOf(stage).every((d) => outcomes.get(d)?.status === 'passed');
-  };
+  private isDispatchable(stage: Stage): boolean {
+    if (this.started.has(stage.name) || this.outcomes.has(stage.name) || this.skipped.has(stage.name)) return false;
+    return this.depsOf(stage).every((d) => this.outcomes.get(d)?.status === 'passed');
+  }
 
   /**
    * Cascade `skipped` forward from anything not 'passed'.
@@ -405,21 +418,21 @@ export async function runPipeline(
    * reason reported names the *originating* failure rather than the neighbour
    * that happened to be checked first.
    */
-  const propagateSkips = (): void => {
+  private propagateSkips(): void {
     let changed = true;
     while (changed) {
       changed = false;
-      for (const stage of spec.stages) {
-        if (outcomes.has(stage.name) || skipped.has(stage.name)) continue;
-        for (const dep of depsOf(stage)) {
-          const upstream = outcomes.get(dep);
-          if (skipped.has(dep)) {
-            skipStage(stage, 'upstream-skipped', dep, `skipped because upstream '${dep}' was skipped`);
+      for (const stage of this.spec.stages) {
+        if (this.outcomes.has(stage.name) || this.skipped.has(stage.name)) continue;
+        for (const dep of this.depsOf(stage)) {
+          const upstream = this.outcomes.get(dep);
+          if (this.skipped.has(dep)) {
+            this.skipStage(stage, 'upstream-skipped', dep, `skipped because upstream '${dep}' was skipped`);
             changed = true;
             break;
           }
           if (upstream && upstream.status !== 'passed') {
-            skipStage(
+            this.skipStage(
               stage,
               'upstream-failed',
               dep,
@@ -432,15 +445,15 @@ export async function runPipeline(
         }
       }
     }
-  };
+  }
 
-  const skipStage = (
+  private skipStage(
     stage: Stage,
     kind: NonNullable<StageResult['skippedBecause']>['kind'],
     becauseOf: string,
     message: string,
-  ): void => {
-    const t = now();
+  ): void {
+    const t = this.now();
     const result: StageResult = {
       stage: stage.name,
       provider: stage.provider,
@@ -451,11 +464,11 @@ export async function runPipeline(
       durationMs: 0,
       skippedBecause: { kind, becauseOf, message },
     };
-    skipped.add(stage.name);
-    outcomes.set(stage.name, result);
-    order.push(stage.name);
-    options.onStageEnd?.(result);
-  };
+    this.skipped.add(stage.name);
+    this.outcomes.set(stage.name, result);
+    this.order.push(stage.name);
+    this.options.onStageEnd?.(result);
+  }
 
   /**
    * Inputs for a stage: every upstream artifact, in dependency order.
@@ -465,12 +478,12 @@ export async function runPipeline(
    * a summary written by a model is the thing most likely to be confidently
    * wrong (see verify/runner.ts for why prose is not a verdict).
    */
-  const inputsFor = (stage: Stage): readonly ArtifactRef[] => {
+  private inputsFor(stage: Stage): readonly ArtifactRef[] {
     const inherited: ArtifactRef[] = [];
-    for (const dep of depsOf(stage)) {
-      const upstream = outcomes.get(dep);
+    for (const dep of this.depsOf(stage)) {
+      const upstream = this.outcomes.get(dep);
       if (!upstream) continue;
-      const declaredPath = stages.get(dep)?.resultPath ?? 'result.md';
+      const declaredPath = this.stages.get(dep)?.resultPath ?? 'result.md';
       inherited.push({ stage: dep, path: declaredPath, label: declaredPath });
       // Anything the upstream stage advertised beyond its main result.
       for (const art of upstream.artifacts ?? []) {
@@ -478,7 +491,191 @@ export async function runPipeline(
       }
     }
     return [...inherited, ...(stage.consumes ?? [])];
-  };
+  }
+
+  private record(result: StageResult, escalations: readonly Escalation[]): void {
+    const withEsc: StageResult =
+      escalations.length > 0 ? { ...result, escalations } : result;
+    this.outcomes.set(result.stage, withEsc);
+    this.order.push(result.stage);
+    this.options.onStageEnd?.(withEsc);
+  }
+
+  /**
+   * `continues`: resume the target's worker conversation. validateSpec proved
+   * it is an ancestor, so it has passed by now; what can still be missing is the
+   * conversation handle (the provider reported none) or its provider (an
+   * escalation moved the target to another one). Returns the remedy as `problem`.
+   */
+  private resolveContinued(stage: Stage, routing: StageRouting): ContinuedWorker | { readonly problem: string } {
+    const target = this.stages.get(stage.continues!)!;
+    const done = this.outcomes.get(target.name);
+    const ref = done?.transcriptRef;
+    if (ref === undefined) {
+      return { problem: `stage '${target.name}' produced no conversation handle to resume (the provider reported none); keep the fix in '${target.name}' or start a fresh worker` };
+    }
+    if (done?.provider !== routing.provider) {
+      return { problem: `stage '${target.name}' finished on ${done?.provider}, but this stage runs on ${routing.provider} and a conversation cannot move between providers; pin '${target.name}' with routingPinned` };
+    }
+    return { stage: target.name, transcriptRef: ref, workerId: target.workerId, agentName: target.agentName };
+  }
+
+  /**
+   * One attempt: run the stage under its own abort signal and timeout, and turn
+   * a throw or a late success into the result it really is.
+   */
+  private async runAttempt(
+    stage: Stage,
+    attempt: number,
+    stageStart: number,
+    routing: StageRouting,
+    continuation: StageContinuation | undefined,
+    continued: ContinuedWorker | undefined,
+  ): Promise<{ result: StageResult; abortedThisAttempt: boolean }> {
+    // Per-stage timeout: abort this attempt's signal without touching the run.
+    const stageAbort = new AbortController();
+    this.inflight.set(stage.name, stageAbort);
+    if (this.abort.signal.aborted) stageAbort.abort(this.abort.signal.reason);
+
+    const onParentAbort = () => stageAbort.abort(this.abort.signal.reason);
+    this.abort.signal.addEventListener('abort', onParentAbort, { once: true });
+    const timer = stage.timeoutMs
+      ? setTimeout(() => stageAbort.abort(new Error(`stage timeout after ${stage.timeoutMs}ms`)), stage.timeoutMs)
+      : undefined;
+
+    this.options.onStageStart?.(stage, attempt);
+    const ctx: StageContext = {
+      pipeline: this.spec.name,
+      stage,
+      attempt,
+      workDir: this.workDirOf(stage),
+      inputs: this.inputsFor(stage),
+      routing,
+      ...(continuation ? { continuation } : {}),
+      ...(continued ? { continues: continued } : {}),
+      signal: stageAbort.signal,
+    };
+
+    let result: StageResult;
+    try {
+      result = await this.options.runner.run(ctx);
+    } catch (err) {
+      // A runner that throws has still told us something; turning it into a
+      // result (rather than a rejected promise) keeps the DAG's bookkeeping
+      // and lets dependents be skipped for the right reason.
+      const t = this.now();
+      result = {
+        stage: stage.name,
+        provider: routing.provider,
+        model: routing.model,
+        status: 'failed',
+        startedAt: stageStart,
+        finishedAt: t,
+        durationMs: t - stageStart,
+        failure: {
+          code: stageAbort.signal.aborted ? 'timeout' : 'runner-threw',
+          message: stageAbort.signal.aborted
+            ? `stage aborted (timeoutMs=${stage.timeoutMs ?? 'unset'})`
+            : `StageRunner threw: ${err instanceof Error ? err.message : String(err)}`,
+          retryable: !stageAbort.signal.aborted,
+        },
+      };
+    } finally {
+      if (timer) clearTimeout(timer);
+      this.abort.signal.removeEventListener('abort', onParentAbort);
+      this.inflight.delete(stage.name);
+    }
+
+    // A stage that reported success while its own signal was aborted is not a
+    // success. Cheap check, and it closes the "signal-ignored" hole.
+    const abortedThisAttempt = stageAbort.signal.aborted;
+    if (abortedThisAttempt && result.status === 'passed') {
+      this.aborted = true;
+      result = {
+        ...result,
+        status: 'failed',
+        failure: {
+          code: 'timeout',
+          message:
+            `stage reported success after its abort signal fired ` +
+            `(timeoutMs=${stage.timeoutMs ?? 'unset'}); treating as failure`,
+          retryable: false,
+        },
+      };
+    }
+    return { result, abortedThisAttempt };
+  }
+
+  /**
+   * After a failed, un-aborted attempt: stop with a final result, or escalate.
+   *
+   * Escalate only on a stall SHAPE (routing RULE 2). A plain failure with no
+   * shape gets exactly the benefit of the doubt the reference job earned: the
+   * first error of a long job is not evidence of a bad job. Pushes the new
+   * escalation onto `escalations` when it retries.
+   */
+  private decideEscalation(
+    stage: Stage,
+    result: StageResult,
+    routing: StageRouting,
+    attempt: number,
+    escalations: Escalation[],
+  ): { readonly kind: 'stop'; readonly result: StageResult } | { readonly kind: 'retry'; readonly routing: StageRouting; readonly continuation: StageContinuation } {
+    const verdict = assessStall(result.observations ?? [], this.policy);
+    const next = nextRouting(routing, verdict, stage, this.options.ladders, this.policy, escalations.length);
+
+    if (!verdict.escalate || next === null) {
+      if (!verdict.escalate) {
+        return {
+          kind: 'stop',
+          result: {
+            ...result,
+            failure: result.failure
+              ? { ...result.failure, message: `${result.failure.message} (no stall shape: ${verdict.because})` }
+              : { code: 'failed', message: verdict.because },
+          },
+        };
+      }
+      return {
+        kind: 'stop',
+        result: {
+          ...result,
+          failure: {
+            code: 'escalation-ceiling',
+            message:
+              `stall shape '${verdict.shape}' persisted after ${escalations.length} ` +
+              'escalation(s); stopping and surfacing the evidence',
+            retryable: false,
+          },
+        },
+      };
+    }
+
+    const escalation: Escalation = {
+      attempt: escalations.length + 1,
+      because: verdict.because,
+      fromModel: routing.model,
+      toModel: next.model,
+      fromEffort: routing.effort,
+      toEffort: next.effort,
+      transcriptRef: result.transcriptRef,
+      appendedContext: buildEscalationContext(verdict.because, result.outputTail),
+    };
+    escalations.push(escalation);
+
+    return {
+      kind: 'retry',
+      routing: next,
+      continuation: {
+        attempt,
+        priorStatus: result.status,
+        transcriptRef: result.transcriptRef,
+        transcriptProvider: routing.provider,
+        appendedContext: escalation.appendedContext ?? '',
+        priorEscalations: escalations,
+      },
+    };
+  }
 
   /**
    * One stage, including its escalation ladder.
@@ -487,44 +684,33 @@ export async function runPipeline(
    * attempt's transcript reference and its failing tail are handed to the next
    * attempt so the worker resumes rather than starts over.
    */
-  const runStage = async (stage: Stage): Promise<void> => {
-    const stageStart = now();
+  private async runStage(stage: Stage): Promise<void> {
+    const stageStart = this.now();
     let attempt = 1;
     let continuation: StageContinuation | undefined;
     const escalations: Escalation[] = [];
-    let routing = planInitialRouting(stage, options.ladders);
+    let routing = planInitialRouting(stage, this.options.ladders);
 
-    // `continues`: resume the target's worker conversation. validateSpec proved
-    // it is an ancestor, so it has passed by now; what can still be missing is the
-    // conversation handle (the provider reported none) or its provider (an
-    // escalation moved the target to another one). Fail with the remedy.
     let continued: ContinuedWorker | undefined;
     if (stage.continues !== undefined) {
-      const target = stages.get(stage.continues)!;
-      const done = outcomes.get(target.name);
-      const ref = done?.transcriptRef;
-      const problem = ref === undefined
-        ? `stage '${target.name}' produced no conversation handle to resume (the provider reported none); keep the fix in '${target.name}' or start a fresh worker`
-        : done?.provider !== routing.provider
-          ? `stage '${target.name}' finished on ${done?.provider}, but this stage runs on ${routing.provider} and a conversation cannot move between providers; pin '${target.name}' with routingPinned`
-          : undefined;
-      if (ref === undefined || problem !== undefined) {
-        const t = now();
-        record({
+      const resolved = this.resolveContinued(stage, routing);
+      if ('problem' in resolved) {
+        const t = this.now();
+        this.record({
           stage: stage.name, provider: routing.provider, model: routing.model, status: 'failed',
           startedAt: stageStart, finishedAt: t, durationMs: t - stageStart,
-          failure: { code: 'no-conversation', message: `cannot continue: ${problem}`, retryable: false },
+          failure: { code: 'no-conversation', message: `cannot continue: ${resolved.problem}`, retryable: false },
         }, []);
         return;
       }
-      continued = { stage: target.name, transcriptRef: ref, workerId: target.workerId, agentName: target.agentName };
+      continued = resolved;
     }
 
     for (;;) {
-      if (abort.signal.aborted) {
-        aborted = true;
-        const t = now();
-        outcomes.set(stage.name, {
+      if (this.abort.signal.aborted) {
+        this.aborted = true;
+        const t = this.now();
+        this.outcomes.set(stage.name, {
           stage: stage.name,
           provider: routing.provider,
           model: routing.model,
@@ -539,244 +725,124 @@ export async function runPipeline(
           },
           ...(escalations.length > 0 ? { escalations } : {}),
         });
-        order.push(stage.name);
+        this.order.push(stage.name);
         return;
       }
 
-      // Per-stage timeout: abort this attempt's signal without touching the run.
-      const stageAbort = new AbortController();
-      inflight.set(stage.name, stageAbort);
-      if (abort.signal.aborted) stageAbort.abort(abort.signal.reason);
+      const { result, abortedThisAttempt } = await this.runAttempt(stage, attempt, stageStart, routing, continuation, continued);
 
-      const onParentAbort = () => stageAbort.abort(abort.signal.reason);
-      abort.signal.addEventListener('abort', onParentAbort, { once: true });
-      const timer = stage.timeoutMs
-        ? setTimeout(() => stageAbort.abort(new Error(`stage timeout after ${stage.timeoutMs}ms`)), stage.timeoutMs)
-        : undefined;
-
-      options.onStageStart?.(stage, attempt);
-      const ctx: StageContext = {
-        pipeline: spec.name,
-        stage,
-        attempt,
-        workDir: workDirOf(stage),
-        inputs: inputsFor(stage),
-        routing,
-        ...(continuation ? { continuation } : {}),
-        ...(continued ? { continues: continued } : {}),
-        signal: stageAbort.signal,
-      };
-
-      let result: StageResult;
-      try {
-        result = await options.runner.run(ctx);
-      } catch (err) {
-        // A runner that throws has still told us something; turning it into a
-        // result (rather than a rejected promise) keeps the DAG's bookkeeping
-        // and lets dependents be skipped for the right reason.
-        const t = now();
-        result = {
-          stage: stage.name,
-          provider: routing.provider,
-          model: routing.model,
-          status: 'failed',
-          startedAt: stageStart,
-          finishedAt: t,
-          durationMs: t - stageStart,
-          failure: {
-            code: stageAbort.signal.aborted ? 'timeout' : 'runner-threw',
-            message: stageAbort.signal.aborted
-              ? `stage aborted (timeoutMs=${stage.timeoutMs ?? 'unset'})`
-              : `StageRunner threw: ${err instanceof Error ? err.message : String(err)}`,
-            retryable: !stageAbort.signal.aborted,
-          },
-        };
-      } finally {
-        if (timer) clearTimeout(timer);
-        abort.signal.removeEventListener('abort', onParentAbort);
-        inflight.delete(stage.name);
-      }
-
-      // A stage that reported success while its own signal was aborted is not a
-      // success. Cheap check, and it closes the "signal-ignored" hole.
-      const abortedThisAttempt = stageAbort.signal.aborted;
-      if (abortedThisAttempt && result.status === 'passed') {
-        aborted = true;
-        result = {
-          ...result,
-          status: 'failed',
-          failure: {
-            code: 'timeout',
-            message:
-              `stage reported success after its abort signal fired ` +
-              `(timeoutMs=${stage.timeoutMs ?? 'unset'}); treating as failure`,
-            retryable: false,
-          },
-        };
-      }
-
-      if (result.status === 'passed') {
-        record(result, escalations);
+      // An aborted attempt is exempt from escalation: a timeout is not a
+      // reasoning failure, and spending an escalation to re-run the same work
+      // under the same timeout would just burn the ceiling.
+      if (result.status === 'passed' || abortedThisAttempt) {
+        this.record(result, escalations);
         return;
       }
 
-      // Escalate only on a stall SHAPE (routing RULE 2). A plain failure with no
-      // shape gets exactly the benefit of the doubt the reference job earned:
-      // the first error of a long job is not evidence of a bad job.
-      //
-      // An aborted attempt is exempt: a timeout is not a reasoning failure, and
-      // spending an escalation to re-run the same work under the same timeout
-      // would just burn the ceiling.
-      const verdict = assessStall(result.observations ?? [], policy);
-      const next = abortedThisAttempt
-        ? null
-        : nextRouting(routing, verdict, stage, options.ladders, policy, escalations.length);
-
-      if (abortedThisAttempt) {
-        record(result, escalations);
+      const decision = this.decideEscalation(stage, result, routing, attempt, escalations);
+      if (decision.kind === 'stop') {
+        this.record(decision.result, escalations);
         return;
       }
-
-      if (!verdict.escalate || next === null) {
-        if (!verdict.escalate) {
-          result = {
-            ...result,
-            failure: result.failure
-              ? { ...result.failure, message: `${result.failure.message} (no stall shape: ${verdict.because})` }
-              : { code: 'failed', message: verdict.because },
-          };
-        } else {
-          result = {
-            ...result,
-            failure: {
-              code: 'escalation-ceiling',
-              message:
-                `stall shape '${verdict.shape}' persisted after ${escalations.length} ` +
-                'escalation(s); stopping and surfacing the evidence',
-              retryable: false,
-            },
-          };
-        }
-        record(result, escalations);
-        return;
-      }
-
-      const escalation: Escalation = {
-        attempt: escalations.length + 1,
-        because: verdict.because,
-        fromModel: routing.model,
-        toModel: next.model,
-        fromEffort: routing.effort,
-        toEffort: next.effort,
-        transcriptRef: result.transcriptRef,
-        appendedContext: buildEscalationContext(verdict.because, result.outputTail),
-      };
-      escalations.push(escalation);
-
-      continuation = {
-        attempt,
-        priorStatus: result.status,
-        transcriptRef: result.transcriptRef,
-        transcriptProvider: routing.provider,
-        appendedContext: escalation.appendedContext ?? '',
-        priorEscalations: escalations,
-      };
-      routing = next;
+      continuation = decision.continuation;
+      routing = decision.routing;
       attempt += 1;
     }
-  };
-
-  const record = (result: StageResult, escalations: readonly Escalation[]): void => {
-    const withEsc: StageResult =
-      escalations.length > 0 ? { ...result, escalations } : result;
-    outcomes.set(result.stage, withEsc);
-    order.push(result.stage);
-    options.onStageEnd?.(withEsc);
-  };
-
-  /* ------------------------------ main loop ------------------------------ */
-
-  while (true) {
-    propagateSkips();
-
-    const remaining = spec.stages.filter((s) => !started.has(s.name) && !outcomes.has(s.name));
-    if (remaining.length === 0) {
-      // Nothing left to dispatch, but stages we already started may still be
-      // running. Returning here would hand back a PipelineRun with no outcomes
-      // for them, so wait for the last one to settle.
-      if (scheduler.activeCount === 0) break;
-      const settled = scheduler.whenSettled();
-      if (scheduler.activeCount > 0) await settled;
-      continue;
-    }
-
-    // Dispatch everything currently dispatchable, bounded by the ceiling. This
-    // is the whole concurrency story: any dispatchable stage takes the next free
-    // slot, and the slot count is the only ceiling we impose.
-    let dispatched = false;
-    for (const stage of remaining) {
-      if (!scheduler.hasSlot()) break;
-      if (!isDispatchable(stage)) continue;
-      started.add(stage.name);
-      scheduler.enter();
-      peakConcurrency = Math.max(peakConcurrency, scheduler.activeCount);
-      dispatched = true;
-
-      // Deliberately not awaited here: the stage runs concurrently and signals
-      // the scheduler when it settles. Fire-and-observe is what keeps the other
-      // branches moving, and it is why peakConcurrency is a measured fact rather
-      // than an assumption about the ceiling.
-      void runStage(stage).finally(() => scheduler.release());
-    }
-
-    if (dispatched) {
-      // Keep draining the ready queue without waiting: if a stage settled during
-      // the loop above, its dependents may already be dispatchable.
-      continue;
-    }
-
-    // Nothing dispatchable. Two possible reasons:
-    //  - something is still running, so we must wait for a settle or a free slot;
-    //  - the graph is blocked, which validateSpec should have rejected.
-    if (scheduler.activeCount > 0) {
-      // Register the waiter BEFORE re-checking, or a release landing between the
-      // check and the registration would leave us parked forever.
-      const settled = scheduler.whenSettled();
-      if (scheduler.activeCount > 0) await settled;
-      continue;
-    }
-
-    for (const stage of remaining) {
-      skipStage(
-        stage,
-        'upstream-skipped',
-        depsOf(stage)[0] ?? '(none)',
-        'blocked: no dependency reached a passing state and nothing is in flight',
-      );
-    }
-    break;
   }
 
-  // In-flight attempts are already settled at this point (the loop exits only
-  // when every stage has an outcome), but a hard abort may leave stragglers.
-  for (const controller of inflight.values()) controller.abort();
-  inflight.clear();
+  /** Drive the DAG to completion and assemble the run. */
+  async execute(startedAt: number): Promise<PipelineRun> {
+    const { spec, scheduler, started, outcomes } = this;
 
-  const finishedAt = now();
-  const finalStatus = summarize(spec.stages.map((s) => outcomes.get(s.name)));
-  const abortedRun = aborted || abort.signal.aborted;
-  const run: PipelineRun = {
-    pipeline: spec.name,
-    status: finalStatus,
-    outcomes: Object.fromEntries(outcomes),
-    order,
-    startedAt,
-    finishedAt,
-    durationMs: finishedAt - startedAt,
-    peakConcurrency,
-    ...(abortedRun ? { aborted: true } : {}),
-  };
-  return run;
+    while (true) {
+      this.propagateSkips();
+
+      const remaining = spec.stages.filter((s) => !started.has(s.name) && !outcomes.has(s.name));
+      if (remaining.length === 0) {
+        // Nothing left to dispatch, but stages we already started may still be
+        // running. Returning here would hand back a PipelineRun with no outcomes
+        // for them, so wait for the last one to settle.
+        if (scheduler.activeCount === 0) break;
+        const settled = scheduler.whenSettled();
+        if (scheduler.activeCount > 0) await settled;
+        continue;
+      }
+
+      // Dispatch everything currently dispatchable, bounded by the ceiling. This
+      // is the whole concurrency story: any dispatchable stage takes the next free
+      // slot, and the slot count is the only ceiling we impose.
+      let dispatched = false;
+      for (const stage of remaining) {
+        if (!scheduler.hasSlot()) break;
+        if (!this.isDispatchable(stage)) continue;
+        started.add(stage.name);
+        scheduler.enter();
+        this.peakConcurrency = Math.max(this.peakConcurrency, scheduler.activeCount);
+        dispatched = true;
+
+        // Deliberately not awaited here: the stage runs concurrently and signals
+        // the scheduler when it settles. Fire-and-observe is what keeps the other
+        // branches moving, and it is why peakConcurrency is a measured fact rather
+        // than an assumption about the ceiling.
+        void this.runStage(stage).finally(() => scheduler.release());
+      }
+
+      if (dispatched) {
+        // Keep draining the ready queue without waiting: if a stage settled during
+        // the loop above, its dependents may already be dispatchable.
+        continue;
+      }
+
+      // Nothing dispatchable. Two possible reasons:
+      //  - something is still running, so we must wait for a settle or a free slot;
+      //  - the graph is blocked, which validateSpec should have rejected.
+      if (scheduler.activeCount > 0) {
+        // Register the waiter BEFORE re-checking, or a release landing between the
+        // check and the registration would leave us parked forever.
+        const settled = scheduler.whenSettled();
+        if (scheduler.activeCount > 0) await settled;
+        continue;
+      }
+
+      for (const stage of remaining) {
+        this.skipStage(
+          stage,
+          'upstream-skipped',
+          this.depsOf(stage)[0] ?? '(none)',
+          'blocked: no dependency reached a passing state and nothing is in flight',
+        );
+      }
+      break;
+    }
+
+    // In-flight attempts are already settled at this point (the loop exits only
+    // when every stage has an outcome), but a hard abort may leave stragglers.
+    for (const controller of this.inflight.values()) controller.abort();
+    this.inflight.clear();
+
+    const finishedAt = this.now();
+    const abortedRun = this.aborted || this.abort.signal.aborted;
+    return {
+      pipeline: spec.name,
+      status: summarize(spec.stages.map((s) => outcomes.get(s.name))),
+      outcomes: Object.fromEntries(outcomes),
+      order: this.order,
+      startedAt,
+      finishedAt,
+      durationMs: finishedAt - startedAt,
+      peakConcurrency: this.peakConcurrency,
+      ...(abortedRun ? { aborted: true } : {}),
+    };
+  }
+}
+
+export async function runPipeline(
+  spec: PipelineSpec,
+  options: RunOptions,
+): Promise<PipelineRun> {
+  validateSpec(spec);
+  const startedAt = (options.now ?? Date.now)();
+  return new PipelineExecution(spec, options).execute(startedAt);
 }
 
 function normalizeConcurrency(value: number | undefined): number {
@@ -817,9 +883,4 @@ export function buildEscalationContext(shape: string, outputTail?: string | unde
   const tail = outputTail?.trim();
   if (!tail) return head;
   return `${head}\n\nLast output (tail, may be truncated):\n${tail.slice(-4000)}`;
-}
-
-/** Convenience for callers holding only statuses. */
-export function statusOf(run: PipelineRun, stage: string): StageStatus | undefined {
-  return run.outcomes[stage]?.status;
 }

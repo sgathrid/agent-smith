@@ -1,13 +1,8 @@
 /**
  * service.ts — the composition root that can START a worker.
  *
- * This is the file the repo was missing. Until now:
- *   - providers/ (3,643 lines) was never imported by anything
- *   - pipeline/ had no StageRunner
- *   - core/store.ts was unused
- *   - surfaces/mod read somebody else's state and could not create any
- *
- * This module wires those together and answers four questions: spawn a job, list
+ * It wires providers/ (adapters) and pipeline/ (StageRunner) to the job
+ * directory (forge/format.ts, writer.ts), and answers four questions: spawn a job, list
  * them, describe one, cancel one. `surfaces/channel` exposes exactly these as
  * MCP tools; nothing else in the repo may call a provider directly.
  *
@@ -52,17 +47,16 @@
  * implementation.
  */
 
-import { readPipeline } from './execute.ts';
+import { pipelineRecordPath, readPipeline } from './execute.ts';
 import { launchJob } from './supervisor.ts';
 import { humanDuration } from '../providers/failure-text.ts';
-import { appendFileSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, unlinkSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 
 import { AgentSmithReader, SMITH_PAYLOAD } from '../harness/agent-smith.ts';
 import { AgyStaffReader } from '../harness/agy-staff.ts';
 import { readObservedJob } from '../harness/registry.ts';
 import type { JobStateReader, ObservedJob } from '../harness/types.ts';
-import { findProvider, getProvider, providerNames } from '../providers/registry.ts';
 import { getCatalogs, getHarnessDefaults } from '../providers/catalog.ts';
 import type {
   JobResult,
@@ -72,34 +66,44 @@ import type {
   SpawnSpec,
   WorkerHandle,
 } from '../providers/types.js';
-import { isMode, MODE_PRESETS, MODES, type ModePreset } from './modes.ts';
-import { buildBrief, type BriefCheck } from './brief.ts';
+import { isMode, MODE_PRESETS, type ModePreset } from './modes.ts';
+import { buildBrief } from './brief.ts';
 import {
   DEFAULT_TIMEOUT_MS,
   deriveStatus,
   FILES,
   isForgeJobId,
-  isPidAlive,
+  isForgeStatus,
   jobDir,
   jobFile,
   jobsDir,
   newJobId,
+  ownerAlive,
+  readManifest,
   type ForgeActivity,
   type ForgeManifest,
   type ForgeStatus,
-  type SteerDelivery,
   type SteerEntry,
   type WatchedFileSigs,
-  nextActionFor,
 } from './format.ts';
 import { reconcileOrphan } from './reconcile.ts';
-import { computeStaleReads, fileSig, JobWriter, pipeEvents, reportFor } from './writer.ts';
+import { computeStaleReads, JobWriter, pipeEvents, reportFor } from './writer.ts';
 import { writeAtomic, writeJsonAtomic } from './atomic.ts';
 import { readAcceptance, type Acceptance } from './checks.ts';
+import {
+  checkAgainstCatalog, clampTimeout, ENV_KEYS_FILE, modeError, requireProvider, turnStartInput,
+  type SpawnAck, type SpawnRequest, type SteerAck, type SteerRequest, type TrackedSpawn, type TurnSpec,
+} from './spawn-request.ts';
+import { toSummary, type JobDetail, type JobSummary, type ListFilter } from './summary.ts';
+import { appendSteerEntry, buildSteeredPrompt, readSteerEntries, readSteerHead } from './steer-log.ts';
+import { syncWatchedFiles, validateWatchedFiles } from './watched-files.ts';
 import { validateEnv } from '../pipeline/types.ts';
-import type { ProgressDigest } from '../surfaces/mod/hooks/progress.ts';
 
-export { computeStaleReads };
+// The types and constants other packages import from here. Their homes are the
+// modules above; this is the one place that keeps the old import path working.
+export type { JobDetail, JobSummary, ListFilter, SpawnAck, SpawnRequest, SteerAck, SteerRequest, TrackedSpawn };
+export { MAX_WATCHED_FILES } from './watched-files.ts';
+export { ENV_KEYS_FILE };
 
 /**
  * Default wall-clock budget for one job.
@@ -111,200 +115,6 @@ export { computeStaleReads };
  * to press it should not be the reason a job runs for six hours.
  */
 export { DEFAULT_TIMEOUT_MS };
-
-/** Floor and ceiling on a caller-supplied timeout. */
-export const MIN_TIMEOUT_MS = 1_000;
-export const MAX_TIMEOUT_MS = 6 * 60 * 60_000;
-
-export interface SpawnRequest {
-  readonly name?: string;
-  readonly task?: string;
-  readonly workerId?: string;
-  /** Stage/role name. Becomes part of the job id and the pane's task context. */
-  readonly mode: string;
-  readonly prompt: string;
-  /** Defaults to 'agy': the cheapest verified adapter, and the one we tested. */
-  readonly provider?: string | undefined;
-  readonly model?: string | undefined;
-  readonly effort?: string | undefined;
-  readonly timeoutMs?: number | undefined;
-  /**
-   * Opt in to bypassing tool-approval prompts. FALSE unless you say otherwise.
-   * See the header: in headless agy the denied path is a silent no-op, so this is
-   * the difference between a job that works and a job that reports success and
-   * did nothing.
-   */
-  readonly unrestricted?: boolean | undefined;
-  /** Resume a prior conversation. Providers that cannot resume ignore this. */
-  readonly conversation?: string | undefined;
-  /** Extra worker environment. Only the keys are persisted (`env-keys.json`); values live in memory. */
-  readonly env?: Readonly<Record<string, string>> | undefined;
-  /** Overrides the repo root. Only pipeline stages set this. */
-  readonly cwd?: string | undefined;
-  /**
-   * Absolute path of the output artifact a pipeline stage writes. A read-only job
-   * may write exactly this file (claude, codex). Solo spawns leave it unset.
-   */
-  readonly artifactPath?: string | undefined;
-  /** Why the work matters and who it is for. Shown to the worker in its brief. */
-  readonly context?: string | undefined;
-  /**
-   * The acceptance checks, as the worker's brief describes them. The service
-   * never runs these: spawn_job (tools.ts) and the pipeline runner gate
-   * acceptance themselves. This is only so the worker knows its bar.
-   */
-  readonly checks?: readonly BriefCheck[] | undefined;
-  /** Relative paths of brief/spec files in the repository to sync into cwd and monitor for stale reads. */
-  readonly files?: readonly string[] | undefined;
-  /** Prior watched file signatures when resuming a worker, so unchanged repo files do not overwrite worktree edits. */
-  readonly previousWatchedFiles?: Readonly<Record<string, WatchedFileSigs>> | undefined;
-  readonly pipeline?: string | undefined;
-  readonly stage?: string | undefined;
-  readonly attempt?: number | undefined;
-  /** Persist a protocol handle after the job anchor exists, before any worker starts. */
-  readonly onPrepared?: ((jobId: string) => void | Promise<void>) | undefined;
-}
-
-/** What spawn_job returns. Immediate, and always truthful. */
-export interface SpawnAck {
-  readonly jobId: string;
-  readonly name: string;
-  readonly workerId: string;
-  readonly role: string;
-  readonly provider: string;
-  /** Always 'running' at ack time; read `status` later. */
-  readonly status: ForgeStatus;
-  /** Absolute path of the job directory. The anchor is already on disk. */
-  readonly dir: string;
-  readonly repo: string;
-  /** The budget the job actually got, after clamping. */
-  readonly timeoutMs: number;
-  /** Names of the environment variables passed to the worker; never the values. */
-  readonly envKeys?: readonly string[];
-  /** True only when the caller asked for it AND we passed it. */
-  readonly unrestricted: boolean;
-  /** One sentence an operator can act on. */
-  readonly note: string;
-  /** Effective sandbox posture reported by the provider ('unknown' when it cannot say). */
-  readonly sandbox: string;
-  readonly sandboxFlags: readonly string[];
-  /** Whether the mode asked for read-only (false when unrestricted). */
-  readonly readOnlyRequested: boolean;
-  /** Whether the provider's CLI actually enforces that request. */
-  readonly readOnlyEnforced: boolean;
-  readonly modelRequested: string | null;
-  readonly modelResolved: string | null;
-  readonly modelSource: 'requested' | 'harness-config' | 'reported' | 'unknown';
-  /** True when the worker's prompt starts with the brief (forge/brief.ts). */
-  readonly preambleApplied: boolean;
-  /** Non-fatal problems the caller should read. Omitted when none. */
-  readonly warnings?: readonly string[];
-}
-
-/** A spawn plus the promise of its terminal manifest. Used by the pipeline runner. */
-export interface TrackedSpawn {
-  readonly ack: SpawnAck;
-  readonly done: Promise<ForgeManifest>;
-}
-
-export interface ListFilter {
-  /** 'agent-smith' (ours, default), 'agy-staff' (interop history), or 'all'. */
-  readonly provider?: string | undefined;
-  /** Only jobs in this state. */
-  readonly status?: ForgeStatus | undefined;
-  readonly limit?: number | undefined;
-  /** Only jobs last touched (finished, updated or started) at or after this epoch ms. */
-  readonly sinceMs?: number | undefined;
-  /** Only these job IDs (e.g. the ones this process spawned). */
-  readonly ids?: ReadonlySet<string> | undefined;
-}
-
-export interface JobSummary {
-  readonly jobId: string;
-  readonly name: string;
-  readonly workerId: string;
-  readonly role: string | null;
-  readonly latestSummary: string | null;
-  readonly summarySource: 'worker' | null;
-  readonly source: 'agent-smith' | 'agy-staff';
-  readonly status: ObservedJob['status'];
-  readonly provider: string | null;
-  readonly mode: string | null;
-  readonly model: string | null;
-  readonly task: string | null;
-  readonly toolCalls: number | null;
-  readonly currentActivity: ForgeActivity | null;
-  readonly lastActivity: ForgeActivity | null;
-  readonly startedAt: string | null;
-  readonly updatedAt: string | null;
-  readonly finishedAt: string | null;
-  readonly warnings: readonly { code: string; message: string }[];
-  /** Derived (never stored) imperative for the orchestrator on failed/canceled jobs; null otherwise. */
-  readonly nextAction: string | null;
-  /** True when the job ran with the approval prompt bypassed. */
-  readonly unrestricted?: boolean;
-  /** Set when this job turn was superseded by a steered continuation turn. */
-  readonly supersededBy?: string | null;
-  /** Set when this job turn was spawned by steering an earlier turn. */
-  readonly steeredFrom?: string | null;
-  /** Count of unconsumed queued steers waiting for the current turn to finish. */
-  readonly pendingSteers?: number;
-  /** Files changed since the spawn baseline, once the job has finished. */
-  readonly changedFileCount?: number | null;
-  /** What the worker has done so far, read from progress.json (pure projection of the file). */
-  readonly digest?: ProgressDigest | null;
-  /** Acceptance results attached to the job, when checks have been configured or have run. */
-  readonly acceptance?: Acceptance | null;
-  /** Tool calls that ended in an error state; evidence, not a verdict. Absent when none. */
-  readonly toolErrors?: number;
-  /** Failed before any tool call (route, model or account). Absent otherwise. */
-  readonly failedEarly?: boolean;
-  /** changedFiles could not be computed at finish; absent changedFiles then means unknown, not none. */
-  readonly changedFilesUnknown?: boolean;
-  /** The cwd no longer existed at finish. */
-  readonly cwdMissingAtFinish?: boolean;
-  /** Last provider event (progress.json lastEventAt). */
-  readonly lastEventAt?: string | null;
-  /** Last heartbeat from the worker's process owner; null for jobs from older builds. */
-  readonly lastAliveAt?: string | null;
-}
-
-export interface JobDetail extends JobSummary {
-  readonly report: string | null;
-  readonly error: string | null;
-  /** Why it failed, in two to four words; null unless failed. */
-  readonly reason?: string | null;
-  readonly exitCode: number | null;
-  readonly unrestricted: boolean;
-  readonly pipeline: string | null;
-  readonly stage: string | null;
-  readonly usage: Readonly<Record<string, number>> | null;
-  readonly conversation: string | null;
-  readonly effort: string | null;
-  readonly cwd: string | null;
-  readonly modelRequested?: string | null;
-  readonly modelResolved?: string | null;
-  readonly modelSource?: 'requested' | 'harness-config' | 'reported' | 'unknown';
-  readonly preambleApplied?: boolean;
-  readonly sandbox?: string;
-  readonly sandboxFlags?: readonly string[];
-  readonly readOnlyRequested?: boolean;
-  readonly readOnlyEnforced?: boolean;
-  /** False when a cancel was requested but this process holds no live handle. */
-  readonly cancellable: boolean;
-  /** Git reference at spawn (only when cwd was a git repo). */
-  readonly gitBaseline?: { readonly head: string | null; readonly dirty: readonly string[] };
-  /**
-   * Paths changed since the baseline (set at finish). A worktree diff, so
-   * concurrent jobs in one worktree can attribute each other's edits.
-   */
-  readonly changedFiles?: readonly string[];
-  readonly changedFilesTruncated?: boolean;
-  readonly unattributedFiles?: readonly string[];
-  readonly watchedFiles?: Readonly<Record<string, WatchedFileSigs>>;
-  /** Watched brief files whose repository or external cwd copy changed after the turn started. */
-  readonly staleReads?: readonly string[];
-}
 
 export interface CancelResult {
   /** The chain head that was asked to stop (the given id when it was already the head). */
@@ -320,75 +130,6 @@ export interface CancelResult {
   readonly note: string;
 }
 
-export interface SteerRequest {
-  /** Active worker name or job ID. */
-  readonly worker: string;
-  readonly prompt: string;
-  readonly context?: string | undefined;
-  /** Relative paths of brief/spec files in the repository to sync into cwd on the steered turn. */
-  readonly files?: readonly string[] | undefined;
-  /** Required delivery mode: 'queue' (run after current turn) or 'interrupt' (stop current turn now and continue). */
-  readonly delivery: SteerDelivery;
-}
-
-export interface SteerAck {
-  /** Currently active job ID that received the steer. */
-  readonly jobId: string;
-  readonly name: string;
-  readonly workerId: string;
-  readonly provider: string;
-  readonly delivery: SteerDelivery;
-  readonly status: 'queued' | 'interrupting';
-  readonly pendingSteers: number;
-  readonly signalled: boolean;
-  /**
-   * Whether a resumable conversation handle was known when the steer was
-   * accepted. When false, the continuation starts fresh if no handle arrives
-   * before this turn ends.
-   */
-  readonly resumable: boolean;
-  readonly repo: string;
-  readonly dir: string;
-  readonly timeoutMs: number;
-  readonly note: string;
-}
-
-/**
- * Clamp a timeout into the range we are willing to enforce. Pure; unit-tested.
- *
- * ZERO IS "UNSET", NOT "NO TIMEOUT", and that is a deliberate reading of an
- * otherwise ambiguous value. `SpawnSpec.timeoutMs: 0` means "do not arm the timer"
- * to providers/ndjson.ts, so a caller passing 0 would otherwise get an unbounded
- * job whose only kill path is an operator who happens to be watching. And a
- * pipeline stage that does not name a timeout — which is every stage in
- * ARCHITECTURE.md's own example — would have no budget at all.
- *
- * So 0 resolves to the default, exactly like an absent value. Anyone who genuinely
- * wants a very long job passes MAX_TIMEOUT_MS and says so out loud.
- */
-export function clampTimeout(ms: number | undefined): number {
-  if (ms === undefined || !Number.isFinite(ms) || ms <= 0) return DEFAULT_TIMEOUT_MS;
-  return Math.min(MAX_TIMEOUT_MS, Math.max(MIN_TIMEOUT_MS, Math.floor(ms)));
-}
-
-/**
- * The word to put in a SpawnSpec for a provider that is not installed.
- *
- * Throwing rather than defaulting: `getProvider` on an unknown name is a typo in
- * a stage config, and a typo that silently runs zero workers and reports green is
- * the exact failure class this codebase is organised against. A KNOWN provider
- * whose binary is missing is different — that becomes a `failed` job with the
- * ENOENT in it, which is a report an operator can act on.
- */
-export function requireProvider(name: string): Provider {
-  if (findProvider(name) === undefined) {
-    throw new Error(
-      `unknown provider "${name}". Known providers: ${providerNames().join(', ')}.`,
-    );
-  }
-  return getProvider(name);
-}
-
 interface LiveJob {
   writer: JobWriter;
   handle: WorkerHandle | null;
@@ -399,15 +140,38 @@ interface LiveJob {
   userCanceled: boolean;
 }
 
+function newLiveJob(writer: JobWriter, timeoutMs: number): LiveJob {
+  return {
+    writer,
+    handle: null,
+    timeoutMs,
+    consumedSteers: 0,
+    interruptRequested: false,
+    interruptFired: false,
+    userCanceled: false,
+  };
+}
+
 const STEER_CONVERSATION_WAIT_MS = 2_000;
+
+/** A worker name that no job answers to, or that more than one worker does. */
+export class WorkerLookupError extends Error {
+  readonly kind: 'missing' | 'ambiguous';
+  /** The job ids that matched, for an ambiguous name. */
+  readonly jobIds: readonly string[];
+  constructor(message: string, kind: 'missing' | 'ambiguous', jobIds: readonly string[] = []) {
+    super(message);
+    this.name = 'WorkerLookupError';
+    this.kind = kind;
+    this.jobIds = jobIds;
+  }
+}
 
 export interface ForgeOptions {
   /** Packaged execution entrypoint; omitted inside a supervisor and in unit tests. */
   readonly supervisorUrl?: URL;
   /** Repo whose `.agent-smith/jobs/` this service owns. */
   readonly repo: string;
-  /** Write the agy-staff-shaped compat mirror. Default true. */
-  readonly mirror?: boolean | undefined;
   /** Progress coalescing window, ms. Overridable so tests need not sleep. */
   readonly flushMs?: number | undefined;
   /** Model catalog source. Default: providers/catalog.ts getCatalogs. Injectable for tests. */
@@ -424,17 +188,6 @@ export interface ForgeOptions {
     | undefined;
 }
 
-/** The teaching error for a mode outside the closed set. */
-export function modeError(mode: string): Error {
-  const lines = MODES.map((m) => `  ${m}: ${MODE_PRESETS[m].description}`).join('\n');
-  return new Error(
-    `${mode === '' ? 'mode is required' : `unknown mode "${mode}"`}. Valid modes:\n${lines}`,
-  );
-}
-
-/** Sidecar naming the env variables a job's worker was given. Keys only. */
-export const ENV_KEYS_FILE = 'env-keys.json';
-const AGY_EFFORT_SUFFIX = /-(low|medium|high)$/;
 /**
  * How long a spawn waits for the model catalog before passing the model through
  * unchecked. Cold discovery shells out (`agy models` alone took 2.1 s), so the
@@ -443,65 +196,6 @@ const AGY_EFFORT_SUFFIX = /-(low|medium|high)$/;
  */
 const CATALOG_WAIT_MS = 2_000;
 const CATALOG_COLD_WAIT_MS = 5_000;
-
-/**
- * Check model/effort against a catalog. Pure. Throws only when the catalog is
- * fresh and nonempty AND positively says the value is wrong; otherwise warns.
- */
-export function checkAgainstCatalog(
-  provider: string,
-  model: string | undefined,
-  effort: string | undefined,
-  catalog: ModelCatalog | undefined,
-): string[] {
-  const warnings: string[] = [];
-  if (model === undefined && effort === undefined) return warnings;
-  const fresh =
-    catalog !== undefined &&
-    !catalog.stale &&
-    catalog.error === undefined &&
-    catalog.verified !== false &&
-    catalog.source !== 'static' &&
-    catalog.models.length > 0;
-  if (!fresh) {
-    const why =
-      catalog === undefined
-        ? 'no catalog available'
-        : catalog.error !== undefined
-          ? `catalog error: ${catalog.error}`
-          : catalog.stale
-            ? 'catalog is stale'
-            : catalog.models.length === 0
-              ? 'catalog is empty'
-              : catalog.source === 'static'
-                ? 'catalog is a static alias list; full model names are also valid'
-                : 'catalog is unverified';
-    warnings.push(
-      `could not verify ${[model === undefined ? '' : `model "${model}"`, effort === undefined ? '' : `effort "${effort}"`].filter(Boolean).join(' / ')} for ${provider} (${why}); passing it through unchecked.`,
-    );
-    return warnings;
-  }
-  const ids = catalog.models.map((m) => m.id);
-  let match = model === undefined ? undefined : catalog.models.find((m) => m.id === model);
-  if (model !== undefined && match === undefined && provider === 'agy') {
-    const base = model.replace(AGY_EFFORT_SUFFIX, '');
-    if (base !== model) match = catalog.models.find((m) => m.id === base);
-  }
-  if (model !== undefined && match === undefined) {
-    throw new Error(`unknown model "${model}" for ${provider}. Valid model ids: ${ids.join(', ')}.`);
-  }
-  if (effort !== undefined) {
-    const target = match ?? (catalog.defaultModel === undefined ? undefined : catalog.models.find((m) => m.id === catalog.defaultModel));
-    // Defensive: a catalog from disk or a provider could carry a model without an efforts array.
-    const efforts = Array.isArray(target?.efforts) ? target!.efforts : [];
-    if (target !== undefined && efforts.length > 0 && !efforts.includes(effort)) {
-      throw new Error(
-        `effort "${effort}" is not valid for ${provider} model "${target.id}". Valid efforts: ${efforts.join(', ')}.`,
-      );
-    }
-  }
-  return warnings;
-}
 
 /**
  * The forge. One instance per process; the live-handle map is per instance.
@@ -522,7 +216,6 @@ export class ForgeService {
   /** Job IDs spawned by this process, for `list_jobs session`. */
   readonly spawnedIds = new Set<string>();
   readonly spawnedRuns = new Set<string>();
-  private readonly mirrorOn: boolean;
   private readonly flushMs: number | undefined;
   private readonly catalogSource: (providers?: string[]) => Promise<ModelCatalog[]>;
   private readonly catalogWaitMs: { readonly warm: number; readonly cold: number };
@@ -536,7 +229,6 @@ export class ForgeService {
   constructor(options: ForgeOptions) {
     this.repo = options.repo;
     this.supervisorUrl = options.supervisorUrl;
-    this.mirrorOn = options.mirror ?? true;
     this.flushMs = options.flushMs;
     this.providerSource = options.providerSource ?? requireProvider;
     this.catalogSource = options.catalogSource ?? ((providers) => getCatalogs({ providers, repo: this.repo }));
@@ -550,6 +242,27 @@ export class ForgeService {
         if (entry.isDirectory()) reconcileOrphan(this.repo, entry.name);
       }
     } catch { /* A missing job store is the ordinary fresh-repo case. */ }
+  }
+
+  /** One writer per job, configured like every other writer this service makes. */
+  private newWriter(jobId: string): JobWriter {
+    return new JobWriter({
+      repo: this.repo,
+      jobId,
+      ...(this.flushMs === undefined ? {} : { flushMs: this.flushMs }),
+    });
+  }
+
+  /** A worker is one running job at a time: refuse a name or identity that is already busy, on disk or live here. */
+  private assertNameFree(name: string, workerId: string): void {
+    const busy = (jobId: string): Error =>
+      new Error(`"${name}" is busy (${jobId}); wait, cancel, or use another name.`);
+    const canonicalConflict = findActiveIdentity(this.repo, name, workerId);
+    if (canonicalConflict !== null) throw busy(canonicalConflict.jobId);
+    for (const { writer } of this.live.values()) {
+      const active = writer.snapshot();
+      if (active !== null && (active.workerId === workerId || active.name === name)) throw busy(active.jobId);
+    }
   }
 
   /**
@@ -695,26 +408,9 @@ export class ForgeService {
     const name = request.name?.trim() || `${mode}-${jobId.slice(-8)}`;
     if (name.length > 80) throw new Error('worker name must be at most 80 characters');
     const workerId = request.workerId ?? jobId;
-    const canonicalConflict = findActiveIdentity(this.repo, name, workerId);
-    if (canonicalConflict !== null) {
-      throw new Error(`"${name}" is busy (${canonicalConflict.jobId}); wait, cancel, or use another name.`);
-    }
-    for (const { writer } of this.live.values()) {
-      const active = writer.snapshot();
-      if (active?.workerId === workerId) {
-        throw new Error(`"${name}" is busy (${active.jobId}); wait, cancel, or use another name.`);
-      }
-      if (active?.name === name) {
-        throw new Error(`"${name}" is busy (${active.jobId}); wait, cancel, or use another name.`);
-      }
-    }
+    this.assertNameFree(name, workerId);
 
-    const writer = new JobWriter({
-      repo: this.repo,
-      jobId,
-      mirror: this.mirrorOn,
-      ...(this.flushMs === undefined ? {} : { flushMs: this.flushMs }),
-    });
+    const writer = this.newWriter(jobId);
 
     const requestedFiles =
       request.files !== undefined && request.previousWatchedFiles !== undefined
@@ -729,38 +425,50 @@ export class ForgeService {
         ? syncWatchedFiles(this.repo, cwd, requestedFiles, request.previousWatchedFiles, (w) => warnings.push(w))
         : undefined;
 
-    // Anchor first. Everything after this point can fail loudly; nothing after
-    // this point can make the job invisible.
-    writer.start({
+    const spec: TurnSpec = {
+      jobId,
       name,
       workerId,
       task: request.task,
-      provider: provider.name,
       mode,
-      model: request.model ?? null,
-      effort: effort ?? null,
+      preset,
+      context: request.context,
+      checks: request.checks,
+      prompt: sentPrompt,
+      readOnlyRequested,
+      readOnlyEnforced,
+      sandbox,
+      sandboxFlags: [...sandboxFlags],
+      artifactPath,
       cwd,
-      prompt,
-      // Exactly what was prepended, so the /forge pane's "Show preamble" matches what the worker read.
-      ...(prependBrief ? { preamble: brief } : {}),
-      unrestricted,
-      conversation: request.conversation ?? null,
-      timeoutMs,
-      pipeline: request.pipeline ?? null,
-      stage: request.stage ?? null,
-      attempt: request.attempt ?? null,
+      model: request.model,
       modelRequested: request.model ?? null,
       modelResolved,
       modelSource,
+      effort,
+      timeoutMs,
+      unrestricted,
+      conversation: request.conversation,
+      env,
+      pipeline: request.pipeline ?? null,
+      stage: request.stage ?? null,
+      attempt: request.attempt ?? null,
+      onPrepared: request.onPrepared,
+    };
+
+    // Anchor first. Everything after this point can fail loudly; nothing after
+    // this point can make the job invisible.
+    writer.start(turnStartInput(provider.name, spec, {
+      prompt,
+      // Exactly what was prepended, so the /forge pane's "Show preamble" matches what the worker read.
+      preamble: prependBrief ? brief : undefined,
       preambleApplied,
-      sandbox,
-      sandboxFlags: [...sandboxFlags],
-      readOnlyRequested,
-      readOnlyEnforced,
-      ...(watchedFiles === undefined ? {} : { watchedFiles }),
-    });
+      conversation: request.conversation ?? null,
+      task: request.task,
+      watchedFiles,
+    }));
     try {
-      if (request.checks !== undefined) writeJsonAtomic(jobFile(this.repo, jobId, 'checks-spec.json'), request.checks);
+      if (request.checks !== undefined) writeJsonAtomic(jobFile(this.repo, jobId, FILES.checksSpec), request.checks);
       if (envKeys.length > 0) writeJsonAtomic(jobFile(this.repo, jobId, ENV_KEYS_FILE), envKeys);
       await request.onPrepared?.(jobId);
     } catch (error) {
@@ -796,36 +504,7 @@ export class ForgeService {
       ...(warnings.length === 0 ? {} : { warnings }),
     };
 
-    const done = this.pump(writer, provider, {
-      jobId,
-      name,
-      workerId,
-      task: request.task,
-      mode,
-      preset,
-      context: request.context,
-      checks: request.checks,
-      prompt: sentPrompt,
-      readOnlyRequested,
-      readOnlyEnforced,
-      sandbox,
-      sandboxFlags: [...sandboxFlags],
-      artifactPath,
-      cwd,
-      model: request.model,
-      modelRequested: request.model ?? null,
-      modelResolved,
-      modelSource,
-      effort,
-      timeoutMs,
-      unrestricted,
-      conversation: request.conversation,
-      env,
-      pipeline: request.pipeline ?? null,
-      stage: request.stage ?? null,
-      attempt: request.attempt ?? null,
-      onPrepared: request.onPrepared,
-    });
+    const done = this.pump(writer, provider, spec);
 
     return { ack, done };
   }
@@ -842,50 +521,13 @@ export class ForgeService {
   private async pump(
     initialWriter: JobWriter,
     provider: Provider,
-    spec: {
-      jobId: string;
-      name: string;
-      workerId: string;
-      task: string | undefined;
-      mode: string;
-      preset: ModePreset | undefined;
-      context: string | undefined;
-      checks: readonly BriefCheck[] | undefined;
-      prompt: string;
-      readOnlyRequested: boolean;
-      readOnlyEnforced: boolean;
-      sandbox: string;
-      sandboxFlags: readonly string[];
-      artifactPath: string | undefined;
-      cwd: string;
-      model: string | undefined;
-      modelRequested: string | null;
-      modelResolved: string | null;
-      modelSource: SpawnAck['modelSource'];
-      effort: string | undefined;
-      timeoutMs: number;
-      unrestricted: boolean;
-      conversation: string | undefined;
-      env: Readonly<Record<string, string>> | undefined;
-      pipeline: string | null;
-      stage: string | null;
-      attempt: number | null;
-      onPrepared: ((jobId: string) => void) | undefined;
-    },
+    spec: TurnSpec,
   ): Promise<ForgeManifest> {
     let currentWriter = initialWriter;
     let currentJobId = spec.jobId;
     let currentPrompt = spec.prompt;
     let currentConversation = spec.conversation;
-    let liveEntry: LiveJob = {
-      writer: currentWriter,
-      handle: null,
-      timeoutMs: spec.timeoutMs,
-      consumedSteers: 0,
-      interruptRequested: false,
-      interruptFired: false,
-      userCanceled: false,
-    };
+    let liveEntry = newLiveJob(currentWriter, spec.timeoutMs);
     // Register synchronously before the first await so a steer or cancel arriving
     // right after spawn_job finds the live entry in this.live.
     this.live.set(currentJobId, liveEntry);
@@ -909,7 +551,7 @@ export class ForgeService {
           // stateDir means events.jsonl / argv.json / stderr.log / result.json are
           // written by the already-verified plumbing in providers/ndjson.ts, for
           // all four providers, instead of being copied across afterwards by us.
-          stateDir: writerDir(this.repo, currentJobId),
+          stateDir: jobDir(this.repo, currentJobId),
           jobId: currentJobId,
         });
       } catch (err) {
@@ -1016,142 +658,15 @@ export class ForgeService {
         }
 
         if (shouldChain) {
-          const conversation = currentWriter.currentConversation();
-          const wasInterrupted = liveEntry.interruptRequested && verdict.status !== 'succeeded';
-          if (conversation === null && !wasInterrupted) {
-            currentWriter.warn('provider did not report a resumable conversation ID; continuing in a fresh session');
-          }
-          liveEntry.consumedSteers = entries.length;
-          try {
-            unlinkSync(jobFile(this.repo, currentJobId, FILES.cancelSteer));
-          } catch { /* no steer marker present */ }
-          const nextJobId = newJobId(spec.mode);
-          const nextWriter = new JobWriter({
-            repo: this.repo,
-            jobId: nextJobId,
-            mirror: this.mirrorOn,
-            ...(this.flushMs === undefined ? {} : { flushMs: this.flushMs }),
+          const next = await this.chainContinuation({
+            provider, spec, parent: { writer: currentWriter, jobId: currentJobId, live: liveEntry },
+            result, report, entries, unconsumed, verdictStatus: verdict.status,
           });
-          const latestContext = [...unconsumed].reverse().find((e) => e.context !== undefined)?.context ?? spec.context;
-          const resuming = conversation !== null;
-          const parentWatched = currentWriter.snapshot()?.watchedFiles;
-          const explicitSteerFiles = new Set(unconsumed.flatMap((e) => e.files ?? []));
-          const inheritedWatchedPaths = Object.keys(parentWatched ?? {}).filter((f) => {
-            if (existsSync(path.resolve(this.repo, f))) return true;
-            currentWriter.warn(`dropped deleted watched file "${f}" from continuation turn`);
-            return false;
-          });
-          const mergedWatchedPaths = [
-            ...new Set([
-              ...inheritedWatchedPaths,
-              ...explicitSteerFiles,
-            ]),
-          ];
-          let nextWatchedFiles: Record<string, WatchedFileSigs> | undefined;
-          const syncedFiles: string[] = [];
-          const syncWarnings: string[] = [];
-          if (mergedWatchedPaths.length > 0) {
-            try {
-              nextWatchedFiles = syncWatchedFiles(
-                this.repo,
-                spec.cwd,
-                mergedWatchedPaths,
-                parentWatched,
-                (w) => syncWarnings.push(w),
-              );
-              for (const [rel, sigs] of Object.entries(nextWatchedFiles)) {
-                const prev = parentWatched?.[rel];
-                if (prev === undefined || (prev.repoSig !== sigs.repoSig && sigs.cwdSig === sigs.repoSig)) {
-                  syncedFiles.push(rel);
-                }
-              }
-            } catch (err) {
-              currentWriter.warn(`watched file sync warning: ${describe(err)}`);
-            }
-          }
-          const nextBrief = buildBrief({
-            preset: spec.preset,
-            cwd: spec.cwd,
-            context: latestContext,
-            checks: spec.checks,
-            pipelineStage: spec.pipeline !== null,
-            resuming,
-          });
-          const { rawPrompt, sentPrompt, prependBrief } = buildSteeredPrompt({
-            parentJobId: currentJobId,
-            wasInterrupted,
-            freshContinuation: !resuming,
-            toolCalls: currentWriter.snapshot()?.toolCalls ?? 0,
-            responseTail: result.response.trim().slice(-600),
-            entries: unconsumed,
-            syncedFiles,
-            brief: nextBrief,
-          });
-          const nextLiveEntry: LiveJob = {
-            writer: nextWriter,
-            handle: null,
-            timeoutMs: spec.timeoutMs,
-            consumedSteers: 0,
-            interruptRequested: false,
-            interruptFired: false,
-            userCanceled: false,
-          };
-
-          // 1. Open child anchor on disk BEFORE finishing the parent so any reader
-          //    following `supersededBy` finds the child anchor immediately.
-          nextWriter.start({
-            name: spec.name,
-            workerId: spec.workerId,
-            task: currentWriter.snapshot()?.task ?? spec.task,
-            provider: provider.name,
-            mode: spec.mode,
-            model: spec.model ?? null,
-            effort: spec.effort ?? null,
-            cwd: spec.cwd,
-            prompt: rawPrompt,
-            ...(prependBrief ? { preamble: nextBrief } : {}),
-            unrestricted: spec.unrestricted,
-            conversation,
-            timeoutMs: spec.timeoutMs,
-            pipeline: spec.pipeline,
-            stage: spec.stage,
-            attempt: spec.attempt,
-            modelRequested: spec.modelRequested,
-            modelResolved: spec.modelResolved,
-            modelSource: spec.modelSource,
-            preambleApplied: nextBrief !== '',
-            sandbox: spec.sandbox,
-            sandboxFlags: [...spec.sandboxFlags],
-            readOnlyRequested: spec.readOnlyRequested,
-            readOnlyEnforced: spec.readOnlyEnforced,
-            steeredFrom: currentJobId,
-            ...(nextWatchedFiles === undefined ? {} : { watchedFiles: nextWatchedFiles }),
-          });
-          if (spec.checks !== undefined) writeJsonAtomic(jobFile(this.repo, nextJobId, 'checks-spec.json'), spec.checks);
-          if (spec.env !== undefined && Object.keys(spec.env).length > 0) writeJsonAtomic(jobFile(this.repo, nextJobId, ENV_KEYS_FILE), Object.keys(spec.env));
-          for (const w of syncWarnings) nextWriter.warn(w);
-
-          // The child anchor exists; publish its id before the parent's terminal
-          // write so resolveHead can cross the finish window.
-          writeAtomic(jobFile(this.repo, currentJobId, FILES.steerHead), `${nextJobId}\n`);
-
-          // 2. Register child in spawnedIds and live map before removing parent.
-          this.spawnedIds.add(nextJobId);
-          this.live.set(nextJobId, nextLiveEntry);
-          try {
-            await spec.onPrepared?.(nextJobId);
-          } catch { /* best-effort callback for continuation turn */ }
-
-          // 3. Stamp supersededBy on parent and write parent's terminal manifest atomically.
-          currentWriter.markSuperseded(nextJobId);
-          currentWriter.finish(result, report === '' ? null : report);
-          this.live.delete(currentJobId);
-
-          currentWriter = nextWriter;
-          currentJobId = nextJobId;
-          currentPrompt = sentPrompt;
-          currentConversation = conversation ?? undefined;
-          liveEntry = nextLiveEntry;
+          currentWriter = next.writer;
+          currentJobId = next.jobId;
+          currentPrompt = next.prompt;
+          currentConversation = next.conversation;
+          liveEntry = next.live;
           continue;
         }
 
@@ -1170,6 +685,127 @@ export class ForgeService {
         );
       }
     }
+  }
+
+  /**
+   * Open the child turn of a steered chain and hand the job over to it.
+   *
+   * The order is the contract readers rely on: the child anchor is on disk
+   * before the parent is finished, so anyone following `supersededBy` or
+   * `steer.head` always finds a real job.
+   */
+  private async chainContinuation(input: {
+    readonly provider: Provider;
+    readonly spec: TurnSpec;
+    readonly parent: { readonly writer: JobWriter; readonly jobId: string; readonly live: LiveJob };
+    readonly result: JobResult;
+    readonly report: string;
+    /** Every steer entry the parent has seen, and the ones not yet delivered. */
+    readonly entries: readonly SteerEntry[];
+    readonly unconsumed: readonly SteerEntry[];
+    readonly verdictStatus: ForgeStatus;
+  }): Promise<{ writer: JobWriter; jobId: string; live: LiveJob; prompt: string; conversation: string | undefined }> {
+    const { provider, spec, parent, result, report, entries, unconsumed, verdictStatus } = input;
+    const conversation = parent.writer.currentConversation();
+    const wasInterrupted = parent.live.interruptRequested && verdictStatus !== 'succeeded';
+    if (conversation === null && !wasInterrupted) {
+      parent.writer.warn('provider did not report a resumable conversation ID; continuing in a fresh session');
+    }
+    parent.live.consumedSteers = entries.length;
+    try {
+      unlinkSync(jobFile(this.repo, parent.jobId, FILES.cancelSteer));
+    } catch { /* no steer marker present */ }
+    const nextJobId = newJobId(spec.mode);
+    const nextWriter = this.newWriter(nextJobId);
+    const latestContext = [...unconsumed].reverse().find((e) => e.context !== undefined)?.context ?? spec.context;
+    const resuming = conversation !== null;
+    const parentWatched = parent.writer.snapshot()?.watchedFiles;
+    const explicitSteerFiles = new Set(unconsumed.flatMap((e) => e.files ?? []));
+    const inheritedWatchedPaths = Object.keys(parentWatched ?? {}).filter((f) => {
+      if (existsSync(path.resolve(this.repo, f))) return true;
+      parent.writer.warn(`dropped deleted watched file "${f}" from continuation turn`);
+      return false;
+    });
+    const mergedWatchedPaths = [
+      ...new Set([
+        ...inheritedWatchedPaths,
+        ...explicitSteerFiles,
+      ]),
+    ];
+    let nextWatchedFiles: Record<string, WatchedFileSigs> | undefined;
+    const syncedFiles: string[] = [];
+    const syncWarnings: string[] = [];
+    if (mergedWatchedPaths.length > 0) {
+      try {
+        nextWatchedFiles = syncWatchedFiles(
+          this.repo,
+          spec.cwd,
+          mergedWatchedPaths,
+          parentWatched,
+          (w) => syncWarnings.push(w),
+        );
+        for (const [rel, sigs] of Object.entries(nextWatchedFiles)) {
+          const prev = parentWatched?.[rel];
+          if (prev === undefined || (prev.repoSig !== sigs.repoSig && sigs.cwdSig === sigs.repoSig)) {
+            syncedFiles.push(rel);
+          }
+        }
+      } catch (err) {
+        parent.writer.warn(`watched file sync warning: ${describe(err)}`);
+      }
+    }
+    const nextBrief = buildBrief({
+      preset: spec.preset,
+      cwd: spec.cwd,
+      context: latestContext,
+      checks: spec.checks,
+      pipelineStage: spec.pipeline !== null,
+      resuming,
+    });
+    const { rawPrompt, sentPrompt, prependBrief } = buildSteeredPrompt({
+      parentJobId: parent.jobId,
+      wasInterrupted,
+      freshContinuation: !resuming,
+      toolCalls: parent.writer.snapshot()?.toolCalls ?? 0,
+      responseTail: result.response.trim().slice(-600),
+      entries: unconsumed,
+      syncedFiles,
+      brief: nextBrief,
+    });
+    const nextLiveEntry = newLiveJob(nextWriter, spec.timeoutMs);
+
+    // 1. Open child anchor on disk BEFORE finishing the parent so any reader
+    //    following `supersededBy` finds the child anchor immediately.
+    nextWriter.start(turnStartInput(provider.name, spec, {
+      prompt: rawPrompt,
+      preamble: prependBrief ? nextBrief : undefined,
+      preambleApplied: nextBrief !== '',
+      conversation,
+      task: parent.writer.snapshot()?.task ?? spec.task,
+      watchedFiles: nextWatchedFiles,
+      steeredFrom: parent.jobId,
+    }));
+    if (spec.checks !== undefined) writeJsonAtomic(jobFile(this.repo, nextJobId, FILES.checksSpec), spec.checks);
+    if (spec.env !== undefined && Object.keys(spec.env).length > 0) writeJsonAtomic(jobFile(this.repo, nextJobId, ENV_KEYS_FILE), Object.keys(spec.env));
+    for (const w of syncWarnings) nextWriter.warn(w);
+
+    // The child anchor exists; publish its id before the parent's terminal
+    // write so resolveHead can cross the finish window.
+    writeAtomic(jobFile(this.repo, parent.jobId, FILES.steerHead), `${nextJobId}\n`);
+
+    // 2. Register child in spawnedIds and live map before removing parent.
+    this.spawnedIds.add(nextJobId);
+    this.live.set(nextJobId, nextLiveEntry);
+    try {
+      await spec.onPrepared?.(nextJobId);
+    } catch { /* best-effort callback for continuation turn */ }
+
+    // 3. Stamp supersededBy on parent and write parent's terminal manifest atomically.
+    parent.writer.markSuperseded(nextJobId);
+    parent.writer.finish(result, report === '' ? null : report);
+    this.live.delete(parent.jobId);
+
+    return { writer: nextWriter, jobId: nextJobId, live: nextLiveEntry, prompt: sentPrompt, conversation: conversation ?? undefined };
   }
 
   /**
@@ -1199,12 +835,7 @@ export class ForgeService {
       const live = this.live.get(id);
       const writer =
         live?.writer ??
-        new JobWriter({
-          repo: this.repo,
-          jobId: id,
-          mirror: this.mirrorOn,
-          ...(this.flushMs === undefined ? {} : { flushMs: this.flushMs }),
-        });
+        this.newWriter(id);
       writer.requestCancel();
       if (live !== undefined) {
         live.userCanceled = true;
@@ -1268,13 +899,7 @@ export class ForgeService {
       );
     }
     if (live === undefined) {
-      const ownerPid = latestManifest.ownerPid;
-      const ownerAlive =
-        typeof ownerPid === 'number' &&
-        Number.isInteger(ownerPid) &&
-        ownerPid > 0 &&
-        isPidAlive(ownerPid);
-      if (!ownerAlive) {
+      if (!ownerAlive(latestManifest)) {
         reconcileOrphan(this.repo, target.jobId);
         throw new Error(
           `"${latestManifest.name}" (${target.jobId}) has no live owner process; it cannot be steered. Use resume_job to continue it.`,
@@ -1352,7 +977,7 @@ export class ForgeService {
     if (inMem !== null && inMem !== undefined) return inMem;
     reconcileOrphan(this.repo, id);
     try {
-      return JSON.parse(readFileSync(jobFile(this.repo, id, FILES.job), 'utf8')) as ForgeManifest;
+      return readManifest(this.repo, id);
     } catch {
       return null;
     }
@@ -1374,7 +999,7 @@ export class ForgeService {
     if (curManifest === null) return trimmed;
     while (!seen.has(curId)) {
       seen.add(curId);
-      const nextId = curManifest.supersededBy ?? this.readSteerHead(curId);
+      const nextId = curManifest.supersededBy ?? readSteerHead(this.repo, curId);
       if (nextId === null || nextId === undefined || nextId === '') break;
       const nextManifest = this.readManifestSync(nextId);
       if (nextManifest === null) break;
@@ -1382,18 +1007,6 @@ export class ForgeService {
       curManifest = nextManifest;
     }
     return curId;
-  }
-
-  private readSteerHead(jobId: string): string | null {
-    try {
-      const line = readFileSync(jobFile(this.repo, jobId, FILES.steerHead), 'utf8')
-        .split('\n')
-        .map((s) => s.trim())
-        .find((s) => s !== '');
-      return line ?? null;
-    } catch {
-      return null;
-    }
   }
 
   private async resolveSteerTarget(worker: string): Promise<{ jobId: string; manifest: ForgeManifest }> {
@@ -1442,6 +1055,29 @@ export class ForgeService {
     throw new Error(`No worker "${trimmed}"; see list_jobs.`);
   }
 
+  /**
+   * One worker by job id or name, as the detail of its latest turn.
+   *
+   * An id (any turn of a steered chain) wins; otherwise the name must belong to
+   * exactly one worker, and its newest turn is returned. Throws
+   * WorkerLookupError when nothing matches or the name is ambiguous.
+   */
+  async resolveWorker(nameOrId: string): Promise<JobDetail> {
+    try { return await this.detail(this.resolveHead(nameOrId)); } catch { /* not a job id: try it as a worker name */ }
+    const candidates = (await this.list({ limit: 500 })).filter((j) => j.name === nameOrId);
+    const identities = new Set(candidates.map((j) => j.workerId));
+    if (candidates.length === 0) throw new WorkerLookupError(`No worker "${nameOrId}"; see list_jobs.`, 'missing');
+    if (identities.size !== 1) {
+      throw new WorkerLookupError(
+        `"${nameOrId}" matches ${identities.size} workers; pass a job ID from list_jobs.`,
+        'ambiguous',
+        candidates.map((j) => j.jobId),
+      );
+    }
+    candidates.sort((a, b) => Date.parse(b.startedAt ?? b.updatedAt ?? '') - Date.parse(a.startedAt ?? a.updatedAt ?? ''));
+    return this.detail(this.resolveHead(candidates[0]!.jobId));
+  }
+
   /** Jobs the pane would draw. Ours by default; interop history on request. */
   async list(filter: ListFilter = {}): Promise<JobSummary[]> {
     for (const id of this.spawnedRuns) {
@@ -1457,9 +1093,7 @@ export class ForgeService {
       out.push(...(await this.readSource('agent-smith', new AgentSmithReader())));
     }
     if (source === 'agy-staff' || source === 'all') {
-      // The interop source. Our own ids are filtered out because the compat
-      // mirror makes them visible there too, and one job must have one verdict —
-      // see harness/registry.ts for the same rule applied to the registry sweep.
+      // Genuine agy-staff jobs. Forge ids are skipped: older versions mirrored them here, and copies may remain on disk.
       out.push(...(await this.readSource('agy-staff', new AgyStaffReader(), isForgeJobId)));
     }
 
@@ -1508,7 +1142,7 @@ export class ForgeService {
 
     const raw = observed.raw;
     let manifest: ForgeManifest | null = null;
-    try { manifest = JSON.parse(readFileSync(jobFile(this.repo, jobId, FILES.job), 'utf8')) as ForgeManifest; } catch { /* partial state */ }
+    try { manifest = readManifest(this.repo, jobId); } catch { /* partial state */ }
     const liveStale =
       manifest?.status === 'running' && manifest.watchedFiles !== undefined
         ? computeStaleReads(
@@ -1550,7 +1184,7 @@ export class ForgeService {
             ...(manifest.watchedFiles === undefined ? {} : { watchedFiles: manifest.watchedFiles }),
             ...(staleReads.length === 0 ? {} : { staleReads }),
           }),
-      cancellable: this.live.has(jobId) || (manifest?.status === 'running' && typeof manifest.ownerPid === 'number' && isPidAlive(manifest.ownerPid)),
+      cancellable: this.live.has(jobId) || (manifest?.status === 'running' && ownerAlive(manifest)),
     };
   }
 
@@ -1590,7 +1224,7 @@ export class ForgeService {
     try {
       const raw = await new AgentSmithReader().read(this.repo, jobId);
       const s = raw?.payload[SMITH_PAYLOAD.status];
-      return s === 'running' || s === 'succeeded' || s === 'failed' || s === 'canceled' ? s : 'unknown';
+      return isForgeStatus(s) ? s : 'unknown';
     } catch {
       return 'unknown';
     }
@@ -1622,315 +1256,16 @@ export class ForgeService {
   }
 }
 
-/* ── pure helpers ───────────────────────────────────────────────────────── */
-
-/** Project an ObservedJob onto what a list actually needs. */
-export function toSummary(observed: ObservedJob, source: 'agent-smith' | 'agy-staff'): JobSummary {
-  const raw = observed.raw;
-  const toolCalls = typeof raw['tool_calls'] === 'number' ? raw['tool_calls'] : null;
-  const task = typeof raw['task'] === 'string' && raw['task'] !== '' ? raw['task'] : null;
-  const changedFiles = raw['changed_files'];
-  const digest = readDigest(raw['digest']);
-  const activities = Array.isArray(raw['recent_activities']) ? raw['recent_activities'] : [];
-  const currentActivity = observed.status === 'running'
-    ? [...activities].reverse().find(isActiveForgeActivity) ?? null
-    : null;
-  return {
-    jobId: observed.jobId,
-    name: typeof raw['name'] === 'string' && raw['name'] ? raw['name'] : observed.jobId,
-    workerId: typeof raw['workerId'] === 'string' ? raw['workerId'] : observed.jobId,
-    role: typeof raw['role'] === 'string' ? raw['role'] : observed.mode,
-    latestSummary: raw['summarySource'] === 'worker' && typeof raw['latestSummary'] === 'string' ? raw['latestSummary'] : null,
-    summarySource: raw['summarySource'] === 'worker' ? 'worker' : null,
-    source,
-    status: observed.status,
-    // `raw.provider` for OUR jobs. Interop jobs carry no provider field: they are
-    // agy-staff's, i.e. agy. Their `profile` ("unrestricted") is a permission
-    // word, not a provider, so it goes to the unrestricted flag.
-    provider: typeof raw['provider'] === 'string' ? raw['provider'] : source === 'agy-staff' ? 'agy' : observed.label,
-    unrestricted: raw['unrestricted'] === true || (source === 'agy-staff' && observed.label === 'unrestricted'),
-    nextAction: nextActionFor({
-      status: observed.status,
-      jobStatus: typeof raw['job_status'] === 'string' ? raw['job_status'] : null,
-      error: [typeof raw['error'] === 'string' ? raw['error'] : '', ...observed.warnings.map((w) => w.message)].join(' — '),
-      report: observed.output,
-      exitCode: typeof raw['exit_code'] === 'number' ? raw['exit_code'] : null,
-      deniedCount: Array.isArray(raw['denied_actions']) ? raw['denied_actions'].length : 0,
-      unrestricted: raw['unrestricted'] === true,
-      steerNotApplied: observed.warnings.some((w) => w.code === 'steer_not_applied'),
-      failedEarly: raw['failedEarly'] === true,
-    }),
-    mode: observed.mode,
-    model: observed.model,
-    task,
-    toolCalls,
-    currentActivity,
-    lastActivity: isForgeActivity(raw['last_activity']) ? raw['last_activity']
-      : [...activities].reverse().find(isForgeActivity) ?? null,
-    startedAt: observed.startedAt,
-    updatedAt: observed.updatedAt,
-    finishedAt: observed.finishedAt,
-    warnings: observed.warnings.map((w) => ({ code: w.code, message: w.message })),
-    ...(typeof raw['supersededBy'] === 'string' || raw['supersededBy'] === null
-      ? { supersededBy: raw['supersededBy'] as string | null }
-      : {}),
-    ...(typeof raw['steeredFrom'] === 'string' || raw['steeredFrom'] === null
-      ? { steeredFrom: raw['steeredFrom'] as string | null }
-      : {}),
-    ...(typeof raw['pendingSteers'] === 'number'
-      ? { pendingSteers: raw['pendingSteers'] }
-      : {}),
-    ...(Array.isArray(changedFiles) ? { changedFileCount: changedFiles.length } : {}),
-    ...(digest !== null ? { digest } : {}),
-    ...(typeof raw['toolErrors'] === 'number' && raw['toolErrors'] > 0 ? { toolErrors: raw['toolErrors'] } : {}),
-    ...(raw['failedEarly'] === true ? { failedEarly: true } : {}),
-    ...(raw['changedFilesUnknown'] === true ? { changedFilesUnknown: true } : {}),
-    ...(raw['cwdMissingAtFinish'] === true ? { cwdMissingAtFinish: true } : {}),
-    ...(typeof raw['last_event_at'] === 'string' ? { lastEventAt: raw['last_event_at'] } : {}),
-    ...(typeof raw['last_alive_at'] === 'string' ? { lastAliveAt: raw['last_alive_at'] } : {}),
-  };
-}
-
-/** progress.json `digest`, accepted only when it has the shape the writer produces. */
-function readDigest(v: unknown): ProgressDigest | null {
-  if (v === null || typeof v !== 'object' || Array.isArray(v)) return null;
-  const d = v as Record<string, unknown>;
-  if (typeof d['phase'] !== 'string' || !Array.isArray(d['edited'])) return null;
-  const n = (key: string): number => typeof d[key] === 'number' ? d[key] as number : 0;
-  const repeat = d['repeat'];
-  const r = repeat !== null && typeof repeat === 'object' && !Array.isArray(repeat)
-    ? repeat as Record<string, unknown> : null;
-  return {
-    phase: (['starting', 'exploring', 'editing', 'testing', 'running'].includes(d['phase'])
-      ? d['phase'] : 'running') as ProgressDigest['phase'],
-    filesRead: n('filesRead'),
-    searches: n('searches'),
-    commands: n('commands'),
-    testRuns: n('testRuns'),
-    edited: d['edited'].filter((e): e is string => typeof e === 'string'),
-    editedCount: n('editedCount'),
-    lastTestFailed: d['lastTestFailed'] === true,
-    repeat: r !== null && typeof r['label'] === 'string' && typeof r['count'] === 'number'
-      ? { label: r['label'], count: r['count'] } : null,
-  };
-}
-
-function appendSteerEntry(repo: string, jobId: string, entry: SteerEntry): void {
-  const dir = jobDir(repo, jobId);
-  mkdirSync(dir, { recursive: true });
-  appendFileSync(jobFile(repo, jobId, FILES.steer), `${JSON.stringify(entry)}\n`, 'utf8');
-}
-
-function readSteerEntries(repo: string, jobId: string): SteerEntry[] {
-  const file = jobFile(repo, jobId, FILES.steer);
-  let text: string;
-  try {
-    text = readFileSync(file, 'utf8');
-  } catch {
-    return [];
-  }
-  const out: SteerEntry[] = [];
-  const seenIds = new Set<string>();
-  for (const line of text.split('\n')) {
-    const trimmed = line.trim();
-    if (trimmed === '') continue;
-    try {
-      const parsed = JSON.parse(trimmed) as Partial<SteerEntry>;
-      if (
-        typeof parsed.id === 'string' &&
-        typeof parsed.createdAt === 'string' &&
-        typeof parsed.prompt === 'string' &&
-        (parsed.delivery === 'queue' || parsed.delivery === 'interrupt') &&
-        !seenIds.has(parsed.id)
-      ) {
-        seenIds.add(parsed.id);
-        out.push(parsed as SteerEntry);
-      }
-    } catch { /* ignore truncated line */ }
-  }
-  return out;
-}
-
-function buildSteeredPrompt(input: {
-  parentJobId: string;
-  wasInterrupted: boolean;
-  freshContinuation?: boolean;
-  toolCalls: number;
-  responseTail: string;
-  entries: readonly SteerEntry[];
-  syncedFiles?: readonly string[];
-  brief: string;
-}): { rawPrompt: string; sentPrompt: string; prependBrief: boolean } {
-  const steerBody =
-    input.entries.length === 1
-      ? input.entries[0]!.prompt
-      : input.entries.map((e, idx) => `[Steer ${idx + 1} (${e.createdAt})]\n${e.prompt}`).join('\n\n');
-  const tag = input.freshContinuation
-    ? '[FRESH CONTINUATION]'
-    : input.wasInterrupted
-      ? '[TURN INTERRUPTED]'
-      : `[FOLLOW-UP STEER · ${input.entries.length} queued update${input.entries.length === 1 ? '' : 's'}]`;
-  const statusLine = input.wasInterrupted
-    ? `Your previous turn (${input.parentJobId}) was interrupted after ${input.toolCalls} tool call(s) with updated instructions from the orchestrator. Inspect your working tree before repeating any completed steps.`
-    : `Your previous turn (${input.parentJobId}) completed after ${input.toolCalls} tool call(s), and the orchestrator queued follow-up instructions for you.`;
-  const syncedLine =
-    input.syncedFiles !== undefined && input.syncedFiles.length > 0
-      ? `\nSynced brief file(s) in your working tree: ${input.syncedFiles.join(', ')} (re-read before continuing).`
-      : '';
-  const tailBlock = input.responseTail
-    ? `\nLast response excerpt from previous turn:\n${input.responseTail}\n`
-    : '';
-  const header = `[STEERED TURN CONTINUITY] ${tag}\n${statusLine}${syncedLine}${tailBlock}\n[ORCHESTRATOR UPDATE]\n${steerBody}`;
-  const prependBrief = input.brief !== '' && !header.startsWith(input.brief);
-  const sentPrompt = prependBrief ? `${input.brief}\n\n${header}` : header;
-  return { rawPrompt: header, sentPrompt, prependBrief };
-}
-
-export const MAX_WATCHED_FILES = 32;
-export const MAX_WATCHED_BYTES = 4 * 1024 * 1024;
-
-export function validateWatchedFiles(repo: string, files: readonly string[]): string[] {
-  const repoRoot = path.resolve(repo);
-  let realRepoRoot = repoRoot;
-  try {
-    realRepoRoot = realpathSync(repoRoot);
-  } catch { /* non-existent repo root caught by per-file stat below */ }
-  const seen = new Set<string>();
-  const out: string[] = [];
-  let totalBytes = 0;
-  for (const raw of files) {
-    const trimmed = raw.trim();
-    if (trimmed === '') {
-      throw new Error('files entry must be a non-empty relative path inside the repository.');
-    }
-    if (path.isAbsolute(trimmed)) {
-      throw new Error(`watched file "${trimmed}" must be a relative path inside the repository.`);
-    }
-    const abs = path.resolve(repoRoot, trimmed);
-    const rel = path.relative(repoRoot, abs);
-    if (rel === '' || rel === '.' || rel.startsWith('..') || path.isAbsolute(rel)) {
-      throw new Error(`watched file "${trimmed}" escapes repository root ${repoRoot}.`);
-    }
-    const normalized = rel.split(path.sep).join('/');
-    let st;
-    try {
-      st = statSync(abs);
-    } catch {
-      throw new Error(`watched file "${normalized}" does not exist in ${repoRoot}.`);
-    }
-    if (!st.isFile()) {
-      throw new Error(`watched file "${normalized}" is not a regular file.`);
-    }
-    let realAbs: string;
-    try {
-      realAbs = realpathSync(abs);
-    } catch {
-      throw new Error(`watched file "${normalized}" does not exist in ${repoRoot}.`);
-    }
-    const realRel = path.relative(realRepoRoot, realAbs);
-    if (realRel === '' || realRel === '.' || realRel.startsWith('..') || path.isAbsolute(realRel)) {
-      throw new Error(`watched file "${normalized}" resolves outside repository root ${repoRoot}.`);
-    }
-    if (!seen.has(normalized)) {
-      if (out.length >= MAX_WATCHED_FILES) {
-        throw new Error(`files exceeds maximum of ${MAX_WATCHED_FILES} watched files (${files.length} requested).`);
-      }
-      totalBytes += st.size;
-      if (totalBytes > MAX_WATCHED_BYTES) {
-        throw new Error(`watched files exceed maximum total size of ${MAX_WATCHED_BYTES} bytes.`);
-      }
-      seen.add(normalized);
-      out.push(normalized);
-    }
-  }
-  return out;
-}
-
-export function syncWatchedFiles(
-  repo: string,
-  cwd: string,
-  files: readonly string[],
-  previousWatched?: Readonly<Record<string, WatchedFileSigs>> | null,
-  onWarning?: (message: string) => void,
-): Record<string, WatchedFileSigs> {
-  const normalized = validateWatchedFiles(repo, files);
-  const repoRoot = path.resolve(repo);
-  const cwdRoot = path.resolve(cwd);
-  const sameRoot = repoRoot === cwdRoot;
-  const out: Record<string, WatchedFileSigs> = {};
-  for (const rel of normalized) {
-    const repoSig = fileSig(repoRoot, rel);
-    if (!sameRoot) {
-      const src = path.join(repoRoot, rel);
-      const dst = path.join(cwdRoot, rel);
-      // Resolve every existing component, including a symlink at the file itself.
-      // Missing suffixes are safe only after their nearest existing parent passed.
-      const realRoot = realpathSync(cwdRoot);
-      let component = cwdRoot;
-      for (const part of rel.split('/')) {
-        component = path.join(component, part);
-        try { lstatSync(component); } catch (err) {
-          if ((err as NodeJS.ErrnoException).code === 'ENOENT') break;
-          throw err;
-        }
-        const resolved = realpathSync(component);
-        const relative = path.relative(realRoot, resolved);
-        if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-          throw new Error(`watched file "${rel}" destination resolves outside worker cwd ${cwdRoot}.`);
-        }
-      }
-      const prev = previousWatched?.[rel];
-      const currentCwdSig = fileSig(cwdRoot, rel);
-      if (prev === undefined || currentCwdSig === 'gone') {
-        mkdirSync(path.dirname(dst), { recursive: true });
-        copyFileSync(src, dst);
-      } else if (prev.repoSig !== repoSig) {
-        if (currentCwdSig !== prev.cwdSig) {
-          onWarning?.(`watched file "${rel}" changed in both repo and worktree; kept worktree copy`);
-        } else {
-          mkdirSync(path.dirname(dst), { recursive: true });
-          copyFileSync(src, dst);
-        }
-      }
-    }
-    const cwdSig = sameRoot ? repoSig : fileSig(cwdRoot, rel);
-    const prev = previousWatched?.[rel];
-    // Keep the last shared baseline until worker edits are reconciled. Retaining
-    // a divergent copy must never make it replaceable on the following sync.
-    out[rel] = prev !== undefined && cwdSig !== repoSig && cwdSig !== prev.cwdSig
-      ? prev : { repoSig, cwdSig };
-  }
-  return out;
-}
-
-function isForgeActivity(value: unknown): value is ForgeActivity {
-  if (typeof value !== 'object' || value === null) return false;
-  const activity = value as Record<string, unknown>;
-  return typeof activity['stepIndex'] === 'number' && typeof activity['tool'] === 'string'
-    && ['active', 'done', 'denied', 'error'].includes(String(activity['status']));
-}
-
-function isActiveForgeActivity(value: unknown): value is ForgeActivity {
-  if (typeof value !== 'object' || value === null) return false;
-  const activity = value as Record<string, unknown>;
-  return typeof activity['stepIndex'] === 'number' && typeof activity['tool'] === 'string' && activity['status'] === 'active';
-}
-
 function findActiveIdentity(repo: string, name: string, workerId: string): ForgeManifest | null {
   let entries: string[];
   try { entries = readdirSync(jobsDir(repo)); } catch { return null; }
   for (const id of entries) {
     let manifest: ForgeManifest;
-    try { manifest = JSON.parse(readFileSync(jobFile(repo, id, FILES.job), 'utf8')) as ForgeManifest; } catch { continue; }
+    try { manifest = readManifest(repo, id); } catch { continue; }
     if (manifest.status !== 'running') continue;
     if (manifest.workerId === workerId || manifest.name === name) return manifest;
   }
   return null;
-}
-
-/** The job directory, as the provider adapters are told to use it. */
-function writerDir(repo: string, jobId: string): string {
-  return jobDir(repo, jobId);
 }
 
 function describe(err: unknown): string {
@@ -1938,23 +1273,4 @@ function describe(err: unknown): string {
   return String(err);
 }
 
-/* ── pipeline run records ────────────────────────────────────────────────── */
-
-/**
- * Where a finished PipelineRun is written.
- *
- * A pipeline outlives the MCP call that started it and usually outlives the
- * process too, so the run summary has to be a file. It sits beside the jobs,
- * not inside one: a run is not a job, and pretending otherwise would put a second
- * verdict for the same work into the pane.
- */
-export function pipelineRecordPath(repo: string, name: string): string {
-  const safe = name.replace(/[^A-Za-z0-9._-]+/g, '-').slice(0, 80) || 'pipeline';
-  return path.join(repo, '.agent-smith', 'pipelines', `${safe}.json`);
-}
-
-export function writePipelineRecord(repo: string, name: string, value: unknown): void {
-  writeJsonAtomic(pipelineRecordPath(repo, name), value);
-}
-
-export { humanDuration };
+export { pipelineRecordPath, writePipelineRecord } from './execute.ts';

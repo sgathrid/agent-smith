@@ -16,7 +16,7 @@ import { JobWriter } from '../writer.ts';
 function fixture(live = false) {
   const repo = mkdtempSync(path.join(tmpdir(), 'completion-recovery-'));
   const jobId = 'implement-smith-abcd0123';
-  const writer = new JobWriter({ repo, jobId, mirror: false });
+  const writer = new JobWriter({ repo, jobId });
   writer.start({ provider: 'agy', mode: 'implement', model: null, effort: null,
     cwd: repo, prompt: 'complete work', unrestricted: false, conversation: null,
     pipeline: null, stage: null, attempt: null } as never);
@@ -107,7 +107,7 @@ test('service startup publishes a provider completion already present on disk', 
   const { repo, jobId, result } = fixture();
   writeResultFile(result.stateDir, result);
   writeAcceptance(repo, jobId, { state: 'accepted', checks: [], pending: false });
-  const service = new ForgeService({ repo, mirror: false });
+  const service = new ForgeService({ repo });
   assert.equal((await service.list())[0]?.status, 'succeeded');
   assert.equal(readAcceptance(repo, jobId).state, 'accepted', 'published acceptance is preserved');
 });

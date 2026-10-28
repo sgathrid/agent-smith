@@ -1,19 +1,19 @@
-import {F as ForgeService,s as startPipeline}from'./chunk-service.js';import {existsSync}from'node:fs';import {w as writeAcceptance,p as pendingAcceptance,j as jobFile,F as FILES,b as runAcceptance}from'./chunk-progress.js';import'node:crypto';import'node:path';import'node:child_process';import'node:fs/promises';import'node:os';import'node:readline';import'node:url';import'node:timers/promises';/** One execution owner per launch; deliberately independent of MCP transport. */
+import {F as ForgeService}from'./chunk-service.js';import {s as startPipeline,m as markAcceptancePending,j as jobFile,F as FILES,e as settleAcceptance}from'./chunk-execute.js';import {existsSync}from'node:fs';import'node:child_process';import'node:url';import'node:timers/promises';import'node:path';import'node:fs/promises';import'node:crypto';import'node:os';import'node:readline';/** One execution owner per launch; deliberately independent of MCP transport. */
 /** How often a running check set looks for the job's cancel marker; the pump polls at the same order. */
 const CANCEL_POLL_MS = 200;
 /**
- * Run the checks, aborting them when `cancel` writes the job's marker. The in-process path
- * aborts through an AbortController; the marker is the only signal a detached supervisor gets.
+ * Settle the job's acceptance, aborting the checks when `cancel` writes the job's marker. The
+ * in-process path aborts through an AbortController; the marker is the only signal a detached supervisor gets.
  */
-async function runCancelableAcceptance(repo, jobId, succeeded, checks, baseDir) {
+async function settleCancelable(repo, finalJobId, preparedJobIds, succeeded, checks, baseDir) {
     const controller = new AbortController();
-    const marker = jobFile(repo, jobId, FILES.cancel);
+    const marker = jobFile(repo, finalJobId, FILES.cancel);
     const check = () => { if (existsSync(marker))
         controller.abort(); };
     check();
     const timer = setInterval(check, CANCEL_POLL_MS);
     try {
-        return await runAcceptance({ repo, jobId, succeeded, checks, baseDir, signal: controller.signal });
+        return await settleAcceptance({ repo, finalJobId, preparedJobIds, succeeded, checks, baseDir, signal: controller.signal });
     }
     finally {
         clearInterval(timer);
@@ -42,7 +42,7 @@ process.once('message', async (raw) => {
             const tracked = await service.spawnTracked({ ...payload.request, onPrepared: async (jobId) => {
                     prepared.push(jobId);
                     if (checks?.length)
-                        writeAcceptance(payload.repo, jobId, pendingAcceptance(checks));
+                        markAcceptancePending(payload.repo, jobId, checks);
                     if (started)
                         return; // Continuations rebind through resolveHead, without an MCP owner.
                     await new Promise((resolve) => {
@@ -53,11 +53,7 @@ process.once('message', async (raw) => {
             send({ kind: 'ack', value: tracked.ack });
             const manifest = await tracked.done;
             if (checks?.length) {
-                writeAcceptance(payload.repo, manifest.jobId, await runCancelableAcceptance(payload.repo, manifest.jobId, manifest.status === 'succeeded', checks, manifest.cwd));
-                for (const id of prepared)
-                    if (id !== manifest.jobId) {
-                        writeAcceptance(payload.repo, id, { state: 'unchecked', checks: [], reason: 'superseded by steered turn' });
-                    }
+                await settleCancelable(payload.repo, manifest.jobId, prepared, manifest.status === 'succeeded', checks, manifest.cwd);
             }
         }
     }

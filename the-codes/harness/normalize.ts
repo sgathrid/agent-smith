@@ -3,7 +3,7 @@
  *
  * Every provider quirk and every judgement call lives HERE and only here, so
  * this file is the single place a reviewer reads to answer "why did that job
- * show up as failed?". Readers (agy-staff.ts, claude-code.ts) are dumb parsers;
+ * show up as failed?". Readers (agent-smith.ts, agy-staff.ts) are dumb parsers;
  * they extract facts and get out of the way.
  *
  * The headline rule, stated once and enforced below:
@@ -22,7 +22,6 @@ import { SCHEMA_VERSION } from "../forge/format.ts";
 import { STEER_NOT_APPLIED_RE } from "../surfaces/mod/hooks/reasons.ts";
 import { AGY_PAYLOAD } from "./agy-staff.ts";
 import { SMITH_PAYLOAD } from "./agent-smith.ts";
-import { CLAUDE_PAYLOAD } from "./claude-code.ts";
 import {
   type JobNormalizer,
   type ObservedJob,
@@ -225,103 +224,6 @@ const agyNormalizer: JobNormalizer = (raw: RawJobState): ObservedJob => {
   };
 };
 
-// ── claude-code normalizer ──────────────────────────────────────────────────
-
-/**
- * Map a Claude Code subagent transcript onto ObservedJob.
- *
- * LIFECYCLE INFERENCE (necessary because there is no terminal marker record —
- * verified: 0/200 real transcripts carry a `subtype`):
- *   1. meta.stoppedByUser === true                     ⇒ canceled
- *   2. a SubagentHandback tool_use was made            ⇒ succeeded (the
- *      subagent explicitly reported its result back)
- *   3. API-error records present (isApiErrorMessage)   ⇒ failed
- *   4. transcript still being appended (no handback, no
- *      error, and the reader saw a live-looking file)   ⇒ running
- *   5. otherwise (short, ended without handback)         ⇒ unknown
- *
- * Rule 5 is conservative on purpose: a subagent transcript with no handback and
- * no error might have been truncated, killed, or simply not use the handback
- * tool. We do NOT guess `succeeded`.
- */
-const claudeNormalizer: JobNormalizer = (raw: RawJobState): ObservedJob => {
-  const p = raw.payload;
-  const warnings: ObservedWarning[] = [];
-
-  const stoppedByUser = asBool(p[CLAUDE_PAYLOAD.stoppedByUser]) === true;
-  const handback = asString(p[CLAUDE_PAYLOAD.handback]);
-  const finalText = asString(p[CLAUDE_PAYLOAD.finalText]);
-  const errorRecords = asNumber(p[CLAUDE_PAYLOAD.errorRecords]) ?? 0;
-  const malformed = asNumber(p[CLAUDE_PAYLOAD.malformedLines]) ?? 0;
-  const lastAt = asString(p[CLAUDE_PAYLOAD.lastAt]);
-  const firstAt = asString(p[CLAUDE_PAYLOAD.firstAt]);
-  const output = handback ?? finalText;
-
-  // -- warnings ---------------------------------------------------------------
-  if (stoppedByUser) {
-    warnings.push({ code: "canceled", message: "stopped by the user" });
-  }
-  if (errorRecords > 0) {
-    warnings.push({
-      code: "tool_error",
-      message: `${errorRecords} API ${errorRecords === 1 ? 'error' : 'errors'}`,
-    });
-  }
-  if (malformed > 0) {
-    warnings.push({
-      code: "incomplete_state",
-      message: `skipped ${malformed} unreadable transcript ${malformed === 1 ? 'line' : 'lines'}`,
-    });
-  }
-  // Same headline rule as agy: no deliverable + warnings ⇒ not a clean success.
-  const emptyOutput = looksEmpty(output);
-  if (emptyOutput && !stoppedByUser) {
-    warnings.push({
-      code: "empty_output",
-      message: "no output",
-    });
-  }
-
-  // -- status -----------------------------------------------------------------
-  let status: ObservedStatus;
-  if (stoppedByUser) {
-    status = "canceled";
-  } else if (handback !== null) {
-    // The subagent explicitly reported a result back. API errors earlier in the
-    // run become a `tool_error` warning but do not erase the delivered report.
-    status = "succeeded";
-  } else if (errorRecords > 0) {
-    status = "failed";
-  } else if (lastAt !== null) {
-    // Transcript has records but no handback and no error. Most likely still
-    // running or died mid-flight; treat as running only if it looks live.
-    // Without a mtime signal we cannot tell, so `running` is optimistic but
-    // bounded — we prefer it over `unknown` for a file that clearly has
-    // content, because a crashed-with-no-handback subagent is rare.
-    status = "running";
-  } else {
-    status = "unknown";
-  }
-
-  return {
-    provider: "claude-code",
-    jobId: raw.jobId,
-    status,
-    warnings,
-    output,
-    startedAt: firstAt,
-    updatedAt: lastAt,
-    finishedAt: stoppedByUser ? lastAt : null,
-    mode: asString(p[CLAUDE_PAYLOAD.agentType]),
-    model: asString(p[CLAUDE_PAYLOAD.model]),
-    label: asString(p[CLAUDE_PAYLOAD.description]),
-    outputTruncated: false,
-    usage: null,
-    partial: raw.partial === true,
-    raw: p,
-  };
-};
-
 // ── agent-smith normalizer ──────────────────────────────────────────────────
 
 /**
@@ -360,8 +262,8 @@ const smithNormalizer: JobNormalizer = (raw: RawJobState): ObservedJob => {
   const progressWarnings = asStringArray(p[SMITH_PAYLOAD.progressWarnings]);
 
   // A newer on-disk schema is not a job we understand. `unknown` is the honest
-  // answer and it must survive to the surface: core/types.ts is explicit that
-  // `unknown` is load-bearing and must never be collapsed.
+  // answer and it must survive to the surface: `unknown` is
+  // load-bearing and must never be collapsed.
   const schema = asNumber(p[SMITH_PAYLOAD.schema]);
 
   if (deniedCount > 0) {
@@ -505,7 +407,6 @@ function asUsage(v: unknown): ObservedUsage | null {
 const NORMALIZERS: ReadonlyMap<string, JobNormalizer> = new Map<string, JobNormalizer>([
   ["agent-smith", smithNormalizer],
   ["agy-staff", agyNormalizer],
-  ["claude-code", claudeNormalizer],
 ]);
 
 /**
@@ -547,4 +448,4 @@ function fallbackNormalizer(raw: RawJobState): ObservedJob {
 }
 
 // Register the agy normalizer under the reader's provider key.
-export { agyNormalizer, claudeNormalizer, smithNormalizer };
+export { agyNormalizer, smithNormalizer };

@@ -46,13 +46,19 @@ export const probeCommand: ProbeCommand = (binary, args, timeoutMs) => new Promi
   });
 });
 
+/** AGENT_SMITH_PROBE_TIMEOUT_MS overrides the default probe budget (slow or loaded machines). */
+function envProbeTimeout(): number | undefined {
+  const n = Number(process.env['AGENT_SMITH_PROBE_TIMEOUT_MS']);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
 /** Checks the actual CLI surface, never authenticates or submits a prompt. */
 export async function checkCompatibility(provider: string, binary: string,
   options: { timeoutMs?: number; probe?: ProbeCommand } = {}): Promise<ProviderCompatibility> {
   const commands = HELP[provider];
   if (commands === undefined) return { state: 'unknown', version: null, reason: 'no compatibility check' };
   const probe = options.probe ?? probeCommand;
-  const timeoutMs = options.timeoutMs ?? 2_000;
+  const timeoutMs = options.timeoutMs ?? envProbeTimeout() ?? 2_000;
   const run = async (args: readonly string[]): Promise<CompatibilityProbe> => {
     try { return await probe(binary, args, timeoutMs); }
     catch (error) { return { output: '', error: error instanceof Error ? error.message : String(error) }; }

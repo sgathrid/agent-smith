@@ -16,11 +16,11 @@ import { test } from 'node:test';
 
 import {
   DEFAULT_TAIL_BYTES,
-  recheck,
   runCheck,
   runChecks,
 } from './runner.ts';
 import type { Check } from './types.ts';
+import { scaled, waitFor } from '../forge/testing/time.ts';
 
 function scratch(): string {
   return mkdtempSync(join(tmpdir(), 'agent-smith-verify-'));
@@ -30,7 +30,7 @@ function check(over: Partial<Check> & Pick<Check, 'command'>, cwd: string): Chec
   return {
     name: 'test',
     cwd,
-    timeoutMs: 5_000,
+    timeoutMs: scaled(30_000),
     expect: { kind: 'exit0' },
     ...over,
   };
@@ -159,7 +159,8 @@ test('a timeout fails the verdict and never hangs the caller', async () => {
     assert.equal(verdict.timedOut, true);
     assert.match(verdict.reason, /timed out after 150ms/);
     assert.match(verdict.reason, /killed process group/);
-    assert.ok(Date.now() - started < 5_000, 'must not wait for the child');
+    // Failure bound only: waiting out the child's 30 s sleep is the bug, load is not.
+    assert.ok(Date.now() - started < scaled(25_000), 'must not wait for the child');
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
@@ -179,25 +180,22 @@ test('the process GROUP is killed, so grandchildren do not survive', async () =>
     // returns quickly with the grandchild still alive.
     const command = `( sleep 30 ) >/dev/null 2>&1 & echo $! > ${pidFile}; sleep 30`;
 
-    const startedAt = Date.now();
-    const verdict = await runCheck(check({ command, timeoutMs: 200 }, cwd));
-    const elapsed = Date.now() - startedAt;
-
-    assert.equal(verdict.timedOut, true);
-    assert.ok(elapsed < 5_000, `verdict must resolve promptly, took ${elapsed}ms`);
-
-    assert.ok(existsSync(pidFile), 'grandchild should have started and recorded its pid');
-    const pid = Number(readFileSync(pidFile, 'utf8').trim());
-    assert.ok(Number.isInteger(pid) && pid > 0);
+    // Abort only once the pid file is complete, so load cannot kill the shell
+    // before it has started the grandchild. Abort takes the same group-kill path
+    // as the timeout (the timeout verdict is covered by the test above).
+    const controller = new AbortController();
+    const promise = runCheck(check({ command, timeoutMs: 0 }, cwd), { signal: controller.signal, killGraceMs: 100 });
+    const pid = await waitFor(() => {
+      const n = Number(readFileSync(pidFile, 'utf8').trim());
+      return Number.isInteger(n) && n > 0 ? n : 0;
+    }, { message: 'the grandchild to record its pid' });
+    controller.abort();
+    const verdict = await promise;
+    assert.equal(verdict.passed, false);
 
     // SIGTERM goes to the shell; the SIGKILL escalation follows. Give the group a
     // moment to be reaped before asserting.
-    let alive = true;
-    for (let i = 0; i < 60 && alive; i++) {
-      alive = isAlive(pid);
-      if (alive) await new Promise((r) => setTimeout(r, 50));
-    }
-    assert.equal(alive, false, `grandchild pid ${pid} survived: the group was not killed`);
+    await waitFor(() => !isAlive(pid), { message: `grandchild pid ${pid} to be reaped (the group was not killed)` });
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
@@ -218,14 +216,17 @@ test('an abort signal terminates the check', async () => {
   const cwd = scratch();
   const controller = new AbortController();
   try {
-    const promise = runCheck(check({ command: 'sleep 30', timeoutMs: 0 }, cwd), {
+    const promise = runCheck(check({ command: 'touch started; sleep 30', timeoutMs: 0 }, cwd), {
       signal: controller.signal,
       killGraceMs: 100,
     });
-    setTimeout(() => controller.abort(), 100);
+    // Abort once the check's shell has demonstrably started, not after a guessed delay.
+    await waitFor(() => existsSync(join(cwd, 'started')), { message: 'the check to start' });
+    controller.abort();
     const verdict = await promise;
     assert.equal(verdict.passed, false);
-    assert.match(verdict.reason, /killed by SIG|killed process group|timed out/);
+    // The shell may be reaped by the signal (killed by SIG...) or exit 128+SIGTERM itself once its sleep dies.
+    assert.match(verdict.reason, /killed by SIG|killed process group|timed out|exit 143/);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
@@ -235,7 +236,7 @@ test('an abort signal terminates the check', async () => {
 
 test('a missing cwd is reported, not thrown', async () => {
   const verdict = await runCheck(
-    { name: 'ghost', command: 'exit 0', cwd: join(tmpdir(), 'definitely-not-here-9df8a7'), timeoutMs: 1_000 },
+    { name: 'ghost', command: 'exit 0', cwd: join(tmpdir(), 'definitely-not-here-9df8a7'), timeoutMs: scaled(10_000) },
   );
   assert.equal(verdict.passed, false);
   assert.equal(verdict.skipped, 'missing-cwd');
@@ -245,7 +246,7 @@ test('a missing cwd is reported, not thrown', async () => {
 test('a missing cwd preserves an explicitly non-blocking check', async () => {
   const verdict = await runCheck({
     name: 'optional-ghost', command: 'exit 0', cwd: join(tmpdir(), 'definitely-not-here-optional'),
-    timeoutMs: 1_000, blocking: false,
+    timeoutMs: scaled(10_000), blocking: false,
   });
   assert.equal(verdict.skipped, 'missing-cwd');
   assert.equal(verdict.blocking, false);
@@ -254,7 +255,7 @@ test('a missing cwd preserves an explicitly non-blocking check', async () => {
 test('an empty command is absent, not a failure to fix', async () => {
   const cwd = scratch();
   try {
-    const verdict = await runCheck({ name: 'blank', command: '   ', cwd, timeoutMs: 1_000 });
+    const verdict = await runCheck({ name: 'blank', command: '   ', cwd, timeoutMs: scaled(10_000) });
     assert.equal(verdict.passed, false);
     assert.equal(verdict.skipped, 'not-configured');
     // Non-blocking: a check nobody configured must not manufacture a red gate
@@ -315,30 +316,17 @@ test('unrunnable checks mark the report incomplete', async () => {
 test('checks run concurrently', async () => {
   const cwd = scratch();
   try {
-    const started = Date.now();
-    // 4 x 400ms serially would be ~1.6s; concurrently it is ~400ms.
-    await runChecks(
+    // A barrier instead of a stopwatch: each check announces itself, then waits until all 4
+    // have. Run serially the first would wait forever and time out, so passing proves overlap.
+    const barrier = (i: number) =>
+      `touch started-${i}; while [ "$(ls started-* | wc -l)" -lt 4 ]; do sleep 0.05; done`;
+    const report = await runChecks(
       Array.from({ length: 4 }, (_, i) =>
-        check({ name: `s${i}`, command: 'sleep 0.4', timeoutMs: 5_000 }, cwd),
+        check({ name: `s${i}`, command: barrier(i), timeoutMs: scaled(30_000) }, cwd),
       ),
       { concurrency: 4 },
     );
-    const elapsed = Date.now() - started;
-    assert.ok(elapsed < 1_200, `expected concurrent execution, took ${elapsed}ms`);
-  } finally {
-    rmSync(cwd, { recursive: true, force: true });
-  }
-});
-
-test('recheck runs the checks again rather than reusing verdicts', async () => {
-  const cwd = scratch();
-  try {
-    const marker = join(cwd, 'fixed');
-    const checks = [check({ name: 'test', command: `test -f ${marker}` }, cwd)];
-    assert.equal((await recheck(checks)).passed, false);
-    // The worker "fixes" it; the next verification must see the new tree.
-    writeFileSync(marker, 'ok');
-    assert.equal((await recheck(checks)).passed, true);
+    assert.ok(report.verdicts.every((v) => v.passed), 'all four checks overlapped');
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

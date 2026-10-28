@@ -1,30 +1,17 @@
 /**
- * Native Claude monitor entrypoint.
+ * Job-scoped monitor entrypoint (the `notify.fallback` monitorCommand).
  *
  * This process is deliberately separate from the MCP server: Claude Code can
- * launch it as a repo-local monitor and consume one human-readable line per
- * milestone from stdout. It uses the same filesystem reader and poller as the
- * channel, so startup baselining, status rules, and deduplication stay identical.
- * Routine running/progress polls produce no stdout.
+ * launch it with `--job`/`--run` and consume one human-readable line per
+ * milestone from stdout. Routine running/progress polls produce no stdout.
  */
 
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { pollOnce, resetPoller } from './poller.ts';
+import { isTerminalForgeStatus } from '../../../forge/format.ts';
 import { type Batch, type WatchableJob, buildBatch, dedupeKey } from './policy.ts';
-import { readAll, readJob, readPipelineRecord } from './watch-source.ts';
-
-export interface MonitorOptions {
-  readonly cwd: string;
-  readonly intervalMs?: number;
-  readonly signal?: AbortSignal;
-  readonly now?: () => number;
-  readonly read?: (cwd: string, now: number) => Promise<WatchableJob[]>;
-  /** Receives one collapsed, human-readable milestone line (without newline). */
-  readonly emit?: (line: string, batch: Batch) => Promise<void> | void;
-  readonly onError?: (error: unknown) => void;
-}
+import { readJob, readPipelineRecord } from './watch-source.ts';
 
 function delay(ms: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) return Promise.resolve();
@@ -37,39 +24,6 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
     }
     signal?.addEventListener('abort', done, { once: true });
   });
-}
-
-/**
- * Monitor until aborted. Each send is one deduplicated policy batch; progress
- * is suppressed by policy and no startup backlog is emitted.
- */
-export async function runMonitor(options: MonitorOptions): Promise<void> {
-  const intervalMs = Math.max(100, options.intervalMs ?? 5_000);
-  const now = options.now ?? Date.now;
-  const read = options.read ?? readAll;
-  const emit = options.emit ?? emitStdout;
-  const onError = options.onError ?? ((error) => {
-    process.stderr.write(`agent-smith monitor: ${String(error)}\n`);
-  });
-
-  // A monitor is a fresh observer. Existing jobs become the silent baseline;
-  // only transitions seen after this point can reach Claude.
-  resetPoller();
-  while (!options.signal?.aborted) {
-    try {
-      await pollOnce(options.cwd, now(), async (batch) => {
-        if (batch.content === null) return;
-        // One stdout line per milestone; the notice already names Agent Smith.
-        const line = batch.content.replace(/\s+/g, ' ').trim();
-        await emit(line, batch);
-      }, read);
-    } catch (error) {
-      // A transient output or poll failure must not prevent the next observation.
-      onError(error);
-    }
-    if (options.signal?.aborted) break;
-    await delay(intervalMs, options.signal);
-  }
 }
 
 async function emitStdout(line: string): Promise<void> {
@@ -86,7 +40,7 @@ async function emitStdout(line: string): Promise<void> {
   });
 }
 
-export const DEFAULT_WATCH_TIMEOUT_MS = 45 * 60_000 + 60_000;
+const DEFAULT_WATCH_TIMEOUT_MS = 45 * 60_000 + 60_000;
 
 export interface JobWatchOptions {
   readonly cwd: string;
@@ -110,11 +64,10 @@ export interface JobWatchOptions {
 
 export type JobWatchEnd = 'done' | 'timeout' | 'aborted';
 
-const TERMINAL = new Set(['succeeded', 'failed', 'canceled']);
 
 /**
- * Watch specific jobs/runs until each is terminal. Unlike the full-scan monitor
- * there is NO silent baseline: a job that already finished before the watcher
+ * Watch specific jobs/runs until each is terminal. There is NO silent
+ * baseline: a job that already finished before the watcher
  * started is reported on the first observation.
  */
 export async function runJobWatch(options: JobWatchOptions): Promise<JobWatchEnd> {
@@ -187,7 +140,7 @@ export async function runJobWatch(options: JobWatchOptions): Promise<JobWatchEnd
           continue;
         }
         // Exited with checks still running: the verdict is a second notice, so keep watching (unless announcing once).
-        if (job && TERMINAL.has(job.status) && (options.announceOnce === true || job.checksRunning === undefined) && (seen.get(id)?.has(dedupeKey(job)) ?? false)) done.add(id);
+        if (job && isTerminalForgeStatus(job.status) && (options.announceOnce === true || job.checksRunning === undefined) && (seen.get(id)?.has(dedupeKey(job)) ?? false)) done.add(id);
       }
       if (want.size > 0 && [...want].every((id) => done.has(id))) return 'done';
     } catch (error) {
@@ -243,9 +196,7 @@ export async function startCliMonitor(): Promise<void> {
   if (args.jobIds.length > 0 || args.runIds.length > 0) {
     await runJobWatch({ cwd: args.cwd!, jobIds: args.jobIds, runIds: args.runIds, timeoutMs: args.timeoutMs, signal: controller.signal });
     process.exitCode = args.exitCode;
-    return;
   }
-  await runMonitor({ cwd: args.cwd!, signal: controller.signal });
 }
 
 if (isEntrypoint()) await startCliMonitor();

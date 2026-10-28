@@ -145,7 +145,6 @@ export async function buildPlugin({ repoRoot = DEFAULT_ROOT, outputRoot = path.j
         'agent-smith': {
           command: 'node',
           args: ['${CLAUDE_PLUGIN_ROOT}/runtime/dist/server.js'],
-          env: { AGENT_SMITH_CHANNEL: '0' },
         },
       },
       // The always-on monitor is gone: a running monitor shows in Claude's exit

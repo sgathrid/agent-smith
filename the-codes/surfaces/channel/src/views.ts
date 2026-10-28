@@ -8,13 +8,13 @@ import { reasonFromText } from '../../mod/hooks/reasons.ts';
 
 export type ResponseFormat = 'concise' | 'detailed';
 export const CONCISE_LIST_LIMIT = 20;
-export const CONCISE_SUMMARY_CHARS = 200;
-export const CONCISE_REPORT_CHARS = 2_000;
-export const CONCISE_FILES_CAP = 20;
+const CONCISE_SUMMARY_CHARS = 200;
+const CONCISE_REPORT_CHARS = 2_000;
+const CONCISE_FILES_CAP = 20;
 export const EARLIER_TURNS_CAP = 5;
-export const EARLIER_REPORT_CHARS = 600;
-export const OUTPUT_TAIL_CHARS = 500;
-export const DIFF_MAX_CHARS = 40_000;
+const EARLIER_REPORT_CHARS = 600;
+const OUTPUT_TAIL_CHARS = 500;
+const DIFF_MAX_CHARS = 40_000;
 const DETAIL_HINT = 'use response_format: "detailed"';
 const flat = (s: string): string => s.replace(/\s+/g, ' ').trim();
 
@@ -36,7 +36,7 @@ export function taskStatus(status: JobSummary['status']): TaskStatus {
 }
 
 /** Cut at a word boundary within max chars, marking the cut with an ellipsis. */
-export function trimWords(text: string, max: number): string {
+function trimWords(text: string, max: number): string {
   const t = flat(text);
   if (t.length <= max) return t;
   const cut = t.slice(0, max - 1);

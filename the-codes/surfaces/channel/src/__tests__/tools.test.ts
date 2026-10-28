@@ -6,8 +6,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { TOOL_DEFS, callTool, defaultMixedPipeline, type HandlerContext } from '../tools.ts';
 import { readAcceptance, writeAcceptance } from '../../../../forge/checks.ts';
-import { writePipelineRecord } from '../../../../forge/service.ts';
+import { writePipelineRecord } from '../../../../forge/execute.ts';
 import type { ModelCatalog } from '../../../../providers/types.ts';
+import { withWorkerLookup } from './service-mock.ts';
 
 const cat = (provider: string, extra: Partial<ModelCatalog> = {}): ModelCatalog => ({
   provider, models: [{ id: `${provider}-m`, label: provider, efforts: ['low', 'high'], defaultEffort: 'low' }],
@@ -20,10 +21,10 @@ test('spawn and resume validate and forward absolute working directories', async
   const repo = mkdtempSync(path.join(tmpdir(), 'smith-cwd-store-'));
   const cwd = mkdtempSync(path.join(tmpdir(), 'smith-cwd-work-'));
   const seen: Array<Record<string, unknown>> = [];
-  const service = { repo, spawnJob: async (request: Record<string, unknown>) => {
+  const service = withWorkerLookup({ repo, spawnJob: async (request: Record<string, unknown>) => {
     seen.push(request); return { jobId: 'job-cwd' };
   }, detail: async () => ({ jobId: 'fixture-job', status: 'succeeded', provider: 'codex', mode: 'review',
-    name: 'Ada', workerId: 'Ada', conversation: 'thread', cwd }) } as never;
+    name: 'Ada', workerId: 'Ada', conversation: 'thread', cwd }) }) as never;
   const ctx = { service, catalogs: async () => [cat('codex')] } as HandlerContext;
   assert.equal((await callTool(ctx, 'spawn_job', { mode: 'review', provider: 'codex', prompt: 'review', cwd })).isError, undefined);
   assert.equal(seen[0]!.cwd, cwd);
@@ -210,7 +211,7 @@ const summary = (i: number, extra: Record<string, unknown> = {}) => ({
 });
 const detail = (extra: Record<string, unknown> = {}) => ({ ...summary(1), report: 'All done.', error: null, exitCode: 0, unrestricted: true, pipeline: null, stage: null,
   usage: { input: 1 }, conversation: 'c', effort: 'high', cwd: '/x', cancellable: false, ...extra });
-const withService = (service: Record<string, unknown>) => ({ service: { repo: mkdtempSync(path.join(tmpdir(), 'smith-views-')), ...service } as never, catalogs: async () => [] }) as HandlerContext;
+const withService = (service: Record<string, unknown>) => ({ service: withWorkerLookup({ repo: mkdtempSync(path.join(tmpdir(), 'smith-views-')), ...service }) as never, catalogs: async () => [] }) as HandlerContext;
 
 test('list_jobs: concise rows trim summaries on a word boundary and default to limit 20; detailed keeps the record and limit', async () => {
   const seen: Array<Record<string, unknown>> = [];
@@ -242,6 +243,16 @@ test('list_jobs: a turn a steer replaced is left out; its continuation stands fo
   const ctx = withService({ list: async () => [summary(2, { steeredFrom: 'implement-smith-1' }), summary(1, { supersededBy: 'implement-smith-2' })] });
   assert.deepEqual(body(await callTool(ctx, 'list_jobs', {})).map((r: any) => r.jobId), ['implement-smith-2']);
   assert.deepEqual(body(await callTool(ctx, 'list_jobs', { response_format: 'detailed' })).map((r: any) => r.jobId), ['implement-smith-2']);
+});
+
+test('a running job with no progress time is stalled in list_jobs and status, not healthy', async () => {
+  const running = { status: 'running', finishedAt: null, updatedAt: null };
+  const ctx = withService({ list: async () => [summary(1, running)], detail: async () => detail(running) });
+  assert.equal(body(await callTool(ctx, 'list_jobs', {}))[0].stalled, true);
+  assert.equal(body(await callTool(ctx, 'status', { jobId: 'implement-smith-1' })).stalled, true);
+  assert.equal(body(await callTool(ctx, 'status', { jobId: 'implement-smith-1', response_format: 'detailed' })).stalled, true);
+  const done = withService({ list: async () => [summary(1, { updatedAt: null })] });
+  assert.equal('stalled' in body(await callTool(done, 'list_jobs', {}))[0], false);
 });
 
 test('list_jobs: a concise row carries digest, acceptance, changedFileCount and stalled for the whole fleet', async () => {
@@ -297,7 +308,9 @@ test('list_jobs: since parses ISO and relative times; session restricts to jobs 
   const ctx = withService({ spawnedIds: spawned, list: async (f: Record<string, unknown>) => { seen.push(f); return []; } });
   const before = Date.now();
   await callTool(ctx, 'list_jobs', { since: '2h', session: true });
-  assert.ok(Math.abs((seen[0]!.sinceMs as number) - (before - 7_200_000)) < 5_000);
+  const after = Date.now();
+  // The tool reads the clock once, somewhere between `before` and `after`; no absolute tolerance to outrun.
+  assert.ok((seen[0]!.sinceMs as number) >= before - 7_200_000 && (seen[0]!.sinceMs as number) <= after - 7_200_000);
   assert.equal(seen[0]!.ids, spawned);
   await callTool(ctx, 'list_jobs', { since: '2026-10-01T00:00:00Z' });
   assert.equal(seen[1]!.sinceMs, Date.parse('2026-10-01T00:00:00Z')); assert.equal(seen[1]!.ids, undefined);
@@ -409,8 +422,8 @@ test('status include_diff: says so without a baseline, while running, or with no
 test('tool failures are isError results that say what to do next', async () => {
   const cwd = mkdtempSync(path.join(tmpdir(), 'smith-err-'));
   let current: Record<string, unknown> = {};
-  const service = { repo: cwd, detail: async (id: string) => { if (id === 'Ada' || id === 'ghost') throw new Error('no job'); return current; },
-    list: async () => [summary(1, { name: 'Ada', workerId: 'a1' }), summary(2, { name: 'Ada', workerId: 'a2' }), summary(3, { name: 'Bob' })] } as never;
+  const service = withWorkerLookup({ repo: cwd, detail: async (id: string) => { if (id === 'Ada' || id === 'ghost') throw new Error('no job'); return current; },
+    list: async () => [summary(1, { name: 'Ada', workerId: 'a1' }), summary(2, { name: 'Ada', workerId: 'a2' }), summary(3, { name: 'Bob' })] }) as never;
   const ctx = { service, catalogs: async () => [cat('codex')] } as HandlerContext;
   const fail = async (tool: string, args: Record<string, unknown>, expected: RegExp) => {
     const r = await callTool(ctx, tool, args); assert.equal(r.isError, true, `${tool} ${JSON.stringify(args)}`); assert.match(text(r), expected); assert.ok(text(r).length < 200, text(r));

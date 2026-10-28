@@ -29,6 +29,7 @@ import { createRunnerRouter, runPipeline } from '../../pipeline/pipeline.ts';
 import { CrossFamilyViolation, moderateStage } from '../../pipeline/routing.ts';
 import type { Stage } from '../../pipeline/types.ts';
 import { ForgeService } from '../service.ts';
+import { waitFor } from '../testing/time.ts';
 import { readAcceptance } from '../checks.ts';
 import { jobsDir } from '../format.ts';
 import {
@@ -422,7 +423,7 @@ test('the DAG runs and each stage becomes a real fixture-backed job', async () =
 
   // And every stage is a real job on disk, which is what the pane draws and what
   // the channel announces. No new notification vocabulary was needed.
-  const { readAllObservedJobs } = await import('../../harness/registry.ts');
+  const { readAllObservedJobs } = await import('./observe.ts');
   const jobs = await readAllObservedJobs(r);
   assert.equal(jobs.length, 3);
   assert.deepEqual(jobs.map((j) => j.mode).sort(), ['implement', 'moderate', 'review']);
@@ -461,12 +462,15 @@ test('a failed stage SKIPS its dependents; it never reports them as passed', asy
 test('an abort signal stops the worker instead of letting it run to the budget', async () => {
   const r = repo();
   const service = new ForgeService({ repo: r });
-  const runner = createForgeRunner({ service });
+  let running = false;
+  const runner = createForgeRunner({ service, onStageRunning: () => { running = true; } });
   const controller = new AbortController();
   const ctx = ctxFor(r, stage({ prompt: 'go slow and steady' }));
   ctx.signal = controller.signal;
   const p = runner.run(ctx);
-  setTimeout(() => controller.abort(), 300);
+  // Abort once the stage is observed running, not after a guessed delay.
+  await waitFor(() => running, { message: 'the stage to start running' });
+  controller.abort();
 
   const res = await p;
   assert.notEqual(res.status, 'passed', 'a stage that was aborted is not a pass');

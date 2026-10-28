@@ -1,49 +1,23 @@
 /**
- * types.ts — the contract between harness/ and core/.
+ * types.ts — the contract between harness/ readers and their consumers.
  *
- * The whole thesis of agent-smith is that we do not need to instrument agy (or
- * any worker) to see it work: workers already write a complete, continuously
- * updated job snapshot to disk, and we just read those files. This module is
- * the seam of that idea.
+ * The whole thesis of agent-smith is that we do not need to instrument a worker
+ * to see it work: workers already write a complete, continuously updated job
+ * snapshot to disk, and we just read those files. This module is the seam of
+ * that idea.
  *
- * ┌──────────────────────────────────────────────────────────────────────┐
- * │ RECONCILIATION WITH core/types.ts  (READ BEFORE MERGING)            │
- * ├──────────────────────────────────────────────────────────────────────┤
- * │ core/types.ts is being authored concurrently by another engineer. I  │
- * │ did not touch core/ per my scope. Below is exactly what this layer   │
- * │ needs from it, and what core needs from us. Reconcile like this:      │
- * │                                                                      │
- * │ 1. `ObservedStatus` — 5 states:                                     │
- * │      "running" | "succeeded" | "failed" | "canceled" | "unknown"    │
- * │    `unknown` is load-bearing, NOT a cop-out. Because workers mutate   │
- * │    files live, there is a real window where the evidence is           │
- * │    contradictory. `unknown` is the honest answer and is far better    │
- * │    than guessing "running" or "succeeded" and drawing a lie on the    │
- * │    mod band. core MUST NOT collapse `unknown` into a default.         │
- * │                                                                      │
- * │ 2. `ObservedJob.warnings` is `ObservedWarning[]`, NOT `string[]`.    │
- * │    Each carries a stable `code`. The mod band wants to colour rows    │
- * │    by warning class, and free-text strings cannot be grouped safely.  │
- * │    Use `w.code` for logic, `w.message` for display.                   │
- * │                                                                      │
- * │ 3. `ObservedJob.raw` keeps the provider payload. core must NOT parse   │
- * │    it (that is provider knowledge and belongs in harness/). It is     │
- * │    here for the debug dump and for `verify`.                          │
- * │                                                                      │
- * │ 4. TIMESTAMPS are ISO-8601 strings or null — NOT Date objects.        │
- * │    WHY: these values cross a process boundary into SQLite. Storing    │
- * │    Date means a `JSON.stringify` in any logging path silently turns    │
- * │    it into a string anyway, so the type would lie about durability.   │
- * │    An explicit `| null` forces every consumer to handle "no time".    │
- * │                                                                      │
- * │ 5. `ObservedJob` is a SNAPSHOT, not a live handle. Readers must be    │
- * │    re-callable at any cadence (the design says ~100ms). core must     │
- * │    treat two `read()` calls as two independent observations and        │
- * │    tolerate them disagreeing.                                         │
- * │                                                                      │
- * │ 6. If core already defines a status enum, the mapping core should     │
- * │    apply is documented on `STATUS_RECONCILIATION` below.              │
- * └──────────────────────────────────────────────────────────────────────┘
+ * Rules every consumer relies on:
+ *   - `ObservedStatus` has 5 states, including `unknown`. `unknown` is
+ *     load-bearing: workers mutate files live, so evidence can be contradictory,
+ *     and guessing "running" or "succeeded" would draw a lie on the band.
+ *     Never collapse it into a default.
+ *   - `ObservedJob.warnings` is `ObservedWarning[]`; use `code` for logic and
+ *     `message` for display.
+ *   - `ObservedJob.raw` keeps the provider payload for the debug dump. Consumers
+ *     must not parse it.
+ *   - Timestamps are ISO-8601 strings or null, never Date objects.
+ *   - `ObservedJob` is a snapshot, not a live handle. Two `read()` calls are two
+ *     independent observations and may disagree.
  */
 
 /** A reader for one provider's on-disk job-state layout. */
@@ -75,7 +49,7 @@ export interface JobStateReader {
  * Deliberately loose. `payload` is `Record<string, unknown>` because every
  * provider evolves its own layout and we would be chasing it forever if this
  * type tried to pin every field. The *reader* is responsible for doing the
- * provider-specific parsing (see agy-staff.ts / claude-code.ts) and putting
+ * provider-specific parsing (see agy-staff.ts) and putting
  * something useful in `payload`; `normalize.ts` is responsible for mapping that
  * onto the provider-agnostic `ObservedJob`.
  */
@@ -95,7 +69,7 @@ export interface RawJobState {
   readonly partial?: boolean;
 }
 
-/** Normalized, provider-agnostic job state. This is what core consumes. */
+/** Normalized, provider-agnostic job state. This is what consumers read. */
 export interface ObservedJob {
   readonly provider: string;
   readonly jobId: string;
@@ -128,7 +102,7 @@ export interface ObservedJob {
 
   /** True if this snapshot was assembled from incomplete/contradictory evidence. */
   readonly partial: boolean;
-  /** The untouched provider payload, for the debug dump. core must not parse this. */
+  /** The untouched provider payload, for the debug dump. consumers must not parse this. */
   readonly raw: Record<string, unknown>;
 }
 
@@ -182,27 +156,6 @@ export interface ObservedUsage {
   readonly durationMs?: number;
   readonly turns?: number;
 }
-
-/**
- * Mapping for whoever reconciles this into core's own status enum.
- *
- * The critical direction is the last row: a reader that returns `unknown` must
- * surface it as `unknown`. If core coalesces unknown → running, the mod band
- * will show a finished-but-unreadable job as actively working, forever.
- */
-export const STATUS_RECONCILIATION: ReadonlyArray<{
-  readonly from: ObservedStatus;
-  readonly note: string;
-}> = [
-  { from: "running", note: "Live progress evidence present." },
-  { from: "succeeded", note: "Provider terminal status + non-empty output, or explicit done." },
-  { from: "failed", note: "Provider terminal error OR suspicious-success downgrade." },
-  { from: "canceled", note: "Cancel marker or terminal canceled status." },
-  {
-    from: "unknown",
-    note: "Missing/partial/contradictory evidence. MUST be preserved as its own state.",
-  },
-];
 
 /**
  * Normalizes a provider-specific payload into the common shape.

@@ -13,8 +13,8 @@
  * a concrete provider client we would have a compile-order dependency on work
  * that does not exist yet, and pipeline/ could not be tested without spawning
  * real agents. So the dependency points *inward*: pipeline/ declares the shape
- * it needs, providers/ (or core/) supplies an implementation at the composition
- * root. See `createRunnerRouter` in pipeline.ts for the wiring point.
+ * it needs, forge/ supplies an implementation over providers/ at the composition
+ * root (forge/runner.ts, forge/execute.ts). See `createRunnerRouter` in pipeline.ts for the wiring point.
  */
 
 /** Opaque provider key. Values like 'gemini' | 'codex' | 'claude' | 'agy' | 'kimi'. */
@@ -31,7 +31,8 @@ export type ModelId = string;
  * in-band task. That is why `low` is the default everywhere in this codebase
  * and why escalation — not the default — is what buys effort.
  */
-export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const;
+export type Effort = (typeof EFFORTS)[number];
 
 /** An explicit executable acceptance check, resolved against the worker's cwd. */
 export interface StageCheck {
@@ -392,7 +393,7 @@ export interface StageContext {
  *
  *     const runner = createRunnerRouter({
  *       gemini: geminiRunner,   // provided by providers/, constructed at the
- *       codex:  codexRunner,    // composition root in core/
+ *       codex:  codexRunner,    // composition root in forge/
  *     });
  *     await runPipeline(spec, { runner });
  */

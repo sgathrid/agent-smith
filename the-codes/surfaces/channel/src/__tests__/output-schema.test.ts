@@ -14,6 +14,7 @@ import { TOOL_DEFS, callTool, type HandlerContext, type ToolOutcome } from '../t
 import { writeAcceptance } from '../../../../forge/checks.ts';
 import type { JobDetail, JobSummary, SpawnAck } from '../../../../forge/service.ts';
 import type { ModelCatalog } from '../../../../providers/types.ts';
+import { withWorkerLookup } from './service-mock.ts';
 
 const validator = new AjvJsonSchemaValidator();
 function assertValid(tool: string, result: ToolOutcome, label: string): Record<string, unknown> {
@@ -59,7 +60,7 @@ const interop: JobDetail = {
   unrestricted: true, pipeline: null, stage: null, usage: null, conversation: null, effort: null, cwd: null, cancellable: false,
 };
 const details = [detail, running, unknown, interop];
-const service = {
+const service = withWorkerLookup({
   repo, spawnedIds: new Set(['job-1']),
   spawnJob: async () => ack,
   spawnTracked: async (spec: { continuedFrom?: string }) => ({
@@ -73,7 +74,7 @@ const service = {
   }),
   detail: async (id: string) => { const d = details.find(x => x.jobId === id); if (!d) throw new Error('no job'); return d; },
   list: async ({ limit }: { limit?: number }) => (details as JobSummary[]).slice(0, limit),
-} as never;
+}) as never;
 const cat = (provider: string, extra: Partial<ModelCatalog> = {}): ModelCatalog => ({
   provider, models: [{ id: `${provider}-m`, label: provider, efforts: ['low', 'high'], defaultEffort: 'low' }],
   defaultModel: `${provider}-m`, defaultEffort: 'high', defaultSource: 'harness-config', source: 'live', stale: false, verified: true, ...extra,

@@ -9,13 +9,11 @@ import { toolLabel } from './progress.ts';
  * That contradiction is the exact failure this project exists to eliminate, so the
  * number is stated once.
  *
- * WHY IT IS NOT IMPORTED FROM core/liveness.ts: that module's DEFAULT_GRACE_MS is
- * the right number, but it is a sibling package the mod cannot resolve a bare
- * specifier for, and duplicating the literal in two files is how they drift. So:
- * one constant, here, imported by both surfaces, with a comment tying it to
- * core/liveness.ts so a future change there has an obvious counterpart here.
+ * WHY ONE CONSTANT HERE: the mod cannot resolve a bare specifier for a sibling
+ * package, and duplicating the literal in two files is how they drift. So: one
+ * constant, here, imported by both surfaces.
  *
- * Value: core/liveness.ts's DEFAULT_GRACE_MS, 15 minutes.
+ * Value: 15 minutes.
  * Reasoning that number is defensible: agy-staff's own default timeout is 60m
  * (every real spec.json in the corpus says `timeout: "60m"`), so 15m of silence
  * is a quarter of the budget gone with nothing to show, while still leaving ample

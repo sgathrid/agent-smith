@@ -17,31 +17,26 @@ import { test } from 'node:test';
 import {
   ELAPSED_WIDTH,
   EMPTY_STATE,
-  basename,
   countSummary,
   deriveTaskLabel,
-  describeActivity,
-  describeTool,
   elapsed,
   elapsedCell,
-  ellipsis,
   fallbackLabel,
   fitCell,
   formatHeaderLine,
   formatJobLine,
   formatJobRow,
-  humanCommand,
   isRecessive,
   isTerminal,
   jobDetail,
   jobLabel,
   oneLine,
   paneColumns,
-  parseInputPreview,
   pickColor,
   pickGlyph,
   sortJobs,
 } from '../format.ts';
+import { basename, describeActivity, describeTool, humanCommand, parseInputPreview } from '../tools-describe.ts';
 import type { RadarJob, RadarStatus } from '../../types/index.d.ts';
 
 // ── a job builder, so each test states only what it is about ────────────────
@@ -487,14 +482,14 @@ test('basename keeps the last segment only', () => {
   assert.equal(basename(''), '');
 });
 
-test('ellipsis and oneLine collapse whitespace before measuring', () => {
-  assert.equal(ellipsis('a   b\n\tc', 40), 'a b c');
+test('oneLine collapses whitespace before measuring', () => {
+  assert.equal(oneLine('a   b\n\tc', 40), 'a b c');
   assert.equal(oneLine('x'.repeat(500), 100).length, 100);
 });
 
-test('ellipsis on a string at exactly the limit does not add an ellipsis', () => {
-  assert.equal(ellipsis('12345', 5), '12345');
-  assert.equal(ellipsis('123456', 5), '12345');
+test('oneLine on a string at exactly the limit does not add an ellipsis', () => {
+  assert.equal(oneLine('12345', 5), '12345');
+  assert.equal(oneLine('123456', 5), '12345');
 });
 
 test('truncation never splits a surrogate pair the sanitizer would then strip', () => {
@@ -509,5 +504,5 @@ test('truncation never splits a surrogate pair the sanitizer would then strip', 
   const cell = fitCell('a'.repeat(43) + '🚀zz', 44);
   assert.equal(cell, 'a'.repeat(43) + ' ');
   assert.equal(cell.length, 44);
-  assert.equal(ellipsis('a'.repeat(43) + '🚀zz', 44), 'a'.repeat(43));
+  assert.equal(oneLine('a'.repeat(43) + '🚀zz', 44), 'a'.repeat(43));
 });

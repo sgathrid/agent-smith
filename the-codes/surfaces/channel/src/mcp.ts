@@ -32,7 +32,7 @@ class SmithServer extends Server {
 }
 
 export function createSmithServer(context: Omit<HandlerContext, 'server'>, options: {
-  era: 'legacy' | 'modern'; channel?: boolean; instructions?: string; tasks?: boolean;
+  era: 'legacy' | 'modern'; instructions?: string; tasks?: boolean;
 }): Server {
   // Stdio runs every round in this process. Bind approval to the exact call;
   // clients cannot forge approval state or reuse it with broader arguments.
@@ -42,7 +42,6 @@ export function createSmithServer(context: Omit<HandlerContext, 'server'>, optio
     capabilities: {
       tools: {},
       ...(tasks ? { extensions: { [TASKS_EXTENSION_ID_V2]: {} } } : {}),
-      ...(options.era === 'legacy' && options.channel ? { experimental: { 'claude/channel': {} } } : {}),
     },
     instructions: options.instructions,
     requestState: { verify: state.verify },
