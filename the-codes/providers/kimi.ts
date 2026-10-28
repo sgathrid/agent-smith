@@ -127,7 +127,9 @@
 import {
   binaryAvailable,
   earlyVerdict,
+  ErrorRecovery,
   jobResult,
+  recoveredErrorNotice,
   nowIso,
   num,
   obj,
@@ -276,6 +278,8 @@ export interface KimiTranslator {
   /** All assistant text, step by step, in stream order. */
   finalText: string;
   sawError: boolean;
+  /** Whether the last error was followed by more work and a final report. */
+  recovery: ErrorRecovery;
   error?: string;
   usage?: TokenUsage;
   sessionId?: string;
@@ -294,6 +298,7 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
   const tx: KimiTranslator = {
     finalText: '',
     sawError: false,
+    recovery: new ErrorRecovery(),
     completedTools: 0,
     unrecognised: new Set<string>(),
     onEvent: () => [],
@@ -312,7 +317,7 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
     return idx;
   };
 
-  tx.onEvent = (raw: Record<string, unknown>): ProviderEvent[] => {
+  const translate = (raw: Record<string, unknown>): ProviderEvent[] => {
     const out: ProviderEvent[] = [];
     const at = nowIso();
     const role = str(raw, 'role');
@@ -370,6 +375,7 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
       if (type === 'error') {
         tx.sawError = true;
         tx.error = str(obj(raw, 'error'), 'message') ?? str(raw, 'message') ?? str(raw, 'error_message') ?? 'kimi error';
+        tx.recovery.noteError('a worker error', tx.error, at);
         out.push({ kind: 'notice', at, level: 'error', message: tx.error, raw });
         return out;
       }
@@ -476,6 +482,7 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
     if (type === 'error' || obj(raw, 'error') !== undefined) {
       tx.sawError = true;
       tx.error = str(obj(raw, 'error'), 'message') ?? str(raw, 'message') ?? 'kimi error';
+      tx.recovery.noteError('a worker error', tx.error, at);
       out.push({ kind: 'notice', at, level: 'error', message: tx.error, raw });
       return out;
     }
@@ -494,6 +501,11 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
     return out;
   };
 
+  tx.onEvent = (raw) => {
+    const out = translate(raw);
+    tx.recovery.observe(out);
+    return out;
+  };
   return tx;
 }
 
@@ -516,13 +528,15 @@ export function buildResult(args: {
 
   let status: JobStatus;
   let error: string | undefined;
+  // No verified terminal event exists in this stream: recovery needs a clean exit.
+  const recovered = tx.recovery.recovered(tx.finalText, exit.code);
   const early = earlyVerdict(exit, durationMs);
   if (early !== undefined) {
     ({ status, error } = early);
-  } else if (tx.sawError) {
+  } else if (tx.sawError && recovered === undefined) {
     status = 'error';
     error = `${tx.error ?? 'worker error'}${unrecognised}${stderrClause(exit.stderr)}`;
-  } else if (exit.code !== 0) {
+  } else if (exit.code !== 0 && recovered === undefined) {
     status = 'error';
     error = exit.code === null
       ? `${noResultText({ code: exit.code, signal: exit.signal, stderr: '' })}${unrecognised}${stderrClause(exit.stderr)}`
@@ -670,6 +684,10 @@ export const kimiProvider: Provider = {
           'Set [thinking].effort or a model alias default_effort in config.toml instead.',
       }] } : {}),
       buildResult: (ctx) => buildResult({ ...ctx, tx }),
+      afterResult(final) {
+        const notice = recoveredErrorNotice(tx.recovery.recovered(tx.finalText, final.exitCode), final);
+        return notice === undefined ? [] : [notice];
+      },
     });
   },
 };

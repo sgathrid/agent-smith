@@ -3004,6 +3004,17 @@ function noResultText(exit) {
 function deniedText(names, stderr) {
     const list = [...new Set(names.filter((n) => n !== ''))].join(', ');
     return `${list === '' ? 'denied' : `denied ${list}`}${stderrClause(stderr)}`;
+}
+/**
+ * `recovered from a provider connection error at 21:11 UTC: ECONNRESET …`.
+ * The warning a job carries when a worker hit an error, kept working and still
+ * delivered its report. `at` is an ISO timestamp; `label` names the kind of error.
+ */
+function recoveredErrorText(label, message, at) {
+    const flat = message.replace(/\s+/g, ' ').trim();
+    const detail = flat.length > 140 ? `${flat.slice(0, 139)}…` : flat;
+    const clock = /^\d{4}-\d\d-\d\dT(\d\d:\d\d)/.exec(at)?.[1];
+    return `recovered from ${label}${clock === undefined ? '' : ` at ${clock} UTC`}${detail === '' ? '' : `: ${detail}`}`;
 }/**
  * providers/ndjson.ts — shared spawn/stream plumbing for every adapter.
  *
@@ -3498,6 +3509,58 @@ function earlyVerdict(exit, durationMs) {
     if (exit.spawnError !== undefined)
         return { status: 'spawn-failed', error: exit.spawnError };
     return undefined;
+}
+/**
+ * Did the worker get past an error event? A transient error (a dropped
+ * connection the CLI retries) is followed by more work and a final report, yet
+ * the CLI may still exit non-zero. An adapter that treats any error event as
+ * terminal then fails a job that completed.
+ *
+ * Recovery needs assistant text after the LAST error and positive completion
+ * evidence: a clean exit or an adapter-confirmed terminal event. Further text
+ * or tool activity invalidates that event, so a retry preamble followed by a
+ * crash cannot masquerade as a completed report.
+ */
+class ErrorRecovery {
+    last;
+    /** Record an error event. `label` names it in the warning, e.g. "a provider connection error". */
+    noteError(label, message, at) {
+        this.last = { label, message, at, textAfter: false, completed: false };
+    }
+    /** Feed the events the translator just produced. */
+    observe(events) {
+        if (this.last === undefined)
+            return;
+        for (const e of events) {
+            if (e.kind === 'text' || e.kind === 'activity-start' || e.kind === 'activity-update' || e.kind === 'activity-end') {
+                this.invalidateCompletion();
+            }
+            if (e.kind === 'text' && e.stream !== 'thinking' && e.text.trim() !== '')
+                this.last.textAfter = true;
+        }
+    }
+    /** New work means a previously completed step no longer proves the run ended. */
+    invalidateCompletion() {
+        if (this.last !== undefined)
+            this.last.completed = false;
+    }
+    /** Called only for a provider event that explicitly confirms normal completion. */
+    noteCompletion() {
+        if (this.last?.textAfter)
+            this.last.completed = true;
+    }
+    /** A failed exit needs explicit completion evidence, not just partial output. */
+    recovered(finalText, exitCode) {
+        const l = this.last;
+        return l !== undefined && l.textAfter && finalText.trim() !== ''
+            && exitCode !== null && (exitCode === 0 || l.completed) ? l : undefined;
+    }
+}
+/** The warning notice for a run judged a success despite a recovered error. Issued after the verdict. */
+function recoveredErrorNotice(recovered, final) {
+    if (recovered === undefined || final.status !== 'success')
+        return undefined;
+    return { kind: 'notice', at: final.finishedAt, level: 'warn', message: recoveredErrorText(recovered.label, recovered.message, recovered.at) };
 }
 /** The JobResult envelope every adapter fills the same way; callers add their optional fields. */
 function jobResult(args) {
@@ -5813,6 +5876,7 @@ function createKimiTranslator(maxChars) {
     const tx = {
         finalText: '',
         sawError: false,
+        recovery: new ErrorRecovery(),
         completedTools: 0,
         unrecognised: new Set(),
         onEvent: () => [],
@@ -5830,7 +5894,7 @@ function createKimiTranslator(maxChars) {
         toolSteps.set(id, idx);
         return idx;
     };
-    tx.onEvent = (raw) => {
+    const translate = (raw) => {
         const out = [];
         const at = nowIso();
         const role = str(raw, 'role');
@@ -5887,6 +5951,7 @@ function createKimiTranslator(maxChars) {
             if (type === 'error') {
                 tx.sawError = true;
                 tx.error = str(obj(raw, 'error'), 'message') ?? str(raw, 'message') ?? str(raw, 'error_message') ?? 'kimi error';
+                tx.recovery.noteError('a worker error', tx.error, at);
                 out.push({ kind: 'notice', at, level: 'error', message: tx.error, raw });
                 return out;
             }
@@ -5994,6 +6059,7 @@ function createKimiTranslator(maxChars) {
         if (type === 'error' || obj(raw, 'error') !== undefined) {
             tx.sawError = true;
             tx.error = str(obj(raw, 'error'), 'message') ?? str(raw, 'message') ?? 'kimi error';
+            tx.recovery.noteError('a worker error', tx.error, at);
             out.push({ kind: 'notice', at, level: 'error', message: tx.error, raw });
             return out;
         }
@@ -6010,6 +6076,11 @@ function createKimiTranslator(maxChars) {
         });
         return out;
     };
+    tx.onEvent = (raw) => {
+        const out = translate(raw);
+        tx.recovery.observe(out);
+        return out;
+    };
     return tx;
 }
 // ---------------------------------------------------------------------------
@@ -6023,15 +6094,17 @@ function buildResult$1(args) {
         : '';
     let status;
     let error;
+    // No verified terminal event exists in this stream: recovery needs a clean exit.
+    const recovered = tx.recovery.recovered(tx.finalText, exit.code);
     const early = earlyVerdict(exit, durationMs);
     if (early !== undefined) {
         ({ status, error } = early);
     }
-    else if (tx.sawError) {
+    else if (tx.sawError && recovered === undefined) {
         status = 'error';
         error = `${tx.error ?? 'worker error'}${unrecognised}${stderrClause(exit.stderr)}`;
     }
-    else if (exit.code !== 0) {
+    else if (exit.code !== 0 && recovered === undefined) {
         status = 'error';
         error = exit.code === null
             ? `${noResultText({ code: exit.code, signal: exit.signal, stderr: '' })}${unrecognised}${stderrClause(exit.stderr)}`
@@ -6174,6 +6247,10 @@ const kimiProvider = {
                             'Set [thinking].effort or a model alias default_effort in config.toml instead.',
                     }] } : {}),
             buildResult: (ctx) => buildResult$1({ ...ctx, tx }),
+            afterResult(final) {
+                const notice = recoveredErrorNotice(tx.recovery.recovered(tx.finalText, final.exitCode), final);
+                return notice === undefined ? [] : [notice];
+            },
         });
     },
 };/**
@@ -6238,8 +6315,8 @@ const kimiProvider = {
  *      what to add. That is a feature, not an apology.
  *   4. We never guess SUCCESS. The final response is taken from whatever text
  *      the stream produced; if the stream ended with an `error` event or the
- *      exit code is non-zero, the job fails. Exit code alone is never enough to
- *      call it a success, for the same reason as agy.
+ *      exit code is non-zero without explicit recovery completion, the job fails.
+ *      Exit code alone is never enough to call it a success, as with agy.
  *
  * ALSO NOTE, and this is a real trap for anyone spawning this: `opencode run`
  * talks to a BACKGROUND SERVER by default. That means (a) it may pick up an
@@ -6456,6 +6533,8 @@ const DONE_WORDS = new Set(['completed', 'complete', 'done', 'success', 'succeed
 const ERROR_WORDS = new Set(['error', 'failed', 'failure', 'cancelled', 'canceled', 'aborted']);
 /** Failed tool calls that each get their own warning notice; the rest are only counted. */
 const TOOL_ERROR_NOTICES = 5;
+/** OpenCode's error type for a dropped or reset connection to the provider. */
+const TRANSPORT_ERROR_TYPE = 'provider.transport';
 /**
  * Build the translator.
  *
@@ -6473,12 +6552,13 @@ function createOpencodeTranslator(maxChars) {
         toolErrors: 0,
         unrecognised: new Set(),
         deniedNotices: [],
+        recovery: new ErrorRecovery(),
         onEvent: () => [],
     };
     let step = 0;
     /** partID -> stepIndex */
     const partStep = new Map();
-    tx.onEvent = (raw) => {
+    const translate = (raw) => {
         const out = [];
         const at = nowIso();
         const type = str(raw, 'type') ?? 'unknown';
@@ -6502,12 +6582,19 @@ function createOpencodeTranslator(maxChars) {
             // environment failures (no money, no route) rather than the worker doing
             // something wrong, so we label them distinctly: the operator's fix is
             // billing or config, not a better prompt.
-            const isEnv = errorType !== undefined && (errorType.startsWith('provider.') || errorType.startsWith('auth.'));
+            // A dropped connection is different: OpenCode retries it and may finish
+            // the work, so while the worker runs it is a warning, not a failure.
+            // buildResult decides (ErrorRecovery) whether the job survived it.
+            const isTransport = errorType === TRANSPORT_ERROR_TYPE;
+            const isEnv = !isTransport && errorType !== undefined && (errorType.startsWith('provider.') || errorType.startsWith('auth.'));
+            tx.recovery.noteError(isTransport ? 'a provider connection error' : 'a worker error', message, at);
             out.push({
                 kind: 'notice',
                 at,
-                level: 'error',
-                message: isEnv ? `environment failure — ${errorType}: ${message}` : message,
+                level: isTransport ? 'warn' : 'error',
+                message: isTransport
+                    ? `provider connection error (retrying): ${message}`
+                    : isEnv ? `environment failure — ${errorType}: ${message}` : message,
                 raw,
             });
             return out;
@@ -6656,19 +6743,29 @@ function createOpencodeTranslator(maxChars) {
         // One per assistant step. Their counters were handled above and there is
         // nothing else a reader needs per step, so they are silent: one info notice
         // per step would bury real warnings under hundreds of lines of noise.
-        if (isStepStart || isStepFinish)
+        if (isStepStart || isStepFinish) {
+            // Verified in the installed OpenCode CLI: session.step.ended emits
+            // step_finish with part.reason = data.finish. Tool-call/length finishes
+            // end only a step; "stop" confirms the assistant finished normally.
+            if (isStepFinish && str(part, 'reason') === 'stop')
+                tx.recovery.noteCompletion();
+            else
+                tx.recovery.invalidateCompletion();
             return out;
+        }
         // ---- session lifecycle --------------------------------------------------
         // Documented bus names (opencode.ai/docs/server "Events"), UNVERIFIED for
         // `run --format json`. Treated as terminal only for the unambiguous ones.
         if (type === 'session.idle' || type === 'session.idle.completed' || type === 'session.completed') {
             tx.sawTerminal = true;
+            tx.recovery.noteCompletion();
             out.push({ kind: 'notice', at, level: 'info', message: `opencode ${type}`, raw });
             return out;
         }
         if (type === 'session.error') {
             tx.sawError = true;
             tx.error = str(obj(raw, 'error'), 'message') ?? str(raw, 'message') ?? 'opencode session.error';
+            tx.recovery.noteError('a worker error', tx.error, at);
             out.push({ kind: 'notice', at, level: 'error', message: tx.error, raw });
             return out;
         }
@@ -6685,6 +6782,11 @@ function createOpencodeTranslator(maxChars) {
             return out;
         }
         out.push({ kind: 'notice', at, level: 'info', message: `opencode ${type}`, raw });
+        return out;
+    };
+    tx.onEvent = (raw) => {
+        const out = translate(raw);
+        tx.recovery.observe(out);
         return out;
     };
     return tx;
@@ -6726,11 +6828,14 @@ function buildResult(args) {
     // Event types the parser did not know: the clue when a run looks empty or broken.
     const unrecognised = tx.unrecognised.size > 0 ? ` · unrecognised events: ${[...tx.unrecognised].join(', ')}` : '';
     const toolErrors = tx.toolErrors > 0 ? ` · ${tx.toolErrors} tool error(s)` : '';
+    // An error the worker got past: more work and a final report followed it. A
+    // signal kill is no evidence of completion, so it needs a real exit code.
+    const recovered = tx.recovery.recovered(tx.finalText, exit.code);
     const early = earlyVerdict(exit, durationMs);
     if (early !== undefined) {
         ({ status, error } = early);
     }
-    else if (tx.sawError) {
+    else if (tx.sawError && recovered === undefined) {
         // An `error` or `session.error` event (never a failed tool call: see
         // toolErrors). opencode's provider.quota 402 exits 1 with an error event
         // and no text, so this is the common path for a misconfigured account.
@@ -6743,7 +6848,7 @@ function buildResult(args) {
         status = 'denied';
         error = deniedText(tx.deniedNotices, '');
     }
-    else if (exit.code !== 0) {
+    else if (exit.code !== 0 && recovered === undefined) {
         status = 'error';
         error = `exited ${exit.code}${unrecognised}${toolErrors}${stderrClause(exit.stderr)}`;
     }
@@ -6828,6 +6933,10 @@ const opencodeProvider = {
             // the runner surfaces those rather than dropping them.
             translate: tx.onEvent,
             buildResult: (ctx) => buildResult({ ...ctx, tx }),
+            afterResult(final) {
+                const notice = recoveredErrorNotice(tx.recovery.recovered(tx.finalText, final.exitCode), final);
+                return notice === undefined ? [] : [notice];
+            },
         });
     },
 };/**

@@ -9,7 +9,7 @@ import { buildArgv as buildCodexArgv, codexStderrLevel, createCodexTranslator } 
 import { buildArgv as buildAgyArgv } from './agy.ts';
 import { buildArgv as buildOpencodeArgv, buildResult as buildOpencodeResult, createOpencodeTranslator } from './opencode.ts';
 import { buildArgv as buildKimiArgv, buildResult as buildKimiResult, createKimiTranslator } from './kimi.ts';
-import { spawnWorker } from './ndjson.ts';
+import { recoveredErrorNotice, spawnWorker } from './ndjson.ts';
 import type { ProviderEvent, SpawnSpec } from './types.ts';
 import { scaled, waitFor } from '../forge/testing/time.ts';
 import { trackedTempDirs } from '../forge/testing/tmp.ts';
@@ -780,4 +780,191 @@ test('runNdjsonWorker routes heartbeats to the bus, never to the event log', () 
     const adapter = readFileSync(new URL(`./${name}.ts`, import.meta.url), 'utf8');
     assert.match(adapter, /runNdjsonWorker\(/, name);
   }
+});
+
+// ---- recovered provider errors (synthetic streams) -------------------------
+
+const TRANSPORT_ERROR = {
+  type: 'error',
+  sessionID: 'ses_transport',
+  error: { type: 'provider.transport', message: 'Connection lost while reading the response: ECONNRESET: The socket connection was closed unexpectedly.' },
+};
+const toolCall = (id: string) => ({
+  type: 'tool_use',
+  sessionID: 'ses_transport',
+  part: { id, type: 'tool', tool: 'bash', state: { status: 'completed', input: { command: 'ls' }, output: 'ok' } },
+});
+const textPart = (text: string) => ({ type: 'text', sessionID: 'ses_transport', part: { type: 'text', text } });
+const failedExit = { code: 1, signal: null, killReason: undefined, stderr: '' } as const;
+const buildOc = (tx: ReturnType<typeof createOpencodeTranslator>, exit: typeof failedExit | { code: number; signal: null; killReason: undefined; stderr: string }) =>
+  buildOpencodeResult({ jobId: 'j', startedAtMs: Date.now(), stateDir: '/tmp/x', exit, tx });
+
+test('opencode: a transport error is a retrying warning, not an environment failure', () => {
+  const tx = createOpencodeTranslator(10_000);
+  const notice = tx.onEvent(TRANSPORT_ERROR).find((e) => e.kind === 'notice');
+  assert.ok(notice?.kind === 'notice');
+  assert.equal(notice.level, 'warn');
+  assert.match(notice.message, /^provider connection error \(retrying\): Connection lost.*ECONNRESET/);
+  assert.doesNotMatch(notice.message, /environment failure/);
+
+  // Genuine environment failures keep their level and wording.
+  const quota = createOpencodeTranslator(10_000)
+    .onEvent({ type: 'error', error: { type: 'provider.quota', message: 'out of credit' } })
+    .find((e) => e.kind === 'notice');
+  assert.ok(quota?.kind === 'notice');
+  assert.equal(quota.level, 'error');
+  assert.equal(quota.message, 'environment failure — provider.quota: out of credit');
+});
+
+test('opencode: a transport error followed by more work and a report is recovered, despite exit 1', () => {
+  const tx = createOpencodeTranslator(10_000);
+  tx.onEvent(textPart('Starting the review.'));
+  tx.onEvent(toolCall('c1'));
+  tx.onEvent(TRANSPORT_ERROR);
+  tx.onEvent(toolCall('c2'));
+  tx.onEvent(textPart('Final report: no defects.'));
+  tx.onEvent({ type: 'step_finish', part: { type: 'step-finish', reason: 'stop' } });
+  const r = buildOc(tx, failedExit);
+  assert.equal(r.status, 'success');
+  assert.equal(r.ok, true);
+  assert.equal(r.error, undefined);
+  assert.equal(r.exitCode, 1);
+  assert.match(r.response, /Final report/);
+
+  const warning = recoveredErrorNotice(tx.recovery.recovered(tx.finalText, r.exitCode), r);
+  assert.ok(warning?.kind === 'notice');
+  assert.equal(warning.level, 'warn');
+  assert.match(warning.message, /^recovered from a provider connection error at \d\d:\d\d UTC: Connection lost.*ECONNRESET/);
+});
+
+test('opencode: a transport error as the last event still fails', () => {
+  const tx = createOpencodeTranslator(10_000);
+  tx.onEvent(textPart('Starting the review.'));
+  tx.onEvent(toolCall('c1'));
+  tx.onEvent(TRANSPORT_ERROR);
+  const r = buildOc(tx, failedExit);
+  assert.equal(r.status, 'error');
+  assert.equal(r.ok, false);
+  assert.match(r.error ?? '', /ECONNRESET/);
+  assert.equal(recoveredErrorNotice(tx.recovery.recovered(tx.finalText, r.exitCode), r), undefined);
+});
+
+test('opencode: tool activity after the error without a report is not a recovery; a later error is not either', () => {
+  const noReport = createOpencodeTranslator(10_000);
+  noReport.onEvent(textPart('Starting.'));
+  noReport.onEvent(TRANSPORT_ERROR);
+  noReport.onEvent(toolCall('c1'));
+  assert.equal(buildOc(noReport, failedExit).status, 'error');
+
+  const laterError = createOpencodeTranslator(10_000);
+  laterError.onEvent(TRANSPORT_ERROR);
+  laterError.onEvent(textPart('A report.'));
+  laterError.onEvent({ type: 'error', error: { type: 'provider.quota', message: 'out of credit' } });
+  const r = buildOc(laterError, failedExit);
+  assert.equal(r.status, 'error');
+  assert.match(r.error ?? '', /out of credit/);
+
+  // Killed by a signal: no exit code to corroborate completion.
+  const killed = createOpencodeTranslator(10_000);
+  killed.onEvent(TRANSPORT_ERROR);
+  killed.onEvent(textPart('A report.'));
+  assert.equal(buildOc(killed, { code: null, signal: null, killReason: undefined, stderr: '' } as never).status, 'error');
+});
+
+test('kimi: an error followed by assistant text recovers on a clean exit', () => {
+  const tx = createKimiTranslator(200);
+  tx.onEvent({ role: 'assistant', content: 'Starting.' });
+  tx.onEvent({ role: 'meta', type: 'error', error: { message: 'stream dropped' } });
+  tx.onEvent({ role: 'assistant', content: 'Final report.' });
+  const exit = { code: 0, signal: null, killReason: undefined, stderr: '' } as const;
+  const r = buildKimiResult({ jobId: 'j', startedAtMs: Date.now(), stateDir: '/tmp/x', exit, tx });
+  assert.equal(r.status, 'success');
+  assert.equal(r.ok, true);
+  assert.equal(r.error, undefined);
+  const warning = recoveredErrorNotice(tx.recovery.recovered(tx.finalText, r.exitCode), r);
+  assert.ok(warning?.kind === 'notice');
+  assert.equal(warning.level, 'warn');
+  assert.match(warning.message, /^recovered from a worker error at \d\d:\d\d UTC: stream dropped/);
+});
+
+test('kimi: an error as the last meaningful event still fails', () => {
+  const tx = createKimiTranslator(200);
+  tx.onEvent({ role: 'assistant', content: 'Starting.' });
+  tx.onEvent({ role: 'meta', type: 'error', error: { message: 'stream dropped' } });
+  const exit = { code: 0, signal: null, killReason: undefined, stderr: '' } as const;
+  const r = buildKimiResult({ jobId: 'j', startedAtMs: Date.now(), stateDir: '/tmp/x', exit, tx });
+  assert.equal(r.status, 'error');
+  assert.equal(r.ok, false);
+  assert.match(r.error ?? '', /stream dropped/);
+  assert.equal(recoveredErrorNotice(tx.recovery.recovered(tx.finalText, r.exitCode), r), undefined);
+});
+
+
+test('opencode: retry prose and unfinished tools do not recover a crashed worker', () => {
+  const tx = createOpencodeTranslator(10_000);
+  tx.onEvent(TRANSPORT_ERROR);
+  tx.onEvent(textPart('I will retry and inspect the remaining files.'));
+  tx.onEvent({ type: 'tool_use', part: {
+    id: 'unfinished', type: 'tool', tool: 'bash',
+    state: { status: 'running', input: { command: 'npm test' } },
+  } });
+  const r = buildOc(tx, { ...failedExit, stderr: 'fatal: unhandled exception' });
+  assert.equal(r.status, 'error');
+  assert.equal(r.ok, false);
+  assert.equal(recoveredErrorNotice(tx.recovery.recovered(tx.finalText, r.exitCode), r), undefined);
+});
+
+test('opencode: only a normal step finish can recover a failed exit', () => {
+  for (const reason of [undefined, 'tool-calls', 'length', 'error', 'stop']) {
+    const tx = createOpencodeTranslator(10_000);
+    tx.onEvent(TRANSPORT_ERROR);
+    tx.onEvent(textPart('Partial or final report.'));
+    tx.onEvent({ type: 'step_finish', part: { type: 'step-finish', reason } });
+    assert.equal(buildOc(tx, failedExit).status, reason === 'stop' ? 'success' : 'error', String(reason));
+  }
+});
+
+test('opencode: later work or errors invalidate an earlier completion', () => {
+  const laterEvents = [
+    textPart('One more thing to investigate.'),
+    toolCall('later'),
+    { type: 'step_start', part: { type: 'step-start' } },
+    { type: 'error', error: { type: 'provider.quota', message: 'out of credit' } },
+  ];
+  for (const event of laterEvents) {
+    const tx = createOpencodeTranslator(10_000);
+    tx.onEvent(TRANSPORT_ERROR);
+    tx.onEvent(textPart('A report.'));
+    tx.onEvent({ type: 'step_finish', part: { type: 'step-finish', reason: 'stop' } });
+    tx.onEvent(event);
+    assert.equal(buildOc(tx, failedExit).status, 'error', event.type);
+  }
+});
+
+test('kimi: assistant text cannot recover a nonzero exit without a verified completion marker', () => {
+  const tx = createKimiTranslator(200);
+  tx.onEvent({ role: 'meta', type: 'error', error: { message: 'stream dropped' } });
+  tx.onEvent({ role: 'assistant', content: 'I will retry.', tool_calls: [
+    { id: 'unfinished', type: 'function', function: { name: 'Bash', arguments: '{"command":"npm test"}' } },
+  ] });
+  const r = buildKimiResult({ jobId: 'j', startedAtMs: Date.now(), stateDir: '/tmp/x', exit: failedExit, tx });
+  assert.equal(r.status, 'error');
+  assert.equal(r.ok, false);
+});
+
+
+test('opencode: completion before post-error text cannot corroborate a failed exit', () => {
+  const tx = createOpencodeTranslator(10_000);
+  tx.onEvent(TRANSPORT_ERROR);
+  tx.onEvent({ type: 'step_finish', part: { type: 'step-finish', reason: 'stop' } });
+  tx.onEvent(textPart('Still working.'));
+  assert.equal(buildOc(tx, failedExit).status, 'error');
+});
+
+test('opencode: explicit session completion corroborates a recovered report', () => {
+  const tx = createOpencodeTranslator(10_000);
+  tx.onEvent(TRANSPORT_ERROR);
+  tx.onEvent(textPart('Final report.'));
+  tx.onEvent({ type: 'session.completed' });
+  assert.equal(buildOc(tx, failedExit).status, 'success');
 });
