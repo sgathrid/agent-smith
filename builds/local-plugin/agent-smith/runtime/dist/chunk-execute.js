@@ -3516,31 +3516,44 @@ function earlyVerdict(exit, durationMs) {
  * the CLI may still exit non-zero. An adapter that treats any error event as
  * terminal then fails a job that completed.
  *
- * The rule is deliberately narrow. The LAST error is recovered only when
- * assistant text arrived after it (tool activity alone is not a report), so an
- * error that is the final meaningful event, or that comes after the last text,
- * stays a failure. A later error replaces an earlier one and must itself be
- * followed by text.
+ * Recovery needs assistant text after the LAST error and positive completion
+ * evidence: a clean exit or an adapter-confirmed terminal event. Further text
+ * or tool activity invalidates that event, so a retry preamble followed by a
+ * crash cannot masquerade as a completed report.
  */
 class ErrorRecovery {
     last;
     /** Record an error event. `label` names it in the warning, e.g. "a provider connection error". */
     noteError(label, message, at) {
-        this.last = { label, message, at, textAfter: false };
+        this.last = { label, message, at, textAfter: false, completed: false };
     }
     /** Feed the events the translator just produced. */
     observe(events) {
         if (this.last === undefined)
             return;
         for (const e of events) {
+            if (e.kind === 'text' || e.kind === 'activity-start' || e.kind === 'activity-update' || e.kind === 'activity-end') {
+                this.invalidateCompletion();
+            }
             if (e.kind === 'text' && e.stream !== 'thinking' && e.text.trim() !== '')
                 this.last.textAfter = true;
         }
     }
-    /** The recovered error, when the run delivered a non-empty report after it. */
-    recovered(finalText) {
+    /** New work means a previously completed step no longer proves the run ended. */
+    invalidateCompletion() {
+        if (this.last !== undefined)
+            this.last.completed = false;
+    }
+    /** Called only for a provider event that explicitly confirms normal completion. */
+    noteCompletion() {
+        if (this.last?.textAfter)
+            this.last.completed = true;
+    }
+    /** A failed exit needs explicit completion evidence, not just partial output. */
+    recovered(finalText, exitCode) {
         const l = this.last;
-        return l !== undefined && l.textAfter && finalText.trim() !== '' ? l : undefined;
+        return l !== undefined && l.textAfter && finalText.trim() !== ''
+            && exitCode !== null && (exitCode === 0 || l.completed) ? l : undefined;
     }
 }
 /** The warning notice for a run judged a success despite a recovered error. Issued after the verdict. */
@@ -6081,8 +6094,8 @@ function buildResult$1(args) {
         : '';
     let status;
     let error;
-    // An error the worker got past (see ErrorRecovery); a signal kill is no evidence.
-    const recovered = exit.code === null ? undefined : tx.recovery.recovered(tx.finalText);
+    // No verified terminal event exists in this stream: recovery needs a clean exit.
+    const recovered = tx.recovery.recovered(tx.finalText, exit.code);
     const early = earlyVerdict(exit, durationMs);
     if (early !== undefined) {
         ({ status, error } = early);
@@ -6235,7 +6248,7 @@ const kimiProvider = {
                     }] } : {}),
             buildResult: (ctx) => buildResult$1({ ...ctx, tx }),
             afterResult(final) {
-                const notice = recoveredErrorNotice(final.exitCode === null ? undefined : tx.recovery.recovered(tx.finalText), final);
+                const notice = recoveredErrorNotice(tx.recovery.recovered(tx.finalText, final.exitCode), final);
                 return notice === undefined ? [] : [notice];
             },
         });
@@ -6302,8 +6315,8 @@ const kimiProvider = {
  *      what to add. That is a feature, not an apology.
  *   4. We never guess SUCCESS. The final response is taken from whatever text
  *      the stream produced; if the stream ended with an `error` event or the
- *      exit code is non-zero, the job fails. Exit code alone is never enough to
- *      call it a success, for the same reason as agy.
+ *      exit code is non-zero without explicit recovery completion, the job fails.
+ *      Exit code alone is never enough to call it a success, as with agy.
  *
  * ALSO NOTE, and this is a real trap for anyone spawning this: `opencode run`
  * talks to a BACKGROUND SERVER by default. That means (a) it may pick up an
@@ -6730,13 +6743,22 @@ function createOpencodeTranslator(maxChars) {
         // One per assistant step. Their counters were handled above and there is
         // nothing else a reader needs per step, so they are silent: one info notice
         // per step would bury real warnings under hundreds of lines of noise.
-        if (isStepStart || isStepFinish)
+        if (isStepStart || isStepFinish) {
+            // Verified in the installed OpenCode CLI: session.step.ended emits
+            // step_finish with part.reason = data.finish. Tool-call/length finishes
+            // end only a step; "stop" confirms the assistant finished normally.
+            if (isStepFinish && str(part, 'reason') === 'stop')
+                tx.recovery.noteCompletion();
+            else
+                tx.recovery.invalidateCompletion();
             return out;
+        }
         // ---- session lifecycle --------------------------------------------------
         // Documented bus names (opencode.ai/docs/server "Events"), UNVERIFIED for
         // `run --format json`. Treated as terminal only for the unambiguous ones.
         if (type === 'session.idle' || type === 'session.idle.completed' || type === 'session.completed') {
             tx.sawTerminal = true;
+            tx.recovery.noteCompletion();
             out.push({ kind: 'notice', at, level: 'info', message: `opencode ${type}`, raw });
             return out;
         }
@@ -6808,7 +6830,7 @@ function buildResult(args) {
     const toolErrors = tx.toolErrors > 0 ? ` · ${tx.toolErrors} tool error(s)` : '';
     // An error the worker got past: more work and a final report followed it. A
     // signal kill is no evidence of completion, so it needs a real exit code.
-    const recovered = exit.code === null ? undefined : tx.recovery.recovered(tx.finalText);
+    const recovered = tx.recovery.recovered(tx.finalText, exit.code);
     const early = earlyVerdict(exit, durationMs);
     if (early !== undefined) {
         ({ status, error } = early);
@@ -6912,7 +6934,7 @@ const opencodeProvider = {
             translate: tx.onEvent,
             buildResult: (ctx) => buildResult({ ...ctx, tx }),
             afterResult(final) {
-                const notice = recoveredErrorNotice(final.exitCode === null ? undefined : tx.recovery.recovered(tx.finalText), final);
+                const notice = recoveredErrorNotice(tx.recovery.recovered(tx.finalText, final.exitCode), final);
                 return notice === undefined ? [] : [notice];
             },
         });

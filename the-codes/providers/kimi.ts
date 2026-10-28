@@ -528,8 +528,8 @@ export function buildResult(args: {
 
   let status: JobStatus;
   let error: string | undefined;
-  // An error the worker got past (see ErrorRecovery); a signal kill is no evidence.
-  const recovered = exit.code === null ? undefined : tx.recovery.recovered(tx.finalText);
+  // No verified terminal event exists in this stream: recovery needs a clean exit.
+  const recovered = tx.recovery.recovered(tx.finalText, exit.code);
   const early = earlyVerdict(exit, durationMs);
   if (early !== undefined) {
     ({ status, error } = early);
@@ -685,7 +685,7 @@ export const kimiProvider: Provider = {
       }] } : {}),
       buildResult: (ctx) => buildResult({ ...ctx, tx }),
       afterResult(final) {
-        const notice = recoveredErrorNotice(final.exitCode === null ? undefined : tx.recovery.recovered(tx.finalText), final);
+        const notice = recoveredErrorNotice(tx.recovery.recovered(tx.finalText, final.exitCode), final);
         return notice === undefined ? [] : [notice];
       },
     });

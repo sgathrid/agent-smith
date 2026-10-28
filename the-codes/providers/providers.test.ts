@@ -823,6 +823,7 @@ test('opencode: a transport error followed by more work and a report is recovere
   tx.onEvent(TRANSPORT_ERROR);
   tx.onEvent(toolCall('c2'));
   tx.onEvent(textPart('Final report: no defects.'));
+  tx.onEvent({ type: 'step_finish', part: { type: 'step-finish', reason: 'stop' } });
   const r = buildOc(tx, failedExit);
   assert.equal(r.status, 'success');
   assert.equal(r.ok, true);
@@ -830,7 +831,7 @@ test('opencode: a transport error followed by more work and a report is recovere
   assert.equal(r.exitCode, 1);
   assert.match(r.response, /Final report/);
 
-  const warning = recoveredErrorNotice(tx.recovery.recovered(tx.finalText), r);
+  const warning = recoveredErrorNotice(tx.recovery.recovered(tx.finalText, r.exitCode), r);
   assert.ok(warning?.kind === 'notice');
   assert.equal(warning.level, 'warn');
   assert.match(warning.message, /^recovered from a provider connection error at \d\d:\d\d UTC: Connection lost.*ECONNRESET/);
@@ -845,7 +846,7 @@ test('opencode: a transport error as the last event still fails', () => {
   assert.equal(r.status, 'error');
   assert.equal(r.ok, false);
   assert.match(r.error ?? '', /ECONNRESET/);
-  assert.equal(recoveredErrorNotice(tx.recovery.recovered(tx.finalText), r), undefined);
+  assert.equal(recoveredErrorNotice(tx.recovery.recovered(tx.finalText, r.exitCode), r), undefined);
 });
 
 test('opencode: tool activity after the error without a report is not a recovery; a later error is not either', () => {
@@ -870,17 +871,17 @@ test('opencode: tool activity after the error without a report is not a recovery
   assert.equal(buildOc(killed, { code: null, signal: null, killReason: undefined, stderr: '' } as never).status, 'error');
 });
 
-test('kimi: an error followed by assistant text recovers despite a non-zero exit', () => {
+test('kimi: an error followed by assistant text recovers on a clean exit', () => {
   const tx = createKimiTranslator(200);
   tx.onEvent({ role: 'assistant', content: 'Starting.' });
   tx.onEvent({ role: 'meta', type: 'error', error: { message: 'stream dropped' } });
   tx.onEvent({ role: 'assistant', content: 'Final report.' });
-  const exit = { code: 1, signal: null, killReason: undefined, stderr: '' } as const;
+  const exit = { code: 0, signal: null, killReason: undefined, stderr: '' } as const;
   const r = buildKimiResult({ jobId: 'j', startedAtMs: Date.now(), stateDir: '/tmp/x', exit, tx });
   assert.equal(r.status, 'success');
   assert.equal(r.ok, true);
   assert.equal(r.error, undefined);
-  const warning = recoveredErrorNotice(tx.recovery.recovered(tx.finalText), r);
+  const warning = recoveredErrorNotice(tx.recovery.recovered(tx.finalText, r.exitCode), r);
   assert.ok(warning?.kind === 'notice');
   assert.equal(warning.level, 'warn');
   assert.match(warning.message, /^recovered from a worker error at \d\d:\d\d UTC: stream dropped/);
@@ -895,5 +896,75 @@ test('kimi: an error as the last meaningful event still fails', () => {
   assert.equal(r.status, 'error');
   assert.equal(r.ok, false);
   assert.match(r.error ?? '', /stream dropped/);
-  assert.equal(recoveredErrorNotice(tx.recovery.recovered(tx.finalText), r), undefined);
+  assert.equal(recoveredErrorNotice(tx.recovery.recovered(tx.finalText, r.exitCode), r), undefined);
+});
+
+
+test('opencode: retry prose and unfinished tools do not recover a crashed worker', () => {
+  const tx = createOpencodeTranslator(10_000);
+  tx.onEvent(TRANSPORT_ERROR);
+  tx.onEvent(textPart('I will retry and inspect the remaining files.'));
+  tx.onEvent({ type: 'tool_use', part: {
+    id: 'unfinished', type: 'tool', tool: 'bash',
+    state: { status: 'running', input: { command: 'npm test' } },
+  } });
+  const r = buildOc(tx, { ...failedExit, stderr: 'fatal: unhandled exception' });
+  assert.equal(r.status, 'error');
+  assert.equal(r.ok, false);
+  assert.equal(recoveredErrorNotice(tx.recovery.recovered(tx.finalText, r.exitCode), r), undefined);
+});
+
+test('opencode: only a normal step finish can recover a failed exit', () => {
+  for (const reason of [undefined, 'tool-calls', 'length', 'error', 'stop']) {
+    const tx = createOpencodeTranslator(10_000);
+    tx.onEvent(TRANSPORT_ERROR);
+    tx.onEvent(textPart('Partial or final report.'));
+    tx.onEvent({ type: 'step_finish', part: { type: 'step-finish', reason } });
+    assert.equal(buildOc(tx, failedExit).status, reason === 'stop' ? 'success' : 'error', String(reason));
+  }
+});
+
+test('opencode: later work or errors invalidate an earlier completion', () => {
+  const laterEvents = [
+    textPart('One more thing to investigate.'),
+    toolCall('later'),
+    { type: 'step_start', part: { type: 'step-start' } },
+    { type: 'error', error: { type: 'provider.quota', message: 'out of credit' } },
+  ];
+  for (const event of laterEvents) {
+    const tx = createOpencodeTranslator(10_000);
+    tx.onEvent(TRANSPORT_ERROR);
+    tx.onEvent(textPart('A report.'));
+    tx.onEvent({ type: 'step_finish', part: { type: 'step-finish', reason: 'stop' } });
+    tx.onEvent(event);
+    assert.equal(buildOc(tx, failedExit).status, 'error', event.type);
+  }
+});
+
+test('kimi: assistant text cannot recover a nonzero exit without a verified completion marker', () => {
+  const tx = createKimiTranslator(200);
+  tx.onEvent({ role: 'meta', type: 'error', error: { message: 'stream dropped' } });
+  tx.onEvent({ role: 'assistant', content: 'I will retry.', tool_calls: [
+    { id: 'unfinished', type: 'function', function: { name: 'Bash', arguments: '{"command":"npm test"}' } },
+  ] });
+  const r = buildKimiResult({ jobId: 'j', startedAtMs: Date.now(), stateDir: '/tmp/x', exit: failedExit, tx });
+  assert.equal(r.status, 'error');
+  assert.equal(r.ok, false);
+});
+
+
+test('opencode: completion before post-error text cannot corroborate a failed exit', () => {
+  const tx = createOpencodeTranslator(10_000);
+  tx.onEvent(TRANSPORT_ERROR);
+  tx.onEvent({ type: 'step_finish', part: { type: 'step-finish', reason: 'stop' } });
+  tx.onEvent(textPart('Still working.'));
+  assert.equal(buildOc(tx, failedExit).status, 'error');
+});
+
+test('opencode: explicit session completion corroborates a recovered report', () => {
+  const tx = createOpencodeTranslator(10_000);
+  tx.onEvent(TRANSPORT_ERROR);
+  tx.onEvent(textPart('Final report.'));
+  tx.onEvent({ type: 'session.completed' });
+  assert.equal(buildOc(tx, failedExit).status, 'success');
 });

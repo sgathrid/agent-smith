@@ -60,8 +60,8 @@
  *      what to add. That is a feature, not an apology.
  *   4. We never guess SUCCESS. The final response is taken from whatever text
  *      the stream produced; if the stream ended with an `error` event or the
- *      exit code is non-zero, the job fails. Exit code alone is never enough to
- *      call it a success, for the same reason as agy.
+ *      exit code is non-zero without explicit recovery completion, the job fails.
+ *      Exit code alone is never enough to call it a success, as with agy.
  *
  * ALSO NOTE, and this is a real trap for anyone spawning this: `opencode run`
  * talks to a BACKGROUND SERVER by default. That means (a) it may pick up an
@@ -542,13 +542,21 @@ export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
     // One per assistant step. Their counters were handled above and there is
     // nothing else a reader needs per step, so they are silent: one info notice
     // per step would bury real warnings under hundreds of lines of noise.
-    if (isStepStart || isStepFinish) return out;
+    if (isStepStart || isStepFinish) {
+      // Verified in the installed OpenCode CLI: session.step.ended emits
+      // step_finish with part.reason = data.finish. Tool-call/length finishes
+      // end only a step; "stop" confirms the assistant finished normally.
+      if (isStepFinish && str(part, 'reason') === 'stop') tx.recovery.noteCompletion();
+      else tx.recovery.invalidateCompletion();
+      return out;
+    }
 
     // ---- session lifecycle --------------------------------------------------
     // Documented bus names (opencode.ai/docs/server "Events"), UNVERIFIED for
     // `run --format json`. Treated as terminal only for the unambiguous ones.
     if (type === 'session.idle' || type === 'session.idle.completed' || type === 'session.completed') {
       tx.sawTerminal = true;
+      tx.recovery.noteCompletion();
       out.push({ kind: 'notice', at, level: 'info', message: `opencode ${type}`, raw });
       return out;
     }
@@ -634,7 +642,7 @@ export function buildResult(args: {
   const toolErrors = tx.toolErrors > 0 ? ` · ${tx.toolErrors} tool error(s)` : '';
   // An error the worker got past: more work and a final report followed it. A
   // signal kill is no evidence of completion, so it needs a real exit code.
-  const recovered = exit.code === null ? undefined : tx.recovery.recovered(tx.finalText);
+  const recovered = tx.recovery.recovered(tx.finalText, exit.code);
   const early = earlyVerdict(exit, durationMs);
   if (early !== undefined) {
     ({ status, error } = early);
@@ -737,7 +745,7 @@ export const opencodeProvider: Provider = {
       translate: tx.onEvent,
       buildResult: (ctx) => buildResult({ ...ctx, tx }),
       afterResult(final) {
-        const notice = recoveredErrorNotice(final.exitCode === null ? undefined : tx.recovery.recovered(tx.finalText), final);
+        const notice = recoveredErrorNotice(tx.recovery.recovered(tx.finalText, final.exitCode), final);
         return notice === undefined ? [] : [notice];
       },
     });

@@ -586,32 +586,45 @@ export function earlyVerdict(exit: ExitInfo, durationMs: number): Verdict | unde
  * the CLI may still exit non-zero. An adapter that treats any error event as
  * terminal then fails a job that completed.
  *
- * The rule is deliberately narrow. The LAST error is recovered only when
- * assistant text arrived after it (tool activity alone is not a report), so an
- * error that is the final meaningful event, or that comes after the last text,
- * stays a failure. A later error replaces an earlier one and must itself be
- * followed by text.
+ * Recovery needs assistant text after the LAST error and positive completion
+ * evidence: a clean exit or an adapter-confirmed terminal event. Further text
+ * or tool activity invalidates that event, so a retry preamble followed by a
+ * crash cannot masquerade as a completed report.
  */
 export class ErrorRecovery {
-  private last: { message: string; at: string; label: string; textAfter: boolean } | undefined;
+  private last: { message: string; at: string; label: string; textAfter: boolean; completed: boolean } | undefined;
 
   /** Record an error event. `label` names it in the warning, e.g. "a provider connection error". */
   noteError(label: string, message: string, at: string): void {
-    this.last = { label, message, at, textAfter: false };
+    this.last = { label, message, at, textAfter: false, completed: false };
   }
 
   /** Feed the events the translator just produced. */
   observe(events: readonly ProviderEvent[]): void {
     if (this.last === undefined) return;
     for (const e of events) {
+      if (e.kind === 'text' || e.kind === 'activity-start' || e.kind === 'activity-update' || e.kind === 'activity-end') {
+        this.invalidateCompletion();
+      }
       if (e.kind === 'text' && e.stream !== 'thinking' && e.text.trim() !== '') this.last.textAfter = true;
     }
   }
 
-  /** The recovered error, when the run delivered a non-empty report after it. */
-  recovered(finalText: string): { label: string; message: string; at: string } | undefined {
+  /** New work means a previously completed step no longer proves the run ended. */
+  invalidateCompletion(): void {
+    if (this.last !== undefined) this.last.completed = false;
+  }
+
+  /** Called only for a provider event that explicitly confirms normal completion. */
+  noteCompletion(): void {
+    if (this.last?.textAfter) this.last.completed = true;
+  }
+
+  /** A failed exit needs explicit completion evidence, not just partial output. */
+  recovered(finalText: string, exitCode: number | null): { label: string; message: string; at: string } | undefined {
     const l = this.last;
-    return l !== undefined && l.textAfter && finalText.trim() !== '' ? l : undefined;
+    return l !== undefined && l.textAfter && finalText.trim() !== ''
+      && exitCode !== null && (exitCode === 0 || l.completed) ? l : undefined;
   }
 }
 
