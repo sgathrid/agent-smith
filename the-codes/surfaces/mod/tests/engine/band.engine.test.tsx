@@ -20,6 +20,7 @@ import type { BandLine, BandBudget } from '../../hooks/band.ts';
 import { BAND_ROWS, buildLine, isShown, noColor, rowBudget } from '../../hooks/band.ts';
 import type { RadarJob } from '../../../types/index.d.ts';
 import { proseText } from '../../hooks/views.tsx';
+import { updateLine } from '../../hooks/update.ts';
 
 // ── fixtures ────────────────────────────────────────────────────────────────
 
@@ -847,7 +848,7 @@ describe('update check', () => {
     await start($);
     await clock.advance(1);
     expect(seen.fetched).toEqual(['https://raw.githubusercontent.com/sgathrid/agent-smith/main/builds/local-plugin/agent-smith/.claude-plugin/plugin.json']);
-    expect(seen.toasts).toEqual(['agent-smith update available: v0.2.1 → v0.2.3. Update in /plugin → Installed, then restart Claude Code.']);
+    expect(seen.toasts).toEqual([updateLine('0.2.1', '0.2.3')]);
   });
 
   test('an installed version that matches main says nothing', async ($, on) => {

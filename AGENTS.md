@@ -18,7 +18,7 @@ After the merge, the `Release tag` workflow tags `main` as `agent-smith--v<versi
 ## How users learn about an update
 
 - Claude Code auto-updates a third-party marketplace like this one only if the user turned auto-update on for it (README, "Updates").
-- Otherwise the mod tells them: on session start it fetches the released `plugin.json` on `main` and shows one toast, `agent-smith update available: vX → vY` (`the-codes/surfaces/mod/hooks/update.ts`). It is skipped under `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`. This only works if the version on `main` actually rises, which is the second reason to bump.
+- Otherwise the mod tells them: on session start it fetches the released `plugin.json` on `main` and shows one toast naming both versions and how to update (`updateLine` in `the-codes/surfaces/mod/hooks/update.ts`). It is skipped under `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`. This only works if the version on `main` actually rises, which is the second reason to bump.
 
 ## Text Claude reads vs. text the user sees
 

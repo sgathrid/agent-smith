@@ -34,5 +34,5 @@ export function isNewer(latest: string, current: string): boolean {
 /** The toast, or null when there is nothing to say. */
 export function updateLine(current: string | null, latest: string | null): string | null {
   if (current === null || latest === null || !isNewer(latest, current)) return null;
-  return `agent-smith update available: v${current} → v${latest}. Update in /plugin → Installed, then restart Claude Code.`;
+  return `agent-smith update available: v${current} to v${latest}. Update it in /plugin under Installed, in the scope you installed it in, then restart Claude Code.`;
 }
