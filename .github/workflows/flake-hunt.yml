@@ -37,11 +37,29 @@ jobs:
       - run: npm --prefix the-codes/surfaces/channel ci
       - name: Suite x RUNS under CPU load
         run: |
-          for i in 1 2; do yes > /dev/null & done
+          load_pids=()
+          for i in 1 2; do yes > /dev/null & load_pids+=($!); done
+          trap 'kill "${load_pids[@]}" 2>/dev/null || true' EXIT
           pids=()
           for i in $(seq "$RUNS"); do npm test > "run-$i.log" 2>&1 & pids+=($!); done
           status=0
-          for p in "${pids[@]}"; do wait "$p" || status=1; done
-          kill $(jobs -p) 2>/dev/null || true
-          grep -h '^✖ ' run-*.log | grep -v 'failing tests' | sort | uniq -c | sort -rn || true
+          for i in "${!pids[@]}"; do
+            run=$((i + 1))
+            if wait "${pids[$i]}"; then
+              echo "Suite $run passed (exit 0)."
+            else
+              code=$?
+              status=1
+              echo "::group::Suite $run failed (exit $code)"
+              cat "run-$run.log"
+              echo "::endgroup::"
+            fi
+          done
           exit $status
+      - name: Upload suite logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: stress-logs-${{ matrix.os }}
+          path: run-*.log
+          retention-days: 14
