@@ -126,7 +126,7 @@ test('ACCEPTANCE: a job spawned through the tool appears in the mod pane', async
   const service = new ForgeService({ repo: r });
 
   /* 1. SPAWN. Through the same code path the MCP tool calls. */
-  const ack = await service.spawnJob({
+  const { ack, done } = await service.spawnTracked({
     mode: 'implement',
     prompt: '# Dashboard rework\n\nRebuild the pane and prove it renders.',
     provider: 'agy',
@@ -143,10 +143,13 @@ test('ACCEPTANCE: a job spawned through the tool appears in the mod pane', async
   // is what makes a spawn failure a `failed` job rather than a vanished one.
   assert.ok(existsSync(path.join(ack.dir, 'job.json')), 'job.json exists the moment spawn_job returns');
 
-  /* 2. WAIT for the real child process. */
-  // `spawnJob` is fire-and-forget by design; wait for the terminal state the same
-  // way the DAG runner does, via the observable filesystem.
-  const manifest = await waitForTerminal(r, ack.jobId, 20_000);
+  /* 2. WAIT for the complete lifecycle, then read the persisted verdict. */
+  // spawnJob delegates to spawnTracked. Its completion includes the Git snapshot,
+  // whose test budget is 60s: a separate 60s poll races that allowed operation.
+  // The test runner's timeout bounds this wait; the assertions below still read
+  // the same files the pane uses.
+  await done;
+  const manifest = JSON.parse(readFileSync(path.join(ack.dir, 'job.json'), 'utf8'));
 
   assert.equal(manifest.status, 'succeeded', `expected success, got: ${manifest.error ?? 'no error'}`);
   assert.equal(manifest.provider, 'agy');
