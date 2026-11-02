@@ -1,10 +1,12 @@
 {
   "name": "agent-smith",
-  "version": "0.3.2",
-  "description": "Native Claude Code task-list projection and a live progress band for Agent Smith workers. The /forge command expands the bottom worker roster; an inspector is optional.",
+  "version": "0.3.3",
+  "description": "Delegate to Codex, OpenCode, agy, Kimi, and Claude workers from Claude Code, with live progress, resumable conversations, and executable checks.",
   "author": {
     "name": "Agent Smith"
   },
+  "homepage": "https://github.com/sgathrid/agent-smith#readme",
+  "repository": "https://github.com/sgathrid/agent-smith",
   "license": "MIT",
   "types": "./types/index.d.ts",
   "mcpServers": {

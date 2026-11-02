@@ -842,12 +842,12 @@ describe('update check', () => {
   }
   const released = (version: string) => ({ ok: true, text: JSON.stringify({ name: 'agent-smith', version }) });
 
-  test('a newer release on main is one toast naming both versions', async ($, on) => {
+  test('a newer release on main is one toast naming both versions and how to update', async ($, on) => {
     const { seen, clock } = updateHost(on, '0.2.1', released('0.2.3'));
     await start($);
     await clock.advance(1);
     expect(seen.fetched).toEqual(['https://raw.githubusercontent.com/sgathrid/agent-smith/main/builds/local-plugin/agent-smith/.claude-plugin/plugin.json']);
-    expect(seen.toasts).toEqual(['agent-smith update available: v0.2.1 → v0.2.3']);
+    expect(seen.toasts).toEqual(['agent-smith update available: v0.2.1 → v0.2.3. Update in /plugin → Installed, then restart Claude Code.']);
   });
 
   test('an installed version that matches main says nothing', async ($, on) => {
