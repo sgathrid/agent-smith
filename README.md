@@ -47,9 +47,12 @@ The combined install requires Claude Code v2.1.275+ inside a session or v2.1.292
 
 ### Updates
 
-Update the scope you installed in, then restart Claude Code:
+Update the scope you installed in, then restart Claude Code.
+
+In a session, open `/plugin`, go to **Installed**, select Agent Smith in that scope, and choose **Update now**. Or use your shell, refreshing the marketplace first:
 
 ```sh
+claude plugin marketplace update agent-smith
 claude plugin update agent-smith@agent-smith --scope user    # all projects
 claude plugin update agent-smith@agent-smith --scope local   # run inside the repository
 claude plugin update agent-smith@agent-smith --scope project # run inside the repository
@@ -57,7 +60,7 @@ claude plugin update agent-smith@agent-smith --scope project # run inside the re
 
 Always pass `--scope`. Without it, a command run inside a repository can update that repository's install and leave your user-wide one behind.
 
-To update automatically, run `/plugin`, open **Marketplaces**, select `agent-smith` and choose **Enable auto-update**. Otherwise Agent Smith tells you when a session starts: `agent-smith update available: v0.2.2 → v0.2.3`. It skips that check when `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set.
+To update automatically, run `/plugin`, open **Marketplaces**, select `agent-smith` and choose **Enable auto-update**. Otherwise Agent Smith shows a session-start toast with the available version, where to update, and a reminder to restart Claude Code. It skips that check when `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set.
 
 To remove it: `claude plugin uninstall agent-smith@agent-smith --scope <scope>`, run inside the repository for `local` or `project`.
 
@@ -152,18 +155,9 @@ Before you open a pull request that changes the plugin, run `npm run bump` (or `
 <details>
 <summary>Update, uninstall, and troubleshoot</summary>
 
-**Update**, then restart Claude Code:
+**Update or uninstall?** Follow [Updates](#updates) above and use the scope you installed in. Restart Claude Code after updating.
 
-```sh
-claude plugin marketplace update agent-smith
-claude plugin update agent-smith@agent-smith
-```
-
-**Uninstall:**
-
-```sh
-claude plugin uninstall agent-smith@agent-smith
-```
+**Update says you're current, but the toast keeps appearing?** Your copy of the marketplace is stale. Run `claude plugin marketplace update agent-smith`, then update again in the same scope.
 
 **Provider unavailable?** Make sure its CLI runs and is authenticated in the shell you launch Claude Code from, then restart Claude Code. From a source checkout, `node scripts/agent-smith.mjs doctor` checks CLI compatibility, but does not test authentication or model access.
 
@@ -173,4 +167,4 @@ claude plugin uninstall agent-smith@agent-smith
 
 </details>
 
-MIT licensed.
+[MIT licensed](LICENSE).
