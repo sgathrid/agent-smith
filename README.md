@@ -93,11 +93,11 @@ Follow-ups resume a finished worker, or steer a running one mid-run.
 
 **Verify a change:**
 
-> Have Codex run the relevant tests for this change and report any failures. Don't edit the code.
+> Have GPT-6.1-Sol run the relevant tests for this change and report any failures. Don't edit the code.
 
 **Get another perspective:**
 
-> Have OpenCode review the proposed design for failure modes before we implement it.
+> Have Deepseek Flash v4.1 in OpenCode review the proposed design for failure modes before we implement it.
 
 **Second opinion from Moonshot:**
 
