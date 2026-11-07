@@ -10,6 +10,9 @@ Agent Smith brings Codex, OpenCode, agy, and Kimi into Claude Code's delegation 
 
 > Have Codex review the changes on this branch. Call the worker Ada.
 
+<img width="1624" height="1004" alt="Screenshot 2026-11-07 at 12 06 45 PM" src="https://github.com/user-attachments/assets/8165f273-912e-4f91-bba7-e4c593e2afb6" />
+
+
 ## Install
 
 You need **Node.js 22.18+**, a current **Claude Code**, and at least one worker CLI (`codex`, `opencode`, `agy`, or `kimi`) installed and authenticated. Agent Smith uses those CLIs and their configured accounts. It also supports separate `claude` workers. Kimi Code CLI (`kimi`) is installed from [MoonshotAI/kimi-code](https://github.com/MoonshotAI/kimi-code).
