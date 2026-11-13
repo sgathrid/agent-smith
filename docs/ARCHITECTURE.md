@@ -43,6 +43,7 @@ State lives in `<repo>/.agent-smith/jobs/<jobId>/` (gitignored). `FILES` in `for
 | `cancel.steer` | `ForgeService.steer` (`delivery: 'interrupt'`) | Marker telling the owning pump to abort the active turn and immediately chain the queued steer turn. Cleared by `ForgeService.cancel` if user cancellation wins. |
 | `steer.jsonl` | `ForgeService.steer` | Append-only JSONL log of `SteerEntry` records consumed by the owning `pump` loop. |
 | `steer.head` | `ForgeService.pump` | Child job ID written after the continuation anchor exists and before the parent stamps `supersededBy`; lets `resolveHead` (cancel/status) cross that finish window. |
+| `request.json` | `spawn_job` handler (fresh spawns only) | The request the worker was started with (mode, prompt, context, files, cwd, provider, model, effort, timeout, unrestricted), so `spawn_job` `from` can reuse it. Its `checks` come from `checks.json`. Absent for pipeline stages and older jobs. |
 | `acceptance.json` | `forge/checks.ts` (only when `spawn_job` got `checks`) | Sidecar, see Acceptance. Not in `FILES`. |
 | `env-keys.json` | `ForgeService` (only when the spawn got `env`) | The names of the worker's extra environment variables. Values are never written anywhere (`ENV_KEYS_FILE`, `spawn-request.ts`). |
 
@@ -263,6 +264,8 @@ prompt, joined by a blank line:
 5. the mode's guidance, when the mode is in the closed set;
 6. an evidence line: only claim what you can point to, and say what isn't verified.
 
+The brief also asks the worker to start its report with a `Status:` line and lists files already modified in the workspace.
+
 A resume (`conversation` set) already holds the brief, so it gets only the context and
 check lines, and only when that request supplies them; otherwise nothing is prepended.
 Pipeline retries that continue the same conversation pass neither. The brief is not
@@ -325,9 +328,13 @@ file the warm-up wrote instead of probing the CLI again.
   `roleDefaults` target is dropped with an error. No built-in aliases. `run_pipeline`
   expands aliases in explicit stages (mode = `role ?? name`) and applies `roleDefaults` to
   default stages; `resume_job` expands aliases (provider fixed by the original job).
+  There is no hard-coded default provider: if no alias or role default names one, the only
+  installed provider is used, and with several installed the call fails with "provider is
+  required: installed are …" (`stage-defaults.ts`).
 - Default pipeline (no `stages`): implement -> review -> moderate (moderate depends on
-  both), provider per stage preferring agy/codex/claude among installed, else an unused or
-  any installed one. Model/effort come from the provider's catalog default only when its
+  both), provider per stage by the same rule as `spawn_job`: a configured `roleDefaults`
+  provider, else the only installed provider; with several installed it fails with
+  "provider is required: installed are …". Model/effort come from the provider's catalog default only when its
   `defaultSource` is `harness-config`.
 
 ## Acceptance
@@ -383,7 +390,7 @@ only (never progress), all worker text treated as untrusted data.
 Claude                MCP server (dist/server.js)      Claude Code hooks           watch-hook.js
   | spawn_job(...)  ------>  validate, write job.json,
   |                          detach pump ----------------------------> provider CLI (events -> job dir)
-  | <---- SpawnAck {jobId, dir, repo, notify{mode:'hook', note, fallback}} (ms)
+  | <---- slim ack {jobId, name, provider, model, status, timeoutMs, repo, unrestricted, ...} (ms)
   |
   |   PostToolUse(matcher: mcp__plugin_agent-smith_agent-smith__{spawn_job|resume_job|run_pipeline})
   |         hook stdin JSON {tool_name, tool_response, cwd} --------> parseHookInput -> {job|run, id, repo}
@@ -402,7 +409,7 @@ Claude                MCP server (dist/server.js)      Claude Code hooks        
   announcer per job. The mod hooks no `classic.*` event: Claude Code's built-in
   guard (`cc-plugin-sec-default`) sends `classic.PostToolUse` past user-tier
   modules, so `tool.call` is the only path. A `status`/`pipeline_status` read of a
-  settled job on the main loop (`tool.call` with no `agentId`) retires its notice.
+  settled job on the main loop (`tool.call` with no `agentId`) retires its notice, as does a `cancel` that returns `settled: true`.
   It declines (calls `next`) in legacy mode, after a read error, or when the ack's
   repo is not the one it polls. Each 3 s poll announces claimed jobs that ended, or
   went quiet (once: `no output for 16m`, with `(in \`npm test\`)` when a call is open), or
@@ -410,14 +417,14 @@ Claude                MCP server (dist/server.js)      Claude Code hooks        
   asks for an interrupt. It holds a pending acceptance verdict for the checks' budget, with one
   `$.prompt.submit` turn credited to the plugin. Claude Code shows that message to
   the user in full, so it is the only notice: one line per job, no worker summary. Only claimed ids are announced, so two sessions on one repo
-  never wake each other. A claimed run is announced with its stage jobs when the
+  never wake each other. A `spawn_job` with `variants` returns `{jobs:[...]}` and every variant job is claimed and watched. A claimed run is announced with its stage jobs when the
   run ends. `/clear` resets session state, so a job claimed before it goes
   unannounced (the band still shows it).
 - **Hook watcher** (`watch-hook.ts`), the fallback when no mod claims the launch: `build-plugin.mjs` generates `hooks/watch-hooks.json`
   (`PostToolUse`, `asyncRewake: true`, `timeout: 21900` s) running
   `runtime/dist/watch-hook.js`. `parseHookInput` strips the MCP prefix, unwraps the result
   (`structuredContent` or JSON text), takes `jobId` or `runId`, and resolves the repo from
-  `payload.repo`, else `dir`/`recordPath`, else hook `cwd`, else `process.cwd()`. It watches that one job/run (a run also its stage jobs) in-process,
+  `payload.repo`, else hook `cwd`, else `process.cwd()`. It watches that one job/run (a run also its stage jobs) in-process,
   prints the notice to stderr and exits 2 (Claude Code labels that wake "Stop hook
   feedback" and the label can't be changed, so the notice ends by saying it is not an
   error). Any error or non-matching tool exits 0
@@ -431,22 +438,15 @@ Claude                MCP server (dist/server.js)      Claude Code hooks        
   standalone
   `monitor.js` defaults to `DEFAULT_WATCH_TIMEOUT_MS` = 46 min. On timeout it emits "still
   running; check status <ids>" (exit 2 from the hook).
-- **Tasks-shaped handle and opt-in MCP Tasks**: acks carry `taskHandle {taskId, status:'working', pollIntervalMs}` and
-  `status`/`list_jobs` add `taskStatus` (`views.ts` `taskStatus`), the MCP Tasks extension's
-  vocabulary (`pollIntervalMs` is `notify.ts` `POLL_MS`). When `AGENT_SMITH_TASKS=1` is enabled and a
+- **Opt-in MCP Tasks**: `status`/`list_jobs` add `taskStatus` (`views.ts` `taskStatus`), the MCP Tasks extension's
+  vocabulary. When `AGENT_SMITH_TASKS=1` is enabled and a
   modern (`2026-07-28`) `spawn_job` or `resume_job` request advertises `io.modelcontextprotocol/tasks`,
   the server returns a protocol `resultType: 'task'` handle (`tasks.ts`) and stamps
   `_meta['io.agent-smith/task-result']: true` on the terminal result so `notice.ts` (`parseLaunch`)
   never double-announces a Tasks-managed job.
-- **Fallback**: acks carry `notify {mode:'hook', note, fallback {when, use, monitorCommand?,
-  monitorTimeoutMs?}}`. `note` says a notice is coming; `fallback.when` names the only cases to
-  wait yourself: no notice by the job's timeout + its checks' budget + 2 min (a run: `pipeline_status` shows it
-  ended), a headless session that can't receive messages between turns, or a subagent that
-  must return the result. Nothing runnable sits at the top level:
-  agents handed `monitorCommand` there ran it at once and heard about each job twice.
-  `monitorCommand` (only when running from the built `dist/`) is `node .../monitor.js
-  --job <id>|--run <id> --cwd <repo>`, to run in the background
-  (`monitorTimeoutMs` = min(job timeout, 30 min); re-arm on expiry). Or `status wait_ms`.
+- **Subagents and headless sessions**: they receive no announcement. The server instructions tell them to call
+  `status` with `wait_ms` until the job settles. The standalone `monitor.js --job <id>|--run <id> --cwd <repo>` CLI
+  still exists for a human or script; acks no longer mention it.
 - **Why the always-on monitor was removed**: a `when: always` monitor polled every job dir
   every 5 s for the whole session and appeared in Claude's exit dialog. The hook is scoped
   to one job and gone when it finishes.
@@ -476,8 +476,7 @@ user (up to 10 minutes) before anything launches.
   an env opt-out) and kimi is always true because its print mode force-sets auto, so it cannot
   be restricted. `job.json` records the effective posture, not a request that had no effect;
   read-only is not enforceable for kimi. Each harness
-  owns its sandbox (see CONFIGURATION.md); the ack echoes `sandbox`, `sandboxFlags`,
-  `readOnlyRequested`, `readOnlyEnforced`.
+  owns its sandbox (see CONFIGURATION.md); the ack carries `unrestricted` and, for read-only modes, `readOnlyEnforced`.
 - `env` on `spawn_job`, `resume_job` and pipeline stages adds worker environment variables
   (keys `^[A-Za-z_][A-Za-z0-9_]*$`, string values without NUL; `validateEnv`). Values live in
   memory only: `env-keys.json` and the ack's `envKeys` carry names. `resume_job` does not
@@ -485,8 +484,9 @@ user (up to 10 minutes) before anything launches.
 - Worker-authored fields (`report`, `latestSummary`) are untrusted data; `latestSummary`
   is bounded assistant output with source `worker`, never thinking or generic tool output.
   Verify with checks or the diff.
-- Cancellation: the marker is intent. Only the owning process holds the worker handle; a
-  cancel from another process records the marker and says it cannot signal. If the owner
+- Cancellation: the marker is intent. Only the owning process holds the worker handle. `cancel`
+  waits up to 5 s for the job or run to settle and reports `settled`; a settled cancel writes the
+  claim marker so the hook stays silent. If the owner
   dies the job is derived `failed (orphaned)`; there is no automatic replay or lease
   reconciliation.
 - Provider auth, permissions and resume capabilities remain provider-owned. Not
