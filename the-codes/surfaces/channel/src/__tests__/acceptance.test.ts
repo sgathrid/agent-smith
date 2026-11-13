@@ -83,6 +83,19 @@ test('no checks: unchecked acceptance on status', async () => {
   assert.deepEqual(s.acceptance, { state: 'unchecked' }); assert.equal(s.waited, undefined);
 });
 
+test('status wait_ms keeps waiting while acceptance checks run, and returns once they settle', async () => {
+  const f = fake('succeeded');
+  writeAcceptance(f.repo, 'job-1', { state: 'unchecked', checks: [], pending: true, budgetMs: 60_000, running: 'suite' });
+  const started = Date.now();
+  setTimeout(() => writeAcceptance(f.repo, 'job-1', { state: 'accepted', checks: [] }), 150);
+  const s = body(await callTool(f.ctx, 'status', { jobId: 'job-1', wait_ms: 5_000 }));
+  assert.ok(Date.now() - started >= 140, 'did not return while the checks were still running');
+  assert.equal(s.stillRunning, false); assert.equal(s.acceptance.state, 'accepted');
+  // Still pending when the wait ends: reported as still running, not settled.
+  writeAcceptance(f.repo, 'job-1', { state: 'unchecked', checks: [], pending: true, budgetMs: 60_000, running: 'suite' });
+  assert.equal(body(await callTool(f.ctx, 'status', { jobId: 'job-1', wait_ms: 60 })).stillRunning, true);
+});
+
 test('status wait_ms long-polls and is capped', async () => {
   const f = fake('succeeded', 3);
   const s = body(await callTool(f.ctx, 'status', { jobId: 'job-1', wait_ms: 2000 }));
