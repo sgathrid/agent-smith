@@ -3,24 +3,16 @@
  *
  * Every provider quirk and every judgement call lives HERE and only here, so
  * this file is the single place a reviewer reads to answer "why did that job
- * show up as failed?". Readers (agent-smith.ts, agy-staff.ts) are dumb parsers;
- * they extract facts and get out of the way.
+ * show up as failed?". Readers (agent-smith.ts) are dumb parsers; they
+ * extract facts and get out of the way.
  *
- * The headline rule, stated once and enforced below:
- *
- *   ┌──────────────────────────────────────────────────────────────────┐
- *   │ AN EMPTY RESPONSE WITH WARNINGS IS NOT A CLEAN SUCCESS.           │
- *   │ agy-staff will happily write { status:'done', warnings:true } and │
- *   │ an empty result.md when the underlying run degraded. Reporting     │
- *   │ that as `succeeded` with no warnings is a lie the mod band would  │
- *   │ happily render as a green check. We downgrade to `failed` and      │
- *   │ attach `suspicious_success`.                                      │
- *   └──────────────────────────────────────────────────────────────────┘
+ * The headline rule, an empty response is not a clean success, is applied
+ * once, when the job is written (forge/format.ts `deriveStatus`), and not
+ * re-derived here.
  */
 
 import { SCHEMA_VERSION } from "../forge/format.ts";
 import { STEER_NOT_APPLIED_RE } from "../surfaces/mod/hooks/reasons.ts";
-import { AGY_PAYLOAD } from "./agy-staff.ts";
 import { SMITH_PAYLOAD } from "./agent-smith.ts";
 import {
   type JobNormalizer,
@@ -50,187 +42,12 @@ function asStringArray(v: unknown): string[] {
   return v.filter((x): x is string => typeof x === "string");
 }
 
-/** A "clean enough" answer. Whitespace and short filler count as empty. */
-function looksEmpty(text: string | null): boolean {
-  if (text === null) return true;
-  const t = text.trim();
-  if (t.length === 0) return true;
-  // A single stray character is not a deliverable.
-  if (t.length < 8) return true;
-  return false;
-}
-
-// ── agy-staff normalizer ────────────────────────────────────────────────────
-
-/**
- * Map an agy-staff payload onto ObservedJob.
- *
- * Status precedence (highest first):
- *   1. cancel marker exists                         ⇒ canceled    (HAZARD B)
- *   2. status.json status === 'canceled'           ⇒ canceled
- *   3. status.json status === 'error'               ⇒ failed
- *   4. status.json status === 'done'                ⇒ succeeded,
- *        UNLESS empty-output-with-warnings          ⇒ failed (suspicious_success)
- *   5. no status.json but progress evidence present ⇒ running
- *   6. nothing conclusive                           ⇒ unknown
- */
-const agyNormalizer: JobNormalizer = (raw: RawJobState): ObservedJob => {
-  const p = raw.payload;
-  let warnings: ObservedWarning[] = [];
-
-  const canceled = asBool(p[AGY_PAYLOAD.canceled]) === true;
-  const terminalStatus = asString(p[AGY_PAYLOAD.status]);
-  const statusWarnings = asBool(p[AGY_PAYLOAD.statusWarnings]);
-  const statusReason = asString(p[AGY_PAYLOAD.statusReason]);
-  const progressWarnings = asStringArray(p[AGY_PAYLOAD.progressWarnings]);
-  const output = asString(p[AGY_PAYLOAD.output]);
-  const hasProgressFile = asBool(p[AGY_PAYLOAD.hasProgressFile]) === true;
-  const lastEventAt = asString(p[AGY_PAYLOAD.lastEventAt]);
-  const finishedAt = asString(p[AGY_PAYLOAD.finishedAt]);
-  const strippedCount = asNumber(p[AGY_PAYLOAD.notificationsStripped]) ?? 0;
-
-  const telemetry = (p[AGY_PAYLOAD.telemetry] ?? {}) as Record<string, unknown>;
-
-  // -- warning: de-polluted result (HAZARD C) ---------------------------------
-  if (strippedCount > 0) {
-    warnings.push({
-      code: "polluted_result",
-      message: `Removed ${strippedCount} <system_notification> block${strippedCount === 1 ? '' : 's'} from the result text.`,
-    });
-  }
-
-  // -- warning: tool errors observed during the run --------------------------
-  const sawAgyError = asBool(telemetry["saw_agy_error"]) === true;
-  if (sawAgyError || progressWarnings.length > 0) {
-    const detail =
-      asString(telemetry["agy_error_reason"]) ??
-      (progressWarnings[0] ?? "provider reported warnings");
-    warnings.push({ code: "tool_error", message: detail });
-  }
-
-  // -- warning: cancellation --------------------------------------------------
-  if (canceled || terminalStatus === "canceled") {
-    warnings.push({ code: "canceled", message: "canceled" });
-  }
-
-  // -- status resolution ------------------------------------------------------
-  const emptyOutput = looksEmpty(output);
-  let status: ObservedStatus;
-
-  if (canceled || terminalStatus === "canceled") {
-    status = "canceled";
-  } else if (terminalStatus === "error") {
-    status = "failed";
-  } else if (terminalStatus === "done") {
-    // ── THE HEADLINE RULE ──────────────────────────────────────────────────
-    // "done" + (warnings OR an empty answer) is a SUSPICIOUS success. We
-    // refuse to call it `succeeded`, because doing so is exactly the failure
-    // mode this project exists to eliminate: reporting work as done that was
-    // not. Empty-and-warned ⇒ failed with a suspicious_success warning.
-    if (emptyOutput) {
-      status = "failed";
-      warnings.push({
-        code: "empty_output",
-        message: "no output",
-      });
-      if (statusWarnings === true || progressWarnings.length > 0) {
-        warnings.push({
-          code: "suspicious_success",
-          message: "success with warnings and no output",
-        });
-      } else {
-        warnings.push({
-          code: "suspicious_success",
-          message: "success with no output",
-        });
-      }
-    } else {
-      // Non-empty output: still downgrade to `failed` if the provider flagged
-      // hard warnings? No — warnings alone don't fail a job that clearly
-      // produced work. But `statusWarnings: true` with no progress warning
-      // text and a suspiciously short body is still suspicious; we flag it as
-      // a warning while keeping status `succeeded`. This is the "clean success
-      // vs. clean-ish success" distinction: warn loudly, don't overclaim.
-      status = "succeeded";
-      if (statusWarnings === true) {
-        warnings.push({
-          code: "suspicious_success",
-          message: "done with warnings; review it",
-        });
-      }
-    }
-  } else if (hasProgressFile || lastEventAt !== null) {
-    // Terminal status file not written yet but live evidence present ⇒ running.
-    status = "running";
-  } else {
-    // No status.json, no progress. Could be a job that was cleaned up entirely,
-    // or a job we know nothing about. `unknown` is the honest answer.
-    status = "unknown";
-    warnings.push({
-      code: "incomplete_state",
-      message: "no status or progress found",
-    });
-  }
-
-  // A canceled job that also has an empty output is expected; don't double-flag.
-  if (status === "canceled" && emptyOutput) {
-    warnings = warnings.filter((w) => w.code !== "empty_output");
-  }
-
-  // -- usage ------------------------------------------------------------------
-  let usage: ObservedUsage | null = null;
-  // Built field-by-field as telemetry is parsed, so the accumulator itself is
-  // mutable even though the published `ObservedUsage` shape is readonly.
-  type UsageAccumulator = { -readonly [K in keyof ObservedUsage]: ObservedUsage[K] };
-  const usageParts: UsageAccumulator = {};
-  const tin = asNumber(telemetry["tokens_in"]);
-  const tout = asNumber(telemetry["tokens_out"]);
-  const tthink = asNumber(telemetry["tokens_think"]);
-  const tcache = asNumber(telemetry["tokens_cache"]);
-  const durMs = asNumber(telemetry["duration_ms"]);
-  const turns = asNumber(telemetry["turns"]);
-  if (tin !== null) usageParts["inputTokens"] = tin;
-  if (tout !== null) usageParts["outputTokens"] = tout;
-  if (tthink !== null) usageParts["thinkingTokens"] = tthink;
-  if (tcache !== null) usageParts["cacheTokens"] = tcache;
-  if (durMs !== null) usageParts["durationMs"] = durMs;
-  if (turns !== null) usageParts["turns"] = turns;
-  if (Object.keys(usageParts).length > 0) usage = usageParts;
-
-  // -- startedAt: agy-staff does not store a clean start time on the files we
-  // read, so we leave it null rather than guessing. (Honor the contract: an
-  // explicit null beats an invented value.)
-  const startedAt: string | null = null;
-
-  // -- updatedAt: the freshest timestamp we have. --
-  const updatedAt = lastEventAt ?? finishedAt;
-
-  return {
-    provider: "agy-staff",
-    jobId: raw.jobId,
-    status,
-    warnings,
-    output,
-    startedAt,
-    updatedAt,
-    finishedAt,
-    mode: asString(p[AGY_PAYLOAD.mode]),
-    model: asString(p[AGY_PAYLOAD.model]) ?? asString(telemetry["model"]),
-    label: asString(p[AGY_PAYLOAD.profile]),
-    outputTruncated: asBool(p[AGY_PAYLOAD.outputTruncated]) === true,
-    usage,
-    partial: raw.partial === true,
-    raw: p,
-  };
-};
-
 // ── agent-smith normalizer ──────────────────────────────────────────────────
 
 /**
  * Map an agent-smith payload onto ObservedJob.
  *
- * THIS IS THE PRIMARY NORMALIZER, and it is far shorter than the two above
- * because we own the format (see forge/format.ts). Three rows, in order:
+ * It is short because we own the format (see forge/format.ts). Three rows, in order:
  *
  *   1. cancel marker exists                    ⇒ canceled   (outranks job.json:
  *      the marker is written the instant cancel is requested, and the worker may
@@ -330,10 +147,7 @@ const smithNormalizer: JobNormalizer = (raw: RawJobState): ObservedJob => {
     });
   }
 
-  // A cancelled job's empty output is expected, not a defect.
-  const kept = resolved === "canceled" ? warnings.filter((w) => w.code !== "empty_output") : warnings;
-
-  return buildSmith(raw, resolved, kept);
+  return buildSmith(raw, resolved, warnings);
 };
 
 /** Assemble the ObservedJob for the agent-smith normalizer. */
@@ -402,50 +216,9 @@ function asUsage(v: unknown): ObservedUsage | null {
   return Object.keys(out).length > 0 ? out : null;
 }
 
-// ── registry of normalizers ─────────────────────────────────────────────────
-
-const NORMALIZERS: ReadonlyMap<string, JobNormalizer> = new Map<string, JobNormalizer>([
-  ["agent-smith", smithNormalizer],
-  ["agy-staff", agyNormalizer],
-]);
-
-/**
- * Normalize a raw provider snapshot.
- *
- * Unknown provider ⇒ returns a minimal `unknown` ObservedJob rather than
- * throwing, so adding a reader before adding its normalizer degrades to
- * "shows up but unknown", not "crashes the band".
- */
+/** Normalize a raw agent-smith job snapshot. */
 export function normalize(raw: RawJobState): ObservedJob {
-  const norm = NORMALIZERS.get(raw.provider);
-  return norm ? norm(raw) : fallbackNormalizer(raw);
+  return smithNormalizer(raw);
 }
 
-/** Minimal normalization used when no provider-specific normalizer is registered. */
-function fallbackNormalizer(raw: RawJobState): ObservedJob {
-  return {
-    provider: raw.provider,
-    jobId: raw.jobId,
-    status: "unknown",
-    warnings: [
-      {
-        code: "incomplete_state",
-        message: `No normalizer registered for provider "${raw.provider}".`,
-      },
-    ],
-    output: null,
-    startedAt: null,
-    updatedAt: null,
-    finishedAt: null,
-    mode: null,
-    model: null,
-    label: null,
-    outputTruncated: false,
-    usage: null,
-    partial: true,
-    raw: raw.payload,
-  };
-}
-
-// Register the agy normalizer under the reader's provider key.
-export { agyNormalizer, smithNormalizer };
+export { smithNormalizer };

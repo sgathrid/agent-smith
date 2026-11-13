@@ -1,4 +1,4 @@
-import {h as readManifest,c as readPipeline,d as cancelPipeline,n as normalize,A as AgentSmithReader,k as AgyStaffReader,P as PROVIDERS,l as errMessage,o as findProvider,w as writeJsonAtomic,j as jobFile,F as FILES,q as SCHEMA_VERSION,t as validOwnerPid,u as ownerAlive,g as isTerminalForgeStatus,x as reportFor,y as cwdFacts,z as deriveOrphan,B as deriveStatus,C as writeAtomic,E as summaryTail,G as failureFields,R as REASONS,b as readAcceptance,H as writeAcceptance,p as providerNames,I as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,J as nextActionFor,K as jobDir,L as fileSig,N as jobsDir,O as JobWriter,Q as isMode,T as newJobId,U as humanDuration,V as pipeEvents,W as pipelineRecordPath,X as isForgeJobId,Y as computeStaleReads,Z as SMITH_PAYLOAD,_ as isForgeStatus}from'./chunk-execute.js';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import {readFileSync,existsSync,mkdirSync,appendFileSync,realpathSync,lstatSync,copyFileSync,statSync,readdirSync,unlinkSync}from'node:fs';import path from'node:path';/** Detached execution, with one preparation barrier before a worker may start. */
+import {h as readManifest,c as readPipeline,d as cancelPipeline,A as AgentSmithReader,n as normalize,P as PROVIDERS,k as errMessage,l as findProvider,w as writeJsonAtomic,j as jobFile,F as FILES,o as SCHEMA_VERSION,q as validOwnerPid,t as ownerAlive,g as isTerminalForgeStatus,u as reportFor,x as cwdFacts,y as deriveOrphan,z as deriveStatus,B as writeAtomic,C as summaryTail,E as failureFields,R as REASONS,b as readAcceptance,G as writeAcceptance,p as providerNames,H as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,I as nextActionFor,J as jobDir,K as fileSig,L as jobsDir,N as JobWriter,O as isMode,Q as newJobId,T as humanDuration,U as pipeEvents,V as pipelineRecordPath,W as computeStaleReads,X as SMITH_PAYLOAD,Y as isForgeStatus}from'./chunk-execute.js';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import {readFileSync,existsSync,mkdirSync,appendFileSync,realpathSync,lstatSync,copyFileSync,statSync,readdirSync,unlinkSync}from'node:fs';import path from'node:path';/** Detached execution, with one preparation barrier before a worker may start. */
 async function launch(url, payload, onPrepared) {
     const child = fork(fileURLToPath(url), [], {
         detached: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
@@ -76,40 +76,26 @@ async function launchPipeline(service, spec, options) {
     })();
     return { ...ack, done, cancel: () => { cancelPipeline(service.repo, ack.runId); } };
 }/**
- * registry.ts — provider name → reader, and `readObservedJob()`.
+ * registry.ts — `readObservedJob()`, one fault-isolating read of one job.
  *
- * Production reads one job at a time (forge/service.ts, via the id's known
- * provider), so this stays tiny: two readers and one fault-isolating read.
- *
- *   "agent-smith"  PRIMARY.  Every job this repo spawned. Authoritative.
- *   "agy-staff"    INTEROP.  Somebody else's layout, read-only. Callers skip
- *                            forge ids here: older versions mirrored our jobs
- *                            into `.agy-staff/jobs/` and copies may remain, so
- *                            two verdicts for one id must never exist.
- *
- * WHY FAULT ISOLATION MATTERS: readers read other people's mutable state. A
+ * WHY FAULT ISOLATION MATTERS: readers read state a live worker is rewriting. A
  * reader that throws (bad symlink, exotic errno) must degrade to an `unknown`
  * job, never to a crashed band. Every call here is wrapped.
  */
-const READERS = new Map([
-    ["agent-smith", new AgentSmithReader()],
-    ["agy-staff", new AgyStaffReader()],
-]);
+const READER = new AgentSmithReader();
 /**
- * Read + normalize one job from one provider, isolating failures.
+ * Read + normalize one job, isolating failures.
  *
- * Returns `null` if the provider is unknown, if the reader returns null (job
- * not known to it), or if either the read or the normalize threw. A throw here
+ * Returns `null` if the reader returns null (job not known to it), and an
+ * `unknown` job if either the read or the normalize threw. A throw here
  * is a bug we want visible in tests, but it must not take down a caller that
  * is polling every 100ms.
  */
-async function readObservedJob(provider, cwd, jobId) {
-    const reader = READERS.get(provider);
-    if (reader === undefined)
-        return null;
+async function readObservedJob(cwd, jobId) {
+    const provider = READER.provider;
     let raw;
     try {
-        raw = await reader.read(cwd, jobId);
+        raw = await READER.read(cwd, jobId);
     }
     catch (err) {
         // Surface as unknown rather than propagating.
@@ -640,7 +626,7 @@ function turnStartInput(provider, spec, turn) {
  * projection from an ObservedJob onto them.
  */
 /** Project an ObservedJob onto what a list actually needs. */
-function toSummary(observed, source) {
+function toSummary(observed) {
     const raw = observed.raw;
     const toolCalls = typeof raw['tool_calls'] === 'number' ? raw['tool_calls'] : null;
     const task = typeof raw['task'] === 'string' && raw['task'] !== '' ? raw['task'] : null;
@@ -657,13 +643,9 @@ function toSummary(observed, source) {
         role: typeof raw['role'] === 'string' ? raw['role'] : observed.mode,
         latestSummary: raw['summarySource'] === 'worker' && typeof raw['latestSummary'] === 'string' ? raw['latestSummary'] : null,
         summarySource: raw['summarySource'] === 'worker' ? 'worker' : null,
-        source,
         status: observed.status,
-        // `raw.provider` for OUR jobs. Interop jobs carry no provider field: they are
-        // agy-staff's, i.e. agy. Their `profile` ("unrestricted") is a permission
-        // word, not a provider, so it goes to the unrestricted flag.
-        provider: typeof raw['provider'] === 'string' ? raw['provider'] : source === 'agy-staff' ? 'agy' : observed.label,
-        unrestricted: raw['unrestricted'] === true || (source === 'agy-staff' && observed.label === 'unrestricted'),
+        provider: typeof raw['provider'] === 'string' ? raw['provider'] : observed.label,
+        unrestricted: raw['unrestricted'] === true,
         nextAction: nextActionFor({
             status: observed.status,
             jobStatus: typeof raw['job_status'] === 'string' ? raw['job_status'] : null,
@@ -1928,7 +1910,7 @@ class ForgeService {
         candidates.sort((a, b) => Date.parse(b.startedAt ?? b.updatedAt ?? '') - Date.parse(a.startedAt ?? a.updatedAt ?? ''));
         return this.detail(this.resolveHead(candidates[0].jobId));
     }
-    /** Jobs the pane would draw. Ours by default; interop history on request. */
+    /** Jobs the pane would draw. */
     async list(filter = {}) {
         for (const id of this.spawnedRuns) {
             for (const stage of Object.values(readPipeline(this.repo, id)?.stageResults ?? {})) {
@@ -1938,15 +1920,7 @@ class ForgeService {
         }
         for (const id of this.spawnedIds)
             this.spawnedIds.add(this.resolveHead(id));
-        const source = filter.provider ?? 'agent-smith';
-        const out = [];
-        if (source === 'agent-smith' || source === 'all') {
-            out.push(...(await this.readSource('agent-smith', new AgentSmithReader())));
-        }
-        if (source === 'agy-staff' || source === 'all') {
-            // Genuine agy-staff jobs. Forge ids are skipped: older versions mirrored them here, and copies may remain on disk.
-            out.push(...(await this.readSource('agy-staff', new AgyStaffReader(), isForgeJobId)));
-        }
+        const out = await this.readJobs();
         const touched = (j) => Date.parse(j.finishedAt ?? j.updatedAt ?? j.startedAt ?? '');
         const filtered = out.filter((j) => (filter.status === undefined || j.status === filter.status) &&
             (filter.ids === undefined || filter.ids.has(j.jobId)) &&
@@ -1972,13 +1946,9 @@ class ForgeService {
      */
     async detail(jobId) {
         reconcileOrphan(this.repo, jobId);
-        const observed = await readObservedJob('agent-smith', this.repo, jobId);
+        const observed = await readObservedJob(this.repo, jobId);
         if (observed === null) {
-            const interop = await readObservedJob('agy-staff', this.repo, jobId);
-            if (interop === null) {
-                throw new Error(`no job "${jobId}" in ${jobsDir(this.repo)}; call list_jobs for valid job IDs.`);
-            }
-            return { ...toSummary(interop, 'agy-staff'), report: interop.output, error: null, exitCode: null, unrestricted: interop.label === 'unrestricted', pipeline: null, stage: null, usage: null, conversation: null, effort: null, cwd: null, cancellable: false };
+            throw new Error(`no job "${jobId}" in ${jobsDir(this.repo)}; call list_jobs for valid job IDs.`);
         }
         const reportPath = jobFile(this.repo, jobId, FILES.report);
         let report = null;
@@ -1999,7 +1969,7 @@ class ForgeService {
             : [];
         const staleReads = [...new Set([...(manifest?.staleReads ?? []), ...liveStale])].sort();
         return {
-            ...toSummary(observed, 'agent-smith'),
+            ...toSummary(observed),
             report,
             error: typeof raw['error'] === 'string' ? raw['error'] : null,
             exitCode: typeof raw['exit_code'] === 'number' ? raw['exit_code'] : null,
@@ -2076,22 +2046,15 @@ class ForgeService {
             return 'unknown';
         }
     }
-    async readSource(provider, reader, skip = () => false) {
-        const ids = await reader.discover(this.repo);
+    async readJobs() {
+        const ids = await new AgentSmithReader().discover(this.repo);
         const out = [];
         for (const id of ids) {
-            if (skip(id))
-                continue;
-            if (provider === 'agent-smith')
-                reconcileOrphan(this.repo, id);
-            const observed = await readObservedJob(provider, this.repo, id);
+            reconcileOrphan(this.repo, id);
+            const observed = await readObservedJob(this.repo, id);
             if (observed === null)
                 continue;
-            const summary = toSummary(observed, provider === 'agent-smith' ? 'agent-smith' : 'agy-staff');
-            if (provider !== 'agent-smith') {
-                out.push(summary);
-                continue;
-            }
+            const summary = toSummary(observed);
             // Attach acceptance from the sidecar so a list row carries the verdict the
             // caller would otherwise have to poll `status` for once per job. Absent
             // (unchecked, no checks) means nothing to say: the row stays as it was.

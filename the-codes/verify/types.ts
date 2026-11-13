@@ -24,7 +24,7 @@
  *   - A verdict is a BOOLEAN derived from an exit code. Never a judgment.
  *   - Checks run against the WORKING TREE, not against anything a model wrote
  *     about the working tree.
- *   - Output is bounded (8KB tails, like agy-staff) so a verdict cannot smuggle
+ *   - Output is bounded (8KB tails) so a verdict cannot smuggle
  *     a wall of prose past the orchestrator.
  */
 

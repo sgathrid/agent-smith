@@ -1,7 +1,7 @@
 # Agent Smith MCP server
 
 This server is the control surface for the forge runtime. It directly launches
-external harnesses; it does not invoke agy-staff.
+external harnesses.
 
 Build from the repository root with `npm run build`. TypeScript errors fail the
 build; the executable entrypoint is `dist/server.js`.
@@ -19,8 +19,7 @@ For manual MCP configuration:
   "mcpServers": {
     "agent-smith": {
       "command": "node",
-      "args": ["/abs/path/to/agent-smith/the-codes/surfaces/channel/dist/server.js"],
-      "env": { "AGY_WATCH_CWD": "/abs/path/to/workspace" }
+      "args": ["/abs/path/to/agent-smith/the-codes/surfaces/channel/dist/server.js", "/abs/path/to/workspace"]
     }
   }
 }
@@ -37,8 +36,8 @@ MCP Tasks (`io.modelcontextprotocol/tasks`) receiver for `spawn_job` and
 `resume_job` when a modern request advertises client Tasks support; otherwise
 launch `taskHandle` fields remain ordinary tool-result data.
 
-The server resolves the workspace from an explicit positional argument, then
-`AGY_WATCH_CWD`, then its process cwd. stdout is exclusively MCP JSON-RPC; logs go
+The server resolves the workspace from an explicit positional argument, then its
+process cwd. stdout is exclusively MCP JSON-RPC; logs go
 to stderr. Completion notices come from the mod and the job-scoped watch hook, not
 the server.
 

@@ -7,7 +7,7 @@ import { oneLine } from './text.ts';
 /**
  * agy tool name + parameters → a short "what is it doing" phrase.
  *
- * Measured against the real corpus in .agy-staff/jobs:
+ * Measured against real agy tool calls:
  *   run_command           { CommandLine }
  *   view_file             { AbsolutePath }
  *   write_to_file         { TargetFile }
@@ -150,7 +150,7 @@ export function basename(p: string): string {
 }
 
 /**
- * `input_preview` is a JSON STRING of the tool parameters, truncated by agy-staff.
+ * `input_preview` is a JSON STRING of the tool parameters, possibly truncated.
  * A truncated JSON string does not parse, so this never throws — a failure just
  * means we have no parameters and the caller falls back to the bare tool name.
  */

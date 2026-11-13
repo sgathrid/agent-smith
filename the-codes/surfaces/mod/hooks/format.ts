@@ -30,8 +30,8 @@
  *   3 detail    what it is doing (live) or how it ended (terminal). Fixed cell.
  *   4 elapsed   fixed 6 columns, RIGHT-aligned, and LAST — see ELAPSED_WIDTH.
  *
- * WHY THE JOB ID IS NOT ON THE ROW ANY MORE. Measured against the real 20-job
- * corpus in .agy-staff/jobs: every id is `implement-musm82da-f1dc1fe4`. That is
+ * WHY THE JOB ID IS NOT ON THE ROW ANY MORE. Measured against 20 real jobs:
+ * every id looked like `implement-musm82da-f1dc1fe4`. That is
  * 30 columns of which the mode is constant (`implement`, 100% of the corpus, so
  * it is not information) and `-f1dc1fe4` is a UUID fragment that distinguishes
  * nothing a reader can act on. The request the job was actually given sits in
@@ -209,8 +209,7 @@ function firstLine(task: string): string {
 /**
  * Cut a task title down to its subject.
  *
- * TWO CUTS, both derived by reading all 20 real task lines in
- * `.agy-staff/jobs/*.spec.json`:
+ * TWO CUTS, both derived by reading 20 real task lines:
  *
  *   1. `# Task 5a: the output gate core (Renyi, renyi-core)`
  *      → `the output gate core`
@@ -381,9 +380,8 @@ export function jobDetail(job: RadarJob, options: { tools?: boolean } = {}): str
   const activity = job.liveness?.state === 'in-tool' && quiet !== '' ? '' : oneLine(job.activity);
   if (activity !== '') parts.push(activity);
   // Tool count is a liveness signal ONLY while the job is live, so `isTerminal`
-  // has already excluded it above. HAZARD A still applies on top: agy-staff
-  // deletes events.jsonl on a warning-free success, so the count is genuinely
-  // absent for some live jobs too and must be OMITTED, never printed as 0.
+  // has already excluded it above. The count can be genuinely absent for a
+  // live job too, and must then be OMITTED, never printed as 0.
   if (withTools && job.toolCount !== null) parts.push(`${job.toolCount} tools`);
   return parts.join(` ${SEP} `);
 }

@@ -202,7 +202,7 @@ const listJobs: Handler = async (ctx, args) => {
   const fmt = format(args); const since = text(args, 'since');
   const limit = number(args, 'limit', 500) ?? (fmt === 'concise' ? CONCISE_LIST_LIMIT : undefined);
   // Concise asks for one extra row so a cut list says so instead of looking complete.
-  const jobs = await ctx.service.list({ provider: allowed(args, 'provider', ['agent-smith', 'agy-staff', 'all']), status: allowed(args, 'status', ['running', 'succeeded', 'failed', 'canceled']) as ForgeStatus | undefined,
+  const jobs = await ctx.service.list({ status: allowed(args, 'status', ['running', 'succeeded', 'failed', 'canceled']) as ForgeStatus | undefined,
     limit: fmt === 'concise' && limit !== undefined ? limit + 1 : limit, sinceMs: since === undefined ? undefined : parseSince(since), ids: boolean(args, 'session') ? ctx.service.spawnedIds : undefined });
   // A turn a steer replaced is not a worker; its continuation's row stands for it.
   const workers = jobs.filter(j => !j.supersededBy);

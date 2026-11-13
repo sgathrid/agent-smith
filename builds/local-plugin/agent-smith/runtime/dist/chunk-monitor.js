@@ -1,4 +1,4 @@
-import path from'node:path';import {fileURLToPath}from'node:url';import {r as reasonFromText,$ as checksReason,a0 as readJsonSafe,W as pipelineRecordPath,n as normalize,b as readAcceptance,A as AgentSmithReader,g as isTerminalForgeStatus,k as AgyStaffReader}from'./chunk-execute.js';import {l as livenessOf,i as isStalled}from'./chunk-stale.js';/**
+import path from'node:path';import {fileURLToPath}from'node:url';import {r as reasonFromText,Z as checksReason,_ as readJsonSafe,V as pipelineRecordPath,A as AgentSmithReader,n as normalize,b as readAcceptance,g as isTerminalForgeStatus}from'./chunk-execute.js';import {l as livenessOf,i as isStalled}from'./chunk-stale.js';/**
  * format.ts — PURE presentation logic for the /forge pane and the band.
  *
  * WHY THIS FILE IS NOT `register.tsx`:
@@ -30,8 +30,8 @@ import path from'node:path';import {fileURLToPath}from'node:url';import {r as re
  *   3 detail    what it is doing (live) or how it ended (terminal). Fixed cell.
  *   4 elapsed   fixed 6 columns, RIGHT-aligned, and LAST — see ELAPSED_WIDTH.
  *
- * WHY THE JOB ID IS NOT ON THE ROW ANY MORE. Measured against the real 20-job
- * corpus in .agy-staff/jobs: every id is `implement-musm82da-f1dc1fe4`. That is
+ * WHY THE JOB ID IS NOT ON THE ROW ANY MORE. Measured against 20 real jobs:
+ * every id looked like `implement-musm82da-f1dc1fe4`. That is
  * 30 columns of which the mode is constant (`implement`, 100% of the corpus, so
  * it is not information) and `-f1dc1fe4` is a UUID fragment that distinguishes
  * nothing a reader can act on. The request the job was actually given sits in
@@ -107,7 +107,7 @@ function chosenName(job) {
         return null;
     return !job.run && job.id.length >= 8 && job.name.endsWith(`-${job.id.slice(-8)}`) ? null : job.name;
 }
-/** `Ada (codex review)`, `review-smith-1a2b3c4d (agy review)`, or `agy-staff job <id>`. */
+/** `Ada (codex review)`, `review-smith-1a2b3c4d (agy review)`, or `job <id>`. */
 function who(job) {
     const identity = [job.provider, job.role].filter(Boolean).join(' ');
     const name = chosenName(job);
@@ -115,8 +115,6 @@ function who(job) {
         return name ?? `pipeline ${job.id}`;
     if (name)
         return identity ? `${name} (${identity})` : name;
-    if (job.source === 'agy-staff')
-        return `agy-staff job ${job.id}`;
     return identity ? `${job.id} (${identity})` : `job ${job.id}`;
 }
 /** Execution succeeded but a check failed: the work is not done. */
@@ -396,9 +394,7 @@ function pushKindFor(job) {
  * state lets a job speak twice, but only if it genuinely changed its mind.
  *
  * WHY `finishedAt` IS NOT IN THE KEY:
- * it is the natural instinct and it is wrong. A finished job's status.json is
- * rewritten on cleanup in some agy-staff versions, and the file's mtime moves.
- * Keying on a timestamp that the worker does not promise to be stable converts a
+ * it is the natural instinct and it is wrong. Keying on a timestamp that the worker does not promise to be stable converts a
  * re-read into a fake "new" event. The state is the fact; the timestamp is not.
  *
  * WHY `attention` IS NOT IN THE KEY:
@@ -425,9 +421,8 @@ function dedupeKey(job, epoch = 0) {
  *  4. attention must be a transition     — a job that has been stalled since the
  *     channel started is a known quantity, not news
  *
- * GATE 3 EXISTS BECAUSE OF A REAL HAZARD. agy-staff deletes progress.json when a
- * job finishes cleanly (hazard A), and there is a window in which the terminal
- * status file is being written while we read. A reader that samples that window
+ * GATE 3 EXISTS BECAUSE OF A REAL HAZARD. There is a window in which the
+ * terminal status file is being written while we read. A reader that samples that window
  * sees a finished job as `running`, then `succeeded` again. Without gate 3 that
  * flaps as push, silence, push. With it, a push requires the job to have actually
  * finished — a finished_at that exists — so a flap cannot produce a second event.
@@ -501,7 +496,7 @@ function toNotice(job, kind, now) {
             : (job.startedAt && job.finishedAt ? Date.parse(job.finishedAt) - Date.parse(job.startedAt) : NaN);
     return {
         id: job.id, kind, name: job.name ?? null, provider: job.provider ?? null, role: job.role ?? null,
-        source: job.source ?? null, run,
+        run,
         durationMs: Number.isFinite(span) ? span : null,
         changedFiles: job.changedFileCount ?? null,
         checks: job.checks ?? null,
@@ -523,44 +518,11 @@ function toNotice(job, kind, now) {
  * draws as a success, and there would be no way for a user to tell which one is
  * lying.
  *
- * ─────────────────────────────────────────────────────────────────────────────
- * TWO READERS, ONE VERDICT PER JOB
- * ─────────────────────────────────────────────────────────────────────────────
- *
- *   agent-smith   PRIMARY.  Everything this repo spawned via spawn_job. Our own
- *                            format, our own normalizer, our own status rules.
- *   agy-staff     INTEROP.  Somebody else's on-disk layout, read-only. Kept so
- *                            the 20 real jobs under renyi/.agy-staff/jobs stay
- *                            visible and so a future worker that writes that shape
- *                            is picked up for free.
- *
- * BEFORE THIS EXISTED, this file read agy-staff only. That was correct when
- * nothing in the repo could spawn anything: the only jobs that existed were
- * agy-staff's. It stopped being correct the moment `spawn_job` landed, and a
- * channel that never mentioned the jobs it had just started would be a surface
- * that watches somebody else's work and ignores its own.
- *
- * WHY THE DEDUPE IS EXPLICIT: older versions mirrored our jobs into
- * `.agy-staff/jobs/`, and those copies may still be on disk, so the interop reader
- * can discover our job ids too. A naive concatenation would report such a job
- * twice, with two independently computed verdicts. So the primary reader wins the
- * id, here and in forge/service.ts, by the same rule.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * WHY THE HAZARDS ARE HANDLED BY DELEGATING RATHER THAN REPEATED
- * ─────────────────────────────────────────────────────────────────────────────
- *
- *   A. a deleted live-progress file means FINISHED, never "missing". Our writer
- *      never deletes the anchor (forge/format.ts), so the format we own has no
- *      such hazard; the interop reader still has to survive agy-staff's, and it
- *      does by anchoring on result.md.status.json.
- *   B. a cancel marker outranks the terminal status file, because a job we killed
- *      has no trustworthy terminal state of its own.
- *   C. a polluted result is stripped by the reader before we ever see the text.
- *
- * Re-implementing any of these here would create a second source of truth for the
+ * Re-implementing the reader's rules here (the cancel marker outranks job.json;
+ * the anchor is never deleted) would create a second source of truth for the
  * exact failures that are hardest to debug. One place, one answer.
  */
+const reader = new AgentSmithReader();
 function acceptancePending(cwd, job, now) {
     if (job.finishedAt === null)
         return false;
@@ -598,13 +560,13 @@ async function readPipelineRecord(cwd, runId) {
     const stageJobIds = Object.values(run.stageResults).flatMap(s => (s && typeof s.jobId === 'string' ? [s.jobId] : []));
     return { job, stageJobIds };
 }
-/** Read exactly one job by id from either source (primary first). Never throws. */
+/** Read exactly one job by id. Never throws. */
 async function readJob(cwd, jobId, now = Date.now()) {
-    const own = await readOne(new AgentSmithReader(), 'agent-smith', cwd, jobId, now);
+    const own = await readOne(cwd, jobId, now);
     // A watcher polls until the job settles: while its checks are inside their budget it is still in flight.
     if (own !== null && isTerminal(own) && acceptancePending(cwd, own, now))
         return { ...own, status: 'running', finishedAt: null };
-    return own ?? (await readOne(new AgyStaffReader(), 'agy-staff', cwd, jobId, now));
+    return own;
 }
 /**
  * One job, projected onto the minimal shape the policy reasons about.
@@ -613,7 +575,7 @@ async function readJob(cwd, jobId, now = Date.now()) {
  * the provider payload, so it CANNOT accidentally start depending on it, and a
  * reader change cannot silently alter what gets pushed into someone's context.
  */
-async function readOne(reader, source, cwd, jobId, now) {
+async function readOne(cwd, jobId, now) {
     let observed;
     try {
         const raw = await reader.read(cwd, jobId);
@@ -629,7 +591,7 @@ async function readOne(reader, source, cwd, jobId, now) {
     // reason itself (`failureReason`), so only the boolean is kept here.
     const warned = observed.warnings.length > 0;
     const raw = observed.raw;
-    const acceptance = source === 'agent-smith' ? readAcceptance(cwd, observed.jobId) : {};
+    const acceptance = readAcceptance(cwd, observed.jobId);
     const checks = Array.isArray(acceptance.checks) && acceptance.checks.length > 0
         ? {
             passed: acceptance.checks.filter((c) => c?.ok === true).length, total: acceptance.checks.length,
@@ -646,9 +608,8 @@ async function readOne(reader, source, cwd, jobId, now) {
         failureReason: [raw['reason'], raw['error']].find((v) => typeof v === 'string' && v !== '') ?? null,
         failureDetail: typeof raw['error'] === 'string' ? raw['error'] : null,
         checks,
-        ...(source === 'agent-smith' && observed.status === 'succeeded' && acceptance.pending === true
+        ...(observed.status === 'succeeded' && acceptance.pending === true
             ? { checksRunning: typeof acceptance.running === 'string' && acceptance.running !== '' ? acceptance.running : true } : {}),
-        ...(source === 'agy-staff' ? { source } : {}),
         summarySource: observed.raw['summarySource'] === 'worker' ? 'worker' : null,
         status: toWatchStatus(observed, now),
         ...livenessField(watchLiveness(observed, now)),
@@ -840,7 +801,7 @@ async function runJobWatch(options) {
     }
     return 'aborted';
 }
-function parseArgs(argv, env = process.env) {
+function parseArgs(argv) {
     const out = { cwd: null, jobIds: [], runIds: [], exitCode: 0, timeoutMs: DEFAULT_WATCH_TIMEOUT_MS };
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i];
@@ -868,10 +829,8 @@ function parseArgs(argv, env = process.env) {
         else if (!a.startsWith('--') && out.cwd === null && i === 0)
             out.cwd = path.resolve(a);
     }
-    if (out.cwd === null) {
-        const e = env['AGY_WATCH_CWD'];
-        out.cwd = typeof e === 'string' && e.length > 0 ? path.resolve(e) : process.cwd();
-    }
+    if (out.cwd === null)
+        out.cwd = process.cwd();
     return out;
 }
 function isEntrypoint() {

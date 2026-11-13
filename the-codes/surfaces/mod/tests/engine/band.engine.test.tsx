@@ -60,7 +60,6 @@ function engine(
   const clock = mock.clock(on as never, { now: options.now ?? RUNNING_NOW });
   on('env.get', (_$: unknown, e: unknown) => {
     const name = (e as { name: string }).name;
-    if (name === 'AGY_RADAR_REPO') return { value: '/work' };
     if (name === 'NO_COLOR') return { value: options.noColorEnv };
     return { value: undefined };
   });
@@ -968,19 +967,6 @@ describe('completion notices', () => {
     const { clock, said } = noticeHost(on, files, ['job-ada']);
     await start($);
     Object.assign(files, ada('failed', {finishedAt:iso(RUNNING_NOW+1000),error:'exit 1'}));
-    await clock.advance(3000);
-    await clock.advance(3000);
-    expect(said.logs).toEqual([]);
-    expect(said.prompts).toEqual([]);
-  });
-
-  test('with AGY_RADAR_REPO pinned, a launch in another repo stays with the hook', async ($, on) => {
-    const files = ada('running');
-    const { clock, said } = noticeHost(on, files, ['job-ada'], { AGY_RADAR_REPO: '/work' });
-    await start($);
-    await launched($, 'job-ada', '/elsewhere');
-    expect(Object.hasOwn(files, '/work/.agent-smith/claims/job-job-ada')).toBe(false);
-    Object.assign(files, ada('succeeded', {finishedAt:iso(RUNNING_NOW+1000)}));
     await clock.advance(3000);
     await clock.advance(3000);
     expect(said.logs).toEqual([]);

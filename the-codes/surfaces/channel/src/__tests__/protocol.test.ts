@@ -40,7 +40,7 @@ setTimeout(()=>{console.log(JSON.stringify({type:'item.completed',item:{id:'answ
 `);
   chmodSync(fake, 0o755);
   const env = Object.fromEntries(Object.entries(process.env).filter((e): e is [string, string] => e[1] !== undefined));
-  const transport = new StdioClientTransport({ command: process.execPath, args: ['--experimental-strip-types', server], env: { ...env, AGY_WATCH_CWD: repo, AGENT_SMITH_CODEX_BIN: fake }, stderr: 'pipe' });
+  const transport = new StdioClientTransport({ command: process.execPath, args: ['--experimental-strip-types', server, repo], env: { ...env, AGENT_SMITH_CODEX_BIN: fake }, stderr: 'pipe' });
   const client = new Client({ name: 'smith-protocol-test', version: '1' });
   let stderr = ''; transport.stderr?.on('data', chunk => { stderr += String(chunk); });
   try {
@@ -85,7 +85,7 @@ setTimeout(()=>{console.log(JSON.stringify({type:'item.completed',item:{id:'answ
 test('MCP asks the user before unrestricted codex, over the wire; a decline launches nothing', async () => {
   const repo = mkdtempSync(path.join(os.tmpdir(), 'smith-elicit-'));
   const env = Object.fromEntries(Object.entries(process.env).filter((e): e is [string, string] => e[1] !== undefined && e[0] !== 'AGENT_SMITH_CONFIRM_UNRESTRICTED'));
-  const transport = new StdioClientTransport({ command: process.execPath, args: ['--experimental-strip-types', server], env: { ...env, AGY_WATCH_CWD: repo, AGENT_SMITH_CODEX_BIN: path.join(repo, 'never-run') }, stderr: 'pipe' });
+  const transport = new StdioClientTransport({ command: process.execPath, args: ['--experimental-strip-types', server, repo], env: { ...env, AGENT_SMITH_CODEX_BIN: path.join(repo, 'never-run') }, stderr: 'pipe' });
   const client = new Client({ name: 'smith-elicit-test', version: '1' }, { capabilities: { elicitation: { form: {} } } });
   const asked: string[] = [];
   client.setRequestHandler(ElicitRequestSchema, async (request) => { asked.push(request.params.message); return { action: 'decline' }; });
@@ -119,7 +119,7 @@ else setTimeout(finish,1800);
   const env = Object.fromEntries(Object.entries(process.env).filter((e): e is [string, string] => e[1] !== undefined));
   const sessions: Array<{ client: Client; transport: StdioClientTransport }> = [];
   const connect = async () => {
-    const transport = new StdioClientTransport({ command: process.execPath, args: ['--experimental-strip-types', server], env: { ...env, AGY_WATCH_CWD: repo, AGENT_SMITH_CODEX_BIN: fake }, stderr: 'pipe' });
+    const transport = new StdioClientTransport({ command: process.execPath, args: ['--experimental-strip-types', server, repo], env: { ...env, AGENT_SMITH_CODEX_BIN: fake }, stderr: 'pipe' });
     const client = new Client({ name: 'reload-test', version: '1' });
     transport.stderr?.on('data', () => {});
     await client.connect(transport);
@@ -191,7 +191,7 @@ console.log(JSON.stringify(event));process.exitCode=1;
 `);
   chmodSync(fake, 0o755);
   const env = Object.fromEntries(Object.entries(process.env).filter((e): e is [string, string] => e[1] !== undefined));
-  const transport = new StdioClientTransport({ command: process.execPath, args: ['--experimental-strip-types', server], env: { ...env, AGY_WATCH_CWD: repo, AGENT_SMITH_CODEX_BIN: fake, AGENT_SMITH_OPENCODE_BIN: fake }, stderr: 'pipe' });
+  const transport = new StdioClientTransport({ command: process.execPath, args: ['--experimental-strip-types', server, repo], env: { ...env, AGENT_SMITH_CODEX_BIN: fake, AGENT_SMITH_OPENCODE_BIN: fake }, stderr: 'pipe' });
   transport.stderr?.on('data', () => {});
   const client = new Client({ name: 'error-test', version: '1' });
   try {

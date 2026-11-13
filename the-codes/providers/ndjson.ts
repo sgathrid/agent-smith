@@ -385,7 +385,7 @@ export function spawnWorker(opts: SpawnWorkerOptions): Promise<WorkerProcess> {
   }
 
   // RULE 4: polite first, then escalate. SIGTERM gives the CLI a chance to flush
-  // its result file, which matters for the agy-staff readers in harness/.
+  // its result file.
   // Some CLIs ignore SIGTERM while a tool call is in flight, hence the SIGKILL.
   function terminate(reason: 'cancelled' | 'timeout'): void {
     if (killReason !== undefined) return; // idempotent; first reason wins

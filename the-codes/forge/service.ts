@@ -54,9 +54,8 @@ import { existsSync, readFileSync, readdirSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 
 import { AgentSmithReader, SMITH_PAYLOAD } from '../harness/agent-smith.ts';
-import { AgyStaffReader } from '../harness/agy-staff.ts';
 import { readObservedJob } from '../harness/registry.ts';
-import type { JobStateReader, ObservedJob } from '../harness/types.ts';
+import type { ObservedJob } from '../harness/types.ts';
 import { getCatalogs, getHarnessDefaults } from '../providers/catalog.ts';
 import type {
   JobResult,
@@ -72,7 +71,6 @@ import {
   DEFAULT_TIMEOUT_MS,
   deriveStatus,
   FILES,
-  isForgeJobId,
   isForgeStatus,
   jobDir,
   jobFile,
@@ -1078,7 +1076,7 @@ export class ForgeService {
     return this.detail(this.resolveHead(candidates[0]!.jobId));
   }
 
-  /** Jobs the pane would draw. Ours by default; interop history on request. */
+  /** Jobs the pane would draw. */
   async list(filter: ListFilter = {}): Promise<JobSummary[]> {
     for (const id of this.spawnedRuns) {
       for (const stage of Object.values(readPipeline(this.repo, id)?.stageResults ?? {})) {
@@ -1086,16 +1084,7 @@ export class ForgeService {
       }
     }
     for (const id of this.spawnedIds) this.spawnedIds.add(this.resolveHead(id));
-    const source = filter.provider ?? 'agent-smith';
-    const out: JobSummary[] = [];
-
-    if (source === 'agent-smith' || source === 'all') {
-      out.push(...(await this.readSource('agent-smith', new AgentSmithReader())));
-    }
-    if (source === 'agy-staff' || source === 'all') {
-      // Genuine agy-staff jobs. Forge ids are skipped: older versions mirrored them here, and copies may remain on disk.
-      out.push(...(await this.readSource('agy-staff', new AgyStaffReader(), isForgeJobId)));
-    }
+    const out = await this.readJobs();
 
     const touched = (j: JobSummary): number => Date.parse(j.finishedAt ?? j.updatedAt ?? j.startedAt ?? '');
     const filtered = out.filter((j) =>
@@ -1123,13 +1112,9 @@ export class ForgeService {
    */
   async detail(jobId: string): Promise<JobDetail> {
     reconcileOrphan(this.repo, jobId);
-    const observed = await readObservedJob('agent-smith', this.repo, jobId);
+    const observed = await readObservedJob(this.repo, jobId);
     if (observed === null) {
-      const interop = await readObservedJob('agy-staff', this.repo, jobId);
-      if (interop === null) {
-        throw new Error(`no job "${jobId}" in ${jobsDir(this.repo)}; call list_jobs for valid job IDs.`);
-      }
-      return { ...toSummary(interop, 'agy-staff'), report: interop.output, error: null, exitCode: null, unrestricted: interop.label === 'unrestricted', pipeline: null, stage: null, usage: null, conversation: null, effort: null, cwd: null, cancellable: false };
+      throw new Error(`no job "${jobId}" in ${jobsDir(this.repo)}; call list_jobs for valid job IDs.`);
     }
 
     const reportPath = jobFile(this.repo, jobId, FILES.report);
@@ -1154,7 +1139,7 @@ export class ForgeService {
         : [];
     const staleReads = [...new Set([...(manifest?.staleReads ?? []), ...liveStale])].sort();
     return {
-      ...toSummary(observed, 'agent-smith'),
+      ...toSummary(observed),
       report,
       error: typeof raw['error'] === 'string' ? raw['error'] : null,
       exitCode: typeof raw['exit_code'] === 'number' ? raw['exit_code'] : null,
@@ -1230,20 +1215,14 @@ export class ForgeService {
     }
   }
 
-  private async readSource(
-    provider: string,
-    reader: JobStateReader,
-    skip: (jobId: string) => boolean = () => false,
-  ): Promise<JobSummary[]> {
-    const ids = await reader.discover(this.repo);
+  private async readJobs(): Promise<JobSummary[]> {
+    const ids = await new AgentSmithReader().discover(this.repo);
     const out: JobSummary[] = [];
     for (const id of ids) {
-      if (skip(id)) continue;
-      if (provider === 'agent-smith') reconcileOrphan(this.repo, id);
-      const observed = await readObservedJob(provider, this.repo, id);
+      reconcileOrphan(this.repo, id);
+      const observed = await readObservedJob(this.repo, id);
       if (observed === null) continue;
-      const summary = toSummary(observed, provider === 'agent-smith' ? 'agent-smith' : 'agy-staff');
-      if (provider !== 'agent-smith') { out.push(summary); continue; }
+      const summary = toSummary(observed);
       // Attach acceptance from the sidecar so a list row carries the verdict the
       // caller would otherwise have to poll `status` for once per job. Absent
       // (unchecked, no checks) means nothing to say: the row stays as it was.

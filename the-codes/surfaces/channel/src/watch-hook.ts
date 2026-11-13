@@ -44,13 +44,13 @@ const isObj = (v: unknown): v is Record<string, unknown> => v !== null && typeof
  * is the mod's (notice.ts parseLaunch), so both announcers agree on what a
  * launch started; only the cwd fallbacks are the hook's own.
  */
-export function parseHookInput(input: unknown, env: NodeJS.ProcessEnv = process.env): WatchTarget | null {
+export function parseHookInput(input: unknown): WatchTarget | null {
   if (!isObj(input)) return null;
   const launch = parseLaunch(input['tool_name'], input['tool_response']);
   if (launch === null) return null;
   let cwd = launch.repo;
   if (cwd === null && typeof input['cwd'] === 'string' && input['cwd'].length > 0) cwd = input['cwd'];
-  if (cwd === null) cwd = env['AGY_WATCH_CWD'] || process.cwd();
+  if (cwd === null) cwd = process.cwd();
   const resolved = path.resolve(cwd);
   const budget = launch.kind === 'job' ? pendingBudgetMs(resolved, launch.id) : 0;
   const timeoutMs = Math.min(WATCH_CAP_MS, (launch.timeoutMs ?? MAX_WATCH_JOB_MS) + budget + WATCH_GRACE_MS);
@@ -69,10 +69,9 @@ export async function runHook(
   stdin: string,
   write: (line: string) => void,
   options: Partial<JobWatchOptions> = {},
-  env: NodeJS.ProcessEnv = process.env,
 ): Promise<number> {
   try {
-    const target = parseHookInput(JSON.parse(stdin) as unknown, env);
+    const target = parseHookInput(JSON.parse(stdin) as unknown);
     if (target === null) return 0;
     const lines: string[] = [];
     await runJobWatch({

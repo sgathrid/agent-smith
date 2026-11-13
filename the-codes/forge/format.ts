@@ -2,19 +2,6 @@
  * format.ts — agent-smith's OWN job-state format, and the pure rules over it.
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * WHY WE HAVE OUR OWN FORMAT AT ALL
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * Up until now this repo could only READ somebody else's state (agy-staff's
- * `.agy-staff/jobs/<jobId>.*`). Nothing here wrote anything, so "agent-smith can
- * watch workers but cannot start one" was literally true: providers/ was 3,643
- * lines of never-executed adapters and harness/ was a re-implementation of
- * somebody else's directory layout.
- *
- * Now that we spawn, the layout is OURS to decide. So we decided it here, and
- * this file is the whole decision.
- *
- * ─────────────────────────────────────────────────────────────────────────────
  * THE LAYOUT
  * ─────────────────────────────────────────────────────────────────────────────
  *
@@ -40,7 +27,7 @@
  *                       job.json reaches a terminal state, so it outranks it.
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * WHY A DIRECTORY, NOT agy-staff's FLAT `<jobId>.suffix` FILES
+ * WHY A DIRECTORY, NOT FLAT `<jobId>.suffix` FILES
  * ─────────────────────────────────────────────────────────────────────────────
  *
  * Three reasons, all of them about not having to guess:
@@ -65,9 +52,7 @@
  * progress.json is advisory, events.jsonl is a convenience, result.md is empty
  * for a denied job.
  *
- * This is the direct answer to agy-staff's HAZARD A, where progress.json is
- * deleted on a clean success and every reader has to learn that a missing file
- * means "finished", not "missing". We simply never delete it.
+ * It is never deleted, so a missing file never has to mean "finished".
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * THE HEADLINE RULE, IN ONE PURE FUNCTION
@@ -160,12 +145,8 @@ export interface SteerEntry {
  * The id segment that marks a job as OURS.
  *
  * WHY A MARKER IN THE ID RATHER THAN ONLY IN THE FILES: the mod band renders
- * ids, and "these six jobs I started" versus "those fourteen jobs a previous
- * harness left behind" is a distinction a human needs to be able to make by
- * looking. `implement-smith-3f9a2c71` says it in three characters.
- *
- * It also makes collisions with agy-staff's `<mode>-<word>-<8 hex>` structurally
- * impossible in practice rather than merely improbable.
+ * ids, and a human should be able to tell an agent-smith job by looking.
+ * `implement-smith-3f9a2c71` says it in three characters.
  */
 export const ID_MARKER = 'smith';
 
@@ -352,7 +333,7 @@ export const CHANGED_FILES_CAP = 200;
 
 /** Paths that are our own bookkeeping, never a worker's change. */
 export function isForgeStatePath(p: string): boolean {
-  return p === '.agent-smith' || p.startsWith('.agent-smith/') || p === '.agy-staff' || p.startsWith('.agy-staff/');
+  return p === '.agent-smith' || p.startsWith('.agent-smith/');
 }
 
 /**
@@ -479,11 +460,6 @@ export function newJobId(mode: string): string {
   const safeMode = mode.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 120).replace(/-+$/g, '');
   const prefix = safeMode === '' ? 'job' : safeMode;
   return `${prefix}-${ID_MARKER}-${randomBytes(4).toString('hex')}`;
-}
-
-/** Is this id one of ours? Used to keep the two readers from double-counting. */
-export function isForgeJobId(jobId: string): boolean {
-  return /(?:^|-)smith-[0-9a-f]{8}$/i.test(jobId);
 }
 
 /** The first non-empty line of a prompt, `#`-stripped, capped. The task cell. */

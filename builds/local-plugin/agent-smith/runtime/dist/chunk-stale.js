@@ -1,4 +1,4 @@
-import {a1 as toolLabel}from'./chunk-execute.js';/**
+import {$ as toolLabel}from'./chunk-execute.js';/**
  * The one place the stall threshold is defined.
  *
  * WHY THIS FILE EXISTS: two surfaces (the mod pane and the channel) each need to
@@ -12,8 +12,7 @@ import {a1 as toolLabel}from'./chunk-execute.js';/**
  * constant, here, imported by both surfaces.
  *
  * Value: 15 minutes.
- * Reasoning that number is defensible: agy-staff's own default timeout is 60m
- * (every real spec.json in the corpus says `timeout: "60m"`), so 15m of silence
+ * Reasoning that number is defensible: against a 60m job budget, 15m of silence
  * is a quarter of the budget gone with nothing to show, while still leaving ample
  * room for a genuinely long single command like `cargo test --workspace` on a
  * cold target directory.

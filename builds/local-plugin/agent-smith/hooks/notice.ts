@@ -64,8 +64,6 @@ export interface NoticeJob {
   readonly name?: string | null;
   readonly provider?: string | null;
   readonly role?: string | null;
-  /** `agy-staff` only for legacy interop jobs, which have no Forge identity. */
-  readonly source?: 'agy-staff' | null;
   /** Start to end for a terminal job; for `attention`, time since the last event (silent) or the last heartbeat (dead). */
   readonly durationMs?: number | null;
   readonly changedFiles?: number | null;
@@ -128,13 +126,12 @@ function chosenName(job: NoticeJob): string | null {
   return !job.run && job.id.length >= 8 && job.name.endsWith(`-${job.id.slice(-8)}`) ? null : job.name;
 }
 
-/** `Ada (codex review)`, `review-smith-1a2b3c4d (agy review)`, or `agy-staff job <id>`. */
+/** `Ada (codex review)`, `review-smith-1a2b3c4d (agy review)`, or `job <id>`. */
 function who(job: NoticeJob): string {
   const identity = [job.provider, job.role].filter(Boolean).join(' ');
   const name = chosenName(job);
   if (job.run) return name ?? `pipeline ${job.id}`;
   if (name) return identity ? `${name} (${identity})` : name;
-  if (job.source === 'agy-staff') return `agy-staff job ${job.id}`;
   return identity ? `${job.id} (${identity})` : `job ${job.id}`;
 }
 

@@ -58,15 +58,12 @@ const forge = new ForgeService({ repo: resolveCwd(), supervisorUrl: new URL(impo
 /**
  * Which repo to watch.
  *
- * Resolution order: an explicit argv path, then AGY_WATCH_CWD, then process.cwd().
- * The argv form exists so the server can be pointed at another repo
- * without an env var; the env form exists so an MCP config entry can set it once.
+ * An explicit argv path, else process.cwd(). The argv form lets an MCP config
+ * entry point the server at another repo.
  */
 function resolveCwd(): string {
   const arg = process.argv[2];
   if (arg !== undefined && arg.length > 0 && !arg.startsWith('--')) return arg;
-  const env = process.env['AGY_WATCH_CWD'];
-  if (typeof env === 'string' && env.length > 0) return env;
   return process.cwd();
 }
 

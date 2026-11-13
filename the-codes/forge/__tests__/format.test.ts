@@ -19,7 +19,6 @@ import {
   SCHEMA_VERSION,
   attributeChanged,
   deriveStatus,
-  isForgeJobId,
   isForgeStatus,
   isTerminalForgeStatus,
   ownerAlive,
@@ -37,7 +36,7 @@ import {
 
 // ── paths ────────────────────────────────────────────────────────────────────
 
-test('the job root is ours, not agy-staffs', () => {
+test('the job root is .agent-smith/jobs', () => {
   assert.equal(jobsDir('/repo'), '/repo/.agent-smith/jobs');
   assert.equal(jobDir('/repo', 'implement-smith-abcd1234'), '/repo/.agent-smith/jobs/implement-smith-abcd1234');
   assert.equal(jobFile('/repo', 'j', FILES.job), '/repo/.agent-smith/jobs/j/job.json');
@@ -68,12 +67,10 @@ test('every file name in the format is one the writer and the reader share', () 
 test('a job id carries the mode and the smith marker', () => {
   const id = newJobId('implement');
   assert.match(id, /^implement-smith-[0-9a-f]{8}$/);
-  assert.equal(isForgeJobId(id), true);
 });
 
 test('a mode with path characters in it cannot escape the jobs directory', () => {
-  // The id becomes a DIRECTORY name and, through the compat mirror, a filename
-  // in somebody else's directory. `../../etc` must not survive.
+  // The id becomes a DIRECTORY name. `../../etc` must not survive.
   const id = newJobId('../../etc/passwd');
   assert.equal(id.includes('/'), false);
   assert.equal(id.includes('..'), false);
@@ -85,18 +82,9 @@ test('two ids never collide', () => {
   assert.equal(ids.size, 500);
 });
 
-test('isForgeJobId recognises our ids and not agy-staffs', () => {
-  // Real ids from the corpus. If these ever came back true, the registry would
-  // drop somebody else's history in favour of a reader that cannot find it.
-  assert.equal(isForgeJobId('implement-musm82da-f1dc1fe4'), false);
-  assert.equal(isForgeJobId('implement-muroviej-9a1b2c3d'), false);
-  assert.equal(isForgeJobId('review-smith-00000000'), true);
-});
-
-test('multiword modes remain forge ids and job paths reject traversal', () => {
+test('multiword modes keep the id shape and job paths reject traversal', () => {
   const id = newJobId('code review');
   assert.match(id, /^code-review-smith-[0-9a-f]{8}$/);
-  assert.equal(isForgeJobId(id), true);
   assert.throws(() => jobDir('/repo', '../outside'), /invalid job id/);
 });
 

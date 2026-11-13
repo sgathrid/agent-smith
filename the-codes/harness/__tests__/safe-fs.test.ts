@@ -32,7 +32,7 @@ test("readJsonSafe returns null for missing, empty, and half-written files", asy
     await writeFile(empty, "");
     assert.equal(await readJsonSafe(empty), null);
 
-    // The real-world failure: agy-staff writeFile, we read mid-write.
+    // The real-world failure: a plain writeFile, read mid-write.
     const half = path.join(root, "half.json");
     await writeFile(half, '{"status":"do');
     assert.equal(await readJsonSafe(half), null);

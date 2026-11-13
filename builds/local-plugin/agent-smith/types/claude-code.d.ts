@@ -66,7 +66,7 @@ declare module 'claude-code' {
     /**
      * Host-provided filesystem access.
      *
-     * The band half polls `.agy-staff/jobs/` through this rather than through
+     * The band half polls `.agent-smith/jobs/` through this rather than through
      * `node:fs`, which lets the host mediate I/O and lets tests inject a fake —
      * that is what `./jobs.ts`'s `FsLike` parameter is for.
      */
@@ -97,8 +97,7 @@ declare module 'claude-code' {
    *
    * `read` and `list` REJECT when the path is missing and `exists` never does. That
    * asymmetry is deliberate on the host's side and callers rely on it: a missing
-   * file in `.agy-staff/jobs/` is the NORMAL case (agy-staff deletes
-   * progress.json on a clean success), so `exists` is the tolerant probe and the
+   * sidecar file is a NORMAL case, so `exists` is the tolerant probe and the
    * other two are allowed to fail loudly.
    */
   export interface FsApi {
@@ -364,7 +363,7 @@ declare module 'claude-code' {
  * preference: the engine REFUSES two matcher-less registrations of one event in a
  * module ("on(\"session.start\") is registered twice without a matcher").
  *
- * Both halves need session.start (the band to read `AGY_RADAR_REPO` and honour
+ * Both halves need session.start (the band to record the session cwd and honour
  * `NO_COLOR`; the pane to register `/forge`), so the band half parks its handler
  * in a module-level variable and the pane half — which owns the single registration
  * — awaits it. That is the whole band↔pane coupling: two calls.

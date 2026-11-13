@@ -9,11 +9,8 @@
  * be observed half-written, then for one poll window every reader sees a
  * malformed manifest, the job reads as `unknown`, and the channel's Gate 3 (a
  * terminal claim needs a terminal timestamp) suppresses the one notification
- * that mattered. We have already paid for this class of bug once — see
- * harness/agy-staff.ts, where every read has to tolerate a half-written JSON
- * body because somebody else writes those files.
- *
- * We write this file, so we do not have to tolerate that.
+ * that mattered. We write this file, so we never let a reader see it
+ * half-written.
  *
  * The primitive is the standard one: write a sibling temp file, then rename.
  * `rename(2)` is atomic within a filesystem, so a reader sees either the whole

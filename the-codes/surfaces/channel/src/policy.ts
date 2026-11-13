@@ -68,8 +68,6 @@ export interface WatchableJob {
   readonly checks?: { readonly passed: number; readonly total: number; readonly failed?: readonly string[] } | null;
   /** The job exited but its acceptance checks have no verdict yet: names running, or true. */
   readonly checksRunning?: string | true;
-  /** `agy-staff` for a legacy interop job; absent for Forge jobs and runs. */
-  readonly source?: 'agy-staff';
   readonly status: WatchStatus;
   /** ISO-8601 of the last evidence of real work. Null ⇒ we have no evidence. */
   readonly lastEventAt: string | null;
@@ -127,9 +125,7 @@ export function pushKindFor(job: WatchableJob): PushKind | null {
  * state lets a job speak twice, but only if it genuinely changed its mind.
  *
  * WHY `finishedAt` IS NOT IN THE KEY:
- * it is the natural instinct and it is wrong. A finished job's status.json is
- * rewritten on cleanup in some agy-staff versions, and the file's mtime moves.
- * Keying on a timestamp that the worker does not promise to be stable converts a
+ * it is the natural instinct and it is wrong. Keying on a timestamp that the worker does not promise to be stable converts a
  * re-read into a fake "new" event. The state is the fact; the timestamp is not.
  *
  * WHY `attention` IS NOT IN THE KEY:
@@ -179,9 +175,8 @@ export interface Candidate {
  *  4. attention must be a transition     — a job that has been stalled since the
  *     channel started is a known quantity, not news
  *
- * GATE 3 EXISTS BECAUSE OF A REAL HAZARD. agy-staff deletes progress.json when a
- * job finishes cleanly (hazard A), and there is a window in which the terminal
- * status file is being written while we read. A reader that samples that window
+ * GATE 3 EXISTS BECAUSE OF A REAL HAZARD. There is a window in which the
+ * terminal status file is being written while we read. A reader that samples that window
  * sees a finished job as `running`, then `succeeded` again. Without gate 3 that
  * flaps as push, silence, push. With it, a push requires the job to have actually
  * finished — a finished_at that exists — so a flap cannot produce a second event.
@@ -278,7 +273,7 @@ export function toNotice(job: WatchableJob, kind: PushKind, now: number): Notice
       : (job.startedAt && job.finishedAt ? Date.parse(job.finishedAt) - Date.parse(job.startedAt) : NaN);
   return {
     id: job.id, kind, name: job.name ?? null, provider: job.provider ?? null, role: job.role ?? null,
-    source: job.source ?? null, run,
+    run,
     durationMs: Number.isFinite(span) ? span : null,
     changedFiles: job.changedFileCount ?? null,
     checks: job.checks ?? null,

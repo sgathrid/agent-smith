@@ -657,9 +657,9 @@ export class JobWriter {
    * Request cancellation. Writes the marker FIRST, then the caller kills.
    *
    * Marker before kill because the kill is asynchronous and a reader polling in
-   * between must already see the intent. This is agy-staff's HAZARD B, kept for
-   * the same reason it exists there: a cancellation caught mid-flight is still a
-   * cancellation, and the worker may never get to write its own terminal state.
+   * between must already see the intent: a cancellation caught mid-flight is
+   * still a cancellation, and the worker may never get to write its own
+   * terminal state.
    */
   requestCancel(at: string = new Date().toISOString()): void {
     if (this.finished) return;

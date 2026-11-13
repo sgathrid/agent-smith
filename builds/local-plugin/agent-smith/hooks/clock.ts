@@ -39,8 +39,7 @@ export function elapsedCell(ms: number): string {
 /** The clock cell for one job, or a BLANK cell when the start is unknown. */
 export function clockCell(job: RadarJob, now: number): string {
   const span = job.startedAt === null ? null : (job.endedAt ?? now) - job.startedAt;
-  // BLANK, never `0s`: harness/normalize.ts refuses to invent a start time for
-  // agy-staff and neither do we. A confident `0s` about a job that has been
+  // BLANK, never `0s`: we never invent a start time. A confident `0s` about a job that has been
   // working for half an hour is the one lie this surface must not tell.
   return span === null ? '' : elapsedCell(span);
 }

@@ -164,7 +164,7 @@ interface CliArgs {
   timeoutMs: number;
 }
 
-export function parseArgs(argv: readonly string[], env: NodeJS.ProcessEnv = process.env): CliArgs {
+export function parseArgs(argv: readonly string[]): CliArgs {
   const out: CliArgs = { cwd: null, jobIds: [], runIds: [], exitCode: 0, timeoutMs: DEFAULT_WATCH_TIMEOUT_MS };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
@@ -176,10 +176,7 @@ export function parseArgs(argv: readonly string[], env: NodeJS.ProcessEnv = proc
     else if (a === '--timeout-ms' && v && Number(v) > 0) { out.timeoutMs = Number(v); i++; }
     else if (!a.startsWith('--') && out.cwd === null && i === 0) out.cwd = path.resolve(a);
   }
-  if (out.cwd === null) {
-    const e = env['AGY_WATCH_CWD'];
-    out.cwd = typeof e === 'string' && e.length > 0 ? path.resolve(e) : process.cwd();
-  }
+  if (out.cwd === null) out.cwd = process.cwd();
   return out;
 }
 

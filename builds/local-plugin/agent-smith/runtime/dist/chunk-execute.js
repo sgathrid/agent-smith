@@ -1,4 +1,4 @@
-import path from'node:path';import {readFileSync,existsSync,constants,mkdirSync,writeFileSync,createWriteStream,renameSync,unlinkSync,openSync,fsyncSync,closeSync,statSync,copyFileSync}from'node:fs';import {open,readdir,access,constants as constants$1}from'node:fs/promises';import {randomBytes,randomUUID,createHash}from'node:crypto';import {spawn,execFile}from'node:child_process';import os from'node:os';import readline from'node:readline';/**
+import {readFileSync,existsSync,constants,mkdirSync,writeFileSync,createWriteStream,renameSync,unlinkSync,openSync,fsyncSync,closeSync,statSync,copyFileSync}from'node:fs';import {open,readdir,access,constants as constants$1}from'node:fs/promises';import {randomBytes,randomUUID,createHash}from'node:crypto';import path from'node:path';import {spawn,execFile}from'node:child_process';import os from'node:os';import readline from'node:readline';/**
  * reasons.ts — every failure, in two to four words.
  *
  * One vocabulary for every surface: the completion notice, the band, the pane,
@@ -118,19 +118,6 @@ function reasonFromText(text) {
  * format.ts — agent-smith's OWN job-state format, and the pure rules over it.
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * WHY WE HAVE OUR OWN FORMAT AT ALL
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * Up until now this repo could only READ somebody else's state (agy-staff's
- * `.agy-staff/jobs/<jobId>.*`). Nothing here wrote anything, so "agent-smith can
- * watch workers but cannot start one" was literally true: providers/ was 3,643
- * lines of never-executed adapters and harness/ was a re-implementation of
- * somebody else's directory layout.
- *
- * Now that we spawn, the layout is OURS to decide. So we decided it here, and
- * this file is the whole decision.
- *
- * ─────────────────────────────────────────────────────────────────────────────
  * THE LAYOUT
  * ─────────────────────────────────────────────────────────────────────────────
  *
@@ -156,7 +143,7 @@ function reasonFromText(text) {
  *                       job.json reaches a terminal state, so it outranks it.
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * WHY A DIRECTORY, NOT agy-staff's FLAT `<jobId>.suffix` FILES
+ * WHY A DIRECTORY, NOT FLAT `<jobId>.suffix` FILES
  * ─────────────────────────────────────────────────────────────────────────────
  *
  * Three reasons, all of them about not having to guess:
@@ -181,9 +168,7 @@ function reasonFromText(text) {
  * progress.json is advisory, events.jsonl is a convenience, result.md is empty
  * for a denied job.
  *
- * This is the direct answer to agy-staff's HAZARD A, where progress.json is
- * deleted on a clean success and every reader has to learn that a missing file
- * means "finished", not "missing". We simply never delete it.
+ * It is never deleted, so a missing file never has to mean "finished".
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * THE HEADLINE RULE, IN ONE PURE FUNCTION
@@ -246,12 +231,8 @@ const FILES = {
  * The id segment that marks a job as OURS.
  *
  * WHY A MARKER IN THE ID RATHER THAN ONLY IN THE FILES: the mod band renders
- * ids, and "these six jobs I started" versus "those fourteen jobs a previous
- * harness left behind" is a distinction a human needs to be able to make by
- * looking. `implement-smith-3f9a2c71` says it in three characters.
- *
- * It also makes collisions with agy-staff's `<mode>-<word>-<8 hex>` structurally
- * impossible in practice rather than merely improbable.
+ * ids, and a human should be able to tell an agent-smith job by looking.
+ * `implement-smith-3f9a2c71` says it in three characters.
  */
 const ID_MARKER = 'smith';
 function isForgeStatus(v) {
@@ -281,7 +262,7 @@ function attributeChanged(files, toolInputs) {
 const CHANGED_FILES_CAP = 200;
 /** Paths that are our own bookkeeping, never a worker's change. */
 function isForgeStatePath(p) {
-    return p === '.agent-smith' || p.startsWith('.agent-smith/') || p === '.agy-staff' || p.startsWith('.agy-staff/');
+    return p === '.agent-smith' || p.startsWith('.agent-smith/');
 }
 /**
  * Pure: which paths changed since the baseline.
@@ -341,10 +322,6 @@ function newJobId$1(mode) {
     const prefix = safeMode === '' ? 'job' : safeMode;
     return `${prefix}-${ID_MARKER}-${randomBytes(4).toString('hex')}`;
 }
-/** Is this id one of ours? Used to keep the two readers from double-counting. */
-function isForgeJobId(jobId) {
-    return /(?:^|-)smith-[0-9a-f]{8}$/i.test(jobId);
-}
 /** The first non-empty line of a prompt, `#`-stripped, capped. The task cell. */
 function taskTitle(prompt) {
     const first = prompt.split('\n').find((l) => l.trim().length > 0) ?? '';
@@ -359,7 +336,7 @@ function taskTitle(prompt) {
  */
 const MIN_USEFUL_CHARS = 1;
 /** Is there no usable output? See MIN_USEFUL_CHARS. */
-function looksEmpty$1(text) {
+function looksEmpty(text) {
     if (text === null || text === undefined)
         return true;
     return text.trim().length < MIN_USEFUL_CHARS;
@@ -469,7 +446,7 @@ function deriveStatus(d) {
     // Denials the adapter marked non-fatal (a delivered report plus denied calls,
     // e.g. a reviewer that wanted a shell) do not fail the job, whatever the
     // provider. `action: 'tool'` is the pre-flag claude encoding, still on disk.
-    const nonfatalOnly = denials.length > 0 && d.ok === true && !looksEmpty$1(d.report) && denials.every((x) => x.nonfatal === true || x.action === 'tool');
+    const nonfatalOnly = denials.length > 0 && d.ok === true && !looksEmpty(d.report) && denials.every((x) => x.nonfatal === true || x.action === 'tool');
     if (denials.length > 0 && !nonfatalOnly) {
         return { status: 'failed', suspicious: true, reason: deniedReason(denialNames(denials)) };
     }
@@ -496,7 +473,7 @@ function deriveStatus(d) {
             note: `${denials.length} ${denials.length === 1 ? 'call' : 'calls'} denied` + (deniedNames(denials) === '' ? '' : `: ${deniedNames(denials)}`),
         };
     }
-    if (looksEmpty$1(d.report)) {
+    if (looksEmpty(d.report)) {
         return {
             status: 'failed',
             suspicious: true,
@@ -617,7 +594,7 @@ function baseNextAction(i) {
     }
     if (NETWORK_RE.test(err))
         return 'Network error: retry once with resume_job or a new spawn.';
-    if (NO_OUTPUT_RE.test(err) || (i.exitCode === 0 && looksEmpty$1(i.report))) {
+    if (NO_OUTPUT_RE.test(err) || (i.exitCode === 0 && looksEmpty(i.report))) {
         return 'No output: ask for a final answer via resume_job, or rerun.';
     }
     return 'Read status.error and warnings before retrying.';
@@ -674,13 +651,12 @@ function oneLine(s, max = 400) {
  * WHY THIS EXISTS
  * ---------------
  * Every reader in this directory observes state that another process is
- * *actively mutating*. agy-staff rewrites `progress.json` every ~100ms and then
- * **deletes** it the moment a job finishes cleanly. Claude Code appends to a
+ * *actively mutating*: a worker rewrites its job files on every event. Claude Code appends to a
  * subagent `.jsonl` while we read it. So between our `readdir` and our `read`,
  * a path can vanish, be truncated mid-write, or be replaced by a directory.
  *
- * Throwing here is never correct: a missing file is *information* (see hazard A
- * in agy-staff.ts), not an error. Every function in this module returns
+ * Throwing here is never correct: a missing file is *information*, not an
+ * error. Every function in this module returns
  * `null` / `[]` / `false` instead of throwing. This is the single most
  * important flake-prevention rule in the harness.
  */
@@ -756,8 +732,8 @@ async function readTextSafe$1(path, maxBytes = DEFAULT_MAX_BYTES) {
  * Read and JSON.parse, tolerating every way that can go wrong.
  *
  * Returns `null` for: missing file, unreadable file, empty file, invalid JSON.
- * Invalid JSON is EXPECTED, not exceptional — agy-staff writes with a plain
- * `writeFile`, so a reader that arrives mid-write sees a truncated document.
+ * Invalid JSON is EXPECTED, not exceptional — a writer using a plain
+ * `writeFile` can be caught mid-write, so a reader that arrives mid-write sees a truncated document.
  * Treating that as `null` and retrying on the next poll is the whole strategy.
  */
 async function readJsonSafe(path, maxBytes) {
@@ -793,44 +769,16 @@ async function readdirSafe(path) {
 }/**
  * agent-smith.ts — reads OUR OWN job state from `<repo>/.agent-smith/jobs/`.
  *
- * ─────────────────────────────────────────────────────────────────────────────
- * THIS IS THE PRIMARY READER. WHY IT EXISTS
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * Until now the only reader in this layer read somebody else's directory.
- * harness/agy-staff.ts is a re-implementation of a layout nobody in this repo
- * writes any more, kept because the 20 real jobs under
- * /Users/gathrid/Repos/renyi/.agy-staff/jobs are the corpus the hazard rules
- * were verified against and because any future worker that writes that layout
- * should be picked up for free.
- *
- * It is now an INTEROP reader. This one is the source of truth, and
- * registry.ts holds both:
- *
- *     "agent-smith"   PRIMARY.   Every job this repo spawned.
- *     "agy-staff"     INTEROP.   Read-only history from another harness.
- *
- * The two are kept strictly apart — see the last section, which is the one rule
- * this file has to enforce.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * WHY THIS FILE IS NOT MUCH CODE
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * Because forge/format.ts made it not much code. That is the point of owning the
- * state format. Compare with agy-staff.ts, which needs three documented hazards
- * and a seven-suffix fallback chain to answer the same three questions:
+ * The source of truth for every job this repo spawned. It is not much code
+ * because forge/format.ts made it not much code: owning the state format means
+ * three questions, three answers:
  *
  *   - Does this job exist?        → the directory exists and holds a job.json.
  *   - What is its terminal state? → job.json.status. Written atomically, always.
  *   - Is it alive?                → job.json.updatedAt, refreshed on every event.
  *
- * agy-staff's equivalents are all "which of these seven files, some of which are
- * deleted on success, do I read, and in what order". We traded that for a
- * directory, an atomic rewrite, and the refusal to ever delete the anchor.
- *
- * The one hazard we DID keep is the cancel marker, and it is the same hazard:
- * `cancel` can exist before job.json reaches a terminal state, so it outranks it.
+ * The one hazard to respect is the cancel marker: `cancel` can exist before
+ * job.json reaches a terminal state, so it outranks it.
  */
 /**
  * payload keys the normalizer relies on. Cross-referenced by name from
@@ -873,8 +821,8 @@ const CANCELED_ORPHAN = { status: 'canceled', suspicious: false, reason: CANCEL_
 /**
  * Reads `.agent-smith/jobs`.
  *
- * Every method is fault-tolerant in the same way and for the same reason as
- * agy-staff.ts: a reader reads files a live process is rewriting, and one
+ * Every method is fault-tolerant: a reader reads files a live process is
+ * rewriting, and one
  * unreadable job is that job's absence rather than a dead band. `discover`
  * NEVER throws; an absent jobs directory is the ordinary case for a repo that
  * has never spawned anything, not an error.
@@ -884,8 +832,7 @@ class AgentSmithReader {
     /**
      * Enumerate job ids from the jobs directory.
      *
-     * Keyed on the DIRECTORY, which is the whole reason this is simpler than the
-     * interop reader: there is no suffix to parse, no "which file proves this job
+     * Keyed on the DIRECTORY: there is no suffix to parse, no "which file proves this job
      * exists", and no entry that can half-qualify. A job's identity is its
      * directory, so identity cannot be lost.
      */
@@ -910,8 +857,8 @@ class AgentSmithReader {
      * deleted, which is the whole reason the format has a single anchor.
      */
     async read(cwd, jobId) {
-        // The cancel marker outranks job.json (same hazard as agy-staff's B: the
-        // marker can exist before the worker has been reaped).
+        // The cancel marker outranks job.json: it can exist before the worker has
+        // been reaped.
         const cancelPath = jobFile(cwd, jobId, FILES.cancel);
         const cancelRequested = await existsSafe(cancelPath);
         let cancelAt = null;
@@ -1041,339 +988,17 @@ class AgentSmithReader {
             partial: manifest === null,
         };
     }
-}
-/*
- * Older versions mirrored our jobs into `.agy-staff/jobs/`; copies may remain on
- * disk. `AgyStaffReader` callers skip forge ids (`isForgeJobId`) so a job never
- * gets two verdicts in one sweep.
- *//**
- * agy-staff.ts — reads agy-staff's job state from `<repo>/.agy-staff/jobs/`.
- *
- * This reader spawns nothing and patches nothing. agy-staff already writes a
- * complete, continuously-updated snapshot for every job; we read it. The layout
- * (verified against 20 real jobs in /Users/gathrid/Repos/renyi/.agy-staff/jobs):
- *
- *   <jobId>.spec.json          { resolved: { mode, model, profile, timeout,
- *                                       background }, prompt, prompt_source,
- *                               opts, cwd }
- *   <jobId>.progress.json      { job_id, last_event_at, recent_activities[<=5],
- *                               latest_text: { step_index, text, truncated,
- *                               updated_at, incomplete, status }, warnings: string[] }
- *   <jobId>.result.md.status.json  { status: 'done'|'error'|'canceled',
- *                               warnings?: bool, reason?: string, finished_at: iso }
- *   <jobId>.result.md          final report markdown (sometimes POLLUTED, see HAZARD C)
- *   <jobId>.log                telemetry lines, e.g.
- *                               "[agy-staff] mode=... agy_status=SUCCESS agy_exit=0
- *                                duration=1681.5s turns=1 tokens(in ..., out ...)"
- *   <jobId>.events.jsonl       raw NDJSON stream; only present for RUNNING or
- *                               WARNED/FAILED jobs
- *   <jobId>.spec.json.cancel   cancel marker; content is the cancel ISO timestamp
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * THE THREE REAL HAZARDS (each handled explicitly below, labeled [HAZARD A/B/C])
- * ─────────────────────────────────────────────────────────────────────────────
- */
-/**
- * =============================================================================
- * [HAZARD A] progress.json is DELETED on a clean, warning-free success.
- * =============================================================================
- * A missing progress.json does NOT mean "job missing" — it means the job
- * FINISHED. agy-staff cleans up progress.json + events.jsonl when a job
- * succeeds with no warnings, precisely so a finished job looks tidy. Observed
- * in the real corpus: all 20 jobs had warnings=true, so all 20 retained
- * progress.json; but the cleanup path is real and warning-free successes WILL
- * lose the file.
- *
- * THE FIX: never treat progress.json as the liveness or terminal anchor.
- * Terminal state is anchored on the always-written `<jobId>.result.md.status.json`.
- * Progress/events are treated as OPTIONAL liveness evidence. This reader
- * returns a full snapshot for a finished job even when both files are gone.
- *
- * =============================================================================
- * [HAZARD B] `.spec.json.cancel` marker files mark cancelled jobs.
- * =============================================================================
- * When a job is cancelled, agy-staff writes a sibling `<jobId>.spec.json.cancel`
- * file whose content is the cancellation timestamp. In the real corpus there
- * are 2 of these (implement-murvydru-07eed78d, implement-musledug-f5e05526),
- * and BOTH correspond to a status.json with { status:'canceled', reason:'canceled' }.
- * We detect the marker directly because a cancellation may be mid-flight: the
- * marker can exist before status.json is finalized.
- *
- * THE FIX: read the marker and set a `canceled` flag in the payload; the
- * normalizer turns that into status 'canceled' regardless of status.json.
- *
- * =============================================================================
- * [HAZARD C] result.md can be POLLUTED with <system_notification> blocks.
- * =============================================================================
- * Some result.md files are prefixed with a run of `<system_notification>...
- * </system_notification>` blocks (background-task completion messages) that
- * agy-staff failed to strip before persisting the report. The real job
- * implement-musm82da-f1dc1fe4.result.md has 12 such blocks (= 24 open+close
- * tags) prepended before the real markdown. This is a genuine upstream bug
- * and `stripSystemNotifications()` below is the clean fix.
- */
-/** Directory agy-staff writes per-repo job state into. */
-const JOBS_DIR = path.join(".agy-staff", "jobs");
-/** Suffixes that identify a job directory entry, mapped to a logical field. */
-const SPEC_SUFFIX = ".spec.json";
-const PROGRESS_SUFFIX = ".progress.json";
-const STATUS_SUFFIX = ".result.md.status.json";
-const RESULT_SUFFIX = ".result.md";
-const LOG_SUFFIX = ".log";
-const EVENTS_SUFFIX = ".events.jsonl";
-const CANCEL_SUFFIX = ".spec.json.cancel";
-/** payload keys the normalizer relies on (documented here for cross-reference). */
-const AGY_PAYLOAD = {
-    mode: "mode",
-    model: "model",
-    profile: "profile",
-    resolved: "resolved",
-    promptSource: "prompt_source",
-    status: "status", // terminal status from status.json: 'done'|'error'|'canceled'
-    statusWarnings: "status_warnings", // status.json warnings:boolean
-    statusReason: "status_reason", // status.json reason:string (error/canceled)
-    finishedAt: "finished_at", // status.json finished_at
-    lastEventAt: "last_event_at", // progress.json
-    recentActivities: "recent_activities", // progress.json
-    latestText: "latest_text", // progress.json
-    progressWarnings: "progress_warnings", // progress.json warnings:string[]
-    output: "output", // cleaned result.md text
-    outputTruncated: "output_truncated",
-    telemetry: "telemetry", // parsed fields from .log
-    canceled: "canceled", // true if .spec.json.cancel exists (HAZARD B)
-    cancelAt: "cancel_at", // marker timestamp (HAZARD B)
-    hasProgressFile: "has_progress_file", // for evidence/debug (HAZARD A)
-    hasEventsFile: "has_events_file",
-    notificationsStripped: "notifications_stripped", // count removed (HAZARD C)
-};
-/** A dependency-free `.agy-staff/jobs` reader. */
-class AgyStaffReader {
-    provider = "agy-staff";
-    /** Resolve the per-repo jobs directory for a given cwd. */
-    jobsDir(cwd) {
-        return path.join(cwd, JOBS_DIR);
-    }
-    /**
-     * Enumerate job ids from `<jobId>.spec.json` entries.
-     *
-     * Robustness notes:
-     *  - We key on spec.json because every job (running or finished) has one.
-     *  - We tolerate readdir races by simply ignoring names we cannot classify.
-     *  - `discover` never throws; unknown cwd yields [].
-     */
-    async discover(cwd) {
-        const dir = this.jobsDir(cwd);
-        const entries = await readdirSafe(dir);
-        const ids = new Set();
-        for (const name of entries) {
-            if (name.endsWith(SPEC_SUFFIX) && name.length > SPEC_SUFFIX.length) {
-                ids.add(name.slice(0, -SPEC_SUFFIX.length));
-            }
-        }
-        return [...ids].sort();
-    }
-    /**
-     * Assemble a snapshot for one job.
-     *
-     * Returns null ONLY when there is no evidence the job exists at all (no
-     * spec, no status, no result, no log, no cancel marker). A finished job with
-     * a deleted progress.json still returns a snapshot — see HAZARD A.
-     */
-    async read(cwd, jobId) {
-        const dir = this.jobsDir(cwd);
-        const at = (suffix) => path.join(dir, `${jobId}${suffix}`);
-        // --- HAZARD B: cancel marker. Read it first; it can outrank status.json. ---
-        const cancelMarkerPath = at(CANCEL_SUFFIX);
-        const canceled = await existsSafe(cancelMarkerPath);
-        let cancelAt = null;
-        if (canceled) {
-            const raw = await readTextSafe$1(cancelMarkerPath);
-            // The marker body is the cancel timestamp; normalize to trimmed string or null.
-            const t = raw?.trim();
-            cancelAt = t && t.length > 0 ? t : null;
-        }
-        // --- Terminal anchor (HAZARD A). status.json is written on every terminal
-        // job, so it is the reliable source of done/error/canceled. ---
-        const status = await readJsonSafe(at(STATUS_SUFFIX));
-        // --- spec.json: exists for every job; carries mode/model/profile. ---
-        const spec = await readJsonSafe(at(SPEC_SUFFIX));
-        // --- result.md: the final report. Read + de-pollute (HAZARD C). ---
-        const rawResult = await readTextSafe$1(at(RESULT_SUFFIX));
-        let output = null;
-        let outputTruncated = false;
-        let notificationsStripped = 0;
-        if (rawResult !== null) {
-            const cleaned = stripSystemNotifications(rawResult);
-            notificationsStripped = cleaned.removedCount;
-            output = cleaned.text;
-            // After stripping, if what remains is empty the "final answer" is empty —
-            // a suspicious success, flagged in normalize.ts.
-        }
-        // --- .log: best-effort telemetry (mode/model/agy_status/duration/tokens). ---
-        const log = await readTextSafe$1(at(LOG_SUFFIX));
-        const telemetry = log === null ? {} : parseLogTelemetry(log);
-        // Decide "does this job exist at all?" only after collecting all evidence,
-        // so a job whose only surviving artifact is the cancel marker is still seen.
-        const anyEvidence = status !== null ||
-            spec !== null ||
-            rawResult !== null ||
-            log !== null ||
-            canceled;
-        if (!anyEvidence)
-            return null;
-        // --- progress.json + events.jsonl are OPTIONAL liveness evidence (HAZARD A).
-        // A null here means either "still running but not written yet" OR
-        // "finished clean and agy-staff deleted it". We record presence as evidence
-        // but never treat absence as fatal. ---
-        const progress = await readJsonSafe(at(PROGRESS_SUFFIX));
-        const hasProgressFile = progress !== null;
-        const hasEventsFile = await existsSafe(at(EVENTS_SUFFIX));
-        const payload = {
-            [AGY_PAYLOAD.mode]: spec?.resolved?.mode ?? null,
-            [AGY_PAYLOAD.model]: spec?.resolved?.model ?? null,
-            [AGY_PAYLOAD.profile]: spec?.resolved?.profile ?? null,
-            [AGY_PAYLOAD.resolved]: spec?.resolved ?? null,
-            [AGY_PAYLOAD.promptSource]: spec?.prompt_source?.kind ?? null,
-            [AGY_PAYLOAD.status]: status?.status ?? null,
-            [AGY_PAYLOAD.statusWarnings]: status?.warnings ?? null,
-            [AGY_PAYLOAD.statusReason]: status?.reason ?? null,
-            [AGY_PAYLOAD.finishedAt]: status?.finished_at ?? null,
-            [AGY_PAYLOAD.lastEventAt]: progress?.last_event_at ?? null,
-            [AGY_PAYLOAD.recentActivities]: progress?.recent_activities ?? [],
-            [AGY_PAYLOAD.latestText]: progress?.latest_text ?? null,
-            [AGY_PAYLOAD.progressWarnings]: progress?.warnings ?? [],
-            [AGY_PAYLOAD.output]: output,
-            [AGY_PAYLOAD.outputTruncated]: outputTruncated,
-            [AGY_PAYLOAD.telemetry]: telemetry,
-            [AGY_PAYLOAD.canceled]: canceled,
-            [AGY_PAYLOAD.cancelAt]: cancelAt,
-            [AGY_PAYLOAD.hasProgressFile]: hasProgressFile,
-            [AGY_PAYLOAD.hasEventsFile]: hasEventsFile,
-            [AGY_PAYLOAD.notificationsStripped]: notificationsStripped,
-        };
-        // partial=true when the terminal anchor is missing (still running) OR when
-        // any parse silently failed. normalize.ts uses this to bias toward 'unknown'
-        // over a confident guess.
-        const partial = status === null;
-        return {
-            // MUST match `this.provider`: normalize() selects its per-provider rule by
-            // this string, and a mismatch silently degrades to `unknown`.
-            provider: this.provider,
-            jobId,
-            cwd: spec?.cwd ?? cwd,
-            payload,
-            partial,
-        };
-    }
-}
-/**
- * =============================================================================
- * HAZARD C FIX: strip leading `<system_notification>` blocks from result.md
- * =============================================================================
- * Upstream bug: agy-staff prepends `<system_notification>...</system_notification>`
- * blocks (completed background-task messages) to some result.md files, burying
- * the real report. Real job implement-musm82da-f1dc1fe4.result.md has 12 such
- * blocks before the real markdown.
- *
- * Approach notes:
- *  - Blocks can span multiple lines (the notification body contains log paths and
- *    wrapped text), so we cannot strip line-by-line. We scan for the open tag,
- *    then find the matching close tag after it, and cut the whole span.
- *  - We only strip a block when BOTH an open and a close tag are found, so a
- *    lone open tag (e.g. someone literally wrote the text) is left intact rather
- *    than swallowing the rest of the document.
- *  - Runs at the start are collapsed. A notification appearing mid-document is
- *    still removed (they are always noise), but we don't reorder anything.
- *  - Pure function; unit-tested against the real file in __tests__/.
- */
-function stripSystemNotifications(text) {
-    const OPEN = "<system_notification>";
-    const CLOSE = "</system_notification>";
-    let out = text;
-    let removed = 0;
-    for (;;) {
-        const start = out.indexOf(OPEN);
-        if (start === -1)
-            break;
-        const closeIdx = out.indexOf(CLOSE, start + OPEN.length);
-        if (closeIdx === -1)
-            break; // unmatched open tag: leave everything alone
-        const end = closeIdx + CLOSE.length;
-        out = out.slice(0, start) + out.slice(end);
-        removed += 1;
-    }
-    // Collapse any blank-line gap left where the leading run used to be, so the
-    // real report starts at the top rather than after dozens of blank lines.
-    const cleaned = out.replace(/^(?:[ \t]*\r?\n)+/, "").trimStart();
-    return { text: cleaned, removedCount: removed };
-}
-/**
- * Parse the `[agy-staff] ...` telemetry line(s) from a job's .log.
- *
- * Example real line:
- *   [agy-staff] mode=implement profile=unrestricted model=gemini-3.8-flash-high
- *   agy_status=SUCCESS agy_exit=0 duration=1681.549339s turns=1
- *   tokens(in 2221077, out 137616, think 88239, cache 20425839)
- *
- * Failure logs instead carry `AGY_ERROR: {...}` and no telemetry fields. This
- * returns an empty object in that case — absence is not an error here.
- */
-function parseLogTelemetry(log) {
-    const out = {};
-    const mode = /\bmode=(\S+)/.exec(log);
-    if (mode?.[1])
-        out["mode"] = mode[1];
-    const profile = /\bprofile=(\S+)/.exec(log);
-    if (profile?.[1])
-        out["profile"] = profile[1];
-    const model = /\bmodel=(\S+)/.exec(log);
-    if (model?.[1])
-        out["model"] = model[1];
-    const agyStatus = /\bagy_status=(\S+)/.exec(log);
-    if (agyStatus?.[1])
-        out["agy_status"] = agyStatus[1];
-    const agyExit = /\bagy_exit=(-?\d+)/.exec(log);
-    if (agyExit?.[1])
-        out["agy_exit"] = Number(agyExit[1]);
-    const duration = /\bduration=([\d.]+)s/.exec(log);
-    if (duration?.[1])
-        out["duration_ms"] = Math.round(Number(duration[1]) * 1000);
-    const turns = /\bturns=(\d+)/.exec(log);
-    if (turns?.[1])
-        out["turns"] = Number(turns[1]);
-    const tokens = /\btokens\(in (\d+), out (\d+), think (\d+), cache (\d+)\)/.exec(log);
-    if (tokens) {
-        out["tokens_in"] = Number(tokens[1]);
-        out["tokens_out"] = Number(tokens[2]);
-        out["tokens_think"] = Number(tokens[3]);
-        out["tokens_cache"] = Number(tokens[4]);
-    }
-    // A failure line is hard error evidence; keep a marker for normalize.ts.
-    if (log.includes("AGY_ERROR:")) {
-        out["saw_agy_error"] = true;
-        const reasonLine = /\nerror:\s*(.+)/.exec(log);
-        if (reasonLine?.[1])
-            out["agy_error_reason"] = reasonLine[1].trim();
-    }
-    return out;
 }/**
  * normalize.ts — provider-agnostic normalization to ObservedJob.
  *
  * Every provider quirk and every judgement call lives HERE and only here, so
  * this file is the single place a reviewer reads to answer "why did that job
- * show up as failed?". Readers (agent-smith.ts, agy-staff.ts) are dumb parsers;
- * they extract facts and get out of the way.
+ * show up as failed?". Readers (agent-smith.ts) are dumb parsers; they
+ * extract facts and get out of the way.
  *
- * The headline rule, stated once and enforced below:
- *
- *   ┌──────────────────────────────────────────────────────────────────┐
- *   │ AN EMPTY RESPONSE WITH WARNINGS IS NOT A CLEAN SUCCESS.           │
- *   │ agy-staff will happily write { status:'done', warnings:true } and │
- *   │ an empty result.md when the underlying run degraded. Reporting     │
- *   │ that as `succeeded` with no warnings is a lie the mod band would  │
- *   │ happily render as a green check. We downgrade to `failed` and      │
- *   │ attach `suspicious_success`.                                      │
- *   └──────────────────────────────────────────────────────────────────┘
+ * The headline rule, an empty response is not a clean success, is applied
+ * once, when the job is written (forge/format.ts `deriveStatus`), and not
+ * re-derived here.
  */
 // ── helpers ────────────────────────────────────────────────────────────────
 function asString(v) {
@@ -1390,183 +1015,11 @@ function asStringArray(v) {
         return [];
     return v.filter((x) => typeof x === "string");
 }
-/** A "clean enough" answer. Whitespace and short filler count as empty. */
-function looksEmpty(text) {
-    if (text === null)
-        return true;
-    const t = text.trim();
-    if (t.length === 0)
-        return true;
-    // A single stray character is not a deliverable.
-    if (t.length < 8)
-        return true;
-    return false;
-}
-// ── agy-staff normalizer ────────────────────────────────────────────────────
-/**
- * Map an agy-staff payload onto ObservedJob.
- *
- * Status precedence (highest first):
- *   1. cancel marker exists                         ⇒ canceled    (HAZARD B)
- *   2. status.json status === 'canceled'           ⇒ canceled
- *   3. status.json status === 'error'               ⇒ failed
- *   4. status.json status === 'done'                ⇒ succeeded,
- *        UNLESS empty-output-with-warnings          ⇒ failed (suspicious_success)
- *   5. no status.json but progress evidence present ⇒ running
- *   6. nothing conclusive                           ⇒ unknown
- */
-const agyNormalizer = (raw) => {
-    const p = raw.payload;
-    let warnings = [];
-    const canceled = asBool(p[AGY_PAYLOAD.canceled]) === true;
-    const terminalStatus = asString(p[AGY_PAYLOAD.status]);
-    const statusWarnings = asBool(p[AGY_PAYLOAD.statusWarnings]);
-    asString(p[AGY_PAYLOAD.statusReason]);
-    const progressWarnings = asStringArray(p[AGY_PAYLOAD.progressWarnings]);
-    const output = asString(p[AGY_PAYLOAD.output]);
-    const hasProgressFile = asBool(p[AGY_PAYLOAD.hasProgressFile]) === true;
-    const lastEventAt = asString(p[AGY_PAYLOAD.lastEventAt]);
-    const finishedAt = asString(p[AGY_PAYLOAD.finishedAt]);
-    const strippedCount = asNumber(p[AGY_PAYLOAD.notificationsStripped]) ?? 0;
-    const telemetry = (p[AGY_PAYLOAD.telemetry] ?? {});
-    // -- warning: de-polluted result (HAZARD C) ---------------------------------
-    if (strippedCount > 0) {
-        warnings.push({
-            code: "polluted_result",
-            message: `Removed ${strippedCount} <system_notification> block${strippedCount === 1 ? '' : 's'} from the result text.`,
-        });
-    }
-    // -- warning: tool errors observed during the run --------------------------
-    const sawAgyError = asBool(telemetry["saw_agy_error"]) === true;
-    if (sawAgyError || progressWarnings.length > 0) {
-        const detail = asString(telemetry["agy_error_reason"]) ??
-            (progressWarnings[0] ?? "provider reported warnings");
-        warnings.push({ code: "tool_error", message: detail });
-    }
-    // -- warning: cancellation --------------------------------------------------
-    if (canceled || terminalStatus === "canceled") {
-        warnings.push({ code: "canceled", message: "canceled" });
-    }
-    // -- status resolution ------------------------------------------------------
-    const emptyOutput = looksEmpty(output);
-    let status;
-    if (canceled || terminalStatus === "canceled") {
-        status = "canceled";
-    }
-    else if (terminalStatus === "error") {
-        status = "failed";
-    }
-    else if (terminalStatus === "done") {
-        // ── THE HEADLINE RULE ──────────────────────────────────────────────────
-        // "done" + (warnings OR an empty answer) is a SUSPICIOUS success. We
-        // refuse to call it `succeeded`, because doing so is exactly the failure
-        // mode this project exists to eliminate: reporting work as done that was
-        // not. Empty-and-warned ⇒ failed with a suspicious_success warning.
-        if (emptyOutput) {
-            status = "failed";
-            warnings.push({
-                code: "empty_output",
-                message: "no output",
-            });
-            if (statusWarnings === true || progressWarnings.length > 0) {
-                warnings.push({
-                    code: "suspicious_success",
-                    message: "success with warnings and no output",
-                });
-            }
-            else {
-                warnings.push({
-                    code: "suspicious_success",
-                    message: "success with no output",
-                });
-            }
-        }
-        else {
-            // Non-empty output: still downgrade to `failed` if the provider flagged
-            // hard warnings? No — warnings alone don't fail a job that clearly
-            // produced work. But `statusWarnings: true` with no progress warning
-            // text and a suspiciously short body is still suspicious; we flag it as
-            // a warning while keeping status `succeeded`. This is the "clean success
-            // vs. clean-ish success" distinction: warn loudly, don't overclaim.
-            status = "succeeded";
-            if (statusWarnings === true) {
-                warnings.push({
-                    code: "suspicious_success",
-                    message: "done with warnings; review it",
-                });
-            }
-        }
-    }
-    else if (hasProgressFile || lastEventAt !== null) {
-        // Terminal status file not written yet but live evidence present ⇒ running.
-        status = "running";
-    }
-    else {
-        // No status.json, no progress. Could be a job that was cleaned up entirely,
-        // or a job we know nothing about. `unknown` is the honest answer.
-        status = "unknown";
-        warnings.push({
-            code: "incomplete_state",
-            message: "no status or progress found",
-        });
-    }
-    // A canceled job that also has an empty output is expected; don't double-flag.
-    if (status === "canceled" && emptyOutput) {
-        warnings = warnings.filter((w) => w.code !== "empty_output");
-    }
-    // -- usage ------------------------------------------------------------------
-    let usage = null;
-    const usageParts = {};
-    const tin = asNumber(telemetry["tokens_in"]);
-    const tout = asNumber(telemetry["tokens_out"]);
-    const tthink = asNumber(telemetry["tokens_think"]);
-    const tcache = asNumber(telemetry["tokens_cache"]);
-    const durMs = asNumber(telemetry["duration_ms"]);
-    const turns = asNumber(telemetry["turns"]);
-    if (tin !== null)
-        usageParts["inputTokens"] = tin;
-    if (tout !== null)
-        usageParts["outputTokens"] = tout;
-    if (tthink !== null)
-        usageParts["thinkingTokens"] = tthink;
-    if (tcache !== null)
-        usageParts["cacheTokens"] = tcache;
-    if (durMs !== null)
-        usageParts["durationMs"] = durMs;
-    if (turns !== null)
-        usageParts["turns"] = turns;
-    if (Object.keys(usageParts).length > 0)
-        usage = usageParts;
-    // -- startedAt: agy-staff does not store a clean start time on the files we
-    // read, so we leave it null rather than guessing. (Honor the contract: an
-    // explicit null beats an invented value.)
-    const startedAt = null;
-    // -- updatedAt: the freshest timestamp we have. --
-    const updatedAt = lastEventAt ?? finishedAt;
-    return {
-        provider: "agy-staff",
-        jobId: raw.jobId,
-        status,
-        warnings,
-        output,
-        startedAt,
-        updatedAt,
-        finishedAt,
-        mode: asString(p[AGY_PAYLOAD.mode]),
-        model: asString(p[AGY_PAYLOAD.model]) ?? asString(telemetry["model"]),
-        label: asString(p[AGY_PAYLOAD.profile]),
-        outputTruncated: asBool(p[AGY_PAYLOAD.outputTruncated]) === true,
-        usage,
-        partial: raw.partial === true,
-        raw: p,
-    };
-};
 // ── agent-smith normalizer ──────────────────────────────────────────────────
 /**
  * Map an agent-smith payload onto ObservedJob.
  *
- * THIS IS THE PRIMARY NORMALIZER, and it is far shorter than the two above
- * because we own the format (see forge/format.ts). Three rows, in order:
+ * It is short because we own the format (see forge/format.ts). Three rows, in order:
  *
  *   1. cancel marker exists                    ⇒ canceled   (outranks job.json:
  *      the marker is written the instant cancel is requested, and the worker may
@@ -1666,9 +1119,7 @@ const smithNormalizer = (raw) => {
             message: "no status in job.json",
         });
     }
-    // A cancelled job's empty output is expected, not a defect.
-    const kept = resolved === "canceled" ? warnings.filter((w) => w.code !== "empty_output") : warnings;
-    return buildSmith(raw, resolved, kept);
+    return buildSmith(raw, resolved, warnings);
 };
 /** Assemble the ObservedJob for the agent-smith normalizer. */
 function buildSmith(raw, status, warnings) {
@@ -1730,46 +1181,9 @@ function asUsage(v) {
     }
     return Object.keys(out).length > 0 ? out : null;
 }
-// ── registry of normalizers ─────────────────────────────────────────────────
-const NORMALIZERS = new Map([
-    ["agent-smith", smithNormalizer],
-    ["agy-staff", agyNormalizer],
-]);
-/**
- * Normalize a raw provider snapshot.
- *
- * Unknown provider ⇒ returns a minimal `unknown` ObservedJob rather than
- * throwing, so adding a reader before adding its normalizer degrades to
- * "shows up but unknown", not "crashes the band".
- */
+/** Normalize a raw agent-smith job snapshot. */
 function normalize(raw) {
-    const norm = NORMALIZERS.get(raw.provider);
-    return norm ? norm(raw) : fallbackNormalizer(raw);
-}
-/** Minimal normalization used when no provider-specific normalizer is registered. */
-function fallbackNormalizer(raw) {
-    return {
-        provider: raw.provider,
-        jobId: raw.jobId,
-        status: "unknown",
-        warnings: [
-            {
-                code: "incomplete_state",
-                message: `No normalizer registered for provider "${raw.provider}".`,
-            },
-        ],
-        output: null,
-        startedAt: null,
-        updatedAt: null,
-        finishedAt: null,
-        mode: null,
-        model: null,
-        label: null,
-        outputTruncated: false,
-        usage: null,
-        partial: true,
-        raw: raw.payload,
-    };
+    return smithNormalizer(raw);
 }/**
  * pipeline/routing.ts — dynamic model/stage selection.
  *
@@ -3322,7 +2736,7 @@ function spawnWorker(opts) {
         }
     }
     // RULE 4: polite first, then escalate. SIGTERM gives the CLI a chance to flush
-    // its result file, which matters for the agy-staff readers in harness/.
+    // its result file.
     // Some CLIs ignore SIGTERM while a tool call is in flight, hence the SIGKILL.
     function terminate(reason) {
         if (killReason !== undefined)
@@ -3722,8 +3136,6 @@ function parseTomlTopLevel(text) {
  * Verified on 2026-10-06 with:
  *   $ agy --print=hello --print-timeout=20s --output-format stream-json \
  *         --model gemini-3.8-flash-low
- * plus cross-checked against 20 archived agy-staff jobs in
- * ~/Repos/renyi/.agy-staff/jobs/ (~14 900 step_update records).
  * Commands used to check: `agy --help`, `agy models`, and live `--print` runs.
  * ============================================================================
  *
@@ -3786,26 +3198,6 @@ function parseTomlTopLevel(text) {
  * which is what makes this whole class of silent failure disappear. But we still
  * check, because a config-level allow-rule can deny a single command and the
  * flag does not override an explicit deny.
- *
- * ----------------------------------------------------------------------------
- * THE OTHER TRAP: agy-staff DELETES progress.json on clean success.
- * ----------------------------------------------------------------------------
- * agy-staff (the host harness that used to drive agy) writes job state under
- *   <cwd>/.agy-staff/jobs/<jobId>.{spec.json,progress.json,events.jsonl,log,
- *                                   result.md,result.md.status.json}
- * On a run with NO warnings it DELETES progress.json and events.jsonl when the
- * job completes. This is not a bug and not a crash — it is the good path.
- *
- * CONSEQUENCE FOR ANY WATCHER (including harness/, and including anyone tempted
- * to poll progress.json from this file): a MISSING progress.json MEANS "JOB
- * FINISHED", NEVER "JOB VANISHED". Treating absence as liveness is how you get
- * a watcher that reports every healthy job as missing. The authoritative
- * terminal signal is the existence of result.md + result.md.status.json.
- *
- * We do NOT poll progress.json here — this adapter owns the live stream, and
- * stdio is authoritative. But we do not touch that tree either: it belongs to
- * harness/. Flagged loudly because it is the single most misreadable fact in
- * the whole system.
  */
 const AGY_BINARY = process.env['AGENT_SMITH_AGY_BIN'] ?? 'agy';
 // ---------------------------------------------------------------------------
@@ -3815,8 +3207,7 @@ const AGY_BINARY = process.env['AGENT_SMITH_AGY_BIN'] ?? 'agy';
  * Format a millisecond budget as a Go duration string.
  *
  * agy's --print-timeout is typed as a Go `time.Duration` (its help literally
- * says `0s`), and agy-staff's resolved spec.json carries `"timeout":"120m"`,
- * i.e. the same grammar. Verified that `20s` is accepted.
+ * says `0s`). Verified that `20s` is accepted.
  * NOTE: Go durations have no day component; >24h wraps. We clamp to hours.
  */
 function toGoDuration(ms) {
@@ -3891,8 +3282,8 @@ function sandboxPlan$4(spec) {
  *                      "proceed-in-sandbox" (seen in the init event), so we do
  *                      not re-request it and accidentally widen the sandbox.
  *   --log-file         our own stderr.log in stateDir already captures it.
- *   --new-project      agy-staff passes --project for grouped sessions; that is
- *                      a harness concern, and SpawnSpec has no field for it.
+ *   --new-project      grouped sessions are a harness concern, and SpawnSpec
+ *                      has no field for it.
  */
 function buildArgv$4(spec) {
     const argv = [
@@ -7009,11 +6400,8 @@ function findProvider(name) {
  * be observed half-written, then for one poll window every reader sees a
  * malformed manifest, the job reads as `unknown`, and the channel's Gate 3 (a
  * terminal claim needs a terminal timestamp) suppresses the one notification
- * that mattered. We have already paid for this class of bug once — see
- * harness/agy-staff.ts, where every read has to tolerate a half-written JSON
- * body because somebody else writes those files.
- *
- * We write this file, so we do not have to tolerate that.
+ * that mattered. We write this file, so we never let a reader see it
+ * half-written.
  *
  * The primitive is the standard one: write a sibling temp file, then rename.
  * `rename(2)` is atomic within a filesystem, so a reader sees either the whole
@@ -7089,7 +6477,7 @@ function createMarker(filePath, body) {
 /**
  * agy tool name + parameters → a short "what is it doing" phrase.
  *
- * Measured against the real corpus in .agy-staff/jobs:
+ * Measured against real agy tool calls:
  *   run_command           { CommandLine }
  *   view_file             { AbsolutePath }
  *   write_to_file         { TargetFile }
@@ -7227,7 +6615,7 @@ function basename(p) {
     return i === -1 ? p : p.slice(i + 1);
 }
 /**
- * `input_preview` is a JSON STRING of the tool parameters, truncated by agy-staff.
+ * `input_preview` is a JSON STRING of the tool parameters, possibly truncated.
  * A truncated JSON string does not parse, so this never throws — a failure just
  * means we have no parameters and the caller falls back to the bare tool name.
  */
@@ -8118,9 +7506,9 @@ class JobWriter {
      * Request cancellation. Writes the marker FIRST, then the caller kills.
      *
      * Marker before kill because the kill is asynchronous and a reader polling in
-     * between must already see the intent. This is agy-staff's HAZARD B, kept for
-     * the same reason it exists there: a cancellation caught mid-flight is still a
-     * cancellation, and the worker may never get to write its own terminal state.
+     * between must already see the intent: a cancellation caught mid-flight is
+     * still a cancellation, and the worker may never get to write its own
+     * terminal state.
      */
     requestCancel(at = new Date().toISOString()) {
         if (this.finished)
@@ -8415,7 +7803,7 @@ function pipeEvents(writer, handle) {
 }
 /** The report text a JobResult implies, under the headline rule. Exported for tests. */
 function reportFor(result) {
-    if (typeof result.response === 'string' && !looksEmpty$1(result.response))
+    if (typeof result.response === 'string' && !looksEmpty(result.response))
         return result.response;
     return '';
 }
@@ -8509,8 +7897,7 @@ function isMode(value) {
  *     run a command in the working tree → return passed: boolean + evidence
  *
  * and the evidence is BOUNDED, because an unbounded log handed to a model is an
- * invitation to summarise it, which is the thing that fails. 8KB per stream,
- * same bound agy-staff uses, for the same reason.
+ * invitation to summarise it, which is the thing that fails. 8KB per stream.
  * ─────────────────────────────────────────────────────────────────────────────
  *
  * ─────────────────────────────────────────────────────────────────────────────
@@ -8537,7 +7924,7 @@ function isMode(value) {
  * cannot become the thing that keeps the process alive.
  * ─────────────────────────────────────────────────────────────────────────────
  */
-/** Default cap per stream. Matches agy-staff's bound. */
+/** Default cap per stream. */
 const DEFAULT_TAIL_BYTES = 8 * 1024;
 /** Grace between SIGTERM and SIGKILL when a check times out. */
 const DEFAULT_KILL_GRACE_MS = 2_000;
@@ -9719,4 +9106,4 @@ function startPipeline(service, spec, options = {}) {
         throw error;
     }).finally(() => clearInterval(poll));
     return { runId, recordPath, done, cancel: () => { cancelPipeline(service.repo, runId); } };
-}export{checksReason as $,AgentSmithReader as A,deriveStatus as B,writeAtomic as C,DEFAULT_TIMEOUT_MS as D,summaryTail as E,FILES as F,failureFields as G,writeAcceptance as H,getProvider as I,nextActionFor as J,jobDir as K,fileSig as L,MODES as M,jobsDir as N,JobWriter as O,PROVIDERS as P,isMode as Q,REASONS as R,STAGE_PROMPTS as S,newJobId$1 as T,humanDuration as U,pipeEvents as V,pipelineRecordPath as W,isForgeJobId as X,computeStaleReads as Y,SMITH_PAYLOAD as Z,isForgeStatus as _,MODE_PRESETS as a,readJsonSafe as a0,toolLabel as a1,readAcceptance as b,readPipeline as c,cancelPipeline as d,settleAcceptance as e,markAcceptanceSuperseded as f,isTerminalForgeStatus as g,readManifest as h,inheritContinuedProviders as i,jobFile as j,AgyStaffReader as k,errMessage as l,markAcceptancePending as m,normalize as n,findProvider as o,providerNames as p,SCHEMA_VERSION as q,reasonFromText as r,startPipeline as s,validOwnerPid as t,ownerAlive as u,validateSpec as v,writeJsonAtomic as w,reportFor as x,cwdFacts as y,deriveOrphan as z};
+}export{toolLabel as $,AgentSmithReader as A,writeAtomic as B,summaryTail as C,DEFAULT_TIMEOUT_MS as D,failureFields as E,FILES as F,writeAcceptance as G,getProvider as H,nextActionFor as I,jobDir as J,fileSig as K,jobsDir as L,MODES as M,JobWriter as N,isMode as O,PROVIDERS as P,newJobId$1 as Q,REASONS as R,STAGE_PROMPTS as S,humanDuration as T,pipeEvents as U,pipelineRecordPath as V,computeStaleReads as W,SMITH_PAYLOAD as X,isForgeStatus as Y,checksReason as Z,readJsonSafe as _,MODE_PRESETS as a,readAcceptance as b,readPipeline as c,cancelPipeline as d,settleAcceptance as e,markAcceptanceSuperseded as f,isTerminalForgeStatus as g,readManifest as h,inheritContinuedProviders as i,jobFile as j,errMessage as k,findProvider as l,markAcceptancePending as m,normalize as n,SCHEMA_VERSION as o,providerNames as p,validOwnerPid as q,reasonFromText as r,startPipeline as s,ownerAlive as t,reportFor as u,validateSpec as v,writeJsonAtomic as w,cwdFacts as x,deriveOrphan as y,deriveStatus as z};

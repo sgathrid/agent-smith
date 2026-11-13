@@ -49,7 +49,7 @@ try {
   chmodSync(fakeCodex, 0o755); chmodSync(fakeAgy, 0o755);
   let stderr = '';
   const openClient = async (name, env) => {
-    const transport = new StdioClientTransport({ command: process.execPath, args: ['--experimental-strip-types', server], env, stderr: 'pipe' });
+    const transport = new StdioClientTransport({ command: process.execPath, args: ['--experimental-strip-types', server, repo], env, stderr: 'pipe' });
     transport.stderr?.on('data', (chunk) => { stderr += String(chunk); });
     const next = new Client({ name, version: '1' });
     await next.connect(transport);

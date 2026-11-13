@@ -68,11 +68,11 @@ Only variables the code reads.
 | `AGENT_SMITH_TASKS` | `surfaces/channel/src/mcp.ts` | unset (`0`) | `1` advertises `extensions['io.modelcontextprotocol/tasks']` on modern (`2026-07-28`) connections and registers `tasks/get`, `tasks/update` and `tasks/cancel`, returning `resultType: 'task'` for `spawn_job`/`resume_job` requests that advertise client Tasks support. |
 | `AGENT_SMITH_NO_CATALOG_WARMUP` | `surfaces/channel/src/server.ts` | unset | `1` skips the background model discovery the MCP server starts at launch. The first spawn that names a model then waits up to `CATALOG_COLD_WAIT_MS` for a cold catalog, unless a fresh `.agent-smith/catalogs/<provider>.json` already holds it. |
 | `AGENT_SMITH_CONFIRM_UNRESTRICTED` | `surfaces/channel/src/tools.ts` | enabled | `0` stops `spawn_job`/`resume_job` asking the user to confirm an explicit `unrestricted: true` for codex, claude or opencode, and drops the "not confirmed" ack warning. For automation with no one to answer. |
-| `AGY_WATCH_CWD` | `server.ts`, `monitor.ts`, `watch-hook.ts` | `process.cwd()` | Repo to operate on. MCP server order: positional argv path, then this, then cwd. `monitor.js`: `--cwd`, positional first arg, then this. Hook: last resort after payload `repo`/`dir`/`recordPath` and hook `cwd`. `dev.sh` sets it to `--repo`. |
 | `HOME`, `PATH` | `discovery.ts`, `ndjson.ts` | process env | `HOME` roots the default config dirs; `PATH` is probed for provider binaries (cached per binary+PATH). |
 
-Name note: `AGY_WATCH_CWD` is a legacy name from the agy-staff watcher but is the live
-repo-selection variable for the MCP server, hook and monitor.
+Repo selection: the MCP server takes a positional repo path, else its process cwd.
+`monitor.js` takes `--cwd` or a positional first argument, else its cwd. The hook uses the
+launch ack's repo, else the hook input's `cwd`, else its process cwd.
 
 ## Harness default sources
 
@@ -232,7 +232,7 @@ Result (`SteerAck`): `jobId` (the active turn ID), `name, workerId, provider, de
 `resumable` reports whether a conversation handle was known when the steer was accepted; if it is false and no handle arrives before the turn ends, the continuation starts fresh. A queued steer that the turn cannot deliver (for example because it failed) is recorded as a warning on the terminal job rather than being lost silently.
 
 ### `list_jobs` (read-only, structured)
-Params: `provider` enum `agent-smith|agy-staff|all` (default `agent-smith`), `status` enum
+Params: `status` enum
 `running|succeeded|failed|canceled`, `limit` 1-500 (default 20 concise, 50 detailed), `since` (ISO time
 or relative `30m`/`2h`/`1d`; jobs last active at or after it), `session` (only jobs spawned by this server
 process; empty after a restart), `response_format` `concise|detailed` (default `concise`). Running first,
@@ -365,7 +365,7 @@ completion notice or call cancel.`).
 - `npm run build:plugin`: builds the channel and bundles the self-contained plugin (`builds/local-plugin/agent-smith`, with the MCP v2 runtime bundled into `runtime/dist/` and no `node_modules`).
 - `npm run setup:claude`: runs `build:plugin`, validates `builds/local-plugin/agent-smith`, and enables it in `.claude/settings.local.json` via a directory marketplace. No global config is touched.
 - `dev.sh [--repo DIR] [claude flags]`: session-scoped launch with
-  `--plugin-dir the-codes/surfaces/mod` and an inline MCP config (`AGY_WATCH_CWD=<repo>`).
+  `--plugin-dir the-codes/surfaces/mod` and an inline MCP config that passes `<repo>` to the server.
 - CLI: `agent-smith setup|run|resume|ls|status|cancel|gc|doctor` (`scripts/agent-smith.mjs`; Node
   >= 22.18 with native TypeScript stripping).
 

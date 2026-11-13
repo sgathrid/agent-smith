@@ -22,7 +22,7 @@
 
 /** A reader for one provider's on-disk job-state layout. */
 export interface JobStateReader {
-  /** Stable provider key used by the registry, e.g. "agy-staff". */
+  /** Stable provider key used by the registry, e.g. "agent-smith". */
   readonly provider: string;
 
   /**
@@ -36,9 +36,8 @@ export interface JobStateReader {
   /**
    * Read one job's current state.
    *
-   * Returns `null` when the job is unknown to this provider. Note that a
-   * *known but finished* job still returns a full snapshot: see hazard A in
-   * agy-staff.ts, where the live-progress file is deliberately deleted.
+   * Returns `null` when the job is unknown to this provider. A *known but
+   * finished* job still returns a full snapshot.
    */
   read(cwd: string, jobId: string): Promise<RawJobState | null>;
 }
@@ -49,7 +48,7 @@ export interface JobStateReader {
  * Deliberately loose. `payload` is `Record<string, unknown>` because every
  * provider evolves its own layout and we would be chasing it forever if this
  * type tried to pin every field. The *reader* is responsible for doing the
- * provider-specific parsing (see agy-staff.ts) and putting
+ * provider-specific parsing (see agent-smith.ts) and putting
  * something useful in `payload`; `normalize.ts` is responsible for mapping that
  * onto the provider-agnostic `ObservedJob`.
  */

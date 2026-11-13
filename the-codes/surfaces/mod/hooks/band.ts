@@ -185,10 +185,9 @@ export function buildLine(
  * Live (running or attention): always. Terminal: for LINGER_MS after it
  * actually finished.
  *
- * MEASURED FROM `endedAt` — the instant agy-staff wrote the terminal file — AND
- * NOT from when we first noticed. That distinction is load-bearing against the
- * real corpus: `/Users/gathrid/Repos/renyi/.agy-staff/jobs` holds 20 jobs
- * finished hours ago, and a band that showed four of them at session start would
+ * MEASURED FROM `endedAt` — the instant the terminal state was written — AND
+ * NOT from when we first noticed. That distinction is load-bearing: a repo can
+ * hold jobs finished hours ago, and a band that showed four of them at session start would
  * be asserting that work is in flight when it is not. The linger therefore also
  * serves as the honest bound on "I missed the finish, and that is fine".
  */
