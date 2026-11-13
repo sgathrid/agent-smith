@@ -131,7 +131,7 @@ test('cancel under a detached supervisor does not claim it aborted the checks', 
   (f.ctx.service as unknown as { supervisorUrl: URL }).supervisorUrl = new URL('file:///unused');
   writeAcceptance(f.repo, 'job-1', { state: 'unchecked', checks: [], pending: true, budgetMs: 60_000, running: 'hang' });
   const c = body(await callTool(f.ctx, 'cancel', { jobId: 'job-1' }));
-  assert.equal(c.requested, true);
+  assert.equal(typeof c.settled, 'boolean');
   assert.equal(c.checksCanceled, false);
   assert.match(c.checksNote, /supervisor .* will stop them/);
   // Checks not running (job still executing): nothing to say about them.

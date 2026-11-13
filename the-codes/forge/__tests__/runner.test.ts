@@ -193,7 +193,7 @@ test('a read-only stage is told its artifact is the only permitted write', () =>
     assert.ok(prompt.includes(path.resolve(work, name, 'result.md')));
     assert.match(stagePrompt, /leave every file in the source workspace as it is/);
     assert.match(stagePrompt, /only permitted write/);
-    const guidanceAt = prompt.toLowerCase().indexOf('leave the files as they are');
+    const guidanceAt = prompt.indexOf(MODE_PRESETS[name].guidance);
     assert.ok(guidanceAt >= 0 && guidanceAt < prompt.indexOf('only permitted write'), 'the qualification comes after the guidance');
   }
   // A custom role that is not a read-only mode keeps the plain wording.

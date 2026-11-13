@@ -3,7 +3,8 @@
  * catalog validation and the agy preflight, all with injected fakes.
  */
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, readdirSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -13,6 +14,7 @@ import { buildBrief } from '../brief.ts';
 import { MODE_PRESETS } from '../modes.ts';
 import { ForgeService } from '../service.ts';
 import { scaled, waitFor } from '../testing/time.ts';
+import { withDefaultProvider } from '../testing/steer-harness.ts';
 
 interface Fake {
   provider: Provider;
@@ -62,14 +64,13 @@ function svc(
   harnessDefaults: (provider: string) => { model?: string } = () => ({}),
 ) {
   const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-policy-'));
-  const service = new ForgeService({
+  const service = withDefaultProvider(new ForgeService({
     repo,
-   
     flushMs: 1,
     providerSource: () => fake.provider,
     catalogSource: typeof cat === 'function' ? cat : async () => (cat === undefined ? [] : [cat]),
     harnessDefaults,
-  });
+  }), fake.provider.name);
   return { service, repo };
 }
 
@@ -120,7 +121,8 @@ test('the brief is prepended to the provider prompt, stored apart from it, and n
   const { service, repo } = svc(f);
   const ack = await service.spawnJob({ mode: 'review', prompt: 'look at it' });
   assert.equal(ack.preambleApplied, true);
-  const brief = buildBrief({ preset: MODE_PRESETS.review, cwd: repo });
+  const brief = buildBrief({ mode: 'review', preset: MODE_PRESETS.review, cwd: repo });
+  await waitFor(() => f.specs.length === 1);
   assert.equal(f.specs[0]!.prompt, `${brief}\n\nlook at it`);
   const manifest = JSON.parse(readFileSync(path.join(ack.dir, 'job.json'), 'utf8'));
   assert.equal(manifest.preambleApplied, true);
@@ -149,6 +151,7 @@ test('the brief names the workspace, context and checks when given', async () =>
       { name: 'lint', command: 'npm run lint', cwd: 'pkg', blocking: false },
     ],
   });
+  await waitFor(() => f.specs.length === 1);
   const sent = f.specs[0]!.prompt;
   assert.match(sent, /orchestrating agent/);
   assert.ok(sent.includes(`Workspace: ${cwd}.`));
@@ -157,7 +160,7 @@ test('the brief names the workspace, context and checks when given', async () =>
   assert.ok(sent.includes('- tests: `npm test`'));
   assert.ok(sent.includes('for information only:\n- lint: `npm run lint` (in pkg)'), 'a non-blocking check is not presented as the bar');
   assert.ok(sent.includes(MODE_PRESETS.implement.guidance));
-  assert.match(sent, /only claim what you can point to/);
+  assert.match(sent, /Only claim what you can point to/);
   assert.ok(sent.endsWith('\n\nadd the flag'));
 });
 
@@ -165,6 +168,7 @@ test('the brief leaves out context and checks when absent', async () => {
   const f = fakeProvider('fake');
   const { service } = svc(f);
   await service.spawnJob({ mode: 'verify', prompt: 'run it' });
+  await waitFor(() => f.specs.length === 1);
   const sent = f.specs[0]!.prompt;
   assert.doesNotMatch(sent, /Context:/);
   assert.doesNotMatch(sent, /checks pass/);
@@ -197,17 +201,88 @@ test('a pipeline stage brief leaves the workspace line to the stage prompt', asy
   assert.ok(f.specs[0]!.prompt.includes(MODE_PRESETS.review.guidance));
 });
 
+test('workspace, checks, and closing lines vary by mode as specified', () => {
+  const checks = [{ name: 'unit', command: 'npm test' }];
+  const impl = buildBrief({ mode: 'implement', preset: MODE_PRESETS.implement, cwd: '/w', checks });
+  assert.ok(impl.includes('Workspace: /w. Make changes only inside it; edits elsewhere go unreviewed.'));
+  assert.ok(impl.includes("You're done when these checks pass. They run after you finish, so run them yourself first if you can:"));
+  assert.ok(impl.includes('Start your report with `Status: DONE`, `Status: DONE_WITH_CONCERNS` or `Status: BLOCKED`.'));
+
+  const rev = buildBrief({ mode: 'review', preset: MODE_PRESETS.review, cwd: '/w', checks });
+  assert.ok(rev.includes('\nWorkspace: /w.\n'));
+  assert.equal(rev.includes('Make changes only inside it'), false);
+  assert.ok(rev.includes('These run after you finish; report their result if you run them:'));
+
+  const mod = buildBrief({ mode: 'moderate', preset: MODE_PRESETS.moderate, cwd: '/w', checks });
+  assert.ok(mod.includes('\nWorkspace: /w.\n'));
+  assert.equal(mod.includes('Make changes only inside it'), false);
+  assert.ok(mod.includes('These run after you finish; report their result if you run them:'));
+
+  const ver = buildBrief({ mode: 'verify', preset: MODE_PRESETS.verify, cwd: '/w', checks });
+  assert.ok(ver.includes('Workspace: /w. Make changes only inside it; edits elsewhere go unreviewed.'));
+  assert.ok(ver.includes('These run after you finish; report their result if you run them:'));
+});
+
+test('already-dirty files line is capped at 20, omitted on resume/pipeline, and added before provider spawn', async () => {
+  const many = Array.from({ length: 23 }, (_, i) => `f${String(i + 1).padStart(2, '0')}.ts`);
+  const syncBrief = buildBrief({ mode: 'implement', preset: MODE_PRESETS.implement, cwd: '/w', dirtyFiles: many });
+  assert.ok(syncBrief.includes(
+    `Already modified before you started; not yours, leave them unless the task says otherwise: ${many.slice(0, 20).join(', ')}, and 3 more`,
+  ));
+  assert.equal(
+    buildBrief({ mode: 'implement', preset: MODE_PRESETS.implement, cwd: '/w', dirtyFiles: many, resuming: true }),
+    '',
+  );
+  assert.equal(
+    buildBrief({ mode: 'implement', preset: MODE_PRESETS.implement, cwd: '/w', dirtyFiles: many, pipelineStage: true }).includes('Already modified'),
+    false,
+  );
+
+  const f = fakeProvider('fake');
+  const { service, repo } = svc(f);
+  execFileSync('git', ['init', '-q'], { cwd: repo });
+  execFileSync('git', ['config', 'user.email', 't@example.com'], { cwd: repo });
+  execFileSync('git', ['config', 'user.name', 'Test'], { cwd: repo });
+  writeFileSync(path.join(repo, 'tracked.ts'), 'export const a = 1;\n');
+  execFileSync('git', ['add', 'tracked.ts'], { cwd: repo });
+  execFileSync('git', ['commit', '-q', '-m', 'init'], { cwd: repo });
+  writeFileSync(path.join(repo, 'tracked.ts'), 'export const a = 2;\n');
+  writeFileSync(path.join(repo, 'untracked.ts'), 'export const b = 1;\n');
+
+  const ack = await service.spawnJob({ mode: 'implement', prompt: 'do the task' });
+  await waitFor(() => f.specs.length === 1);
+  const sent = f.specs[0]!.prompt;
+  assert.ok(sent.includes('Already modified before you started; not yours, leave them unless the task says otherwise: tracked.ts, untracked.ts'));
+  const view = JSON.parse(readFileSync(path.join(ack.dir, 'view.json'), 'utf8')) as { preamble: string | null; prompt: string };
+  assert.equal(`${view.preamble}\n\n${view.prompt}`, sent);
+
+  // Cancel landing during the baseline wait finishes the job as canceled and never spawns the provider.
+  const f2 = fakeProvider('fake');
+  const service2 = withDefaultProvider(new ForgeService({ repo, flushMs: 5, providerSource: () => f2.provider, catalogSource: async () => [] }));
+  const { ack: cancelAck, done: cancelDone } = await service2.spawnTracked({ mode: 'implement', name: 'cancel-during-baseline', prompt: 'do not run' });
+  const cancelRes = service2.cancel(cancelAck.jobId);
+  assert.equal(cancelRes.requested, true);
+  assert.equal(cancelRes.signalled, false);
+  const canceledManifest = await cancelDone;
+  assert.equal(canceledManifest.status, 'canceled');
+  assert.equal(f2.specs.length, 0);
+});
+
 test('a read-only stage hands its artifact path to the sandbox describer and the provider; others do not', async () => {
   const f = fakeProvider('fake');
   const { service } = svc(f);
   const ack = await service.spawnJob({ mode: 'review', prompt: 'x', pipeline: 'pl', stage: 'review', artifactPath: '/a/review/result.md' });
+  await waitFor(() => f.specs.length === 1);
   assert.equal(f.specs[0]!.artifactPath, '/a/review/result.md');
   assert.equal(ack.sandbox, 'fake ro+/a/review/result.md');
   await service.spawnJob({ mode: 'review', name: 'solo', prompt: 'x' });
+  await waitFor(() => f.specs.length === 2);
   assert.equal('artifactPath' in f.specs[1]!, false);
   await service.spawnJob({ mode: 'implement', name: 'rw', prompt: 'x', artifactPath: '/a/implement/result.md' });
+  await waitFor(() => f.specs.length === 3);
   assert.equal('artifactPath' in f.specs[2]!, false, 'a writable stage needs no special allowance');
   await service.spawnJob({ mode: 'review', name: 'open', prompt: 'x', unrestricted: true, artifactPath: '/a/r.md' });
+  await waitFor(() => f.specs.length === 4);
   assert.equal('artifactPath' in f.specs[3]!, false);
 });
 
@@ -215,6 +290,7 @@ test('read-only comes from the preset and the sandbox is echoed in ack and manif
   const f = fakeProvider('fake');
   const { service } = svc(f);
   const ack = await service.spawnJob({ mode: 'review', prompt: 'x' });
+  await waitFor(() => f.specs.length === 1);
   assert.equal(f.specs[0]!.readOnly, true);
   assert.equal(ack.readOnlyRequested, true);
   assert.equal(ack.readOnlyEnforced, true);
@@ -225,6 +301,7 @@ test('read-only comes from the preset and the sandbox is echoed in ack and manif
   assert.equal(m.readOnlyEnforced, true);
 
   const open = await service.spawnJob({ mode: 'review', name: 'u', prompt: 'x', unrestricted: true });
+  await waitFor(() => f.specs.length === 2);
   assert.equal(open.readOnlyRequested, false);
   assert.notEqual(f.specs[1]!.readOnly, true);
 

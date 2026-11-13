@@ -883,6 +883,13 @@ test('summaryTail cuts at a paragraph, else a line, else raw', () => {
   assert.equal(summaryTail('abcdefghij', 4), 'ghij');
 });
 
+test('summaryTail skips a leading Status line', () => {
+  assert.equal(summaryTail('Status: DONE\n\nFixed the bug in parser.ts.', 100), 'Fixed the bug in parser.ts.');
+  assert.equal(summaryTail('Status: DONE_WITH_CONCERNS\nPartial fix.', 100), 'Partial fix.');
+  assert.equal(summaryTail('Status: BLOCKED', 100), '');
+  assert.equal(summaryTail('Report body\nStatus: DONE', 100), 'Report body\nStatus: DONE');
+});
+
 test('a fast failure with no tool calls is marked failedEarly; a slow or busy one is not', () => {
   const r = repo();
   const early = startIn(r, r, 'review', 'review-smith-early001');

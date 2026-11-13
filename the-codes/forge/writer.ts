@@ -253,8 +253,12 @@ export class JobWriter {
     this.flushProgress(this.manifest.createdAt);
     // Fire and forget: spawn never waits on git. Merged into the manifest when it lands.
     this.cwd = input.cwd;
-    this.baselinePending = this.captureBaseline(input.cwd);
+    this.baselinePending = isInsideGitRepo(input.cwd) ? this.captureBaseline(input.cwd) : null;
     return manifest;
+  }
+
+  hasPendingBaseline(): boolean {
+    return this.baselinePending !== null;
   }
 
   private async captureBaseline(cwd: string): Promise<void> {
@@ -265,6 +269,24 @@ export class JobWriter {
       this.manifest = { ...this.manifest, gitBaseline: { head: snap.head, dirty: snap.dirty } };
       this.writeManifest();
     } catch { /* best effort */ }
+  }
+
+  /** Wait for the async git baseline capture and return the dirty paths, if any. */
+  async awaitBaseline(): Promise<readonly string[]> {
+    try {
+      if (this.baselinePending !== null) await this.baselinePending;
+    } catch { /* best effort */ }
+    return (this.manifest?.gitBaseline?.dirty ?? []).filter((p) => !isForgeStatePath(p));
+  }
+
+  /** Update `view.preamble` when the async brief enrichment lands before spawn. */
+  updatePreamble(preamble: string): void {
+    this.view = {
+      ...this.view,
+      preamble: preamble.slice(0, 4_000),
+      truncated: this.view.truncated || preamble.length > 4_000,
+    };
+    writeJsonAtomic(jobFile(this.repo, this.jobId, FILES.view), this.view);
   }
 
   /** Candidate paths that this worker's own edit tool calls touched. */
@@ -798,6 +820,16 @@ function gitCapMs(): number {
 const TOOL_INPUTS_CAP = 200_000;
 const CHANGED_FILES_SIG_CAP = 500;
 
+function isInsideGitRepo(cwd: string): boolean {
+  let dir = path.resolve(cwd);
+  while (true) {
+    if (existsSync(path.join(dir, '.git'))) return true;
+    const parent = path.dirname(dir);
+    if (parent === dir) return false;
+    dir = parent;
+  }
+}
+
 function git(cwd: string, args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
     execFile(
@@ -907,7 +939,7 @@ export function appendBounded(base: string, add: string, max: number): string {
  * conclusion is at the end of its message. Pure; exported for tests.
  */
 export function summaryTail(text: string, max: number): string {
-  const t = text.trim();
+  const t = text.trim().replace(/^Status:[^\n]*(?:\n|$)/, '').trim();
   if (t.length <= max) return t;
   const tail = t.slice(t.length - max);
   for (const sep of ['\n\n', '\n']) {

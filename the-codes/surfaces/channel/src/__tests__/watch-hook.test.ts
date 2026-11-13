@@ -339,3 +339,34 @@ test('hook with checks that outlive their budget: one "exited · checks running"
     assert.equal(out.split('Agent Smith').length - 1, 1);
   } finally { fs.rmSync(repo, { recursive: true, force: true }); }
 });
+
+test('a variants ack watches every job in one watch, with the longest budget', () => {
+  const resp = { jobs: [
+    { jobId: 'v1', status: 'running', repo: '/tmp/r', timeoutMs: 120_000 },
+    { name: 'Bad', error: 'no model' },
+    { jobId: 'v2', status: 'running', repo: '/tmp/r', timeoutMs: 300_000 },
+  ] };
+  const t = parseHookInput({ tool_name: 'mcp__x__spawn_job', tool_response: { structuredContent: resp, content: [] } });
+  assert.deepEqual({ kind: t?.kind, id: t?.id, ids: t?.ids, cwd: t?.cwd }, { kind: 'job', id: 'v1', ids: ['v1', 'v2'], cwd: '/tmp/r' });
+  assert.equal(t?.timeoutMs, 360_000);
+  assert.equal(parseHookInput({ tool_name: 'spawn_job', tool_response: { jobs: [{ name: 'x', error: 'e' }] } }), null);
+  assert.deepEqual(parseHookInput(wrap('spawn_job', ack))?.ids, ['j1']);
+});
+
+test('runHook for a variants ack waits for both jobs, and is silent only when every one is claimed', async () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-variants-'));
+  try {
+    const input = JSON.stringify(wrap('spawn_job', { jobs: [{ jobId: 'v1', status: 'running', repo }, { jobId: 'v2', status: 'running', repo }] }));
+    const opts = { readJob: async (_c: string, id: string) => job(id, 'succeeded'), intervalMs: 50 };
+    const claim = (id: string) => { const m = claimMarkerPath(repo, 'job', id); fs.mkdirSync(path.dirname(m), { recursive: true }); fs.writeFileSync(m, 'c\n'); };
+    let out = '';
+    claim('v1');
+    assert.equal(await runHook(input, (s) => { out += s; }, opts), 2, 'one unclaimed id still wakes Claude');
+    assert.match(out, /W-v1/);
+    assert.match(out, /W-v2/);
+    claim('v2');
+    out = '';
+    assert.equal(await runHook(input, (s) => { out += s; }, opts), 0);
+    assert.equal(out, '');
+  } finally { fs.rmSync(repo, { recursive: true, force: true }); }
+});

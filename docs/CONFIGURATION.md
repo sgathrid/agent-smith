@@ -71,7 +71,7 @@ Only variables the code reads.
 | `HOME`, `PATH` | `discovery.ts`, `ndjson.ts` | process env | `HOME` roots the default config dirs; `PATH` is probed for provider binaries (cached per binary+PATH). |
 
 Repo selection: the MCP server takes a positional repo path, else its process cwd.
-`monitor.js` takes `--cwd` or a positional first argument, else its cwd. The hook uses the
+The standalone `monitor.js` CLI takes `--cwd` or a positional first argument, else its cwd. The hook uses the
 launch ack's repo, else the hook input's `cwd`, else its process cwd.
 
 ## Harness default sources
@@ -88,7 +88,7 @@ never a CLI call on the spawn path.
 | `claude` | static `fable`, `opus`, `sonnet`, `haiku` (efforts low/medium/high/xhigh/max) | `<claudeHome>/settings.json` top-level `model` (no effort) |
 | `kimi` | `kimi provider list --json` (keys of its `models` map are the aliases `--model` accepts; live-verified on 2.1.1) | `<kimiHome>/config.toml` top-level `default_model` (no per-run effort flag) |
 
-Sandbox posture per provider (echoed in the ack): agy default = `--dangerously-skip-permissions`
+Sandbox posture per provider (recorded in `job.json`; the ack carries only `unrestricted` and `readOnlyEnforced`): agy default = `--dangerously-skip-permissions`
 (headless agy cannot prompt, so restricted means silent denial; opt out with `unrestricted:false`
 or `AGENT_SMITH_AGY_RESTRICTED=1`, which gives no flag and auto-denies unapproved tools;
 read-only is not enforceable). codex default = `-s workspace-write`, `-s read-only` for
@@ -147,9 +147,7 @@ accepts. Providers: `agy|codex|opencode|claude|kimi`. Tools marked structured al
 `structuredContent` (arrays wrapped as `{items}`) and declare a per-tool `outputSchema` that types the
 fields below and allows extra ones (`additionalProperties: true`); clients validate against it.
 
-Tasks vocabulary and opt-in extension: launch acks (`spawn_job`, `resume_job`, `run_pipeline`) carry `taskHandle {taskId, status:
-'working', pollIntervalMs: 5000}` (`taskId` is the job or run ID; `pollIntervalMs` is the server's poll
-cadence), and `status`/`list_jobs` rows carry `taskStatus` beside `status`: `running`/`unknown` ->
+Tasks vocabulary and opt-in extension: `status`/`list_jobs` rows carry `taskStatus` beside `status`: `running`/`unknown` ->
 `working`, `succeeded` -> `completed`, `failed` -> `failed`, `canceled` -> `cancelled`. Jobs in
 `.agent-smith/jobs/` are kept until `agent-smith gc` is run. When `AGENT_SMITH_TASKS=1` is set on a
 2026-07-28 connection and the request's `_meta['io.modelcontextprotocol/clientCapabilities'].extensions`
@@ -195,7 +193,7 @@ roleDefaults}`, `aliasConfigErrors?`, `modes[{name,description,readOnly,runsComm
 | `context` | string | optional, 1 to 2 000 chars; why the work matters and who it is for, shown to the worker in its brief |
 | `name` | string | worker label for `resume_job`; default `<mode>-<8 hex of id>`; max 80; must not collide with an active job |
 | `task` | string | short description; default first prompt line |
-| `provider` | enum | default: alias/roleDefault provider, else `agy` if installed, else the first installed |
+| `provider` | enum | default: alias/roleDefault provider, else the only installed provider; with several installed the call fails with `provider is required: installed are …` |
 | `model`, `effort` | string, enum | optional; validated against a fresh catalog, otherwise warnings only |
 | `timeoutMs` | integer >= 1 | default 2 700 000, clamped 1 000 to 21 600 000 |
 | `unrestricted` | boolean | default true for agy; always true for kimi (it cannot be restricted); false for other providers; `true` for codex, claude or opencode asks the user to confirm (above) |
@@ -203,14 +201,14 @@ roleDefaults}`, `aliasConfigErrors?`, `modes[{name,description,readOnly,runsComm
 | `files` | array | relative paths of brief/spec files in `repo` (max 32 files, 4 MiB total; symlinks escaping `repo` are rejected); copied into `cwd` when `cwd !== repo`, excluded from `changedFiles` unless modified by the worker, and watched for `staleReads` |
 | `conversation` | string | native conversation handle to resume |
 | `checks` | array | items `{name, command}` required, `cwd`, `timeoutMs` (int >= 1; default 60 000), `blocking` (default true); run after success; also listed in the worker's brief as its definition of done |
+| `from` | string | worker name or job id; reuses that worker's saved `request.json` (mode, prompt, context, files, cwd, provider, model, effort, timeout, unrestricted) and its checks. Params passed here override. Switching `provider` drops the saved model, effort and unrestricted. Fails for pipeline stages and jobs without a `request.json` |
+| `variants` | array | up to 8 entries `{name?, provider?, model?, effort?}`, each an independent job started from the shared params; names must be distinct (default `<name>-<provider>-<model>`). Not available on a task-augmented call |
 | `env` | object | extra worker environment variables, merged over the server's (e.g. a per-worktree `CARGO_TARGET_DIR`); keys `^[A-Za-z_][A-Za-z0-9_]*$`, string values without NUL. Keys that change how the worker binary is found, loaded or configured are refused, because the env applies before any worker sandbox exists: `PATH`, `HOME`, `SHELL`, `TMPDIR`, `NODE_OPTIONS`, `NODE_PATH`, `PYTHONPATH`, `PYTHONHOME`, `PYTHONSTARTUP`, the shell startup files `BASH_ENV`, `ENV`, `ZDOTDIR`, `SHELLOPTS`, `PROMPT_COMMAND`, `PERL5OPT`, `RUBYOPT`, and any key starting `LD_`, `DYLD_`, `XDG_`, `AGENT_SMITH_`, `AGY_`, `CLAUDE_`, `CODEX_`, `OPENCODE_` or `KIMI_` (case-insensitive; `ENV_DENYLIST` in `pipeline/types.ts`). Only the names are stored (`env-keys.json`); values are never written |
 
-Result (`SpawnAck`): `jobId, name, workerId, role, provider, status:'running', dir, repo,
-timeoutMs, unrestricted, note, sandbox, sandboxFlags, readOnlyRequested, readOnlyEnforced,
-modelRequested, modelResolved, modelSource` (`requested|harness-config|reported|unknown`),
-`preambleApplied`, `warnings?`; plus `taskHandle {taskId, status, pollIntervalMs}`, `notify {mode:'hook', note,
-fallback {when, use, monitorCommand?, monitorTimeoutMs?}}`, `aliasApplied?`/`aliasSource?`, `checks` (names) when checks were
-given, and `envKeys` (names, never values) when `env` was given.
+Result (slim ack, compact JSON): `jobId, name, provider, model, status:'running', timeoutMs, repo, unrestricted`, plus
+`readOnlyEnforced` for read-only modes, `envKeys` (names, never values) when `env` was given, `warnings?`,
+`checks` (names) when checks were given, and `aliasApplied?`/`aliasSource?`. With `variants`:
+`{jobs:[ack | {name, error}]}`. The saved request goes to the job's `request.json`.
 
 ### `resume_job` (structured)
 Params: `worker` (name or job id, required), `prompt` (required), `files` (optional relative paths in `repo`, merged with the previous job's existing watched files and re-synced into `cwd` only when changed in `repo` so worker worktree edits are preserved), `model`, `effort`,
@@ -219,16 +217,16 @@ default: the original job's), `env` (as for `spawn_job`; not inherited, because 
 stored: when the original job had env and this call passes none, the ack warns). An explicit cwd changes the process working directory while
 retaining the prior conversation, which can still mention its previous workspace. kimi is
 stricter: it resumes a session only from the directory that created it, so keeping the default
-cwd is required there. Provider, mode, workerId,
+cwd is required there. Provider, mode,
 name, watched files, acceptance checks and conversation come from the finished job; no `provider` parameter, and `checks` replaces the inherited checks (`[]` clears them).
 Refuses running workers (pointing to `steer_job`), workers without a conversation handle, ambiguous names. Result:
-a `SpawnAck` plus `taskHandle` and `notify`.
+the slim ack, as for `spawn_job`.
 
 ### `steer_job` (structured)
 Params: `worker` (name or job id of a running worker, required), `prompt` (required),
 `delivery` enum `queue|interrupt` (required; `queue` appends the steer and chains a continuation turn when the active turn exits; `interrupt` writes `cancel.steer` so the pump stops the active turn after a short wait for a conversation handle and chains the continuation turn; if no handle arrives, the continuation starts fresh), `context` (optional, 1 to 2 000 chars), `files` (optional relative paths in `repo`, merged with the active turn's watched files and re-synced into `cwd` when changed in `repo` or newly added).
 Refuses finished workers (pointing to `resume_job`), pipeline stages, and running workers without a live owner process.
-Result (`SteerAck`): `jobId` (the active turn ID), `name, workerId, provider, delivery, status: 'queued'|'interrupting', pendingSteers, signalled, resumable, dir, repo, timeoutMs, note`, plus `taskHandle` and `notify`.
+Result (`SteerAck`): `jobId` (the active turn ID), `name, provider, delivery, status: 'queued'|'interrupting', pendingSteers, signalled, resumable, repo, timeoutMs, note`.
 `resumable` reports whether a conversation handle was known when the steer was accepted; if it is false and no handle arrives before the turn ends, the continuation starts fresh. A queued steer that the turn cannot deliver (for example because it failed) is recorded as a warning on the terminal job rather than being lost silently.
 
 ### `list_jobs` (read-only, structured)
@@ -286,14 +284,14 @@ Detailed result (the full record): `JobSummary` fields plus `report` (first 8 00
 reason?}`, and with `wait_ms`: `waited:true`, `stillRunning`.
 
 ### `cancel` (destructive, idempotent)
-Params: `jobId` (a job id or a pipeline run id; a run record is tried first). Job result:
-`{jobId, requested, signalled, note}`, plus `checksCanceled: true` when the worker had already
-exited and this process aborted its running acceptance checks (acceptance then reads `unchecked`,
-reason `checks canceled`). When a detached supervisor owns the checks, the result instead carries
-`checksCanceled: false` and a `checksNote` (the supervisor stops them within about 200 ms, same
-outcome); `signalled` is true only when this process held the
-live worker. Run result: `{requested, runId, note}`. A request does not prove the worker
-stopped; check `status`.
+Params: `jobId` (a job id or a pipeline run id; a run record is tried first). Waits up to 5 s for the job or run to
+settle. Job result: `{jobId, status, settled, resolvedFrom?}` (`resolvedFrom` when a steer redirected the id to its
+continuation), plus `checksCanceled: true` when the worker had already exited and this process aborted its running
+acceptance checks (acceptance then reads `unchecked`, reason `checks canceled`). When a detached supervisor owns the
+checks, the result instead carries `checksCanceled: false` and a `checksNote` (the supervisor stops them within about
+200 ms, same outcome). Run result: `{runId, status, settled}`. A settled cancel writes the claim marker, so the hook
+stays silent, and the mod retires its pending notice; `settled: false` means the worker has not stopped yet, so check
+`status`.
 
 ### `run_pipeline`
 Params: `spec` object (unknown fields rejected): `name` (required), `task` (required unless
@@ -301,9 +299,7 @@ Params: `spec` object (unknown fields rejected): `name` (required), `task` (requ
 `stages[]`. Stage fields: `name`, `provider` (required unless `continues` is set); `agentName`, `workerId`,
 `conversation`, `continues` (see below), `model`, `effort`, `prompt`, `context` (as `spawn_job`), `title`, `role`, `dependsOn[]`, `workDir`,
 `resultPath`, `timeoutMs`, `routingPinned`, `checks[]` (same shape as `spawn_job`), `env` (as
-`spawn_job`; names only on disk), `consumes[{stage,path,label?}]`. Without `stages`: implement -> review -> moderate from
-installed providers. Result: `{runId, recordPath, stages[{name,provider,dependsOn}],
-started:true, task, notify}` (not structured).
+`spawn_job`; names only on disk), `consumes[{stage,path,label?}]`. Without `stages`: implement -> review -> moderate; each stage's provider follows the `spawn_job` rule (role default, else the only installed provider, else `provider is required`). Result: `{runId, repo, stages}` (not structured).
 
 #### Fixing from a review: `continues`
 `continues: "<stage>"` makes a stage resume an earlier stage's worker instead of starting a

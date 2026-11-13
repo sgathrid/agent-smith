@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import path from'node:path';import {fileURLToPath}from'node:url';import {existsSync,realpathSync}from'node:fs';import {b as readAcceptance}from'./chunk-execute.js';import {r as runJobWatch,p as parseLaunch,c as claimMarkerPath}from'./chunk-monitor.js';import'node:fs/promises';import'node:crypto';import'node:child_process';import'node:os';import'node:readline';import'./chunk-stale.js';/**
+import path from'node:path';import {fileURLToPath}from'node:url';import {existsSync,realpathSync}from'node:fs';import {d as readAcceptance}from'./chunk-execute.js';import {p as parseLaunches,c as claimMarkerPath}from'./chunk-stale.js';import {r as runJobWatch}from'./chunk-monitor.js';import'node:fs/promises';import'node:crypto';import'node:child_process';import'node:os';import'node:readline';/**
  * PostToolUse (asyncRewake) hook entrypoint.
  *
  * Reads the hook JSON from stdin; for spawn_job / resume_job / run_pipeline it
@@ -22,8 +22,9 @@ const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 function parseHookInput(input) {
     if (!isObj(input))
         return null;
-    const launch = parseLaunch(input['tool_name'], input['tool_response']);
-    if (launch === null)
+    const launches = parseLaunches(input['tool_name'], input['tool_response']);
+    const launch = launches[0];
+    if (launch === undefined)
         return null;
     let cwd = launch.repo;
     if (cwd === null && typeof input['cwd'] === 'string' && input['cwd'].length > 0)
@@ -31,9 +32,12 @@ function parseHookInput(input) {
     if (cwd === null)
         cwd = process.cwd();
     const resolved = path.resolve(cwd);
-    const budget = launch.kind === 'job' ? pendingBudgetMs(resolved, launch.id) : 0;
-    const timeoutMs = Math.min(WATCH_CAP_MS, (launch.timeoutMs ?? MAX_WATCH_JOB_MS) + budget + WATCH_GRACE_MS);
-    return { kind: launch.kind, id: launch.id, cwd: resolved, timeoutMs };
+    // One watch for all of them: it lasts as long as the longest job's budget.
+    const timeoutMs = Math.max(...launches.map((l) => {
+        const budget = l.kind === 'job' ? pendingBudgetMs(resolved, l.id) : 0;
+        return Math.min(WATCH_CAP_MS, (l.timeoutMs ?? MAX_WATCH_JOB_MS) + budget + WATCH_GRACE_MS);
+    }));
+    return { kind: launch.kind, id: launch.id, ids: launches.map((l) => l.id), cwd: resolved, timeoutMs };
 }
 function pendingBudgetMs(cwd, jobId) {
     try {
@@ -55,7 +59,7 @@ async function runHook(stdin, write, options = {}) {
             timeoutMs: target.timeoutMs,
             ...options,
             cwd: target.cwd,
-            jobIds: target.kind === 'job' ? [target.id] : [],
+            jobIds: target.kind === 'job' ? [...target.ids] : [],
             runIds: target.kind === 'run' ? [target.id] : [],
             onError: () => { },
             // A hook wakes Claude once (exit 2 with stderr), so it announces once: the verdict, or
@@ -67,7 +71,7 @@ async function runHook(stdin, write, options = {}) {
         if (lines.length === 0)
             return 0;
         // The mod claimed this launch and announces it; a second notice would repeat it.
-        if (claimed(target.cwd, target.kind, target.id))
+        if (target.ids.every((id) => claimed(target.cwd, target.kind, id)))
             return 0;
         // Exit 2 is the wake protocol, and the host labels it "Stop hook feedback".
         // This path runs only without the mod (which claims the job and announces it

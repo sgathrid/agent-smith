@@ -226,6 +226,8 @@ const FILES = {
     steerHead: 'steer.head',
     /** The acceptance checks a job was spawned with, so resume_job can inherit them. */
     checksSpec: 'checks-spec.json',
+    /** The spawn_job request (prompt, context, mode, ...), so a later spawn can reuse it with `from`. */
+    request: 'request.json',
 };
 /**
  * The id segment that marks a job as OURS.
@@ -7081,8 +7083,11 @@ class JobWriter {
         this.flushProgress(this.manifest.createdAt);
         // Fire and forget: spawn never waits on git. Merged into the manifest when it lands.
         this.cwd = input.cwd;
-        this.baselinePending = this.captureBaseline(input.cwd);
+        this.baselinePending = isInsideGitRepo(input.cwd) ? this.captureBaseline(input.cwd) : null;
         return manifest;
+    }
+    hasPendingBaseline() {
+        return this.baselinePending !== null;
     }
     async captureBaseline(cwd) {
         try {
@@ -7095,6 +7100,24 @@ class JobWriter {
             this.writeManifest();
         }
         catch { /* best effort */ }
+    }
+    /** Wait for the async git baseline capture and return the dirty paths, if any. */
+    async awaitBaseline() {
+        try {
+            if (this.baselinePending !== null)
+                await this.baselinePending;
+        }
+        catch { /* best effort */ }
+        return (this.manifest?.gitBaseline?.dirty ?? []).filter((p) => !isForgeStatePath(p));
+    }
+    /** Update `view.preamble` when the async brief enrichment lands before spawn. */
+    updatePreamble(preamble) {
+        this.view = {
+            ...this.view,
+            preamble: preamble.slice(0, 4_000),
+            truncated: this.view.truncated || preamble.length > 4_000,
+        };
+        writeJsonAtomic(jobFile(this.repo, this.jobId, FILES.view), this.view);
     }
     /** Candidate paths that this worker's own edit tool calls touched. */
     editedFiles(candidates) {
@@ -7641,6 +7664,17 @@ function gitCapMs() {
 }
 const TOOL_INPUTS_CAP = 200_000;
 const CHANGED_FILES_SIG_CAP = 500;
+function isInsideGitRepo(cwd) {
+    let dir = path.resolve(cwd);
+    while (true) {
+        if (existsSync(path.join(dir, '.git')))
+            return true;
+        const parent = path.dirname(dir);
+        if (parent === dir)
+            return false;
+        dir = parent;
+    }
+}
 function git(cwd, args) {
     return new Promise((resolve, reject) => {
         execFile('git', args, { cwd, timeout: gitCapMs(), maxBuffer: 8 * 1024 * 1024, env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' } }, (err, stdout) => (err ? reject(err) : resolve(stdout)));
@@ -7742,7 +7776,7 @@ function appendBounded(base, add, max) {
  * conclusion is at the end of its message. Pure; exported for tests.
  */
 function summaryTail(text, max) {
-    const t = text.trim();
+    const t = text.trim().replace(/^Status:[^\n]*(?:\n|$)/, '').trim();
     if (t.length <= max)
         return t;
     const tail = t.slice(t.length - max);
@@ -7842,25 +7876,25 @@ const MODES = ['implement', 'review', 'moderate', 'verify'];
 const MODE_PRESETS = Object.freeze({
     implement: {
         description: 'Make the change and report what changed and found.',
-        guidance: 'Make the change, keeping it as small as the task allows. The orchestrator reviews the diff, and unrelated edits make that review harder. Say what you changed and why.',
+        guidance: 'Make the change, as small as the task allows; unrelated edits make the diff harder to review. Say what you changed and why.',
         readOnly: false,
         runsCommands: true,
     },
     review: {
         description: 'Read-only review: report defects, missed cases and unsupported claims.',
-        guidance: "Find problems; don't fix them. The author fixes from your findings, and your edits would change the work you're judging, so leave the files as they are. Give each defect, missed case or unsupported claim with its evidence (file:line, a failing input or command). Skip style nits unless asked.",
+        guidance: "Find problems; don't fix them. Give each defect or unsupported claim with evidence (file:line, a failing input or command). Skip style nits unless asked.",
         readOnly: true,
         runsCommands: false,
     },
     moderate: {
         description: 'Independently probe prior work and reviewer findings; findings only.',
-        guidance: "Test the earlier work and any reviewer's claims independently, and confirm or refute each one with evidence. Leave the files as they are: the author fixes from your findings, and your edits would change the work you're judging.",
+        guidance: "Independently test the earlier work and reviewer claims; confirm or refute each one with evidence. Don't edit.",
         readOnly: true,
         runsCommands: false,
     },
     verify: {
         description: 'Run the checks and report what actually happened.',
-        guidance: 'Run the checks and report exactly what happened, including the failing output. If something fails, report it rather than fixing it, so your result describes the work as it was handed to you.',
+        guidance: "Run the checks and report exactly what happened, including failing output. Don't fix failures: your result should describe the work as handed to you.",
         readOnly: false,
         runsCommands: true,
     },
@@ -7871,8 +7905,8 @@ const MODE_PRESETS = Object.freeze({
  * use it, so a stage is briefed the same way from either surface.
  */
 const STAGE_PROMPTS = Object.freeze({
-    review: 'Review the implementation and its supplied artifacts. Report defects with evidence; do not edit code.',
-    moderate: 'Probe the implementation and reviewer findings against the original task. Report unresolved defects with evidence; do not edit code.',
+    review: 'Review the implementation and its supplied artifacts. Report defects with evidence.',
+    moderate: 'Probe the implementation and reviewer findings against the original task. Report unresolved defects with evidence.',
 });
 function isMode(value) {
     return MODES.includes(value);
@@ -9106,4 +9140,4 @@ function startPipeline(service, spec, options = {}) {
         throw error;
     }).finally(() => clearInterval(poll));
     return { runId, recordPath, done, cancel: () => { cancelPipeline(service.repo, runId); } };
-}export{toolLabel as $,AgentSmithReader as A,writeAtomic as B,summaryTail as C,DEFAULT_TIMEOUT_MS as D,failureFields as E,FILES as F,writeAcceptance as G,getProvider as H,nextActionFor as I,jobDir as J,fileSig as K,jobsDir as L,MODES as M,JobWriter as N,isMode as O,PROVIDERS as P,newJobId$1 as Q,REASONS as R,STAGE_PROMPTS as S,humanDuration as T,pipeEvents as U,pipelineRecordPath as V,computeStaleReads as W,SMITH_PAYLOAD as X,isForgeStatus as Y,checksReason as Z,readJsonSafe as _,MODE_PRESETS as a,readAcceptance as b,readPipeline as c,cancelPipeline as d,settleAcceptance as e,markAcceptanceSuperseded as f,isTerminalForgeStatus as g,readManifest as h,inheritContinuedProviders as i,jobFile as j,errMessage as k,findProvider as l,markAcceptancePending as m,normalize as n,SCHEMA_VERSION as o,providerNames as p,validOwnerPid as q,reasonFromText as r,startPipeline as s,ownerAlive as t,reportFor as u,validateSpec as v,writeJsonAtomic as w,cwdFacts as x,deriveOrphan as y,deriveStatus as z};
+}export{toolLabel as $,AgentSmithReader as A,deriveStatus as B,writeAtomic as C,DEFAULT_TIMEOUT_MS as D,summaryTail as E,FILES as F,failureFields as G,writeAcceptance as H,getProvider as I,nextActionFor as J,jobDir as K,fileSig as L,MODES as M,jobsDir as N,JobWriter as O,PROVIDERS as P,newJobId$1 as Q,REASONS as R,STAGE_PROMPTS as S,humanDuration as T,pipeEvents as U,pipelineRecordPath as V,computeStaleReads as W,SMITH_PAYLOAD as X,isForgeStatus as Y,readJsonSafe as Z,checksReason as _,MODE_PRESETS as a,readPipeline as b,cancelPipeline as c,readAcceptance as d,settleAcceptance as e,isMode as f,markAcceptanceSuperseded as g,isTerminalForgeStatus as h,inheritContinuedProviders as i,jobFile as j,readManifest as k,errMessage as l,markAcceptancePending as m,normalize as n,findProvider as o,providerNames as p,SCHEMA_VERSION as q,reasonFromText as r,startPipeline as s,validOwnerPid as t,ownerAlive as u,validateSpec as v,writeJsonAtomic as w,reportFor as x,cwdFacts as y,deriveOrphan as z};

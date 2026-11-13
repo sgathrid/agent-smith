@@ -41,6 +41,19 @@ test('spawn and resume validate and forward absolute working directories', async
   assert.equal(seen.length, 3, 'invalid cwd must not launch a worker');
 });
 
+test('spawn_job with no configured default: the only installed provider, else a short error', async () => {
+  const seen: Array<Record<string, unknown>> = [];
+  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-prov-'));
+  const service = withWorkerLookup({ repo, spawnJob: async (req: Record<string, unknown>) => { seen.push(req); return { jobId: 'j' }; } });
+  const one = await callTool({ service, catalogs: async () => [cat('kimi')] } as unknown as HandlerContext, 'spawn_job', { mode: 'review', prompt: 'x' });
+  assert.equal(one.isError, undefined); assert.equal(seen[0]!.provider, 'kimi'); assert.equal(body(one).provider, 'kimi');
+  const many = await callTool({ service, catalogs: async () => [cat('agy'), cat('codex')] } as unknown as HandlerContext, 'spawn_job', { mode: 'review', prompt: 'x' });
+  assert.equal(many.isError, true); assert.match((many.content as { text: string }[])[0]!.text, /provider is required: installed are agy, codex\./);
+  const none = await callTool({ service, catalogs: async () => [] } as unknown as HandlerContext, 'spawn_job', { mode: 'review', prompt: 'x' });
+  assert.equal(none.isError, true); assert.match((none.content as { text: string }[])[0]!.text, /No coding agent installed/);
+  assert.equal(seen.length, 1);
+});
+
 test('mode enum rejects unknown modes', async () => {
   const r = await callTool(ctxWith([cat('agy')]), 'spawn_job', { mode: 'task', prompt: 'x' });
   assert.equal(r.isError, true);
@@ -75,13 +88,11 @@ test('files is bounded in the schema, matching the service cap', () => {
 });
 
 test('default pipeline derives providers from installed catalogs', async () => {
-  const all = await defaultMixedPipeline({ name: 'p', task: 't' }, async () => [cat('agy'), cat('codex'), cat('claude', { defaultSource: 'unknown' })]);
-  assert.deepEqual(all.stages.map(s => s.provider), ['agy', 'codex', 'claude']);
-  assert.equal(all.stages[0]!.model, 'agy-m'); assert.equal(all.stages[0]!.effort, 'high');
-  assert.equal(all.stages[2]!.model, undefined); assert.notEqual(all.stages[2]!.model, 'sonnet');
+  await assert.rejects(defaultMixedPipeline({ name: 'p', task: 't' }, async () => [cat('agy'), cat('codex')]), /^Error: pass stages with a provider each: installed are agy, codex\.$/);
   const one = await defaultMixedPipeline({ name: 'p', task: 't' }, async () => [cat('codex')]);
   assert.deepEqual(one.stages.map(s => s.provider), ['codex', 'codex', 'codex']);
-  await assert.rejects(defaultMixedPipeline({ name: 'p', task: 't' }, async () => []), /No providers installed.*agy/);
+  assert.equal(one.stages[0]!.model, 'codex-m'); assert.equal(one.stages[0]!.effort, 'high');
+  await assert.rejects(defaultMixedPipeline({ name: 'p', task: 't' }, async () => []), /No coding agent installed: install one of agy, codex, opencode, claude, kimi\./);
 });
 
 test('run_pipeline stages accept continues, inherit its provider, and reject a bad spec before starting anything', async () => {
@@ -146,57 +157,39 @@ test('pipelines expand aliases in explicit stages and apply roleDefaults to the 
   const modelConfig = loadModelConfig({ repo });
   const explicit = await defaultMixedPipeline({ name: 'p', task: 't', modelConfig, stages: [{ name: 'a', provider: 'codex', model: 'sol-high', role: 'implement' } as never] });
   assert.deepEqual([explicit.stages[0]!.provider, explicit.stages[0]!.model, explicit.stages[0]!.effort], ['codex', 'gpt-6.1-sol', 'high']);
-  const cats = ['agy', 'codex', 'claude'].map(provider => ({ provider, models: [], defaultSource: 'unknown', source: 'live', stale: false, verified: true }) as never);
+  const cats = ['codex'].map(provider => ({ provider, models: [], defaultSource: 'unknown', source: 'live', stale: false, verified: true }) as never);
   const def = await defaultMixedPipeline({ name: 'p', task: 't', modelConfig }, async () => cats);
   const review = def.stages.find(s => s.name === 'review')!;
   assert.deepEqual([review.provider, review.model, review.effort], ['codex', 'gpt-6.1-sol', 'high']);
   assert.equal(def.stages.find(s => s.name === 'implement')!.model, undefined);
 });
 
-test('notifyHint: a notice is promised; the monitor command waits under fallback, behind a deadline', async () => {
-  const { builtMonitorPath, notifyHint } = await import('../tools.ts');
-  assert.equal(builtMonitorPath('/repo/the-codes/surfaces/channel/src/tools.ts'), undefined);
-  assert.equal(builtMonitorPath('/repo/the-codes/surfaces/channel/dist/surfaces/channel/src/tools.js'), '/repo/the-codes/surfaces/channel/dist/monitor.js');
-  assert.equal(builtMonitorPath('/plugin/runtime/dist/server.js'), '/plugin/runtime/dist/monitor.js');
-  const none = notifyHint({ job: 'j1' }, '/repo', 60_000, undefined);
-  assert.equal(none.mode, 'hook');
-  assert.match(none.note, /You will be notified when this job ends.*don't poll or start a monitor/);
-  // Nothing runnable at the top level: an agent runs a command it is handed.
-  assert.deepEqual(Object.keys(none).sort(), ['fallback', 'mode', 'note']);
-  assert.equal('monitorCommand' in none.fallback, false);
-  assert.match(none.fallback.when, /no notice has arrived 3 min after launch, this session can't receive messages between turns \(headless\), or you are a subagent/);
-  assert.equal(none.fallback.use, 'Call status with wait_ms until it settles.');
-  // The deadline defaults to the job default timeout.
-  assert.match(notifyHint({ job: 'j1' }, '/repo', undefined, undefined).fallback.when, /47 min/);
-  const job = notifyHint({ job: 'j1' }, '/repo', 2_700_000, '/rt/dist/monitor.js') as { fallback: { use: string; monitorCommand: string; monitorTimeoutMs: number } };
-  assert.equal(job.fallback.monitorCommand, 'node "/rt/dist/monitor.js" --job j1 --cwd "/repo"');
-  assert.equal(job.fallback.monitorTimeoutMs, 1_800_000);
-  assert.match(job.fallback.use, /or run monitorCommand in the background \(it stops after monitorTimeoutMs; run it again if the job has not ended\)/);
-  const run = notifyHint({ run: 'r1' }, '/repo', 120_000, '/rt/dist/monitor.js') as { note: string; fallback: { when: string; monitorCommand: string; monitorTimeoutMs: number } };
-  assert.match(run.note, /this run ends/);
-  assert.match(run.fallback.when, /pipeline_status shows the run ended/);
-  assert.match(run.fallback.monitorCommand, /--run r1 /);
-  assert.equal(run.fallback.monitorTimeoutMs, 120_000);
-});
-
-test('notifyHint: the "no notice by" wait includes the acceptance budget written at spawn', async () => {
-  const { notifyHint } = await import('../tools.ts');
-  const { pendingAcceptance, writeAcceptance } = await import('../../../../forge/checks.ts');
-  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-notify-budget-'));
-  try {
-    writeAcceptance(repo, 'j1', pendingAcceptance([{ name: 'slow', command: 'sleep 1', timeoutMs: 10 * 60_000 }]));
-    // 1 min job + (10 min + 30 s grace) checks + 2 min notice grace = 14 min (rounded up).
-    assert.match(notifyHint({ job: 'j1' }, repo, 60_000, undefined).fallback.when, /no notice has arrived 14 min after launch/);
-    assert.match(notifyHint({ job: 'other' }, repo, 60_000, undefined).fallback.when, /arrived 3 min after launch/);
-  } finally { (await import('node:fs')).rmSync(repo, { recursive: true, force: true }); }
-});
-
-test('spawn_job ack carries a notify hint', async () => {
-  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-notify-'));
-  const service = { repo, spawnJob: async () => ({ jobId: 'j9', timeoutMs: 1000 }) } as never;
-  const r = await callTool({ service, catalogs: async () => [cat('agy')] } as HandlerContext, 'spawn_job', { mode: 'implement', prompt: 'x', provider: 'agy' });
+test('spawn_job ack is slim: identity, budget, permissions and warnings only', async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-ack-'));
+  const full = { jobId: 'j9', name: 'Ada', workerId: 'j9', role: 'review', provider: 'codex', status: 'running', dir: `${repo}/.agent-smith/jobs/j9`, repo, timeoutMs: 1000,
+    unrestricted: false, note: 'queued', sandbox: 'codex -s read-only', sandboxFlags: ['-s', 'read-only'], readOnlyRequested: true, readOnlyEnforced: true,
+    modelRequested: null, modelResolved: 'gpt-x', modelSource: 'harness-config', preambleApplied: true };
+  const service = { repo, spawnJob: async () => full } as never;
+  const r = await callTool({ service, catalogs: async () => [cat('codex')] } as HandlerContext, 'spawn_job', { mode: 'review', prompt: 'x', provider: 'codex' });
   assert.equal(r.isError, undefined);
-  assert.equal(body(r).notify.mode, 'hook');
+  assert.deepEqual(body(r), { jobId: 'j9', name: 'Ada', provider: 'codex', model: 'gpt-x', status: 'running', timeoutMs: 1000, repo, unrestricted: false, readOnlyEnforced: true });
+  assert.ok(text(r).length < 250, text(r));
+});
+
+test('an unrestricted review ack still says whether read-only is enforced', async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-ack-'));
+  const full = { jobId: 'j8', name: 'Bo', workerId: 'j8', role: 'review', provider: 'agy', status: 'running', repo, timeoutMs: 1000,
+    unrestricted: true, readOnlyRequested: false, readOnlyEnforced: false, modelResolved: null };
+  const service = { repo, spawnJob: async () => full } as never;
+  const r = await callTool({ service, catalogs: async () => [cat('agy')] } as HandlerContext, 'spawn_job', { mode: 'review', prompt: 'x', provider: 'agy' });
+  assert.equal(body(r).readOnlyEnforced, false);
+});
+
+test('cancel of a job it cannot read is not reported as settled', async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-cancel-'));
+  const service = { repo, cancel: (id: string) => ({ jobId: id, requested: true, signalled: false, note: 'x' }), detail: async () => { throw new Error('gone'); } } as never;
+  const r = await callTool({ service, cancelSettleMs: 0 } as HandlerContext, 'cancel', { jobId: 'j1' });
+  assert.deepEqual(body(r), { jobId: 'j1', status: 'unknown', settled: false });
 });
 
 // ── concise responses, diff on demand, recoverable errors ────────────────────

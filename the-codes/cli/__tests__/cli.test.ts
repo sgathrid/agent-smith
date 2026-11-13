@@ -71,7 +71,7 @@ test('CLI run uses the canonical forge, records a pipeline, and resumes a named 
     return (stderr as (...values: unknown[]) => boolean).call(process.stderr, chunk, ...args);
   }) as typeof process.stderr.write;
   try {
-    const code = await main(['run', 'implement', '--prompt', 'Make a small change', '--name', 'Ada', '--repo', repo, '--cwd', workerCwd, '--effort', 'high', '--foreground']);
+    const code = await main(['run', 'implement', '--prompt', 'Make a small change', '--provider', 'agy', '--name', 'Ada', '--repo', repo, '--cwd', workerCwd, '--effort', 'high', '--foreground']);
     assert.equal(code, 0, err);
     const runId = out.split('\n')[0] ?? '';
     assert.match(runId, /^implement-/);
@@ -127,7 +127,7 @@ test('background CLI returns a statusable run id, exposes the canonical job, and
   process.env['FAKE_AGY_SLEEP_MS'] = '120000';
   try {
     const cliPath = new URL('../cli.ts', import.meta.url).pathname;
-    const stdout = execFileSync(process.execPath, ['--experimental-strip-types', cliPath, 'run', 'implement', '--prompt', 'slow fake task', '--repo', repo], {
+    const stdout = execFileSync(process.execPath, ['--experimental-strip-types', cliPath, 'run', 'implement', '--prompt', 'slow fake task', '--provider', 'agy', '--repo', repo], {
       encoding: 'utf8',
       env: process.env,
       timeout: scaled(60_000),

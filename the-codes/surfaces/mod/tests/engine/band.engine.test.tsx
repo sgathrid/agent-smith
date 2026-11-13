@@ -97,7 +97,10 @@ function engine(
 /** The three launch tools, under the built plugin's server name. */
 const LAUNCH_TOOL = /__(?:spawn_job|resume_job|run_pipeline)$/;
 /** Core answering a launch tool with its ack, echoing the id and repo the test passed. */
-const launchAck = (e: any) => ({ result: { structuredContent: { [e.runId ? 'runId' : 'jobId']: e.runId ?? e.jobId, repo: e.repo ?? '/work', timeoutMs: 600_000 }, content: [] } });
+const launchAck = (e: any) => e.variantJobs
+  // A `variants` spawn: one ack per variant, plus a variant that failed to start.
+  ? { result: { structuredContent: { jobs: [...e.variantJobs.map((id: string) => ({ jobId: id, status: 'running', repo: e.repo ?? '/work', timeoutMs: 600_000 })), { name: 'Bad', error: 'no such model' }] }, content: [] } }
+  : { result: { structuredContent: { [e.runId ? 'runId' : 'jobId']: e.runId ?? e.jobId, repo: e.repo ?? '/work', timeoutMs: 600_000 }, content: [] } };
 /** A successful launch through `tool.call`: how this session comes to own a job or run. */
 const launched = ($: any, id: string, repo = '/work', kind: 'job' | 'run' = 'job') => $.tool.call({
   tool: `mcp__plugin_agent-smith_agent-smith__${kind === 'job' ? 'spawn_job' : 'run_pipeline'}`, [kind === 'job' ? 'jobId' : 'runId']: id, repo,
@@ -286,6 +289,7 @@ function forgeHost(on: (...args: any[]) => void, files: Record<string,string>, i
   on('tool.call', (_$: unknown, e: any) => e.tool==='TaskCreate'?{result:{task:{id:'native-task-1'}}}
     // Core answering a launch call with its ack.
     :LAUNCH_TOOL.test(e.tool)?launchAck(e)
+    :/__cancel$/.test(e.tool)?{result:{structuredContent:{jobId:e.jobId,status:'canceled',settled:e.settled??true},content:[]}}
     :/__status$/.test(e.tool)?{result:{structuredContent:{jobId:e.jobId,status:e.status??'succeeded',acceptance:{state:'accepted',pending:false}},content:[]}}
     :{result:{success:true}});
   const clock = mock.clock(on as never,{now:RUNNING_NOW});
@@ -938,6 +942,49 @@ describe('completion notices', () => {
     await clock.advance(3000);
     expect(said.prompts).toHaveLength(1);
   });
+
+  test('a variants ack claims every job it started, and skips a variant that failed', async ($, on) => {
+    const files = { ...ada('running'), ...canonicalJob('job-bo', { status: 'running', name: 'Bo', provider: 'codex', role: 'review' }) };
+    noticeHost(on, files, ['job-ada', 'job-bo']);
+    await start($);
+    const r = await $.tool.call({ tool: 'mcp__plugin_agent-smith_agent-smith__spawn_job', variantJobs: ['job-ada', 'job-bo'], repo: '/work' }) as any;
+    expect(r.result.structuredContent.jobs).toHaveLength(3); // passed through untouched
+    expect(Object.hasOwn(files, '/work/.agent-smith/claims/job-job-ada')).toBe(true);
+    expect(Object.hasOwn(files, '/work/.agent-smith/claims/job-job-bo')).toBe(true);
+    expect(Object.keys(files).filter((k) => k.includes('/claims/'))).toHaveLength(2);
+  });
+
+  test('a variants ack with two jobs announces both jobs when both finish', async ($, on) => {
+    const files = { ...ada('running'), ...canonicalJob('job-bo', { status: 'running', name: 'Bo', provider: 'codex', role: 'review' }) };
+    const { clock, said } = noticeHost(on, files, ['job-ada', 'job-bo']);
+    await start($);
+    await $.tool.call({ tool: 'mcp__plugin_agent-smith_agent-smith__spawn_job', variantJobs: ['job-ada', 'job-bo'], repo: '/work' });
+    Object.assign(files, ada('succeeded', { finishedAt: iso(RUNNING_NOW + 1000) }),
+      canonicalJob('job-bo', { status: 'succeeded', name: 'Bo', provider: 'codex', role: 'review', finishedAt: iso(RUNNING_NOW + 1000) },
+        { 'acceptance.json': JSON.stringify({ state: 'accepted', checks: [] }) }));
+    await clock.advance(3000);
+    await clock.advance(3000);
+    await clock.advance(3000);
+    expect(said.prompts).toHaveLength(1); // both are due together, so one batched prompt
+    expect(said.prompts[0]).toMatch(/status job-ada, job-bo/);
+    const all = said.prompts.join('\n');
+    expect(all).toMatch(/Ada/);
+    expect(all).toMatch(/Bo/);
+  });
+
+  for (const settled of [true, false]) {
+    test(`a cancel answering settled:${settled} ${settled ? 'retires the notice' : 'leaves the notice'}`, async ($, on) => {
+      const files = ada('running');
+      const { clock, said } = noticeHost(on, files, ['job-ada']);
+      await start($);
+      await launched($, 'job-ada');
+      await $.tool.call({ tool: 'mcp__plugin_agent-smith_agent-smith__cancel', jobId: 'job-ada', settled });
+      Object.assign(files, ada('succeeded', { finishedAt: iso(RUNNING_NOW + 1000) }));
+      await clock.advance(3000);
+      await clock.advance(3000);
+      expect(said.prompts).toHaveLength(settled ? 0 : 1);
+    });
+  }
 
   test('the mod leaves classic.PostToolUse to the command hook', async ($, on) => {
     const { said } = noticeHost(on, ada('running'), ['job-ada']);

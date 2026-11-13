@@ -298,6 +298,7 @@ test('watched brief files: rejects symlink escaping repo, enforces 32-file cap, 
     prompt: 'Turn 1.',
   });
   const t1 = await t1Ready;
+  await Promise.resolve();
   t1.emit({ kind: 'started', at: new Date().toISOString(), conversationId: 'thread-resume-del' });
   t1.finish({ status: 'success', response: 'Done turn 1.' });
   await done;
@@ -403,3 +404,23 @@ test('steer ack reports the job timeoutMs from the manifest when another process
   await done;
 });
 
+
+test('a steer continuation that starts fresh does not list the worker\'s own edits as already modified', async () => {
+  const ctrl = controlledProvider();
+  const { service, repo } = makeService(ctrl.provider);
+  seedRepo(repo);
+  writeFileSync(path.join(repo, 'pre.ts'), 'export const pre = 1;\n');
+  const turn1Ready = ctrl.nextTurn();
+  const { done } = await service.spawnTracked({ mode: 'implement', name: 'worker-dirty', prompt: 'Edit src.ts.' });
+  const turn1 = await turn1Ready;
+  assert.match(turn1.spec.prompt, /Already modified before you started[^\n]*pre\.ts/);
+  writeFileSync(path.join(repo, 'src.ts'), 'export const x = 1;\n');
+  const turn2Ready = ctrl.nextTurn();
+  await service.steer({ worker: 'worker-dirty', prompt: 'Also add y.', delivery: 'queue' });
+  // No conversation handle: the continuation starts fresh with a full brief.
+  turn1.finish({});
+  const turn2 = await turn2Ready;
+  assert.doesNotMatch(turn2.spec.prompt, /Already modified/);
+  turn2.finish({});
+  await done;
+});
