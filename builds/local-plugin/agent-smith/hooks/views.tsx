@@ -2,12 +2,9 @@
 import type { UiComponents } from 'claude-code';
 import type { RadarJob } from '../types/index.d.ts';
 import type { ForgeDetail } from './canonical.ts';
-import { checksLabel, condenseTimeline, forgeList, isLive, needsAttention, scopeLine, statusLine, timelineGroupLabel, workerHeading, workerStatus, type TimelineItem } from './dashboard.ts';
+import { checksLabel, condenseTimeline, forgeList, isLive, needsAttention, scopeLine, statusLine, timelineGroupLabel, workerHeading, workerLivenessLine, workerStatus, type TimelineItem } from './dashboard.ts';
 import { elapsed, isTerminal, oneLine, pickColor, pickGlyph, sanitizeText } from './format.ts';
 import { classify, progressLines } from './progress.ts';
-
-/** A running worker this long without a new event is called out as quiet. */
-const QUIET_MS = 60_000;
 
 export interface ViewActions {
   pick(job: RadarJob): Promise<void>;
@@ -79,16 +76,16 @@ export function renderWorker(W: UiComponents, d: ForgeDetail, o: ViewOptions, a:
   // changedFiles manifest is the only evidence of what it touched.
   const changedFiles=isTerminal(job.status)&&job.changedFileCount!=null&&job.changedFileCount>0&&(job.progress?.editedCount??0)===0
     ? job.changedFileCount : 0;
+  const livenessLine=workerLivenessLine(job,o.now);
   return <Box flexDirection="column">
     <Text bold color={o.colour?pickColor(job.status):undefined} wrap="truncate-end">{`${pickGlyph(job.status)} ${workerHeading(job)}`}</Text>
     {meta!=='' && <Text dimColor wrap="truncate-end">{meta}</Text>}
     {statusRow && <Text wrap="truncate-end">{workerStatus(job)}</Text>}
     {changedFiles>0 && <Text dimColor wrap="truncate-end">{`Changed: ${changedFiles} ${changedFiles===1?'file':'files'}`}</Text>}
-    {(job.progress||note!=='') && <Box flexDirection="column">
+    {(job.progress||note!==''||livenessLine!==null) && <Box flexDirection="column">
       {job.progress && progressLines(job.progress, job.toolCount).map((line,i) => <Text key={`progress-${i}`} dimColor={i>0} wrap="truncate-end">{sanitizeText(line)}</Text>)}
       {note!=='' && <Text dimColor wrap="truncate-end">{`Note: ${note}`}</Text>}
-      {job.status==='running' && job.lastEventAt!=null && o.now-job.lastEventAt>QUIET_MS &&
-        <Text color={o.colour?'yellow':undefined} wrap="truncate-end">{`Stalled ${elapsed(o.now-job.lastEventAt)}`}</Text>}
+      {livenessLine!==null && <Text dimColor={livenessLine.tone==='dim'} color={o.colour&&livenessLine.tone!=='dim'?livenessLine.tone:undefined} wrap="truncate-end">{livenessLine.text}</Text>}
     </Box>}
     {job.warnings.map((warning,i) => <Text key={`warning-${i}`} color={o.colour?'yellow':undefined} wrap="wrap">{sanitizeText(warning.message)}</Text>)}
     <Button key="task" plain hotkey="t" label={o.taskOpen?'Task (as sent)':`Task: ${oneLine(prompt,Math.max(1,o.width-12))}`} onPress={a.task} />

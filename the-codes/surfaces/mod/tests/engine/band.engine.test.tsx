@@ -616,6 +616,21 @@ test('canonical acceptance refreshes in an open worker view; a read failure keep
   expect(await pane.find({key:'job-job-native-1'})).toBeDefined();
 });
 
+test('a quiet but live worker shows process alive instead of Stalled, and the line disappears once a new event arrives', async ($, on) => {
+  const files = canonicalJob('job-ada', {status:'running',name:'Ada',workerId:'ada',provider:'agy',updatedAt:iso(RUNNING_NOW-130_000)},
+    {'progress.json':JSON.stringify({lastEventAt:iso(RUNNING_NOW-130_000),lastAliveAt:iso(RUNNING_NOW-10_000)})});
+  const { clock } = forgeHost(on, files, ['job-ada']);
+  await start($);
+  await $.command.run({command:'forge',args:'Ada'});
+  const pane = await $.ui.mount(PANE_TARGET);
+  expect(await pane.find({type:'Text',text:'No output 2m10s · process alive'})).toBeDefined();
+  expect(await pane.find({type:'Text',text:/Stalled/})).toBeUndefined();
+
+  files['/work/.agent-smith/jobs/job-ada/progress.json'] = JSON.stringify({lastEventAt:iso(RUNNING_NOW+1000),lastAliveAt:iso(RUNNING_NOW+1000)});
+  await clock.advance(3000);
+  expect(await pane.find({type:'Text',text:/No output .* · process alive/})).toBeUndefined();
+});
+
 test('a failure older than 24 h stays in Recent but is no longer drawn as one needing attention', async ($, on) => {
   forgeHost(on, { ...failedJob('job-old', RUNNING_NOW - 25*3600*1000), ...failedJob('job-new', RUNNING_NOW - 3600*1000) }, ['job-old','job-new']);
   await start($);

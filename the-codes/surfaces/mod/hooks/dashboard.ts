@@ -142,6 +142,44 @@ export function workerStatus(job: RadarJob): string {
   return parts.join(' · ');
 }
 
+/** Quiet threshold for the worker detail pane before calling out silence. */
+export const PANE_QUIET_MS = 2 * 60_000;
+
+export interface WorkerLivenessLine {
+  readonly text: string;
+  readonly tone: 'dim' | 'yellow' | 'red';
+}
+
+/**
+ * The detail-pane liveness callout for a live worker, driven by `job.liveness`
+ * (from `stale.ts` `livenessOf`). Falls back to a 2-minute silence check for
+ * older snapshots that lack `liveness`.
+ */
+export function workerLivenessLine(job: RadarJob, now: number): WorkerLivenessLine | null {
+  if (isTerminal(job.status)) return null;
+  const l = job.liveness;
+  if (l) {
+    switch (l.state) {
+      case 'in-tool':
+        return null;
+      case 'active':
+        return l.silentForMs >= PANE_QUIET_MS
+          ? { text: `No output ${elapsed(l.silentForMs)} · process alive`, tone: 'dim' }
+          : null;
+      case 'silent':
+        return { text: `Stalled ${elapsed(l.forMs)}`, tone: 'yellow' };
+      case 'dead':
+        return { text: `Worker process gone ${elapsed(l.forMs)}`, tone: 'red' };
+      default:
+        return null;
+    }
+  }
+  if (job.status === 'running' && job.lastEventAt != null && now - job.lastEventAt > PANE_QUIET_MS) {
+    return { text: `Stalled ${elapsed(now - job.lastEventAt)}`, tone: 'yellow' };
+  }
+  return null;
+}
+
 /** `3 files changed`, else `2 files edited` from the digest, else '' — never `0 files`. */
 function changedFilesPhrase(job: RadarJob): string {
   const count = typeof job.changedFileCount === 'number' && job.changedFileCount > 0 ? job.changedFileCount

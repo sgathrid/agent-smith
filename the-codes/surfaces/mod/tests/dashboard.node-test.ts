@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { ATTENTION_TTL_MS, PANE_FALLBACK_COLUMNS, PANE_MIN_COLUMNS, checksLabel, commandTerminalColumns, condenseTimeline, countLine, findWorker, forgeList, groupWorkers, measurePaneTerminalColumns, needsAttention, paneWidthRequest, recordLaunch, scopeLine, sessionBoard, sessionJobs, statusLine, timelineGroupLabel, turnCount, workerHeading, workerStatus } from '../hooks/dashboard.ts';
+import { ATTENTION_TTL_MS, PANE_FALLBACK_COLUMNS, PANE_MIN_COLUMNS, PANE_QUIET_MS, checksLabel, commandTerminalColumns, condenseTimeline, countLine, findWorker, forgeList, groupWorkers, measurePaneTerminalColumns, needsAttention, paneWidthRequest, recordLaunch, scopeLine, sessionBoard, sessionJobs, statusLine, timelineGroupLabel, turnCount, workerHeading, workerLivenessLine, workerStatus } from '../hooks/dashboard.ts';
 import { oneLine, sanitizeText } from '../hooks/format.ts';
 import type { RadarJob } from '../types/index.d.ts';
 const job=(id:string,extra:Partial<RadarJob>={}):RadarJob=>({id,status:'running',startedAt:100,endedAt:null,toolCount:1,activity:'Read file.ts',task:'Review',warnings:[],report:null,reasoning:null,raw:{},...extra});
@@ -241,4 +241,30 @@ test('a settled row says when it started; a live row does not',()=>{
   assert.match(statusLine(done,t+120_000,80),/^done · started 14:05 +1m30s$/);
   assert.match(statusLine(job('f',{status:'failed',startedAt:t,endedAt:t+5_000}),t+9_000,80),/^failed · started 14:05 +5s$/);
   assert.doesNotMatch(statusLine(job('r',{startedAt:t}),t+10_000,60),/started/);
+});
+
+test('workerLivenessLine drives the pane callout from job.liveness with a 2-minute fallback', () => {
+  const now = 1_000_000;
+  // active under 2 min -> no line
+  assert.equal(workerLivenessLine(job('a1', { liveness: { state: 'active', silentForMs: PANE_QUIET_MS - 1, since: now - PANE_QUIET_MS + 1, forMs: PANE_QUIET_MS - 1 } }), now), null);
+  // active at 2 min or more -> dim process-alive line
+  assert.deepEqual(workerLivenessLine(job('a2', { liveness: { state: 'active', silentForMs: PANE_QUIET_MS, since: now - PANE_QUIET_MS, forMs: PANE_QUIET_MS } }), now),
+    { text: 'No output 2m00s · process alive', tone: 'dim' });
+  assert.deepEqual(workerLivenessLine(job('a3', { liveness: { state: 'active', silentForMs: 130_000, since: now - 130_000, forMs: 130_000 } }), now),
+    { text: 'No output 2m10s · process alive', tone: 'dim' });
+  // in-tool -> no line, even when silent for a long time
+  assert.equal(workerLivenessLine(job('t1', { liveness: { state: 'in-tool', silentForMs: 16 * 60_000, since: now - 16 * 60_000, forMs: 16 * 60_000, tool: 'cargo test' } }), now), null);
+  // silent -> yellow Stalled <elapsed>
+  assert.deepEqual(workerLivenessLine(job('s1', { status: 'attention', liveness: { state: 'silent', silentForMs: 16 * 60_000, since: now - 16 * 60_000, forMs: 16 * 60_000 } }), now),
+    { text: 'Stalled 16m00s', tone: 'yellow' });
+  // dead -> red Worker process gone <elapsed of forMs>
+  assert.deepEqual(workerLivenessLine(job('d1', { status: 'attention', liveness: { state: 'dead', silentForMs: 18 * 60_000, since: now - 3 * 60_000, forMs: 3 * 60_000 } }), now),
+    { text: 'Worker process gone 3m00s', tone: 'red' });
+  // No liveness: running uses 2 min threshold (> PANE_QUIET_MS)
+  assert.equal(workerLivenessLine(job('o1', { lastEventAt: now - PANE_QUIET_MS }), now), null);
+  assert.deepEqual(workerLivenessLine(job('o2', { lastEventAt: now - PANE_QUIET_MS - 1_000 }), now),
+    { text: 'Stalled 2m01s', tone: 'yellow' });
+  assert.equal(workerLivenessLine(job('o3', { lastEventAt: null }), now), null);
+  // Terminal job: no line even if lastEventAt is old
+  assert.equal(workerLivenessLine(job('done', { status: 'succeeded', endedAt: now - 1_000, lastEventAt: now - 10 * 60_000 }), now), null);
 });
