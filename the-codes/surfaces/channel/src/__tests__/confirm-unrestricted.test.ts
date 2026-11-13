@@ -108,3 +108,15 @@ test('the prompt names an unnamed worker generically and asks only after validat
   assert.equal(bad.isError, true);
   assert.equal(h.asked.length, 1, 'an invalid call must not prompt the user');
 });
+
+test('variants: one confirmation for the batch; a decline starts none', async () => {
+  const variants = [{ name: 'A', provider: 'codex' }, { name: 'B', provider: 'claude' }, { name: 'C', provider: 'agy' }];
+  const h = harness({ caps: FORM, action: 'accept' });
+  const r = await callTool(h.ctx, 'spawn_job', { mode: 'review', prompt: 'x', unrestricted: true, variants });
+  assert.equal(r.isError, undefined, text(r));
+  assert.deepEqual(h.asked, [`Allow 2 workers (A: codex, B: claude) to run without approval prompts in ${h.repo}? It will be able to run any command.`]);
+  assert.deepEqual(h.spawned.map(s => s.unrestricted), [true, true, true]);
+  const declined = harness({ caps: FORM, action: 'decline' });
+  const d = await callTool(declined.ctx, 'spawn_job', { mode: 'review', prompt: 'x', unrestricted: true, variants });
+  assert.equal(d.isError, true); assert.equal(declined.asked.length, 1); assert.equal(declined.spawned.length, 0);
+});

@@ -148,7 +148,6 @@ const CAPABILITIES_OUTPUT = open({
 const STEER_OUTPUT = open({
   jobId: typed('string'),
   name: typed('string'),
-  workerId: typed('string'),
   provider: typed(['string', 'null']),
   delivery: { type: 'string', enum: ['queue', 'interrupt'] },
   status: { type: 'string', enum: ['queued', 'interrupting'] },
@@ -156,7 +155,6 @@ const STEER_OUTPUT = open({
   signalled: typed('boolean'),
   resumable: typed('boolean', 'Whether a resumable conversation handle was known when the steer was accepted.'),
   repo: typed('string'),
-  dir: typed('string'),
   timeoutMs: typed('integer'),
   note: typed('string'),
 }, ['jobId', 'name', 'delivery', 'status', 'pendingSteers', 'signalled', 'resumable']);

@@ -42,10 +42,11 @@ export const UNCONFIRMED_UNRESTRICTED = 'unrestricted: true was not confirmed wi
  * Returns `refused` to stop the call, or a `warning` for the ack when no prompt was possible.
  * Skipped for agy, for unrestricted false/absent, and when AGENT_SMITH_CONFIRM_UNRESTRICTED=0 (automation).
  */
-async function confirmUnrestricted(ctx: HandlerContext, req: { unrestricted?: boolean | undefined; provider: string; worker?: string | undefined; cwd: string }): Promise<{ refused?: ToolOutcome; warning?: string }> {
+async function confirmUnrestricted(ctx: HandlerContext, req: { unrestricted?: boolean | undefined; provider: string; worker?: string | undefined; cwd: string; who?: string }): Promise<{ refused?: ToolOutcome; warning?: string }> {
   if (req.unrestricted !== true || !RESTRICTED_BY_DEFAULT.has(req.provider) || process.env['AGENT_SMITH_CONFIRM_UNRESTRICTED'] === '0') return {};
+  if (ctx.unrestrictedGate) return ctx.unrestrictedGate;
   if (!ctx.server?.getClientCapabilities()?.elicitation?.form) return { warning: UNCONFIRMED_UNRESTRICTED };
-  const who = req.worker ? `${req.provider} worker "${req.worker}"` : `a new ${req.provider} worker`;
+  const who = req.who ?? (req.worker ? `${req.provider} worker "${req.worker}"` : `a new ${req.provider} worker`);
   try {
     const answer = await ctx.server.elicitInput({ mode: 'form', message: `Allow ${who} to run without approval prompts in ${req.cwd}? It will be able to run any command.`, requestedSchema: { type: 'object', properties: {} } }, { timeout: CONFIRM_TIMEOUT_MS });
     return answer.action === 'accept' ? {} : { refused: failure(DECLINED_UNRESTRICTED) };
@@ -64,6 +65,8 @@ export interface HandlerContext {
   readonly server?: Pick<Server, 'getClientCapabilities' | 'elicitInput'>;
   /** Override CANCEL_SETTLE_MS (tests). */
   readonly cancelSettleMs?: number;
+  /** Set by a variants spawn: the one confirmation it asked, so each variant does not ask again. */
+  readonly unrestrictedGate?: { warning?: string };
 }
 export function json(value: unknown): ToolOutcome { return { content: [{ type: 'text', text: JSON.stringify(value, null, 2) }] }; }
 /** json plus structuredContent (arrays wrapped as {items}). */
@@ -218,9 +221,19 @@ const spawnJob: Handler = async (ctx, args) => {
   const variants = args.variants.map((raw, i) => { const v = record(raw, `variants[${i}]`); keys(v, [...VARIANT_KEYS]); return v; });
   const names = variants.map(v => text(v, 'name') ?? [stem, text(v, 'provider') ?? text(shared, 'provider'), text(v, 'model')].filter(Boolean).join('-').slice(0, 80));
   if (new Set(names).size !== names.length) throw new Error('variants need distinct names; pass name on each variant.');
+  const requests = variants.map((v, i) => overlay(shared, { ...v, name: names[i] }));
+  // One confirmation for the batch, naming every variant that escalates, instead of one prompt per variant.
+  const escalating = requests.filter(r => r.unrestricted === true && RESTRICTED_BY_DEFAULT.has(String(r.provider)));
+  let batchCtx = ctx;
+  if (escalating.length > 0) {
+    const who = escalating.length === 1 ? `${String(escalating[0]!.provider)} worker "${String(escalating[0]!.name)}"` : `${escalating.length} workers (${escalating.map(r => `${String(r.name)}: ${String(r.provider)}`).join(', ')})`;
+    const gate = await confirmUnrestricted(ctx, { unrestricted: true, provider: String(escalating[0]!.provider), cwd: text(shared, 'cwd') ?? ctx.service.repo, who });
+    if (gate.refused) return gate.refused;
+    batchCtx = { ...ctx, unrestrictedGate: gate.warning ? { warning: gate.warning } : {} };
+  }
   const jobs: Record<string, unknown>[] = [];
-  for (const [i, v] of variants.entries()) {
-    try { jobs.push(await spawnOne(ctx, overlay(shared, { ...v, name: names[i] }))); } catch (err) { jobs.push({ name: names[i], error: err instanceof Error ? err.message : String(err) }); }
+  for (const [i, r] of requests.entries()) {
+    try { jobs.push(await spawnOne(batchCtx, r)); } catch (err) { jobs.push({ name: names[i], error: err instanceof Error ? err.message : String(err) }); }
   }
   return structured({ jobs }, { compact: true });
 };
