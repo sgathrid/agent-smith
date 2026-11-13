@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import process$1 from'node:process';import {randomUUID,randomBytes}from'node:crypto';import {readFileSync,statSync,mkdirSync,writeFileSync,linkSync,unlinkSync,existsSync,renameSync,readdirSync}from'node:fs';import path from'node:path';import {l as livenessOf,i as isStalled,L as LIVENESS_STATES,c as claimMarkerPath}from'./chunk-stale.js';import {r as reasonFromText,M as MODES$1,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS,i as inheritContinuedProviders,S as STAGE_PROMPTS,v as validateSpec,s as startPipeline,b as readPipeline,c as cancelPipeline,d as readAcceptance,j as jobFile,F as FILES,m as markAcceptancePending,e as settleAcceptance,f as isMode,p as providerNames,g as markAcceptanceSuperseded,h as isTerminalForgeStatus}from'./chunk-execute.js';import {E as EFFORTS$1,M as MAX_WATCHED_FILES,v as validateEnv,g as getCatalogs,l as launchPipeline,a as ENV_KEYS_FILE,b as getInstalledProviders,F as ForgeService}from'./chunk-service.js';import'node:fs/promises';import {execFile}from'node:child_process';import os from'node:os';import'node:url';import'node:timers/promises';import'node:readline';//#region rolldown:runtime
+import process$1 from'node:process';import {randomUUID,randomBytes}from'node:crypto';import {readFileSync,statSync,mkdirSync,writeFileSync,rmSync,linkSync,unlinkSync,existsSync,renameSync,readdirSync}from'node:fs';import path from'node:path';import {l as livenessOf,i as isStalled,L as LIVENESS_STATES,c as claimMarkerPath}from'./chunk-stale.js';import {r as reasonFromText,M as MODES$1,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS,i as inheritContinuedProviders,S as STAGE_PROMPTS,v as validateSpec,s as startPipeline,b as readPipeline,c as cancelPipeline,d as readAcceptance,j as jobFile,F as FILES,m as markAcceptancePending,e as settleAcceptance,f as isMode,p as providerNames,g as markAcceptanceSuperseded,h as isTerminalForgeStatus}from'./chunk-execute.js';import {E as EFFORTS$1,M as MAX_WATCHED_FILES,v as validateEnv,g as getCatalogs,l as launchPipeline,a as ENV_KEYS_FILE,b as getInstalledProviders,F as ForgeService}from'./chunk-service.js';import'node:fs/promises';import {execFile}from'node:child_process';import os from'node:os';import'node:url';import'node:timers/promises';import'node:readline';//#region rolldown:runtime
 var __create = Object.create;
 var __defProp = Object.defineProperty;
 var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
@@ -25911,7 +25911,8 @@ async function spawnOne(ctx, args) {
     if (mode === undefined)
         throw new Error(`mode is required; one of ${MODES$1.join(', ')}.`);
     const cfg = loadModelConfig({ repo: ctx.service.repo });
-    const resolved = resolveRequest({ provider: allowed(args, 'provider', PROVIDERS), model: text(args, 'model'), effort: allowed(args, 'effort', EFFORTS$1), mode }, cfg);
+    const rawProvider = allowed(args, 'provider', PROVIDERS);
+    const resolved = resolveRequest({ provider: rawProvider, model: text(args, 'model'), effort: allowed(args, 'effort', EFFORTS$1), mode }, cfg);
     const provider = resolved.provider ?? defaultProvider(ctx.catalogs ? (await installedCatalogs(ctx)).map(c => c.provider) : await getInstalledProviders());
     const notes = [...resolved.warnings, ...cfg.errors.map(e => `models.json: ${e}`)];
     const withNotes = (ack) => ({ ...slimAck(ack), provider: ack.provider ?? provider, ...(resolved.appliedAlias ? { aliasApplied: resolved.appliedAlias, aliasSource: resolved.source } : {}), ...(notes.length ? { warnings: [...(ack.warnings ?? []), ...notes] } : {}) });
@@ -25952,7 +25953,7 @@ async function spawnOne(ctx, args) {
         throw new Error(refusedText(gate.refused));
     if (gate.warning)
         notes.push(gate.warning);
-    const saved = { mode, prompt: request.prompt, context: request.context, files: request.files, cwd: request.cwd, task: request.task, name: request.name, provider, model: text(args, 'model'), effort: allowed(args, 'effort', EFFORTS$1), timeoutMs: request.timeoutMs, unrestricted: request.unrestricted };
+    const saved = { mode, prompt: request.prompt, context: request.context, files: request.files, cwd: request.cwd, task: request.task, name: request.name, provider: rawProvider, model: text(args, 'model'), effort: allowed(args, 'effort', EFFORTS$1), timeoutMs: request.timeoutMs, unrestricted: request.unrestricted };
     if (!checks?.length) {
         const ack = await ctx.service.spawnJob(request);
         saveRequest(ctx, ack.jobId, saved);
@@ -25987,9 +25988,9 @@ const VARIANT_KEYS = ['name', 'provider', 'model', 'effort'];
  * Overrides on top of a base request. A different provider drops the base's model, effort and
  * unrestricted: they belonged to the old provider.
  */
-function overlay(base, over) {
+function overlay(base, over, baseProvider) {
     const defined = Object.fromEntries(Object.entries(over).filter(([, v]) => v !== undefined));
-    const switched = defined.provider !== undefined && base.provider !== undefined && defined.provider !== base.provider;
+    const switched = defined.provider !== undefined && baseProvider !== defined.provider;
     const kept = switched ? Object.fromEntries(Object.entries(base).filter(([k]) => !['model', 'effort', 'unrestricted'].includes(k))) : base;
     return { ...kept, ...defined };
 }
@@ -26010,8 +26011,15 @@ async function inheritFrom(ctx, args) {
     }
     catch { /* spawned without checks */ }
     delete saved.name;
+    const cfg = loadModelConfig({ repo: ctx.service.repo });
+    const baseProvider = resolveRequest({
+        provider: allowed(saved, 'provider', PROVIDERS),
+        model: text(saved, 'model'),
+        effort: allowed(saved, 'effort', EFFORTS$1),
+        mode: allowed(saved, 'mode', MODES$1),
+    }, cfg).provider;
     const { from: _from, ...rest } = args;
-    return overlay(saved, rest);
+    return overlay(saved, rest, baseProvider);
 }
 const spawnJob = async (ctx, args) => {
     const base = args.from === undefined ? args : await inheritFrom(ctx, args);
@@ -26022,18 +26030,61 @@ const spawnJob = async (ctx, args) => {
     if (!Array.isArray(args.variants) || args.variants.length === 0 || args.variants.length > MAX_VARIANTS)
         throw new Error(`variants must be an array of 1 to ${MAX_VARIANTS} entries.`);
     const { variants: _v, ...shared } = base;
-    const stem = text(shared, 'name') ?? text(shared, 'mode') ?? 'job';
-    const variants = args.variants.map((raw, i) => { const v = record(raw, `variants[${i}]`); keys(v, [...VARIANT_KEYS]); return v; });
+    // Validate shared arguments and each variant's overrides before asking any confirmation.
+    const mode = allowed(shared, 'mode', MODES$1);
+    if (mode === undefined)
+        throw new Error(`mode is required; one of ${MODES$1.join(', ')}.`);
+    text(shared, 'prompt', true);
+    contextText(shared);
+    filesList(shared);
+    parseChecks(shared.checks);
+    const cwd = workingDirectory(shared);
+    text(shared, 'name');
+    text(shared, 'task');
+    allowed(shared, 'provider', PROVIDERS);
+    text(shared, 'model');
+    allowed(shared, 'effort', EFFORTS$1);
+    number(shared, 'timeoutMs');
+    text(shared, 'conversation');
+    boolean(shared, 'unrestricted');
+    validateEnv(shared.env);
+    const stem = text(shared, 'name') ?? mode;
+    const variants = args.variants.map((raw, i) => {
+        const v = record(raw, `variants[${i}]`);
+        keys(v, [...VARIANT_KEYS]);
+        allowed(v, 'provider', PROVIDERS);
+        text(v, 'model');
+        allowed(v, 'effort', EFFORTS$1);
+        return v;
+    });
     const names = variants.map(v => text(v, 'name') ?? [stem, text(v, 'provider') ?? text(shared, 'provider'), text(v, 'model')].filter(Boolean).join('-').slice(0, 80));
     if (new Set(names).size !== names.length)
         throw new Error('variants need distinct names; pass name on each variant.');
-    const requests = variants.map((v, i) => overlay(shared, { ...v, name: names[i] }));
+    const cfg = loadModelConfig({ repo: ctx.service.repo });
+    const baseProvider = resolveRequest({
+        provider: allowed(shared, 'provider', PROVIDERS),
+        model: text(shared, 'model'),
+        effort: allowed(shared, 'effort', EFFORTS$1),
+        mode,
+    }, cfg).provider;
+    const requests = variants.map((v, i) => overlay(shared, { ...v, name: names[i] }, baseProvider));
+    let fallbackProvider;
+    const getFallbackProvider = async () => fallbackProvider ??= defaultProvider(ctx.catalogs ? (await installedCatalogs(ctx)).map(c => c.provider) : await getInstalledProviders());
+    const resolvedProviders = [];
+    for (const r of requests) {
+        const resolved = resolveRequest({ provider: allowed(r, 'provider', PROVIDERS), model: text(r, 'model'), effort: allowed(r, 'effort', EFFORTS$1), mode }, cfg);
+        resolvedProviders.push(resolved.provider ?? await getFallbackProvider());
+    }
     // One confirmation for the batch, naming every variant that escalates, instead of one prompt per variant.
-    const escalating = requests.filter(r => r.unrestricted === true && RESTRICTED_BY_DEFAULT.has(String(r.provider)));
+    const escalating = requests
+        .map((r, i) => ({ r, provider: resolvedProviders[i] }))
+        .filter(({ r, provider }) => r.unrestricted === true && RESTRICTED_BY_DEFAULT.has(provider));
     let batchCtx = ctx;
     if (escalating.length > 0) {
-        const who = escalating.length === 1 ? `${String(escalating[0].provider)} worker "${String(escalating[0].name)}"` : `${escalating.length} workers (${escalating.map(r => `${String(r.name)}: ${String(r.provider)}`).join(', ')})`;
-        const gate = await confirmUnrestricted(ctx, { unrestricted: true, provider: String(escalating[0].provider), cwd: text(shared, 'cwd') ?? ctx.service.repo, who });
+        const who = escalating.length === 1
+            ? `${escalating[0].provider} worker "${String(escalating[0].r.name)}"`
+            : `${escalating.length} workers (${escalating.map(e => `${String(e.r.name)}: ${e.provider}`).join(', ')})`;
+        const gate = await confirmUnrestricted(ctx, { unrestricted: true, provider: escalating[0].provider, cwd: cwd ?? ctx.service.repo, who });
         if (gate.refused)
             return gate.refused;
         batchCtx = { ...ctx, unrestrictedGate: gate.warning ? { warning: gate.warning } : {} };
@@ -26098,7 +26149,7 @@ const resumeJob = async (ctx, args) => {
         catch { /* the original had no env */ }
     }
     const allWarnings = [...(resumed.warnings ?? []), ...(gate.warning ? [gate.warning] : []), ...(droppedEnv.length > 0 ? [`The original job set env ${droppedEnv.join(', ')}; values are not stored, so this turn runs without them. Pass env again to keep them.`] : [])];
-    return structured({ ...slimAck(resumed), ...(allWarnings.length > 0 ? { warnings: allWarnings } : {}) }, { compact: true });
+    return structured({ ...slimAck(resumed), ...(checks?.length ? { checks: checks.map(c => c.name) } : {}), ...(allWarnings.length > 0 ? { warnings: allWarnings } : {}) }, { compact: true });
 };
 const steerJob = async (ctx, args) => {
     const worker = text(args, 'worker', true);
@@ -26171,14 +26222,23 @@ const pipelineStatus = async (ctx, args) => {
         throw new Error(`No pipeline run "${runId}".`);
     return json(format(args) === 'concise' ? concisePipeline(r) : r);
 };
-/** The caller asked for this cancel and its answer says the job stopped: mark it claimed so the command hook stays silent. */
+/** Mark a job or run claimed so the command hook stays silent. Returns true when this call created the marker. */
 function quietNotice(repo, kind, id) {
     const marker = claimMarkerPath(repo, kind, id);
     try {
         mkdirSync(path.dirname(marker), { recursive: true });
         writeFileSync(marker, `${new Date().toISOString()}\n`, { flag: 'wx' });
+        return true;
     }
-    catch { /* already claimed, or best effort */ }
+    catch {
+        return false;
+    }
+}
+function unquietNotice(repo, kind, id) {
+    try {
+        rmSync(claimMarkerPath(repo, kind, id), { force: true });
+    }
+    catch { /* best effort */ }
 }
 /** How long cancel waits for a job or run to settle before answering. */
 const CANCEL_SETTLE_MS = 5_000;
@@ -26192,39 +26252,95 @@ const cancelJob = async (ctx, args) => {
     const step = ctx.pollMs ?? WAIT_POLL_MS;
     const settleBy = Date.now() + (ctx.cancelSettleMs ?? CANCEL_SETTLE_MS);
     if (readPipeline(ctx.service.repo, id)) {
-        cancelPipeline(ctx.service.repo, id);
-        let run = readPipeline(ctx.service.repo, id);
-        while (run?.status === 'running' && Date.now() < settleBy) {
-            await sleep(Math.min(step, Math.max(0, settleBy - Date.now())));
-            run = readPipeline(ctx.service.repo, id);
+        const marked = quietNotice(ctx.service.repo, 'run', id);
+        let settled = false;
+        try {
+            cancelPipeline(ctx.service.repo, id);
+            let run = readPipeline(ctx.service.repo, id);
+            while (run?.status === 'running' && Date.now() < settleBy) {
+                await sleep(Math.min(step, Math.max(0, settleBy - Date.now())));
+                run = readPipeline(ctx.service.repo, id);
+            }
+            const status = run?.status ?? 'unknown';
+            settled = status === 'passed' || status === 'partial' || status === 'failed';
+            return json({ runId: id, status, settled });
         }
-        const status = run?.status ?? 'unknown';
-        const settled = status === 'passed' || status === 'partial' || status === 'failed';
-        if (settled)
-            quietNotice(ctx.service.repo, 'run', id);
-        return json({ runId: id, status, settled });
+        finally {
+            if (!settled && marked)
+                unquietNotice(ctx.service.repo, 'run', id);
+        }
     }
-    const result = ctx.service.cancel(id);
-    const resolved = result.resolvedFrom === undefined ? {} : { resolvedFrom: result.resolvedFrom };
-    // A worker that already exited can still have checks running; stop those too.
-    // With a detached supervisor the cancel marker is the request; the supervisor stops the checks within ~200 ms.
-    const checksCanceled = abortChecks(id, result.jobId);
-    let detail = await ctx.service.detail(result.jobId).catch(() => null);
-    while (detail?.status === 'running' && Date.now() < settleBy) {
-        await sleep(Math.min(step, Math.max(0, settleBy - Date.now())));
-        detail = await ctx.service.detail(resolveHead(ctx, result.jobId)).catch(() => detail);
+    const created = new Set();
+    const mark = (jobId) => { if (quietNotice(ctx.service.repo, 'job', jobId))
+        created.add(jobId); };
+    let settled = false;
+    try {
+        // Write the marker before signalling so a concurrent watch-hook poll cannot wake Claude first.
+        mark(id);
+        const headBefore = resolveHead(ctx, id);
+        if (headBefore !== id)
+            mark(headBefore);
+        const result = ctx.service.cancel(id);
+        mark(result.jobId);
+        if (result.resolvedFrom !== undefined)
+            mark(result.resolvedFrom);
+        const resolved = result.resolvedFrom === undefined ? {} : { resolvedFrom: result.resolvedFrom };
+        // A worker that already exited can still have checks running; stop those too.
+        // With a detached supervisor the cancel marker is the request; the supervisor stops the checks within ~200 ms.
+        let checksCanceled = abortChecks(id, result.jobId);
+        const isTerminal = (s) => s === 'succeeded' || s === 'failed' || s === 'canceled';
+        const isPendingAcceptance = (jobId) => readAcceptance(ctx.service.repo, jobId).pending === true;
+        const isSettled = (d) => d !== null && isTerminal(d.status) && !d.supersededBy && !isPendingAcceptance(d.jobId);
+        const cancelledIds = new Set([id, result.jobId]);
+        let currentId = result.jobId;
+        const cancelHead = (headId) => {
+            if (cancelledIds.has(headId))
+                return;
+            cancelledIds.add(headId);
+            mark(headId);
+            const next = ctx.service.cancel(headId);
+            mark(next.jobId);
+            cancelledIds.add(next.jobId);
+            if (abortChecks(headId, next.jobId))
+                checksCanceled = true;
+            currentId = next.jobId;
+        };
+        let detail = await ctx.service.detail(currentId).catch(() => null);
+        if (detail?.jobId) {
+            mark(detail.jobId);
+            cancelHead(detail.jobId);
+        }
+        while (!isSettled(detail) && Date.now() < settleBy) {
+            await sleep(Math.min(step, Math.max(0, settleBy - Date.now())));
+            const nextHead = resolveHead(ctx, detail?.supersededBy || detail?.jobId || currentId);
+            if (nextHead !== currentId)
+                cancelHead(nextHead);
+            else if (detail?.supersededBy)
+                cancelHead(detail.supersededBy);
+            detail = await ctx.service.detail(currentId).catch(() => detail);
+            if (detail?.jobId) {
+                mark(detail.jobId);
+                cancelHead(detail.jobId);
+            }
+        }
+        const status = detail?.status ?? 'unknown';
+        settled = isSettled(detail);
+        const finalJobId = detail?.jobId ?? currentId;
+        if (abortChecks(finalJobId))
+            checksCanceled = true;
+        const out = { jobId: finalJobId, ...resolved, status, settled };
+        if (checksCanceled)
+            return json({ ...out, checksCanceled: true });
+        const pending = readAcceptance(ctx.service.repo, finalJobId);
+        return json(pending.pending === true && pending.running !== undefined
+            ? { ...out, checksCanceled: false, checksNote: 'The supervisor running the acceptance checks will stop them; status shows acceptance.' }
+            : out);
     }
-    const status = detail?.status ?? 'unknown';
-    const settled = status === 'succeeded' || status === 'failed' || status === 'canceled';
-    const out = { jobId: detail?.jobId ?? result.jobId, ...resolved, status, settled };
-    if (settled)
-        quietNotice(ctx.service.repo, 'job', String(out.jobId));
-    if (checksCanceled)
-        return json({ ...out, checksCanceled: true });
-    const pending = readAcceptance(ctx.service.repo, result.jobId);
-    return json(pending.pending === true && pending.running !== undefined
-        ? { ...out, checksCanceled: false, checksNote: 'The supervisor running the acceptance checks will stop them; status shows acceptance.' }
-        : out);
+    finally {
+        if (!settled)
+            for (const jobId of created)
+                unquietNotice(ctx.service.repo, 'job', jobId);
+    }
 };
 const runPipeline = async (ctx, args) => {
     const raw = record(args.spec, 'spec');

@@ -79,23 +79,26 @@ export async function runHook(
   try {
     const target = parseHookInput(JSON.parse(stdin) as unknown);
     if (target === null) return 0;
-    const lines: string[] = [];
-    await runJobWatch({
-      timeoutMs: target.timeoutMs,
-      ...options,
-      cwd: target.cwd,
-      jobIds: target.kind === 'job' ? [...target.ids] : [],
-      runIds: target.kind === 'run' ? [target.id] : [],
-      onError: () => {},
-      // A hook wakes Claude once (exit 2 with stderr), so it announces once: the verdict, or
-      // "exited · checks running" if the acceptance budget runs out first. The mod sends both.
-      announceOnce: true,
-      // The notice as written, line breaks kept; the timeout line has no batch.
-      emit: (line, batch) => { lines.push(batch?.content ?? line); },
-    });
+    const perId = await Promise.all(target.ids.map(async (id) => {
+      const lines: string[] = [];
+      await runJobWatch({
+        timeoutMs: target.timeoutMs,
+        ...options,
+        cwd: target.cwd,
+        jobIds: target.kind === 'job' ? [id] : [],
+        runIds: target.kind === 'run' ? [id] : [],
+        onError: () => {},
+        // A hook wakes Claude once (exit 2 with stderr), so it announces once: the verdict, or
+        // "exited · checks running" if the acceptance budget runs out first. The mod sends both.
+        announceOnce: true,
+        // The notice as written, line breaks kept; the timeout line has no batch.
+        emit: (line, batch) => { lines.push(batch?.content ?? line); },
+      });
+      return { id, lines };
+    }));
+    // Drop lines for any job/run whose claim marker exists when the hook writes (e.g. a cancelled variant).
+    const lines = perId.flatMap(({ id, lines: idLines }) => (claimed(target.cwd, target.kind, id) ? [] : idLines));
     if (lines.length === 0) return 0;
-    // The mod claimed this launch and announces it; a second notice would repeat it.
-    if (target.ids.every((id) => claimed(target.cwd, target.kind, id))) return 0;
     // Exit 2 is the wake protocol, and the host labels it "Stop hook feedback".
     // This path runs only without the mod (which claims the job and announces it
     // itself), so say plainly that it is a notice, not an error.

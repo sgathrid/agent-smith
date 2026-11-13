@@ -426,7 +426,9 @@ test('parseSettledRead reads a cancel only when it settled', () => {
   const cancel = `${PLUGIN}cancel`;
   assert.ok(STATUS_TOOL.test(cancel));
   assert.deepEqual(parseSettledRead(cancel, { jobId: 'j1', status: 'canceled', settled: true }), { kind: 'job', id: 'j1' });
-  assert.deepEqual(parseSettledRead(cancel, { structuredContent: { jobId: 'j1', status: 'canceled', settled: true, resolvedFrom: 'j0' }, content: [] }), { kind: 'job', id: 'j1' });
+  const resolved = parseSettledRead(cancel, { structuredContent: { jobId: 'j1', status: 'canceled', settled: true, resolvedFrom: 'j0' }, content: [] });
+  assert.deepEqual(resolved, { kind: 'job', id: 'j1', resolvedFrom: 'j0' });
+  assert.deepEqual(unclaim(claim(claim([], launch('j0'), NOW), launch('j2'), NOW), resolved!).map((o) => o.id), ['j2']);
   assert.equal(parseSettledRead(cancel, { jobId: 'j1', status: 'canceling', settled: false }), null);
   assert.equal(parseSettledRead(cancel, { jobId: 'j1', status: 'canceled' }), null);
   assert.deepEqual(parseSettledRead(cancel, { runId: 'r1', status: 'canceled', settled: true }), { kind: 'run', id: 'r1' });

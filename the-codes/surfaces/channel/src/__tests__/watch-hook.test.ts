@@ -353,7 +353,7 @@ test('a variants ack watches every job in one watch, with the longest budget', (
   assert.deepEqual(parseHookInput(wrap('spawn_job', ack))?.ids, ['j1']);
 });
 
-test('runHook for a variants ack waits for both jobs, and is silent only when every one is claimed', async () => {
+test('runHook for a variants ack drops lines for claimed variants and is silent when every one is claimed', async () => {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-variants-'));
   try {
     const input = JSON.stringify(wrap('spawn_job', { jobs: [{ jobId: 'v1', status: 'running', repo }, { jobId: 'v2', status: 'running', repo }] }));
@@ -362,7 +362,7 @@ test('runHook for a variants ack waits for both jobs, and is silent only when ev
     let out = '';
     claim('v1');
     assert.equal(await runHook(input, (s) => { out += s; }, opts), 2, 'one unclaimed id still wakes Claude');
-    assert.match(out, /W-v1/);
+    assert.doesNotMatch(out, /W-v1/);
     assert.match(out, /W-v2/);
     claim('v2');
     out = '';
