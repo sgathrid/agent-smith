@@ -7,7 +7,8 @@ import type { Server } from '@modelcontextprotocol/server';
 import type { ForgeStatus } from '../../../forge/format.ts';
 import { ENV_KEYS_FILE, type ForgeService, type JobDetail, type SpawnAck } from '../../../forge/service.ts';
 import { launchPipeline } from '../../../forge/supervisor.ts';
-import { FILES, jobFile } from '../../../forge/format.ts';
+import { FILES, jobDir, jobFile } from '../../../forge/format.ts';
+import { waitForChange } from '../../../forge/watch.ts';
 import { startPipeline, readPipeline, cancelPipeline } from '../../../forge/execute.ts';
 import { markAcceptancePending, markAcceptanceSuperseded, readAcceptance, settleAcceptance } from '../../../forge/checks.ts';
 import { validateSpec } from '../../../pipeline/pipeline.ts';
@@ -29,6 +30,8 @@ export { defaultMixedPipeline, type CatalogSource, type MixedSpecInput } from '.
 
 export const REPORT_HEAD_CHARS = 8_000;
 const WAIT_POLL_MS = 500;
+/** What `until: 'change'` compares: the turn, its state and how far it has got. */
+const progressKey = (d: JobDetail) => JSON.stringify([d.jobId, d.status, d.toolCalls ?? null, d.lastActivity ?? null, d.supersededBy ?? null]);
 
 // ── unrestricted confirmation ────────────────────────────────────────────────
 /** Providers that run restricted unless asked. agy and kimi are unrestricted by design: headless they cannot prompt (kimi's print mode forces auto). */
@@ -123,7 +126,7 @@ const listCapabilitiesTool: Handler = async (ctx, args) => {
 export function slimAck(ack: SpawnAck) {
   const out = {
     jobId: ack.jobId, name: ack.name, provider: ack.provider, model: ack.modelResolved ?? null, status: ack.status,
-    timeoutMs: ack.timeoutMs, repo: ack.repo, unrestricted: ack.unrestricted,
+    timeoutMs: ack.timeoutMs, repo: ack.repo, nodePath: process.execPath, unrestricted: ack.unrestricted,
     ...(ack.readOnlyRequested || (isModeName(ack.role) && MODE_PRESETS[ack.role].readOnly) ? { readOnlyEnforced: ack.readOnlyEnforced ?? false } : {}),
     ...(ack.envKeys?.length ? { envKeys: ack.envKeys } : {}),
     ...(ack.warnings?.length ? { warnings: ack.warnings } : {}),
@@ -366,9 +369,13 @@ const jobStatus: Handler = async (ctx, args) => {
   const jobId = text(args, 'jobId', true)!; const waitMs = number(args, 'wait_ms', MAX_WAIT_MS); const fmt = format(args); const wantDiff = boolean(args, 'include_diff') ?? false;
   let detail = await ctx.service.detail(resolveHead(ctx, jobId)); let waited = false;
   if (waitMs !== undefined) {
-    waited = true; const deadline = Date.now() + waitMs; const step = ctx.pollMs ?? WAIT_POLL_MS;
-    while (unsettled(ctx, detail) && Date.now() < deadline) {
-      await sleep(Math.min(step, Math.max(0, deadline - Date.now())));
+    waited = true; const deadline = Date.now() + waitMs; const fallbackMs = ctx.pollMs ?? WAIT_POLL_MS;
+    // `until: 'change'` returns on the job's next change (its progress), else on settling.
+    const untilChange = allowed(args, 'until', ['settled', 'change']) === 'change';
+    const seen = progressKey(detail);
+    while (unsettled(ctx, detail) && Date.now() < deadline && !(untilChange && progressKey(detail) !== seen)) {
+      // Woken by the OS when the job's files change (acceptance.json included); a timer only where they cannot be watched.
+      await waitForChange(jobDir(ctx.service.repo, detail.jobId), deadline - Date.now(), { fallbackMs });
       detail = await ctx.service.detail(resolveHead(ctx, detail.jobId));
     }
   }

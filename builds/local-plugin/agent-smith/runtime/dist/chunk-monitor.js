@@ -1,4 +1,4 @@
-import path from'node:path';import {fileURLToPath}from'node:url';import {r as reasonFromText,Z as readJsonSafe,V as pipelineRecordPath,A as AgentSmithReader,n as normalize,d as readAcceptance,h as isTerminalForgeStatus}from'./chunk-execute.js';import {a as claudeText,A as ACCEPTANCE_HOLD_MS,b as pipelineOutcome,l as livenessOf,i as isStalled}from'./chunk-stale.js';/**
+import path from'node:path';import {fileURLToPath}from'node:url';import {r as reasonFromText,a as readAcceptance,i as isTerminalForgeStatus}from'./chunk-checks.js';import {a as claudeText,A as ACCEPTANCE_HOLD_MS,b as pipelineOutcome}from'./chunk-notice.js';import {k as readJsonSafe,d as pipelineRecordPath,A as AgentSmithReader,n as normalize}from'./chunk-execute.js';import {l as livenessOf,i as isStalled}from'./chunk-stale.js';/**
  * policy.ts — when the channel is allowed to speak into Claude's context.
  *
  * This file is the whole point of Surface 2, and it is pure so it can be tested

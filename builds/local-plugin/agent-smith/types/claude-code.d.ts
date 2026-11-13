@@ -78,6 +78,14 @@ declare module 'claude-code' {
     readonly plugin: { readonly name: string; readonly root: string };
     /** Fetches through the host; the update check reads the released manifest with it. */
     readonly http: { fetch(url: string): Promise<{ status: number; ok: boolean; text: string }> };
+    /** Calls a tool on a connected MCP server (agent-native.ts reads capabilities and cancels with it). */
+    readonly mcp: { call(server: string, tool: string, args?: Record<string, unknown>): Promise<McpToolResult> };
+    /** Agent types this plugin registers (`<plugin>:<name>`) and the agents running now. */
+    readonly agent: AgentApi;
+    /** The session's conversation, or a subagent's with `agentId`. */
+    readonly session: { messages(args?: { agentId?: string; as?: 'api' }): Promise<unknown> };
+    /** Starts a child on the host (no shell) and streams its output; leaving the loop kills it. */
+    readonly process: ProcessApi;
   }
 
   /**
@@ -188,6 +196,8 @@ declare module 'claude-code' {
      * See TERMINAL-UI.md §Timing.
      */
     every(ms: number, fn: () => void | Promise<void>): unknown;
+    /** A one-shot timer. */
+    after(ms: number, fn: () => void | Promise<void>): unknown;
     /**
      * The current time in epoch ms.
      *
@@ -342,7 +352,61 @@ declare module 'claude-code' {
     (event: 'session.start', handler: Handler): void;
     (event: 'ui.close', handler: Handler<{ id: string }>): void;
     (event: 'ui.scroll', handler: Handler<{ component: string; requestId: string; origin: { kind: 'person' | 'plugin' }; offset: number; by: number; bodyRows: number; contentRows: number }>): void;
+    (event: 'turn.step', handler: StreamHandler<TurnStepEvent, TurnStepChunk, TurnStepResult>): void;
+    (event: 'turn.complete', handler: Handler<{ readonly turnId: string; readonly agentId?: string; [key: string]: unknown }>): void;
+    (event: 'session.send', handler: ($: EngineInterface, e: SessionSendEvent, next: (e: SessionSendEvent) => Promise<SessionSendResult>) => Promise<SessionSendResult>): void;
   }
+
+  /** The MCP result `$.mcp.call` resolves to. */
+  export interface McpToolResult {
+    readonly content: readonly unknown[];
+    readonly isError: boolean;
+    readonly structuredContent?: Record<string, unknown>;
+  }
+
+  export interface AgentInfo { readonly id: string; readonly type: string; readonly name?: string; readonly description: string; readonly status: string }
+  export interface AgentApi {
+    register(spec: { name: string; description: string; prompt: string; tools?: readonly string[]; model?: string; maxTurns?: number }): Promise<unknown>;
+    list(): Promise<AgentInfo[]>;
+  }
+
+  export type ProcessSpawnRequest = {
+    argv: readonly string[];
+    cwd?: string;
+    env?: Record<string, string>;
+    input?: string;
+  };
+  export type ProcessSpawnChunk = {
+    stream: 'stdout' | 'stderr';
+    text: string;
+  };
+  export type ProcessSpawnResult = {
+    code: number | null;
+    signal: string | null;
+  };
+  export type HookStream<C, R> = AsyncGenerator<C, R> & {
+    readonly result: Promise<R>;
+  };
+  export interface ProcessApi {
+    spawn(request: ProcessSpawnRequest): HookStream<ProcessSpawnChunk, ProcessSpawnResult>;
+  }
+
+  /** One model request inside a turn; a hook that yields its own chunks answers it without a request. */
+  export interface TurnStepEvent { readonly turnId: string; readonly index: number; readonly model: string; readonly messageCount: number; readonly agentId?: string }
+  export type TurnStepChunk =
+    | { kind: 'text'; index: number; text: string }
+    | { kind: 'tool'; index: number; id: string; name: string }
+    | { kind: 'input'; index: number; json: string }
+    | { kind: 'stop'; stopReason: 'end_turn' | 'tool_use'; usage: null };
+  export interface TurnStepResult { turnId: string; index: number; answer: string; toolUses: readonly { name: string; input: unknown }[]; stopReason: 'end_turn' | 'tool_use' | null; usage: null }
+  /** A streaming hook: an async generator yielding chunks, `next(e)` the stream beneath. */
+  export type StreamHandler<E, C, R> = ($: EngineInterface, e: E, next: StreamNext<E, C, R>) => AsyncGenerator<C, R | void>;
+  /** `next(e)` is the stream beneath; `next.signal` aborts when the dispatch is abandoned (a stop, an interrupt). */
+  export type StreamNext<E, C, R> = ((e: E) => AsyncGenerator<C, R>) & { readonly signal: AbortSignal };
+
+  /** A plain-text message leaving for another agent (SendMessage, or `$.session.send`). */
+  export interface SessionSendEvent { readonly to: string; readonly text: string; readonly origin: unknown; readonly agentId?: string }
+  export type SessionSendResult = { isDelivered: true } | { isDelivered: false; reason: string };
 
   /** A tool invocation. Only the fields this mod reads are declared. */
   export interface ToolCallEvent {

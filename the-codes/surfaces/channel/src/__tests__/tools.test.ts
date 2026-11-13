@@ -172,8 +172,8 @@ test('spawn_job ack is slim: identity, budget, permissions and warnings only', a
   const service = { repo, spawnJob: async () => full } as never;
   const r = await callTool({ service, catalogs: async () => [cat('codex')] } as HandlerContext, 'spawn_job', { mode: 'review', prompt: 'x', provider: 'codex' });
   assert.equal(r.isError, undefined);
-  assert.deepEqual(body(r), { jobId: 'j9', name: 'Ada', provider: 'codex', model: 'gpt-x', status: 'running', timeoutMs: 1000, repo, unrestricted: false, readOnlyEnforced: true });
-  assert.ok(text(r).length < 250, text(r));
+  assert.deepEqual(body(r), { jobId: 'j9', name: 'Ada', provider: 'codex', model: 'gpt-x', status: 'running', timeoutMs: 1000, repo, nodePath: process.execPath, unrestricted: false, readOnlyEnforced: true });
+  assert.ok(text(r).length < 270 + process.execPath.length, text(r));
 });
 
 test('an unrestricted review ack still says whether read-only is enforced', async () => {
@@ -437,7 +437,7 @@ test('tool failures are isError results that say what to do next', async () => {
   await fail('cancel', {}, /jobId is required/);
   await fail('pipeline_status', { runId: 'nope' }, /No pipeline run "nope"/);
   await fail('pipeline_status', {}, /runId is required/);
-  await fail('status', { jobId: 'j', bogus: 1 }, /Unknown field bogus; valid fields: jobId, wait_ms, include_diff, response_format/);
+  await fail('status', { jobId: 'j', bogus: 1 }, /Unknown field bogus; valid fields: jobId, wait_ms, until, include_diff, response_format/);
   await fail('nope', {}, /Unknown tool nope; available: list_capabilities/);
 });
 
