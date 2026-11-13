@@ -63,7 +63,7 @@ claude plugin update agent-smith@agent-smith --scope project # run inside the re
 
 Always pass `--scope`. Without it, a command run inside a repository can update that repository's install and leave your user-wide one behind.
 
-To update automatically, run `/plugin`, open **Marketplaces**, select `agent-smith` and choose **Enable auto-update**. Otherwise Agent Smith shows a session-start toast with the available version, where to update, and a reminder to restart Claude Code. It skips that check when `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set.
+To update automatically, run `/plugin`, open **Marketplaces**, select `agent-smith` and choose **Enable auto-update**. Otherwise Agent Smith shows a short session-start toast naming the new version (`agent-smith v0.4.2 available · /plugin`); update in `/plugin`, then restart Claude Code. It skips that check when `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set.
 
 To remove it: `claude plugin uninstall agent-smith@agent-smith --scope <scope>`, run inside the repository for `local` or `project`.
 

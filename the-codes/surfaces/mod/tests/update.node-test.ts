@@ -20,7 +20,7 @@ test('manifestVersion reads a stated dotted version and nothing else', () => {
 });
 
 test('updateLine names both versions and how to update, only when the release is newer', () => {
-  assert.equal(updateLine('0.2.1', '0.2.3'), 'agent-smith update available: v0.2.1 to v0.2.3. Update it in /plugin under Installed, in the scope you installed it in, then restart Claude Code.');
+  assert.equal(updateLine('0.2.1', '0.2.3'), 'agent-smith v0.2.3 available · /plugin');
   assert.equal(updateLine('0.2.3', '0.2.3'), null);
   assert.equal(updateLine('0.2.4', '0.2.3'), null);
   assert.equal(updateLine(null, '0.2.3'), null);
