@@ -116,6 +116,7 @@ const bandJobs = atom({ plugin: 'agent-smith', key: 'bandJobs' } as const, [] as
 const bandConfig = atom({ plugin: 'agent-smith', key: 'bandConfig' } as const, {
   repo: DEFAULT_REPO,
   colour: true,
+  source: 'cwd' as 'env' | 'cwd' | 'launch',
 });
 
 /**
@@ -232,8 +233,13 @@ const sameRepo = (a: string, b: string): boolean => a.replace(/\/+$/, '') === b.
  * session's own tool calls, and `notices` is session state.
  */
 async function takeLaunch($: EngineInterface, launch: Launch, cwd: string): Promise<boolean> {
-  const cfg = await read($, bandConfig);
   const repo = launch.repo ?? cwd;
+  // The ack's repo is where the MCP server keeps its jobs, so it is the repo
+  // to watch. The session cwd was only a guess: it differs when the session
+  // started, or restarted, somewhere other than where the server did. Only an
+  // explicit AGY_RADAR_REPO is kept over it.
+  if (repo !== '' && await adoptRepo($, repo)) await pollBand($).catch(() => {});
+  const cfg = await read($, bandConfig);
   // Whether this session shows the job is a separate question from who
   // announces it: any launch in this repo is shown, even one the hook keeps.
   if (cfg.repo !== '' && sameRepo(repo, cfg.repo)) await update($, launched, (l) => recordLaunch(l, launch));
@@ -249,6 +255,26 @@ async function takeLaunch($: EngineInterface, launch: Launch, cwd: string): Prom
   await $.fs.write(claimMarkerPath(cfg.repo, launch.kind, launch.id), `${new Date(at).toISOString()}\n`).catch(() => {});
   return true;
 }
+
+/**
+ * Watch `repo`, the repo a launch reported, unless AGY_RADAR_REPO pins another.
+ * True when the watched repo changed, so the caller can re-read jobs now.
+ */
+async function adoptRepo($: EngineInterface, repo: string): Promise<boolean> {
+  const cfg = await read($, bandConfig);
+  if (cfg.source === 'env') return false;
+  if (sameRepo(repo, cfg.repo)) {
+    if (cfg.source !== 'launch') await update($, bandConfig, (c) => ({ ...c, source: 'launch' as const }));
+    return false;
+  }
+  await update($, bandConfig, (c) => ({ ...c, repo: trimSlashes(repo), source: 'launch' as const }));
+  // The old guess's rows and read error say nothing about the new repo.
+  await update($, bandJobs, () => []);
+  await update($, readError, () => null);
+  return true;
+}
+
+const trimSlashes = (p: string): string => p.replace(/\/+$/, '') || p;
 
 // A slow pass can overlap the next tick; one announcement pass at a time.
 let announcing = false;
@@ -359,12 +385,20 @@ export async function startBand($: EngineInterface, cwd?: string): Promise<void>
     $.env.get('TERM').catch(() => undefined),
     $.env.get('AGY_RADAR_REPO').catch(() => undefined),
   ]);
-  await update($, bandConfig, () => ({
-    // Precedence: explicit AGY_RADAR_REPO, else the session cwd, else
-    // DEFAULT_REPO (empty by design). A hardcoded developer path here would
-    // make the plugin show another machine's jobs.
-    repo: repo !== undefined && repo.trim() !== '' ? repo.trim()
-      : (cwd !== undefined && cwd !== '' ? cwd : DEFAULT_REPO),
+  const pinned = repo !== undefined && repo.trim() !== '' ? repo.trim() : null;
+  await update($, bandConfig, (previous) => ({
+    // Precedence: explicit AGY_RADAR_REPO, else the repo a launch already
+    // reported, else the session cwd, else DEFAULT_REPO (empty by design). A
+    // hardcoded developer path here would make the plugin show another
+    // machine's jobs.
+    //
+    // A launch's repo outranks the cwd because session.start fires again on a
+    // resume or compaction, and by then the cwd may have moved (a persisted
+    // `cd`, a worktree) while the MCP server still writes jobs under the
+    // directory it started in. See takeLaunch.
+    ...(pinned !== null ? { repo: pinned, source: 'env' as const }
+      : previous.source === 'launch' && previous.repo !== '' ? { repo: previous.repo, source: 'launch' as const }
+      : { repo: cwd !== undefined && cwd !== '' ? cwd : DEFAULT_REPO, source: 'cwd' as const }),
     colour: !noColor({ NO_COLOR: nc, FORCE_COLOR: force, TERM: term }),
   }));
 

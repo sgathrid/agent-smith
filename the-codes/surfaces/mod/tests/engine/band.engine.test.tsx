@@ -274,11 +274,11 @@ const ADA_VIEW = JSON.stringify({schema:1,prompt:'Long task instructions',preamb
 const ada = () => canonicalJob('job-ada', {status:'running',name:'Ada',workerId:'ada',role:'reviewer',provider:'codex',model:'gpt-6-sol'}, {'view.json':ADA_VIEW});
 
 /** A host over canonical jobs that records what the mod asks of the UI. */
-function forgeHost(on: (...args: any[]) => void, files: Record<string,string>, ids: string[]) {
+function forgeHost(on: (...args: any[]) => void, files: Record<string,string>, ids: string[], env: Record<string,string> = {}) {
   const host = { opens: [] as Record<string,unknown>[], closes: [] as Record<string,unknown>[], toasts: [] as string[], scrolls: [] as Record<string,unknown>[] };
   on('session.start', (_$: unknown, e: any) => ({sessionId:'s',cwd:e.cwd}));
   on('command.register', () => ({value:undefined}));
-  on('env.get', () => ({value:undefined}));
+  on('env.get', (_$: unknown, e: any) => ({value:env[e.name]}));
   on('ui.open', (_$: unknown, e: any) => { host.opens.push({...e}); return {value:{isPlaced:true}}; });
   on('ui.toast', (_$: unknown, e: any) => { host.toasts.push(e.text); return {value:undefined}; });
   on('ui.scroll', (_$: unknown, e: any) => { host.scrolls.push({...e}); return {}; });
@@ -876,8 +876,8 @@ describe('update check', () => {
 
 describe('completion notices', () => {
   /** forgeHost, plus what the mod says and whether the command hook beneath ran. */
-  function noticeHost(on: (...args: any[]) => void, files: Record<string,string>, ids: string[]) {
-    const r = forgeHost(on, files, ids);
+  function noticeHost(on: (...args: any[]) => void, files: Record<string,string>, ids: string[], env: Record<string,string> = {}) {
+    const r = forgeHost(on, files, ids, env);
     const said = { logs: [] as string[], prompts: [] as string[], origins: [] as any[], hookRuns: 0 };
     on('ui.log', (_$: unknown, e: any) => { said.logs.push(e.text); return {value:undefined}; });
     on('prompt.submit', (_$: unknown, e: any) => { said.prompts.push(e.text); said.origins.push(e.origin); return {text:e.text}; });
@@ -974,9 +974,9 @@ describe('completion notices', () => {
     expect(said.prompts).toEqual([]);
   });
 
-  test('a launch in a repo the mod is not watching stays with the hook', async ($, on) => {
+  test('with AGY_RADAR_REPO pinned, a launch in another repo stays with the hook', async ($, on) => {
     const files = ada('running');
-    const { clock, said } = noticeHost(on, files, ['job-ada']);
+    const { clock, said } = noticeHost(on, files, ['job-ada'], { AGY_RADAR_REPO: '/work' });
     await start($);
     await launched($, 'job-ada', '/elsewhere');
     expect(Object.hasOwn(files, '/work/.agent-smith/claims/job-job-ada')).toBe(false);
@@ -985,6 +985,37 @@ describe('completion notices', () => {
     await clock.advance(3000);
     expect(said.logs).toEqual([]);
     expect(said.prompts).toEqual([]);
+  });
+});
+
+describe("a session cwd that is not the server's repo (#43)", () => {
+  // The MCP server keeps jobs under the directory it started in, /work. The
+  // session reports a cwd it has since moved to: a persisted `cd`, a worktree.
+  const drifted = ($: any, cwd = '/work/reports/x') => $.session.start({surface:'terminal',isInteractive:true,cwd} as never);
+  const files = () => canonicalJob('job-ada', {status:'running',name:'Ada',provider:'codex',role:'review'});
+
+  test('a launch moves the watch to the repo the server reported: shown, listed, and claimed', async ($, on) => {
+    const jobs = files();
+    const host: Record<string,string> = jobs;
+    forgeHost(on, host, ['job-ada']);
+    on('fs.write', (_$: unknown, e: any) => { host[e.path] = e.text; return {value:undefined}; });
+    on('prompt.submit', (_$: unknown, e: any) => ({text:e.text}));
+    await drifted($);
+    await launched($, 'job-ada', '/work/');
+    const band = await $.ui.mount({plugin:'agent-smith',surface:'terminal',...BAND} as never);
+    expect(await band.find({key:'band-job-ada'})).toBeDefined();
+    expect(await $.command.run({command:'forge',args:''})).toMatchObject({text:'1 running'});
+    // The marker lands where the command hook looks, so there is one notice, not two.
+    expect(Object.hasOwn(host, '/work/.agent-smith/claims/job-job-ada')).toBe(true);
+  });
+
+  test('a later session.start from the drifted cwd keeps the repo a launch reported', async ($, on) => {
+    forgeHost(on, files(), ['job-ada']);
+    await start($);
+    await launched($, 'job-ada');
+    await drifted($);
+    expect(await $.command.run({command:'forge',args:''})).toMatchObject({text:'1 running'});
+    expect(await $.command.run({command:'forge',args:'all'})).toMatchObject({text:'repository: 1 running'});
   });
 });
 
