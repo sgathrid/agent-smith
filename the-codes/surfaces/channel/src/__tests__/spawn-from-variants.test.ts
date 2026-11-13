@@ -231,7 +231,7 @@ test('cancel by an earlier turn marks both IDs and reads acceptance on the final
     resolveHead: (id: string) => string;
     detail: (id: string) => Promise<unknown>;
   };
-  svc.cancel = (id: string) => ({ jobId: 'turn-2', resolvedFrom: id, requested: true, signalled: true, note: 'x' });
+  svc.cancel = (id: string) => (id === 'turn-1' ? { jobId: 'turn-2', resolvedFrom: id, requested: true, signalled: true, note: 'x' } : { jobId: id, requested: true, signalled: true, note: 'x' });
   svc.resolveHead = () => (reads === 0 ? 'turn-2' : 'turn-3');
   svc.detail = async (id: string) => {
     reads++;
@@ -240,9 +240,96 @@ test('cancel by an earlier turn marks both IDs and reads acceptance on the final
   const c = body(await callTool(f.ctx, 'cancel', { jobId: 'turn-1' }));
   assert.equal(c.jobId, 'turn-3');
   assert.equal(c.resolvedFrom, 'turn-1');
-  assert.equal(c.settled, true);
+  assert.equal(c.settled, false);
   assert.equal(c.checksCanceled, false);
+  assert.equal(existsSync(claimMarkerPath(f.repo, 'job', 'turn-1')), false);
+  assert.equal(existsSync(claimMarkerPath(f.repo, 'job', 'turn-2')), false);
+  assert.equal(existsSync(claimMarkerPath(f.repo, 'job', 'turn-3')), false);
+
+  // Once acceptance finishes, cancel settles and keeps markers for both IDs.
+  writeFileSync(path.join(jobDir(f.repo, 'turn-3'), ACCEPTANCE_FILE), JSON.stringify({ state: 'accepted', pending: false }));
+  const settled = body(await callTool(f.ctx, 'cancel', { jobId: 'turn-1' }));
+  assert.equal(settled.jobId, 'turn-3');
+  assert.equal(settled.resolvedFrom, 'turn-1');
+  assert.equal(settled.settled, true);
   assert.ok(existsSync(claimMarkerPath(f.repo, 'job', 'turn-1')));
   assert.ok(existsSync(claimMarkerPath(f.repo, 'job', 'turn-2')));
   assert.ok(existsSync(claimMarkerPath(f.repo, 'job', 'turn-3')));
+});
+
+test('from preserves raw provider so role defaults re-apply and another-provider aliases work', async () => {
+  const f = fixture();
+  mkdirSync(path.join(f.repo, '.agent-smith'), { recursive: true });
+  writeFileSync(path.join(f.repo, '.agent-smith', 'models.json'), JSON.stringify({
+    aliases: {
+      'rev-codex': { provider: 'codex', model: 'gpt-5.4', effort: 'high' },
+      'alt-agy': { provider: 'agy', model: 'gemini-2.5', effort: 'low' },
+    },
+    roleDefaults: { review: 'rev-codex' },
+  }));
+  const first = await callTool(f.ctx, 'spawn_job', { mode: 'review', prompt: 'x' });
+  assert.equal(first.isError, undefined, errText(first));
+  assert.equal(f.seen[0]!.provider, 'codex');
+  assert.equal(f.seen[0]!.model, 'gpt-5.4');
+  assert.equal(f.seen[0]!.effort, 'high');
+
+  const rerun = await callTool(f.ctx, 'spawn_job', { from: 'job-1' });
+  assert.equal(rerun.isError, undefined, errText(rerun));
+  assert.equal(f.seen[1]!.provider, 'codex');
+  assert.equal(f.seen[1]!.model, 'gpt-5.4');
+  assert.equal(f.seen[1]!.effort, 'high');
+
+  const switched = await callTool(f.ctx, 'spawn_job', { from: 'job-1', model: 'alt-agy' });
+  assert.equal(switched.isError, undefined, errText(switched));
+  assert.equal(f.seen[2]!.provider, 'agy');
+  assert.equal(f.seen[2]!.model, 'gemini-2.5');
+});
+
+test('overlay drops base model, effort and unrestricted when a variant names a different or unresolved provider', async () => {
+  const f = fixture();
+  const r = await callTool(f.ctx, 'spawn_job', {
+    mode: 'review', prompt: 'x', model: 'gpt-5.4', effort: 'high', unrestricted: false,
+    variants: [{ provider: 'codex' }, { provider: 'agy' }, { name: 'agy-low', provider: 'agy', effort: 'low' }],
+  });
+  assert.equal(r.isError, undefined, errText(r));
+  assert.equal(f.seen[0]!.provider, 'codex');
+  assert.equal(f.seen[0]!.model, undefined);
+  assert.equal(f.seen[0]!.effort, undefined);
+  assert.equal(f.seen[0]!.unrestricted, undefined);
+  assert.equal(f.seen[1]!.provider, 'agy');
+  assert.equal(f.seen[1]!.model, undefined);
+  assert.equal(f.seen[1]!.effort, undefined);
+  assert.equal(f.seen[1]!.unrestricted, undefined);
+  assert.equal(f.seen[2]!.provider, 'agy');
+  assert.equal(f.seen[2]!.effort, 'low');
+});
+
+test('cancel waits for supersededBy to settle and cancels the new head that appears during the wait', async () => {
+  const f = fixture({ cancelSettleMs: 200 });
+  mkdirSync(jobDir(f.repo, 'turn-1'), { recursive: true });
+  mkdirSync(jobDir(f.repo, 'turn-2'), { recursive: true });
+  const canceledCalls: string[] = [];
+  let turn2Status = 'running';
+  const svc = f.ctx.service as unknown as {
+    cancel: (id: string) => unknown;
+    resolveHead: (id: string) => string;
+    detail: (id: string) => Promise<unknown>;
+  };
+  svc.cancel = (id: string) => {
+    canceledCalls.push(id);
+    if (id === 'turn-2') turn2Status = 'canceled';
+    return { jobId: id, requested: true, signalled: true, note: 'x' };
+  };
+  svc.resolveHead = () => 'turn-2';
+  svc.detail = async (id: string) => (
+    id === 'turn-1'
+      ? { jobId: 'turn-1', name: 'w', workerId: 'turn-1', status: 'canceled', supersededBy: 'turn-2', report: null, warnings: [] }
+      : { jobId: 'turn-2', name: 'w', workerId: 'turn-1', status: turn2Status, report: null, warnings: [] }
+  );
+  const c = body(await callTool(f.ctx, 'cancel', { jobId: 'turn-1' }));
+  assert.deepEqual(canceledCalls, ['turn-1', 'turn-2']);
+  assert.equal(c.jobId, 'turn-2');
+  assert.equal(c.settled, true);
+  assert.ok(existsSync(claimMarkerPath(f.repo, 'job', 'turn-1')));
+  assert.ok(existsSync(claimMarkerPath(f.repo, 'job', 'turn-2')));
 });

@@ -160,9 +160,11 @@ else setTimeout(finish,1800);
     const listed = await call('list_jobs', { session: true });
     assert.ok((listed.items ?? listed).some((j: any) => j.jobId === queuedResult.jobId));
     const replacement = await call('resume_job', { worker: resumed.jobId, prompt: 'replace checks', checks: [{ name: 'replacement', command: `${JSON.stringify(process.execPath)} -e "process.exit(0)"` }] });
+    assert.deepEqual(replacement.checks, ['replacement']);
     const replaced = await until(() => call('status', { jobId: replacement.jobId }), r => r.status === 'succeeded' && r.acceptance?.state === 'accepted');
     assert.deepEqual(replaced.acceptance.passed, ['replacement']);
     const cleared = await call('resume_job', { worker: replacement.jobId, prompt: 'clear checks', checks: [] });
+    assert.equal('checks' in cleared, false);
     const unchecked = await until(() => call('status', { jobId: cleared.jobId }), r => r.status === 'succeeded');
     assert.equal(unchecked.acceptance.state, 'unchecked');
     const pipeline = await call('run_pipeline', { spec: { name: 'reload-pipeline', stages: [

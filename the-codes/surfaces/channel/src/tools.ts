@@ -135,7 +135,8 @@ export function slimAck(ack: SpawnAck) {
 async function spawnOne(ctx: HandlerContext, args: Args): Promise<Record<string, unknown>> {
   const mode = allowed(args, 'mode', MODES); if (mode === undefined) throw new Error(`mode is required; one of ${MODES.join(', ')}.`);
   const cfg = loadModelConfig({ repo: ctx.service.repo });
-  const resolved = resolveRequest({ provider: allowed(args, 'provider', PROVIDERS), model: text(args, 'model'), effort: allowed(args, 'effort', EFFORTS), mode }, cfg);
+  const rawProvider = allowed(args, 'provider', PROVIDERS);
+  const resolved = resolveRequest({ provider: rawProvider, model: text(args, 'model'), effort: allowed(args, 'effort', EFFORTS), mode }, cfg);
   const provider = resolved.provider ?? defaultProvider(ctx.catalogs ? (await installedCatalogs(ctx)).map(c => c.provider) : await getInstalledProviders());
   const notes = [...resolved.warnings, ...cfg.errors.map(e => `models.json: ${e}`)];
   const withNotes = (ack: SpawnAck) => ({ ...slimAck(ack), provider: ack.provider ?? provider, ...(resolved.appliedAlias ? { aliasApplied: resolved.appliedAlias, aliasSource: resolved.source } : {}), ...(notes.length ? { warnings: [...(ack.warnings ?? []), ...notes] } : {}) });
@@ -162,7 +163,7 @@ async function spawnOne(ctx: HandlerContext, args: Args): Promise<Record<string,
   const gate = await confirmUnrestricted(ctx, { unrestricted: request.unrestricted, provider, worker: request.name, cwd: request.cwd ?? ctx.service.repo });
   if (gate.refused) throw new Error(refusedText(gate.refused));
   if (gate.warning) notes.push(gate.warning);
-  const saved = { mode, prompt: request.prompt, context: request.context, files: request.files, cwd: request.cwd, task: request.task, name: request.name, provider, model: text(args, 'model'), effort: allowed(args, 'effort', EFFORTS), timeoutMs: request.timeoutMs, unrestricted: request.unrestricted };
+  const saved = { mode, prompt: request.prompt, context: request.context, files: request.files, cwd: request.cwd, task: request.task, name: request.name, provider: rawProvider, model: text(args, 'model'), effort: allowed(args, 'effort', EFFORTS), timeoutMs: request.timeoutMs, unrestricted: request.unrestricted };
   if (!checks?.length) { const ack = await ctx.service.spawnJob(request); saveRequest(ctx, ack.jobId, saved); return withNotes(ack); }
   const { ack, done } = await ctx.service.spawnTracked(request);
   if (!preparedJobIds.includes(ack.jobId)) {
@@ -189,9 +190,9 @@ const VARIANT_KEYS = ['name', 'provider', 'model', 'effort'] as const;
  * Overrides on top of a base request. A different provider drops the base's model, effort and
  * unrestricted: they belonged to the old provider.
  */
-function overlay(base: Args, over: Args): Args {
+function overlay(base: Args, over: Args, baseProvider?: string): Args {
   const defined = Object.fromEntries(Object.entries(over).filter(([, v]) => v !== undefined));
-  const switched = defined.provider !== undefined && base.provider !== undefined && defined.provider !== base.provider;
+  const switched = defined.provider !== undefined && baseProvider !== defined.provider;
   const kept = switched ? Object.fromEntries(Object.entries(base).filter(([k]) => !['model', 'effort', 'unrestricted'].includes(k))) : base;
   return { ...kept, ...defined };
 }
@@ -207,8 +208,15 @@ async function inheritFrom(ctx: HandlerContext, args: Args): Promise<Args> {
   }
   try { saved.checks = JSON.parse(readFileSync(jobFile(ctx.service.repo, root, FILES.checksSpec), 'utf8')); } catch { /* spawned without checks */ }
   delete saved.name;
+  const cfg = loadModelConfig({ repo: ctx.service.repo });
+  const baseProvider = resolveRequest({
+    provider: allowed(saved, 'provider', PROVIDERS),
+    model: text(saved, 'model'),
+    effort: allowed(saved, 'effort', EFFORTS),
+    mode: allowed(saved, 'mode', MODES),
+  }, cfg).provider;
   const { from: _from, ...rest } = args;
-  return overlay(saved, rest);
+  return overlay(saved, rest, baseProvider);
 }
 
 const spawnJob: Handler = async (ctx, args) => {
@@ -244,8 +252,14 @@ const spawnJob: Handler = async (ctx, args) => {
   });
   const names = variants.map(v => text(v, 'name') ?? [stem, text(v, 'provider') ?? text(shared, 'provider'), text(v, 'model')].filter(Boolean).join('-').slice(0, 80));
   if (new Set(names).size !== names.length) throw new Error('variants need distinct names; pass name on each variant.');
-  const requests = variants.map((v, i) => overlay(shared, { ...v, name: names[i] }));
   const cfg = loadModelConfig({ repo: ctx.service.repo });
+  const baseProvider = resolveRequest({
+    provider: allowed(shared, 'provider', PROVIDERS),
+    model: text(shared, 'model'),
+    effort: allowed(shared, 'effort', EFFORTS),
+    mode,
+  }, cfg).provider;
+  const requests = variants.map((v, i) => overlay(shared, { ...v, name: names[i] }, baseProvider));
   let fallbackProvider: string | undefined;
   const getFallbackProvider = async () => fallbackProvider ??= defaultProvider(ctx.catalogs ? (await installedCatalogs(ctx)).map(c => c.provider) : await getInstalledProviders());
   const resolvedProviders: string[] = [];
@@ -308,7 +322,7 @@ const resumeJob: Handler = async (ctx, args) => {
   let droppedEnv: string[] = [];
   if (request.env === undefined) { try { droppedEnv = JSON.parse(readFileSync(jobFile(ctx.service.repo, detail.jobId, ENV_KEYS_FILE), 'utf8')) as string[]; } catch { /* the original had no env */ } }
   const allWarnings = [...(resumed.warnings ?? []), ...(gate.warning ? [gate.warning] : []), ...(droppedEnv.length > 0 ? [`The original job set env ${droppedEnv.join(', ')}; values are not stored, so this turn runs without them. Pass env again to keep them.`] : [])];
-  return structured({ ...slimAck(resumed), ...(allWarnings.length > 0 ? { warnings: allWarnings } : {}) }, { compact: true });
+  return structured({ ...slimAck(resumed), ...(checks?.length ? { checks: checks.map(c => c.name) } : {}), ...(allWarnings.length > 0 ? { warnings: allWarnings } : {}) }, { compact: true });
 };
 
 const steerJob: Handler = async (ctx, args) => {
@@ -421,17 +435,36 @@ const cancelJob: Handler = async (ctx, args) => {
     // A worker that already exited can still have checks running; stop those too.
     // With a detached supervisor the cancel marker is the request; the supervisor stops the checks within ~200 ms.
     let checksCanceled = abortChecks(id, result.jobId);
-    let detail = await ctx.service.detail(result.jobId).catch(() => null);
-    if (detail?.jobId) mark(detail.jobId);
-    while (detail?.status === 'running' && Date.now() < settleBy) {
+    const isTerminal = (s: string | undefined) => s === 'succeeded' || s === 'failed' || s === 'canceled';
+    const isPendingAcceptance = (jobId: string) => (readAcceptance(ctx.service.repo, jobId) as { pending?: boolean }).pending === true;
+    const isSettled = (d: JobDetail | null) =>
+      d !== null && isTerminal(d.status) && !d.supersededBy && !isPendingAcceptance(d.jobId);
+    const cancelledIds = new Set<string>([id, result.jobId]);
+    let currentId = result.jobId;
+    const cancelHead = (headId: string) => {
+      if (cancelledIds.has(headId)) return;
+      cancelledIds.add(headId);
+      mark(headId);
+      const next = ctx.service.cancel(headId);
+      mark(next.jobId);
+      cancelledIds.add(next.jobId);
+      if (abortChecks(headId, next.jobId)) checksCanceled = true;
+      currentId = next.jobId;
+    };
+    let detail = await ctx.service.detail(currentId).catch(() => null);
+    if (detail?.jobId) { mark(detail.jobId); cancelHead(detail.jobId); }
+    while (!isSettled(detail) && Date.now() < settleBy) {
       await sleep(Math.min(step, Math.max(0, settleBy - Date.now())));
-      detail = await ctx.service.detail(resolveHead(ctx, result.jobId)).catch(() => detail);
-      if (detail?.jobId) mark(detail.jobId);
+      const nextHead = resolveHead(ctx, detail?.supersededBy || detail?.jobId || currentId);
+      if (nextHead !== currentId) cancelHead(nextHead);
+      else if (detail?.supersededBy) cancelHead(detail.supersededBy);
+      detail = await ctx.service.detail(currentId).catch(() => detail);
+      if (detail?.jobId) { mark(detail.jobId); cancelHead(detail.jobId); }
     }
     const status = detail?.status ?? 'unknown';
-    settled = status === 'succeeded' || status === 'failed' || status === 'canceled';
-    const finalJobId = detail?.jobId ?? result.jobId;
-    if (finalJobId !== id && finalJobId !== result.jobId && abortChecks(finalJobId)) checksCanceled = true;
+    settled = isSettled(detail);
+    const finalJobId = detail?.jobId ?? currentId;
+    if (abortChecks(finalJobId)) checksCanceled = true;
     const out: Record<string, unknown> = { jobId: finalJobId, ...resolved, status, settled };
     if (checksCanceled) return json({ ...out, checksCanceled: true });
     const pending = readAcceptance(ctx.service.repo, finalJobId) as { pending?: boolean; running?: string };

@@ -110,13 +110,25 @@ test('the prompt names an unnamed worker generically and asks only after validat
 });
 
 test('variants: one confirmation for the batch; a decline starts none', async () => {
-  const variants = [{ name: 'A', provider: 'codex' }, { name: 'B', provider: 'claude' }, { name: 'C', provider: 'agy' }];
+  const variants = [{ name: 'A', model: 'codex-alias' }, { name: 'B', model: 'claude-alias' }, { name: 'C', model: 'agy-alias' }];
+  const writeAliases = (repo: string) => {
+    mkdirSync(path.join(repo, '.agent-smith'), { recursive: true });
+    writeFileSync(path.join(repo, '.agent-smith', 'models.json'), JSON.stringify({
+      aliases: {
+        'codex-alias': { provider: 'codex' },
+        'claude-alias': { provider: 'claude' },
+        'agy-alias': { provider: 'agy' },
+      },
+    }));
+  };
   const h = harness({ caps: FORM, action: 'accept' });
+  writeAliases(h.repo);
   const r = await callTool(h.ctx, 'spawn_job', { mode: 'review', prompt: 'x', unrestricted: true, variants });
   assert.equal(r.isError, undefined, text(r));
   assert.deepEqual(h.asked, [`Allow 2 workers (A: codex, B: claude) to run without approval prompts in ${h.repo}? It will be able to run any command.`]);
   assert.deepEqual(h.spawned.map(s => s.unrestricted), [true, true, true]);
   const declined = harness({ caps: FORM, action: 'decline' });
+  writeAliases(declined.repo);
   const d = await callTool(declined.ctx, 'spawn_job', { mode: 'review', prompt: 'x', unrestricted: true, variants });
   assert.equal(d.isError, true); assert.equal(declined.asked.length, 1); assert.equal(declined.spawned.length, 0);
 });
