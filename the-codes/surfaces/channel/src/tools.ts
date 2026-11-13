@@ -5,7 +5,7 @@ import { claimMarkerPath } from '../../mod/hooks/notice.ts';
 import type { CallToolResult } from '@modelcontextprotocol/server';
 import type { Server } from '@modelcontextprotocol/server';
 import type { ForgeStatus } from '../../../forge/format.ts';
-import { ENV_KEYS_FILE, type ForgeService, type JobDetail } from '../../../forge/service.ts';
+import { ENV_KEYS_FILE, type ForgeService, type JobDetail, type SpawnAck } from '../../../forge/service.ts';
 import { launchPipeline } from '../../../forge/supervisor.ts';
 import { FILES, jobFile } from '../../../forge/format.ts';
 import { startPipeline, readPipeline, cancelPipeline } from '../../../forge/execute.ts';
@@ -21,13 +21,11 @@ import { isStalled } from '../../mod/hooks/stale.ts';
 import { PROVIDERS, TOOL_DEFS, MAX_WAIT_MS } from './tool-defs.ts';
 import { allowed, boolean, contextText, filesList, format, keys, number, parseChecks, parseStages, record, text, workingDirectory } from './args.ts';
 import { defaultMixedPipeline, defaultProvider, installedCatalogs, type CatalogSource } from './stage-defaults.ts';
-import { launchTask, notifyHint } from './notify.ts';
 
 // The tool-facing surface lives in sibling modules; callers keep importing it from here.
 export { MAX_CONTEXT_CHARS, TOOL_DEFS, type ToolAnnotations, type ToolDef } from './tool-defs.ts';
 export { parseStages } from './args.ts';
 export { defaultMixedPipeline, type CatalogSource, type MixedSpecInput } from './stage-defaults.ts';
-export { builtMonitorPath, notifyHint } from './notify.ts';
 
 export const REPORT_HEAD_CHARS = 8_000;
 const WAIT_POLL_MS = 500;
@@ -114,6 +112,22 @@ const listCapabilitiesTool: Handler = async (ctx, args) => {
   return structured(await listCapabilities(ctx, boolean(args, 'refresh') ?? false, fmt, allowed(args, 'provider', PROVIDERS)), { compact: fmt === 'concise' });
 };
 
+/**
+ * A launch ack with only what the caller acts on: the job's identity, where it runs, its budget, its
+ * permissions, and any warnings. The full record is one status call away. `repo` and `timeoutMs`
+ * also tell the mod and the completion hook where to watch and for how long.
+ */
+export function slimAck(ack: SpawnAck) {
+  const out = {
+    jobId: ack.jobId, name: ack.name, provider: ack.provider, model: ack.modelResolved ?? null, status: ack.status,
+    timeoutMs: ack.timeoutMs, repo: ack.repo, unrestricted: ack.unrestricted,
+    ...(ack.readOnlyRequested ? { readOnlyEnforced: ack.readOnlyEnforced ?? false } : {}),
+    ...(ack.envKeys?.length ? { envKeys: ack.envKeys } : {}),
+    ...(ack.warnings?.length ? { warnings: ack.warnings } : {}),
+  };
+  return Object.fromEntries(Object.entries(out).filter(([, v]) => v !== undefined)) as Partial<typeof out>;
+}
+
 /** One spawn: the ack as an object. Throws on a bad request or a refused confirmation. */
 async function spawnOne(ctx: HandlerContext, args: Args): Promise<Record<string, unknown>> {
   const mode = allowed(args, 'mode', MODES); if (mode === undefined) throw new Error(`mode is required; one of ${MODES.join(', ')}.`);
@@ -121,7 +135,7 @@ async function spawnOne(ctx: HandlerContext, args: Args): Promise<Record<string,
   const resolved = resolveRequest({ provider: allowed(args, 'provider', PROVIDERS), model: text(args, 'model'), effort: allowed(args, 'effort', EFFORTS), mode }, cfg);
   const provider = resolved.provider ?? defaultProvider(ctx.catalogs ? (await installedCatalogs(ctx)).map(c => c.provider) : await getInstalledProviders());
   const notes = [...resolved.warnings, ...cfg.errors.map(e => `models.json: ${e}`)];
-  const withNotes = <T extends { warnings?: readonly string[]; jobId?: string; timeoutMs?: number }>(ack: T) => ({ ...ack, ...(ack.jobId ? { taskHandle: launchTask(ack.jobId), notify: notifyHint({ job: ack.jobId }, ctx.service.repo, ack.timeoutMs) } : {}), ...(resolved.appliedAlias ? { aliasApplied: resolved.appliedAlias, aliasSource: resolved.source } : {}), ...(notes.length ? { warnings: [...(ack.warnings ?? []), ...notes] } : {}) });
+  const withNotes = (ack: SpawnAck) => ({ ...slimAck(ack), provider: ack.provider ?? provider, ...(resolved.appliedAlias ? { aliasApplied: resolved.appliedAlias, aliasSource: resolved.source } : {}), ...(notes.length ? { warnings: [...(ack.warnings ?? []), ...notes] } : {}) });
   const checks = parseChecks(args.checks);
   const preparedJobIds: string[] = [];
   const onPrepared = (jobId: string) => {
@@ -146,7 +160,7 @@ async function spawnOne(ctx: HandlerContext, args: Args): Promise<Record<string,
   if (gate.refused) throw new Error(refusedText(gate.refused));
   if (gate.warning) notes.push(gate.warning);
   const saved = { mode, prompt: request.prompt, context: request.context, files: request.files, cwd: request.cwd, task: request.task, name: request.name, provider, model: text(args, 'model'), effort: allowed(args, 'effort', EFFORTS), timeoutMs: request.timeoutMs, unrestricted: request.unrestricted };
-  if (!checks?.length) { const ack = await ctx.service.spawnJob(request); saveRequest(ctx, ack.jobId, saved); return { ...withNotes(ack), provider }; }
+  if (!checks?.length) { const ack = await ctx.service.spawnJob(request); saveRequest(ctx, ack.jobId, saved); return withNotes(ack); }
   const { ack, done } = await ctx.service.spawnTracked(request);
   if (!preparedJobIds.includes(ack.jobId)) {
     preparedJobIds.push(ack.jobId);
@@ -154,7 +168,7 @@ async function spawnOne(ctx: HandlerContext, args: Args): Promise<Record<string,
   }
   gateAcceptance(ctx, ack.jobId, done, checks, preparedJobIds);
   saveRequest(ctx, ack.jobId, saved);
-  return { ...withNotes(ack), provider, checks: checks.map(c => c.name) };
+  return { ...withNotes(ack), checks: checks.map(c => c.name) };
 }
 
 const refusedText = (r: ToolOutcome) => (r.content as { text?: string }[])[0]?.text ?? 'refused';
@@ -196,7 +210,7 @@ async function inheritFrom(ctx: HandlerContext, args: Args): Promise<Args> {
 
 const spawnJob: Handler = async (ctx, args) => {
   const base = args.from === undefined ? args : await inheritFrom(ctx, args);
-  if (args.variants === undefined) return structured(await spawnOne(ctx, base));
+  if (args.variants === undefined) return structured(await spawnOne(ctx, base), { compact: true });
   if (ctx.onJobPrepared) throw new Error('variants start several jobs, and a task-augmented call tracks one; call spawn_job once per variant.');
   if (!Array.isArray(args.variants) || args.variants.length === 0 || args.variants.length > MAX_VARIANTS) throw new Error(`variants must be an array of 1 to ${MAX_VARIANTS} entries.`);
   const { variants: _v, ...shared } = base;
@@ -208,7 +222,7 @@ const spawnJob: Handler = async (ctx, args) => {
   for (const [i, v] of variants.entries()) {
     try { jobs.push(await spawnOne(ctx, overlay(shared, { ...v, name: names[i] }))); } catch (err) { jobs.push({ name: names[i], error: err instanceof Error ? err.message : String(err) }); }
   }
-  return structured({ jobs });
+  return structured({ jobs }, { compact: true });
 };
 
 
@@ -246,7 +260,7 @@ const resumeJob: Handler = async (ctx, args) => {
   let droppedEnv: string[] = [];
   if (request.env === undefined) { try { droppedEnv = JSON.parse(readFileSync(jobFile(ctx.service.repo, detail.jobId, ENV_KEYS_FILE), 'utf8')) as string[]; } catch { /* the original had no env */ } }
   const allWarnings = [...(resumed.warnings ?? []), ...(gate.warning ? [gate.warning] : []), ...(droppedEnv.length > 0 ? [`The original job set env ${droppedEnv.join(', ')}; values are not stored, so this turn runs without them. Pass env again to keep them.`] : [])];
-  return structured({ ...resumed, taskHandle: launchTask(resumed.jobId), notify: notifyHint({ job: resumed.jobId }, ctx.service.repo, resumed.timeoutMs), ...(allWarnings.length > 0 ? { warnings: allWarnings } : {}) });
+  return structured({ ...slimAck(resumed), ...(allWarnings.length > 0 ? { warnings: allWarnings } : {}) }, { compact: true });
 };
 
 const steerJob: Handler = async (ctx, args) => {
@@ -257,8 +271,8 @@ const steerJob: Handler = async (ctx, args) => {
   const delivery = allowed(args, 'delivery', ['queue', 'interrupt']) as 'queue' | 'interrupt' | undefined;
   if (delivery === undefined) throw new Error('delivery is required: choose "queue" (after current turn) or "interrupt" (stop current turn now).');
   const ack = await ctx.service.steer({ worker, prompt, context, files, delivery });
-  const idNote = ` The continuation gets a new job ID; status and cancel on ${ack.jobId} follow it.`;
-  return structured({ ...ack, note: `${ack.note}${idNote}`, taskHandle: launchTask(ack.jobId), notify: notifyHint({ job: ack.jobId }, ctx.service.repo, ack.timeoutMs) });
+  const { dir: _dir, workerId: _w, ...rest } = ack as typeof ack & { dir?: unknown; workerId?: unknown };
+  return structured({ ...rest, note: `${ack.note} The continuation gets a new job ID; status and cancel on ${ack.jobId} follow it.` });
 };
 
 const listJobs: Handler = async (ctx, args) => {
@@ -363,7 +377,7 @@ const runPipeline: Handler = async (ctx, args) => {
     ? await launchPipeline(ctx.service, spec, { unrestricted: boolean(raw, 'unrestricted') })
     : startPipeline(ctx.service, spec, { unrestricted: boolean(raw, 'unrestricted') });
   void run.done.catch(err => process.stderr.write(`agent-smith pipeline ${run.runId}: ${String(err)}\n`));
-  return json({ runId: run.runId, recordPath: run.recordPath, stages: spec.stages.map(s => ({ name: s.name, provider: s.provider, dependsOn: s.dependsOn ?? [] })), started: true, taskHandle: launchTask(run.runId), notify: notifyHint({ run: run.runId }, ctx.service.repo, Math.max(0, ...spec.stages.map(st => st.timeoutMs ?? 0)) || undefined) });
+  return json({ runId: run.runId, repo: ctx.service.repo, stages: spec.stages.map(s => ({ name: s.name, provider: s.provider, ...(s.dependsOn?.length ? { dependsOn: s.dependsOn } : {}) })) });
 };
 
 const HANDLERS: Readonly<Record<string, Handler>> = {

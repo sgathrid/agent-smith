@@ -46,8 +46,8 @@ denied, ask the user before retrying with `unrestricted: true`.
 
 `spawn_job` returns at once and the worker runs in the background. You get a message when it
 ends, so don't poll or start your own monitor. A subagent doesn't get that message (it goes
-to the main conversation), and neither does a headless session; in either case follow the
-ack's `notify.fallback`.
+to the main conversation), and neither does a headless session; either one calls `status`
+with `wait_ms` until the job settles.
 
 To redirect a running worker, use `steer_job`: `queue` runs after the current turn (dropped if
 that turn fails), `interrupt` stops it now, losing the tool call in flight. Each steer starts a

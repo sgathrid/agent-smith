@@ -164,50 +164,16 @@ test('pipelines expand aliases in explicit stages and apply roleDefaults to the 
   assert.equal(def.stages.find(s => s.name === 'implement')!.model, undefined);
 });
 
-test('notifyHint: a notice is promised; the monitor command waits under fallback, behind a deadline', async () => {
-  const { builtMonitorPath, notifyHint } = await import('../tools.ts');
-  assert.equal(builtMonitorPath('/repo/the-codes/surfaces/channel/src/tools.ts'), undefined);
-  assert.equal(builtMonitorPath('/repo/the-codes/surfaces/channel/dist/surfaces/channel/src/tools.js'), '/repo/the-codes/surfaces/channel/dist/monitor.js');
-  assert.equal(builtMonitorPath('/plugin/runtime/dist/server.js'), '/plugin/runtime/dist/monitor.js');
-  const none = notifyHint({ job: 'j1' }, '/repo', 60_000, undefined);
-  assert.equal(none.mode, 'hook');
-  assert.match(none.note, /You will be notified when this job ends.*don't poll or start a monitor/);
-  // Nothing runnable at the top level: an agent runs a command it is handed.
-  assert.deepEqual(Object.keys(none).sort(), ['fallback', 'mode', 'note']);
-  assert.equal('monitorCommand' in none.fallback, false);
-  assert.match(none.fallback.when, /no notice has arrived 3 min after launch, this session can't receive messages between turns \(headless\), or you are a subagent/);
-  assert.equal(none.fallback.use, 'Call status with wait_ms until it settles.');
-  // The deadline defaults to the job default timeout.
-  assert.match(notifyHint({ job: 'j1' }, '/repo', undefined, undefined).fallback.when, /47 min/);
-  const job = notifyHint({ job: 'j1' }, '/repo', 2_700_000, '/rt/dist/monitor.js') as { fallback: { use: string; monitorCommand: string; monitorTimeoutMs: number } };
-  assert.equal(job.fallback.monitorCommand, 'node "/rt/dist/monitor.js" --job j1 --cwd "/repo"');
-  assert.equal(job.fallback.monitorTimeoutMs, 1_800_000);
-  assert.match(job.fallback.use, /or run monitorCommand in the background \(it stops after monitorTimeoutMs; run it again if the job has not ended\)/);
-  const run = notifyHint({ run: 'r1' }, '/repo', 120_000, '/rt/dist/monitor.js') as { note: string; fallback: { when: string; monitorCommand: string; monitorTimeoutMs: number } };
-  assert.match(run.note, /this run ends/);
-  assert.match(run.fallback.when, /pipeline_status shows the run ended/);
-  assert.match(run.fallback.monitorCommand, /--run r1 /);
-  assert.equal(run.fallback.monitorTimeoutMs, 120_000);
-});
-
-test('notifyHint: the "no notice by" wait includes the acceptance budget written at spawn', async () => {
-  const { notifyHint } = await import('../tools.ts');
-  const { pendingAcceptance, writeAcceptance } = await import('../../../../forge/checks.ts');
-  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-notify-budget-'));
-  try {
-    writeAcceptance(repo, 'j1', pendingAcceptance([{ name: 'slow', command: 'sleep 1', timeoutMs: 10 * 60_000 }]));
-    // 1 min job + (10 min + 30 s grace) checks + 2 min notice grace = 14 min (rounded up).
-    assert.match(notifyHint({ job: 'j1' }, repo, 60_000, undefined).fallback.when, /no notice has arrived 14 min after launch/);
-    assert.match(notifyHint({ job: 'other' }, repo, 60_000, undefined).fallback.when, /arrived 3 min after launch/);
-  } finally { (await import('node:fs')).rmSync(repo, { recursive: true, force: true }); }
-});
-
-test('spawn_job ack carries a notify hint', async () => {
-  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-notify-'));
-  const service = { repo, spawnJob: async () => ({ jobId: 'j9', timeoutMs: 1000 }) } as never;
-  const r = await callTool({ service, catalogs: async () => [cat('agy')] } as HandlerContext, 'spawn_job', { mode: 'implement', prompt: 'x', provider: 'agy' });
+test('spawn_job ack is slim: identity, budget, permissions and warnings only', async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-ack-'));
+  const full = { jobId: 'j9', name: 'Ada', workerId: 'j9', role: 'review', provider: 'codex', status: 'running', dir: `${repo}/.agent-smith/jobs/j9`, repo, timeoutMs: 1000,
+    unrestricted: false, note: 'queued', sandbox: 'codex -s read-only', sandboxFlags: ['-s', 'read-only'], readOnlyRequested: true, readOnlyEnforced: true,
+    modelRequested: null, modelResolved: 'gpt-x', modelSource: 'harness-config', preambleApplied: true };
+  const service = { repo, spawnJob: async () => full } as never;
+  const r = await callTool({ service, catalogs: async () => [cat('codex')] } as HandlerContext, 'spawn_job', { mode: 'review', prompt: 'x', provider: 'codex' });
   assert.equal(r.isError, undefined);
-  assert.equal(body(r).notify.mode, 'hook');
+  assert.deepEqual(body(r), { jobId: 'j9', name: 'Ada', provider: 'codex', model: 'gpt-x', status: 'running', timeoutMs: 1000, repo, unrestricted: false, readOnlyEnforced: true });
+  assert.ok(text(r).length < 250, text(r));
 });
 
 // ── concise responses, diff on demand, recoverable errors ────────────────────

@@ -76,13 +76,6 @@ const jobFields = {
   changedFilesUnknown: typed('boolean', 'Changed files could not be computed at finish; a missing changedFiles then means unknown, not none.'),
   cwdMissingAtFinish: typed('boolean', 'The working directory was gone when the job finished; nothing in it could be checked.'),
 };
-const TASK_SCHEMA = open({
-  taskId: typed('string', 'The job ID or pipeline run ID.'),
-  status: { type: 'string', enum: TASK_STATUSES, description: 'Always working on a launch ack.' },
-  pollIntervalMs: { type: 'integer', minimum: 1, description: "The server's own polling cadence; checking more often gains nothing." },
-}, ['taskId', 'status', 'pollIntervalMs']);
-const NOTIFY_SCHEMA = open({ mode: typed('string'), note: typed('string'),
-  fallback: open({ when: typed('string'), use: typed('string'), monitorCommand: typed('string'), monitorTimeoutMs: typed('integer') }, ['when', 'use']) }, ['mode']);
 const ACCEPTANCE_OUTPUT = open({
   state: { type: 'string', enum: ['accepted', 'rejected', 'unchecked'] },
   passed: strings('Check names that passed (concise).'), failed: strings('Check names that failed (concise).'),
@@ -119,13 +112,9 @@ const STATUS_OUTPUT = open({
 }, ['jobId', 'status', 'taskStatus']);
 const SPAWN_OUTPUT = open({
   ...(STATUS_OUTPUT.properties as Record<string, unknown>),
-  workerId: typed('string'),
-  taskHandle: { ...TASK_SCHEMA, description: 'MCP Tasks-shaped handle for this job.' },
-  timeoutMs: typed('integer'), unrestricted: typed('boolean', 'Whether worker approval prompts are bypassed.'),
-  sandbox: typed('string', "The provider's sandbox posture for this job."), sandboxFlags: strings(),
-  readOnlyRequested: typed('boolean'), readOnlyEnforced: typed('boolean'),
-  modelResolved: typed(['string', 'null']), modelSource: typed('string'),
-  notify: { ...NOTIFY_SCHEMA, description: 'How completion is announced, with a fallback if no notice arrives.' },
+  timeoutMs: typed('integer'), repo: typed('string', 'Repository whose .agent-smith/ holds the job.'),
+  unrestricted: typed('boolean', 'Whether worker approval prompts are bypassed.'),
+  readOnlyEnforced: typed('boolean', 'Present for read-only modes: whether the provider enforces it.'),
   checks: strings('Names of the acceptance checks attached to this job.'),
   envKeys: strings('Names of the environment variables passed to the worker; values are never echoed.'),
   aliasApplied: typed('string'), aliasSource: typed('string'),
@@ -170,8 +159,6 @@ const STEER_OUTPUT = open({
   dir: typed('string'),
   timeoutMs: typed('integer'),
   note: typed('string'),
-  taskHandle: { ...TASK_SCHEMA, description: 'MCP Tasks-shaped handle for this job.' },
-  notify: { ...NOTIFY_SCHEMA, description: 'How completion is announced, with a fallback if no notice arrives.' },
 }, ['jobId', 'name', 'delivery', 'status', 'pendingSteers', 'signalled', 'resumable']);
 /** One ack, or {jobs} for variants. */
 const SPAWN_JOB_OUTPUT = open({
