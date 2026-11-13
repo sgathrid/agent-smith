@@ -176,6 +176,22 @@ test('spawn_job ack is slim: identity, budget, permissions and warnings only', a
   assert.ok(text(r).length < 250, text(r));
 });
 
+test('an unrestricted review ack still says whether read-only is enforced', async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-ack-'));
+  const full = { jobId: 'j8', name: 'Bo', workerId: 'j8', role: 'review', provider: 'agy', status: 'running', repo, timeoutMs: 1000,
+    unrestricted: true, readOnlyRequested: false, readOnlyEnforced: false, modelResolved: null };
+  const service = { repo, spawnJob: async () => full } as never;
+  const r = await callTool({ service, catalogs: async () => [cat('agy')] } as HandlerContext, 'spawn_job', { mode: 'review', prompt: 'x', provider: 'agy' });
+  assert.equal(body(r).readOnlyEnforced, false);
+});
+
+test('cancel of a job it cannot read is not reported as settled', async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-cancel-'));
+  const service = { repo, cancel: (id: string) => ({ jobId: id, requested: true, signalled: false, note: 'x' }), detail: async () => { throw new Error('gone'); } } as never;
+  const r = await callTool({ service, cancelSettleMs: 0 } as HandlerContext, 'cancel', { jobId: 'j1' });
+  assert.deepEqual(body(r), { jobId: 'j1', status: 'unknown', settled: false });
+});
+
 // ── concise responses, diff on demand, recoverable errors ────────────────────
 const text = (r: { content: unknown }) => (r.content as { text: string }[])[0]!.text;
 const iso = (agoMs: number) => new Date(Date.now() - agoMs).toISOString();

@@ -55,7 +55,7 @@ function singleStageSpec(args: RunArgs, repo: string): PipelineSpec {
   }
   const stage: Record<string, unknown> = {
     name: args.target,
-    provider: args.provider ?? 'agy',
+    provider: args.provider,
     role: args.target,
     prompt: `${rolePrompt(args.target)}\n\n${args.prompt}`,
     title: taskTitle(args.prompt),
@@ -75,13 +75,20 @@ function singleStageSpec(args: RunArgs, repo: string): PipelineSpec {
   return { name: args.target, workDir: repo, stages: [stage as unknown as Stage] };
 }
 
+/** The only installed provider; with none or several, a usage error naming what is installed. */
+async function soleProvider(): Promise<string> {
+  const installed = (await detectAvailable()).filter((p) => p.available).map((p) => p.name);
+  if (installed.length === 1) return installed[0]!;
+  throw new UsageError(installed.length === 0 ? 'no coding agent installed' : `--provider is required: installed are ${installed.join(', ')}`);
+}
+
 async function resolveSpec(args: RunArgs, repo: string): Promise<PipelineSpec> {
   let spec: PipelineSpec;
   if (args.target.endsWith('.yaml') || args.target.endsWith('.yml')) {
     const loaded = loadSpec(path.resolve(args.target));
     spec = { ...loaded, workDir: loaded.workDir ?? repo };
   } else {
-    spec = singleStageSpec(args, repo);
+    spec = singleStageSpec({ ...args, provider: args.provider ?? await soleProvider() }, repo);
   }
   if (args.timeout !== undefined && (args.target.endsWith('.yaml') || args.target.endsWith('.yml'))) {
     const timeoutMs = parseCliDuration(args.timeout, '--timeout');
@@ -181,7 +188,7 @@ export async function cmdResume(identifier: string, args: RunArgs): Promise<numb
   const target = selected.mode ?? 'resume';
   const workerName = args.name ?? selected.name ?? selected.mode ?? identifier;
   const workerId = selected.workerId || selected.jobId;
-  return cmdRun({ ...args, target, repo, cwd: args.cwd ?? selected.cwd ?? repo, provider: selected.provider ?? 'agy', model, effort, name: workerName, workerId, conversation: selected.conversation, routingPinned: true, unrestricted: args.unrestricted === true || selected.unrestricted, prompt: args.prompt });
+  return cmdRun({ ...args, target, repo, cwd: args.cwd ?? selected.cwd ?? repo, provider: selected.provider ?? await soleProvider(), model, effort, name: workerName, workerId, conversation: selected.conversation, routingPinned: true, unrestricted: args.unrestricted === true || selected.unrestricted, prompt: args.prompt });
 }
 
 interface SupervisePayload {

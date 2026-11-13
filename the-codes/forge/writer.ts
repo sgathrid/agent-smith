@@ -276,7 +276,7 @@ export class JobWriter {
     try {
       if (this.baselinePending !== null) await this.baselinePending;
     } catch { /* best effort */ }
-    return this.manifest?.gitBaseline?.dirty ?? [];
+    return (this.manifest?.gitBaseline?.dirty ?? []).filter((p) => !isForgeStatePath(p));
   }
 
   /** Update `view.preamble` when the async brief enrichment lands before spawn. */

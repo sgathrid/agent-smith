@@ -858,7 +858,8 @@ export class ForgeService {
       live: nextLiveEntry,
       prompt: sentPrompt,
       conversation: conversation ?? undefined,
-      turn: { rawPrompt, prependBrief, resuming, context: latestContext },
+      // A continuation's baseline holds the worker's own earlier edits: no already-modified line.
+      turn: { rawPrompt, prependBrief: false, resuming, context: latestContext },
     };
   }
 

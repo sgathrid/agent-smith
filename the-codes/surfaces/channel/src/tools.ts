@@ -12,7 +12,7 @@ import { startPipeline, readPipeline, cancelPipeline } from '../../../forge/exec
 import { markAcceptancePending, markAcceptanceSuperseded, readAcceptance, settleAcceptance } from '../../../forge/checks.ts';
 import { validateSpec } from '../../../pipeline/pipeline.ts';
 import { EFFORTS, validateEnv, type StageCheck } from '../../../pipeline/types.ts';
-import { MODES, MODE_PRESETS } from '../../../forge/modes.ts';
+import { MODES, MODE_PRESETS, isMode as isModeName } from '../../../forge/modes.ts';
 import { getCatalogs, getInstalledProviders } from '../../../providers/catalog.ts';
 import { providerNames } from '../../../providers/registry.ts';
 import { loadModelConfig, resolveRequest, describeAliases } from '../../../providers/aliases.ts';
@@ -121,7 +121,7 @@ export function slimAck(ack: SpawnAck) {
   const out = {
     jobId: ack.jobId, name: ack.name, provider: ack.provider, model: ack.modelResolved ?? null, status: ack.status,
     timeoutMs: ack.timeoutMs, repo: ack.repo, unrestricted: ack.unrestricted,
-    ...(ack.readOnlyRequested ? { readOnlyEnforced: ack.readOnlyEnforced ?? false } : {}),
+    ...(ack.readOnlyRequested || (isModeName(ack.role) && MODE_PRESETS[ack.role].readOnly) ? { readOnlyEnforced: ack.readOnlyEnforced ?? false } : {}),
     ...(ack.envKeys?.length ? { envKeys: ack.envKeys } : {}),
     ...(ack.warnings?.length ? { warnings: ack.warnings } : {}),
   };
@@ -345,8 +345,9 @@ const cancelJob: Handler = async (ctx, args) => {
     let run = readPipeline(ctx.service.repo, id);
     while (run?.status === 'running' && Date.now() < settleBy) { await sleep(Math.min(step, Math.max(0, settleBy - Date.now()))); run = readPipeline(ctx.service.repo, id); }
     const status = run?.status ?? 'unknown';
-    if (status !== 'running') quietNotice(ctx.service.repo, 'run', id);
-    return json({ runId: id, status, settled: status !== 'running' });
+    const settled = status === 'passed' || status === 'partial' || status === 'failed';
+    if (settled) quietNotice(ctx.service.repo, 'run', id);
+    return json({ runId: id, status, settled });
   }
   const result = ctx.service.cancel(id);
   const resolved = result.resolvedFrom === undefined ? {} : { resolvedFrom: result.resolvedFrom };
@@ -359,8 +360,9 @@ const cancelJob: Handler = async (ctx, args) => {
     detail = await ctx.service.detail(resolveHead(ctx, result.jobId)).catch(() => detail);
   }
   const status = detail?.status ?? 'unknown';
-  const out: Record<string, unknown> = { jobId: detail?.jobId ?? result.jobId, ...resolved, status, settled: status !== 'running' };
-  if (status !== 'running') quietNotice(ctx.service.repo, 'job', String(out.jobId));
+  const settled = status === 'succeeded' || status === 'failed' || status === 'canceled';
+  const out: Record<string, unknown> = { jobId: detail?.jobId ?? result.jobId, ...resolved, status, settled };
+  if (settled) quietNotice(ctx.service.repo, 'job', String(out.jobId));
   if (checksCanceled) return json({ ...out, checksCanceled: true });
   const pending = readAcceptance(ctx.service.repo, result.jobId) as { pending?: boolean; running?: string };
   return json(pending.pending === true && pending.running !== undefined

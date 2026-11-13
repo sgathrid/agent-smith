@@ -7108,7 +7108,7 @@ class JobWriter {
                 await this.baselinePending;
         }
         catch { /* best effort */ }
-        return this.manifest?.gitBaseline?.dirty ?? [];
+        return (this.manifest?.gitBaseline?.dirty ?? []).filter((p) => !isForgeStatePath(p));
     }
     /** Update `view.preamble` when the async brief enrichment lands before spawn. */
     updatePreamble(preamble) {
@@ -9140,4 +9140,4 @@ function startPipeline(service, spec, options = {}) {
         throw error;
     }).finally(() => clearInterval(poll));
     return { runId, recordPath, done, cancel: () => { cancelPipeline(service.repo, runId); } };
-}export{toolLabel as $,AgentSmithReader as A,writeAtomic as B,summaryTail as C,DEFAULT_TIMEOUT_MS as D,failureFields as E,FILES as F,writeAcceptance as G,getProvider as H,nextActionFor as I,jobDir as J,fileSig as K,jobsDir as L,MODES as M,JobWriter as N,isMode as O,PROVIDERS as P,newJobId$1 as Q,REASONS as R,STAGE_PROMPTS as S,humanDuration as T,pipeEvents as U,pipelineRecordPath as V,computeStaleReads as W,SMITH_PAYLOAD as X,isForgeStatus as Y,readJsonSafe as Z,checksReason as _,MODE_PRESETS as a,readPipeline as b,cancelPipeline as c,readAcceptance as d,settleAcceptance as e,markAcceptanceSuperseded as f,isTerminalForgeStatus as g,readManifest as h,inheritContinuedProviders as i,jobFile as j,errMessage as k,findProvider as l,markAcceptancePending as m,normalize as n,SCHEMA_VERSION as o,providerNames as p,validOwnerPid as q,reasonFromText as r,startPipeline as s,ownerAlive as t,reportFor as u,validateSpec as v,writeJsonAtomic as w,cwdFacts as x,deriveOrphan as y,deriveStatus as z};
+}export{toolLabel as $,AgentSmithReader as A,deriveStatus as B,writeAtomic as C,DEFAULT_TIMEOUT_MS as D,summaryTail as E,FILES as F,failureFields as G,writeAcceptance as H,getProvider as I,nextActionFor as J,jobDir as K,fileSig as L,MODES as M,jobsDir as N,JobWriter as O,PROVIDERS as P,newJobId$1 as Q,REASONS as R,STAGE_PROMPTS as S,humanDuration as T,pipeEvents as U,pipelineRecordPath as V,computeStaleReads as W,SMITH_PAYLOAD as X,isForgeStatus as Y,readJsonSafe as Z,checksReason as _,MODE_PRESETS as a,readPipeline as b,cancelPipeline as c,readAcceptance as d,settleAcceptance as e,isMode as f,markAcceptanceSuperseded as g,isTerminalForgeStatus as h,inheritContinuedProviders as i,jobFile as j,readManifest as k,errMessage as l,markAcceptancePending as m,normalize as n,findProvider as o,providerNames as p,SCHEMA_VERSION as q,reasonFromText as r,startPipeline as s,validOwnerPid as t,ownerAlive as u,validateSpec as v,writeJsonAtomic as w,reportFor as x,cwdFacts as y,deriveOrphan as z};

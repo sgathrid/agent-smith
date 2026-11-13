@@ -1,4 +1,4 @@
-import {h as readManifest,b as readPipeline,c as cancelPipeline,A as AgentSmithReader,n as normalize,P as PROVIDERS,k as errMessage,l as findProvider,w as writeJsonAtomic,j as jobFile,F as FILES,o as SCHEMA_VERSION,q as validOwnerPid,t as ownerAlive,g as isTerminalForgeStatus,u as reportFor,x as cwdFacts,y as deriveOrphan,z as deriveStatus,B as writeAtomic,C as summaryTail,E as failureFields,R as REASONS,d as readAcceptance,G as writeAcceptance,p as providerNames,H as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,I as nextActionFor,J as jobDir,K as fileSig,L as jobsDir,N as JobWriter,O as isMode,Q as newJobId,T as humanDuration,U as pipeEvents,V as pipelineRecordPath,W as computeStaleReads,X as SMITH_PAYLOAD,Y as isForgeStatus}from'./chunk-execute.js';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import {readFileSync,existsSync,mkdirSync,appendFileSync,realpathSync,lstatSync,copyFileSync,statSync,readdirSync,unlinkSync}from'node:fs';import path from'node:path';/** Detached execution, with one preparation barrier before a worker may start. */
+import {k as readManifest,b as readPipeline,c as cancelPipeline,A as AgentSmithReader,n as normalize,P as PROVIDERS,l as errMessage,o as findProvider,w as writeJsonAtomic,j as jobFile,F as FILES,q as SCHEMA_VERSION,t as validOwnerPid,u as ownerAlive,h as isTerminalForgeStatus,x as reportFor,y as cwdFacts,z as deriveOrphan,B as deriveStatus,C as writeAtomic,E as summaryTail,G as failureFields,R as REASONS,d as readAcceptance,H as writeAcceptance,p as providerNames,I as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,J as nextActionFor,K as jobDir,L as fileSig,N as jobsDir,O as JobWriter,f as isMode,Q as newJobId,T as humanDuration,U as pipeEvents,V as pipelineRecordPath,W as computeStaleReads,X as SMITH_PAYLOAD,Y as isForgeStatus}from'./chunk-execute.js';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import {readFileSync,existsSync,mkdirSync,appendFileSync,realpathSync,lstatSync,copyFileSync,statSync,readdirSync,unlinkSync}from'node:fs';import path from'node:path';/** Detached execution, with one preparation barrier before a worker may start. */
 async function launch(url, payload, onPrepared) {
     const child = fork(fileURLToPath(url), [], {
         detached: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
@@ -1710,7 +1710,8 @@ class ForgeService {
             live: nextLiveEntry,
             prompt: sentPrompt,
             conversation: conversation ?? undefined,
-            turn: { rawPrompt, prependBrief, resuming, context: latestContext },
+            // A continuation's baseline holds the worker's own earlier edits: no already-modified line.
+            turn: { rawPrompt, prependBrief: false, resuming, context: latestContext },
         };
     }
     /**
