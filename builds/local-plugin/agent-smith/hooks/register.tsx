@@ -29,7 +29,7 @@ import {
   claudeText,
   displayNoticeText,
   due,
-  parseLaunch,
+  parseLaunches,
   parseSettledRead,
   runFileName,
   unclaim,
@@ -482,8 +482,9 @@ function registerBand(on: Parameters<Register>[0]): void {
   on('tool.call', { tool: LAUNCH_TOOL }, async ($, e, next) => {
     const r = await next(e) as { result?: unknown; text?: unknown; deny?: string; isError?: boolean } | undefined;
     if (r && r.deny === undefined && r.isError !== true) {
-      const launch = parseLaunch(e.tool, r.result) ?? parseLaunch(e.tool, r.text);
-      if (launch !== null) await takeLaunch($, launch, '').catch(() => {});
+      let launches = parseLaunches(e.tool, r.result);
+      if (launches.length === 0) launches = parseLaunches(e.tool, r.text);
+      for (const launch of launches) await takeLaunch($, launch, '').catch(() => {});
     }
     return r;
   });

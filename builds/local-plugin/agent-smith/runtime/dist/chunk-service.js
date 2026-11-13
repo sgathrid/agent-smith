@@ -1,4 +1,4 @@
-import {h as readManifest,c as readPipeline,d as cancelPipeline,A as AgentSmithReader,n as normalize,P as PROVIDERS,k as errMessage,l as findProvider,w as writeJsonAtomic,j as jobFile,F as FILES,o as SCHEMA_VERSION,q as validOwnerPid,t as ownerAlive,g as isTerminalForgeStatus,u as reportFor,x as cwdFacts,y as deriveOrphan,z as deriveStatus,B as writeAtomic,C as summaryTail,E as failureFields,R as REASONS,b as readAcceptance,G as writeAcceptance,p as providerNames,H as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,I as nextActionFor,J as jobDir,K as fileSig,L as jobsDir,N as JobWriter,O as isMode,Q as newJobId,T as humanDuration,U as pipeEvents,V as pipelineRecordPath,W as computeStaleReads,X as SMITH_PAYLOAD,Y as isForgeStatus}from'./chunk-execute.js';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import {readFileSync,existsSync,mkdirSync,appendFileSync,realpathSync,lstatSync,copyFileSync,statSync,readdirSync,unlinkSync}from'node:fs';import path from'node:path';/** Detached execution, with one preparation barrier before a worker may start. */
+import {h as readManifest,b as readPipeline,c as cancelPipeline,A as AgentSmithReader,n as normalize,P as PROVIDERS,k as errMessage,l as findProvider,w as writeJsonAtomic,j as jobFile,F as FILES,o as SCHEMA_VERSION,q as validOwnerPid,t as ownerAlive,g as isTerminalForgeStatus,u as reportFor,x as cwdFacts,y as deriveOrphan,z as deriveStatus,B as writeAtomic,C as summaryTail,E as failureFields,R as REASONS,d as readAcceptance,G as writeAcceptance,p as providerNames,H as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,I as nextActionFor,J as jobDir,K as fileSig,L as jobsDir,N as JobWriter,O as isMode,Q as newJobId,T as humanDuration,U as pipeEvents,V as pipelineRecordPath,W as computeStaleReads,X as SMITH_PAYLOAD,Y as isForgeStatus}from'./chunk-execute.js';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import {readFileSync,existsSync,mkdirSync,appendFileSync,realpathSync,lstatSync,copyFileSync,statSync,readdirSync,unlinkSync}from'node:fs';import path from'node:path';/** Detached execution, with one preparation barrier before a worker may start. */
 async function launch(url, payload, onPrepared) {
     const child = fork(fileURLToPath(url), [], {
         detached: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
@@ -289,20 +289,32 @@ async function getCatalogs(options = {}) {
     catch (e) {
         return [failed('*', errMessage(e))];
     }
-}function checkLine(check) {
+}const DIRTY_FILES_CAP = 20;
+function workspaceLine(mode, cwd) {
+    if (mode === 'review' || mode === 'moderate')
+        return `Workspace: ${cwd}.`;
+    return `Workspace: ${cwd}. Make changes only inside it; edits elsewhere go unreviewed.`;
+}
+function dirtyFilesLine(dirtyFiles) {
+    if (dirtyFiles === undefined || dirtyFiles.length === 0)
+        return null;
+    const shown = dirtyFiles.slice(0, DIRTY_FILES_CAP);
+    const rest = dirtyFiles.length - shown.length;
+    const list = rest > 0 ? `${shown.join(', ')}, and ${rest} more` : shown.join(', ');
+    return `Already modified before you started; not yours, leave them unless the task says otherwise: ${list}`;
+}
+function checkLine(check) {
     const command = check.command.includes('`') ? check.command : `\`${check.command}\``;
     return `- ${check.name}: ${command}${check.cwd === undefined ? '' : ` (in ${check.cwd})`}`;
 }
-function checkLines(checks) {
+function checkLines(checks, mode) {
     const gating = checks.filter((c) => c.blocking !== false);
     const advisory = checks.filter((c) => c.blocking === false);
+    const gatingHeader = mode === 'review' || mode === 'moderate' || mode === 'verify'
+        ? 'These run after you finish; report their result if you run them:'
+        : "You're done when these checks pass. They run after you finish, so run them yourself first if you can:";
     return [
-        ...(gating.length === 0
-            ? []
-            : [
-                "You're done when these checks pass. They run after you finish, so run them yourself first if you can:",
-                ...gating.map(checkLine),
-            ]),
+        ...(gating.length === 0 ? [] : [gatingHeader, ...gating.map(checkLine)]),
         ...(advisory.length === 0
             ? []
             : ['These also run afterwards, for information only:', ...advisory.map(checkLine)]),
@@ -312,22 +324,20 @@ function checkLines(checks) {
 function buildBrief(input) {
     const context = input.context?.trim();
     const contextLines = context ? [`Context: ${context}`] : [];
-    const checks = input.checks?.length ? checkLines(input.checks) : [];
+    const checks = input.checks?.length ? checkLines(input.checks, input.mode) : [];
     if (input.resuming === true)
         return [...contextLines, ...checks].join('\n');
+    const dirtyLine = input.pipelineStage === true ? null : dirtyFilesLine(input.dirtyFiles);
     return [
         "You're working for an orchestrating agent that will check your work and act on your report.",
-        ...(input.pipelineStage === true
-            ? []
-            : [
-                `Workspace: ${input.cwd}. Make your changes only inside it: that's where the orchestrator reviews them, ` +
-                    'and edits elsewhere would go unreviewed.',
-            ]),
+        ...(input.pipelineStage === true ? [] : [workspaceLine(input.mode, input.cwd)]),
+        ...(dirtyLine === null ? [] : [dirtyLine]),
         ...contextLines,
         ...checks,
         ...(input.preset === undefined ? [] : [input.preset.guidance]),
-        'In your report, only claim what you can point to: command output, file contents or a diff. ' +
-            "If you couldn't verify something, say so.",
+        'Start your report with `Status: DONE`, `Status: DONE_WITH_CONCERNS` or `Status: BLOCKED`. ' +
+            "Only claim what you can point to (command output, file contents, a diff); say what you couldn't verify. " +
+            'If the task conflicts with what you find, say so rather than guess.',
     ].join('\n');
 }/** Service-owned recovery of abandoned jobs. Readers never write job records. */
 /**
@@ -1228,7 +1238,7 @@ class ForgeService {
     async spawnTracked(request) {
         if (this.supervisorUrl)
             return launchJob(this, request);
-        const provider = this.providerSource(request.provider ?? 'agy');
+        const provider = this.providerSource(request.provider ?? (() => { throw new Error('provider is required.'); })());
         const rawMode = request.mode.trim();
         const resuming = request.conversation !== undefined && request.conversation !== null;
         // Closed set for fresh, non-pipeline spawns. Pipeline stages keep arbitrary
@@ -1291,6 +1301,7 @@ class ForgeService {
             warnings.push('agy cannot prompt for permission headless; commands will be denied and the job will return an empty result. Retry with unrestricted:true if this job needs shell access.');
         }
         const brief = buildBrief({
+            mode,
             preset,
             cwd,
             context: request.context,
@@ -1396,7 +1407,12 @@ class ForgeService {
             preambleApplied,
             ...(warnings.length === 0 ? {} : { warnings }),
         };
-        const done = this.pump(writer, provider, spec);
+        const done = this.pump(writer, provider, spec, {
+            rawPrompt: prompt,
+            prependBrief,
+            resuming,
+            context: request.context,
+        });
         return { ack, done };
     }
     /**
@@ -1408,16 +1424,41 @@ class ForgeService {
      * queued or interrupts the turn, this loop is the sole owner that opens the
      * child anchor and marks the parent superseded.
      */
-    async pump(initialWriter, provider, spec) {
+    async pump(initialWriter, provider, spec, initialTurn) {
         let currentWriter = initialWriter;
         let currentJobId = spec.jobId;
         let currentPrompt = spec.prompt;
         let currentConversation = spec.conversation;
+        let currentTurn = initialTurn;
         let liveEntry = newLiveJob(currentWriter, spec.timeoutMs);
         // Register synchronously before the first await so a steer or cancel arriving
         // right after spawn_job finds the live entry in this.live.
         this.live.set(currentJobId, liveEntry);
         while (true) {
+            if (currentTurn.prependBrief && !currentTurn.resuming && spec.pipeline === null && currentWriter.hasPendingBaseline()) {
+                const dirty = await currentWriter.awaitBaseline();
+                if (liveEntry.userCanceled || currentWriter.cancelled || existsSync(jobFile(this.repo, currentJobId, FILES.cancel))) {
+                    currentWriter.requestCancel();
+                    this.live.delete(currentJobId);
+                    return (currentWriter.abort('canceled', 'canceled by user') ??
+                        currentWriter.snapshot() ??
+                        { jobId: currentJobId });
+                }
+                if (dirty.length > 0) {
+                    const fullBrief = buildBrief({
+                        mode: spec.mode,
+                        preset: spec.preset,
+                        cwd: spec.cwd,
+                        context: currentTurn.context,
+                        checks: spec.checks,
+                        pipelineStage: false,
+                        resuming: false,
+                        dirtyFiles: dirty,
+                    });
+                    currentPrompt = `${fullBrief}\n\n${currentTurn.rawPrompt}`;
+                    currentWriter.updatePreamble(fullBrief);
+                }
+            }
             let handle;
             try {
                 handle = await provider.spawn({
@@ -1539,6 +1580,7 @@ class ForgeService {
                     currentJobId = next.jobId;
                     currentPrompt = next.prompt;
                     currentConversation = next.conversation;
+                    currentTurn = next.turn;
                     liveEntry = next.live;
                     continue;
                 }
@@ -1612,6 +1654,7 @@ class ForgeService {
             }
         }
         const nextBrief = buildBrief({
+            mode: spec.mode,
             preset: spec.preset,
             cwd: spec.cwd,
             context: latestContext,
@@ -1661,7 +1704,14 @@ class ForgeService {
         parent.writer.markSuperseded(nextJobId);
         parent.writer.finish(result, report === '' ? null : report);
         this.live.delete(parent.jobId);
-        return { writer: nextWriter, jobId: nextJobId, live: nextLiveEntry, prompt: sentPrompt, conversation: conversation ?? undefined };
+        return {
+            writer: nextWriter,
+            jobId: nextJobId,
+            live: nextLiveEntry,
+            prompt: sentPrompt,
+            conversation: conversation ?? undefined,
+            turn: { rawPrompt, prependBrief, resuming, context: latestContext },
+        };
     }
     /**
      * Cancel a job.
