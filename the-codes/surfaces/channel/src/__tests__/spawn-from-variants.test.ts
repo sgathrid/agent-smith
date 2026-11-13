@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { AjvJsonSchemaValidator } from '@modelcontextprotocol/sdk/validation/ajv';
+import { ACCEPTANCE_FILE } from '../../../../forge/checks.ts';
 import { FILES, jobDir, jobFile } from '../../../../forge/format.ts';
 import { claimMarkerPath } from '../../../mod/hooks/notice.ts';
 import type { ModelCatalog } from '../../../../providers/types.ts';
@@ -175,4 +176,73 @@ test('cancel gives up after the window with settled:false and no claim marker', 
   assert.equal(c.status, 'running'); assert.equal(c.settled, false);
   assert.ok(Date.now() - t0 < 2_000, 'waits only the window');
   assert.equal(existsSync(claimMarkerPath(f.repo, 'job', 'job-1')), false);
+});
+
+test('variants reject invalid shared args and invalid variant provider/model/effort as isError with nothing started', async () => {
+  const f = fixture();
+  for (const args of [
+    { prompt: 'x', variants: [{ name: 'a' }] },
+    { mode: 'review', variants: [{ name: 'a' }] },
+    { mode: 'review', prompt: 'x', cwd: 'relative', variants: [{ name: 'a' }] },
+    { mode: 'review', prompt: 'x', checks: 'bad', variants: [{ name: 'a' }] },
+    { mode: 'review', prompt: 'x', env: { BAD: 123 }, variants: [{ name: 'a' }] },
+    { mode: 'review', prompt: 'x', variants: [{ name: 'a', provider: 'bogus' }] },
+    { mode: 'review', prompt: 'x', variants: [{ name: 'a', effort: 'bogus' }] },
+    { mode: 'review', prompt: 'x', variants: [{ name: 'a', model: '' }] },
+  ]) {
+    const r = await callTool(f.ctx, 'spawn_job', args);
+    assert.equal(r.isError, true, JSON.stringify(args));
+  }
+  assert.equal(f.seen.length, 0);
+});
+
+test('cancel writes the claim marker before signalling, removes it if unsettled, and keeps pre-existing markers', async () => {
+  const f = fixture({ status: () => 'running', cancelSettleMs: 30 });
+  await callTool(f.ctx, 'spawn_job', { mode: 'review', prompt: 'x', provider: 'codex' });
+  let sawMarkerDuringCancel = false;
+  const origCancel = f.ctx.service.cancel;
+  (f.ctx.service as unknown as { cancel: (id: string) => unknown }).cancel = (id: string) => {
+    sawMarkerDuringCancel = existsSync(claimMarkerPath(f.repo, 'job', id));
+    return origCancel(id);
+  };
+  const unsettled = body(await callTool(f.ctx, 'cancel', { jobId: 'job-1' }));
+  assert.equal(sawMarkerDuringCancel, true);
+  assert.equal(unsettled.settled, false);
+  assert.equal(existsSync(claimMarkerPath(f.repo, 'job', 'job-1')), false);
+
+  // A pre-existing marker (e.g. claimed by the mod) is not removed when cancel times out.
+  const preExisting = claimMarkerPath(f.repo, 'job', 'job-1');
+  mkdirSync(path.dirname(preExisting), { recursive: true });
+  writeFileSync(preExisting, 'mod\n');
+  const stillRunning = body(await callTool(f.ctx, 'cancel', { jobId: 'job-1' }));
+  assert.equal(stillRunning.settled, false);
+  assert.equal(existsSync(preExisting), true);
+});
+
+test('cancel by an earlier turn marks both IDs and reads acceptance on the final jobId', async () => {
+  const f = fixture({ cancelSettleMs: 200 });
+  mkdirSync(jobDir(f.repo, 'turn-1'), { recursive: true });
+  mkdirSync(jobDir(f.repo, 'turn-2'), { recursive: true });
+  mkdirSync(jobDir(f.repo, 'turn-3'), { recursive: true });
+  writeFileSync(path.join(jobDir(f.repo, 'turn-3'), ACCEPTANCE_FILE), JSON.stringify({ state: 'unchecked', pending: true, running: 'check-3' }));
+  let reads = 0;
+  const svc = f.ctx.service as unknown as {
+    cancel: (id: string) => unknown;
+    resolveHead: (id: string) => string;
+    detail: (id: string) => Promise<unknown>;
+  };
+  svc.cancel = (id: string) => ({ jobId: 'turn-2', resolvedFrom: id, requested: true, signalled: true, note: 'x' });
+  svc.resolveHead = () => (reads === 0 ? 'turn-2' : 'turn-3');
+  svc.detail = async (id: string) => {
+    reads++;
+    return { jobId: id, name: 'w', workerId: 'turn-1', status: id === 'turn-3' ? 'canceled' : 'running', report: null, warnings: [] };
+  };
+  const c = body(await callTool(f.ctx, 'cancel', { jobId: 'turn-1' }));
+  assert.equal(c.jobId, 'turn-3');
+  assert.equal(c.resolvedFrom, 'turn-1');
+  assert.equal(c.settled, true);
+  assert.equal(c.checksCanceled, false);
+  assert.ok(existsSync(claimMarkerPath(f.repo, 'job', 'turn-1')));
+  assert.ok(existsSync(claimMarkerPath(f.repo, 'job', 'turn-2')));
+  assert.ok(existsSync(claimMarkerPath(f.repo, 'job', 'turn-3')));
 });

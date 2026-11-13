@@ -295,7 +295,10 @@ export const STATUS_TOOL = /^mcp__(?:plugin_agent-smith_)?agent-smith__(?:status
  * acceptance checks), or cancels one and the answer says it stopped, return its { kind, id } so the session can retire its
  * pending completion notice instead of waking Claude a second time.
  */
-export function parseSettledRead(toolName: unknown, response: unknown): { readonly kind: 'job' | 'run'; readonly id: string } | null {
+export function parseSettledRead(
+  toolName: unknown,
+  response: unknown,
+): { readonly kind: 'job' | 'run'; readonly id: string; readonly resolvedFrom?: string } | null {
   if (typeof toolName !== 'string' || !STATUS_TOOL.test(toolName)) return null;
   const payload = unwrapResponse(response);
   if (payload === null || typeof payload['error'] === 'string') return null;
@@ -306,7 +309,11 @@ export function parseSettledRead(toolName: unknown, response: unknown): { readon
     const runId = payload['runId'];
     if (typeof runId === 'string' && runId.length > 0) return { kind: 'run', id: runId };
     const jobId = payload['jobId'];
-    return typeof jobId === 'string' && jobId.length > 0 ? { kind: 'job', id: jobId } : null;
+    if (typeof jobId !== 'string' || jobId.length === 0) return null;
+    const resolvedFrom = payload['resolvedFrom'];
+    return typeof resolvedFrom === 'string' && resolvedFrom.length > 0 && resolvedFrom !== jobId
+      ? { kind: 'job', id: jobId, resolvedFrom }
+      : { kind: 'job', id: jobId };
   }
   if (bare === 'pipeline_status') {
     const runId = payload['runId'];
@@ -326,8 +333,13 @@ export function parseSettledRead(toolName: unknown, response: unknown): { readon
   return { kind: 'job', id: jobId };
 }
 
-export function unclaim(owned: readonly Owned[], settled: { readonly kind: 'job' | 'run'; readonly id: string }): Owned[] {
-  return owned.filter((o) => !(o.kind === settled.kind && o.id === settled.id));
+export function unclaim(
+  owned: readonly Owned[],
+  settled: { readonly kind: 'job' | 'run'; readonly id: string; readonly resolvedFrom?: string },
+): Owned[] {
+  return owned.filter(
+    (o) => !(o.kind === settled.kind && (o.id === settled.id || (settled.resolvedFrom !== undefined && o.id === settled.resolvedFrom))),
+  );
 }
 
 function launchKind(toolName: unknown): 'job' | 'run' | null {

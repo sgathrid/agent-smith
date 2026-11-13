@@ -1,5 +1,5 @@
 /** MCP control surface over the canonical forge runtime. */
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { claimMarkerPath } from '../../mod/hooks/notice.ts';
 import type { CallToolResult } from '@modelcontextprotocol/server';
@@ -217,17 +217,52 @@ const spawnJob: Handler = async (ctx, args) => {
   if (ctx.onJobPrepared) throw new Error('variants start several jobs, and a task-augmented call tracks one; call spawn_job once per variant.');
   if (!Array.isArray(args.variants) || args.variants.length === 0 || args.variants.length > MAX_VARIANTS) throw new Error(`variants must be an array of 1 to ${MAX_VARIANTS} entries.`);
   const { variants: _v, ...shared } = base;
-  const stem = text(shared, 'name') ?? text(shared, 'mode') ?? 'job';
-  const variants = args.variants.map((raw, i) => { const v = record(raw, `variants[${i}]`); keys(v, [...VARIANT_KEYS]); return v; });
+  // Validate shared arguments and each variant's overrides before asking any confirmation.
+  const mode = allowed(shared, 'mode', MODES); if (mode === undefined) throw new Error(`mode is required; one of ${MODES.join(', ')}.`);
+  text(shared, 'prompt', true);
+  contextText(shared);
+  filesList(shared);
+  parseChecks(shared.checks);
+  const cwd = workingDirectory(shared);
+  text(shared, 'name');
+  text(shared, 'task');
+  allowed(shared, 'provider', PROVIDERS);
+  text(shared, 'model');
+  allowed(shared, 'effort', EFFORTS);
+  number(shared, 'timeoutMs');
+  text(shared, 'conversation');
+  boolean(shared, 'unrestricted');
+  validateEnv(shared.env);
+  const stem = text(shared, 'name') ?? mode;
+  const variants = args.variants.map((raw, i) => {
+    const v = record(raw, `variants[${i}]`);
+    keys(v, [...VARIANT_KEYS]);
+    allowed(v, 'provider', PROVIDERS);
+    text(v, 'model');
+    allowed(v, 'effort', EFFORTS);
+    return v;
+  });
   const names = variants.map(v => text(v, 'name') ?? [stem, text(v, 'provider') ?? text(shared, 'provider'), text(v, 'model')].filter(Boolean).join('-').slice(0, 80));
   if (new Set(names).size !== names.length) throw new Error('variants need distinct names; pass name on each variant.');
   const requests = variants.map((v, i) => overlay(shared, { ...v, name: names[i] }));
+  const cfg = loadModelConfig({ repo: ctx.service.repo });
+  let fallbackProvider: string | undefined;
+  const getFallbackProvider = async () => fallbackProvider ??= defaultProvider(ctx.catalogs ? (await installedCatalogs(ctx)).map(c => c.provider) : await getInstalledProviders());
+  const resolvedProviders: string[] = [];
+  for (const r of requests) {
+    const resolved = resolveRequest({ provider: allowed(r, 'provider', PROVIDERS), model: text(r, 'model'), effort: allowed(r, 'effort', EFFORTS), mode }, cfg);
+    resolvedProviders.push(resolved.provider ?? await getFallbackProvider());
+  }
   // One confirmation for the batch, naming every variant that escalates, instead of one prompt per variant.
-  const escalating = requests.filter(r => r.unrestricted === true && RESTRICTED_BY_DEFAULT.has(String(r.provider)));
+  const escalating = requests
+    .map((r, i) => ({ r, provider: resolvedProviders[i]! }))
+    .filter(({ r, provider }) => r.unrestricted === true && RESTRICTED_BY_DEFAULT.has(provider));
   let batchCtx = ctx;
   if (escalating.length > 0) {
-    const who = escalating.length === 1 ? `${String(escalating[0]!.provider)} worker "${String(escalating[0]!.name)}"` : `${escalating.length} workers (${escalating.map(r => `${String(r.name)}: ${String(r.provider)}`).join(', ')})`;
-    const gate = await confirmUnrestricted(ctx, { unrestricted: true, provider: String(escalating[0]!.provider), cwd: text(shared, 'cwd') ?? ctx.service.repo, who });
+    const who = escalating.length === 1
+      ? `${escalating[0]!.provider} worker "${String(escalating[0]!.r.name)}"`
+      : `${escalating.length} workers (${escalating.map(e => `${String(e.r.name)}: ${e.provider}`).join(', ')})`;
+    const gate = await confirmUnrestricted(ctx, { unrestricted: true, provider: escalating[0]!.provider, cwd: cwd ?? ctx.service.repo, who });
     if (gate.refused) return gate.refused;
     batchCtx = { ...ctx, unrestrictedGate: gate.warning ? { warning: gate.warning } : {} };
   }
@@ -335,10 +370,14 @@ const pipelineStatus: Handler = async (ctx, args) => {
   return json(format(args) === 'concise' ? concisePipeline(r) : r);
 };
 
-/** The caller asked for this cancel and its answer says the job stopped: mark it claimed so the command hook stays silent. */
-function quietNotice(repo: string, kind: 'job' | 'run', id: string): void {
+/** Mark a job or run claimed so the command hook stays silent. Returns true when this call created the marker. */
+function quietNotice(repo: string, kind: 'job' | 'run', id: string): boolean {
   const marker = claimMarkerPath(repo, kind, id);
-  try { mkdirSync(path.dirname(marker), { recursive: true }); writeFileSync(marker, `${new Date().toISOString()}\n`, { flag: 'wx' }); } catch { /* already claimed, or best effort */ }
+  try { mkdirSync(path.dirname(marker), { recursive: true }); writeFileSync(marker, `${new Date().toISOString()}\n`, { flag: 'wx' }); return true; } catch { return false; }
+}
+
+function unquietNotice(repo: string, kind: 'job' | 'run', id: string): void {
+  try { rmSync(claimMarkerPath(repo, kind, id), { force: true }); } catch { /* best effort */ }
 }
 
 /** How long cancel waits for a job or run to settle before answering. */
@@ -354,33 +393,54 @@ const cancelJob: Handler = async (ctx, args) => {
   const step = ctx.pollMs ?? WAIT_POLL_MS;
   const settleBy = Date.now() + (ctx.cancelSettleMs ?? CANCEL_SETTLE_MS);
   if (readPipeline(ctx.service.repo, id)) {
-    cancelPipeline(ctx.service.repo, id);
-    let run = readPipeline(ctx.service.repo, id);
-    while (run?.status === 'running' && Date.now() < settleBy) { await sleep(Math.min(step, Math.max(0, settleBy - Date.now()))); run = readPipeline(ctx.service.repo, id); }
-    const status = run?.status ?? 'unknown';
-    const settled = status === 'passed' || status === 'partial' || status === 'failed';
-    if (settled) quietNotice(ctx.service.repo, 'run', id);
-    return json({ runId: id, status, settled });
+    const marked = quietNotice(ctx.service.repo, 'run', id);
+    let settled = false;
+    try {
+      cancelPipeline(ctx.service.repo, id);
+      let run = readPipeline(ctx.service.repo, id);
+      while (run?.status === 'running' && Date.now() < settleBy) { await sleep(Math.min(step, Math.max(0, settleBy - Date.now()))); run = readPipeline(ctx.service.repo, id); }
+      const status = run?.status ?? 'unknown';
+      settled = status === 'passed' || status === 'partial' || status === 'failed';
+      return json({ runId: id, status, settled });
+    } finally {
+      if (!settled && marked) unquietNotice(ctx.service.repo, 'run', id);
+    }
   }
-  const result = ctx.service.cancel(id);
-  const resolved = result.resolvedFrom === undefined ? {} : { resolvedFrom: result.resolvedFrom };
-  // A worker that already exited can still have checks running; stop those too.
-  // With a detached supervisor the cancel marker is the request; the supervisor stops the checks within ~200 ms.
-  const checksCanceled = abortChecks(id, result.jobId);
-  let detail = await ctx.service.detail(result.jobId).catch(() => null);
-  while (detail?.status === 'running' && Date.now() < settleBy) {
-    await sleep(Math.min(step, Math.max(0, settleBy - Date.now())));
-    detail = await ctx.service.detail(resolveHead(ctx, result.jobId)).catch(() => detail);
+  const created = new Set<string>();
+  const mark = (jobId: string) => { if (quietNotice(ctx.service.repo, 'job', jobId)) created.add(jobId); };
+  let settled = false;
+  try {
+    // Write the marker before signalling so a concurrent watch-hook poll cannot wake Claude first.
+    mark(id);
+    const headBefore = resolveHead(ctx, id);
+    if (headBefore !== id) mark(headBefore);
+    const result = ctx.service.cancel(id);
+    mark(result.jobId);
+    if (result.resolvedFrom !== undefined) mark(result.resolvedFrom);
+    const resolved = result.resolvedFrom === undefined ? {} : { resolvedFrom: result.resolvedFrom };
+    // A worker that already exited can still have checks running; stop those too.
+    // With a detached supervisor the cancel marker is the request; the supervisor stops the checks within ~200 ms.
+    let checksCanceled = abortChecks(id, result.jobId);
+    let detail = await ctx.service.detail(result.jobId).catch(() => null);
+    if (detail?.jobId) mark(detail.jobId);
+    while (detail?.status === 'running' && Date.now() < settleBy) {
+      await sleep(Math.min(step, Math.max(0, settleBy - Date.now())));
+      detail = await ctx.service.detail(resolveHead(ctx, result.jobId)).catch(() => detail);
+      if (detail?.jobId) mark(detail.jobId);
+    }
+    const status = detail?.status ?? 'unknown';
+    settled = status === 'succeeded' || status === 'failed' || status === 'canceled';
+    const finalJobId = detail?.jobId ?? result.jobId;
+    if (finalJobId !== id && finalJobId !== result.jobId && abortChecks(finalJobId)) checksCanceled = true;
+    const out: Record<string, unknown> = { jobId: finalJobId, ...resolved, status, settled };
+    if (checksCanceled) return json({ ...out, checksCanceled: true });
+    const pending = readAcceptance(ctx.service.repo, finalJobId) as { pending?: boolean; running?: string };
+    return json(pending.pending === true && pending.running !== undefined
+      ? { ...out, checksCanceled: false, checksNote: 'The supervisor running the acceptance checks will stop them; status shows acceptance.' }
+      : out);
+  } finally {
+    if (!settled) for (const jobId of created) unquietNotice(ctx.service.repo, 'job', jobId);
   }
-  const status = detail?.status ?? 'unknown';
-  const settled = status === 'succeeded' || status === 'failed' || status === 'canceled';
-  const out: Record<string, unknown> = { jobId: detail?.jobId ?? result.jobId, ...resolved, status, settled };
-  if (settled) quietNotice(ctx.service.repo, 'job', String(out.jobId));
-  if (checksCanceled) return json({ ...out, checksCanceled: true });
-  const pending = readAcceptance(ctx.service.repo, result.jobId) as { pending?: boolean; running?: string };
-  return json(pending.pending === true && pending.running !== undefined
-    ? { ...out, checksCanceled: false, checksNote: 'The supervisor running the acceptance checks will stop them; status shows acceptance.' }
-    : out);
 };
 
 const runPipeline: Handler = async (ctx, args) => {

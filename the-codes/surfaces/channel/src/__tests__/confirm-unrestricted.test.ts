@@ -1,4 +1,4 @@
-import { mkdtempSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
@@ -119,4 +119,31 @@ test('variants: one confirmation for the batch; a decline starts none', async ()
   const declined = harness({ caps: FORM, action: 'decline' });
   const d = await callTool(declined.ctx, 'spawn_job', { mode: 'review', prompt: 'x', unrestricted: true, variants });
   assert.equal(d.isError, true); assert.equal(declined.asked.length, 1); assert.equal(declined.spawned.length, 0);
+});
+
+test('variants: resolves providers from models.json aliases and defaultProvider before batch confirmation, and validates before asking', async () => {
+  const h = harness({ caps: FORM, action: 'accept' });
+  mkdirSync(path.join(h.repo, '.agent-smith'), { recursive: true });
+  writeFileSync(path.join(h.repo, '.agent-smith', 'models.json'), JSON.stringify({
+    aliases: { 'codex-alias': { provider: 'codex', model: 'gpt-5' } },
+  }));
+  const ctx: HandlerContext = {
+    ...h.ctx,
+    catalogs: async () => [{ provider: 'claude', models: [], defaultModel: 'm', defaultEffort: 'low', defaultSource: 'harness-config', source: 'static', stale: false, verified: true }],
+  };
+  const r = await callTool(ctx, 'spawn_job', {
+    mode: 'review', prompt: 'x', unrestricted: true,
+    variants: [{ name: 'A', model: 'codex-alias' }, { name: 'B' }],
+  });
+  assert.equal(r.isError, undefined, text(r));
+  assert.deepEqual(h.asked, [`Allow 2 workers (A: codex, B: claude) to run without approval prompts in ${h.repo}? It will be able to run any command.`]);
+  assert.deepEqual(h.spawned.map(s => s.unrestricted), [true, true]);
+
+  const bad = await callTool(ctx, 'spawn_job', {
+    mode: 'review', prompt: 'x', cwd: 'relative', unrestricted: true,
+    variants: [{ name: 'A', model: 'codex-alias' }],
+  });
+  assert.equal(bad.isError, true);
+  assert.equal(h.asked.length, 1, 'invalid shared arg must not prompt');
+  assert.equal(h.spawned.length, 2);
 });
