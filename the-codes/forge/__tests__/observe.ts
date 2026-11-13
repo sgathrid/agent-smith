@@ -8,7 +8,7 @@ import type { ObservedJob } from '../../harness/types.ts';
 export async function readAllObservedJobs(cwd: string): Promise<ObservedJob[]> {
   const out: ObservedJob[] = [];
   for (const id of await new AgentSmithReader().discover(cwd)) {
-    const job = await readObservedJob('agent-smith', cwd, id);
+    const job = await readObservedJob(cwd, id);
     if (job !== null) out.push(job);
   }
   return out;

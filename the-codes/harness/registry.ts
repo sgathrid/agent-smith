@@ -1,8 +1,5 @@
 /**
- * registry.ts — provider name → reader, and `readObservedJob()`.
- *
- * Production reads one job at a time (forge/service.ts), so this stays tiny:
- * one reader, "agent-smith", and one fault-isolating read.
+ * registry.ts — `readObservedJob()`, one fault-isolating read of one job.
  *
  * WHY FAULT ISOLATION MATTERS: readers read state a live worker is rewriting. A
  * reader that throws (bad symlink, exotic errno) must degrade to an `unknown`
@@ -13,28 +10,24 @@ import { AgentSmithReader } from "./agent-smith.ts";
 import { normalize } from "./normalize.ts";
 import type { JobStateReader, ObservedJob } from "./types.ts";
 
-const READERS: ReadonlyMap<string, JobStateReader> = new Map<string, JobStateReader>([
-  ["agent-smith", new AgentSmithReader()],
-]);
+const READER: JobStateReader = new AgentSmithReader();
 
 /**
- * Read + normalize one job from one provider, isolating failures.
+ * Read + normalize one job, isolating failures.
  *
- * Returns `null` if the provider is unknown, if the reader returns null (job
- * not known to it), or if either the read or the normalize threw. A throw here
+ * Returns `null` if the reader returns null (job not known to it), and an
+ * `unknown` job if either the read or the normalize threw. A throw here
  * is a bug we want visible in tests, but it must not take down a caller that
  * is polling every 100ms.
  */
 export async function readObservedJob(
-  provider: string,
   cwd: string,
   jobId: string,
 ): Promise<ObservedJob | null> {
-  const reader = READERS.get(provider);
-  if (reader === undefined) return null;
+  const provider = READER.provider;
   let raw;
   try {
-    raw = await reader.read(cwd, jobId);
+    raw = await READER.read(cwd, jobId);
   } catch (err) {
     // Surface as unknown rather than propagating.
     return unknownJob(provider, jobId, errText(err));

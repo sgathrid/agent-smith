@@ -1,4 +1,4 @@
-import {h as readManifest,c as readPipeline,d as cancelPipeline,n as normalize,A as AgentSmithReader,P as PROVIDERS,k as errMessage,l as findProvider,w as writeJsonAtomic,j as jobFile,F as FILES,o as SCHEMA_VERSION,q as validOwnerPid,t as ownerAlive,g as isTerminalForgeStatus,u as reportFor,x as cwdFacts,y as deriveOrphan,z as deriveStatus,B as writeAtomic,C as summaryTail,E as failureFields,R as REASONS,b as readAcceptance,G as writeAcceptance,p as providerNames,H as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,I as nextActionFor,J as jobDir,K as fileSig,L as jobsDir,N as JobWriter,O as isMode,Q as newJobId,T as humanDuration,U as pipeEvents,V as pipelineRecordPath,W as computeStaleReads,X as SMITH_PAYLOAD,Y as isForgeStatus}from'./chunk-execute.js';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import {readFileSync,existsSync,mkdirSync,appendFileSync,realpathSync,lstatSync,copyFileSync,statSync,readdirSync,unlinkSync}from'node:fs';import path from'node:path';/** Detached execution, with one preparation barrier before a worker may start. */
+import {h as readManifest,c as readPipeline,d as cancelPipeline,A as AgentSmithReader,n as normalize,P as PROVIDERS,k as errMessage,l as findProvider,w as writeJsonAtomic,j as jobFile,F as FILES,o as SCHEMA_VERSION,q as validOwnerPid,t as ownerAlive,g as isTerminalForgeStatus,u as reportFor,x as cwdFacts,y as deriveOrphan,z as deriveStatus,B as writeAtomic,C as summaryTail,E as failureFields,R as REASONS,b as readAcceptance,G as writeAcceptance,p as providerNames,H as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,I as nextActionFor,J as jobDir,K as fileSig,L as jobsDir,N as JobWriter,O as isMode,Q as newJobId,T as humanDuration,U as pipeEvents,V as pipelineRecordPath,W as computeStaleReads,X as SMITH_PAYLOAD,Y as isForgeStatus}from'./chunk-execute.js';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import {readFileSync,existsSync,mkdirSync,appendFileSync,realpathSync,lstatSync,copyFileSync,statSync,readdirSync,unlinkSync}from'node:fs';import path from'node:path';/** Detached execution, with one preparation barrier before a worker may start. */
 async function launch(url, payload, onPrepared) {
     const child = fork(fileURLToPath(url), [], {
         detached: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
@@ -76,33 +76,26 @@ async function launchPipeline(service, spec, options) {
     })();
     return { ...ack, done, cancel: () => { cancelPipeline(service.repo, ack.runId); } };
 }/**
- * registry.ts — provider name → reader, and `readObservedJob()`.
- *
- * Production reads one job at a time (forge/service.ts), so this stays tiny:
- * one reader, "agent-smith", and one fault-isolating read.
+ * registry.ts — `readObservedJob()`, one fault-isolating read of one job.
  *
  * WHY FAULT ISOLATION MATTERS: readers read state a live worker is rewriting. A
  * reader that throws (bad symlink, exotic errno) must degrade to an `unknown`
  * job, never to a crashed band. Every call here is wrapped.
  */
-const READERS = new Map([
-    ["agent-smith", new AgentSmithReader()],
-]);
+const READER = new AgentSmithReader();
 /**
- * Read + normalize one job from one provider, isolating failures.
+ * Read + normalize one job, isolating failures.
  *
- * Returns `null` if the provider is unknown, if the reader returns null (job
- * not known to it), or if either the read or the normalize threw. A throw here
+ * Returns `null` if the reader returns null (job not known to it), and an
+ * `unknown` job if either the read or the normalize threw. A throw here
  * is a bug we want visible in tests, but it must not take down a caller that
  * is polling every 100ms.
  */
-async function readObservedJob(provider, cwd, jobId) {
-    const reader = READERS.get(provider);
-    if (reader === undefined)
-        return null;
+async function readObservedJob(cwd, jobId) {
+    const provider = READER.provider;
     let raw;
     try {
-        raw = await reader.read(cwd, jobId);
+        raw = await READER.read(cwd, jobId);
     }
     catch (err) {
         // Surface as unknown rather than propagating.
@@ -1953,7 +1946,7 @@ class ForgeService {
      */
     async detail(jobId) {
         reconcileOrphan(this.repo, jobId);
-        const observed = await readObservedJob('agent-smith', this.repo, jobId);
+        const observed = await readObservedJob(this.repo, jobId);
         if (observed === null) {
             throw new Error(`no job "${jobId}" in ${jobsDir(this.repo)}; call list_jobs for valid job IDs.`);
         }
@@ -2058,7 +2051,7 @@ class ForgeService {
         const out = [];
         for (const id of ids) {
             reconcileOrphan(this.repo, id);
-            const observed = await readObservedJob('agent-smith', this.repo, id);
+            const observed = await readObservedJob(this.repo, id);
             if (observed === null)
                 continue;
             const summary = toSummary(observed);

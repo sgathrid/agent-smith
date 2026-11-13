@@ -1112,7 +1112,7 @@ export class ForgeService {
    */
   async detail(jobId: string): Promise<JobDetail> {
     reconcileOrphan(this.repo, jobId);
-    const observed = await readObservedJob('agent-smith', this.repo, jobId);
+    const observed = await readObservedJob(this.repo, jobId);
     if (observed === null) {
       throw new Error(`no job "${jobId}" in ${jobsDir(this.repo)}; call list_jobs for valid job IDs.`);
     }
@@ -1220,7 +1220,7 @@ export class ForgeService {
     const out: JobSummary[] = [];
     for (const id of ids) {
       reconcileOrphan(this.repo, id);
-      const observed = await readObservedJob('agent-smith', this.repo, id);
+      const observed = await readObservedJob(this.repo, id);
       if (observed === null) continue;
       const summary = toSummary(observed);
       // Attach acceptance from the sidecar so a list row carries the verdict the

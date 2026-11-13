@@ -204,7 +204,7 @@ const text = (r: { content: unknown }) => (r.content as { text: string }[])[0]!.
 const iso = (agoMs: number) => new Date(Date.now() - agoMs).toISOString();
 const LONG = 'The worker refactored the parser and then ran the full suite twice. '.repeat(20);
 const summary = (i: number, extra: Record<string, unknown> = {}) => ({
-  jobId: `implement-smith-${i}`, name: `w${i}`, workerId: `w${i}`, role: 'implement', latestSummary: LONG, summarySource: 'worker', source: 'agent-smith',
+  jobId: `implement-smith-${i}`, name: `w${i}`, workerId: `w${i}`, role: 'implement', latestSummary: LONG, summarySource: 'worker',
   status: 'succeeded', provider: 'agy', mode: 'implement', model: 'm', task: 't', toolCalls: 7, currentActivity: null,
   lastActivity: { stepIndex: 12, tool: 'Bash', input: 'npm test '.repeat(100), status: 'done' },
   startedAt: iso(60_000), updatedAt: iso(30_000), finishedAt: iso(30_000), warnings: [], nextAction: null, ...extra,

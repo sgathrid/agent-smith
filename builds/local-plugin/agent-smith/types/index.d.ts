@@ -239,12 +239,11 @@ declare module 'claude-code' {
        * folded in here; the pane reading the result means the band and the pane
        * cannot end up pointed at different repos.
        *
-       * `source` says where `repo` came from. `env` (AGY_RADAR_REPO) is a pin
-       * and never moves. `launch` is the MCP server's own repo, read from a
+       * `source` says where `repo` came from. `launch` is the MCP server's own repo, read from a
        * launch ack: authoritative, so a later session.start does not replace it
        * with a cwd that has drifted. `cwd` is the first guess until then.
        */
-      bandConfig: { repo: string; colour: boolean; source: 'env' | 'cwd' | 'launch' };
+      bandConfig: { repo: string; colour: boolean; source: 'cwd' | 'launch' };
       /**
        * Launches this session claimed at `tool.call`, until announced.
        * Session state on purpose: another session's jobs are never in it.

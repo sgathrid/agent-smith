@@ -1119,9 +1119,7 @@ const smithNormalizer = (raw) => {
             message: "no status in job.json",
         });
     }
-    // A cancelled job's empty output is expected, not a defect.
-    const kept = resolved === "canceled" ? warnings.filter((w) => w.code !== "empty_output") : warnings;
-    return buildSmith(raw, resolved, kept);
+    return buildSmith(raw, resolved, warnings);
 };
 /** Assemble the ObservedJob for the agent-smith normalizer. */
 function buildSmith(raw, status, warnings) {
@@ -1183,45 +1181,9 @@ function asUsage(v) {
     }
     return Object.keys(out).length > 0 ? out : null;
 }
-// ── registry of normalizers ─────────────────────────────────────────────────
-const NORMALIZERS = new Map([
-    ["agent-smith", smithNormalizer],
-]);
-/**
- * Normalize a raw provider snapshot.
- *
- * Unknown provider ⇒ returns a minimal `unknown` ObservedJob rather than
- * throwing, so adding a reader before adding its normalizer degrades to
- * "shows up but unknown", not "crashes the band".
- */
+/** Normalize a raw agent-smith job snapshot. */
 function normalize(raw) {
-    const norm = NORMALIZERS.get(raw.provider);
-    return norm ? norm(raw) : fallbackNormalizer(raw);
-}
-/** Minimal normalization used when no provider-specific normalizer is registered. */
-function fallbackNormalizer(raw) {
-    return {
-        provider: raw.provider,
-        jobId: raw.jobId,
-        status: "unknown",
-        warnings: [
-            {
-                code: "incomplete_state",
-                message: `No normalizer registered for provider "${raw.provider}".`,
-            },
-        ],
-        output: null,
-        startedAt: null,
-        updatedAt: null,
-        finishedAt: null,
-        mode: null,
-        model: null,
-        label: null,
-        outputTruncated: false,
-        usage: null,
-        partial: true,
-        raw: raw.payload,
-    };
+    return smithNormalizer(raw);
 }/**
  * pipeline/routing.ts — dynamic model/stage selection.
  *

@@ -10,10 +10,6 @@ import { test } from "node:test";
 
 import { readObservedJob } from "../registry.ts";
 
-test("readObservedJob returns null for an unknown provider", async () => {
-  assert.equal(await readObservedJob("nope", "/tmp", "job"), null);
-});
-
 test("readObservedJob returns null (not a throw) for an unknown job", async () => {
-  assert.equal(await readObservedJob("agent-smith", "/definitely/not/a/repo", "nope"), null);
+  assert.equal(await readObservedJob("/definitely/not/a/repo", "nope"), null);
 });
