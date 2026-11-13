@@ -34,13 +34,14 @@ function writeJson(file, value) {
 }
 
 /** Bundle the channel entrypoints and MCP SDK into self-contained ESM files with no node_modules. */
-async function bundleRuntime({ channelRoot, serverSource, monitorSource, watchHookSource, outDir }) {
+async function bundleRuntime({ channelRoot, serverSource, monitorSource, watchHookSource, tailSource, outDir }) {
   const bundle = await rollup({
     input: {
       server: serverSource,
       supervisor: path.join(path.dirname(serverSource), 'surfaces/channel/src/supervisor.js'),
       monitor: monitorSource,
       'watch-hook': watchHookSource,
+      tail: tailSource,
     },
     plugins: [
       nodeResolve({ preferBuiltins: true, rootDir: channelRoot }),
@@ -63,7 +64,7 @@ async function bundleRuntime({ channelRoot, serverSource, monitorSource, watchHo
   } finally {
     await bundle.close();
   }
-  for (const name of ['server.js', 'monitor.js', 'watch-hook.js']) {
+  for (const name of ['server.js', 'monitor.js', 'watch-hook.js', 'tail.js']) {
     chmodSync(path.join(outDir, name), 0o755);
   }
 }
@@ -77,6 +78,7 @@ export async function buildPlugin({ repoRoot = DEFAULT_ROOT, outputRoot = path.j
   const serverSource = path.join(channelRoot, 'dist', 'server.js');
   const monitorSource = path.join(channelRoot, 'dist', 'monitor.js');
   const watchHookSource = path.join(channelRoot, 'dist', 'watch-hook.js');
+  const tailSource = path.join(channelRoot, 'dist', 'tail.js');
   const modulesSource = path.join(channelRoot, 'node_modules');
   const channelPackagePath = path.join(channelRoot, 'package.json');
 
@@ -87,6 +89,7 @@ export async function buildPlugin({ repoRoot = DEFAULT_ROOT, outputRoot = path.j
   required(serverSource, 'built MCP server');
   required(monitorSource, 'built monitor entrypoint');
   required(watchHookSource, 'built watch hook entrypoint (run the channel build; src/watch-hook.ts must exist)');
+  required(tailSource, 'built tail entrypoint');
   required(modulesSource, 'channel runtime node_modules');
   required(channelPackagePath, 'channel package metadata');
 
@@ -116,7 +119,7 @@ export async function buildPlugin({ repoRoot = DEFAULT_ROOT, outputRoot = path.j
     const runtime = path.join(staging, 'runtime');
     const runtimeDist = path.join(runtime, 'dist');
     mkdirSync(runtimeDist, { recursive: true });
-    await bundleRuntime({ channelRoot, serverSource, monitorSource, watchHookSource, outDir: runtimeDist });
+    await bundleRuntime({ channelRoot, serverSource, monitorSource, watchHookSource, tailSource, outDir: runtimeDist });
     writeJson(path.join(runtime, 'package.json'), {
       name: 'agent-smith-runtime',
       private: true,
@@ -157,6 +160,7 @@ export async function buildPlugin({ repoRoot = DEFAULT_ROOT, outputRoot = path.j
     required(path.join(staging, 'runtime', 'dist', 'server.js'), 'staged MCP server');
     required(path.join(staging, 'runtime', 'dist', 'monitor.js'), 'staged monitor entrypoint');
     required(path.join(staging, 'runtime', 'dist', 'watch-hook.js'), 'staged watch hook entrypoint');
+    required(path.join(staging, 'runtime', 'dist', 'tail.js'), 'staged tail entrypoint');
     required(path.join(staging, 'hooks', 'watch-hooks.json'), 'staged watch hooks');
 
     if (existsSync(target)) renameSync(target, backup);

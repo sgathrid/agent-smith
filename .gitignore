@@ -10,3 +10,7 @@ builds/tmp/
 builds/local-plugin/.agent-smith-*
 .claude/settings.local.json
 the-codes/surfaces/channel/dist/
+
+# Written by Claude Code when it loads the build with --plugin-dir (editor types).
+builds/local-plugin/agent-smith/tsconfig.json
+builds/local-plugin/agent-smith/.claude-plugin/types/

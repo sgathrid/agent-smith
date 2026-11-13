@@ -20,6 +20,7 @@ import {
 import type { FsLike } from './fs.ts';
 import { sortForBand } from './format.ts';
 import { readForgeJobs, readForgeDetail } from './canonical.ts';
+import { isOurAgent, registerNativeAgents, startNativeAgents } from './agent-native.ts';
 import {
   LAUNCH_TOOL,
   STATUS_TOOL,
@@ -132,6 +133,11 @@ const notices = atom({ plugin: 'agent-smith', key: 'notices' } as const, [] as O
  * finished job stays in this session's list. Session state, reset like `notices`.
  */
 const launched = atom({ plugin: 'agent-smith', key: 'launched' } as const, { jobs: [], runs: [] } as Launched);
+/**
+ * Jobs a native agent-smith subagent launched. Claude Code's own agent row shows and
+ * controls them, so the band, native tasks and notices leave them out; /forge lists them.
+ */
+const nativeJobs = atom({ plugin: 'agent-smith', key: 'nativeJobs' } as const, [] as string[]);
 /** The /forge list shows this session's workers, or the repository's history. */
 const listScope = atom({ plugin: 'agent-smith', key: 'listScope' } as const, 'session' as 'session' | 'all');
 
@@ -139,10 +145,25 @@ const listScope = atom({ plugin: 'agent-smith', key: 'listScope' } as const, 'se
  * The rows the band, the session list and native tasks show: this session's
  * launches.
  */
-async function sessionRows($: EngineInterface): Promise<RadarJob[]> {
+async function sessionRows($: EngineInterface, { withNative = false } = {}): Promise<RadarJob[]> {
   const jobs = await read($, bandJobs);
   const mine = await read($, launched);
-  return sessionJobs(jobs, mine);
+  const rows = sessionJobs(jobs, mine);
+  if (withNative) return rows;
+  const native = new Set(await read($, nativeJobs));
+  return native.size === 0 ? rows : rows.filter((j) => !native.has(j.id) && !native.has(j.workerId ?? ''));
+}
+
+/**
+ * A launch made by one of this plugin's native subagents: list it in /forge, and
+ * mark it claimed so the completion hook stays silent; the subagent hands back the result.
+ */
+async function takeNativeLaunch($: EngineInterface, launch: Launch): Promise<void> {
+  const cfg = await read($, bandConfig);
+  const repo = launch.repo ?? cfg.repo;
+  if (cfg.repo !== '' && sameRepo(repo, cfg.repo)) await update($, launched, (l) => recordLaunch(l, launch));
+  await update($, nativeJobs, (ids) => ids.includes(launch.id) ? ids : [...ids, launch.id]);
+  if (repo !== '') await $.fs.write(claimMarkerPath(repo, launch.kind, launch.id), `${new Date(await $.clock.now()).toISOString()}\n`).catch(() => {});
 }
 
 // =============================================================================
@@ -451,7 +472,8 @@ async function pollNativeTasks($: EngineInterface, rows: readonly RadarJob[]): P
       update: (input) => $.tool.call({ tool: 'TaskUpdate', ...input }),
     };
     // Only this session's launches get a new task; tasks already linked finish as before.
-    const mine = new Set(sessionJobs(rows, await read($, launched)).map((job) => job.id));
+    // A native subagent's job already has Claude Code's own agent row: no second task for it.
+    const mine = new Set((await sessionRows($)).map((job) => job.id));
     const next = await syncNativeTasks(nativeJobsFromRadar(rows), previous, client, await $.clock.now(), (id) => mine.has(id));
     if (JSON.stringify(previous) !== JSON.stringify(next)) {
       await update($, nativeTaskLinks, () => next);
@@ -484,7 +506,9 @@ function registerBand(on: Parameters<Register>[0]): void {
     if (r && r.deny === undefined && r.isError !== true) {
       let launches = parseLaunches(e.tool, r.result);
       if (launches.length === 0) launches = parseLaunches(e.tool, r.text);
-      for (const launch of launches) await takeLaunch($, launch, '').catch(() => {});
+      // An agent-smith native agent hands back its own result and has its own row.
+      const native = launches.length > 0 && await isOurAgent($, e.agentId).catch(() => false);
+      for (const launch of launches) await (native ? takeNativeLaunch($, launch) : takeLaunch($, launch, '')).catch(() => {});
     }
     return r;
   });
@@ -636,6 +660,8 @@ export const register: Register = (on) => {
   // The pane below knows none of this and would work unchanged if both lines were
   // deleted. See § BAND above.
   registerBand(on);
+  // Workers as native subagents: agent types, their step driver, cancel on stop.
+  registerNativeAgents(on);
 
   // ── the command ───────────────────────────────────────────────────────────
   //
@@ -649,6 +675,7 @@ export const register: Register = (on) => {
     await startBand($, typeof e.cwd === 'string' ? e.cwd : undefined);
     // Not awaited: a slow network must not hold the session's start.
     void checkForUpdate($).catch(() => {});
+    startNativeAgents($);
 
     await $.command
       .register({
@@ -675,7 +702,7 @@ export const register: Register = (on) => {
     await pollBand($);
     const cfg = await read($, bandConfig);
     const jobs = await read($, bandJobs);
-    const mine = await sessionRows($);
+    const mine = await sessionRows($, { withNative: true });
     const args = typeof e.args === 'string' ? e.args.trim() : '';
     // `/forge recap` (and `/forge all recap` / `/forge recap all`) prints the board
     // instead of opening one worker. `recap` is a verb here, never a worker name,
@@ -768,7 +795,7 @@ async function renderForge($: EngineInterface, e: UiRenderEvent): Promise<JSX.El
   const cfg = await read($, bandConfig);
   const t = await read($, now);
   const jobs = await read($, bandJobs);
-  const mine = await sessionRows($);
+  const mine = await sessionRows($, { withNative: true });
   const scope = await read($, listScope);
   const pick = await read($, selected);
   const error = await read($, readError);

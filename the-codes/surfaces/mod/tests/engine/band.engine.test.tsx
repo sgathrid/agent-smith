@@ -1078,3 +1078,227 @@ describe('proseText', () => {
     expect(proseText('<details>x</details>')).toBe('<details>x</details>');
   });
 });
+
+describe('native subagents (turn.step + tail.js)', () => {
+  const REM = '<system-reminder>Your final report is delivered through SubagentHandback.</system-reminder>';
+
+  function nativeHost(
+    on: (...args: any[]) => void,
+    agentId: string,
+    mcpHandler: (tool: string, args: Record<string, unknown>) => Record<string, unknown>,
+  ) {
+    forgeHost(on, {}, []);
+    on('http.fetch', () => ({ value: { status: 404, ok: false, headers: {}, text: '' } }));
+    on('agent.register', (_$: unknown, e: any) => ({ value: { agent: `agent-smith:${e.name}` } }));
+    on('agent.list', () => ({
+      value: [{ id: agentId, type: 'agent-smith:codex', name: 'Ada', description: 'codex worker', status: 'running' }],
+    }));
+    on('session.messages', () => ({
+      value: [{ role: 'user', content: `${REM}\nAudit parser edge cases.` }],
+    }));
+    on('mcp.call', (_$: unknown, e: any) => {
+      if (e.tool === 'list_capabilities') {
+        return {
+          value: {
+            isError: false,
+            content: [],
+            structuredContent: { providers: [{ name: 'codex', available: true, defaultModel: 'gpt-5' }] },
+          },
+        };
+      }
+      const data = mcpHandler(e.tool, e.args ?? {});
+      return { value: { isError: false, content: [{ type: 'text', text: JSON.stringify(data) }], structuredContent: data } };
+    });
+  }
+
+  async function collectStep(stream: AsyncIterable<any>) {
+    const chunks: any[] = [];
+    for await (const c of stream) chunks.push(c);
+    const transcript = chunks.filter((c) => c.kind === 'text').map((c) => c.text).join('');
+    const toolChunk = chunks.find((c) => c.kind === 'tool');
+    const inputJson = chunks.filter((c) => c.kind === 'input').map((c) => c.json).join('');
+    const stopChunk = chunks.find((c) => c.kind === 'stop');
+    return {
+      chunks,
+      transcript,
+      toolName: toolChunk?.name as string | undefined,
+      toolInput: inputJson ? (JSON.parse(inputJson) as Record<string, unknown>) : undefined,
+      stopReason: stopChunk?.stopReason as string | undefined,
+    };
+  }
+
+  test('streams step lines from tail.js, switches jobId on job, and settles with concise status + report', async ($, on) => {
+    const mcpCalls: { tool: string; args: Record<string, unknown> }[] = [];
+    const spawns: { argv: readonly string[] }[] = [];
+    let sendMidStream: (() => Promise<unknown>) | null = null;
+
+    nativeHost(on, 'agent-stream-1', (tool, args) => {
+      mcpCalls.push({ tool, args });
+      if (tool === 'spawn_job') {
+        return { jobId: 'job-1', name: 'Ada', provider: 'codex', model: 'gpt-5', status: 'running', repo: '/work', nodePath: '/opt/node22/bin/node' };
+      }
+      if (tool === 'steer_job') {
+        return { jobId: args.worker, status: 'queued' };
+      }
+      if (tool === 'status' && args.report_only === true) {
+        return { jobId: args.jobId, status: 'succeeded', report: 'Finished parser audit.' };
+      }
+      if (tool === 'status') {
+        return {
+          jobId: args.jobId,
+          status: 'succeeded',
+          acceptance: { state: 'rejected', passed: ['lint'], failed: ['unit-tests'], pending: false },
+        };
+      }
+      return {};
+    });
+
+    on('process.spawn', async function* (_$: unknown, e: any) {
+      spawns.push({ argv: e.argv });
+      yield { stream: 'stderr' as const, text: 'ignored stderr\n' };
+      yield { stream: 'stdout' as const, text: '{"kind":"step","text":"Read src/parser.ts"}\n{"kind":"jo' };
+      yield { stream: 'stdout' as const, text: 'b","jobId":"job-2"}\r\nnot-json\n' };
+      if (sendMidStream) await sendMidStream();
+      yield { stream: 'stdout' as const, text: '{"kind":"step","text":"Ran npm test"}\n{"kind":"settled","jobId":"job-2","status":"succeeded"}\n' };
+      yield { stream: 'stdout' as const, text: '{"kind":"step","text":"after settled"}\n' };
+      return { value: { code: 0, signal: null } };
+    });
+
+    await start($);
+    // Steer after `job` switched the ID to verify jobsByAgent updated too.
+    sendMidStream = () => ($ as any).session.send({ to: 'Ada', text: 'Check CRLF too.', origin: { kind: 'agent' } });
+
+    const out = await collectStep(($ as any).turn.step({ turnId: 'turn-s1', index: 0, model: 'sonnet', messageCount: 1, agentId: 'agent-stream-1' }));
+
+    expect(spawns).toHaveLength(1);
+    expect(spawns[0]!.argv[0]).toBe('/opt/node22/bin/node');
+    expect(spawns[0]!.argv[1]).toMatch(/\/runtime\/dist\/tail\.js$/);
+    expect(spawns[0]!.argv.slice(2)).toEqual(['--job', 'job-1', '--repo', '/work']);
+
+    expect(out.transcript).toContain('Read src/parser.ts');
+    expect(out.transcript).toContain('Ran npm test');
+    expect(out.transcript).not.toContain('ignored stderr');
+    expect(out.transcript).not.toContain('after settled');
+
+    // Steer mid-stream hit job-2, and settle fetched both concise status (no wait_ms) and report_only on job-2.
+    expect(mcpCalls.find((c) => c.tool === 'steer_job')?.args).toMatchObject({ worker: 'job-2', prompt: 'Check CRLF too.' });
+    const statusCalls = mcpCalls.filter((c) => c.tool === 'status');
+    expect(statusCalls).toEqual([
+      { tool: 'status', args: { jobId: 'job-2' } },
+      { tool: 'status', args: { jobId: 'job-2', report_only: true } },
+    ]);
+
+    expect(out.stopReason).toBe('tool_use');
+    expect(out.toolName).toBe('SubagentHandback');
+    expect(out.toolInput).toEqual({
+      message: 'Finished parser audit.\nAcceptance: rejected (1/2 checks; failed: unit-tests)',
+    });
+  });
+
+  test('falls back to status loop when process.spawn rejects, waiting through pending acceptance checks', async ($, on) => {
+    const statusCalls: Record<string, unknown>[] = [];
+    let pollCount = 0;
+
+    nativeHost(on, 'agent-fallback-1', (tool, args) => {
+      if (tool === 'spawn_job') {
+        return { jobId: 'job-fb-1', name: 'Ada', provider: 'codex', model: 'gpt-5', status: 'running', repo: '/work' };
+      }
+      if (tool === 'status' && args.report_only === true) {
+        statusCalls.push(args);
+        return { jobId: 'job-fb-1', status: 'succeeded', report: 'Fallback report body.' };
+      }
+      if (tool === 'status' && args.wait_ms !== undefined) {
+        statusCalls.push(args);
+        pollCount++;
+        if (pollCount === 1) {
+          return {
+            jobId: 'job-fb-1',
+            status: 'succeeded',
+            waited: true,
+            stillRunning: false,
+            acceptance: { state: 'unchecked', pending: true },
+          };
+        }
+        return {
+          jobId: 'job-fb-1',
+          status: 'succeeded',
+          waited: true,
+          stillRunning: false,
+          acceptance: { state: 'rejected', passed: [], failed: ['typecheck'], pending: false },
+        };
+      }
+      if (tool === 'status') {
+        statusCalls.push(args);
+        return {
+          jobId: 'job-fb-1',
+          status: 'succeeded',
+          acceptance: { state: 'rejected', passed: [], failed: ['typecheck'], pending: false },
+        };
+      }
+      return {};
+    });
+
+    on('process.spawn', async function* () {
+      return { deny: 'ENOENT: tail.js missing' };
+    });
+
+    await start($);
+    const out = await collectStep(($ as any).turn.step({ turnId: 'turn-fb1', index: 0, model: 'sonnet', messageCount: 1, agentId: 'agent-fallback-1' }));
+
+    // First wait uses WAIT_MS (20_000) + until:'change'; after stillRunning:false with acceptance.pending,
+    // second wait uses MAX_STATUS_WAIT_MS (60_000); then settle fetches concise status + report_only.
+    expect(statusCalls).toEqual([
+      { jobId: 'job-fb-1', wait_ms: 20_000, until: 'change' },
+      { jobId: 'job-fb-1', wait_ms: 60_000, until: 'change' },
+      { jobId: 'job-fb-1' },
+      { jobId: 'job-fb-1', report_only: true },
+    ]);
+    expect(out.transcript).toContain('Waiting for acceptance checks…');
+    expect(out.toolName).toBe('SubagentHandback');
+    expect(out.toolInput).toEqual({
+      message: 'Fallback report body.\nAcceptance: rejected (0/1 checks; failed: typecheck)',
+    });
+  });
+
+  test('falls back to status loop when tail.js exits non-zero without a settled record', async ($, on) => {
+    const statusCalls: Record<string, unknown>[] = [];
+
+    nativeHost(on, 'agent-fallback-2', (tool, args) => {
+      if (tool === 'spawn_job') {
+        return { jobId: 'job-fb-2', name: 'Ada', provider: 'codex', model: 'gpt-5', status: 'running', repo: '/work' };
+      }
+      if (tool === 'status' && args.report_only === true) {
+        statusCalls.push(args);
+        return { jobId: 'job-fb-2', status: 'succeeded', report: 'Recovered after tail crash.' };
+      }
+      if (tool === 'status') {
+        statusCalls.push(args);
+        return {
+          jobId: 'job-fb-2',
+          status: 'succeeded',
+          acceptance: { state: 'accepted', passed: ['lint'], failed: [], pending: false },
+        };
+      }
+      return {};
+    });
+
+    on('process.spawn', async function* () {
+      yield { stream: 'stdout' as const, text: '{"kind":"step","text":"Step before non-zero exit"}\n' };
+      return { value: { code: 1, signal: null } };
+    });
+
+    await start($);
+    const out = await collectStep(($ as any).turn.step({ turnId: 'turn-fb2', index: 0, model: 'sonnet', messageCount: 1, agentId: 'agent-fallback-2' }));
+
+    expect(out.transcript).toContain('Step before non-zero exit');
+    expect(statusCalls).toEqual([
+      { jobId: 'job-fb-2', wait_ms: 20_000, until: 'change' },
+      { jobId: 'job-fb-2' },
+      { jobId: 'job-fb-2', report_only: true },
+    ]);
+    expect(out.toolName).toBe('SubagentHandback');
+    expect(out.toolInput).toEqual({
+      message: 'Recovered after tail crash.\nAcceptance: accepted (1/1 checks)',
+    });
+  });
+});

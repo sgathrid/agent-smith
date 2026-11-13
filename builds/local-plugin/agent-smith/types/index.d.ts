@@ -256,6 +256,8 @@ declare module 'claude-code' {
        * The shape is hooks/dashboard.ts `Launched`, spelled out for the validator.
        */
       launched: { jobs: string[]; runs: string[] };
+      /** Job IDs launched by this plugin's native subagents: shown in /forge, left out of the band, tasks and notices. */
+      nativeJobs: string[];
       /** The /forge list: this session's workers, or the repository's. */
       listScope: 'session' | 'all';
     };
