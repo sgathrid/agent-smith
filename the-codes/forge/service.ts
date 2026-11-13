@@ -319,7 +319,7 @@ export class ForgeService {
    */
   async spawnTracked(request: SpawnRequest): Promise<TrackedSpawn> {
     if (this.supervisorUrl) return launchJob(this, request);
-    const provider = this.providerSource(request.provider ?? 'agy');
+    const provider = this.providerSource(request.provider ?? (() => { throw new Error('provider is required.'); })());
     const rawMode = request.mode.trim();
     const resuming = request.conversation !== undefined && request.conversation !== null;
     // Closed set for fresh, non-pipeline spawns. Pipeline stages keep arbitrary

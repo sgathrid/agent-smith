@@ -13,6 +13,7 @@ import { buildBrief } from '../brief.ts';
 import { MODE_PRESETS } from '../modes.ts';
 import { ForgeService } from '../service.ts';
 import { scaled, waitFor } from '../testing/time.ts';
+import { withDefaultProvider } from '../testing/steer-harness.ts';
 
 interface Fake {
   provider: Provider;
@@ -62,14 +63,13 @@ function svc(
   harnessDefaults: (provider: string) => { model?: string } = () => ({}),
 ) {
   const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-policy-'));
-  const service = new ForgeService({
+  const service = withDefaultProvider(new ForgeService({
     repo,
-   
     flushMs: 1,
     providerSource: () => fake.provider,
     catalogSource: typeof cat === 'function' ? cat : async () => (cat === undefined ? [] : [cat]),
     harnessDefaults,
-  });
+  }), fake.provider.name);
   return { service, repo };
 }
 

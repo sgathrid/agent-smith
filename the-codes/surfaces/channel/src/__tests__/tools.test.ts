@@ -41,6 +41,19 @@ test('spawn and resume validate and forward absolute working directories', async
   assert.equal(seen.length, 3, 'invalid cwd must not launch a worker');
 });
 
+test('spawn_job with no configured default: the only installed provider, else a short error', async () => {
+  const seen: Array<Record<string, unknown>> = [];
+  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-prov-'));
+  const service = withWorkerLookup({ repo, spawnJob: async (req: Record<string, unknown>) => { seen.push(req); return { jobId: 'j' }; } });
+  const one = await callTool({ service, catalogs: async () => [cat('kimi')] } as unknown as HandlerContext, 'spawn_job', { mode: 'review', prompt: 'x' });
+  assert.equal(one.isError, undefined); assert.equal(seen[0]!.provider, 'kimi'); assert.equal(body(one).provider, 'kimi');
+  const many = await callTool({ service, catalogs: async () => [cat('agy'), cat('codex')] } as unknown as HandlerContext, 'spawn_job', { mode: 'review', prompt: 'x' });
+  assert.equal(many.isError, true); assert.match((many.content as { text: string }[])[0]!.text, /provider is required: installed are agy, codex\./);
+  const none = await callTool({ service, catalogs: async () => [] } as unknown as HandlerContext, 'spawn_job', { mode: 'review', prompt: 'x' });
+  assert.equal(none.isError, true); assert.match((none.content as { text: string }[])[0]!.text, /No coding agent installed/);
+  assert.equal(seen.length, 1);
+});
+
 test('mode enum rejects unknown modes', async () => {
   const r = await callTool(ctxWith([cat('agy')]), 'spawn_job', { mode: 'task', prompt: 'x' });
   assert.equal(r.isError, true);
@@ -75,13 +88,11 @@ test('files is bounded in the schema, matching the service cap', () => {
 });
 
 test('default pipeline derives providers from installed catalogs', async () => {
-  const all = await defaultMixedPipeline({ name: 'p', task: 't' }, async () => [cat('agy'), cat('codex'), cat('claude', { defaultSource: 'unknown' })]);
-  assert.deepEqual(all.stages.map(s => s.provider), ['agy', 'codex', 'claude']);
-  assert.equal(all.stages[0]!.model, 'agy-m'); assert.equal(all.stages[0]!.effort, 'high');
-  assert.equal(all.stages[2]!.model, undefined); assert.notEqual(all.stages[2]!.model, 'sonnet');
+  await assert.rejects(defaultMixedPipeline({ name: 'p', task: 't' }, async () => [cat('agy'), cat('codex')]), /^Error: pass stages with a provider each: installed are agy, codex\.$/);
   const one = await defaultMixedPipeline({ name: 'p', task: 't' }, async () => [cat('codex')]);
   assert.deepEqual(one.stages.map(s => s.provider), ['codex', 'codex', 'codex']);
-  await assert.rejects(defaultMixedPipeline({ name: 'p', task: 't' }, async () => []), /No providers installed.*agy/);
+  assert.equal(one.stages[0]!.model, 'codex-m'); assert.equal(one.stages[0]!.effort, 'high');
+  await assert.rejects(defaultMixedPipeline({ name: 'p', task: 't' }, async () => []), /No coding agent installed: install one of agy, codex, opencode, claude, kimi\./);
 });
 
 test('run_pipeline stages accept continues, inherit its provider, and reject a bad spec before starting anything', async () => {
@@ -146,7 +157,7 @@ test('pipelines expand aliases in explicit stages and apply roleDefaults to the 
   const modelConfig = loadModelConfig({ repo });
   const explicit = await defaultMixedPipeline({ name: 'p', task: 't', modelConfig, stages: [{ name: 'a', provider: 'codex', model: 'sol-high', role: 'implement' } as never] });
   assert.deepEqual([explicit.stages[0]!.provider, explicit.stages[0]!.model, explicit.stages[0]!.effort], ['codex', 'gpt-6.1-sol', 'high']);
-  const cats = ['agy', 'codex', 'claude'].map(provider => ({ provider, models: [], defaultSource: 'unknown', source: 'live', stale: false, verified: true }) as never);
+  const cats = ['codex'].map(provider => ({ provider, models: [], defaultSource: 'unknown', source: 'live', stale: false, verified: true }) as never);
   const def = await defaultMixedPipeline({ name: 'p', task: 't', modelConfig }, async () => cats);
   const review = def.stages.find(s => s.name === 'review')!;
   assert.deepEqual([review.provider, review.model, review.effort], ['codex', 'gpt-6.1-sol', 'high']);

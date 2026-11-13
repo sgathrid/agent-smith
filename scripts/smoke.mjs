@@ -131,8 +131,8 @@ try {
     const ack = await data(await client.callTool({ name: 'spawn_job', arguments: { provider: 'codex', mode: 'review', name: 'Smoke Cancel', task: 'Cancel fixture', prompt: 'SMOKE_SLOW cancellation fixture', model: 'smoke-fixture', effort: 'low', cwd: repo } }));
     const cancellation = await data(await client.callTool({ name: 'cancel', arguments: { jobId: ack.jobId } }));
     const terminal = await waitStatus('status', 'jobId', ack.jobId);
-    if (!cancellation.requested || terminal.status !== 'canceled') throw new Error(`Cancellation ended ${terminal.status}`);
-    return { requested: cancellation.requested, status: terminal.status };
+    if (cancellation.settled !== true || terminal.status !== 'canceled') throw new Error(`Cancellation ended ${terminal.status}`);
+    return { settled: cancellation.settled, status: terminal.status };
   });
   await record('timeout', async () => {
     const ack = await data(await client.callTool({ name: 'spawn_job', arguments: { provider: 'codex', mode: 'review', name: 'Smoke Timeout', task: 'Timeout fixture', prompt: 'SMOKE_SLOW timeout fixture', model: 'smoke-fixture', effort: 'low', timeoutMs: 1_000, cwd: repo } }));

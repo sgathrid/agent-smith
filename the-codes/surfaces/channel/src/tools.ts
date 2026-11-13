@@ -174,7 +174,7 @@ const VARIANT_KEYS = ['name', 'provider', 'model', 'effort'] as const;
  */
 function overlay(base: Args, over: Args): Args {
   const defined = Object.fromEntries(Object.entries(over).filter(([, v]) => v !== undefined));
-  const switched = defined.provider !== undefined && defined.provider !== base.provider;
+  const switched = defined.provider !== undefined && base.provider !== undefined && defined.provider !== base.provider;
   const kept = switched ? Object.fromEntries(Object.entries(base).filter(([k]) => !['model', 'effort', 'unrestricted'].includes(k))) : base;
   return { ...kept, ...defined };
 }

@@ -95,14 +95,20 @@ export function controlledProvider(name = 'codex') {
   return { provider, turns, nextTurn };
 }
 
+/** The service no longer guesses a provider; tests that do not care name one. */
+export function withDefaultProvider<S extends ForgeService>(service: S, name = 'fake'): S {
+  const spawnTracked = service.spawnTracked.bind(service);
+  service.spawnTracked = (request) => spawnTracked({ ...request, provider: request.provider ?? name });
+  return service;
+}
+
 export function makeService(provider: Provider) {
   const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-steer-'));
-  const service = new ForgeService({
+  const service = withDefaultProvider(new ForgeService({
     repo,
-   
     flushMs: 5,
     providerSource: () => provider,
     catalogSource: async () => [],
-  });
+  }));
   return { service, repo };
 }
