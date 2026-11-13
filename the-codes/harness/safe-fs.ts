@@ -4,13 +4,12 @@
  * WHY THIS EXISTS
  * ---------------
  * Every reader in this directory observes state that another process is
- * *actively mutating*. agy-staff rewrites `progress.json` every ~100ms and then
- * **deletes** it the moment a job finishes cleanly. Claude Code appends to a
+ * *actively mutating*: a worker rewrites its job files on every event. Claude Code appends to a
  * subagent `.jsonl` while we read it. So between our `readdir` and our `read`,
  * a path can vanish, be truncated mid-write, or be replaced by a directory.
  *
- * Throwing here is never correct: a missing file is *information* (see hazard A
- * in agy-staff.ts), not an error. Every function in this module returns
+ * Throwing here is never correct: a missing file is *information*, not an
+ * error. Every function in this module returns
  * `null` / `[]` / `false` instead of throwing. This is the single most
  * important flake-prevention rule in the harness.
  */
@@ -104,8 +103,8 @@ export async function readTextSafe(
  * Read and JSON.parse, tolerating every way that can go wrong.
  *
  * Returns `null` for: missing file, unreadable file, empty file, invalid JSON.
- * Invalid JSON is EXPECTED, not exceptional — agy-staff writes with a plain
- * `writeFile`, so a reader that arrives mid-write sees a truncated document.
+ * Invalid JSON is EXPECTED, not exceptional — a writer using a plain
+ * `writeFile` can be caught mid-write, so a reader that arrives mid-write sees a truncated document.
  * Treating that as `null` and retrying on the next poll is the whole strategy.
  */
 export async function readJsonSafe<T = unknown>(

@@ -18,13 +18,12 @@ const now = Date.parse('2026-10-08T10:00:00Z');
 const manifest = { schema: 1, jobId: 'job-a', name: 'Ada', workerId: 'ada', status: 'running', task: 'Review dashboard',
   provider: 'codex', model: null, updatedAt: new Date(now).toISOString(), startedAt: new Date(now - 1000).toISOString(), toolCalls: 1 };
 
-test('canonical list ignores legacy jobs and never reads report, view or event logs', async () => {
+test('canonical list never reads report, view or event logs', async () => {
   const reads: string[] = [];
   const jobs = await readForgeJobs(memoryFs({
     [`${base}/job.json`]: JSON.stringify(manifest),
     [`${base}/progress.json`]: JSON.stringify({ lastEventAt: manifest.updatedAt, toolCalls: 1 }),
     [`${base}/result.md`]: 'not for list', [`${base}/events.jsonl`]: 'not for list', [`${base}/view.json`]: 'not for list',
-    '/repo/.agy-staff/jobs/foreign.spec.json': '{}',
   }, reads), '/repo', now);
   assert.equal(jobs.length, 1);
   assert.equal(jobs[0]?.toolCount, 1);

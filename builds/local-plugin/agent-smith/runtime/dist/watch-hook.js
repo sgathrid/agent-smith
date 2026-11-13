@@ -19,7 +19,7 @@ const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
  * is the mod's (notice.ts parseLaunch), so both announcers agree on what a
  * launch started; only the cwd fallbacks are the hook's own.
  */
-function parseHookInput(input, env = process.env) {
+function parseHookInput(input) {
     if (!isObj(input))
         return null;
     const launch = parseLaunch(input['tool_name'], input['tool_response']);
@@ -29,7 +29,7 @@ function parseHookInput(input, env = process.env) {
     if (cwd === null && typeof input['cwd'] === 'string' && input['cwd'].length > 0)
         cwd = input['cwd'];
     if (cwd === null)
-        cwd = env['AGY_WATCH_CWD'] || process.cwd();
+        cwd = process.cwd();
     const resolved = path.resolve(cwd);
     const budget = launch.kind === 'job' ? pendingBudgetMs(resolved, launch.id) : 0;
     const timeoutMs = Math.min(WATCH_CAP_MS, (launch.timeoutMs ?? MAX_WATCH_JOB_MS) + budget + WATCH_GRACE_MS);
@@ -45,9 +45,9 @@ function pendingBudgetMs(cwd, jobId) {
     }
 }
 /** Run the hook. Resolves to the process exit code (2 = wake Claude). */
-async function runHook(stdin, write, options = {}, env = process.env) {
+async function runHook(stdin, write, options = {}) {
     try {
-        const target = parseHookInput(JSON.parse(stdin), env);
+        const target = parseHookInput(JSON.parse(stdin));
         if (target === null)
             return 0;
         const lines = [];

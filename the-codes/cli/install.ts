@@ -7,7 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { ForgeService } from '../forge/service.ts';
-import { isForgeJobId, jobsDir, ownerAlive } from '../forge/format.ts';
+import { jobsDir, ownerAlive } from '../forge/format.ts';
 import { cancelPipeline, readPipeline } from '../forge/execute.ts';
 import { checkCompatibility } from '../providers/compatibility.ts';
 import { detectAvailable, providerNames } from '../providers/registry.ts';
@@ -106,7 +106,6 @@ const UNINSTALL_SETTLE_MS = 15_000;
 
 const MARKETPLACE_KEYS = ['agent-smith', 'agent-smith-dev'] as const;
 const PLUGIN_IDS = ['agent-smith@agent-smith', 'agent-smith@agent-smith-dev', 'agent-smith@inline'] as const;
-const MIRROR_SUFFIXES = ['.spec.json', '.progress.json', '.result.md.status.json', '.result.md', '.log', '.events.jsonl', '.spec.json.cancel'] as const;
 
 function removeEmptyDirIfPossible(dir: string): void {
   try {
@@ -144,38 +143,6 @@ function scrubClaudeSettingsFile(settingsFile: string): boolean {
     writeFileSync(settingsFile, `${JSON.stringify(settings, null, 2)}\n`);
   }
   return true;
-}
-
-/** Older versions marked every mirrored spec.json with this key. */
-const MIRROR_MARKER = 'agent-smith';
-const mirrorDir = (repo: string): string => path.join(repo, '.agy-staff', 'jobs');
-
-/** Remove only Agent Smith's own mirrored files from `<repo>/.agy-staff/jobs/`, leaving genuine agy-staff jobs untouched. */
-function scrubMirrorDir(repo: string): number {
-  const dir = mirrorDir(repo);
-  if (!existsSync(dir)) return 0;
-  let removedJobs = 0;
-  let entries: string[] = [];
-  try { entries = readdirSync(dir); } catch { return 0; }
-  for (const name of entries) {
-    if (!name.endsWith('.spec.json')) continue;
-    const jobId = name.slice(0, -'.spec.json'.length);
-    let ours = isForgeJobId(jobId);
-    if (!ours) {
-      try {
-        const spec = JSON.parse(readFileSync(path.join(dir, name), 'utf8')) as Record<string, unknown>;
-        ours = spec[MIRROR_MARKER] === true;
-      } catch { /* unreadable spec: leave it alone */ }
-    }
-    if (!ours) continue;
-    for (const suffix of MIRROR_SUFFIXES) {
-      rmSync(path.join(dir, `${jobId}${suffix}`), { force: true });
-    }
-    removedJobs += 1;
-  }
-  removeEmptyDirIfPossible(dir);
-  removeEmptyDirIfPossible(path.dirname(dir));
-  return removedJobs;
 }
 
 /** Running jobs in `repo` whose owning process is still alive. */
@@ -317,7 +284,7 @@ function removeUserState(home: string): string[] {
 /**
  * Leave-zero-trace uninstaller: removes plugin/mod/hooks/MCP registrations,
  * immediate-purges Claude Code's 14-day plugin cache/data/marketplace clones,
- * and cleans `.agent-smith/` + mirrored `.agy-staff/jobs/` entries.
+ * and cleans `.agent-smith/`.
  */
 export async function cmdUninstall(args: UninstallArgs = {}): Promise<number> {
   const targetRepo = path.resolve(args.repo ?? process.cwd());
@@ -366,8 +333,6 @@ export async function cmdUninstall(args: UninstallArgs = {}): Promise<number> {
       rmSync(repoState, { recursive: true, force: true });
       actions.push(`removed ${repoState}`);
     }
-    const mirrored = scrubMirrorDir(targetRepo);
-    if (mirrored > 0) actions.push(`removed ${mirrored} mirrored job(s) from ${mirrorDir(targetRepo)}`);
 
     if (!localOnly) {
       const agentHome = args.homeDir ?? process.env['AGENT_SMITH_HOME'] ?? home;

@@ -15,6 +15,5 @@ test("readObservedJob returns null for an unknown provider", async () => {
 });
 
 test("readObservedJob returns null (not a throw) for an unknown job", async () => {
-  assert.equal(await readObservedJob("agy-staff", "/definitely/not/a/repo", "nope"), null);
   assert.equal(await readObservedJob("agent-smith", "/definitely/not/a/repo", "nope"), null);
 });

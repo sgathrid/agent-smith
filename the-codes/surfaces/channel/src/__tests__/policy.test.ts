@@ -7,9 +7,8 @@
  * seconds would spend ~10k tokens an hour and would not be noticed until the bill
  * arrived, so the "must NOT push" cases are tested as hard as the "must push" ones.
  *
- * Fixtures use the real 20-job corpus shape at
- * /Users/gathrid/Repos/renyi/.agy-staff/jobs — real ids, real warning strings, real
- * ISO timestamps — so the tests fail on realistic data rather than on tidy data.
+ * Fixtures use realistic ids, warning strings and ISO timestamps, so the tests
+ * fail on realistic data rather than on tidy data.
  */
 
 import assert from 'node:assert/strict';
@@ -37,9 +36,9 @@ test('named completion notices lead with status and leave the worker summary out
   assert.match(batch.content!, /\nstatus [^\n]+$/);
 });
 
-// ── fixtures, built from the real corpus ────────────────────────────────────
+// ── fixtures ────────────────────────────────────────────────────
 
-/** Real ids and statuses, read from the corpus. */
+/** Realistic ids and statuses. */
 function job(over: Partial<WatchableJob> = {}): WatchableJob {
   return {
     id: 'implement-musm82da-f1dc1fe4',
@@ -107,9 +106,9 @@ test('a job that fails then succeeds speaks twice — that is two facts', () => 
 });
 
 test('the dedupe key is id + status, and never a timestamp', () => {
-  // finished_at is the natural instinct for a dedupe key and it is wrong:
-  // agy-staff rewrites status.json on some cleanup paths, so a timestamp is not
-  // stable and would turn a re-read into a fake "new" event.
+  // finished_at is the natural instinct for a dedupe key and it is wrong: a
+  // timestamp is not stable across rewrites and would turn a re-read into a
+  // fake "new" event.
   const a = job({ status: 'failed', finishedAt: '2026-10-03T16:30:00Z' });
   const b = job({ status: 'failed', finishedAt: '2026-10-03T17:45:00Z' });
   assert.equal(dedupeKey(a), dedupeKey(b), 'a moved timestamp must not create a new event');
@@ -119,8 +118,8 @@ test('the dedupe key is id + status, and never a timestamp', () => {
 });
 
 test('a terminal claim with no finished_at is not pushed', () => {
-  // The mid-flight flap: agy-staff deletes progress.json on a clean finish, and
-  // there is a window where the terminal file is mid-write. A reader sampling that
+  // The mid-flight flap: there is a window where the terminal file is
+  // mid-write. A reader sampling that
   // window can see a finished job as `succeeded` with no finished_at yet. Pushing
   // it, then pushing again once the timestamp lands, would produce a duplicate.
   const flapping = job({ status: 'succeeded', finishedAt: null });
@@ -225,7 +224,6 @@ test('the failure message is terse, specific, and ends with the next step', () =
       cand(
         job({
           id: 'implement-musm82da-f1dc1fe4',
-          source: 'agy-staff',
           status: 'failed',
           warned: true,
           failureReason: 'agy exited 1',
@@ -237,9 +235,8 @@ test('the failure message is terse, specific, and ends with the next step', () =
     NOW,
   );
   const text = batch.content!;
-  assert.ok(text.includes('agy-staff job implement-musm82da-f1dc1fe4 · failed: exit 1'), text);
+  assert.ok(text.includes('job implement-musm82da-f1dc1fe4 · failed: exit 1'), text);
   assert.match(text, /\nstatus implement-musm82da-f1dc1fe4$/);
-  assert.ok(!text.includes('/agy-radar'), 'no /agy-radar command exists any more');
   // The budget is ~50 tokens. A multi-sentence essay would blow it.
   assert.ok(text.length < 220, `message is ${text.length} chars: ${text}`);
 });

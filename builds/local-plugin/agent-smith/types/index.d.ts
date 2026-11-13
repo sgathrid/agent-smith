@@ -7,9 +7,8 @@
  * harness/ObservedJob is the right shape for a *store row* and the wrong shape
  * for a *list row*. It carries `raw: Record<string, unknown>` (the whole provider
  * payload — good for a debug dump, dead weight for rendering), it carries no tool
- * history and no activity, and its `startedAt` is honestly `null` for agy-staff
- * because agy-staff does not record a start time (normalize.ts says so and
- * refuses to invent one).
+ * history and no activity, and its `startedAt` is honestly `null` when no start
+ * time was recorded (normalize.ts refuses to invent one).
  *
  * The pane needs three things ObservedJob does not have:
  *   - toolCount, counted from events.jsonl (a real quantity, shown as-is)
@@ -50,7 +49,7 @@ export type RadarStatus =
  * pane holds one of these across ticks expecting it to stay fresh.
  */
 export interface RadarJob {
-  /** agy-staff's job id, e.g. `implement-musm82da-f1dc1fe4`. */
+  /** The job id, e.g. `implement-smith-3f9a2c71`. */
   readonly id: string;
 
   /** Optional human label for the worker; absent labels fall back to task text. */
@@ -104,9 +103,8 @@ export interface RadarJob {
   /**
    * Tool invocations counted from events.jsonl, or null when the file is gone.
    *
-   * NULL IS COMMON AND CORRECT. agy-staff deletes events.jsonl on a warning-free
-   * success (hazard A), so most finished jobs have no count. Inventing 0 there
-   * would draw a confident lie.
+   * NULL IS CORRECT when no count was recorded. Inventing 0 there would draw a
+   * confident lie.
    */
   readonly toolCount: number | null;
 
@@ -139,7 +137,7 @@ export interface RadarJob {
   /** Current reasoning text, or null when the job has not produced any yet. */
   readonly reasoning: string | null;
 
-  /** What the worker has done so far, from its tool calls (progress.json `digest`). Absent for older and agy-staff jobs. */
+  /** What the worker has done so far, from its tool calls (progress.json `digest`). Absent for older jobs. */
   readonly progress?: ProgressDigest | null;
 
   /** Child job ID when this turn was superseded by a steered continuation turn. */

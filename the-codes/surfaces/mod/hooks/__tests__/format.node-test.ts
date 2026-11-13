@@ -275,8 +275,7 @@ test('elapsed never goes negative and drops seconds past an hour', () => {
 // ── tool count ──────────────────────────────────────────────────────────────
 
 test('an unknown tool count is omitted, while a real zero stays explicit', () => {
-  // HAZARD A: agy-staff deletes events.jsonl on a warning-free success, so for a
-  // cleanly finished job there is genuinely no count anywhere on disk. Printing
+  // A job can have genuinely no count anywhere on disk. Printing
   // "0 tools" would be a confident fabrication about a job that ran hundreds.
   assert.equal(jobDetail(job({ toolCount: null })), '');
   assert.equal(jobDetail(job({ toolCount: 0 })), '0 tools');
@@ -420,9 +419,7 @@ test('the empty state is a literal string and nothing else', () => {
 // ── activity ────────────────────────────────────────────────────────────────
 
 test('describeTool matches the real agy tool parameter shapes', () => {
-  // Parameter names taken from the real corpus at
-  // /Users/gathrid/Repos/renyi/.agy-staff/jobs, reading tool_info.parameters out
-  // of every step_update record in all 20 jobs. Inventing plausible-looking names
+  // Parameter names taken from real agy step_update records. Inventing plausible-looking names
   // here would produce a pane full of `using run_command`.
   assert.equal(describeTool('run_command', { CommandLine: 'cargo test --workspace' }), 'running tests');
   assert.equal(
@@ -448,8 +445,8 @@ test('activity text is truncated at the source, never with raw output', () => {
   assert.ok(!out.includes('x'.repeat(20)), 'the row must not carry raw command arguments');
 });
 
-test('parseInputPreview survives the truncated JSON agy-staff actually writes', () => {
-  // agy-staff truncates input_preview mid-string, so JSON.parse legitimately fails
+test('parseInputPreview survives truncated JSON', () => {
+  // input_preview can be cut mid-string, so JSON.parse legitimately fails
   // on real data. This must not throw — a throw here would blank a whole job row.
   assert.deepEqual(parseInputPreview('{"CommandLine":"cargo fmt"}'), { CommandLine: 'cargo fmt' });
   assert.deepEqual(parseInputPreview('{"CommandLine":"cargo fmt'), {});

@@ -1,44 +1,16 @@
 /**
  * agent-smith.ts — reads OUR OWN job state from `<repo>/.agent-smith/jobs/`.
  *
- * ─────────────────────────────────────────────────────────────────────────────
- * THIS IS THE PRIMARY READER. WHY IT EXISTS
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * Until now the only reader in this layer read somebody else's directory.
- * harness/agy-staff.ts is a re-implementation of a layout nobody in this repo
- * writes any more, kept because the 20 real jobs under
- * /Users/gathrid/Repos/renyi/.agy-staff/jobs are the corpus the hazard rules
- * were verified against and because any future worker that writes that layout
- * should be picked up for free.
- *
- * It is now an INTEROP reader. This one is the source of truth, and
- * registry.ts holds both:
- *
- *     "agent-smith"   PRIMARY.   Every job this repo spawned.
- *     "agy-staff"     INTEROP.   Read-only history from another harness.
- *
- * The two are kept strictly apart — see the last section, which is the one rule
- * this file has to enforce.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * WHY THIS FILE IS NOT MUCH CODE
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * Because forge/format.ts made it not much code. That is the point of owning the
- * state format. Compare with agy-staff.ts, which needs three documented hazards
- * and a seven-suffix fallback chain to answer the same three questions:
+ * The source of truth for every job this repo spawned. It is not much code
+ * because forge/format.ts made it not much code: owning the state format means
+ * three questions, three answers:
  *
  *   - Does this job exist?        → the directory exists and holds a job.json.
  *   - What is its terminal state? → job.json.status. Written atomically, always.
  *   - Is it alive?                → job.json.updatedAt, refreshed on every event.
  *
- * agy-staff's equivalents are all "which of these seven files, some of which are
- * deleted on success, do I read, and in what order". We traded that for a
- * directory, an atomic rewrite, and the refusal to ever delete the anchor.
- *
- * The one hazard we DID keep is the cancel marker, and it is the same hazard:
- * `cancel` can exist before job.json reaches a terminal state, so it outranks it.
+ * The one hazard to respect is the cancel marker: `cancel` can exist before
+ * job.json reaches a terminal state, so it outranks it.
  */
 
 import { existsSafe, readJsonSafe, readTextSafe, readdirSafe } from './safe-fs.ts';
@@ -98,8 +70,8 @@ const CANCELED_ORPHAN = { status: 'canceled', suspicious: false, reason: CANCEL_
 /**
  * Reads `.agent-smith/jobs`.
  *
- * Every method is fault-tolerant in the same way and for the same reason as
- * agy-staff.ts: a reader reads files a live process is rewriting, and one
+ * Every method is fault-tolerant: a reader reads files a live process is
+ * rewriting, and one
  * unreadable job is that job's absence rather than a dead band. `discover`
  * NEVER throws; an absent jobs directory is the ordinary case for a repo that
  * has never spawned anything, not an error.
@@ -110,8 +82,7 @@ export class AgentSmithReader implements JobStateReader {
   /**
    * Enumerate job ids from the jobs directory.
    *
-   * Keyed on the DIRECTORY, which is the whole reason this is simpler than the
-   * interop reader: there is no suffix to parse, no "which file proves this job
+   * Keyed on the DIRECTORY: there is no suffix to parse, no "which file proves this job
    * exists", and no entry that can half-qualify. A job's identity is its
    * directory, so identity cannot be lost.
    */
@@ -136,8 +107,8 @@ export class AgentSmithReader implements JobStateReader {
    * deleted, which is the whole reason the format has a single anchor.
    */
   async read(cwd: string, jobId: string): Promise<RawJobState | null> {
-    // The cancel marker outranks job.json (same hazard as agy-staff's B: the
-    // marker can exist before the worker has been reaped).
+    // The cancel marker outranks job.json: it can exist before the worker has
+    // been reaped.
     const cancelPath = jobFile(cwd, jobId, FILES.cancel);
     const cancelRequested = await existsSafe(cancelPath);
     let cancelAt: string | null = null;
@@ -289,9 +260,3 @@ export class AgentSmithReader implements JobStateReader {
     };
   }
 }
-
-/*
- * Older versions mirrored our jobs into `.agy-staff/jobs/`; copies may remain on
- * disk. `AgyStaffReader` callers skip forge ids (`isForgeJobId`) so a job never
- * gets two verdicts in one sweep.
- */

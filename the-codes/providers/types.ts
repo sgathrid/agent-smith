@@ -270,8 +270,6 @@ export interface WorkerHandle {
    *   <stateDir>/argv.json      the exact argv + cwd we spawned with
    *   <stateDir>/stderr.log     the child's stderr, verbatim
    *   <stateDir>/result.json    the JobResult, written on completion
-   * agy additionally has agy-staff's own <cwd>/.agy-staff/jobs/<jobId>.* tree,
-   * which harness/ (not us) reads.
    */
   stateDir: string;
 

@@ -13,18 +13,18 @@ function observed(raw: Record<string, unknown>, status: ObservedJob['status'] = 
 
 test('job summary exposes only an observed active tool call as currentActivity', () => {
   const activity = { stepIndex: 3, tool: 'run_command', status: 'active', input: 'npm test' };
-  const summary = toSummary(observed({ recent_activities: [{ stepIndex: 2, tool: 'read_file', status: 'done' }, activity] }), 'agent-smith');
+  const summary = toSummary(observed({ recent_activities: [{ stepIndex: 2, tool: 'read_file', status: 'done' }, activity] }));
   assert.deepEqual(summary.currentActivity, activity);
-  assert.equal(toSummary(observed({ recent_activities: [] }), 'agent-smith').currentActivity, null);
-  assert.equal(toSummary(observed({ recent_activities: [activity] }, 'succeeded'), 'agent-smith').currentActivity, null);
+  assert.equal(toSummary(observed({ recent_activities: [] })).currentActivity, null);
+  assert.equal(toSummary(observed({ recent_activities: [activity] }, 'succeeded')).currentActivity, null);
 });
 
 test('lastActivity retains a completed agy tool while currentActivity is empty', () => {
   const activity = { stepIndex: 3, tool: 'run_command', status: 'done', input: 'npm test' };
-  const summary = toSummary(observed({ recent_activities: [activity] }), 'agent-smith');
+  const summary = toSummary(observed({ recent_activities: [activity] }));
   assert.equal(summary.currentActivity, null);
   assert.deepEqual(summary.lastActivity, activity);
-  assert.deepEqual(toSummary(observed({ recent_activities: [activity] }, 'succeeded'), 'agent-smith').lastActivity, activity);
+  assert.deepEqual(toSummary(observed({ recent_activities: [activity] }, 'succeeded')).lastActivity, activity);
 });
 
 test('toSummary projects digest and changedFileCount when present', () => {
@@ -32,31 +32,31 @@ test('toSummary projects digest and changedFileCount when present', () => {
     phase: 'editing', filesRead: 3, searches: 1, edited: ['a.ts', 'b.ts'], editedCount: 2,
     commands: 4, testRuns: 1, lastTestFailed: false, repeat: { label: 'Bash npm test', count: 2 },
   };
-  const summary = toSummary(observed({ digest, changed_files: ['a.ts', 'b.ts', 'c.ts'] }), 'agent-smith');
+  const summary = toSummary(observed({ digest, changed_files: ['a.ts', 'b.ts', 'c.ts'] }));
   assert.deepEqual(summary.digest, digest);
   assert.equal(summary.changedFileCount, 3);
 });
 
 test('toSummary leaves digest and changedFileCount absent when the job has none', () => {
-  const bare = toSummary(observed({}), 'agent-smith');
+  const bare = toSummary(observed({}));
   assert.equal(bare.digest, undefined);
   assert.equal(bare.changedFileCount, undefined);
   // A digest without the shape the writer produces is not trusted.
-  assert.equal(toSummary(observed({ digest: { phase: 'editing' } }), 'agent-smith').digest, undefined);
-  assert.equal(toSummary(observed({ digest: 'editing' }), 'agent-smith').digest, undefined);
-  assert.equal(toSummary(observed({ changed_files: 'not-a-list' }), 'agent-smith').changedFileCount, undefined);
+  assert.equal(toSummary(observed({ digest: { phase: 'editing' } })).digest, undefined);
+  assert.equal(toSummary(observed({ digest: 'editing' })).digest, undefined);
+  assert.equal(toSummary(observed({ changed_files: 'not-a-list' })).changedFileCount, undefined);
 });
 
 test('toSummary carries finish evidence and liveness inputs, and failedEarly reaches nextAction', () => {
   const raw = { failedEarly: true, toolErrors: 3, changedFilesUnknown: true, cwdMissingAtFinish: true,
     job_status: 'error', error: 'Selected model is not supported in the selected location',
     last_event_at: '2026-10-27T10:00:00.000Z', last_alive_at: '2026-10-27T10:00:30.000Z' };
-  const s = toSummary(observed(raw, 'failed'), 'agent-smith');
+  const s = toSummary(observed(raw, 'failed'));
   assert.deepEqual([s.failedEarly, s.toolErrors, s.changedFilesUnknown, s.cwdMissingAtFinish], [true, 3, true, true]);
   assert.equal(s.lastEventAt, '2026-10-27T10:00:00.000Z');
   assert.equal(s.lastAliveAt, '2026-10-27T10:00:30.000Z');
   assert.match(s.nextAction ?? '', /^Route failed before any work/);
-  const plain = toSummary(observed({ job_status: 'error', error: 'Selected model is not supported in the selected location' }, 'failed'), 'agent-smith');
+  const plain = toSummary(observed({ job_status: 'error', error: 'Selected model is not supported in the selected location' }, 'failed'));
   assert.doesNotMatch(plain.nextAction ?? '', /^Route failed before any work/);
   assert.equal(plain.failedEarly, undefined);
 });

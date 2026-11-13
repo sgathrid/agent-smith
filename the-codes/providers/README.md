@@ -41,9 +41,7 @@ cwd). Once running, every outcome — including an instant crash — arrives thr
 `waitForResult()`, never as a rejection.
 
 `onEvent` and `events` are additive beyond the four members in the original
-brief. Live progress is the entire point of this project (agy-staff wrote a
-complete event log to disk and then told the host model not to look at it), so
-an interface that can only report at the end does not serve the thesis. `onEvent`
+brief. Live progress is the entire point of this project, so an interface that can only report at the end does not serve the thesis. `onEvent`
 is the push form a store writer wants; `events` is the async-iterable form for
 draining and tests. Both feed the same bus.
 
@@ -77,8 +75,7 @@ agy --print=<prompt> --output-format stream-json
 - `--print-timeout` is a Go duration; `SpawnSpec.timeoutMs` is converted
   (`toGoDuration`) and we *also* enforce the budget ourselves.
 
-**Verified by executing** against the live binary, plus ~14 900 archived
-`step_update` records from `~/Repos/renyi/.agy-staff/jobs/`. Event shapes:
+**Verified by executing** against the live binary. Event shapes:
 `{event:'init'}`, `{event:'step_update', step_update:{step_index, state, step_type,
 tool_name, tool_info:{name,parameters,output,error}, text_delta, duration_seconds,
 usage}}`, `{event:'result', result:{conversation_id,status,response,duration_seconds,
@@ -128,13 +125,6 @@ The fix is upstream too — `unrestricted: true` adds
 `--dangerously-skip-permissions` — but detection stays, because a config-level
 allow-rule can still deny one command and the flag does not override an
 explicit deny.
-
-> **agy-staff deletes `progress.json` and `events.jsonl` on warning-free
-> success.** A missing `progress.json` means **"job finished"**, never "job
-> vanished". Treating absence as liveness reports every healthy job as missing.
-> The authoritative terminal signal is `result.md` + `result.md.status.json`.
-> This directory never polls that tree — it is `harness/`'s job — but it is the
-> single most misreadable fact in the system, so it is written down here.
 
 ### codex — `codex.ts`
 
@@ -349,9 +339,6 @@ consumer can tail immediately:
 <stateDir>/stderr.log     the child's stderr, verbatim (4 MB cap)
 <stateDir>/result.json    the JobResult, written on completion
 ```
-
-agy additionally has agy-staff's own `<cwd>/.agy-staff/jobs/<jobId>.*` tree,
-which `harness/` reads. This layer does not touch it.
 
 ## Event contract
 

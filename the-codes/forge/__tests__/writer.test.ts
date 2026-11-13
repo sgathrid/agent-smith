@@ -515,41 +515,6 @@ test('events after the terminal state are ignored', async () => {
   assert.equal(p.latestText, null);
 });
 
-/* ── the registry sweep ────────────────────────────────────────────────────── */
-
-test('one job, one verdict — a mirrored copy left by an older version is not counted twice', async () => {
-  const r = repo();
-  const w = start(r);
-  w.finish(result(), '# Report\n\nthe deliverable text');
-  // Older versions mirrored the job into .agy-staff/jobs; the primary reader
-  // must claim the id or the job is reported twice.
-  const dir = path.join(r, '.agy-staff', 'jobs');
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(path.join(dir, `${w.jobId}.spec.json`), JSON.stringify({ prompt_source: { task: 'mirrored' } }));
-  const all = await readAllObservedJobs(r);
-  assert.equal(all.length, 1);
-  assert.equal(all[0]?.provider, 'agent-smith');
-});
-
-test('an interop job from another harness is still visible, and still once', async () => {
-  const r = repo();
-  // Pre-populate as if agy-staff wrote it.
-  const id = 'implement-musm82da-f1dc1fe4';
-  const dir = path.join(r, '.agy-staff', 'jobs');
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(path.join(dir, `${id}.spec.json`), JSON.stringify({ prompt_source: { task: 'a real job' } }));
-  writeFileSync(
-    path.join(dir, `${id}.result.md.status.json`),
-    JSON.stringify({ status: 'done', finished_at: '2026-10-03T17:05:00.000Z' }),
-  );
-  writeFileSync(path.join(dir, `${id}.result.md`), '# the real report\n\nwith words in it');
-
-  const all = await readAllObservedJobs(r);
-  assert.equal(all.length, 1);
-  assert.equal(all[0]?.provider, 'agy-staff');
-  assert.equal(all[0]?.status, 'succeeded');
-});
-
 /* ── helpers ───────────────────────────────────────────────────────────────── */
 
 /** appendBounded cuts from the FRONT, because the newest text is what is shown. */

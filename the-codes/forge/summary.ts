@@ -9,8 +9,6 @@ import { nextActionFor, type ForgeActivity, type ForgeStatus, type WatchedFileSi
 import type { Acceptance } from './checks.ts';
 
 export interface ListFilter {
-  /** 'agent-smith' (ours, default), 'agy-staff' (interop history), or 'all'. */
-  readonly provider?: string | undefined;
   /** Only jobs in this state. */
   readonly status?: ForgeStatus | undefined;
   readonly limit?: number | undefined;
@@ -27,7 +25,6 @@ export interface JobSummary {
   readonly role: string | null;
   readonly latestSummary: string | null;
   readonly summarySource: 'worker' | null;
-  readonly source: 'agent-smith' | 'agy-staff';
   readonly status: ObservedJob['status'];
   readonly provider: string | null;
   readonly mode: string | null;
@@ -108,7 +105,7 @@ export interface JobDetail extends JobSummary {
 }
 
 /** Project an ObservedJob onto what a list actually needs. */
-export function toSummary(observed: ObservedJob, source: 'agent-smith' | 'agy-staff'): JobSummary {
+export function toSummary(observed: ObservedJob): JobSummary {
   const raw = observed.raw;
   const toolCalls = typeof raw['tool_calls'] === 'number' ? raw['tool_calls'] : null;
   const task = typeof raw['task'] === 'string' && raw['task'] !== '' ? raw['task'] : null;
@@ -125,13 +122,9 @@ export function toSummary(observed: ObservedJob, source: 'agent-smith' | 'agy-st
     role: typeof raw['role'] === 'string' ? raw['role'] : observed.mode,
     latestSummary: raw['summarySource'] === 'worker' && typeof raw['latestSummary'] === 'string' ? raw['latestSummary'] : null,
     summarySource: raw['summarySource'] === 'worker' ? 'worker' : null,
-    source,
     status: observed.status,
-    // `raw.provider` for OUR jobs. Interop jobs carry no provider field: they are
-    // agy-staff's, i.e. agy. Their `profile` ("unrestricted") is a permission
-    // word, not a provider, so it goes to the unrestricted flag.
-    provider: typeof raw['provider'] === 'string' ? raw['provider'] : source === 'agy-staff' ? 'agy' : observed.label,
-    unrestricted: raw['unrestricted'] === true || (source === 'agy-staff' && observed.label === 'unrestricted'),
+    provider: typeof raw['provider'] === 'string' ? raw['provider'] : observed.label,
+    unrestricted: raw['unrestricted'] === true,
     nextAction: nextActionFor({
       status: observed.status,
       jobStatus: typeof raw['job_status'] === 'string' ? raw['job_status'] : null,

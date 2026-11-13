@@ -1,6 +1,6 @@
 ---
 name: terminal-ui
-description: House rules for the agent-smith terminal UI — the band above the prompt and the /agy-radar pane. Adapted from Renyi's ui-motion-loading skill (Geist + Vercel Web Interface Guidelines + Apple HIG) to a redrawn-in-place terminal surface, and reconciled against what Claude Code's mod API and the shipped reference mods actually do. Read before writing any `surfaces/` rendering code. Covers hierarchy, colour, glyphs, width, timing, truncation and empty states.
+description: House rules for the agent-smith terminal UI — the band above the prompt and the /forge pane. Adapted from Renyi's ui-motion-loading skill (Geist + Vercel Web Interface Guidelines + Apple HIG) to a redrawn-in-place terminal surface, and reconciled against what Claude Code's mod API and the shipped reference mods actually do. Read before writing any `surfaces/` rendering code. Covers hierarchy, colour, glyphs, width, timing, truncation and empty states.
 ---
 
 # Terminal UI for agent-smith
@@ -10,7 +10,7 @@ Two surfaces, both in a terminal that is **redrawn, not composited**:
 | Surface | Region | Job |
 | --- | --- | --- |
 | **Band** | 1–4 lines above the prompt | one line per running worker, always glanceable |
-| **Pane** | opened with `/agy-radar` | browsable detail: tool history, output, the report |
+| **Pane** | opened with `/forge` | browsable detail: tool history, output, the report |
 
 Sourced rules are **[S]**. House choices where the sources are silent are **[I]**.
 Terminal reality is a different medium from the web skill this adapts: **no
@@ -241,9 +241,9 @@ Each gets its own copy. Collapsing them is how a status UI ends up saying
 | State | Copy | Example |
 | --- | --- | --- |
 | **Loading** | the specific verb, never "loading" | `Reading job state` |
-| **Empty — never had data** | why it's empty, and when it fills | `No jobs yet · run /agy:implement to start one` |
+| **Empty — never had data** | why it's empty, and when it fills | `No jobs yet · delegate a task to start one` |
 | **Empty — filtered** | name the filter | `No running jobs · 14 finished` |
-| **Error** | what failed **and what to do** | `.agy-staff unreadable · is the path right?` |
+| **Error** | what failed **and what to do** | `Can't read job state · is the path right?` |
 | **Nothing selected** (pane) | list with no highlighted row | never a fake selection on row 0 |
 
 The pattern to copy is Claude Code's usage panel: *"No attribution data yet ·

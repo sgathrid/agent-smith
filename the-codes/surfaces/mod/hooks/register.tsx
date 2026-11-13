@@ -116,7 +116,7 @@ const bandJobs = atom({ plugin: 'agent-smith', key: 'bandJobs' } as const, [] as
 const bandConfig = atom({ plugin: 'agent-smith', key: 'bandConfig' } as const, {
   repo: DEFAULT_REPO,
   colour: true,
-  source: 'cwd' as 'env' | 'cwd' | 'launch',
+  source: 'cwd' as 'cwd' | 'launch',
 });
 
 /**
@@ -151,7 +151,6 @@ async function sessionRows($: EngineInterface): Promise<RadarJob[]> {
 // The band is the 1–4 line strip between the transcript and the prompt. It owns:
 //   - the `ui.render` matcher for component 'AbovePrompt'
 //   - the session.start wiring: config, the 1 s band clock, the 3 s data poll
-//   - an immediate poll when a Bash call looks like a dispatch
 //
 // It is exported as a function rather than registered inline because `register`
 // below belongs to the pane and must not be edited to fix a band bug. The pane
@@ -236,8 +235,7 @@ async function takeLaunch($: EngineInterface, launch: Launch, cwd: string): Prom
   const repo = launch.repo ?? cwd;
   // The ack's repo is where the MCP server keeps its jobs, so it is the repo
   // to watch. The session cwd was only a guess: it differs when the session
-  // started, or restarted, somewhere other than where the server did. Only an
-  // explicit AGY_RADAR_REPO is kept over it.
+  // started, or restarted, somewhere other than where the server did.
   if (repo !== '' && await adoptRepo($, repo)) await pollBand($).catch(() => {});
   const cfg = await read($, bandConfig);
   // Whether this session shows the job is a separate question from who
@@ -257,12 +255,11 @@ async function takeLaunch($: EngineInterface, launch: Launch, cwd: string): Prom
 }
 
 /**
- * Watch `repo`, the repo a launch reported, unless AGY_RADAR_REPO pins another.
+ * Watch `repo`, the repo a launch reported.
  * True when the watched repo changed, so the caller can re-read jobs now.
  */
 async function adoptRepo($: EngineInterface, repo: string): Promise<boolean> {
   const cfg = await read($, bandConfig);
-  if (cfg.source === 'env') return false;
   if (sameRepo(repo, cfg.repo)) {
     if (cfg.source !== 'launch') await update($, bandConfig, (c) => ({ ...c, source: 'launch' as const }));
     return false;
@@ -379,25 +376,21 @@ export async function startBand($: EngineInterface, cwd?: string): Promise<void>
   // refused at compile time, "so the variables a module reads and writes can be
   // listed"), so each is spelled out. no-color.org: present AND non-empty means
   // no colour; FORCE_COLOR=0/false and TERM=dumb are the same request.
-  const [nc, force, term, repo] = await Promise.all([
+  const [nc, force, term] = await Promise.all([
     $.env.get('NO_COLOR').catch(() => undefined),
     $.env.get('FORCE_COLOR').catch(() => undefined),
     $.env.get('TERM').catch(() => undefined),
-    $.env.get('AGY_RADAR_REPO').catch(() => undefined),
   ]);
-  const pinned = repo !== undefined && repo.trim() !== '' ? repo.trim() : null;
   await update($, bandConfig, (previous) => ({
-    // Precedence: explicit AGY_RADAR_REPO, else the repo a launch already
-    // reported, else the session cwd, else DEFAULT_REPO (empty by design). A
-    // hardcoded developer path here would make the plugin show another
-    // machine's jobs.
+    // Precedence: the repo a launch already reported, else the session cwd,
+    // else DEFAULT_REPO (empty by design). A hardcoded developer path here
+    // would make the plugin show another machine's jobs.
     //
     // A launch's repo outranks the cwd because session.start fires again on a
     // resume or compaction, and by then the cwd may have moved (a persisted
     // `cd`, a worktree) while the MCP server still writes jobs under the
     // directory it started in. See takeLaunch.
-    ...(pinned !== null ? { repo: pinned, source: 'env' as const }
-      : previous.source === 'launch' && previous.repo !== '' ? { repo: previous.repo, source: 'launch' as const }
+    ...(previous.source === 'launch' && previous.repo !== '' ? { repo: previous.repo, source: 'launch' as const }
       : { repo: cwd !== undefined && cwd !== '' ? cwd : DEFAULT_REPO, source: 'cwd' as const }),
     colour: !noColor({ NO_COLOR: nc, FORCE_COLOR: force, TERM: term }),
   }));
@@ -431,7 +424,7 @@ export async function startBand($: EngineInterface, cwd?: string): Promise<void>
 
   // The data poll, on its own slower cadence. Notices go out from here only:
   // a timer runs outside any event, which is where `$.prompt.submit` belongs.
-  // The other pollBand callers run inside a hook (a Bash tool.call, /forge),
+  // The other pollBand caller runs inside a hook (/forge),
   // where a submit could be refused after the notice was already recorded.
   $.clock.every(POLL_MS, () => {
     void (async () => {
@@ -474,7 +467,7 @@ async function pollNativeTasks($: EngineInterface, rows: readonly RadarJob[]): P
 // ── the band's remaining registrations ─────────────────────────────────────
 //
 // Its session-start half is `startBand` above, because the engine refuses two
-// matcher-less registrations of the same event in one module. These two need
+// matcher-less registrations of the same event in one module. These need
 // nothing from the pane, so they are registered here.
 
 /**
@@ -484,20 +477,6 @@ async function pollNativeTasks($: EngineInterface, rows: readonly RadarJob[]): P
  * half. Its rows' digit hotkeys open the pane through `openForge`.
  */
 function registerBand(on: Parameters<Register>[0]): void {
-  // A Bash call that looks like a dispatch: refresh NOW, not in up to 3 s.
-  // TERMINAL-UI.md L22-35 says nothing moves unless the user caused it, and the
-  // user causing it here is dispatching a job. Making them wait 3 s to see the
-  // job they just started is the delay they would notice and blame the band for.
-  // The trigger is deliberately narrow: refreshing on every Bash call would poll
-  // on every `ls`.
-  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
-    const command = typeof e.command === 'string' ? e.command : '';
-    if (/agy-staff|\bagy\s+(implement|review|moderate|researcher|implementer|reviewer)\b/.test(command)) {
-      await pollBand($).catch(() => {});
-    }
-    return next(e);
-  });
-
   // A launch this session made: wrap the launch tool, read its result, claim it
   // for the mod's notices (see takeLaunch), and return the result untouched.
   on('tool.call', { tool: LAUNCH_TOOL }, async ($, e, next) => {
@@ -647,7 +626,7 @@ export const register: Register = (on) => {
   // TWO calls are the entire band↔pane coupling.
   //
   //   registerBand  registers the band's AbovePrompt render hook and its
-  //              Bash-dispatch poll, and stores its session-start half.
+  //              launch and status hooks, and stores its session-start half.
   //   startBand()   that stored half, awaited inside the handler below. It cannot
   //              register its own `session.start`: VERIFIED, the engine refuses
   //              two matcher-less registrations of one event in a module

@@ -20,7 +20,7 @@ REPO="$(cd "$REPO" && pwd)"
 }
 MCP_CONFIG="$(node --input-type=module - "$HERE" "$REPO" <<'JS'
 const [root, repo] = process.argv.slice(2);
-console.log(JSON.stringify({mcpServers:{'agent-smith':{command:process.execPath,args:[`${root}/the-codes/surfaces/channel/dist/server.js`],env:{AGY_WATCH_CWD:repo}}}}));
+console.log(JSON.stringify({mcpServers:{'agent-smith':{command:process.execPath,args:[`${root}/the-codes/surfaces/channel/dist/server.js`,repo]}}}));
 JS
 )"
 ARGS=(--plugin-dir "$HERE/the-codes/surfaces/mod" --mcp-config "$MCP_CONFIG")

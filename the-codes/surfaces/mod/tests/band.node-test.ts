@@ -149,7 +149,7 @@ test('the clock cell is a fixed width, so nothing tears when the second changes'
 });
 
 test('a job with no known start gets a BLANK clock, never 0s', () => {
-  // harness/normalize.ts refuses to invent a start for agy-staff. Printing `0s`
+  // We never invent a start time. Printing `0s`
   // about a job that has been working for half an hour is a fabrication.
   const line = buildLine(job({ startedAt: null, toolCount: null }), Date.now());
   assert.ok(!line.plain.includes('0s'), `blank clock expected, got: ${line.plain}`);
@@ -290,7 +290,7 @@ test('a succeeded job with warnings says so in words, not in colour', () => {
       status: 'succeeded',
       startedAt: 0,
       endedAt: 2_000,
-      warnings: [{ code: 'suspicious_success', message: 'agy-staff set warnings:true' }],
+      warnings: [{ code: 'suspicious_success', message: 'worker reported warnings' }],
     }),
     2_000,
   );
@@ -299,8 +299,7 @@ test('a succeeded job with warnings says so in words, not in colour', () => {
 });
 
 test('an unknown tool count is omitted entirely, with no dangling separator', () => {
-  // HAZARD A: agy-staff deletes events.jsonl on a warning-free success, so for a
-  // clean finish there is genuinely no count on disk. `0 tools` is a fabrication;
+  // A job can have genuinely no count on disk. `0 tools` is a fabrication;
   // `· ·` reads as a rendering bug. And there IS a count to be had from
   // progress.json's step_index, which is why this is omitted rather than zeroed.
   const line = buildLine(job({ status: 'succeeded', startedAt: 0, endedAt: 5_000, toolCount: null }), 5_000);
@@ -391,8 +390,7 @@ test('a finished job lingers LINGER_MS and then leaves', () => {
 });
 
 test('a finished job from hours ago is NOT shown', () => {
-  // The real corpus at /Users/gathrid/Repos/renyi/.agy-staff/jobs holds 20 jobs
-  // finished hours ago. A band that showed four of them at session start would be
+  // A repo can hold jobs finished hours ago. A band that showed four of them at session start would be
   // asserting work is in flight when it is not. This is why isShown measures from
   // endedAt and NOT from "when we first noticed".
   const hoursOld = job({ status: 'succeeded', startedAt: 0, endedAt: Date.now() - 6 * 3600_000 });

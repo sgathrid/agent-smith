@@ -1,28 +1,20 @@
 /**
  * registry.ts — provider name → reader, and `readObservedJob()`.
  *
- * Production reads one job at a time (forge/service.ts, via the id's known
- * provider), so this stays tiny: two readers and one fault-isolating read.
+ * Production reads one job at a time (forge/service.ts), so this stays tiny:
+ * one reader, "agent-smith", and one fault-isolating read.
  *
- *   "agent-smith"  PRIMARY.  Every job this repo spawned. Authoritative.
- *   "agy-staff"    INTEROP.  Somebody else's layout, read-only. Callers skip
- *                            forge ids here: older versions mirrored our jobs
- *                            into `.agy-staff/jobs/` and copies may remain, so
- *                            two verdicts for one id must never exist.
- *
- * WHY FAULT ISOLATION MATTERS: readers read other people's mutable state. A
+ * WHY FAULT ISOLATION MATTERS: readers read state a live worker is rewriting. A
  * reader that throws (bad symlink, exotic errno) must degrade to an `unknown`
  * job, never to a crashed band. Every call here is wrapped.
  */
 
 import { AgentSmithReader } from "./agent-smith.ts";
-import { AgyStaffReader } from "./agy-staff.ts";
 import { normalize } from "./normalize.ts";
 import type { JobStateReader, ObservedJob } from "./types.ts";
 
 const READERS: ReadonlyMap<string, JobStateReader> = new Map<string, JobStateReader>([
   ["agent-smith", new AgentSmithReader()],
-  ["agy-staff", new AgyStaffReader()],
 ]);
 
 /**

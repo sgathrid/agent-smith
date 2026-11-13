@@ -90,18 +90,10 @@ claude          # launched IN the repo; .agent-smith/jobs is found there
 The band needs no flags, no channels, and no model tokens. It reads
 `<repo>/.agent-smith/jobs/`.
 
-To watch a *different* repo from the one you launched in:
-
-```bash
-export AGY_RADAR_REPO=/path/to/repo
-claude
-```
-
 ### Configuration
 
 | variable | default | meaning |
 |---|---|---|
-| `AGY_RADAR_REPO` | the session's cwd | the repo whose `.agent-smith/jobs/` to read |
 | `NO_COLOR` | unset | any non-empty value drops all colour (glyphs remain) |
 | `FORCE_COLOR` | unset | `0` or `false` treated as `NO_COLOR` |
 | `TERM` | unset | `dumb` treated as `NO_COLOR` |
@@ -117,7 +109,7 @@ is refused at compile time), which is why they are spelled out rather than
 looped over.
 
 **`DEFAULT_REPO` in `hooks/register.tsx` is the empty string.** It used to be
-`/Users/gathrid/Repos/renyi`, which is not a thing a shipped plugin should
+a developer's absolute path, which is not a thing a shipped plugin should
 contain: on another machine that path is either absent or — worse — someone
 else's repo, and the band would confidently draw their jobs. It is empty now, and
 `session.start`'s `e.cwd` fills it in; `register.tsx` reads the result from the
@@ -297,7 +289,7 @@ activity clause is the varying field and it is truncated at the source anyway.
 ```
 cannot import "node:path" (from hooks/job-source.ts): a hooks module
   imports its own files by relative path and "claude-code", nothing else
-cannot import "../../../harness/agy-staff.ts": it is outside the plugin's folder
+cannot import "../../../harness/agent-smith.ts": it is outside the plugin's folder
 ```
 
 So the mod did not load at all, and nothing in it worked. It is now one reader,

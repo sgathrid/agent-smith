@@ -18,34 +18,11 @@ isolates reader failures (an `unknown` job, never a throw).
 
 | provider | source | job id |
 |---|---|---|
-| `agent-smith` (primary) | `<repo>/.agent-smith/jobs/<id>/job.json` and sidecars | `<mode>-smith-<8 hex>` |
-| `agy-staff` (interop, read-only) | `<repo>/.agy-staff/jobs/` | `implement-musm82da-f1dc1fe4` |
+| `agent-smith` | `<repo>/.agent-smith/jobs/<id>/job.json` and sidecars | `<mode>-smith-<8 hex>` |
 
-The `agent-smith` reader owns forge ids. Older versions mirrored forge jobs into
-`.agy-staff/jobs/` and copies may remain on disk, so callers skip forge ids
-(`isForgeJobId`) when reading `agy-staff`: one job, one verdict.
-
-## The three agy-staff hazards
-
-**A. Deleted `progress.json` means FINISHED, not missing.** On a warning-free
-success agy-staff deletes `progress.json` *and* `events.jsonl`. Treating that as
-"no such job" silently loses completed work. Terminal state is anchored on the
-always-written `<jobId>.result.md.status.json`; progress/events are only optional
-liveness evidence, so a finished job still returns a full snapshot.
-
-**B. `.spec.json.cancel` markers.** Cancelled jobs get a sibling marker file whose
-body is the cancel timestamp. It can appear before `status.json` is finalized, so
-it outranks it (2 of 20 real jobs).
-
-**C. Polluted `result.md`.** Some reports carry `<system_notification>…</system_notification>`
-blocks agy-staff never stripped; `stripSystemNotifications()` removes them. Real
-job `implement-musm82da-f1dc1fe4.result.md` has 12. Clean upstream PR.
-
-## The headline rule
-
-**An empty response with warnings is NOT a clean success.** agy-staff will write
-`{status:'done', warnings:true}` with an empty `result.md`. That normalizes to
-`failed` + `suspicious_success`, never `succeeded`.
+The cancel marker outranks `job.json`: it can exist before the worker is reaped.
+An empty response is never a clean success; that verdict is decided once, when
+the job is written (`forge/format.ts`), not re-derived on read.
 
 Missing files ⇒ `null`, invalid JSON ⇒ `null`, unknown shapes ⇒ skipped and
 counted; `registry.ts` isolates reader failures.

@@ -96,10 +96,8 @@ test('every provider is named as itself; agy is not the default', () => {
   for (const provider of ['codex', 'claude', 'agy', 'opencode', 'kimi']) {
     const text = claudeText([notice({ name: 'W', provider, role: 'review' })]);
     assert.match(text, new RegExp(`^Agent Smith · ✓ W \\(${provider} review\\) · done`));
-    assert.doesNotMatch(text, /agy-radar/);
   }
   assert.match(headline(notice({ id: 'x-1' })), /^✓ job x-1 · done/);
-  assert.match(headline(notice({ id: 'implement-1', source: 'agy-staff' })), /^✓ agy-staff job implement-1 · done/);
 });
 
 test("Claude's text: the user's failed job is one short line, then how to read it", () => {

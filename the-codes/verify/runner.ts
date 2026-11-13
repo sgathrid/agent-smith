@@ -19,8 +19,7 @@
  *     run a command in the working tree → return passed: boolean + evidence
  *
  * and the evidence is BOUNDED, because an unbounded log handed to a model is an
- * invitation to summarise it, which is the thing that fails. 8KB per stream,
- * same bound agy-staff uses, for the same reason.
+ * invitation to summarise it, which is the thing that fails. 8KB per stream.
  * ─────────────────────────────────────────────────────────────────────────────
  *
  * ─────────────────────────────────────────────────────────────────────────────
@@ -52,7 +51,7 @@ import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import type { Check, CheckObservation, CheckReport, Expectation, Verdict } from './types.ts';
 
-/** Default cap per stream. Matches agy-staff's bound. */
+/** Default cap per stream. */
 export const DEFAULT_TAIL_BYTES = 8 * 1024;
 
 /** Grace between SIGTERM and SIGKILL when a check times out. */

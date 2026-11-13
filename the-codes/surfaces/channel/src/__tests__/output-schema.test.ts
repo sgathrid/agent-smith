@@ -38,7 +38,7 @@ const ack: SpawnAck = {
 };
 const summary: JobSummary = {
   jobId: 'job-1', name: 'Ada', workerId: 'Ada', role: 'review', latestSummary: 'Found two bugs in the parser.', summarySource: 'worker',
-  source: 'agent-smith', status: 'succeeded', provider: 'codex', mode: 'review', model: 'gpt-x', task: 'Review parser', toolCalls: 4,
+  status: 'succeeded', provider: 'codex', mode: 'review', model: 'gpt-x', task: 'Review parser', toolCalls: 4,
   currentActivity: null, lastActivity: { stepIndex: 3, tool: 'shell', input: 'npm test', status: 'done' },
   startedAt: '2026-10-11T09:00:00.000Z', updatedAt: '2026-10-11T09:05:00.000Z', finishedAt: '2026-10-11T09:05:00.000Z',
   warnings: [{ code: 'slow', message: 'took a while' }], nextAction: null, unrestricted: false,
@@ -52,14 +52,9 @@ const detail: JobDetail = {
 };
 const running: JobDetail = { ...detail, jobId: 'job-2', name: 'Bo', status: 'running', finishedAt: null, report: null, exitCode: null, latestSummary: null, summarySource: null, lastActivity: null, toolCalls: null, changedFiles: undefined, gitBaseline: undefined, warnings: [] };
 const unknown: JobDetail = { ...running, jobId: 'job-3', name: 'Cy', status: 'unknown' };
-// The sparsest record: an agy-staff interop job (forge/service.ts detail()).
-const interop: JobDetail = {
-  jobId: 'staff-1', name: 'staff-1', workerId: 'staff-1', role: null, latestSummary: null, summarySource: null, source: 'agy-staff',
-  status: 'failed', provider: 'agy', mode: null, model: null, task: null, toolCalls: null, currentActivity: null, lastActivity: null,
-  startedAt: null, updatedAt: null, finishedAt: null, warnings: [], nextAction: 'rerun', report: null, error: null, exitCode: null,
-  unrestricted: true, pipeline: null, stage: null, usage: null, conversation: null, effort: null, cwd: null, cancellable: false,
-};
-const details = [detail, running, unknown, interop];
+// A failed job with no report, exit code or summary: the sparsest terminal record.
+const failed: JobDetail = { ...running, jobId: 'job-4', name: 'Di', status: 'failed', finishedAt: '2026-10-11T09:06:00.000Z', exitCode: 1, error: 'exit 1', nextAction: 'rerun' };
+const details = [detail, running, unknown, failed];
 const service = withWorkerLookup({
   repo, spawnedIds: new Set(['job-1']),
   spawnJob: async () => ack,

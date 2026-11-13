@@ -7,8 +7,6 @@
  * Verified on 2026-10-06 with:
  *   $ agy --print=hello --print-timeout=20s --output-format stream-json \
  *         --model gemini-3.8-flash-low
- * plus cross-checked against 20 archived agy-staff jobs in
- * ~/Repos/renyi/.agy-staff/jobs/ (~14 900 step_update records).
  * Commands used to check: `agy --help`, `agy models`, and live `--print` runs.
  * ============================================================================
  *
@@ -71,26 +69,6 @@
  * which is what makes this whole class of silent failure disappear. But we still
  * check, because a config-level allow-rule can deny a single command and the
  * flag does not override an explicit deny.
- *
- * ----------------------------------------------------------------------------
- * THE OTHER TRAP: agy-staff DELETES progress.json on clean success.
- * ----------------------------------------------------------------------------
- * agy-staff (the host harness that used to drive agy) writes job state under
- *   <cwd>/.agy-staff/jobs/<jobId>.{spec.json,progress.json,events.jsonl,log,
- *                                   result.md,result.md.status.json}
- * On a run with NO warnings it DELETES progress.json and events.jsonl when the
- * job completes. This is not a bug and not a crash — it is the good path.
- *
- * CONSEQUENCE FOR ANY WATCHER (including harness/, and including anyone tempted
- * to poll progress.json from this file): a MISSING progress.json MEANS "JOB
- * FINISHED", NEVER "JOB VANISHED". Treating absence as liveness is how you get
- * a watcher that reports every healthy job as missing. The authoritative
- * terminal signal is the existence of result.md + result.md.status.json.
- *
- * We do NOT poll progress.json here — this adapter owns the live stream, and
- * stdio is authoritative. But we do not touch that tree either: it belongs to
- * harness/. Flagged loudly because it is the single most misreadable fact in
- * the whole system.
  */
 
 import {
@@ -181,8 +159,7 @@ interface AgyResultEvent {
  * Format a millisecond budget as a Go duration string.
  *
  * agy's --print-timeout is typed as a Go `time.Duration` (its help literally
- * says `0s`), and agy-staff's resolved spec.json carries `"timeout":"120m"`,
- * i.e. the same grammar. Verified that `20s` is accepted.
+ * says `0s`). Verified that `20s` is accepted.
  * NOTE: Go durations have no day component; >24h wraps. We clamp to hours.
  */
 function toGoDuration(ms: number): string {
@@ -258,8 +235,8 @@ export function sandboxPlan(spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly'>):
  *                      "proceed-in-sandbox" (seen in the init event), so we do
  *                      not re-request it and accidentally widen the sandbox.
  *   --log-file         our own stderr.log in stateDir already captures it.
- *   --new-project      agy-staff passes --project for grouped sessions; that is
- *                      a harness concern, and SpawnSpec has no field for it.
+ *   --new-project      grouped sessions are a harness concern, and SpawnSpec
+ *                      has no field for it.
  */
 export function buildArgv(spec: SpawnSpec): string[] {
   const argv: string[] = [

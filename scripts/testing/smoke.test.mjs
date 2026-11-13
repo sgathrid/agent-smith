@@ -32,9 +32,8 @@ test('smoke runner exercises isolated MCP scenarios and reports cleanup', () => 
 
 test('live server env removes only fixture binary overrides', () => {
   const env = buildSmokeServerEnv({ PATH: '/bin', AGENT_SMITH_CODEX_BIN: '/tmp/fake-codex', AGENT_SMITH_AGY_BIN: '/tmp/fake-agy', AGENT_SMITH_CLAUDE_BIN: '/opt/claude' }, {
-    repo: '/tmp/smoke-repo', stateDir: '/tmp/smoke-state', fixtureBins: ['/tmp/fake-codex', '/tmp/fake-agy'],
+    stateDir: '/tmp/smoke-state', fixtureBins: ['/tmp/fake-codex', '/tmp/fake-agy'],
   });
-  assert.equal(env.AGY_WATCH_CWD, '/tmp/smoke-repo');
   assert.equal(env.AGENT_SMITH_STATE_DIR, '/tmp/smoke-state');
   assert.equal(env.AGENT_SMITH_CODEX_BIN, undefined);
   assert.equal(env.AGENT_SMITH_AGY_BIN, undefined);

@@ -1,10 +1,8 @@
 node_modules
 *.log
-!the-codes/harness/__tests__/fixtures/**/*.log
 .DS_Store
 
 # Worker state written into consuming repos, not ours.
-.agy-staff/
 .agent-smith/
 
 # Local scratch for the mod/channel dev loop.

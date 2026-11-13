@@ -49,7 +49,6 @@ function rawTransport(tasks = true) {
       role: 'review',
       latestSummary: 'Reviewed fixture.',
       summarySource: 'worker',
-      source: 'agent-smith',
       status,
       provider: 'codex',
       mode: 'review',
@@ -538,8 +537,8 @@ setTimeout(()=>{
   const env = Object.fromEntries(Object.entries(process.env).filter((e): e is [string, string] => e[1] !== undefined));
   const transport = new StdioClientTransport({
     command: process.execPath,
-    args: ['--experimental-strip-types', serverEntry],
-    env: { ...env, AGY_WATCH_CWD: repo, AGENT_SMITH_CODEX_BIN: fake, AGENT_SMITH_TASKS: '1' },
+    args: ['--experimental-strip-types', serverEntry, repo],
+    env: { ...env, AGENT_SMITH_CODEX_BIN: fake, AGENT_SMITH_TASKS: '1' },
     stderr: 'pipe',
   });
   const clientCapabilities = { extensions: { [TASKS_EXTENSION_ID_V2]: {} } };
@@ -634,7 +633,7 @@ child.on('exit', code => process.exit(code ?? 0));
     const isolatedEnv = { ...process.env, CLAUDE_CONFIG_DIR: claudeHome, HOME: tmp };
     const addRes = spawnSync(
       'claude',
-      ['mcp', 'add-json', 'smith-probe', JSON.stringify({ type: 'stdio', command: spy, env: { SPY_WIRE_LOG: wireLog, SPY_PID_LOG: pidLog, AGY_WATCH_CWD: tmp } })],
+      ['mcp', 'add-json', 'smith-probe', JSON.stringify({ type: 'stdio', command: spy, env: { SPY_WIRE_LOG: wireLog, SPY_PID_LOG: pidLog } })],
       { cwd: tmp, env: isolatedEnv, encoding: 'utf8', timeout: scaled(60_000) },
     );
     assert.equal(addRes.status, 0, addRes.stderr);

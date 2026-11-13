@@ -19,15 +19,12 @@ providers/  -> forge/ runtime -> surfaces/channel (MCP + hook watcher) -> surfac
 | `forge/` | Job directory format and status rules (`format.ts`), the single-writer `JobWriter` (`writer.ts`), `ForgeService` (spawn/list/detail/cancel, `service.ts`), closed modes (`modes.ts`), executable acceptance (`checks.ts`), pipeline runner and persistence (`runner.ts`, `execute.ts`). |
 | `pipeline/` | DAG validation, bounded scheduling (1-32), failure propagation, routing/escalation. Does not interpret prose. |
 | `verify/` | Runs acceptance commands against the real working tree; exit codes decide, not worker text. |
-| `harness/` | Readers. `AgentSmithReader` (primary, `.agent-smith/jobs`) and `AgyStaffReader` (read-only interop for `.agy-staff/jobs`), behind `readObservedJob` in `registry.ts`. Readers derive the final status (orphan/cancel rules below). |
+| `harness/` | Reader. `AgentSmithReader` (`.agent-smith/jobs`), behind `readObservedJob` in `registry.ts`. Readers derive the final status (orphan/cancel rules below). |
 | `surfaces/channel/` | MCP server (`server.ts`, `tools.ts`), job-scoped hook watcher (`watch-hook.ts`, reading jobs via `watch-source.ts` and batching notices via `policy.ts`) and the job-scoped CLI monitor (`monitor.ts`). |
 | `surfaces/mod/` | Claude Code mod: band, `/forge` pane, native task-list projection. A UI projection, not an execution runtime. It cannot import outside its plugin folder, so it restates the reader rules. Its one reader is `hooks/canonical.ts` over `.agent-smith/jobs` (`FsLike` and `toEpoch` live in `hooks/fs.ts`). |
 | `cli/` | Argument parsing and detached supervisor (`supervise`), same forge APIs. |
 
-Forge writes only `.agent-smith/jobs/`. Older versions also mirrored jobs into `.agy-staff/jobs/`,
-so copies may remain on disk: `AgentSmithReader` claims forge ids (`<mode>-smith-<8 hex>`,
-`isForgeJobId`) and the interop reader skips them. Genuine agy-staff jobs remain visible
-read-only via `list_jobs provider=agy-staff|all`.
+Forge reads and writes only `.agent-smith/jobs/`. Job ids are `<mode>-smith-<8 hex>`.
 
 ## Job lifecycle and on-disk layout
 
@@ -373,7 +370,7 @@ At `start`, `captureBaseline` (async, never blocks spawn, 2 s git cap) stores
 `gitBaseline {head, dirty[]}` when cwd is a git repo. Before `finish`, `prepareFinish`
 computes `changedFiles`: paths newly dirty, reverted/committed since, baseline-dirty files
 whose content signature moved (first 500 sigs), and paths in commits since the baseline
-HEAD; `.agent-smith/` and `.agy-staff/` excluded, sorted, capped at 200
+HEAD; `.agent-smith/` excluded, sorted, capped at 200
 (`changedFilesTruncated`). It is a worktree diff, not attribution: concurrent jobs in one
 worktree can show each other's edits.
 
@@ -420,8 +417,7 @@ Claude                MCP server (dist/server.js)      Claude Code hooks        
   (`PostToolUse`, `asyncRewake: true`, `timeout: 21900` s) running
   `runtime/dist/watch-hook.js`. `parseHookInput` strips the MCP prefix, unwraps the result
   (`structuredContent` or JSON text), takes `jobId` or `runId`, and resolves the repo from
-  `payload.repo`, else `dir`/`recordPath`, else hook `cwd`, else `AGY_WATCH_CWD`, else
-  `process.cwd()`. It watches that one job/run (a run also its stage jobs) in-process,
+  `payload.repo`, else `dir`/`recordPath`, else hook `cwd`, else `process.cwd()`. It watches that one job/run (a run also its stage jobs) in-process,
   prints the notice to stderr and exits 2 (Claude Code labels that wake "Stop hook
   feedback" and the label can't be changed, so the notice ends by saying it is not an
   error). Any error or non-matching tool exits 0

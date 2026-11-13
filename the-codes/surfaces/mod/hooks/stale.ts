@@ -14,8 +14,7 @@ import { toolLabel } from './progress.ts';
  * constant, here, imported by both surfaces.
  *
  * Value: 15 minutes.
- * Reasoning that number is defensible: agy-staff's own default timeout is 60m
- * (every real spec.json in the corpus says `timeout: "60m"`), so 15m of silence
+ * Reasoning that number is defensible: against a 60m job budget, 15m of silence
  * is a quarter of the budget gone with nothing to show, while still leaving ample
  * room for a genuinely long single command like `cargo test --workspace` on a
  * cold target directory.
