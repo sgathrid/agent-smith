@@ -123,6 +123,8 @@ export const FILES = {
   steerHead: 'steer.head',
   /** The acceptance checks a job was spawned with, so resume_job can inherit them. */
   checksSpec: 'checks-spec.json',
+  /** The spawn_job request (prompt, context, mode, ...), so a later spawn can reuse it with `from`. */
+  request: 'request.json',
 } as const;
 
 export type SteerDelivery = 'queue' | 'interrupt';

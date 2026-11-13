@@ -1,5 +1,7 @@
 /** MCP control surface over the canonical forge runtime. */
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import { claimMarkerPath } from '../../mod/hooks/notice.ts';
 import type { CallToolResult } from '@modelcontextprotocol/server';
 import type { Server } from '@modelcontextprotocol/server';
 import type { ForgeStatus } from '../../../forge/format.ts';
@@ -62,6 +64,8 @@ export interface HandlerContext {
   readonly onJobPrepared?: (jobId: string) => void;
   /** The MCP server, to ask the user mid-call (elicitation). Absent outside the server: no prompt is possible. */
   readonly server?: Pick<Server, 'getClientCapabilities' | 'elicitInput'>;
+  /** Override CANCEL_SETTLE_MS (tests). */
+  readonly cancelSettleMs?: number;
 }
 export function json(value: unknown): ToolOutcome { return { content: [{ type: 'text', text: JSON.stringify(value, null, 2) }] }; }
 /** json plus structuredContent (arrays wrapped as {items}). */
@@ -110,7 +114,8 @@ const listCapabilitiesTool: Handler = async (ctx, args) => {
   return structured(await listCapabilities(ctx, boolean(args, 'refresh') ?? false, fmt, allowed(args, 'provider', PROVIDERS)), { compact: fmt === 'concise' });
 };
 
-const spawnJob: Handler = async (ctx, args) => {
+/** One spawn: the ack as an object. Throws on a bad request or a refused confirmation. */
+async function spawnOne(ctx: HandlerContext, args: Args): Promise<Record<string, unknown>> {
   const mode = allowed(args, 'mode', MODES); if (mode === undefined) throw new Error(`mode is required; one of ${MODES.join(', ')}.`);
   const cfg = loadModelConfig({ repo: ctx.service.repo });
   const resolved = resolveRequest({ provider: allowed(args, 'provider', PROVIDERS), model: text(args, 'model'), effort: allowed(args, 'effort', EFFORTS), mode }, cfg);
@@ -138,17 +143,75 @@ const spawnJob: Handler = async (ctx, args) => {
   const request = { mode, prompt: text(args, 'prompt', true)!, context: contextText(args), files: filesList(args), checks, cwd: workingDirectory(args), name: text(args, 'name'), task: text(args, 'task'), provider, model: resolved.model, effort: resolved.effort, timeoutMs: number(args, 'timeoutMs'), conversation: text(args, 'conversation'), unrestricted: boolean(args, 'unrestricted'), env: validateEnv(args.env), onPrepared };
   // After every argument is validated, so the user is never asked about a call that then fails.
   const gate = await confirmUnrestricted(ctx, { unrestricted: request.unrestricted, provider, worker: request.name, cwd: request.cwd ?? ctx.service.repo });
-  if (gate.refused) return gate.refused;
+  if (gate.refused) throw new Error(refusedText(gate.refused));
   if (gate.warning) notes.push(gate.warning);
-  if (!checks?.length) return structured({ ...withNotes(await ctx.service.spawnJob(request)), provider });
+  const saved = { mode, prompt: request.prompt, context: request.context, files: request.files, cwd: request.cwd, task: request.task, name: request.name, provider, model: text(args, 'model'), effort: allowed(args, 'effort', EFFORTS), timeoutMs: request.timeoutMs, unrestricted: request.unrestricted };
+  if (!checks?.length) { const ack = await ctx.service.spawnJob(request); saveRequest(ctx, ack.jobId, saved); return { ...withNotes(ack), provider }; }
   const { ack, done } = await ctx.service.spawnTracked(request);
   if (!preparedJobIds.includes(ack.jobId)) {
     preparedJobIds.push(ack.jobId);
     try { markAcceptancePending(ctx.service.repo, ack.jobId, checks); } catch (err) { process.stderr.write(`agent-smith acceptance ${ack.jobId}: ${String(err)}\n`); }
   }
   gateAcceptance(ctx, ack.jobId, done, checks, preparedJobIds);
-  return structured({ ...withNotes(ack), provider, checks: checks.map(c => c.name) });
+  saveRequest(ctx, ack.jobId, saved);
+  return { ...withNotes(ack), provider, checks: checks.map(c => c.name) };
+}
+
+const refusedText = (r: ToolOutcome) => (r.content as { text?: string }[])[0]?.text ?? 'refused';
+
+/** The request a fresh spawn was made with, so `from` can reuse its brief. Best effort. */
+function saveRequest(ctx: HandlerContext, jobId: string, saved: Record<string, unknown>): void {
+  try { writeFileSync(jobFile(ctx.service.repo, jobId, FILES.request), JSON.stringify(saved)); } catch { /* from will say the brief is missing */ }
+}
+
+/** Most variants one spawn_job call starts. */
+export const MAX_VARIANTS = 8;
+const VARIANT_KEYS = ['name', 'provider', 'model', 'effort'] as const;
+
+/**
+ * Overrides on top of a base request. A different provider drops the base's model, effort and
+ * unrestricted: they belonged to the old provider.
+ */
+function overlay(base: Args, over: Args): Args {
+  const defined = Object.fromEntries(Object.entries(over).filter(([, v]) => v !== undefined));
+  const switched = defined.provider !== undefined && defined.provider !== base.provider;
+  const kept = switched ? Object.fromEntries(Object.entries(base).filter(([k]) => !['model', 'effort', 'unrestricted'].includes(k))) : base;
+  return { ...kept, ...defined };
+}
+
+/** spawn_job args with `from` resolved: the earlier worker's first request, overlaid with what this call passes. */
+async function inheritFrom(ctx: HandlerContext, args: Args): Promise<Args> {
+  const from = text(args, 'from', true)!;
+  const detail = await ctx.service.resolveWorker(from);
+  const root = detail.workerId || detail.jobId;
+  let saved: Args;
+  try { saved = JSON.parse(readFileSync(jobFile(ctx.service.repo, root, FILES.request), 'utf8')) as Args; } catch {
+    throw new Error(`"${detail.name}" has no saved request to reuse (a pipeline stage, or spawned before from existed); pass mode and prompt.`);
+  }
+  try { saved.checks = JSON.parse(readFileSync(jobFile(ctx.service.repo, root, FILES.checksSpec), 'utf8')); } catch { /* spawned without checks */ }
+  delete saved.name;
+  const { from: _from, ...rest } = args;
+  return overlay(saved, rest);
+}
+
+const spawnJob: Handler = async (ctx, args) => {
+  const base = args.from === undefined ? args : await inheritFrom(ctx, args);
+  if (args.variants === undefined) return structured(await spawnOne(ctx, base));
+  if (ctx.onJobPrepared) throw new Error('variants start several jobs, and a task-augmented call tracks one; call spawn_job once per variant.');
+  if (!Array.isArray(args.variants) || args.variants.length === 0 || args.variants.length > MAX_VARIANTS) throw new Error(`variants must be an array of 1 to ${MAX_VARIANTS} entries.`);
+  const { variants: _v, ...shared } = base;
+  const stem = text(shared, 'name') ?? text(shared, 'mode') ?? 'job';
+  const variants = args.variants.map((raw, i) => { const v = record(raw, `variants[${i}]`); keys(v, [...VARIANT_KEYS]); return v; });
+  const names = variants.map(v => text(v, 'name') ?? [stem, text(v, 'provider') ?? text(shared, 'provider'), text(v, 'model')].filter(Boolean).join('-').slice(0, 80));
+  if (new Set(names).size !== names.length) throw new Error('variants need distinct names; pass name on each variant.');
+  const jobs: Record<string, unknown>[] = [];
+  for (const [i, v] of variants.entries()) {
+    try { jobs.push(await spawnOne(ctx, overlay(shared, { ...v, name: names[i] }))); } catch (err) { jobs.push({ name: names[i], error: err instanceof Error ? err.message : String(err) }); }
+  }
+  return structured({ jobs });
 };
+
+
 
 const resumeJob: Handler = async (ctx, args) => {
   const worker = text(args, 'worker', true)!;
@@ -245,18 +308,50 @@ const pipelineStatus: Handler = async (ctx, args) => {
   return json(format(args) === 'concise' ? concisePipeline(r) : r);
 };
 
+/** The caller asked for this cancel and its answer says the job stopped: mark it claimed so the command hook stays silent. */
+function quietNotice(repo: string, kind: 'job' | 'run', id: string): void {
+  const marker = claimMarkerPath(repo, kind, id);
+  try { mkdirSync(path.dirname(marker), { recursive: true }); writeFileSync(marker, `${new Date().toISOString()}\n`, { flag: 'wx' }); } catch { /* already claimed, or best effort */ }
+}
+
+/** How long cancel waits for a job or run to settle before answering. */
+export const CANCEL_SETTLE_MS = 5_000;
+
+/**
+ * Cancel, then wait briefly for the settled state. The answer is the job's status after the wait,
+ * so the caller learns whether it stopped without a second call. `settled: false` (still
+ * running after the wait) is the one case worth a later status call.
+ */
 const cancelJob: Handler = async (ctx, args) => {
   const id = text(args, 'jobId', true)!;
-  if (readPipeline(ctx.service.repo, id)) return json(cancelPipeline(ctx.service.repo, id));
+  const step = ctx.pollMs ?? WAIT_POLL_MS;
+  const settleBy = Date.now() + (ctx.cancelSettleMs ?? CANCEL_SETTLE_MS);
+  if (readPipeline(ctx.service.repo, id)) {
+    cancelPipeline(ctx.service.repo, id);
+    let run = readPipeline(ctx.service.repo, id);
+    while (run?.status === 'running' && Date.now() < settleBy) { await sleep(Math.min(step, Math.max(0, settleBy - Date.now()))); run = readPipeline(ctx.service.repo, id); }
+    const status = run?.status ?? 'unknown';
+    if (status !== 'running') quietNotice(ctx.service.repo, 'run', id);
+    return json({ runId: id, status, settled: status !== 'running' });
+  }
   const result = ctx.service.cancel(id);
+  const resolved = result.resolvedFrom === undefined ? {} : { resolvedFrom: result.resolvedFrom };
   // A worker that already exited can still have checks running; stop those too.
-  // `checksCanceled` is true only when this process aborted them. With a detached supervisor
-  // the marker `cancel` just wrote is the request; the supervisor stops the checks within ~200 ms.
-  if (abortChecks(id, result.jobId)) return json({ ...result, checksCanceled: true });
+  // With a detached supervisor the cancel marker is the request; the supervisor stops the checks within ~200 ms.
+  const checksCanceled = abortChecks(id, result.jobId);
+  let detail = await ctx.service.detail(result.jobId).catch(() => null);
+  while (detail?.status === 'running' && Date.now() < settleBy) {
+    await sleep(Math.min(step, Math.max(0, settleBy - Date.now())));
+    detail = await ctx.service.detail(resolveHead(ctx, result.jobId)).catch(() => detail);
+  }
+  const status = detail?.status ?? 'unknown';
+  const out: Record<string, unknown> = { jobId: detail?.jobId ?? result.jobId, ...resolved, status, settled: status !== 'running' };
+  if (status !== 'running') quietNotice(ctx.service.repo, 'job', String(out.jobId));
+  if (checksCanceled) return json({ ...out, checksCanceled: true });
   const pending = readAcceptance(ctx.service.repo, result.jobId) as { pending?: boolean; running?: string };
   return json(pending.pending === true && pending.running !== undefined
-    ? { ...result, checksCanceled: false, checksNote: 'Cancel recorded; the supervisor running the acceptance checks will stop them. Check status for acceptance.' }
-    : result);
+    ? { ...out, checksCanceled: false, checksNote: 'The supervisor running the acceptance checks will stop them; status shows acceptance.' }
+    : out);
 };
 
 const runPipeline: Handler = async (ctx, args) => {

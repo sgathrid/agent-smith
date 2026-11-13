@@ -288,11 +288,11 @@ const LAUNCH: Record<string, 'job' | 'run'> = { spawn_job: 'job', resume_job: 'j
  * plugin (`mcp__plugin_agent-smith_agent-smith__`) and dev.sh (`mcp__agent-smith__`).
  */
 export const LAUNCH_TOOL = /^mcp__(?:plugin_agent-smith_)?agent-smith__(?:spawn_job|resume_job|steer_job|run_pipeline)$/;
-export const STATUS_TOOL = /^mcp__(?:plugin_agent-smith_)?agent-smith__(?:status|pipeline_status)$/;
+export const STATUS_TOOL = /^mcp__(?:plugin_agent-smith_)?agent-smith__(?:status|pipeline_status|cancel)$/;
 
 /**
  * When Claude reads a job or pipeline run that has already settled (including
- * acceptance checks), return its { kind, id } so the session can retire its
+ * acceptance checks), or cancels one and the answer says it stopped, return its { kind, id } so the session can retire its
  * pending completion notice instead of waking Claude a second time.
  */
 export function parseSettledRead(toolName: unknown, response: unknown): { readonly kind: 'job' | 'run'; readonly id: string } | null {
@@ -300,6 +300,14 @@ export function parseSettledRead(toolName: unknown, response: unknown): { readon
   const payload = unwrapResponse(response);
   if (payload === null || typeof payload['error'] === 'string') return null;
   const bare = toolName.slice(toolName.lastIndexOf('__') + 2);
+  // Claude cancelled it and the answer says it stopped: a notice would only repeat that.
+  if (bare === 'cancel') {
+    if (payload['settled'] !== true) return null;
+    const runId = payload['runId'];
+    if (typeof runId === 'string' && runId.length > 0) return { kind: 'run', id: runId };
+    const jobId = payload['jobId'];
+    return typeof jobId === 'string' && jobId.length > 0 ? { kind: 'job', id: jobId } : null;
+  }
   if (bare === 'pipeline_status') {
     const runId = payload['runId'];
     const status = payload['status'];
