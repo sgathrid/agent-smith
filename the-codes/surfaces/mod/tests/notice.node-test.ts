@@ -8,7 +8,7 @@ import { test } from 'node:test';
 
 import {
   ACCEPTANCE_HOLD_MS, LAUNCH_TOOL, STATUS_TOOL, type NoticeJob, type NoticeRow, type Owned, type RunRecord,
-  claim, claudeText, displayNoticeText, due, headline, noticeFromRadar, parseLaunch, pipelineOutcome, parseSettledRead, unclaim,
+  claim, claudeText, displayNoticeText, due, headline, noticeFromRadar, parseLaunch, parseLaunches, pipelineOutcome, parseSettledRead, unclaim,
 } from '../hooks/notice.ts';
 import { buildBatch } from '../../channel/src/policy.ts';
 
@@ -405,4 +405,31 @@ test('owned pipeline reports a stalled stage once while the pipeline keeps runni
 test('failure notice includes the provider diagnostic rather than only its category', () => {
   const n = noticeFromRadar(row({ id: 'quota', status: 'failed', failureReason: 'out of credits', failureDetail: 'HTTP 402: payment required for opencode/deepseek' }), 'failed', NOW);
   assert.match(claudeText([n]), /402: payment required/);
+});
+
+test('parseLaunches yields one launch per started variant and skips failed or terminal items', () => {
+  const tool = `${PLUGIN}spawn_job`;
+  const ack = (id: string) => ({ jobId: id, status: 'running', repo: '/repo/', timeoutMs: 1000 });
+  const variants = { jobs: [ack('a'), { name: 'Bad', error: 'boom' }, ack('b'), { jobId: 'c', status: 'succeeded' }] };
+  assert.deepEqual(parseLaunches(tool, { structuredContent: variants, content: [] }).map((l) => l.id), ['a', 'b']);
+  assert.deepEqual(parseLaunches(tool, [{ type: 'text', text: JSON.stringify(variants) }])[0], { kind: 'job', id: 'a', repo: '/repo', timeoutMs: 1000 });
+  assert.deepEqual(parseLaunches(tool, { jobs: [{ name: 'x', error: 'e' }] }), []);
+  // Single acks behave as parseLaunch does.
+  assert.deepEqual(parseLaunches(tool, ack('s')), [parseLaunch(tool, ack('s'))]);
+  assert.deepEqual(parseLaunches(`${PLUGIN}run_pipeline`, { runId: 'r1', repo: '/r' }).map((l) => l.id), ['r1']);
+  assert.deepEqual(parseLaunches(tool, { error: 'nope' }), []);
+  assert.deepEqual(parseLaunches(tool, { jobId: 'j', status: 'succeeded' }), []);
+  assert.deepEqual(parseLaunches(`${PLUGIN}status`, variants), []);
+});
+
+test('parseSettledRead reads a cancel only when it settled', () => {
+  const cancel = `${PLUGIN}cancel`;
+  assert.ok(STATUS_TOOL.test(cancel));
+  assert.deepEqual(parseSettledRead(cancel, { jobId: 'j1', status: 'canceled', settled: true }), { kind: 'job', id: 'j1' });
+  assert.deepEqual(parseSettledRead(cancel, { structuredContent: { jobId: 'j1', status: 'canceled', settled: true, resolvedFrom: 'j0' }, content: [] }), { kind: 'job', id: 'j1' });
+  assert.equal(parseSettledRead(cancel, { jobId: 'j1', status: 'canceling', settled: false }), null);
+  assert.equal(parseSettledRead(cancel, { jobId: 'j1', status: 'canceled' }), null);
+  assert.deepEqual(parseSettledRead(cancel, { runId: 'r1', status: 'canceled', settled: true }), { kind: 'run', id: 'r1' });
+  assert.equal(parseSettledRead(cancel, { runId: 'r1', status: 'canceling', settled: false }), null);
+  assert.equal(parseSettledRead(cancel, { error: 'unknown job', settled: true }), null);
 });

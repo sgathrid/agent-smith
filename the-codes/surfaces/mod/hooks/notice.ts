@@ -365,7 +365,35 @@ export function parseLaunch(toolName: unknown, response: unknown): Launch | null
   const kind = launchKind(toolName);
   if (kind === null) return null;
   const payload = unwrapResponse(response);
-  if (payload === null || typeof payload['error'] === 'string') return null;
+  if (payload === null) return null;
+  return launchFromPayload(kind, payload);
+}
+
+/**
+ * Every launch an ack started. A `variants` spawn answers `{ jobs: [ack | {name, error}, ...] }`:
+ * one launch per item that started a job, none for an item that failed. Any other ack is
+ * the single launch parseLaunch reads.
+ */
+export function parseLaunches(toolName: unknown, response: unknown): Launch[] {
+  const kind = launchKind(toolName);
+  if (kind === null) return [];
+  const payload = unwrapResponse(response);
+  if (payload === null || typeof payload['error'] === 'string') return [];
+  const jobs = payload['jobs'];
+  if (kind === 'job' && Array.isArray(jobs)) {
+    return jobs.flatMap((item): Launch[] => {
+      const one = isRecord(item) ? launchFromPayload('job', item) : null;
+      return one === null ? [] : [one];
+    });
+  }
+  const one = launchFromPayload(kind, payload);
+  return one === null ? [] : [one];
+}
+
+const isRecord = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+function launchFromPayload(kind: 'job' | 'run', payload: Record<string, unknown>): Launch | null {
+  if (typeof payload['error'] === 'string') return null;
   const id = kind === 'job' ? payload['jobId'] : payload['runId'];
   // Hosts may expose only structuredContent and omit the outer MCP metadata.
   if (kind === 'job' && isTerminal(String(payload['status']))) return null;

@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 
 import { existsSync, realpathSync } from 'node:fs';
 import { readAcceptance } from '../../../forge/checks.ts';
-import { claimMarkerPath, parseLaunch, unwrapResponse } from '../../mod/hooks/notice.ts';
+import { claimMarkerPath, parseLaunches, unwrapResponse } from '../../mod/hooks/notice.ts';
 import { type JobWatchOptions, runJobWatch } from './monitor.ts';
 
 /** Longest job a spawn may request (forge MAX_TIMEOUT_MS = 6h). */
@@ -25,7 +25,9 @@ const WATCH_GRACE_MS = 60_000;
 
 export interface WatchTarget {
   readonly kind: 'job' | 'run';
+  /** The first id; `ids` holds every one a variants ack started. */
   readonly id: string;
+  readonly ids: readonly string[];
   readonly cwd: string;
   /**
    * Watch budget: the job's own timeout (from the ack), plus the acceptance budget its checks may take
@@ -46,15 +48,19 @@ const isObj = (v: unknown): v is Record<string, unknown> => v !== null && typeof
  */
 export function parseHookInput(input: unknown): WatchTarget | null {
   if (!isObj(input)) return null;
-  const launch = parseLaunch(input['tool_name'], input['tool_response']);
-  if (launch === null) return null;
+  const launches = parseLaunches(input['tool_name'], input['tool_response']);
+  const launch = launches[0];
+  if (launch === undefined) return null;
   let cwd = launch.repo;
   if (cwd === null && typeof input['cwd'] === 'string' && input['cwd'].length > 0) cwd = input['cwd'];
   if (cwd === null) cwd = process.cwd();
   const resolved = path.resolve(cwd);
-  const budget = launch.kind === 'job' ? pendingBudgetMs(resolved, launch.id) : 0;
-  const timeoutMs = Math.min(WATCH_CAP_MS, (launch.timeoutMs ?? MAX_WATCH_JOB_MS) + budget + WATCH_GRACE_MS);
-  return { kind: launch.kind, id: launch.id, cwd: resolved, timeoutMs };
+  // One watch for all of them: it lasts as long as the longest job's budget.
+  const timeoutMs = Math.max(...launches.map((l) => {
+    const budget = l.kind === 'job' ? pendingBudgetMs(resolved, l.id) : 0;
+    return Math.min(WATCH_CAP_MS, (l.timeoutMs ?? MAX_WATCH_JOB_MS) + budget + WATCH_GRACE_MS);
+  }));
+  return { kind: launch.kind, id: launch.id, ids: launches.map((l) => l.id), cwd: resolved, timeoutMs };
 }
 
 function pendingBudgetMs(cwd: string, jobId: string): number {
@@ -78,7 +84,7 @@ export async function runHook(
       timeoutMs: target.timeoutMs,
       ...options,
       cwd: target.cwd,
-      jobIds: target.kind === 'job' ? [target.id] : [],
+      jobIds: target.kind === 'job' ? [...target.ids] : [],
       runIds: target.kind === 'run' ? [target.id] : [],
       onError: () => {},
       // A hook wakes Claude once (exit 2 with stderr), so it announces once: the verdict, or
@@ -89,7 +95,7 @@ export async function runHook(
     });
     if (lines.length === 0) return 0;
     // The mod claimed this launch and announces it; a second notice would repeat it.
-    if (claimed(target.cwd, target.kind, target.id)) return 0;
+    if (target.ids.every((id) => claimed(target.cwd, target.kind, id))) return 0;
     // Exit 2 is the wake protocol, and the host labels it "Stop hook feedback".
     // This path runs only without the mod (which claims the job and announces it
     // itself), so say plainly that it is a notice, not an error.
