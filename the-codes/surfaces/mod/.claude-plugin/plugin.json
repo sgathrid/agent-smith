@@ -1,6 +1,6 @@
 {
   "name": "agent-smith",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "description": "Delegate to Codex, OpenCode, agy, Kimi, and Claude workers from Claude Code, with live progress, resumable conversations, and executable checks.",
   "author": {
     "name": "Agent Smith"

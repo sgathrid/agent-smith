@@ -26179,6 +26179,16 @@ const listJobs = async (ctx, args) => {
         ? { items: rows, more: `More than ${rows.length} jobs match; narrow with since, status or session, or raise limit.` }
         : rows);
 };
+/**
+ * Still worth waiting on: running, handed to a steer continuation, or exited with its
+ * acceptance checks still running. Without the last, a wait returned the moment the
+ * worker exited, before any verdict, and a caller looping on it spun.
+ */
+function unsettled(ctx, d) {
+    if (d.status === 'running' || Boolean(d.supersededBy))
+        return true;
+    return readAcceptance(ctx.service.repo, d.jobId).pending === true;
+}
 const jobStatus = async (ctx, args) => {
     const jobId = text(args, 'jobId', true);
     const waitMs = number(args, 'wait_ms', MAX_WAIT_MS);
@@ -26190,7 +26200,7 @@ const jobStatus = async (ctx, args) => {
         waited = true;
         const deadline = Date.now() + waitMs;
         const step = ctx.pollMs ?? WAIT_POLL_MS;
-        while ((detail.status === 'running' || Boolean(detail.supersededBy)) && Date.now() < deadline) {
+        while (unsettled(ctx, detail) && Date.now() < deadline) {
             await sleep(Math.min(step, Math.max(0, deadline - Date.now())));
             detail = await ctx.service.detail(resolveHead(ctx, detail.jobId));
         }
@@ -26199,7 +26209,7 @@ const jobStatus = async (ctx, args) => {
     if (boolean(args, 'report_only'))
         return structured({ jobId: detail.jobId, status: detail.status, taskStatus: taskStatus(detail.status), report: detail.report, reportPath });
     const acceptance = readAcceptance(ctx.service.repo, detail.jobId);
-    const wait = waited ? { waited: true, stillRunning: detail.status === 'running' || Boolean(detail.supersededBy) } : {};
+    const wait = waited ? { waited: true, stillRunning: unsettled(ctx, detail) } : {};
     const diff = wantDiff ? await jobDiff(detail) : {};
     // Oldest first, so the turns read in the order the worker took them.
     const earlier = [];
