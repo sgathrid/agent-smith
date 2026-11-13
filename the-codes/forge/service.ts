@@ -391,6 +391,7 @@ export class ForgeService {
       );
     }
     const brief = buildBrief({
+      mode,
       preset,
       cwd,
       context: request.context,
@@ -502,7 +503,12 @@ export class ForgeService {
       ...(warnings.length === 0 ? {} : { warnings }),
     };
 
-    const done = this.pump(writer, provider, spec);
+    const done = this.pump(writer, provider, spec, {
+      rawPrompt: prompt,
+      prependBrief,
+      resuming,
+      context: request.context,
+    });
 
     return { ack, done };
   }
@@ -520,17 +526,51 @@ export class ForgeService {
     initialWriter: JobWriter,
     provider: Provider,
     spec: TurnSpec,
+    initialTurn: {
+      readonly rawPrompt: string;
+      readonly prependBrief: boolean;
+      readonly resuming: boolean;
+      readonly context: string | undefined;
+    },
   ): Promise<ForgeManifest> {
     let currentWriter = initialWriter;
     let currentJobId = spec.jobId;
     let currentPrompt = spec.prompt;
     let currentConversation = spec.conversation;
+    let currentTurn = initialTurn;
     let liveEntry = newLiveJob(currentWriter, spec.timeoutMs);
     // Register synchronously before the first await so a steer or cancel arriving
     // right after spawn_job finds the live entry in this.live.
     this.live.set(currentJobId, liveEntry);
 
     while (true) {
+      if (currentTurn.prependBrief && !currentTurn.resuming && spec.pipeline === null && currentWriter.hasPendingBaseline()) {
+        const dirty = await currentWriter.awaitBaseline();
+        if (liveEntry.userCanceled || currentWriter.cancelled || existsSync(jobFile(this.repo, currentJobId, FILES.cancel))) {
+          currentWriter.requestCancel();
+          this.live.delete(currentJobId);
+          return (
+            currentWriter.abort('canceled', 'canceled by user') ??
+            currentWriter.snapshot() ??
+            ({ jobId: currentJobId } as unknown as ForgeManifest)
+          );
+        }
+        if (dirty.length > 0) {
+          const fullBrief = buildBrief({
+            mode: spec.mode,
+            preset: spec.preset,
+            cwd: spec.cwd,
+            context: currentTurn.context,
+            checks: spec.checks,
+            pipelineStage: false,
+            resuming: false,
+            dirtyFiles: dirty,
+          });
+          currentPrompt = `${fullBrief}\n\n${currentTurn.rawPrompt}`;
+          currentWriter.updatePreamble(fullBrief);
+        }
+      }
+
       let handle: WorkerHandle;
       try {
         handle = await provider.spawn({
@@ -664,6 +704,7 @@ export class ForgeService {
           currentJobId = next.jobId;
           currentPrompt = next.prompt;
           currentConversation = next.conversation;
+          currentTurn = next.turn;
           liveEntry = next.live;
           continue;
         }
@@ -702,7 +743,14 @@ export class ForgeService {
     readonly entries: readonly SteerEntry[];
     readonly unconsumed: readonly SteerEntry[];
     readonly verdictStatus: ForgeStatus;
-  }): Promise<{ writer: JobWriter; jobId: string; live: LiveJob; prompt: string; conversation: string | undefined }> {
+  }): Promise<{
+    writer: JobWriter;
+    jobId: string;
+    live: LiveJob;
+    prompt: string;
+    conversation: string | undefined;
+    turn: { rawPrompt: string; prependBrief: boolean; resuming: boolean; context: string | undefined };
+  }> {
     const { provider, spec, parent, result, report, entries, unconsumed, verdictStatus } = input;
     const conversation = parent.writer.currentConversation();
     const wasInterrupted = parent.live.interruptRequested && verdictStatus !== 'succeeded';
@@ -753,6 +801,7 @@ export class ForgeService {
       }
     }
     const nextBrief = buildBrief({
+      mode: spec.mode,
       preset: spec.preset,
       cwd: spec.cwd,
       context: latestContext,
@@ -803,7 +852,14 @@ export class ForgeService {
     parent.writer.finish(result, report === '' ? null : report);
     this.live.delete(parent.jobId);
 
-    return { writer: nextWriter, jobId: nextJobId, live: nextLiveEntry, prompt: sentPrompt, conversation: conversation ?? undefined };
+    return {
+      writer: nextWriter,
+      jobId: nextJobId,
+      live: nextLiveEntry,
+      prompt: sentPrompt,
+      conversation: conversation ?? undefined,
+      turn: { rawPrompt, prependBrief, resuming, context: latestContext },
+    };
   }
 
   /**

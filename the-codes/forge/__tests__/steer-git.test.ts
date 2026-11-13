@@ -298,6 +298,7 @@ test('watched brief files: rejects symlink escaping repo, enforces 32-file cap, 
     prompt: 'Turn 1.',
   });
   const t1 = await t1Ready;
+  await Promise.resolve();
   t1.emit({ kind: 'started', at: new Date().toISOString(), conversationId: 'thread-resume-del' });
   t1.finish({ status: 'success', response: 'Done turn 1.' });
   await done;

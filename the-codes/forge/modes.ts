@@ -25,25 +25,25 @@ export interface ModePreset {
 export const MODE_PRESETS: Readonly<Record<Mode, ModePreset>> = Object.freeze({
   implement: {
     description: 'Make the change and report what changed and found.',
-    guidance: 'Make the change, keeping it as small as the task allows. The orchestrator reviews the diff, and unrelated edits make that review harder. Say what you changed and why.',
+    guidance: 'Make the change, as small as the task allows; unrelated edits make the diff harder to review. Say what you changed and why.',
     readOnly: false,
     runsCommands: true,
   },
   review: {
     description: 'Read-only review: report defects, missed cases and unsupported claims.',
-    guidance: "Find problems; don't fix them. The author fixes from your findings, and your edits would change the work you're judging, so leave the files as they are. Give each defect, missed case or unsupported claim with its evidence (file:line, a failing input or command). Skip style nits unless asked.",
+    guidance: "Find problems; don't fix them. Give each defect or unsupported claim with evidence (file:line, a failing input or command). Skip style nits unless asked.",
     readOnly: true,
     runsCommands: false,
   },
   moderate: {
     description: 'Independently probe prior work and reviewer findings; findings only.',
-    guidance: "Test the earlier work and any reviewer's claims independently, and confirm or refute each one with evidence. Leave the files as they are: the author fixes from your findings, and your edits would change the work you're judging.",
+    guidance: "Independently test the earlier work and reviewer claims; confirm or refute each one with evidence. Don't edit.",
     readOnly: true,
     runsCommands: false,
   },
   verify: {
     description: 'Run the checks and report what actually happened.',
-    guidance: 'Run the checks and report exactly what happened, including the failing output. If something fails, report it rather than fixing it, so your result describes the work as it was handed to you.',
+    guidance: "Run the checks and report exactly what happened, including failing output. Don't fix failures: your result should describe the work as handed to you.",
     readOnly: false,
     runsCommands: true,
   },
@@ -55,8 +55,8 @@ export const MODE_PRESETS: Readonly<Record<Mode, ModePreset>> = Object.freeze({
  * use it, so a stage is briefed the same way from either surface.
  */
 export const STAGE_PROMPTS: Readonly<Record<'review' | 'moderate', string>> = Object.freeze({
-  review: 'Review the implementation and its supplied artifacts. Report defects with evidence; do not edit code.',
-  moderate: 'Probe the implementation and reviewer findings against the original task. Report unresolved defects with evidence; do not edit code.',
+  review: 'Review the implementation and its supplied artifacts. Report defects with evidence.',
+  moderate: 'Probe the implementation and reviewer findings against the original task. Report unresolved defects with evidence.',
 });
 
 export function isMode(value: string): value is Mode {

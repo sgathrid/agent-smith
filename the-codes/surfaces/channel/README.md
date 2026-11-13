@@ -34,7 +34,7 @@ Its stdio dispatcher serves the 2026-07-28 protocol and legacy clients through
 the same Forge handlers. Setting `AGENT_SMITH_TASKS=1` enables the opt-in 2026-07-28
 MCP Tasks (`io.modelcontextprotocol/tasks`) receiver for `spawn_job` and
 `resume_job` when a modern request advertises client Tasks support; otherwise
-launch `taskHandle` fields remain ordinary tool-result data.
+launch results stay ordinary tool-result data.
 
 The server resolves the workspace from an explicit positional argument, then its
 process cwd. stdout is exclusively MCP JSON-RPC; logs go
