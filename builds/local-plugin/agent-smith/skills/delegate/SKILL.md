@@ -3,7 +3,23 @@ name: delegate
 description: Delegate a task to a named external Codex, OpenCode, agy, Kimi, or Claude harness worker using Agent Smith, brief it with context, workspace and acceptance checks, and verify what it reports. Use when asked for an external worker, another model's view, or a follow-up to an earlier worker.
 ---
 
-Agent Smith runs work on external coding agents through this plugin's MCP tools.
+Agent Smith runs work on external coding agents two ways:
+
+- **As a native subagent**: the Agent tool with `subagent_type: "agent-smith:<name>"`, one type
+  per installed provider and per models.json alias. The worker's steps stream into the agent's
+  row, `SendMessage` steers it, `TaskStop` cancels it, and its report comes back as the agent's
+  result. The prompt may start with header lines, then the task:
+
+  ```
+  mode: review
+  model: gemini-4-hydrogen
+  cwd: /abs/path
+
+  Review the parser changes for missed cases.
+  ```
+
+- **Through the MCP tools** (`spawn_job` and the rest, below): for `checks`, `files`, `env`,
+  `variants`, `from`, pipelines, or anything the headers don't cover.
 
 ## Writing the brief
 
