@@ -34,7 +34,7 @@ export function waitForChange(dir: string, timeoutMs: number, opts: { signal?: A
     let timer: ReturnType<typeof setTimeout>;
     try {
       watcher = watch(dir, { persistent: false }, () => finish('change'));
-      watcher.on('error', () => { timer = setTimeout(() => finish('polled'), Math.min(opts.fallbackMs ?? 500, Math.max(0, timeoutMs))); });
+      watcher.on('error', () => { clearTimeout(timer); timer = setTimeout(() => finish('polled'), Math.min(opts.fallbackMs ?? 500, Math.max(0, timeoutMs))); });
       timer = setTimeout(() => finish('timeout'), Math.max(0, timeoutMs));
     } catch {
       // No watchable directory: fall back to one short sleep.

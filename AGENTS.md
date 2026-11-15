@@ -1,6 +1,6 @@
 # Agent Smith: working in this repo
 
-`npm run verify` (typecheck and node tests) and `npm run test:plugin` (the mod under Claude Code's engine) must pass. CI runs both, plus the two release checks below.
+`npm run verify` (typecheck and node tests) and `npm run test:plugin` (the mod under Claude Code's engine) must pass. CI runs `verify` and the two release checks below. It does not run `test:plugin`, which needs the Claude Code CLI, so run that one yourself before you push.
 
 ## Shipping a change to users
 

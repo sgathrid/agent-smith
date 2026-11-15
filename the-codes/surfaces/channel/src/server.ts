@@ -19,6 +19,8 @@
 // The mod above stays dependency-free because a terminal surface should not drag a
 // library into the user's session.
 
+import { mkdirSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
 import { createSmithServer } from './mcp.ts';
 import { ForgeService } from '../../../forge/service.ts';
@@ -38,6 +40,15 @@ const INSTRUCTIONS =
   "list_capabilities lists each provider's models and efforts.";
 
 // ── the server ──────────────────────────────────────────────────────────────
+
+// The Node this server runs on, for the mod's native agents to start runtime/dist/tail.js
+// with: GUI and nvm installs may have no `node` on PATH. A file, not an ack field, because
+// acks are text Claude reads (AGENTS.md).
+try {
+  const dir = path.join(resolveCwd(), '.agent-smith');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, 'runtime.json'), JSON.stringify({ nodePath: process.execPath }));
+} catch { /* the mod falls back to `node` on PATH, then to the change wait */ }
 
 const forge = new ForgeService({ repo: resolveCwd(), supervisorUrl: new URL(import.meta.url.endsWith('.ts') ? './supervisor.ts' : './supervisor.js', import.meta.url) });
 

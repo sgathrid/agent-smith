@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import process$1 from'node:process';import {randomUUID,randomBytes}from'node:crypto';import {watch,readFileSync,statSync,mkdirSync,writeFileSync,rmSync,linkSync,unlinkSync,existsSync,renameSync,readdirSync}from'node:fs';import path from'node:path';import {c as claimMarkerPath}from'./chunk-notice.js';import {M as MODES$1,a as MODE_PRESETS,i as inheritContinuedProviders,S as STAGE_PROMPTS,v as validateSpec,s as startPipeline,r as readPipeline,c as cancelPipeline,b as isMode,p as providerNames}from'./chunk-execute.js';import {E as EFFORTS$1,M as MAX_WATCHED_FILES,v as validateEnv,g as getCatalogs,l as launchPipeline,a as ENV_KEYS_FILE,b as getInstalledProviders,F as ForgeService}from'./chunk-service.js';import'node:fs/promises';import {r as reasonFromText,D as DEFAULT_TIMEOUT_MS,a as readAcceptance,j as jobDir,b as jobFile,F as FILES,m as markAcceptancePending,s as settleAcceptance,c as markAcceptanceSuperseded,i as isTerminalForgeStatus}from'./chunk-checks.js';import {execFile}from'node:child_process';import os from'node:os';import {l as livenessOf,i as isStalled,L as LIVENESS_STATES}from'./chunk-stale.js';import'node:url';import'node:timers/promises';import'node:readline';import'./chunk-steer-log.js';//#region rolldown:runtime
+import {watch,readFileSync,statSync,mkdirSync,writeFileSync,rmSync,linkSync,unlinkSync,existsSync,renameSync,readdirSync}from'node:fs';import path from'node:path';import process$1 from'node:process';import {randomUUID,randomBytes}from'node:crypto';import {c as claimMarkerPath}from'./chunk-notice.js';import {M as MODES$1,a as MODE_PRESETS,i as inheritContinuedProviders,S as STAGE_PROMPTS,v as validateSpec,s as startPipeline,r as readPipeline,c as cancelPipeline,b as isMode,p as providerNames}from'./chunk-execute.js';import {E as EFFORTS$1,M as MAX_WATCHED_FILES,v as validateEnv,g as getCatalogs,l as launchPipeline,a as ENV_KEYS_FILE,b as getInstalledProviders,F as ForgeService}from'./chunk-service.js';import'node:fs/promises';import {r as reasonFromText,D as DEFAULT_TIMEOUT_MS,a as readAcceptance,j as jobDir,b as jobFile,F as FILES,m as markAcceptancePending,s as settleAcceptance,c as markAcceptanceSuperseded,i as isTerminalForgeStatus}from'./chunk-checks.js';import {execFile}from'node:child_process';import os from'node:os';import {l as livenessOf,i as isStalled,L as LIVENESS_STATES}from'./chunk-stale.js';import'node:url';import'node:timers/promises';import'node:readline';import'./chunk-steer-log.js';//#region rolldown:runtime
 var __create = Object.create;
 var __defProp = Object.defineProperty;
 var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
@@ -25108,7 +25108,7 @@ function waitForChange(dir, timeoutMs, opts = {}) {
         let timer;
         try {
             watcher = watch(dir, { persistent: false }, () => finish('change'));
-            watcher.on('error', () => { timer = setTimeout(() => finish('polled'), Math.min(opts.fallbackMs ?? 500, Math.max(0, timeoutMs))); });
+            watcher.on('error', () => { clearTimeout(timer); timer = setTimeout(() => finish('polled'), Math.min(opts.fallbackMs ?? 500, Math.max(0, timeoutMs))); });
             timer = setTimeout(() => finish('timeout'), Math.max(0, timeoutMs));
         }
         catch {
@@ -25636,7 +25636,6 @@ const STATUS_OUTPUT = open({
 const SPAWN_OUTPUT = open({
     ...STATUS_OUTPUT.properties,
     timeoutMs: typed('integer'), repo: typed('string', 'Repository whose .agent-smith/ holds the job.'),
-    nodePath: typed('string'),
     unrestricted: typed('boolean', 'Whether worker approval prompts are bypassed.'),
     readOnlyEnforced: typed('boolean', 'Present for read-only modes: whether the provider enforces it.'),
     checks: strings('Names of the acceptance checks attached to this job.'),
@@ -25950,7 +25949,7 @@ const listCapabilitiesTool = async (ctx, args) => {
 function slimAck(ack) {
     const out = {
         jobId: ack.jobId, name: ack.name, provider: ack.provider, model: ack.modelResolved ?? null, status: ack.status,
-        timeoutMs: ack.timeoutMs, repo: ack.repo, nodePath: process.execPath, unrestricted: ack.unrestricted,
+        timeoutMs: ack.timeoutMs, repo: ack.repo, unrestricted: ack.unrestricted,
         ...(ack.readOnlyRequested || (isMode(ack.role) && MODE_PRESETS[ack.role].readOnly) ? { readOnlyEnforced: ack.readOnlyEnforced ?? false } : {}),
         ...(ack.envKeys?.length ? { envKeys: ack.envKeys } : {}),
         ...(ack.warnings?.length ? { warnings: ack.warnings } : {}),
@@ -27336,6 +27335,15 @@ const INSTRUCTIONS = 'Agent Smith runs work on external coding agents: codex, ag
     'session gets no announcement: call status with wait_ms until the job settles. ' +
     "list_capabilities lists each provider's models and efforts.";
 // ── the server ──────────────────────────────────────────────────────────────
+// The Node this server runs on, for the mod's native agents to start runtime/dist/tail.js
+// with: GUI and nvm installs may have no `node` on PATH. A file, not an ack field, because
+// acks are text Claude reads (AGENTS.md).
+try {
+    const dir = path.join(resolveCwd(), '.agent-smith');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, 'runtime.json'), JSON.stringify({ nodePath: process.execPath }));
+}
+catch { /* the mod falls back to `node` on PATH, then to the change wait */ }
 const forge = new ForgeService({ repo: resolveCwd(), supervisorUrl: new URL(import.meta.url.endsWith('.ts') ? './supervisor.ts' : './supervisor.js', import.meta.url) });
 /**
  * Which repo to watch.

@@ -172,7 +172,7 @@ test('spawn_job ack is slim: identity, budget, permissions and warnings only', a
   const service = { repo, spawnJob: async () => full } as never;
   const r = await callTool({ service, catalogs: async () => [cat('codex')] } as HandlerContext, 'spawn_job', { mode: 'review', prompt: 'x', provider: 'codex' });
   assert.equal(r.isError, undefined);
-  assert.deepEqual(body(r), { jobId: 'j9', name: 'Ada', provider: 'codex', model: 'gpt-x', status: 'running', timeoutMs: 1000, repo, nodePath: process.execPath, unrestricted: false, readOnlyEnforced: true });
+  assert.deepEqual(body(r), { jobId: 'j9', name: 'Ada', provider: 'codex', model: 'gpt-x', status: 'running', timeoutMs: 1000, repo, unrestricted: false, readOnlyEnforced: true });
   assert.ok(text(r).length < 270 + process.execPath.length, text(r));
 });
 

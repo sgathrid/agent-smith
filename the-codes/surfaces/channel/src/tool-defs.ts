@@ -113,7 +113,6 @@ const STATUS_OUTPUT = open({
 const SPAWN_OUTPUT = open({
   ...(STATUS_OUTPUT.properties as Record<string, unknown>),
   timeoutMs: typed('integer'), repo: typed('string', 'Repository whose .agent-smith/ holds the job.'),
-  nodePath: typed('string'),
   unrestricted: typed('boolean', 'Whether worker approval prompts are bypassed.'),
   readOnlyEnforced: typed('boolean', 'Present for read-only modes: whether the provider enforces it.'),
   checks: strings('Names of the acceptance checks attached to this job.'),

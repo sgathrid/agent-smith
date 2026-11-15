@@ -126,7 +126,7 @@ const listCapabilitiesTool: Handler = async (ctx, args) => {
 export function slimAck(ack: SpawnAck) {
   const out = {
     jobId: ack.jobId, name: ack.name, provider: ack.provider, model: ack.modelResolved ?? null, status: ack.status,
-    timeoutMs: ack.timeoutMs, repo: ack.repo, nodePath: process.execPath, unrestricted: ack.unrestricted,
+    timeoutMs: ack.timeoutMs, repo: ack.repo, unrestricted: ack.unrestricted,
     ...(ack.readOnlyRequested || (isModeName(ack.role) && MODE_PRESETS[ack.role].readOnly) ? { readOnlyEnforced: ack.readOnlyEnforced ?? false } : {}),
     ...(ack.envKeys?.length ? { envKeys: ack.envKeys } : {}),
     ...(ack.warnings?.length ? { warnings: ack.warnings } : {}),

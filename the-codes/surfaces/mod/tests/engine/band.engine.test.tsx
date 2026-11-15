@@ -1087,7 +1087,8 @@ describe('native subagents (turn.step + tail.js)', () => {
     agentId: string,
     mcpHandler: (tool: string, args: Record<string, unknown>) => Record<string, unknown>,
   ) {
-    forgeHost(on, {}, []);
+    // The MCP server records the Node it runs on; the hook starts tail.js with it.
+    forgeHost(on, { '/work/.agent-smith/runtime.json': JSON.stringify({ nodePath: '/opt/node22/bin/node' }) }, []);
     on('http.fetch', () => ({ value: { status: 404, ok: false, headers: {}, text: '' } }));
     on('agent.register', (_$: unknown, e: any) => ({ value: { agent: `agent-smith:${e.name}` } }));
     on('agent.list', () => ({
@@ -1135,7 +1136,7 @@ describe('native subagents (turn.step + tail.js)', () => {
     nativeHost(on, 'agent-stream-1', (tool, args) => {
       mcpCalls.push({ tool, args });
       if (tool === 'spawn_job') {
-        return { jobId: 'job-1', name: 'Ada', provider: 'codex', model: 'gpt-5', status: 'running', repo: '/work', nodePath: '/opt/node22/bin/node' };
+        return { jobId: 'job-1', name: 'Ada', provider: 'codex', model: 'gpt-5', status: 'running', repo: '/work' };
       }
       if (tool === 'steer_job') {
         return { jobId: args.worker, status: 'queued' };

@@ -141,6 +141,14 @@ export function registerNativeAgents(on: Parameters<Register>[0]): void {
     // transcript holds the progress and the report, not a tool row per call.
     const coords = coordinatorMessages(messages);
     let run = runs.get(agentId);
+    // A host that steps the agent again after a delivered SubagentHandback: the run is over.
+    // Without this the step would re-read the settled job and hand back again, up to maxTurns.
+    const lastAssistant = [...messages].reverse().find((m) => m.role === 'assistant');
+    const handedBack = lastAssistant?.toolUses.some((t) => t.name === HANDBACK && t.isError !== true && t.resultText !== undefined) === true;
+    if (handedBack && run !== undefined && coords.length <= run.handled) {
+      yield { kind: 'stop', stopReason: 'end_turn', usage: null };
+      return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: null };
+    }
     const firstUser = messages.find((m) => m.role === 'user');
     if (run === undefined) {
       const plan = nextStep({ messages: firstUser ? [firstUser] : [], toolPrefix: TOOL_PREFIX, defaults: mine.spec.defaults, agentName: mine.name });
@@ -149,7 +157,10 @@ export function registerNativeAgents(on: Parameters<Register>[0]): void {
       if (!ack.ok || typeof ack.data['jobId'] !== 'string') return yield* finish(`Status: BLOCKED\n${withoutReminders(ack.text) || 'spawn_job returned no job'}`);
       // Name what is running: the header above shows the placeholder model, not the worker.
       yield say(['agent-smith', ack.data['provider'], ack.data['model'] ?? 'default model', plan.tool.input['mode']].filter((x) => typeof x === 'string' && x !== '').join(' · '));
-      const nodePath = typeof ack.data['nodePath'] === 'string' && ack.data['nodePath'] !== '' ? ack.data['nodePath'] : undefined;
+      const repo = typeof ack.data['repo'] === 'string' ? ack.data['repo'] : '';
+      const nodePath = repo === '' ? undefined : await $.fs.read(`${repo}/.agent-smith/runtime.json`)
+        .then((t) => { const v = JSON.parse(t) as { nodePath?: unknown }; return typeof v.nodePath === 'string' && v.nodePath !== '' ? v.nodePath : undefined; })
+        .catch(() => undefined);
       run = { jobId: ack.data['jobId'], handled: coords.length, task: firstUser, repo: typeof ack.data['repo'] === 'string' ? ack.data['repo'] : '', nodePath, seq: 0 };
       runs.set(agentId, run);
       await noteLaunch($, run.jobId);
@@ -161,7 +172,6 @@ export function registerNativeAgents(on: Parameters<Register>[0]): void {
         if (!ack.ok || typeof ack.data['jobId'] !== 'string') return yield* finish(`Status: BLOCKED\n${withoutReminders(ack.text) || 'resume_job failed'}`);
         run.jobId = ack.data['jobId'];
         if (typeof ack.data['repo'] === 'string' && ack.data['repo'] !== '') run.repo = ack.data['repo'];
-        if (typeof ack.data['nodePath'] === 'string' && ack.data['nodePath'] !== '') run.nodePath = ack.data['nodePath'];
         run.seq = 0;
         await noteLaunch($, run.jobId);
       }
