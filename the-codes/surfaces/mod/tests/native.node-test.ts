@@ -52,7 +52,7 @@ test('native completion records real outcome and latest worker output without cr
     provider: 'codex', model: 'gpt-6-sol', latestSummary: null, summarySource: null,
   };
   const created = await syncNativeTasks([live], {}, client);
-  assert.equal(created['job-a']?.taskId, 'host-task-4');
+  assert.equal(created['codex-1']?.taskId, 'host-task-4');
 
   const completed = await syncNativeTasks([{
     ...live,
@@ -65,7 +65,7 @@ test('native completion records real outcome and latest worker output without cr
   assert.equal(last?.input.status, 'completed');
   assert.match(String(last?.input.description), /Outcome: failed/);
   assert.match(String(last?.input.description), /Worker said:\nBuild failed/);
-  assert.equal(completed['job-a']?.status, 'completed');
+  assert.equal(completed['codex-1']?.status, 'completed');
 
   calls.length = 0;
   const untouched = await syncNativeTasks([{
@@ -75,7 +75,7 @@ test('native completion records real outcome and latest worker output without cr
   assert.deepEqual(calls, [], 'finished jobs without an existing native link must not flood TaskList');
 });
 
-test('a finished job native task is deleted after the close delay, once', async () => {
+test('a finished worker native task is deleted after the close delay, once', async () => {
   const calls: Array<Record<string, unknown>> = [];
   const client: NativeTaskClient = {
     async create() { return { result: { task: { id: 't1' } } }; },
@@ -85,19 +85,19 @@ test('a finished job native task is deleted after the close delay, once', async 
     id: 'job-d', status: 'succeeded' as const, task: 'x', name: 'w', workerId: 'w', role: 'implement',
     provider: 'codex', model: null, latestSummary: null, summarySource: null,
   };
-  const linked = { 'job-d': { taskId: 't1', status: 'in_progress' as const, fingerprint: '' } };
+  const linked = { 'w': { taskId: 't1', status: 'in_progress' as const, fingerprint: '' } };
   const t0 = 1_000_000;
   const done = await syncNativeTasks([job], linked, client, t0);
-  assert.equal(done['job-d']?.status, 'completed');
-  assert.equal(done['job-d']?.doneAt, t0);
+  assert.equal(done['w']?.status, 'completed');
+  assert.equal(done['w']?.doneAt, t0);
   const early = await syncNativeTasks([job], done, client, t0 + 9_999);
-  assert.equal(early['job-d']?.status, 'completed', 'still shown inside the delay');
+  assert.equal(early['w']?.status, 'completed', 'still shown inside the delay');
   const closed = await syncNativeTasks([job], early, client, t0 + 10_000);
-  assert.equal(closed['job-d']?.status, 'deleted');
+  assert.equal(closed['w']?.status, 'deleted');
   assert.equal(calls.at(-1)?.status, 'deleted');
   const n = calls.length;
   await syncNativeTasks([job], closed, client, t0 + 60_000);
-  assert.equal(calls.length, n, 'a deleted task is never touched again');
+  assert.equal(calls.length, n, 'a deleted task is never touched again while finished');
 });
 
 test('acceptance settlement starts the native close delay, while failed outcomes remain inspectable', async () => {
@@ -110,18 +110,18 @@ test('acceptance settlement starts the native close delay, while failed outcomes
     provider:'codex',model:null,latestSummary:null,summarySource:null,
     acceptance:{state:'unchecked' as const,pending:true,checks:[]}};
   const pending=await syncNativeTasks([job],{},client,1000);
-  assert.equal(pending.j?.status,'in_progress');
-  assert.equal(pending.j?.doneAt,undefined);
+  assert.equal(pending.ada?.status,'in_progress');
+  assert.equal(pending.ada?.doneAt,undefined);
   const accepted={...job,acceptance:{state:'accepted' as const,pending:false,checks:[]}};
   const settled=await syncNativeTasks([accepted],pending,client,60_000);
-  assert.equal(settled.j?.status,'completed');
-  assert.equal(settled.j?.doneAt,60_000);
-  assert.equal((await syncNativeTasks([accepted],settled,client,69_999)).j?.status,'completed');
-  assert.equal((await syncNativeTasks([accepted],settled,client,70_000)).j?.status,'deleted');
+  assert.equal(settled.ada?.status,'completed');
+  assert.equal(settled.ada?.doneAt,60_000);
+  assert.equal((await syncNativeTasks([accepted],settled,client,69_999)).ada?.status,'completed');
+  assert.equal((await syncNativeTasks([accepted],settled,client,70_000)).ada?.status,'deleted');
   const failed={...accepted,status:'failed' as const};
   const failure=await syncNativeTasks([failed],pending,client,60_000);
   const later=await syncNativeTasks([failed],failure,client,100_000);
-  assert.equal(later.j?.status,'completed');
+  assert.equal(later.ada?.status,'completed');
   assert.match(String(calls.at(-1)?.subject),/\[failed\]/);
 });
 
@@ -138,36 +138,66 @@ test('a job this session does not own gets no new task, but an existing link sti
   const notMine = () => false;
   assert.deepEqual(await syncNativeTasks([job], {}, client, 1000, notMine), {});
   assert.equal(calls.length, 0);
-  const linked = { 'job-x': { taskId: 't1', status: 'in_progress' as const, fingerprint: '' } };
+  const linked = { 'w': { taskId: 't1', status: 'in_progress' as const, fingerprint: '' } };
   const done = await syncNativeTasks([{ ...job, status: 'succeeded' }], linked, client, 1000, notMine);
-  assert.equal(done['job-x']?.status, 'completed');
+  assert.equal(done['w']?.status, 'completed');
   const closed = await syncNativeTasks([{ ...job, status: 'succeeded' }], done, client, 11_000, notMine);
-  assert.equal(closed['job-x']?.status, 'deleted');
+  assert.equal(closed['w']?.status, 'deleted');
   assert.equal(calls.filter((c) => c.method === 'create').length, 0);
 });
 
-test('syncNativeTasks transfers an in_progress native task across supersededBy without closing the parent task', async () => {
+test('syncNativeTasks keeps 1 worker-keyed native task across steer and reopens in_progress on resume', async () => {
+  let nextTask = 1;
   const calls: Array<{ method: string; input: Record<string, unknown> }> = [];
   const client: NativeTaskClient = {
-    async create(input) { calls.push({ method: 'create', input }); return { result: { task: { id: 'native-1' } } }; },
+    async create(input) { calls.push({ method: 'create', input }); return { result: { task: { id: `native-${nextTask++}` } } }; },
     async update(input) { calls.push({ method: 'update', input }); return { result: { success: true } }; },
   };
   const parent = {
-    id: 'turn-1', status: 'running' as const, task: 'Build nav', name: 'shell', workerId: 'shell', role: 'implement',
+    id: 'turn-1', turn: 1, status: 'running' as const, task: 'Build nav', name: 'shell', workerId: 'shell', role: 'implement',
     provider: 'codex', model: null, latestSummary: null, summarySource: null,
   };
   const linked = await syncNativeTasks([parent], {}, client, 1000);
-  assert.equal(linked['turn-1']?.taskId, 'native-1');
+  assert.equal(linked['shell']?.taskId, 'native-1');
 
+  // Steer: parent superseded, child turn-2 running -> reuses native-1 without completing parent.
   const supersededParent = { ...parent, status: 'canceled' as const, supersededBy: 'turn-2' };
   const child = {
-    ...parent, id: 'turn-2', status: 'running' as const, steeredFrom: 'turn-1',
+    ...parent, id: 'turn-2', turn: 2, status: 'running' as const, continuedFrom: 'turn-1', continuationKind: 'steer-interrupt' as const,
     latestSummary: 'Pivoting to profile menu.', summarySource: 'worker' as const,
   };
-  const transferred = await syncNativeTasks([supersededParent, child], linked, client, 2000);
-  assert.equal(transferred['turn-1'], undefined, 'parent link moved to child');
-  assert.equal(transferred['turn-2']?.taskId, 'native-1');
-  assert.equal(transferred['turn-2']?.status, 'in_progress');
-  assert.equal(calls.filter((c) => c.method === 'create').length, 1, 'did not create a second native task');
+  const steered = await syncNativeTasks([supersededParent, child], linked, client, 2000);
+  assert.equal(steered['shell']?.taskId, 'native-1');
+  assert.equal(steered['shell']?.status, 'in_progress');
+  assert.equal(calls.filter((c) => c.method === 'create').length, 1, 'did not create a second native task on steer');
   assert.equal(calls.some((c) => c.input.status === 'completed'), false, 'did not mark parent completed');
+
+  // Finish turn-2 -> marks native-1 completed with doneAt.
+  const finishedTurn2 = { ...child, status: 'succeeded' as const };
+  const completed = await syncNativeTasks([supersededParent, finishedTurn2], steered, client, 5000);
+  assert.equal(completed['shell']?.status, 'completed');
+  assert.equal(completed['shell']?.doneAt, 5000);
+
+  // Resume before close delay -> reopens native-1 in_progress and clears doneAt, no second TaskCreate.
+  const resumedTurn3 = {
+    ...parent, id: 'turn-3', turn: 3, status: 'running' as const, continuedFrom: 'turn-2', continuationKind: 'resume' as const,
+  };
+  const reopened = await syncNativeTasks([supersededParent, finishedTurn2, resumedTurn3], completed, client, 8000);
+  assert.equal(reopened['shell']?.taskId, 'native-1');
+  assert.equal(reopened['shell']?.status, 'in_progress');
+  assert.equal(reopened['shell']?.doneAt, undefined, 'doneAt cleared on reopen');
+  assert.equal(calls.filter((c) => c.method === 'create').length, 1, 'reused native task on resume');
+
+  // Finish turn-3 and wait past close delay -> deleted; later resume re-creates a fresh native task.
+  const doneTurn3 = { ...resumedTurn3, status: 'succeeded' as const };
+  const settled3 = await syncNativeTasks([supersededParent, finishedTurn2, doneTurn3], reopened, client, 10_000);
+  const deleted3 = await syncNativeTasks([supersededParent, finishedTurn2, doneTurn3], settled3, client, 20_000);
+  assert.equal(deleted3['shell']?.status, 'deleted');
+
+  const resumedTurn4 = {
+    ...parent, id: 'turn-4', turn: 4, status: 'running' as const, continuedFrom: 'turn-3', continuationKind: 'resume' as const,
+  };
+  const recreated = await syncNativeTasks([supersededParent, finishedTurn2, doneTurn3, resumedTurn4], deleted3, client, 30_000);
+  assert.equal(recreated['shell']?.taskId, 'native-2', 're-creates task after earlier task was deleted');
+  assert.equal(recreated['shell']?.status, 'in_progress');
 });

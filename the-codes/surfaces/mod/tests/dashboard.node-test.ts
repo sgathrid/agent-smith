@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { ATTENTION_TTL_MS, PANE_FALLBACK_COLUMNS, PANE_MIN_COLUMNS, PANE_QUIET_MS, checksLabel, commandTerminalColumns, condenseTimeline, countLine, findWorker, forgeList, groupWorkers, measurePaneTerminalColumns, needsAttention, paneWidthRequest, recordLaunch, scopeLine, sessionBoard, sessionJobs, statusLine, timelineGroupLabel, turnCount, workerHeading, workerLivenessLine, workerStatus } from '../hooks/dashboard.ts';
+import { ATTENTION_TTL_MS, PANE_FALLBACK_COLUMNS, PANE_MIN_COLUMNS, PANE_QUIET_MS, checksLabel, commandTerminalColumns, condenseTimeline, countLine, findWorker, forgeList, groupWorkers, measurePaneTerminalColumns, needsAttention, paneWidthRequest, priorTurnSummary, recordLaunch, scopeLine, sessionBoard, sessionJobs, statusLine, timelineGroupLabel, turnCount, workerHead, workerHeading, workerLivenessLine, workerStatus, workerTurns } from '../hooks/dashboard.ts';
 import { oneLine, sanitizeText } from '../hooks/format.ts';
 import type { RadarJob } from '../types/index.d.ts';
-const job=(id:string,extra:Partial<RadarJob>={}):RadarJob=>({id,status:'running',startedAt:100,endedAt:null,toolCount:1,activity:'Read file.ts',task:'Review',warnings:[],report:null,reasoning:null,raw:{},...extra});
+const job=(id:string,extra:Partial<RadarJob>={}):RadarJob=>({id,workerId:extra.workerId??id,turn:1,status:'running',startedAt:100,endedAt:null,toolCount:1,activity:'Read file.ts',task:'Review',warnings:[],report:null,reasoning:null,raw:{},...extra});
 test('the list puts running and checking work first, then settled work most recent first',()=>{
   const running=job('run',{startedAt:50});
   const pending=job('pending',{status:'succeeded',startedAt:10,endedAt:20,acceptance:{state:'unchecked',pending:true,checks:[]}});
@@ -159,9 +159,13 @@ test('a finished row carries the evidence the writer recorded, and never a fabri
   const digest={phase:'editing' as const,filesRead:2,searches:0,commands:1,testRuns:0,
     edited:['a.ts'],editedCount:1,lastTestFailed:false,repeat:null};
   assert.equal(workerStatus(job('edited',{status:'succeeded',endedAt:200,progress:digest})),'done · 1 file edited');
-  // A steered continuation is named, not hidden.
-  assert.equal(workerStatus(job('steer',{status:'succeeded',endedAt:200,steeredFrom:'job-0',changedFileCount:1})),
+  // Steered and resumed continuations are labeled honestly.
+  assert.equal(workerStatus(job('steer',{status:'succeeded',endedAt:200,turn:2,continuedFrom:'job-0',continuationKind:'steer-queue',changedFileCount:1})),
     'done · 1 file changed · after steer');
+  assert.equal(workerStatus(job('resumed',{status:'succeeded',endedAt:200,turn:2,continuedFrom:'job-0',continuationKind:'resume',changedFileCount:1})),
+    'done · 1 file changed · resumed');
+  assert.equal(workerStatus(job('superseded',{status:'canceled',endedAt:200,supersededBy:'job-2'})),'steered');
+  assert.equal(workerStatus(job('queued',{status:'running',pendingSteers:1,activity:'editing a.ts'})),'Running · steer queued · editing a.ts');
   // A failure keeps its reason and adds the same evidence.
   assert.equal(workerStatus(job('broke',{status:'failed',endedAt:200,failureReason:'timeout',changedFileCount:2})),
     'failed · timed out · 2 files changed');
@@ -243,28 +247,59 @@ test('a settled row says when it started; a live row does not',()=>{
   assert.doesNotMatch(statusLine(job('r',{startedAt:t}),t+10_000,60),/started/);
 });
 
-test('workerLivenessLine drives the pane callout from job.liveness with a 2-minute fallback', () => {
+test('workerLivenessLine drives the pane callout strictly from job.liveness with no legacy fallback', () => {
   const now = 1_000_000;
   // active under 2 min -> no line
-  assert.equal(workerLivenessLine(job('a1', { liveness: { state: 'active', silentForMs: PANE_QUIET_MS - 1, since: now - PANE_QUIET_MS + 1, forMs: PANE_QUIET_MS - 1 } }), now), null);
+  assert.equal(workerLivenessLine(job('a1', { liveness: { state: 'active', silentForMs: PANE_QUIET_MS - 1, since: now - PANE_QUIET_MS + 1, forMs: PANE_QUIET_MS - 1 } })), null);
   // active at 2 min or more -> dim process-alive line
-  assert.deepEqual(workerLivenessLine(job('a2', { liveness: { state: 'active', silentForMs: PANE_QUIET_MS, since: now - PANE_QUIET_MS, forMs: PANE_QUIET_MS } }), now),
+  assert.deepEqual(workerLivenessLine(job('a2', { liveness: { state: 'active', silentForMs: PANE_QUIET_MS, since: now - PANE_QUIET_MS, forMs: PANE_QUIET_MS } })),
     { text: 'No output 2m00s · process alive', tone: 'dim' });
-  assert.deepEqual(workerLivenessLine(job('a3', { liveness: { state: 'active', silentForMs: 130_000, since: now - 130_000, forMs: 130_000 } }), now),
+  assert.deepEqual(workerLivenessLine(job('a3', { liveness: { state: 'active', silentForMs: 130_000, since: now - 130_000, forMs: 130_000 } })),
     { text: 'No output 2m10s · process alive', tone: 'dim' });
   // in-tool -> no line, even when silent for a long time
-  assert.equal(workerLivenessLine(job('t1', { liveness: { state: 'in-tool', silentForMs: 16 * 60_000, since: now - 16 * 60_000, forMs: 16 * 60_000, tool: 'cargo test' } }), now), null);
-  // silent -> yellow Stalled <elapsed>
-  assert.deepEqual(workerLivenessLine(job('s1', { status: 'attention', liveness: { state: 'silent', silentForMs: 16 * 60_000, since: now - 16 * 60_000, forMs: 16 * 60_000 } }), now),
-    { text: 'Stalled 16m00s', tone: 'yellow' });
+  assert.equal(workerLivenessLine(job('t1', { liveness: { state: 'in-tool', silentForMs: 16 * 60_000, since: now - 16 * 60_000, forMs: 16 * 60_000, tool: 'cargo test' } })), null);
+  // silent -> yellow No output <elapsed> (never "Stalled")
+  assert.deepEqual(workerLivenessLine(job('s1', { status: 'attention', liveness: { state: 'silent', silentForMs: 16 * 60_000, since: now - 16 * 60_000, forMs: 16 * 60_000 } })),
+    { text: 'No output 16m00s', tone: 'yellow' });
   // dead -> red Worker process gone <elapsed of forMs>
-  assert.deepEqual(workerLivenessLine(job('d1', { status: 'attention', liveness: { state: 'dead', silentForMs: 18 * 60_000, since: now - 3 * 60_000, forMs: 3 * 60_000 } }), now),
+  assert.deepEqual(workerLivenessLine(job('d1', { status: 'attention', liveness: { state: 'dead', silentForMs: 18 * 60_000, since: now - 3 * 60_000, forMs: 3 * 60_000 } })),
     { text: 'Worker process gone 3m00s', tone: 'red' });
-  // No liveness: running uses 2 min threshold (> PANE_QUIET_MS)
-  assert.equal(workerLivenessLine(job('o1', { lastEventAt: now - PANE_QUIET_MS }), now), null);
-  assert.deepEqual(workerLivenessLine(job('o2', { lastEventAt: now - PANE_QUIET_MS - 1_000 }), now),
-    { text: 'Stalled 2m01s', tone: 'yellow' });
-  assert.equal(workerLivenessLine(job('o3', { lastEventAt: null }), now), null);
-  // Terminal job: no line even if lastEventAt is old
-  assert.equal(workerLivenessLine(job('done', { status: 'succeeded', endedAt: now - 1_000, lastEventAt: now - 10 * 60_000 }), now), null);
+  // No liveness: returns null (legacy lastEventAt fallback purged)
+  assert.equal(workerLivenessLine(job('o2', { lastEventAt: now - PANE_QUIET_MS - 1_000 })), null);
+  // Terminal job: no line
+  assert.equal(workerLivenessLine(job('done', { status: 'succeeded', endedAt: now - 1_000, lastEventAt: now - 10 * 60_000 })), null);
+});
+
+test('priorTurnSummary formats inline clickable prior turns honestly without labeling steered parents canceled', () => {
+  const steeredParent = job('t1', {
+    workerId: 'ada', turn: 1, status: 'canceled', supersededBy: 't2',
+    startedAt: 0, endedAt: 72_000, toolCount: 14,
+  });
+  assert.equal(priorTurnSummary(steeredParent, 1, 100_000), '▸ Turn 1 · steered · 14 tools · 1m12s');
+
+  const resumedParent = job('t1-res', {
+    workerId: 'ada', turn: 1, status: 'succeeded',
+    startedAt: 10_000, endedAt: 55_000, chainStartedAt: 0, toolCount: 1,
+  });
+  // Uses turn's own endedAt - startedAt (45s), NOT chainStartedAt (55s).
+  assert.equal(priorTurnSummary(resumedParent, 1, 100_000), '▸ Turn 1 · done · 1 tool · 45s');
+
+  const failedParent = job('t1-fail', {
+    workerId: 'ada', turn: 1, status: 'failed', failureReason: 'timeout',
+    startedAt: 0, endedAt: 30_000, toolCount: null,
+  });
+  assert.equal(priorTurnSummary(failedParent, 1, 100_000), '▸ Turn 1 · failed · timed out · 30s');
+});
+
+test('workerTurns, workerHead, statusLine and sessionJobs unify steered and resumed turns', () => {
+  const t1 = job('t1', { workerId: 'ada', turn: 1, status: 'canceled', supersededBy: 't2', startedAt: 0, endedAt: 60_000, chainStartedAt: 0 });
+  const t2 = job('t2', { workerId: 'ada', turn: 2, status: 'running', continuedFrom: 't1', continuationKind: 'steer-interrupt', startedAt: 60_000, chainStartedAt: 0 });
+  assert.deepEqual(workerTurns([t2, t1], 'ada').map((j) => j.id), ['t1', 't2']);
+  assert.equal(workerHead([t1, t2], 'ada')?.id, 't2');
+  // statusLine uses continuous chainStartedAt for steered turn 2 (72s = 1m12s, not 12s).
+  assert.match(statusLine(t2, 72_000, 60), /1m12s$/);
+  // sessionJobs follows continuedFrom & workerId across steers and resumes.
+  const t3 = job('t3', { workerId: 'ada', turn: 3, status: 'running', continuedFrom: 't2', continuationKind: 'resume', startedAt: 200_000, chainStartedAt: 200_000 });
+  const mine = sessionJobs([t1, t2, t3, job('other')], { jobs: ['t1'], runs: [] });
+  assert.deepEqual(mine.map((j) => j.id), ['t1', 't2', 't3']);
 });

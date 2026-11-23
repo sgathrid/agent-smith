@@ -47,8 +47,11 @@ import type { RadarJob, RadarStatus } from '../types/index.d.ts';
 let seq = 0;
 function job(over: Partial<RadarJob> = {}): RadarJob {
   seq += 1;
+  const id = over.id ?? `implement-job${seq}`;
   return {
-    id: `implement-job${seq}`,
+    id,
+    workerId: over.workerId ?? id,
+    turn: 1,
     status: 'running',
     startedAt: 0,
     endedAt: null,
@@ -433,4 +436,45 @@ test('the engine\'s own maxRows wins, and leaves us a row for the overflow line'
   // A nonsense or absent maxRows falls back to BAND_ROWS.
   assert.equal(rowBudget(many, Number.NaN).rows.length, BAND_ROWS);
   assert.equal(rowBudget(many, undefined).rows.length, BAND_ROWS);
+});
+
+test('band renders pendingSteers immediately, turn N when turn > 1, and chainStartedAt continuously across steers', () => {
+  const queuedOne = buildLine(
+    job({ name: 'Ada', workerId: 'ada', turn: 1, status: 'running', startedAt: 0, pendingSteers: 1, activity: 'editing a.ts' }),
+    15_000,
+    { width: 100, longestLabel: 3 },
+  );
+  assert.match(queuedOne.plain, /steer queued ∙ editing a\.ts/);
+
+  const queuedTwo = buildLine(
+    job({ name: 'Ada', workerId: 'ada', turn: 2, status: 'running', startedAt: 60_000, chainStartedAt: 0, pendingSteers: 2, activity: 'running tests' }),
+    72_000,
+    { width: 100, longestLabel: 3 },
+  );
+  assert.match(queuedTwo.plain, /2 steers queued ∙ turn 2 ∙ running tests/);
+  assert.ok(queuedTwo.plain.endsWith('1m12s'), `expected continuous chainStartedAt elapsed 1m12s, got: ${queuedTwo.plain}`);
+
+  // Resumed turn resets chainStartedAt to its own startedAt.
+  const resumed = buildLine(
+    job({ name: 'Ada', workerId: 'ada', turn: 2, status: 'running', startedAt: 300_000, chainStartedAt: 300_000, continuationKind: 'resume', activity: 'editing b.ts' }),
+    312_000,
+    { width: 100, longestLabel: 3 },
+  );
+  assert.match(resumed.plain, /turn 2 ∙ editing b\.ts/);
+  assert.ok(resumed.plain.endsWith('12s'), `expected fresh elapsed 12s on resume, got: ${resumed.plain}`);
+
+  // Terminal turn 2 outcomes distinguish after steer vs resumed.
+  const afterSteer = buildLine(
+    job({ name: 'Ada', workerId: 'ada', turn: 2, status: 'succeeded', startedAt: 60_000, chainStartedAt: 0, endedAt: 90_000, continuationKind: 'steer-interrupt' }),
+    95_000,
+    { width: 100, longestLabel: 3 },
+  );
+  assert.match(afterSteer.plain, /done ∙ turn 2 ∙ after steer/);
+
+  const afterResume = buildLine(
+    job({ name: 'Ada', workerId: 'ada', turn: 2, status: 'succeeded', startedAt: 300_000, chainStartedAt: 300_000, endedAt: 320_000, continuationKind: 'resume' }),
+    325_000,
+    { width: 100, longestLabel: 3 },
+  );
+  assert.match(afterResume.plain, /done ∙ turn 2 ∙ resumed/);
 });

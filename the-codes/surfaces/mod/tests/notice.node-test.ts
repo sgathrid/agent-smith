@@ -42,17 +42,20 @@ test('done names worker, provider, role and duration; checks only when they ran'
   assert.equal(headline(notice({ name: 'Ada', provider: 'codex', role: 'review' })), '✓ Ada (codex review) · done');
 });
 
-test('a steered continuation says so, and a dropped queued steer is named', () => {
-  assert.equal(headline(notice({ name: 'Ada', provider: 'codex', role: 'review', durationMs: 6000, steered: true })), '✓ Ada (codex review) 6s · done · after steer');
+test('a steered or resumed continuation says so honestly, and a dropped queued steer is named', () => {
+  assert.equal(headline(notice({ name: 'Ada', provider: 'codex', role: 'review', durationMs: 6000, continuationKind: 'steer-queue' })), '✓ Ada (codex review) 6s · done · after steer');
+  assert.equal(headline(notice({ name: 'Ada', provider: 'codex', role: 'review', durationMs: 6000, continuationKind: 'resume' })), '✓ Ada (codex review) 6s · done · resumed');
   assert.equal(
     headline(notice({ name: 'Ada', provider: 'codex', role: 'review', durationMs: 4000, kind: 'failed', reason: 'timed out', steerNotApplied: true })),
     '✗ Ada (codex review) 4s · failed: timed out · queued steer not applied',
   );
-  const steered = noticeFromRadar(row({ id: 'j2', name: 'Ada', status: 'succeeded', endedAt: NOW, steeredFrom: 'j1' }), 'finished', NOW);
+  const steered = noticeFromRadar(row({ id: 'j2', name: 'Ada', status: 'succeeded', endedAt: NOW, continuedFrom: 'j1', continuationKind: 'steer-interrupt' }), 'finished', NOW);
   assert.match(headline(steered), /· done · after steer$/);
+  const resumed = noticeFromRadar(row({ id: 'j2r', name: 'Ada', status: 'succeeded', endedAt: NOW, continuedFrom: 'j1', continuationKind: 'resume' }), 'finished', NOW);
+  assert.match(headline(resumed), /· done · resumed$/);
   const dropped = noticeFromRadar(row({ id: 'j3', name: 'Ada', status: 'failed', endedAt: NOW, failureReason: 'timed out', warnings: [{ code: 'steer_not_applied' }] }), 'failed', NOW);
   assert.match(headline(dropped), /· queued steer not applied$/);
-  assert.doesNotMatch(headline(noticeFromRadar(row({ id: 'j4', status: 'succeeded', endedAt: NOW }), 'finished', NOW)), /steer/);
+  assert.doesNotMatch(headline(noticeFromRadar(row({ id: 'j4', status: 'succeeded', endedAt: NOW }), 'finished', NOW)), /steer|resumed/);
 });
 
 test('failure says failed and the short reason', () => {
@@ -375,19 +378,55 @@ test('due follows supersededBy across turns without announcing the superseded pa
 
   // Case 2: child appears running -> claim transfers to child with refreshed budget
   const step2 = due(step1.owned, [
-    row({ id: 'turn-1', status: 'canceled', endedAt: NOW, supersededBy: 'turn-2' }),
-    row({ id: 'turn-2', status: 'running', steeredFrom: 'turn-1' }),
+    row({ id: 'turn-1', workerId: 'ada', turn: 1, status: 'canceled', endedAt: NOW, supersededBy: 'turn-2' }),
+    row({ id: 'turn-2', workerId: 'ada', turn: 2, status: 'running', continuedFrom: 'turn-1', continuationKind: 'steer-interrupt' }),
   ], new Map(), NOW + 2000);
   assert.deepEqual(step2.notices, []);
   assert.deepEqual(step2.owned.map((o) => o.id), ['turn-2']);
 
   // Case 3: child finishes -> single completion notice fires for turn-2
   const step3 = due(step2.owned, [
-    row({ id: 'turn-1', status: 'canceled', endedAt: NOW, supersededBy: 'turn-2' }),
-    row({ id: 'turn-2', status: 'succeeded', endedAt: NOW + 5000, steeredFrom: 'turn-1', name: 'Ada', provider: 'codex' }),
+    row({ id: 'turn-1', workerId: 'ada', turn: 1, status: 'canceled', endedAt: NOW, supersededBy: 'turn-2' }),
+    row({ id: 'turn-2', workerId: 'ada', turn: 2, status: 'succeeded', endedAt: NOW + 5000, continuedFrom: 'turn-1', continuationKind: 'steer-interrupt', name: 'Ada', provider: 'codex' }),
   ], new Map(), NOW + 5000);
   assert.deepEqual(step3.notices.map((n) => n.id), ['turn-2']);
   assert.deepEqual(step3.owned, []);
+});
+
+test('worker-aware claims update across steer_job resumed fallthrough and resume_job, and unclaim by workerId', () => {
+  const spawnAck = parseLaunch(`${PLUGIN}spawn_job`, { jobId: 'turn-1', workerId: 'ada', status: 'running', repo: '/repo', timeoutMs: 60_000 })!;
+  assert.equal(spawnAck.workerId, 'ada');
+  let owned = claim([], spawnAck, NOW);
+  assert.equal(owned.length, 1);
+  assert.equal(owned[0]?.workerId, 'ada');
+
+  // steer_job queue fallthrough returning action: 'resumed' with new turn's jobId replaces the worker's claim.
+  const steerResumeAck = parseLaunch(`${PLUGIN}steer_job`, {
+    jobId: 'turn-2', workerId: 'ada', status: 'running', action: 'resumed', delivery: 'queue',
+    turn: 2, continuedFrom: 'turn-1', continuationKind: 'resume', repo: '/repo', timeoutMs: 60_000,
+  })!;
+  assert.deepEqual(steerResumeAck, { kind: 'job', id: 'turn-2', workerId: 'ada', repo: '/repo', timeoutMs: 60_000 });
+  owned = claim(owned, steerResumeAck, NOW + 1000);
+  assert.equal(owned.length, 1, 'one claim per worker');
+  assert.equal(owned[0]?.id, 'turn-2');
+
+  // Settled status read with workerId unclaims the worker.
+  const settled = parseSettledRead(`${PLUGIN}status`, { jobId: 'turn-2', workerId: 'ada', status: 'succeeded' });
+  assert.deepEqual(settled, { kind: 'job', id: 'turn-2', workerId: 'ada' });
+  assert.deepEqual(unclaim(owned, settled!), []);
+
+  // due() also follows worker head across a resume even if claim still pointed at turn-1.
+  const resumedDue = due(
+    claim([], spawnAck, NOW),
+    [
+      row({ id: 'turn-1', workerId: 'ada', turn: 1, status: 'succeeded', startedAt: NOW - 5000, endedAt: NOW }),
+      row({ id: 'turn-2', workerId: 'ada', turn: 2, status: 'running', startedAt: NOW + 1000, continuedFrom: 'turn-1', continuationKind: 'resume' }),
+    ],
+    new Map(),
+    NOW + 2000,
+  );
+  assert.deepEqual(resumedDue.notices, []);
+  assert.deepEqual(resumedDue.owned.map((o) => o.id), ['turn-2']);
 });
 
 test('owned pipeline reports a stalled stage once while the pipeline keeps running', () => {

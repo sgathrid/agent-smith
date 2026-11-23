@@ -7,7 +7,7 @@
  */
 
 import type { FsLike } from './fs.ts';
-import type { RadarJob, RadarAcceptance } from '../types/index.d.ts';
+import type { ContinuationKind, RadarAcceptance, RadarJob } from '../types/index.d.ts';
 import { readForgeJobs, acceptanceLabel } from './canonical.ts';
 import { isLiveStatus } from './format.ts';
 import { firstTrimmed, record } from './guards.ts';
@@ -20,6 +20,8 @@ export interface NativeJob {
   readonly task: string;
   readonly name: string | null;
   readonly workerId: string;
+  readonly turn?: number;
+  readonly startedAt?: number | null;
   readonly role: string | null;
   readonly provider: string | null;
   readonly model: string | null;
@@ -27,18 +29,21 @@ export interface NativeJob {
   readonly acceptance?: RadarAcceptance;
   readonly summarySource: 'worker' | null;
   readonly supersededBy?: string | null;
-  readonly steeredFrom?: string | null;
+  readonly continuedFrom?: string | null;
+  readonly continuationKind?: ContinuationKind | null;
+  readonly pendingSteers?: number | null;
 }
 
 export interface NativeTaskLink {
   readonly taskId: string;
   readonly status: 'in_progress' | 'completed' | 'deleted';
-  /** When this job was first seen finished (epoch ms); starts the close delay. */
+  /** When this worker was first seen finished (epoch ms); starts the close delay. */
   readonly doneAt?: number;
   /** Last description/status sent successfully; lets the poll avoid no-op writes. */
   readonly fingerprint: string;
 }
 
+/** Keyed by `workerId` — one native task per worker across spawn, steer, and resume. */
 export type NativeTaskLinks = Record<string, NativeTaskLink>;
 
 export interface NativeTaskClient {
@@ -61,11 +66,14 @@ export interface NativeTaskClient {
 export function nativeJobsFromRadar(jobs: readonly RadarJob[]): NativeJob[] {
   return jobs.filter(job => job.status !== 'unknown').map(job => ({
     id: job.id, status: job.status as NativeJobStatus, task: job.task,
-    name: job.name ?? null, workerId: job.workerId ?? job.id, role: job.role ?? null,
-    provider: job.provider ?? null, model: job.model ?? null,
+    name: job.name ?? null, workerId: job.workerId, turn: job.turn, startedAt: job.startedAt,
+    role: job.role ?? null, provider: job.provider ?? null, model: job.model ?? null,
     latestSummary: job.latestSummary ?? null, summarySource: job.summarySource ?? null,
     acceptance: job.acceptance,
-    supersededBy: job.supersededBy ?? null, steeredFrom: job.steeredFrom ?? null,
+    supersededBy: job.supersededBy ?? null,
+    continuedFrom: job.continuedFrom ?? null,
+    continuationKind: job.continuationKind ?? null,
+    pendingSteers: job.pendingSteers ?? null,
   }));
 }
 export async function readNativeJobs(fs: FsLike, repo: string, now = Date.now()): Promise<NativeJob[]> {
@@ -86,6 +94,7 @@ function descriptionFor(job: NativeJob): string {
   const lines = [
     `Job ID: ${job.id}`,
     `Worker ID: ${job.workerId}`,
+    ...((job.turn ?? 1) > 1 ? [`Turn: ${job.turn}`] : []),
     ...(job.role === null ? [] : [`Role: ${job.role}`]),
     ...(job.provider === null ? [] : [`Provider: ${job.provider}`]),
     ...(job.model === null ? [] : [`Model: ${job.model}`]),
@@ -120,11 +129,16 @@ function updateSucceeded(result: unknown): boolean {
   return output?.success === true;
 }
 
-/** How long a finished job's task stays in the host list before it is closed. */
+/** How long a finished worker's task stays in the host list before it is closed. */
 const CLOSE_DELAY_MS = 10_000;
 
+function isLiveNative(job: NativeJob): boolean {
+  if (job.supersededBy && !isLiveStatus(job.status)) return false;
+  return isLiveStatus(job.status) || job.acceptance?.pending === true;
+}
+
 function taskStatus(job: NativeJob): 'in_progress' | 'completed' {
-  return isLiveStatus(job.status) || job.acceptance?.pending ? 'in_progress' : 'completed';
+  return isLiveNative(job) ? 'in_progress' : 'completed';
 }
 
 function fingerprint(job: NativeJob): string {
@@ -136,11 +150,40 @@ function fingerprint(job: NativeJob): string {
   });
 }
 
+function isBetterNativeHead(candidate: NativeJob, current: NativeJob): boolean {
+  const cSup = Boolean(candidate.supersededBy);
+  const oSup = Boolean(current.supersededBy);
+  if (cSup !== oSup) return !cSup;
+  const cLive = isLiveNative(candidate);
+  const oLive = isLiveNative(current);
+  if (cLive !== oLive) return cLive;
+  const cTurn = candidate.turn ?? 1;
+  const oTurn = current.turn ?? 1;
+  if (cTurn !== oTurn) return cTurn > oTurn;
+  const cAt = candidate.startedAt ?? 0;
+  const oAt = current.startedAt ?? 0;
+  if (cAt !== oAt) return cAt > oAt;
+  return candidate.id.localeCompare(current.id) > 0;
+}
+
+/** Collapse turns to one head turn per worker. */
+function groupNativeWorkers(jobs: readonly NativeJob[]): NativeJob[] {
+  const byWorker = new Map<string, NativeJob>();
+  for (const job of jobs) {
+    const key = job.workerId || job.id;
+    const prev = byWorker.get(key);
+    if (!prev || isBetterNativeHead(job, prev)) byWorker.set(key, job);
+  }
+  return [...byWorker.values()];
+}
+
 /**
- * Create tasks only for currently live jobs this session owns, and update only
- * jobs already represented in the host task list. That keeps old finished jobs
- * and other sessions' work from flooding TaskList; a task already linked runs
- * to completion and closes as before, whoever owns its job.
+ * Create tasks only for currently live workers this session owns, and update
+ * existing worker links across spawn, steer, and resume.
+ *
+ * Keyed by `workerId`: a steered or resumed worker reuses its existing native
+ * task (reopening `in_progress` and clearing `doneAt` on resume, or re-creating
+ * a new task if the earlier one was already deleted after the close delay).
  */
 export async function syncNativeTasks(
   jobs: readonly NativeJob[],
@@ -150,35 +193,26 @@ export async function syncNativeTasks(
   owned: (id: string) => boolean = () => true,
 ): Promise<NativeTaskLinks> {
   const next: NativeTaskLinks = { ...previous };
-  const byId = new Map(jobs.map((j) => [j.id, j]));
-  for (const job of jobs) {
-    if (!job.supersededBy || !next[job.id]) continue;
-    const seen = new Set<string>([job.id]);
-    let targetId = job.supersededBy;
-    let cur = byId.get(targetId);
-    while (cur?.supersededBy && !seen.has(targetId)) {
-      seen.add(targetId);
-      targetId = cur.supersededBy;
-      cur = byId.get(targetId);
-    }
-    const link = next[job.id]!;
-    delete next[job.id];
-    if (link.status !== 'deleted' && !next[targetId]) {
-      next[targetId] = link;
-    }
-  }
-  for (const job of jobs) {
-    if (job.supersededBy) continue;
-    const old = next[job.id];
-    if (old?.status === 'deleted') continue;
-    const live = isLiveStatus(job.status) || job.acceptance?.pending === true;
-    if (old === undefined && (!live || !owned(job.id))) continue;
+  const workers = groupNativeWorkers(jobs);
+
+  for (const job of workers) {
+    // Mid-handoff: only a superseded parent is visible before its child appears;
+    // keep the worker's task in_progress without marking it completed.
+    if (job.supersededBy && !isLiveStatus(job.status)) continue;
+
+    const key = job.workerId || job.id;
+    const old = next[key];
+    const live = isLiveNative(job);
+
+    if (old?.status === 'deleted' && !live) continue;
+    const needsCreate = old === undefined || old.status === 'deleted';
+    if (needsCreate && (!live || !owned(job.id))) continue;
 
     const subject = subjectFor(job);
     const description = descriptionFor(job);
     const status = taskStatus(job);
     const currentFingerprint = fingerprint(job);
-    let taskId = old?.taskId;
+    let taskId = needsCreate ? undefined : old?.taskId;
     if (taskId === undefined) {
       try {
         const created = await client.create({
@@ -198,11 +232,17 @@ export async function syncNativeTasks(
         continue;
       }
       if (taskId === undefined) continue;
-      next[job.id] = { taskId, status: 'in_progress', fingerprint: '' };
+      next[key] = { taskId, status: 'in_progress', fingerprint: '' };
     }
 
-    const link = next[job.id]!;
-    // A finished job's task is closed (deleted from the host list) CLOSE_DELAY_MS
+    let link = next[key]!;
+    // Reopening a worker (e.g. resume_job before close delay) clears doneAt.
+    if (live && link.doneAt !== undefined) {
+      link = { taskId: link.taskId, status: link.status, fingerprint: link.fingerprint };
+      next[key] = link;
+    }
+
+    // A finished worker's task is closed (deleted from the host list) CLOSE_DELAY_MS
     // after we first see it finished, so the list does not fill with done work.
     if (!live) {
       const doneAt = link.doneAt ?? now;
@@ -210,13 +250,16 @@ export async function syncNativeTasks(
       if (dismissible && now - doneAt >= CLOSE_DELAY_MS && link.status === 'completed') {
         try {
           const closed = await client.update({ taskId, subject, description, status: 'deleted' });
-          if (updateSucceeded(closed)) next[job.id] = { taskId, status: 'deleted', fingerprint: '', doneAt };
+          if (updateSucceeded(closed)) next[key] = { taskId, status: 'deleted', fingerprint: '', doneAt };
         } catch {
           // Retried on the next poll.
         }
         continue;
       }
-      if (link.doneAt === undefined) next[job.id] = { ...link, doneAt };
+      if (link.doneAt === undefined) {
+        link = { ...link, doneAt };
+        next[key] = link;
+      }
     }
     if (link.fingerprint === currentFingerprint) continue;
     try {
@@ -228,8 +271,13 @@ export async function syncNativeTasks(
         status,
       });
       if (updateSucceeded(updated)) {
-        const prior = next[job.id];
-        next[job.id] = { taskId, status, fingerprint: currentFingerprint, ...(prior?.doneAt === undefined ? {} : { doneAt: prior.doneAt }) };
+        const prior = next[key];
+        next[key] = {
+          taskId,
+          status,
+          fingerprint: currentFingerprint,
+          ...(!live && prior?.doneAt !== undefined ? { doneAt: prior.doneAt } : {}),
+        };
       }
     } catch {
       // Retain the old fingerprint so a later poll retries the update.

@@ -44,8 +44,11 @@ import type { RadarJob, RadarStatus } from '../../types/index.d.ts';
 let seq = 0;
 function job(over: Partial<RadarJob> = {}): RadarJob {
   seq += 1;
+  const id = over.id ?? `implement-job${seq}`;
   return {
-    id: `implement-job${seq}`,
+    id,
+    workerId: over.workerId ?? id,
+    turn: 1,
     status: 'running',
     startedAt: 0,
     endedAt: null,

@@ -100,8 +100,3 @@ export function livenessOf(i: LivenessInput): Liveness | null {
   if (silentForMs > STALL_GRACE_MS) return { state: 'silent', silentForMs, since: lastSeen, forMs: silentForMs };
   return { state: 'active', silentForMs, since: lastSeen, forMs: silentForMs };
 }
-
-/** The old boolean, derived: true for `silent` or `dead`. */
-export function isStalled(l: Liveness | null): boolean {
-  return l !== null && (l.state === 'silent' || l.state === 'dead');
-}

@@ -94,13 +94,13 @@ function engine(
   return clock;
 }
 
-/** The three launch tools, under the built plugin's server name. */
-const LAUNCH_TOOL = /__(?:spawn_job|resume_job|run_pipeline)$/;
+/** The four launch tools, under the built plugin's server name. */
+const LAUNCH_TOOL = /__(?:spawn_job|resume_job|steer_job|run_pipeline)$/;
 /** Core answering a launch tool with its ack, echoing the id and repo the test passed. */
 const launchAck = (e: any) => e.variantJobs
   // A `variants` spawn: one ack per variant, plus a variant that failed to start.
   ? { result: { structuredContent: { jobs: [...e.variantJobs.map((id: string) => ({ jobId: id, status: 'running', repo: e.repo ?? '/work', timeoutMs: 600_000 })), { name: 'Bad', error: 'no such model' }] }, content: [] } }
-  : { result: { structuredContent: { [e.runId ? 'runId' : 'jobId']: e.runId ?? e.jobId, repo: e.repo ?? '/work', timeoutMs: 600_000 }, content: [] } };
+  : { result: { structuredContent: { [e.runId ? 'runId' : 'jobId']: e.runId ?? e.jobId, ...(e.workerId ? { workerId: e.workerId } : {}), repo: e.repo ?? '/work', timeoutMs: 600_000 }, content: [] } };
 /** A successful launch through `tool.call`: how this session comes to own a job or run. */
 const launched = ($: any, id: string, repo = '/work', kind: 'job' | 'run' = 'job') => $.tool.call({
   tool: `mcp__plugin_agent-smith_agent-smith__${kind === 'job' ? 'spawn_job' : 'run_pipeline'}`, [kind === 'job' ? 'jobId' : 'runId']: id, repo,
@@ -131,7 +131,7 @@ describe('the band', () => {
     await start($);
     await launch($, 'job-ada');
     const band = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', ...BAND } as never);
-    expect(await band.find({ key: 'band-job-ada' })).toBeDefined();
+    expect(await band.find({ key: 'band-ada' })).toBeDefined();
     expect(await band.find({ type: 'Text', text: 'REST-OF-BAND' })).toBeDefined();
   });
 
@@ -144,7 +144,7 @@ describe('the band', () => {
       props: { hasSurvey: true, isWorking: true, maxRows: 10, bodyColumns: 120 },
     } as never);
     // The job IS running, and we still draw no line of our own.
-    expect(await band.find({ key: 'band-job-ada' })).toBeUndefined();
+    expect(await band.find({ key: 'band-ada' })).toBeUndefined();
     expect(await band.find({ type: 'Text', text: 'REST-OF-BAND' })).toBeDefined();
   });
 
@@ -181,6 +181,8 @@ describe('the render path uses the tested helpers', () => {
     // and quietly stops matching band.ts. Same type, same function, no TUI.
     const job: RadarJob = {
       id: ID,
+      workerId: ID,
+      turn: 1,
       status: 'running',
       startedAt: Date.parse('2026-10-03T16:37:41.031Z'),
       endedAt: null,
@@ -277,7 +279,7 @@ const ada = () => canonicalJob('job-ada', {status:'running',name:'Ada',workerId:
 
 /** A host over canonical jobs that records what the mod asks of the UI. */
 function forgeHost(on: (...args: any[]) => void, files: Record<string,string>, ids: string[], env: Record<string,string> = {}) {
-  const host = { opens: [] as Record<string,unknown>[], closes: [] as Record<string,unknown>[], toasts: [] as string[], scrolls: [] as Record<string,unknown>[] };
+  const host = { opens: [] as Record<string,unknown>[], closes: [] as Record<string,unknown>[], toasts: [] as string[], scrolls: [] as Record<string,unknown>[], io: { list: 0, reads: [] as string[] } };
   on('session.start', (_$: unknown, e: any) => ({sessionId:'s',cwd:e.cwd}));
   on('command.register', () => ({value:undefined}));
   on('env.get', (_$: unknown, e: any) => ({value:env[e.name]}));
@@ -293,9 +295,9 @@ function forgeHost(on: (...args: any[]) => void, files: Record<string,string>, i
     :/__status$/.test(e.tool)?{result:{structuredContent:{jobId:e.jobId,status:e.status??'succeeded',acceptance:{state:'accepted',pending:false}},content:[]}}
     :{result:{success:true}});
   const clock = mock.clock(on as never,{now:RUNNING_NOW});
-  on('fs.list', () => ({value:ids.map(name=>({name,kind:'dir',size:0}))}));
+  on('fs.list', () => { host.io.list += 1; return {value:ids.map(name=>({name,kind:'dir',size:0}))}; });
   on('fs.exists', (_$: unknown, e: any) => ({value:e.path==='/work/.agent-smith/jobs'||Object.hasOwn(files,e.path)}));
-  on('fs.read', (_$: unknown, e: any) => { const body=files[e.path]; return body===undefined?{deny:'ENOENT'}:{value:body}; });
+  on('fs.read', (_$: unknown, e: any) => { host.io.reads.push(e.path); const body=files[e.path]; return body===undefined?{deny:'ENOENT'}:{value:body}; });
   return { host, clock };
 }
 const start = ($: any) => $.session.start({surface:'terminal',isInteractive:true,cwd:'/work'} as never);
@@ -317,9 +319,9 @@ test('the band shows on the main thread only, not while viewing a subagent', asy
   await start($);
   await launch($, 'job-ada');
   const main = await $.ui.mount({plugin:'agent-smith',surface:'terminal',...BAND,props:{...BAND.props,view:{}}} as never);
-  expect(await main.find({key:'band-job-ada'})).toBeDefined();
+  expect(await main.find({key:'band-ada'})).toBeDefined();
   const sub = await $.ui.mount({plugin:'agent-smith',surface:'terminal',...BAND,requestId:'forge-band-sub',props:{...BAND.props,view:{agentId:'agent-1'}}} as never);
-  expect(await sub.find({key:'band-job-ada'})).toBeUndefined();
+  expect(await sub.find({key:'band-ada'})).toBeUndefined();
   expect(await sub.find({type:'Text',text:/REST-OF-BAND/})).toBeDefined();
 });
 
@@ -328,9 +330,9 @@ test('a band row is a digit Button that opens the focused sidebar on that worker
   await start($);
   await launch($, 'job-ada');
   const band = await $.ui.mount({plugin:'agent-smith',surface:'terminal',...BAND} as never);
-  const row = await band.find({key:'band-job-ada'}) as { props?: Record<string,unknown> } | undefined;
+  const row = await band.find({key:'band-ada'}) as { props?: Record<string,unknown> } | undefined;
   expect(row?.props?.hotkey).toBe('1');
-  await band.press({key:'band-job-ada'});
+  await band.press({key:'band-ada'});
   expect(host.opens.at(-1)).toMatchObject({id:'agent-smith',focus:true});
   const pane = await $.ui.mount(PANE_TARGET);
   expect(await pane.find({type:'Text',text:/Ada · reviewer/})).toBeDefined();
@@ -346,9 +348,9 @@ test('a running worker with a progress digest shows what it is doing and what it
   await start($);
   await launch($, 'job-ada');
   const band = await $.ui.mount({plugin:'agent-smith',surface:'terminal',...BAND} as never);
-  const row = await band.find({key:'band-job-ada'}) as { props?: Record<string,unknown> } | undefined;
+  const row = await band.find({key:'band-ada'}) as { props?: Record<string,unknown> } | undefined;
   expect(String(row?.props?.label)).toMatch(/pp-engine\s+editing loader\.py · 3 files edited · last test run failed/);
-  await band.press({key:'band-job-ada'});
+  await band.press({key:'band-ada'});
   const pane = await $.ui.mount(PANE_TARGET);
   expect(await pane.find({type:'Text',text:/^Editing · 21 files read · 14 searches · 2 commands · 59 tool calls$/})).toBeDefined();
   expect(await pane.find({type:'Text',text:/^Edited: config\.py, loader\.py, test_config\.py$/})).toBeDefined();
@@ -371,16 +373,16 @@ test('/forge opens the focused session list; /forge pane is the same list; /forg
   expect(host.opens.at(-1)).toMatchObject({id:'agent-smith',focus:true});
   const pane = await $.ui.mount(PANE_TARGET);
   expect(await pane.find({type:'Text',text:'Workers · 1 running'})).toBeDefined();
-  expect(await pane.find({key:'job-job-ada'})).toBeDefined();
+  expect(await pane.find({key:'job-ada'})).toBeDefined();
   expect(await pane.find({key:'job-job-failed'})).toBeUndefined();
-  await pane.press({key:'job-job-ada'});
+  await pane.press({key:'job-ada'});
   await $.command.run({command:'forge',args:'pane'});
-  expect(await pane.find({key:'job-job-ada'})).toBeDefined();
+  expect(await pane.find({key:'job-ada'})).toBeDefined();
   expect(await pane.find({key:'job-job-failed'})).toBeUndefined();
 
   expect(await $.command.run({command:'forge',args:'all'})).toMatchObject({text:'repository: 1 running · 1 failed'});
   expect(await pane.find({type:'Text',text:'Workers · repository: 1 running · 1 failed'})).toBeDefined();
-  expect(await pane.find({key:'job-job-ada'})).toBeDefined();
+  expect(await pane.find({key:'job-ada'})).toBeDefined();
   expect(await pane.find({type:'Text',text:'Recent'})).toBeDefined();
   // A recent failure stays marked: red, with its failure label.
   expect((await pane.find({type:'Text',text:/failed · server stopped/}) as { props?: Record<string,unknown> })?.props?.color).toBe('red');
@@ -397,7 +399,7 @@ test('a fresh session over old jobs: an empty band, an empty session list, no li
   const { host } = forgeHost(on, { ...ada(), ...failedJob('job-failed', RUNNING_NOW) }, ['job-ada','job-failed']);
   await start($);
   const band = await $.ui.mount({plugin:'agent-smith',surface:'terminal',...BAND} as never);
-  expect(await band.find({key:'band-job-ada'})).toBeUndefined();
+  expect(await band.find({key:'band-ada'})).toBeUndefined();
   expect(await band.find({type:'Text',text:'REST-OF-BAND'})).toBeDefined();
   const reply = await $.command.run({command:'forge',args:''}) as { text?: string };
   expect(reply.text).toBe('No workers in this session');
@@ -405,9 +407,9 @@ test('a fresh session over old jobs: an empty band, an empty session list, no li
   const pane = await $.ui.mount(PANE_TARGET);
   expect(await pane.find({type:'Text',text:'Workers · No workers in this session'})).toBeDefined();
   expect(await pane.find({type:'Text',text:/\/forge all shows the repository's history/})).toBeDefined();
-  expect(await pane.find({key:'job-job-ada'})).toBeUndefined();
+  expect(await pane.find({key:'job-ada'})).toBeUndefined();
   await pane.press({key:'scope-all'});
-  expect(await pane.find({key:'job-job-ada'})).toBeDefined();
+  expect(await pane.find({key:'job-ada'})).toBeDefined();
   expect(await pane.find({key:'job-job-failed'})).toBeDefined();
   expect(host.toasts).toHaveLength(0);
 });
@@ -421,7 +423,7 @@ test('/forge recap prints the multi-line session board instead of treating "reca
   expect(host.toasts).toHaveLength(0);
   // The list pane opened: recap is a board request, never a lookup that misses.
   const pane = await $.ui.mount(PANE_TARGET);
-  expect(await pane.find({key:'job-job-ada'})).toBeDefined();
+  expect(await pane.find({key:'job-ada'})).toBeDefined();
   expect(await pane.find({key:'back'})).toBeUndefined();
   const board = 'Repository · 1 running · 1 failed\n⏺ Ada · reviewer — Running · 5s\n✗ job-failed — failed · server stopped · 5s';
   expect(await $.command.run({command:'forge',args:'all recap'})).toMatchObject({text:board});
@@ -502,14 +504,14 @@ test('after a launch only that job shows; a pipeline launch shows its stage jobs
   await start($);
   await launch($, 'job-ada');
   const band = await $.ui.mount({plugin:'agent-smith',surface:'terminal',...BAND} as never);
-  expect(await band.find({key:'band-job-ada'})).toBeDefined();
+  expect(await band.find({key:'band-ada'})).toBeDefined();
   expect(await band.find({key:'band-job-failed'})).toBeUndefined();
-  expect(await band.find({key:'band-job-stage'})).toBeUndefined();
+  expect(await band.find({key:'band-bo'})).toBeUndefined();
   await launch($, 'run-7', 'run');
-  expect(await band.find({key:'band-job-stage'})).toBeDefined();
+  expect(await band.find({key:'band-bo'})).toBeDefined();
   expect(await $.command.run({command:'forge',args:''})).toMatchObject({text:'2 running'});
   const pane = await $.ui.mount(PANE_TARGET);
-  expect(await pane.find({key:'job-job-stage'})).toBeDefined();
+  expect(await pane.find({key:'job-bo'})).toBeDefined();
   expect(await pane.find({key:'job-job-failed'})).toBeUndefined();
 });
 
@@ -536,7 +538,7 @@ test('/forge Ada opens Ada; an unknown name falls back to the list with a toast'
   expect(await pane.find({type:'Markdown',text:'● Tracing the renderer.'})).toBeDefined();
   await $.command.run({command:'forge',args:'Grace'});
   expect(host.toasts.at(-1)).toMatch(/No worker matches "Grace"/);
-  expect(await pane.find({key:'job-job-ada'})).toBeDefined();
+  expect(await pane.find({key:'job-ada'})).toBeDefined();
   expect(await pane.find({key:'back'})).toBeUndefined();
 });
 
@@ -558,7 +560,7 @@ test('the worker view is one scroll: header, task, transcript, then result and f
   files['/work/.agent-smith/jobs/job-ada/result.md'] = 'Final findings';
   files['/work/.agent-smith/jobs/job-ada/acceptance.json'] = JSON.stringify({state:'rejected',pending:false,checks:[
     {name:'tests',ok:true,outputTail:''},{name:'lint',ok:false,outputTail:'src/a.ts: unused import',reason:'exit 1'}]});
-  await clock.advance(3000);
+  await clock.advance(1000);
   expect(await pane.find({type:'Text',text:/✗ lint/})).toBeDefined();
   expect(await pane.find({type:'Markdown',text:'● Tracing the renderer.'})).toBeDefined();
   expect(await pane.find({type:'Markdown',text:'Final findings'})).toBeDefined();
@@ -573,8 +575,8 @@ test('b returns to the list; x closes the sidebar', async ($, on) => {
   await $.command.run({command:'forge',args:'Ada'});
   const pane = await $.ui.mount(PANE_TARGET);
   await pane.press({key:'back'});
-  expect(await pane.find({key:'job-job-ada'})).toBeDefined();
-  await pane.press({key:'job-job-ada'});
+  expect(await pane.find({key:'job-ada'})).toBeDefined();
+  await pane.press({key:'job-ada'});
   expect(await pane.find({key:'back'})).toBeDefined();
   await pane.press({key:'close'});
   expect(host.closes.at(-1)).toMatchObject({id:'agent-smith'});
@@ -597,9 +599,10 @@ test('scrolling up pauses following and scrolling back to the end resumes it', a
 });
 
 test('canonical acceptance refreshes in an open worker view; a read failure keeps the rows', async ($, on) => {
+  const ids = ['job-native-1'];
   const files = canonicalJob('job-native-1', {status:'succeeded',name:'Ada',workerId:'ada',finishedAt:iso(RUNNING_NOW-1000),toolCalls:1},
     {'acceptance.json':JSON.stringify({state:'unchecked',pending:true,checks:[]}),'result.md':'Worker report'});
-  const { clock } = forgeHost(on, files, ['job-native-1']);
+  const { clock } = forgeHost(on, files, ids);
   await start($);
   await launch($, 'job-native-1');
   await $.command.run({command:'forge',args:'job-native-1'});
@@ -607,13 +610,15 @@ test('canonical acceptance refreshes in an open worker view; a read failure keep
   expect(await pane.find({type:'Text',text:/checking/})).toBeDefined();
   files['/work/.agent-smith/jobs/job-native-1/acceptance.json']=JSON.stringify({state:'rejected',pending:false,checks:[
     {name:'tests',ok:false,outputTail:'',timedOut:true,signal:'SIGTERM',reason:'command timed out'}]});
-  await clock.advance(3000);
+  await clock.advance(1000);
   expect(await pane.find({type:'Text',text:/✗ tests · timed out · signal SIGTERM · command timed out/})).toBeDefined();
   await pane.press({key:'back'});
-  files['/work/.agent-smith/jobs/job-native-1/job.json']='{broken';
-  await clock.advance(3000);
+  // A newly-appearing corrupt job dir fails the poll while keeping cached rows visible.
+  ids.push('job-broken');
+  files['/work/.agent-smith/jobs/job-broken/job.json']='{broken';
+  await clock.advance(1000);
   expect(await pane.find({type:'Text',text:/Can't read job state/})).toBeDefined();
-  expect(await pane.find({key:'job-job-native-1'})).toBeDefined();
+  expect(await pane.find({key:'job-ada'})).toBeDefined();
 });
 
 test('a quiet but live worker shows process alive instead of Stalled, and the line disappears once a new event arrives', async ($, on) => {
@@ -666,7 +671,7 @@ test('docked pane rendering does not feed conversationColumns back into ui.open,
     viewport: { columns: 180, rows: 40, isFullscreen: true },
     props: { ...BAND.props, bodyColumns: 180 },
   } as never);
-  expect(await band.find({ key: 'band-job-ada' })).toBeDefined();
+  expect(await band.find({ key: 'band-ada' })).toBeDefined();
 
   // 2. /forge requests 60 columns (floor(180 / 3)).
   await $.command.run({ command: 'forge', args: '' });
@@ -676,7 +681,7 @@ test('docked pane rendering does not feed conversationColumns back into ui.open,
   // 3. The host mounts the docked Pane with viewport.columns = conversationColumns (119) and bodyColumns = 60.
   //    Without reconstructing terminalColumns = 119 + 60 + 1 = 180, the Pane render would request 39 columns and loop.
   const pane = await $.ui.mount(PANE_TARGET);
-  expect(await pane.find({ key: 'job-job-ada' })).toBeDefined();
+  expect(await pane.find({ key: 'job-ada' })).toBeDefined();
   expect(host.opens).toHaveLength(1);
 
   // 4. While the pane is open, AbovePrompt renders at conversationColumns (119).
@@ -689,7 +694,7 @@ test('docked pane rendering does not feed conversationColumns back into ui.open,
     viewport: { columns: 119, rows: 40, isFullscreen: true },
     props: { ...BAND.props, bodyColumns: 119 },
   } as never);
-  await pane.press({ key: 'job-job-ada' });
+  await pane.press({ key: 'job-ada' });
   expect(await pane.find({ key: 'back' })).toBeDefined();
   expect(host.opens).toHaveLength(1);
 
@@ -740,7 +745,7 @@ test('a second session.start (a reload) leaves a mounted pane measuring the term
     viewport: { columns: 180, rows: 40, isFullscreen: true },
     props: { ...BAND.props, bodyColumns: 180 },
   } as never);
-  expect(await band.find({ key: 'band-job-ada' })).toBeDefined();
+  expect(await band.find({ key: 'band-ada' })).toBeDefined();
   await $.command.run({ command: 'forge', args: '' });
   await $.ui.mount(PANE_TARGET);
   expect(host.opens).toHaveLength(1);
@@ -1076,5 +1081,144 @@ describe('proseText', () => {
     expect(proseText('* * *\nnext')).toBe('* * *\nnext');
     expect(proseText('- item')).toBe('- item');
     expect(proseText('<details>x</details>')).toBe('<details>x</details>');
+  });
+});
+
+describe('worker-first UI, inline prior turns, auto-follow, and O(active) idle polling', () => {
+  test('band groups by workerId (always 1 row across steer/resume), renders pendingSteers, turn N, and continuous chainStartedAt', async ($, on) => {
+    const t1Start = RUNNING_NOW - 72_000;
+    const t2Start = RUNNING_NOW - 12_000;
+    const files = {
+      ...canonicalJob('job-ada-1', {
+        status: 'succeeded', name: 'Ada', workerId: 'ada', turn: 1,
+        startedAt: iso(t1Start), finishedAt: iso(t2Start), updatedAt: iso(t2Start),
+      }),
+      ...canonicalJob('job-ada-2', {
+        status: 'running', name: 'Ada', workerId: 'ada', turn: 2,
+        continuedFrom: 'job-ada-1', continuationKind: 'steer-interrupt',
+        startedAt: iso(t2Start), chainStartedAt: iso(t1Start), updatedAt: iso(RUNNING_NOW),
+      }, {
+        'progress.json': JSON.stringify({ lastEventAt: iso(RUNNING_NOW), lastAliveAt: iso(RUNNING_NOW), pendingSteers: 1, toolCalls: 3 }),
+      }),
+    };
+    forgeHost(on, files, ['job-ada-1', 'job-ada-2']);
+    await start($);
+    await launch($, 'job-ada-1');
+    const band = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', ...BAND } as never);
+    // Worker is ALWAYS 1 row keyed by workerId, never 2 rows even when Turn 1 is within LINGER_MS.
+    const buttons = await band.findAll({ type: 'Button' });
+    expect(buttons).toHaveLength(1);
+    const row = await band.find({ key: 'band-ada' }) as { props?: Record<string, unknown> } | undefined;
+    expect(row).toBeDefined();
+    expect(String(row?.props?.label)).toMatch(/steer queued ∙ turn 2/);
+    expect(String(row?.props?.label)).toMatch(/1m12s$/);
+  });
+
+  test('/forge auto-follows live head on steer, renders clickable prior turns inline above live turn, and supports pinning a prior turn', async ($, on) => {
+    const t1Start = RUNNING_NOW - 72_000;
+    const ids = ['job-ada-1'];
+    const t1View = JSON.stringify({
+      schema: 1, prompt: 'First task', preamble: '', truncated: false,
+      timeline: [{ kind: 'assistant', sequence: 0, at: iso(t1Start + 5000), text: 'Turn 1 work.' }],
+    });
+    const t2View = JSON.stringify({
+      schema: 1, prompt: 'Steered task', preamble: '', truncated: false,
+      timeline: [{ kind: 'assistant', sequence: 0, at: iso(RUNNING_NOW + 500), text: 'Turn 2 live work.' }],
+    });
+    const files: Record<string, string> = {
+      ...canonicalJob('job-ada-1', {
+        status: 'running', name: 'Ada', workerId: 'ada', turn: 1, provider: 'codex',
+        startedAt: iso(t1Start), updatedAt: iso(RUNNING_NOW), toolCalls: 14,
+      }, { 'view.json': t1View }),
+    };
+    const { clock } = forgeHost(on, files, ids);
+    await start($);
+    await launch($, 'job-ada-1');
+    await $.command.run({ command: 'forge', args: 'Ada' });
+    const pane = await $.ui.mount(PANE_TARGET);
+    expect(await pane.find({ type: 'Markdown', text: '● Turn 1 work.' })).toBeDefined();
+
+    // Steer handoff: Turn 1 becomes superseded (canceled on disk -> labeled steered, never canceled),
+    // Turn 2 spawns as live head for the same workerId.
+    Object.assign(files, canonicalJob('job-ada-1', {
+      status: 'canceled', name: 'Ada', workerId: 'ada', turn: 1, provider: 'codex',
+      supersededBy: 'job-ada-2', startedAt: iso(t1Start), finishedAt: iso(RUNNING_NOW), updatedAt: iso(RUNNING_NOW), toolCalls: 14,
+    }, { 'view.json': t1View }));
+    ids.push('job-ada-2');
+    Object.assign(files, canonicalJob('job-ada-2', {
+      status: 'running', name: 'Ada', workerId: 'ada', turn: 2, provider: 'codex',
+      continuedFrom: 'job-ada-1', continuationKind: 'steer-interrupt',
+      startedAt: iso(RUNNING_NOW), chainStartedAt: iso(t1Start), updatedAt: iso(RUNNING_NOW + 1000),
+    }, { 'view.json': t2View }));
+
+    // 1 s active cadence auto-follows live head without user clicking anything.
+    await clock.advance(1000);
+    expect(await pane.find({ type: 'Markdown', text: '● Turn 2 live work.' })).toBeDefined();
+    const priorBtn = await pane.find({ key: 'turn-job-ada-1' }) as { props?: Record<string, unknown> } | undefined;
+    expect(String(priorBtn?.props?.label)).toBe('▸ Turn 1 · steered · 14 tools · 1m12s');
+    // Legacy bottom "Earlier runs" section is gone.
+    expect(await pane.find({ type: 'Text', text: 'Earlier runs' })).toBeUndefined();
+
+    // Clicking the inline prior turn pins Turn 1 and stays pinned across polls.
+    await pane.press({ key: 'turn-job-ada-1' });
+    expect(await pane.find({ type: 'Markdown', text: '● Turn 1 work.' })).toBeDefined();
+    const backLive = await pane.find({ key: 'return-live' }) as { props?: Record<string, unknown> } | undefined;
+    expect(String(backLive?.props?.label)).toBe('↩ Back to Turn 2 (live)');
+    await clock.advance(1000);
+    expect(await pane.find({ type: 'Markdown', text: '● Turn 1 work.' })).toBeDefined();
+
+    // Clicking return-live snaps back to auto-following live Turn 2.
+    await pane.press({ key: 'return-live' });
+    expect(await pane.find({ type: 'Markdown', text: '● Turn 2 live work.' })).toBeDefined();
+    expect(await pane.find({ key: 'return-live' })).toBeUndefined();
+  });
+
+  test('idle-when-quiet performs 0 disk reads/sec, wakes immediately on launch or /forge open, and serves settled jobs from cache', async ($, on) => {
+    const ids = ['done-1'];
+    const files: Record<string, string> = {
+      ...canonicalJob('done-1', {
+        status: 'succeeded', name: 'Old', workerId: 'old', turn: 1,
+        startedAt: iso(RUNNING_NOW - 120_000), finishedAt: iso(RUNNING_NOW - 60_000), updatedAt: iso(RUNNING_NOW - 60_000),
+      }, { 'acceptance.json': JSON.stringify({ state: 'accepted', pending: false, checks: [] }) }),
+    };
+    const { host, clock } = forgeHost(on, files, ids);
+
+    await start($);
+    // Reset counters after warm startup read.
+    host.io.list = 0;
+    host.io.reads.length = 0;
+
+    // 0 active workers, empty notices, /forge closed -> 0 disk reads across 10 seconds!
+    await clock.advance(10_000);
+    expect(host.io.list).toBe(0);
+    expect(host.io.reads).toEqual([]);
+
+    // Opening /forge while quiet wakes immediately (still serving settled done-1 from cache).
+    await $.command.run({ command: 'forge', args: 'all' });
+    expect(host.io.list).toBeGreaterThan(0);
+    expect(host.io.reads.some((p) => p.includes('/done-1/'))).toBe(false);
+    const pane = await $.ui.mount(PANE_TARGET);
+    await pane.press({ key: 'close' });
+    host.io.list = 0;
+    host.io.reads.length = 0;
+    await clock.advance(5_000);
+    expect(host.io.list).toBe(0);
+    expect(host.io.reads).toEqual([]);
+
+    // Launch a new live worker -> wakes immediately and reads ONLY live-1 (done-1 stays cached!).
+    ids.push('live-1');
+    Object.assign(files, canonicalJob('live-1', {
+      status: 'running', name: 'Fresh', workerId: 'fresh', turn: 1,
+      startedAt: iso(RUNNING_NOW + 15_000), updatedAt: iso(RUNNING_NOW + 15_000),
+    }));
+    await launch($, 'live-1');
+    expect(host.io.reads.some((p) => p.includes('/live-1/'))).toBe(true);
+    expect(host.io.reads.some((p) => p.includes('/done-1/'))).toBe(false);
+
+    // Next 1 s active poll re-reads ONLY live-1, never cached settled done-1.
+    host.io.reads.length = 0;
+    await clock.advance(1000);
+    expect(host.io.reads.some((p) => p.includes('/live-1/'))).toBe(true);
+    expect(host.io.reads.some((p) => p.includes('/done-1/'))).toBe(false);
   });
 });
