@@ -12,10 +12,11 @@ Construct is a set of skills for working on real code: understanding it, designi
 
 ## The programs
 
-Not sure which one fits? Type `/construct:load` with your task and it picks one for you.
+Not sure which one fits? Type `/construct:load` with your task and it picks one for you. To keep them all on hand for a whole session, start it with `/construct:redpill`.
 
 | Command | Use it when you want to… |
 |---|---|
+| `redpill` | start a session where your agent uses any of these when a task calls for it |
 | `how` | understand how some code works before touching it |
 | `why` | find out why it was built that way, with sources and confidence |
 | `architect` | settle the shape (usage, types, modules) before writing code |
@@ -33,7 +34,7 @@ Not sure which one fits? Type `/construct:load` with your task and it picks one 
 
 ## How it behaves
 
-- **You start everything.** Skills are user-invoked only. A running skill may tell your agent to read another one (`no-comments` leans on `how` and `architect`), but nothing starts by itself.
+- **You start everything.** Skills are user-invoked only. After `/construct:redpill`, your agent may open any skill for the rest of that session when a task calls for it, says which one first, and does small tasks directly. A running skill may tell your agent to read another one (`no-comments` leans on `how` and `architect`), but nothing starts by itself.
 - **Effort fits the job.** A small question gets a direct answer. Helpers, and helpers on other model families, only come in when the stakes justify the cost.
 - **It brings no tools of its own.** Skills describe what they need ("a reviewer on a different model, if one is available") and your agent uses whatever you have. With [agent-smith](../README.md) installed, that includes Codex, OpenCode, agy and Kimi workers. Without it, everything still works.
 - **Reports are claims.** Whatever a helper says gets checked against the code before it reaches you.
