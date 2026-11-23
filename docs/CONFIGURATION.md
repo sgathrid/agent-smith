@@ -114,7 +114,7 @@ not the Kimi CLI.
 |---|---|---|
 | `DEFAULT_TIMEOUT_MS` | 2 700 000 (45 min); applies when `timeoutMs` is absent, 0 or non-finite | `forge/format.ts` |
 | `MIN_TIMEOUT_MS` / `MAX_TIMEOUT_MS` | 1 000 / 21 600 000 (6 h); `clampTimeout` | `forge/service.ts` |
-| `wait_ms` (status) | 1 to `MAX_WAIT_MS` = 60 000; polls every 500 ms | `tools.ts` |
+| `wait_ms` (status) | 1 to `MAX_WAIT_MS` = 60 000; wakes on job-directory file events (500 ms fallback) | `tools.ts` |
 | `CATALOG_TTL_MS` | 300 000 (5 min), per provider, in-process | `providers/catalog.ts` |
 | Discovery timeout | 10 000 per provider (+1 000 guard) | `catalog.ts` |
 | `CATALOG_COLD_WAIT_MS` / `CATALOG_WAIT_MS` | 5 000 until a catalog lookup has completed in the process (warm-up or a spawn), then 2 000; spawn-time catalog race. A supervisor's lookup is instant while the disk catalog cache (`CATALOG_TTL_MS` 5 min) is fresh | `service.ts`, `providers/catalog.ts` |

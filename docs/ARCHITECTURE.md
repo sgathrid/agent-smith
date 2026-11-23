@@ -461,7 +461,7 @@ Every tool answers fast so the MCP server and the session are never blocked by a
 long-running job: `spawn_job`/`resume_job`/`run_pipeline` return once the anchor is on disk
 (`run_pipeline` persists the run record first); discovery runs in the background at server
 start, on `list_capabilities`, or when a model/effort is named, bounded on the spawn path to 5 s
-before any catalog has been seen and 2 s after; harness defaults are file reads, not CLI calls. The intentional waits are `status wait_ms` (1-60 000 ms, polling every 500 ms),
+before any catalog has been seen and 2 s after; harness defaults are file reads, not CLI calls. The intentional waits are `status wait_ms` (1-60 000 ms, waking on job-directory file events with a 500 ms fallback),
 meant for when the hook is unavailable, and an unrestricted confirmation, which waits on the
 user (up to 10 minutes) before anything launches.
 

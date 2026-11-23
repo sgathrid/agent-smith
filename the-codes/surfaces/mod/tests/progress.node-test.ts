@@ -9,6 +9,9 @@ const J = (v: Record<string, unknown>) => JSON.stringify(v);
 test('classify understands agy, claude, opencode and codex tool calls', () => {
   const cases: Array<[string, string | null, string, string]> = [
     ['view_file', J({ AbsolutePath: '/w/src/config.py' }), 'read', 'reading config.py'],
+    ['read_file', J({ Path: '/w/src/app.ts' }), 'read', 'reading app.ts'],
+    ['edit_file', J({ Path: '/w/src/app.ts' }), 'edit', 'editing app.ts'],
+    ['write_file', J({ Path: '/w/src/new.ts' }), 'edit', 'editing new.ts'],
     ['replace_file_content', J({ TargetFile: '/w/src/config.py' }), 'edit', 'editing config.py'],
     ['grep_search', J({ Query: 'load_config' }), 'search', 'searching load_config'],
     ['run_command', J({ CommandLine: 'git grep -n "refine_config" tests/' }), 'search', 'git grep'],
