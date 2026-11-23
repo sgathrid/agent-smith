@@ -37,7 +37,7 @@ const SEARCH_TOOLS = new Set(['grep_search', 'grep', 'glob', 'find_by_name', 'se
 const EDIT_TOOLS = new Set(['write_to_file', 'replace_file_content', 'edit', 'edit_file', 'write', 'write_file', 'create_file', 'str_replace_editor', 'multiedit', 'notebookedit', 'patch', 'file_change', 'apply_patch']);
 const COMMAND_TOOLS = new Set(['run_command', 'bash', 'shell', 'command_execution', 'exec']);
 
-const PATH_KEYS = ['AbsolutePath', 'TargetFile', 'file_path', 'filePath', 'notebook_path', 'path'];
+const PATH_KEYS = ['AbsolutePath', 'TargetFile', 'Path', 'file_path', 'filePath', 'notebook_path', 'path'];
 const COMMAND_KEYS = ['CommandLine', 'command', 'cmd'];
 
 /**

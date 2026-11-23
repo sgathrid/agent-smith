@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import process$1 from'node:process';import {randomUUID,randomBytes}from'node:crypto';import {readFileSync,statSync,mkdirSync,writeFileSync,rmSync,linkSync,unlinkSync,existsSync,renameSync,readdirSync}from'node:fs';import path from'node:path';import {l as livenessOf,i as isStalled,L as LIVENESS_STATES,c as claimMarkerPath}from'./chunk-stale.js';import {r as reasonFromText,M as MODES$1,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS,i as inheritContinuedProviders,S as STAGE_PROMPTS,v as validateSpec,s as startPipeline,b as readPipeline,c as cancelPipeline,d as readAcceptance,j as jobFile,F as FILES,m as markAcceptancePending,e as settleAcceptance,f as isMode,p as providerNames,g as markAcceptanceSuperseded,h as isTerminalForgeStatus}from'./chunk-execute.js';import {E as EFFORTS$1,M as MAX_WATCHED_FILES,v as validateEnv,g as getCatalogs,l as launchPipeline,a as ENV_KEYS_FILE,b as getInstalledProviders,F as ForgeService}from'./chunk-service.js';import'node:fs/promises';import {execFile}from'node:child_process';import os from'node:os';import'node:url';import'node:timers/promises';import'node:readline';//#region rolldown:runtime
+import process$1 from'node:process';import {randomUUID,randomBytes}from'node:crypto';import {watch,readFileSync,statSync,mkdirSync,writeFileSync,rmSync,linkSync,unlinkSync,existsSync,renameSync,readdirSync}from'node:fs';import path from'node:path';import {l as livenessOf,i as isStalled,L as LIVENESS_STATES,c as claimMarkerPath}from'./chunk-stale.js';import {r as reasonFromText,M as MODES$1,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS,i as inheritContinuedProviders,S as STAGE_PROMPTS,v as validateSpec,s as startPipeline,b as readPipeline,c as cancelPipeline,d as readAcceptance,j as jobDir,e as jobFile,F as FILES,m as markAcceptancePending,f as settleAcceptance,g as isMode,p as providerNames,h as markAcceptanceSuperseded,k as isTerminalForgeStatus}from'./chunk-execute.js';import {E as EFFORTS$1,M as MAX_WATCHED_FILES,v as validateEnv,g as getCatalogs,l as launchPipeline,a as ENV_KEYS_FILE,b as getInstalledProviders,F as ForgeService}from'./chunk-service.js';import'node:fs/promises';import {execFile}from'node:child_process';import os from'node:os';import'node:url';import'node:timers/promises';import'node:readline';//#region rolldown:runtime
 var __create = Object.create;
 var __defProp = Object.defineProperty;
 var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
@@ -25067,6 +25067,71 @@ function createRequestStateCodec(options) {
 			return envelope.p;
 		}
 	};
+}/**
+ * forge/watch.ts — wake when a job's files change, instead of re-reading them on a timer.
+ *
+ * A worker runs in another process (the detached supervisor) and reports only through
+ * its job directory. The OS tells us when that directory changes (FSEvents on macOS,
+ * inotify on Linux) through fs.watch, so a caller waiting on a job wakes the moment the
+ * writer renames a new job.json, progress.json, or acceptance.json into place.
+ *
+ * The timer is a fallback only: when the directory cannot be watched (it does not exist
+ * yet, or the filesystem has no change events) the wait sleeps `fallbackMs` instead.
+ */
+/**
+ * Resolves on the first change in `dir`, after `timeoutMs`, or when `signal` aborts,
+ * whichever is first. `'polled'` means the directory could not be watched and the
+ * fallback sleep ran instead.
+ */
+function waitForChange(dir, timeoutMs, opts = {}) {
+    if (opts.signal?.aborted)
+        return Promise.resolve('aborted');
+    if (timeoutMs <= 0)
+        return Promise.resolve('timeout');
+    return new Promise((resolve) => {
+        let done = false;
+        let watcher = null;
+        let timer = null;
+        const fallbackMs = Math.min(opts.fallbackMs ?? 500, timeoutMs);
+        const closeWatcher = () => {
+            if (watcher === null)
+                return;
+            const w = watcher;
+            watcher = null;
+            try {
+                w.close();
+            }
+            catch { /* already closed */ }
+        };
+        const finish = (why) => {
+            if (done)
+                return;
+            done = true;
+            if (timer !== null)
+                clearTimeout(timer);
+            opts.signal?.removeEventListener('abort', onAbort);
+            closeWatcher();
+            resolve(why);
+        };
+        const fallBack = () => {
+            if (done)
+                return;
+            closeWatcher();
+            if (timer !== null)
+                clearTimeout(timer);
+            timer = setTimeout(() => finish('polled'), fallbackMs);
+        };
+        const onAbort = () => finish('aborted');
+        opts.signal?.addEventListener('abort', onAbort, { once: true });
+        try {
+            watcher = watch(dir, { persistent: false }, () => finish('change'));
+            watcher.on('error', fallBack);
+            timer = setTimeout(() => finish('timeout'), timeoutMs);
+        }
+        catch {
+            fallBack();
+        }
+    });
 }// Optional user-defined model aliases. No built-in presets: everything comes from models.json.
 // Files: <repo>/.agent-smith/models.json (project) and <home>/.agent-smith/models.json (user).
 // A project alias replaces a user alias of the same name wholesale (no field merging).
@@ -25811,6 +25876,8 @@ async function defaultMixedPipeline(input, catalogs) {
 }/** MCP control surface over the canonical forge runtime. */
 const REPORT_HEAD_CHARS = 8_000;
 const WAIT_POLL_MS = 500;
+/** Upper bound on one fs.watch slice so a dead supervisor (no file write) is still reconciled promptly. */
+const WATCH_RECHECK_MS = 5_000;
 // ── unrestricted confirmation ────────────────────────────────────────────────
 /** Providers that run restricted unless asked. agy and kimi are unrestricted by design: headless they cannot prompt (kimi's print mode forces auto). */
 const RESTRICTED_BY_DEFAULT = new Set(['codex', 'claude', 'opencode']);
@@ -26199,9 +26266,10 @@ const jobStatus = async (ctx, args) => {
     if (waitMs !== undefined) {
         waited = true;
         const deadline = Date.now() + waitMs;
-        const step = ctx.pollMs ?? WAIT_POLL_MS;
+        const fallbackMs = ctx.pollMs ?? WAIT_POLL_MS;
+        const maxSlice = ctx.pollMs ?? WATCH_RECHECK_MS;
         while (unsettled(ctx, detail) && Date.now() < deadline) {
-            await sleep(Math.min(step, Math.max(0, deadline - Date.now())));
+            await waitForChange(jobDir(ctx.service.repo, detail.jobId), Math.min(maxSlice, deadline - Date.now()), { fallbackMs });
             detail = await ctx.service.detail(resolveHead(ctx, detail.jobId));
         }
     }
@@ -26320,8 +26388,9 @@ const cancelJob = async (ctx, args) => {
             mark(detail.jobId);
             cancelHead(detail.jobId);
         }
+        const maxSlice = ctx.pollMs ?? WATCH_RECHECK_MS;
         while (!isSettled(detail) && Date.now() < settleBy) {
-            await sleep(Math.min(step, Math.max(0, settleBy - Date.now())));
+            await waitForChange(jobDir(ctx.service.repo, currentId), Math.min(maxSlice, settleBy - Date.now()), { fallbackMs: step });
             const nextHead = resolveHead(ctx, detail?.supersededBy || detail?.jobId || currentId);
             if (nextHead !== currentId)
                 cancelHead(nextHead);

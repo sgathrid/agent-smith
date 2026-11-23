@@ -7,7 +7,8 @@ import type { Server } from '@modelcontextprotocol/server';
 import type { ForgeStatus } from '../../../forge/format.ts';
 import { ENV_KEYS_FILE, type ForgeService, type JobDetail, type SpawnAck } from '../../../forge/service.ts';
 import { launchPipeline } from '../../../forge/supervisor.ts';
-import { FILES, jobFile } from '../../../forge/format.ts';
+import { FILES, jobDir, jobFile } from '../../../forge/format.ts';
+import { waitForChange } from '../../../forge/watch.ts';
 import { startPipeline, readPipeline, cancelPipeline } from '../../../forge/execute.ts';
 import { markAcceptancePending, markAcceptanceSuperseded, readAcceptance, settleAcceptance } from '../../../forge/checks.ts';
 import { validateSpec } from '../../../pipeline/pipeline.ts';
@@ -29,6 +30,8 @@ export { defaultMixedPipeline, type CatalogSource, type MixedSpecInput } from '.
 
 export const REPORT_HEAD_CHARS = 8_000;
 const WAIT_POLL_MS = 500;
+/** Upper bound on one fs.watch slice so a dead supervisor (no file write) is still reconciled promptly. */
+const WATCH_RECHECK_MS = 5_000;
 
 // ── unrestricted confirmation ────────────────────────────────────────────────
 /** Providers that run restricted unless asked. agy and kimi are unrestricted by design: headless they cannot prompt (kimi's print mode forces auto). */
@@ -366,9 +369,10 @@ const jobStatus: Handler = async (ctx, args) => {
   const jobId = text(args, 'jobId', true)!; const waitMs = number(args, 'wait_ms', MAX_WAIT_MS); const fmt = format(args); const wantDiff = boolean(args, 'include_diff') ?? false;
   let detail = await ctx.service.detail(resolveHead(ctx, jobId)); let waited = false;
   if (waitMs !== undefined) {
-    waited = true; const deadline = Date.now() + waitMs; const step = ctx.pollMs ?? WAIT_POLL_MS;
+    waited = true; const deadline = Date.now() + waitMs; const fallbackMs = ctx.pollMs ?? WAIT_POLL_MS;
+    const maxSlice = ctx.pollMs ?? WATCH_RECHECK_MS;
     while (unsettled(ctx, detail) && Date.now() < deadline) {
-      await sleep(Math.min(step, Math.max(0, deadline - Date.now())));
+      await waitForChange(jobDir(ctx.service.repo, detail.jobId), Math.min(maxSlice, deadline - Date.now()), { fallbackMs });
       detail = await ctx.service.detail(resolveHead(ctx, detail.jobId));
     }
   }
@@ -463,8 +467,9 @@ const cancelJob: Handler = async (ctx, args) => {
     };
     let detail = await ctx.service.detail(currentId).catch(() => null);
     if (detail?.jobId) { mark(detail.jobId); cancelHead(detail.jobId); }
+    const maxSlice = ctx.pollMs ?? WATCH_RECHECK_MS;
     while (!isSettled(detail) && Date.now() < settleBy) {
-      await sleep(Math.min(step, Math.max(0, settleBy - Date.now())));
+      await waitForChange(jobDir(ctx.service.repo, currentId), Math.min(maxSlice, settleBy - Date.now()), { fallbackMs: step });
       const nextHead = resolveHead(ctx, detail?.supersededBy || detail?.jobId || currentId);
       if (nextHead !== currentId) cancelHead(nextHead);
       else if (detail?.supersededBy) cancelHead(detail.supersededBy);
