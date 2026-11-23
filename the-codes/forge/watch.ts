@@ -24,12 +24,13 @@ export function waitForChange(
   opts: { signal?: AbortSignal; fallbackMs?: number } = {},
 ): Promise<WatchOutcome> {
   if (opts.signal?.aborted) return Promise.resolve('aborted');
-  if (timeoutMs <= 0) return Promise.resolve('timeout');
+  if (!(timeoutMs > 0)) return Promise.resolve('timeout');
 
   return new Promise((resolve) => {
     let done = false;
     let watcher: ReturnType<typeof watch> | null = null;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    const deadline = Date.now() + timeoutMs;
     const fallbackMs = Math.min(opts.fallbackMs ?? 500, timeoutMs);
 
     const closeWatcher = () => {
@@ -52,7 +53,8 @@ export function waitForChange(
       if (done) return;
       closeWatcher();
       if (timer !== null) clearTimeout(timer);
-      timer = setTimeout(() => finish('polled'), fallbackMs);
+      const delay = Math.min(fallbackMs, Math.max(0, deadline - Date.now()));
+      timer = setTimeout(() => finish('polled'), delay);
     };
 
     const onAbort = () => finish('aborted');

@@ -25086,12 +25086,13 @@ function createRequestStateCodec(options) {
 function waitForChange(dir, timeoutMs, opts = {}) {
     if (opts.signal?.aborted)
         return Promise.resolve('aborted');
-    if (timeoutMs <= 0)
+    if (!(timeoutMs > 0))
         return Promise.resolve('timeout');
     return new Promise((resolve) => {
         let done = false;
         let watcher = null;
         let timer = null;
+        const deadline = Date.now() + timeoutMs;
         const fallbackMs = Math.min(opts.fallbackMs ?? 500, timeoutMs);
         const closeWatcher = () => {
             if (watcher === null)
@@ -25119,7 +25120,8 @@ function waitForChange(dir, timeoutMs, opts = {}) {
             closeWatcher();
             if (timer !== null)
                 clearTimeout(timer);
-            timer = setTimeout(() => finish('polled'), fallbackMs);
+            const delay = Math.min(fallbackMs, Math.max(0, deadline - Date.now()));
+            timer = setTimeout(() => finish('polled'), delay);
         };
         const onAbort = () => finish('aborted');
         opts.signal?.addEventListener('abort', onAbort, { once: true });
