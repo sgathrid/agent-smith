@@ -5,7 +5,7 @@
 
 import type { ObservedJob } from '../harness/types.ts';
 import type { ProgressDigest } from '../surfaces/mod/hooks/progress.ts';
-import { nextActionFor, type ForgeActivity, type ForgeStatus, type WatchedFileSigs } from './format.ts';
+import { isContinuationKind, nextActionFor, type ContinuationKind, type ForgeActivity, type ForgeStatus, type WatchedFileSigs } from './format.ts';
 import type { Acceptance } from './checks.ts';
 
 export interface ListFilter {
@@ -14,14 +14,17 @@ export interface ListFilter {
   readonly limit?: number | undefined;
   /** Only jobs last touched (finished, updated or started) at or after this epoch ms. */
   readonly sinceMs?: number | undefined;
-  /** Only these job IDs (e.g. the ones this process spawned). */
+  /** Only these job IDs (or worker IDs; expanded by workerId). */
   readonly ids?: ReadonlySet<string> | undefined;
+  /** Group turns by workerId (1 head row per worker). Defaults to true. */
+  readonly groupByWorker?: boolean | undefined;
 }
 
 export interface JobSummary {
   readonly jobId: string;
   readonly name: string;
   readonly workerId: string;
+  readonly turn: number;
   readonly role: string | null;
   readonly latestSummary: string | null;
   readonly summarySource: 'worker' | null;
@@ -41,10 +44,14 @@ export interface JobSummary {
   readonly nextAction: string | null;
   /** True when the job ran with the approval prompt bypassed. */
   readonly unrestricted?: boolean;
-  /** Set when this job turn was superseded by a steered continuation turn. */
+  /** Set when this job turn was superseded by a steered continuation turn. Never set on resume. */
   readonly supersededBy?: string | null;
-  /** Set when this job turn was spawned by steering an earlier turn. */
-  readonly steeredFrom?: string | null;
+  /** Parent job ID when this turn continued an earlier turn (steer or resume). Omitted on Turn 1. */
+  readonly continuedFrom?: string;
+  /** How this turn continued its parent. Omitted on Turn 1. */
+  readonly continuationKind?: ContinuationKind;
+  /** ISO-8601 start of the continuous steered chain (reset to startedAt on Turn 1 and resumes). */
+  readonly chainStartedAt?: string;
   /** Count of unconsumed queued steers waiting for the current turn to finish. */
   readonly pendingSteers?: number;
   /** Files changed since the spawn baseline, once the job has finished. */
@@ -115,10 +122,18 @@ export function toSummary(observed: ObservedJob): JobSummary {
   const currentActivity = observed.status === 'running'
     ? [...activities].reverse().find(isActiveForgeActivity) ?? null
     : null;
+  const turn = typeof raw['turn'] === 'number' && Number.isInteger(raw['turn']) && raw['turn'] >= 1 ? raw['turn'] : 1;
+  const continuedFrom = typeof raw['continuedFrom'] === 'string' && raw['continuedFrom'] !== '' ? raw['continuedFrom'] : undefined;
+  const continuationKind = isContinuationKind(raw['continuationKind']) ? raw['continuationKind'] : undefined;
+  const chainStartedAt =
+    typeof raw['chainStartedAt'] === 'string' && raw['chainStartedAt'] !== ''
+      ? raw['chainStartedAt']
+      : (observed.startedAt ?? undefined);
   return {
     jobId: observed.jobId,
     name: typeof raw['name'] === 'string' && raw['name'] ? raw['name'] : observed.jobId,
-    workerId: typeof raw['workerId'] === 'string' ? raw['workerId'] : observed.jobId,
+    workerId: typeof raw['workerId'] === 'string' && raw['workerId'] !== '' ? raw['workerId'] : observed.jobId,
+    turn,
     role: typeof raw['role'] === 'string' ? raw['role'] : observed.mode,
     latestSummary: raw['summarySource'] === 'worker' && typeof raw['latestSummary'] === 'string' ? raw['latestSummary'] : null,
     summarySource: raw['summarySource'] === 'worker' ? 'worker' : null,
@@ -150,9 +165,9 @@ export function toSummary(observed: ObservedJob): JobSummary {
     ...(typeof raw['supersededBy'] === 'string' || raw['supersededBy'] === null
       ? { supersededBy: raw['supersededBy'] as string | null }
       : {}),
-    ...(typeof raw['steeredFrom'] === 'string' || raw['steeredFrom'] === null
-      ? { steeredFrom: raw['steeredFrom'] as string | null }
-      : {}),
+    ...(continuedFrom !== undefined ? { continuedFrom } : {}),
+    ...(continuationKind !== undefined ? { continuationKind } : {}),
+    ...(chainStartedAt !== undefined ? { chainStartedAt } : {}),
     ...(typeof raw['pendingSteers'] === 'number'
       ? { pendingSteers: raw['pendingSteers'] }
       : {}),

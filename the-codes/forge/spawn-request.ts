@@ -12,7 +12,7 @@ import { MODE_PRESETS, MODES } from './modes.ts';
 import type { BriefCheck } from './brief.ts';
 import type { ModePreset } from './modes.ts';
 import type { StartInput } from './writer.ts';
-import { DEFAULT_TIMEOUT_MS, type ForgeManifest, type ForgeStatus, type SteerDelivery, type WatchedFileSigs } from './format.ts';
+import { DEFAULT_TIMEOUT_MS, type ContinuationKind, type ForgeManifest, type ForgeStatus, type SteerDelivery, type WatchedFileSigs } from './format.ts';
 
 /** Floor and ceiling on a caller-supplied timeout. */
 export const MIN_TIMEOUT_MS = 1_000;
@@ -22,6 +22,14 @@ export interface SpawnRequest {
   readonly name?: string;
   readonly task?: string;
   readonly workerId?: string;
+  /** Explicit 1-based turn number; auto-computed from continuedFrom when omitted. */
+  readonly turn?: number | undefined;
+  /** Parent job ID when continuing a worker (resume or steer). Omitted on Turn 1. */
+  readonly continuedFrom?: string | undefined;
+  /** How this turn continued its parent. Omitted on Turn 1. */
+  readonly continuationKind?: ContinuationKind | undefined;
+  /** Start of the continuous steered chain; omit on Turn 1 and resumes so it resets to startedAt. */
+  readonly chainStartedAt?: string | undefined;
   /** Stage/role name. Becomes part of the job id and the pane's task context. */
   readonly mode: string;
   readonly prompt: string;
@@ -72,6 +80,10 @@ export interface SpawnAck {
   readonly jobId: string;
   readonly name: string;
   readonly workerId: string;
+  readonly turn: number;
+  readonly continuedFrom?: string;
+  readonly continuationKind?: ContinuationKind;
+  readonly chainStartedAt: string;
   readonly role: string;
   readonly provider: string;
   /** Always 'running' at ack time; read `status` later. */
@@ -110,7 +122,7 @@ export interface TrackedSpawn {
 }
 
 export interface SteerRequest {
-  /** Active worker name or job ID. */
+  /** Active worker name, workerId, or any turn's job ID. */
   readonly worker: string;
   readonly prompt: string;
   readonly context?: string | undefined;
@@ -118,16 +130,23 @@ export interface SteerRequest {
   readonly files?: readonly string[] | undefined;
   /** Required delivery mode: 'queue' (run after current turn) or 'interrupt' (stop current turn now and continue). */
   readonly delivery: SteerDelivery;
+  /**
+   * Required opt-in for `delivery: 'interrupt'` when no resumable conversation
+   * handle exists yet. False/omitted fails closed rather than silently wiping context.
+   */
+  readonly allowFresh?: boolean | undefined;
 }
 
 export interface SteerAck {
-  /** Currently active job ID that received the steer. */
+  /** Currently active job ID that received the steer (or the new turn's job ID when action is 'resumed'). */
   readonly jobId: string;
   readonly name: string;
   readonly workerId: string;
   readonly provider: string;
   readonly delivery: SteerDelivery;
-  readonly status: 'queued' | 'interrupting';
+  readonly status: 'running';
+  readonly action: 'queued' | 'interrupting' | 'resumed';
+  readonly turn: number;
   readonly pendingSteers: number;
   readonly signalled: boolean;
   /**
@@ -140,6 +159,9 @@ export interface SteerAck {
   readonly dir: string;
   readonly timeoutMs: number;
   readonly note: string;
+  readonly continuedFrom?: string;
+  readonly continuationKind?: ContinuationKind;
+  readonly chainStartedAt?: string;
 }
 
 /**
@@ -299,8 +321,11 @@ export function turnStartInput(
     readonly conversation: string | null;
     readonly task: string | undefined;
     readonly watchedFiles: Readonly<Record<string, WatchedFileSigs>> | undefined;
-    /** Set on a continuation: the turn it picks up from. */
-    readonly steeredFrom?: string;
+    readonly turn?: number | undefined;
+    /** Set on a continuation (steer or resume): the turn it picks up from. */
+    readonly continuedFrom?: string | undefined;
+    readonly continuationKind?: ContinuationKind | undefined;
+    readonly chainStartedAt?: string | undefined;
   },
 ): StartInput {
   return {
@@ -328,7 +353,10 @@ export function turnStartInput(
     sandboxFlags: [...spec.sandboxFlags],
     readOnlyRequested: spec.readOnlyRequested,
     readOnlyEnforced: spec.readOnlyEnforced,
-    ...(turn.steeredFrom === undefined ? {} : { steeredFrom: turn.steeredFrom }),
+    ...(turn.turn === undefined ? {} : { turn: turn.turn }),
+    ...(turn.continuedFrom === undefined ? {} : { continuedFrom: turn.continuedFrom }),
+    ...(turn.continuationKind === undefined ? {} : { continuationKind: turn.continuationKind }),
+    ...(turn.chainStartedAt === undefined ? {} : { chainStartedAt: turn.chainStartedAt }),
     ...(turn.watchedFiles === undefined ? {} : { watchedFiles: turn.watchedFiles }),
   };
 }

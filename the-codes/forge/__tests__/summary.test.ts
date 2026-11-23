@@ -60,3 +60,29 @@ test('toSummary carries finish evidence and liveness inputs, and failedEarly rea
   assert.doesNotMatch(plain.nextAction ?? '', /^Route failed before any work/);
   assert.equal(plain.failedEarly, undefined);
 });
+
+test('toSummary projects unified turn-chain fields and defaults turn/chainStartedAt cleanly', () => {
+  const modern = toSummary(observed({
+    workerId: 'w-1',
+    turn: 3,
+    continuedFrom: 'job-2',
+    continuationKind: 'resume',
+    chainStartedAt: '2026-11-23T10:00:00.000Z',
+  }));
+  assert.equal(modern.workerId, 'w-1');
+  assert.equal(modern.turn, 3);
+  assert.equal(modern.continuedFrom, 'job-2');
+  assert.equal(modern.continuationKind, 'resume');
+  assert.equal(modern.chainStartedAt, '2026-11-23T10:00:00.000Z');
+  assert.equal('steeredFrom' in modern, false);
+
+  const bare = toSummary({
+    ...observed({}),
+    startedAt: '2026-11-23T09:00:00.000Z',
+  });
+  assert.equal(bare.turn, 1);
+  assert.equal(bare.continuedFrom, undefined);
+  assert.equal(bare.continuationKind, undefined);
+  assert.equal(bare.chainStartedAt, '2026-11-23T09:00:00.000Z');
+  assert.equal('steeredFrom' in bare, false);
+});

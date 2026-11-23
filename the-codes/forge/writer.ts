@@ -54,6 +54,7 @@ import {
   looksEmpty,
   shouldFlush,
   taskTitle,
+  type ContinuationKind,
   type ForgeActivity,
   type GitBaseline,
   type ForgeManifest,
@@ -107,7 +108,10 @@ export interface StartInput {
   readonly sandboxFlags?: readonly string[];
   readonly readOnlyRequested?: boolean;
   readonly readOnlyEnforced?: boolean;
-  readonly steeredFrom?: string | null;
+  readonly turn?: number;
+  readonly continuedFrom?: string | undefined;
+  readonly continuationKind?: ContinuationKind | undefined;
+  readonly chainStartedAt?: string | undefined;
   readonly watchedFiles?: Readonly<Record<string, WatchedFileSigs>>;
 }
 
@@ -188,6 +192,8 @@ export class JobWriter {
    */
   start(input: StartInput): ForgeManifest {
     const now = new Date().toISOString();
+    const turn = typeof input.turn === 'number' && Number.isInteger(input.turn) && input.turn >= 1 ? input.turn : 1;
+    const chainStartedAt = input.chainStartedAt ?? now;
     this.view = { ...this.view, prompt: input.prompt.slice(0, 64_000), preamble: input.preamble?.slice(0, 4_000) ?? null,
       truncated: input.prompt.length > 64_000 || (input.preamble?.length ?? 0) > 4_000 };
     this.conversation = input.conversation;
@@ -196,6 +202,7 @@ export class JobWriter {
       jobId: this.jobId,
       name: input.name ?? this.jobId,
       workerId: input.workerId ?? this.jobId,
+      turn,
       role: input.mode,
       latestSummary: null,
       summarySource: null,
@@ -214,6 +221,7 @@ export class JobWriter {
       createdAt: now,
       updatedAt: now,
       startedAt: now,
+      chainStartedAt,
       finishedAt: null,
       exitCode: null,
       jobStatus: null,
@@ -232,7 +240,8 @@ export class JobWriter {
       ...(input.sandboxFlags === undefined ? {} : { sandboxFlags: input.sandboxFlags }),
       ...(input.readOnlyRequested === undefined ? {} : { readOnlyRequested: input.readOnlyRequested }),
       ...(input.readOnlyEnforced === undefined ? {} : { readOnlyEnforced: input.readOnlyEnforced }),
-      ...(input.steeredFrom ? { steeredFrom: input.steeredFrom } : {}),
+      ...(input.continuedFrom ? { continuedFrom: input.continuedFrom } : {}),
+      ...(input.continuationKind ? { continuationKind: input.continuationKind } : {}),
       ...(input.watchedFiles !== undefined && Object.keys(input.watchedFiles).length > 0
         ? { watchedFiles: input.watchedFiles }
         : {}),
@@ -963,6 +972,8 @@ function emptyManifest(jobId: string): ForgeManifest {
   return {
     schema: SCHEMA_VERSION,
     jobId,
+    workerId: jobId,
+    turn: 1,
     provider: 'unknown',
     mode: 'unknown',
     model: null,
@@ -976,6 +987,7 @@ function emptyManifest(jobId: string): ForgeManifest {
     createdAt: now,
     updatedAt: now,
     startedAt: null,
+    chainStartedAt: now,
     finishedAt: null,
     exitCode: null,
     jobStatus: null,

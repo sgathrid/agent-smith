@@ -91,9 +91,11 @@ test('CLI run uses the canonical forge, records a pipeline, and resumes a named 
     const resumed = await main(['resume', 'Ada', '--prompt', 'Continue the same task', '--repo', repo, '--foreground']);
     assert.equal(resumed, 0, err);
     assert.match(out, /pipeline passed/);
-    const allJobs = await service.list({ limit: 10 });
+    const grouped = await service.list({ limit: 10 });
+    assert.equal(grouped.length, 1, 'default list() groups turns by workerId');
+    const allJobs = await service.list({ limit: 10, groupByWorker: false });
     assert.equal(allJobs.length, 2);
-    const second = await service.detail(allJobs[0]!.jobId) as unknown as { name: string; workerId: string; conversation: string | null; cwd: string };
+    const second = await service.detail(grouped[0]!.jobId) as unknown as { name: string; workerId: string; conversation: string | null; cwd: string };
     assert.equal(second.name, 'Ada');
     assert.equal(second.workerId, first.workerId);
     assert.equal(second.conversation, first.conversation, 'the follow-up must continue the original provider conversation');

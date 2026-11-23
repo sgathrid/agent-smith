@@ -20,6 +20,7 @@ import {
   CANCEL_ORPHAN_REASON,
   ORPHAN_REASON,
   deriveOrphan,
+  isContinuationKind,
   ownerAlive,
   jobFile,
   jobsDir,
@@ -187,11 +188,27 @@ export class AgentSmithReader implements JobStateReader {
       if (orphan === null && cancelRequested && cancelAgeMs > 60_000 && !ownerIsAlive) orphan = CANCELED_ORPHAN;
     }
 
+    // Defensive 0.4.x disk-read fallback: older manifests wrote `steeredFrom` and omitted `turn`/`chainStartedAt`.
+    const legacySteeredFrom = (manifest as (ForgeManifest & { steeredFrom?: unknown }) | null)?.steeredFrom;
+    const turn = typeof manifest?.turn === 'number' && Number.isInteger(manifest.turn) && manifest.turn >= 1 ? manifest.turn : 1;
+    const continuedFrom =
+      typeof manifest?.continuedFrom === 'string' && manifest.continuedFrom !== ''
+        ? manifest.continuedFrom
+        : typeof legacySteeredFrom === 'string' && legacySteeredFrom !== ''
+          ? legacySteeredFrom
+          : undefined;
+    const continuationKind = isContinuationKind(manifest?.continuationKind) ? manifest.continuationKind : undefined;
+    const chainStartedAt =
+      typeof manifest?.chainStartedAt === 'string' && manifest.chainStartedAt !== ''
+        ? manifest.chainStartedAt
+        : (manifest?.startedAt ?? manifest?.createdAt ?? undefined);
+
     const payload: Record<string, unknown> = {
       [SMITH_PAYLOAD.schema]: manifest?.schema ?? null,
       [SMITH_PAYLOAD.provider]: manifest?.provider ?? null,
       name: manifest?.name ?? null,
       workerId: manifest?.workerId ?? jobId,
+      turn,
       role: manifest?.role ?? manifest?.mode ?? null,
       latestSummary: progress?.latestSummary ?? manifest?.latestSummary ?? null,
       summarySource: progress?.summarySource ?? manifest?.summarySource ?? null,
@@ -238,7 +255,9 @@ export class AgentSmithReader implements JobStateReader {
       [SMITH_PAYLOAD.progressWarnings]: progress?.warnings ?? [],
       ...(progress?.digest !== undefined ? { digest: progress.digest } : {}),
       ...(manifest?.supersededBy !== undefined ? { supersededBy: manifest.supersededBy } : {}),
-      ...(manifest?.steeredFrom !== undefined ? { steeredFrom: manifest.steeredFrom } : {}),
+      ...(continuedFrom !== undefined ? { continuedFrom } : {}),
+      ...(continuationKind !== undefined ? { continuationKind } : {}),
+      ...(chainStartedAt !== undefined ? { chainStartedAt } : {}),
       ...(typeof (progress?.pendingSteers ?? manifest?.pendingSteers) === 'number'
         ? { pendingSteers: progress?.pendingSteers ?? manifest?.pendingSteers }
         : {}),

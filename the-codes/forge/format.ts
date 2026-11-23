@@ -129,6 +129,12 @@ export const FILES = {
 
 export type SteerDelivery = 'queue' | 'interrupt';
 
+export type ContinuationKind = 'steer-queue' | 'steer-interrupt' | 'resume';
+
+export function isContinuationKind(v: unknown): v is ContinuationKind {
+  return v === 'steer-queue' || v === 'steer-interrupt' || v === 'resume';
+}
+
 export interface WatchedFileSigs {
   readonly repoSig: string;
   readonly cwdSig: string;
@@ -141,6 +147,7 @@ export interface SteerEntry {
   readonly context?: string | undefined;
   readonly files?: readonly string[] | undefined;
   readonly delivery: SteerDelivery;
+  readonly allowFresh?: boolean | undefined;
 }
 
 /**
@@ -193,6 +200,8 @@ export interface ForgeManifest {
   /** Additive fields are optional when reading manifests written by v1. */
   readonly name?: string;
   readonly workerId?: string;
+  /** 1-based turn index for this worker (1 on initial spawn, parent + 1 on steer or resume). */
+  readonly turn?: number;
   readonly role?: string;
   readonly latestSummary?: string | null;
   readonly summarySource?: 'worker' | null;
@@ -294,10 +303,14 @@ export interface ForgeManifest {
   readonly unattributedFiles?: readonly string[];
   /** Wall-clock limit this job was spawned with (0 = no timer); lets a non-owning process report it. */
   readonly timeoutMs?: number;
-  /** Continuation job ID when this turn was superseded by a steered turn. */
+  /** Continuation job ID when this turn was superseded by a steered turn. Never set on resume. */
   readonly supersededBy?: string | null;
-  /** Parent job ID when this turn was created by steering an earlier turn. */
-  readonly steeredFrom?: string | null;
+  /** Parent job ID when this turn continued an earlier turn (steer or resume). Omitted on Turn 1. */
+  readonly continuedFrom?: string;
+  /** How this turn continued its parent. Omitted on Turn 1. */
+  readonly continuationKind?: ContinuationKind;
+  /** Start of the continuous steered chain (equals startedAt on Turn 1 and resumes; inherited across steers). */
+  readonly chainStartedAt?: string;
   /** Number of unconsumed queued steers in steer.jsonl. */
   readonly pendingSteers?: number;
   /** Declared brief/spec files synced at turn start, mapped to their repo + cwd signatures. */

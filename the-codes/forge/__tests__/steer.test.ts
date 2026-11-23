@@ -10,11 +10,10 @@ import { test } from 'node:test';
 import type { SpawnSpec } from '../../providers/types.ts';
 import { readAcceptance } from '../checks.ts';
 import { FILES, jobFile } from '../format.ts';
+import { SteerTargetSettledError } from '../service.ts';
 import { ForgeTasks } from '../../surfaces/channel/src/tasks.ts';
 import { callTool } from '../../surfaces/channel/src/tools.ts';
 import { isLive } from '../../surfaces/mod/hooks/dashboard.ts';
-import { syncNativeTasks, type NativeJob } from '../../surfaces/mod/hooks/native.ts';
-import { claim, due, parseSettledRead } from '../../surfaces/mod/hooks/notice.ts';
 import { controlledProvider, makeService } from '../testing/steer-harness.ts';
 import { waitFor } from '../testing/time.ts';
 
@@ -38,7 +37,11 @@ test('steer(queue): coalesces multiple queued steers, opens child anchor before 
     delivery: 'queue',
   });
   assert.equal(steer1.jobId, ack.jobId);
-  assert.equal(steer1.status, 'queued');
+  assert.equal(steer1.status, 'running');
+  assert.equal(steer1.action, 'queued');
+  assert.equal(steer1.turn, 1);
+  assert.equal(steer1.workerId, ack.workerId);
+  assert.equal(steer1.chainStartedAt, ack.chainStartedAt);
   assert.equal(steer1.pendingSteers, 1);
   assert.equal(steer1.resumable, true, 'the started event supplied a conversation handle');
 
@@ -64,7 +67,11 @@ test('steer(queue): coalesces multiple queued steers, opens child anchor before 
   const finalManifest = await done;
   assert.notEqual(finalManifest.jobId, ack.jobId);
   assert.equal(finalManifest.status, 'succeeded');
-  assert.equal(finalManifest.steeredFrom, ack.jobId);
+  assert.equal(finalManifest.turn, 2);
+  assert.equal(finalManifest.continuedFrom, ack.jobId);
+  assert.equal(finalManifest.continuationKind, 'steer-queue');
+  assert.equal(finalManifest.chainStartedAt, ack.chainStartedAt);
+  assert.equal('steeredFrom' in finalManifest, false);
   assert.equal(finalManifest.name, 'shell');
 
   const parentDetail = await service.detail(ack.jobId);
@@ -91,7 +98,9 @@ test('steer(interrupt): cancels active turn, records supersededBy on parent, and
     prompt: 'Stop sidebar; move navigation to the profile menu.',
     delivery: 'interrupt',
   });
-  assert.equal(steerAck.status, 'interrupting');
+  assert.equal(steerAck.status, 'running');
+  assert.equal(steerAck.action, 'interrupting');
+  assert.equal(steerAck.turn, 1);
   assert.equal(turn1.cancelled, true);
   assert.equal(existsSync(jobFile(repo, ack.jobId, FILES.cancelSteer)), true);
 
@@ -109,12 +118,15 @@ test('steer(interrupt): cancels active turn, records supersededBy on parent, and
   const finalManifest = await done;
   assert.equal(finalManifest.jobId, parentManifest.supersededBy);
   assert.equal(finalManifest.status, 'succeeded');
-  assert.equal(finalManifest.steeredFrom, ack.jobId);
+  assert.equal(finalManifest.turn, 2);
+  assert.equal(finalManifest.continuedFrom, ack.jobId);
+  assert.equal(finalManifest.continuationKind, 'steer-interrupt');
+  assert.equal(finalManifest.chainStartedAt, ack.chainStartedAt);
 });
 
-test('steer(interrupt) before conversation ID arrives falls back to fresh continuation with full brief', async () => {
+test('steer(interrupt) before conversation ID arrives fails closed unless allowFresh: true is passed', async () => {
   const ctrl = controlledProvider();
-  const { service } = makeService(ctrl.provider);
+  const { service, repo } = makeService(ctrl.provider);
 
   const turn1Ready = ctrl.nextTurn();
   const { ack, done } = await service.spawnTracked({
@@ -122,15 +134,33 @@ test('steer(interrupt) before conversation ID arrives falls back to fresh contin
     name: 'early',
     prompt: 'Initial task.',
   });
-  await turn1Ready;
+  const turn1 = await turn1Ready;
   // Do NOT emit a started event with conversationId.
 
+  // Without allowFresh: true, interrupt must fail closed without cancelling or writing steer files.
+  await assert.rejects(
+    service.steer({
+      worker: 'early',
+      prompt: 'Updated task instructions.',
+      delivery: 'interrupt',
+    }),
+    /no resumable conversation handle.*allowFresh: true/,
+  );
+  assert.equal(turn1.cancelled, false);
+  assert.equal(existsSync(jobFile(repo, ack.jobId, FILES.cancelSteer)), false);
+  assert.equal(existsSync(jobFile(repo, ack.jobId, FILES.steer)), false);
+
+  // With allowFresh: true, interrupt proceeds and chains a fresh continuation.
   const turn2Ready = ctrl.nextTurn();
-  await service.steer({
+  const steerAck = await service.steer({
     worker: 'early',
     prompt: 'Updated task instructions.',
     delivery: 'interrupt',
+    allowFresh: true,
   });
+  assert.equal(steerAck.status, 'running');
+  assert.equal(steerAck.action, 'interrupting');
+  assert.equal(steerAck.resumable, false);
 
   const turn2 = await turn2Ready;
   assert.equal(turn2.spec.conversation, undefined);
@@ -140,7 +170,10 @@ test('steer(interrupt) before conversation ID arrives falls back to fresh contin
 
   turn2.finish({ status: 'success', response: 'Completed fresh continuation with the updated task instructions end-to-end.' });
   const finalManifest = await done;
-  assert.equal(finalManifest.steeredFrom, ack.jobId);
+  assert.equal(finalManifest.turn, 2);
+  assert.equal(finalManifest.continuedFrom, ack.jobId);
+  assert.equal(finalManifest.continuationKind, 'steer-interrupt');
+  assert.equal(finalManifest.chainStartedAt, ack.chainStartedAt);
   assert.equal(finalManifest.status, 'succeeded');
 });
 
@@ -174,9 +207,9 @@ test('steer rejects finished workers, pipeline stages, and orphaned jobs with ac
   const ctrl = controlledProvider();
   const { service, repo } = makeService(ctrl.provider);
 
-  // 1. Finished worker -> points to resume_job
+  // 1. Finished worker -> throws typed SteerTargetSettledError
   const t1 = ctrl.nextTurn();
-  const { done } = await service.spawnTracked({
+  const { ack: revAck, done } = await service.spawnTracked({
     mode: 'review',
     name: 'reviewer',
     prompt: 'Review.',
@@ -186,7 +219,15 @@ test('steer rejects finished workers, pipeline stages, and orphaned jobs with ac
 
   await assert.rejects(
     service.steer({ worker: 'reviewer', prompt: 'More.', delivery: 'queue' }),
-    /is already succeeded; use resume_job to continue a finished worker/,
+    (err: unknown) => {
+      assert.ok(err instanceof SteerTargetSettledError);
+      assert.equal(err.jobId, revAck.jobId);
+      assert.equal(err.workerId, revAck.workerId);
+      assert.equal(err.status, 'succeeded');
+      assert.equal(err.name, 'reviewer');
+      assert.match(err.message, /is already succeeded; use resume_job to continue a finished worker/);
+      return true;
+    },
   );
 
   // 2. Pipeline stage -> rejected
@@ -227,7 +268,12 @@ test('steer rejects finished workers, pipeline stages, and orphaned jobs with ac
 
   await assert.rejects(
     service.steer({ worker: orphanSpawn.ack.jobId, prompt: 'Steer orphan.', delivery: 'queue' }),
-    /is already failed|has no live owner process/,
+    (err: unknown) => {
+      assert.ok(err instanceof SteerTargetSettledError);
+      assert.equal(err.status, 'failed');
+      assert.match(err.message, /is already failed|has no live owner process/);
+      return true;
+    },
   );
 });
 
@@ -317,57 +363,6 @@ test('cancel(parentId) and status(parentId, { wait_ms }) follow supersededBy to 
   const finalManifest = await done;
   assert.equal(finalManifest.jobId, t2.spec.jobId);
   assert.equal(finalManifest.status, 'canceled');
-});
-
-test('parseSettledRead ignores superseded parent and due() deduplicates notices across steered turns', () => {
-  const supersededParentStatus = {
-    jobId: 'implement-parent',
-    status: 'canceled',
-    supersededBy: 'implement-child',
-  };
-  assert.equal(
-    parseSettledRead('mcp__agent-smith__status', supersededParentStatus),
-    null,
-    'reading a superseded parent must not unclaim the live chain',
-  );
-
-  const settledChildStatus = {
-    jobId: 'implement-child',
-    status: 'succeeded',
-  };
-  assert.deepEqual(parseSettledRead('mcp__agent-smith__status', settledChildStatus), {
-    kind: 'job',
-    id: 'implement-child',
-  });
-
-  // Claim both parent and child (e.g. if both were recorded) and verify due() emits exactly 1 notice.
-  const now = 1_000_000;
-  let owned = claim([], { kind: 'job', id: 'implement-parent', repo: '/repo', timeoutMs: 60_000 }, now);
-  owned = claim(owned, { kind: 'job', id: 'implement-child', repo: '/repo', timeoutMs: 60_000 }, now);
-  const res = due(
-    owned,
-    [
-      {
-        id: 'implement-parent',
-        status: 'canceled',
-        supersededBy: 'implement-child',
-        startedAt: now - 2000,
-        endedAt: now - 1000,
-      },
-      {
-        id: 'implement-child',
-        status: 'succeeded',
-        steeredFrom: 'implement-parent',
-        startedAt: now - 1000,
-        endedAt: now,
-      },
-    ],
-    new Map(),
-    now,
-  );
-  assert.equal(res.notices.length, 1);
-  assert.equal(res.notices[0]?.id, 'implement-child');
-  assert.equal(res.owned.length, 0);
 });
 
 test('checks on a steered worker mark child accepted and leave superseded parent unchecked (not live or accepted)', async () => {
@@ -494,73 +489,10 @@ test('queue steer when provider reports no conversation ID chains a fresh contin
 
   t2.finish({ status: 'success', response: 'Finished fresh continuation turn 2.' });
   const finalManifest = await done;
-  assert.equal(finalManifest.steeredFrom, ack.jobId);
+  assert.equal(finalManifest.turn, 2);
+  assert.equal(finalManifest.continuedFrom, ack.jobId);
+  assert.equal(finalManifest.continuationKind, 'steer-queue');
   assert.equal(finalManifest.status, 'succeeded');
-});
-
-test('syncNativeTasks walks multi-hop supersededBy chains in one poll', async () => {
-  const updates: string[] = [];
-  const client = {
-    async create() {
-      return { result: { task: { id: 'native-1' } } };
-    },
-    async update(input: { taskId: string; subject: string }) {
-      updates.push(`${input.taskId}:${input.subject}`);
-      return { result: { success: true } };
-    },
-  };
-  const jobs: NativeJob[] = [
-    {
-      id: 'job-a',
-      status: 'canceled',
-      task: 'Original task',
-      name: 'shell',
-      workerId: 'w1',
-      role: 'implement',
-      provider: 'codex',
-      model: null,
-      latestSummary: null,
-      summarySource: null,
-      supersededBy: 'job-b',
-      steeredFrom: null,
-    },
-    {
-      id: 'job-b',
-      status: 'canceled',
-      task: 'Original task',
-      name: 'shell',
-      workerId: 'w1',
-      role: 'implement',
-      provider: 'codex',
-      model: null,
-      latestSummary: null,
-      summarySource: null,
-      supersededBy: 'job-c',
-      steeredFrom: 'job-a',
-    },
-    {
-      id: 'job-c',
-      status: 'running',
-      task: 'Original task',
-      name: 'shell',
-      workerId: 'w1',
-      role: 'implement',
-      provider: 'codex',
-      model: null,
-      latestSummary: null,
-      summarySource: null,
-      supersededBy: null,
-      steeredFrom: 'job-b',
-    },
-  ];
-  const next = await syncNativeTasks(
-    jobs,
-    { 'job-a': { taskId: 'native-1', status: 'in_progress', fingerprint: 'old' } },
-    client,
-  );
-  assert.equal(next['job-a'], undefined);
-  assert.equal(next['job-b'], undefined);
-  assert.equal(next['job-c']?.taskId, 'native-1');
 });
 
 test('a queued steer on a failed turn is reported, not silently dropped', async () => {
@@ -605,7 +537,7 @@ test('resolveHead crosses the finish window through steer.head before superseded
 
   writeManifest('parent', {});
   writeFileSync(jobFile(repo, 'parent', FILES.steerHead), 'child\n');
-  writeManifest('child', { steeredFrom: 'parent' });
+  writeManifest('child', { turn: 2, continuedFrom: 'parent', continuationKind: 'steer-queue' });
 
   assert.equal(service.resolveHead('parent'), 'child');
 });
