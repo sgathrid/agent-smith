@@ -50,21 +50,21 @@ const detail: JobDetail = {
   sandbox: 'codex -s read-only', sandboxFlags: ['-s', 'read-only'], readOnlyRequested: true, readOnlyEnforced: true, cancellable: false,
   gitBaseline: { head: null, dirty: [] }, changedFiles: ['src/a.ts'], changedFilesTruncated: false,
 };
-const running: JobDetail = { ...detail, jobId: 'job-2', name: 'Bo', status: 'running', finishedAt: null, report: null, exitCode: null, latestSummary: null, summarySource: null, lastActivity: null, toolCalls: null, changedFiles: undefined, gitBaseline: undefined, warnings: [] };
-const unknown: JobDetail = { ...running, jobId: 'job-3', name: 'Cy', status: 'unknown' };
+const running: JobDetail = { ...detail, jobId: 'job-2', name: 'Bo', workerId: 'Bo', status: 'running', finishedAt: null, report: null, exitCode: null, latestSummary: null, summarySource: null, lastActivity: null, toolCalls: null, changedFiles: undefined, gitBaseline: undefined, warnings: [] };
+const unknown: JobDetail = { ...running, jobId: 'job-3', name: 'Cy', workerId: 'Cy', status: 'unknown' };
 // A failed job with no report, exit code or summary: the sparsest terminal record.
-const failed: JobDetail = { ...running, jobId: 'job-4', name: 'Di', status: 'failed', finishedAt: '2026-10-11T09:06:00.000Z', exitCode: 1, error: 'exit 1', nextAction: 'rerun' };
+const failed: JobDetail = { ...running, jobId: 'job-4', name: 'Di', workerId: 'Di', status: 'failed', finishedAt: '2026-10-11T09:06:00.000Z', exitCode: 1, error: 'exit 1', nextAction: 'rerun' };
 const details = [detail, running, unknown, failed];
 const service = withWorkerLookup({
   repo, spawnedIds: new Set(['job-1']),
-  spawnJob: async () => ack,
-  spawnTracked: async (spec: { continuedFrom?: string }) => ({
-    ack: { ...ack, ...(spec?.continuedFrom ? { continuedFrom: spec.continuedFrom } : {}) },
+  spawnJob: async (spec: Record<string, unknown>) => ({ ...ack, ...(spec?.continuedFrom ? { continuedFrom: spec.continuedFrom, continuationKind: spec.continuationKind, turn: spec.turn ?? 2 } : { turn: 1 }) }),
+  spawnTracked: async (spec: Record<string, unknown>) => ({
+    ack: { ...ack, ...(spec?.continuedFrom ? { continuedFrom: spec.continuedFrom, continuationKind: spec.continuationKind, turn: spec.turn ?? 2 } : { turn: 1 }) },
     done: new Promise(() => {}),
   }),
   steer: async () => ({
     jobId: 'job-2', name: 'Bo', workerId: 'Bo', provider: 'codex', delivery: 'interrupt' as const,
-    status: 'interrupting' as const, pendingSteers: 1, signalled: true, resumable: true, repo,
+    status: 'running' as const, action: 'interrupting' as const, turn: 1, pendingSteers: 1, signalled: true, resumable: true, repo,
     dir: path.join(repo, '.agent-smith', 'jobs', 'job-2'), timeoutMs: 2_700_000, note: 'Interrupting.',
   }),
   detail: async (id: string) => { const d = details.find(x => x.jobId === id); if (!d) throw new Error('no job'); return d; },
@@ -119,9 +119,9 @@ test('list_jobs validates concise (bare and cut) and detailed', async () => {
   assert.deepEqual((concise.items as { taskStatus: string }[]).map(r => r.taskStatus), ['completed', 'working', 'working', 'failed']);
 });
 
-test('list_jobs concise rows validate digest, acceptance, changedFileCount and stalled', async () => {
+test('list_jobs concise rows validate digest, acceptance, changedFileCount and liveness (no stalled)', async () => {
   const rich: JobSummary = {
-    ...summary, jobId: 'job-4', name: 'Dee', status: 'running', finishedAt: null,
+    ...summary, jobId: 'job-4', name: 'Dee', workerId: 'Dee', status: 'running', finishedAt: null,
     updatedAt: '2026-10-11T09:00:00.000Z', changedFileCount: 2,
     digest: { phase: 'testing', filesRead: 3, searches: 1, edited: ['src/a.ts', 'src/b.ts'], editedCount: 2, commands: 2, testRuns: 1, lastTestFailed: true, repeat: null },
     acceptance: { state: 'rejected', checks: [{ name: 'tests', ok: false, exitCode: 1, durationMs: 5, outputTail: 'bad', blocking: true, timedOut: false, signal: null }], at: '2026-10-11T09:06:00.000Z' },
@@ -129,7 +129,8 @@ test('list_jobs concise rows validate digest, acceptance, changedFileCount and s
   const listService = { repo, spawnedIds: new Set<string>(), list: async () => [rich] };
   const out = assertValid('list_jobs', await callTool({ ...ctx, service: listService as never }, 'list_jobs', {}), 'list_jobs fleet row');
   const row = (out.items as Record<string, unknown>[])[0]!;
-  assert.equal(row.stalled, true);
+  assert.equal('stalled' in row, false);
+  assert.equal((row.liveness as { state: string }).state, 'silent');
   assert.equal(row.changedFileCount, 2);
   assert.deepEqual(row.acceptance, { state: 'rejected', failed: ['tests'] });
   assert.deepEqual(row.digest, { phase: 'testing', filesRead: 3, edited: ['src/a.ts', 'src/b.ts'], editedCount: 2, testRuns: 1, lastTestFailed: true });
@@ -142,11 +143,40 @@ test('list_capabilities validates with installed, errored and uninstalled provid
   assertValid('list_capabilities', await callTool(ctx, 'list_capabilities', { response_format: 'detailed' }), 'list_capabilities detailed');
 });
 
-test('resume_job and steer_job acks validate against their outputSchemas', async () => {
+test('resume_job and steer_job acks (including queue resume fallthrough) validate against their outputSchemas', async () => {
   const resumed = assertValid('resume_job', await callTool(ctx, 'resume_job', { worker: 'job-1', prompt: 'Continue.' }), 'resume_job');
   assert.equal(resumed.jobId, 'job-1');
+  assert.equal(resumed.continuedFrom, 'job-1');
+  assert.equal(resumed.continuationKind, 'resume');
   const steered = assertValid('steer_job', await callTool(ctx, 'steer_job', { worker: 'job-2', prompt: 'Pivot.', delivery: 'interrupt' }), 'steer_job');
-  assert.equal(steered.status, 'interrupting');
+  assert.equal(steered.status, 'running');
+  assert.equal(steered.action, 'interrupting');
+  assert.equal(steered.workerId, 'Bo');
+  assert.equal(steered.turn, 1);
+
+  class SteerTargetSettledError extends Error {
+    readonly jobId = 'job-1';
+    readonly workerId = 'Ada';
+    readonly status = 'succeeded';
+    override readonly name = 'Ada';
+  }
+  const fallthroughSvc = withWorkerLookup({
+    repo, spawnedIds: new Set(['job-1']),
+    steer: async () => { throw new SteerTargetSettledError('settled'); },
+    detail: async () => detail,
+    spawnJob: async (spec: Record<string, unknown>) => ({
+      ...ack, jobId: 'job-1-turn2', workerId: spec.workerId, turn: 2, continuedFrom: spec.continuedFrom, continuationKind: spec.continuationKind,
+      chainStartedAt: '2026-10-11T09:10:00.000Z',
+    }),
+  }) as never;
+  const fallthrough = assertValid('steer_job', await callTool({ ...ctx, service: fallthroughSvc }, 'steer_job', { worker: 'Ada', prompt: 'Follow up.', delivery: 'queue' }), 'steer_job fallthrough');
+  assert.equal(fallthrough.action, 'resumed');
+  assert.equal(fallthrough.status, 'running');
+  assert.equal(fallthrough.delivery, 'queue');
+  assert.equal(fallthrough.jobId, 'job-1-turn2');
+  assert.equal(fallthrough.turn, 2);
+  assert.equal(fallthrough.continuedFrom, 'job-1');
+  assert.equal(fallthrough.continuationKind, 'resume');
 });
 
 test('a schema violation is caught (the harness can fail)', () => {
@@ -155,27 +185,27 @@ test('a schema violation is caught (the harness can fail)', () => {
   assert.equal(validator.getValidator(schema as never)({ jobId: 'j', status: 'running' }).valid, false);
 });
 
-test('liveness and finish evidence validate in list_jobs and status; stalled is the silent-or-dead alias', async () => {
+test('liveness and finish evidence validate in list_jobs and status without stalled', async () => {
   const now = Date.now(); const iso = (ms: number) => new Date(now - ms).toISOString();
   const open = { stepIndex: 5, tool: 'Bash', input: '{"command":"cargo test --workspace"}', status: 'active' as const };
-  const inTool: JobDetail = { ...running, jobId: 'job-l1', name: 'Lu', updatedAt: iso(40 * 60_000), lastEventAt: iso(40 * 60_000), lastAliveAt: iso(5_000), lastActivity: open };
-  const dead: JobDetail = { ...running, jobId: 'job-l2', name: 'Mo', updatedAt: iso(60_000), lastEventAt: iso(60_000), lastAliveAt: iso(3 * 60_000) };
-  const evidence: JobDetail = { ...detail, jobId: 'job-l3', name: 'Ny', status: 'failed', toolErrors: 2, failedEarly: true, changedFilesUnknown: true, cwdMissingAtFinish: true, changedFiles: undefined };
+  const inTool: JobDetail = { ...running, jobId: 'job-l1', name: 'Lu', workerId: 'Lu', updatedAt: iso(40 * 60_000), lastEventAt: iso(40 * 60_000), lastAliveAt: iso(5_000), lastActivity: open };
+  const dead: JobDetail = { ...running, jobId: 'job-l2', name: 'Mo', workerId: 'Mo', updatedAt: iso(60_000), lastEventAt: iso(60_000), lastAliveAt: iso(3 * 60_000) };
+  const evidence: JobDetail = { ...detail, jobId: 'job-l3', name: 'Ny', workerId: 'Ny', status: 'failed', toolErrors: 2, failedEarly: true, changedFilesUnknown: true, cwdMissingAtFinish: true, changedFiles: undefined };
   const rows = [inTool, dead, evidence];
   const svc = { repo, spawnedIds: new Set<string>(), list: async () => rows, detail: async (id: string) => rows.find(r => r.jobId === id)! };
   const c = { ...ctx, service: svc as never };
   const listed = assertValid('list_jobs', await callTool(c, 'list_jobs', {}), 'list_jobs liveness');
   const [a, b, e] = listed.items as Record<string, unknown>[];
   assert.deepEqual(a!.liveness, { state: 'in-tool', silentForMs: (a!.liveness as { silentForMs: number }).silentForMs, tool: 'cargo test --workspace' });
-  assert.equal(a!.stalled, undefined, 'a long command is not a stall');
+  assert.equal('stalled' in a!, false);
   assert.equal((b!.liveness as { state: string }).state, 'dead');
-  assert.equal(b!.stalled, true);
+  assert.equal('stalled' in b!, false);
   assert.deepEqual([e!.toolErrors, e!.failedEarly, e!.changedFilesUnknown, e!.cwdMissingAtFinish, e!.liveness], [2, true, true, true, undefined]);
   assertValid('list_jobs', await callTool(c, 'list_jobs', { response_format: 'detailed' }), 'list_jobs liveness detailed');
   for (const response_format of ['concise', 'detailed']) {
     const s = assertValid('status', await callTool(c, 'status', { jobId: 'job-l2', response_format }), `status dead ${response_format}`);
     assert.equal((s.liveness as { state: string }).state, 'dead');
-    assert.equal(s.stalled, true);
+    assert.equal('stalled' in s, false);
     const f = assertValid('status', await callTool(c, 'status', { jobId: 'job-l3', response_format }), `status evidence ${response_format}`);
     assert.deepEqual([f.toolErrors, f.failedEarly, f.changedFilesUnknown, f.cwdMissingAtFinish], [2, true, true, true]);
   }

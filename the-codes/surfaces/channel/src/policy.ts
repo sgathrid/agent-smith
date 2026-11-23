@@ -38,6 +38,7 @@
 
 // The words live in the mod (hooks/notice.ts), which announces the same jobs
 // when it is loaded: one renderer, so the hook and the mod cannot drift apart.
+import type { ContinuationKind } from '../../../forge/format.ts';
 import { type NoticeJob, claudeText } from '../../mod/hooks/notice.ts';
 import { reasonFromText } from '../../mod/hooks/reasons.ts';
 
@@ -52,10 +53,13 @@ export type WatchStatus = 'running' | 'succeeded' | 'failed' | 'canceled' | 'att
 /** Everything the policy needs to know about one job. No I/O, no types from core. */
 export interface WatchableJob {
   readonly id: string;
+  readonly workerId?: string;
   readonly name?: string;
+  readonly turn?: number;
   readonly role?: string;
   readonly provider?: string;
   readonly startedAt?: string | null;
+  readonly chainStartedAt?: string | null;
   readonly changedFileCount?: number;
   readonly latestSummary?: string | null;
   readonly summarySource?: 'worker' | null;
@@ -77,8 +81,10 @@ export interface WatchableJob {
   readonly warned: boolean;
   /** Child job ID when this turn was superseded by a steered continuation turn. */
   readonly supersededBy?: string | null;
-  /** Parent job ID when this turn was spawned by pump() consuming steer.jsonl. */
-  readonly steeredFrom?: string | null;
+  /** Parent job ID when this turn continued from an earlier turn (steer or resume). */
+  readonly continuedFrom?: string | null;
+  /** How this turn continued from continuedFrom. */
+  readonly continuationKind?: ContinuationKind | null;
   /** A queued steer was dropped because this turn did not succeed. */
   readonly steerNotApplied?: boolean;
   /** Watched brief files that changed in the repository while the job ran. */
@@ -280,7 +286,7 @@ export function toNotice(job: WatchableJob, kind: PushKind, now: number): Notice
     reason: run ? job.outcome! : kind === 'failed' ? job.failureDetail || reasonFromText(job.failureReason) : null,
     summary: job.summarySource === 'worker' ? job.latestSummary ?? null : null,
     ...(job.staleReads && job.staleReads.length > 0 ? { staleReads: job.staleReads } : {}),
-    ...(job.steeredFrom ? { steered: true } : {}),
+    ...(job.continuationKind ? { continuationKind: job.continuationKind } : {}),
     ...(job.steerNotApplied ? { steerNotApplied: true } : {}),
     ...(kind === 'finished' && job.checksRunning !== undefined ? { checksRunning: job.checksRunning } : {}),
     ...(kind === 'attention' && job.liveness ? { liveness: { state: job.liveness.state, ...(job.liveness.tool ? { tool: job.liveness.tool } : {}) } } : {}),

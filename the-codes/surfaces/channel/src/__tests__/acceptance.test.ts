@@ -113,7 +113,7 @@ test('status wait_ms long-polls and is capped', async () => {
 test('structuredContent wraps arrays; outputSchema is permissive', async () => {
   const ctx = { service: { list: async () => [{ jobId: 'a', warnings: [] }] } as never } as HandlerContext;
   const r = await callTool(ctx, 'list_jobs', {});
-  assert.deepEqual(r.structuredContent, { items: [{ jobId: 'a' }] });
+  assert.deepEqual(r.structuredContent, { items: [{ jobId: 'a', turn: 1 }] });
   for (const n of ['status', 'list_jobs', 'list_capabilities', 'spawn_job']) assert.equal(TOOL_DEFS.find(t => t.name === n)!.outputSchema!.additionalProperties, true);
 });
 

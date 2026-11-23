@@ -9,21 +9,41 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { isTerminalForgeStatus } from '../../../forge/format.ts';
+import { isTerminalForgeStatus, jobDir, jobsDir } from '../../../forge/format.ts';
+import { pipelineRecordPath } from '../../../forge/execute.ts';
+import { waitForChange } from '../../../forge/watch.ts';
 import { type Batch, type WatchableJob, buildBatch, dedupeKey } from './policy.ts';
 import { readJob, readPipelineRecord } from './watch-source.ts';
 
-function delay(ms: number, signal?: AbortSignal): Promise<void> {
-  if (signal?.aborted) return Promise.resolve();
-  return new Promise((resolve) => {
-    const timer = setTimeout(done, ms);
-    function done() {
-      clearTimeout(timer);
-      signal?.removeEventListener('abort', done);
-      resolve();
-    }
-    signal?.addEventListener('abort', done, { once: true });
-  });
+function safeJobDir(cwd: string, id: string): string {
+  try { return jobDir(cwd, id); } catch { return jobsDir(cwd); }
+}
+
+async function waitForAnyChange(
+  dirs: readonly string[],
+  fallbackDir: string,
+  timeoutMs: number,
+  opts: { signal?: AbortSignal; fallbackMs: number },
+): Promise<void> {
+  if (opts.signal?.aborted || !(timeoutMs > 0)) return;
+  const unique = [...new Set(dirs)];
+  if (unique.length === 0) {
+    await waitForChange(fallbackDir, timeoutMs, opts);
+    return;
+  }
+  if (unique.length === 1) {
+    await waitForChange(unique[0]!, timeoutMs, opts);
+    return;
+  }
+  const slice = new AbortController();
+  const onAbort = () => slice.abort();
+  opts.signal?.addEventListener('abort', onAbort, { once: true });
+  try {
+    await Promise.race(unique.map((dir) => waitForChange(dir, timeoutMs, { signal: slice.signal, fallbackMs: opts.fallbackMs })));
+  } finally {
+    slice.abort();
+    opts.signal?.removeEventListener('abort', onAbort);
+  }
 }
 
 async function emitStdout(line: string): Promise<void> {
@@ -41,6 +61,9 @@ async function emitStdout(line: string): Promise<void> {
 }
 
 const DEFAULT_WATCH_TIMEOUT_MS = 45 * 60_000 + 60_000;
+/** Upper bound on one fs.watch slice so a dead supervisor (no file write) is still reconciled promptly. */
+const WATCH_RECHECK_MS = 5_000;
+const WATCH_FALLBACK_MS = 500;
 
 export interface JobWatchOptions {
   readonly cwd: string;
@@ -71,7 +94,8 @@ export type JobWatchEnd = 'done' | 'timeout' | 'aborted';
  * started is reported on the first observation.
  */
 export async function runJobWatch(options: JobWatchOptions): Promise<JobWatchEnd> {
-  const intervalMs = Math.max(50, options.intervalMs ?? 2_000);
+  const recheckMs = Math.max(50, options.intervalMs ?? WATCH_RECHECK_MS);
+  const fallbackMs = Math.max(50, options.intervalMs ?? WATCH_FALLBACK_MS);
   const timeoutMs = options.timeoutMs ?? DEFAULT_WATCH_TIMEOUT_MS;
   const now = options.now ?? Date.now;
   const rj = options.readJob ?? readJob;
@@ -85,6 +109,7 @@ export async function runJobWatch(options: JobWatchOptions): Promise<JobWatchEnd
   let startedAt = now();
 
   while (!options.signal?.aborted) {
+    const watchDirs: string[] = [];
     try {
       const t = now();
       const jobs = new Map<string, WatchableJob>();
@@ -92,7 +117,10 @@ export async function runJobWatch(options: JobWatchOptions): Promise<JobWatchEnd
       for (let i = 0; i < jobIds.length; i++) {
         const id = jobIds[i]!;
         const job = await rj(options.cwd, id, t);
-        if (!job) continue;
+        if (!job) {
+          if (!done.has(id)) watchDirs.push(safeJobDir(options.cwd, id));
+          continue;
+        }
         jobs.set(job.id, job);
         if (job.supersededBy && job.supersededBy !== job.id) {
           if (jobIds.includes(job.supersededBy)) {
@@ -110,10 +138,15 @@ export async function runJobWatch(options: JobWatchOptions): Promise<JobWatchEnd
       }
       for (const id of runIds) {
         const rec = await rr(options.cwd, id);
-        if (!rec) continue;
+        if (!rec) {
+          if (!done.has(id)) watchDirs.push(path.dirname(pipelineRecordPath(options.cwd, id)));
+          continue;
+        }
         jobs.set(rec.job.id, rec.job);
         want.add(rec.job.id);
+        if (!done.has(rec.job.id)) watchDirs.push(path.dirname(pipelineRecordPath(options.cwd, id)));
         for (const sid of rec.stageJobIds) {
+          if (!done.has(sid)) watchDirs.push(safeJobDir(options.cwd, sid));
           if (jobs.has(sid)) continue;
           const sj = await rj(options.cwd, sid, t);
           if (sj) jobs.set(sj.id, sj);
@@ -137,21 +170,24 @@ export async function runJobWatch(options: JobWatchOptions): Promise<JobWatchEnd
         const job = jobs.get(id);
         if (job?.supersededBy) {
           if (want.has(job.supersededBy)) done.add(id);
+          else watchDirs.push(safeJobDir(options.cwd, id));
           continue;
         }
         // Exited with checks still running: the verdict is a second notice, so keep watching (unless announcing once).
         if (job && isTerminalForgeStatus(job.status) && (options.announceOnce === true || job.checksRunning === undefined) && (seen.get(id)?.has(dedupeKey(job)) ?? false)) done.add(id);
+        else if (!done.has(id) && !runIds.includes(id)) watchDirs.push(safeJobDir(options.cwd, id));
       }
       if (want.size > 0 && [...want].every((id) => done.has(id))) return 'done';
     } catch (error) {
       onError(error);
     }
-    if (now() - startedAt >= timeoutMs) {
+    const elapsed = now() - startedAt;
+    if (elapsed >= timeoutMs) {
       const ids = [...jobIds, ...runIds].filter((id) => !done.has(id));
       try { await emit(`Agent Smith · still running: ${ids.join(', ')}`, null); } catch (error) { onError(error); }
       return 'timeout';
     }
-    await delay(intervalMs, options.signal);
+    await waitForAnyChange(watchDirs, jobsDir(options.cwd), Math.min(recheckMs, Math.max(1, timeoutMs - elapsed)), { signal: options.signal, fallbackMs });
   }
   return 'aborted';
 }

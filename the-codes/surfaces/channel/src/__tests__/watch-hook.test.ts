@@ -153,7 +153,8 @@ test('the watch-hook notice carries after-steer and dropped-steer markers', asyn
   const dir = path.join(repo, '.agent-smith', 'jobs', 'turn-2');
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({
-    schema: 1, jobId: 'turn-2', status: 'failed', provider: 'codex', name: 'Ada', steeredFrom: 'turn-1', error: 'timed out after 4s',
+    schema: 1, jobId: 'turn-2', workerId: 'turn-1', turn: 2, status: 'failed', provider: 'codex', name: 'Ada',
+    continuedFrom: 'turn-1', continuationKind: 'steer-queue', error: 'timed out after 4s',
     startedAt: new Date(T0).toISOString(), finishedAt: new Date(T0 + 4000).toISOString(),
   }));
   fs.writeFileSync(path.join(dir, 'progress.json'), JSON.stringify({
@@ -161,11 +162,45 @@ test('the watch-hook notice carries after-steer and dropped-steer markers', asyn
   }));
   const found = (await readAll(repo)).find((j) => j.id === 'turn-2');
   assert.ok(found, 'job is read');
+  assert.equal(found.continuedFrom, 'turn-1');
+  assert.equal(found.continuationKind, 'steer-queue');
   assert.equal(found.steerNotApplied, true);
   const text = toNotice(found, 'failed', T0 + 5000);
-  assert.equal(text.steered, true);
+  assert.equal((text as { continuationKind?: unknown }).continuationKind, 'steer-queue');
   assert.equal(text.steerNotApplied, true);
   assert.match(headline(text), /· after steer · queued steer not applied/);
+  fs.rmSync(repo, { recursive: true, force: true });
+});
+
+test('runJobWatch wakes promptly on disk writes via waitForChange without 2s polling', async () => {
+  clearReadCache();
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'watch-fs-wake-'));
+  const dir = path.join(repo, '.agent-smith', 'jobs', 'j-wake');
+  fs.mkdirSync(dir, { recursive: true });
+  const writeJob = (status: 'running' | 'succeeded') => {
+    fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({
+      schema: 1, jobId: 'j-wake', workerId: 'j-wake', turn: 1, status, provider: 'codex', name: 'Fast',
+      startedAt: new Date(Date.now() - 1000).toISOString(),
+      finishedAt: status === 'running' ? null : new Date().toISOString(),
+    }));
+  };
+  writeJob('running');
+  const lines: string[] = [];
+  const t0 = Date.now();
+  const watchPromise = runJobWatch({
+    cwd: repo,
+    jobIds: ['j-wake'],
+    timeoutMs: 10_000,
+    emit: (l) => { lines.push(l); },
+  });
+  await new Promise((r) => setTimeout(r, 40));
+  const writeAt = Date.now();
+  writeJob('succeeded');
+  assert.equal(await watchPromise, 'done');
+  assert.ok(Date.now() - writeAt < 500, `expected fs.watch wakeup well under 500ms, took ${Date.now() - writeAt}ms`);
+  assert.ok(Date.now() - t0 < 1000, 'did not wait for 2s poll interval');
+  assert.equal(lines.length, 1);
+  assert.match(lines[0]!, /Fast.*done/);
   fs.rmSync(repo, { recursive: true, force: true });
 });
 

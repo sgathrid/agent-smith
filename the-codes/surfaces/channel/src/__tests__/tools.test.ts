@@ -166,13 +166,13 @@ test('pipelines expand aliases in explicit stages and apply roleDefaults to the 
 
 test('spawn_job ack is slim: identity, budget, permissions and warnings only', async () => {
   const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-ack-'));
-  const full = { jobId: 'j9', name: 'Ada', workerId: 'j9', role: 'review', provider: 'codex', status: 'running', dir: `${repo}/.agent-smith/jobs/j9`, repo, timeoutMs: 1000,
+  const full = { jobId: 'j9', name: 'Ada', workerId: 'j9', turn: 1, role: 'review', provider: 'codex', status: 'running', dir: `${repo}/.agent-smith/jobs/j9`, repo, timeoutMs: 1000,
     unrestricted: false, note: 'queued', sandbox: 'codex -s read-only', sandboxFlags: ['-s', 'read-only'], readOnlyRequested: true, readOnlyEnforced: true,
     modelRequested: null, modelResolved: 'gpt-x', modelSource: 'harness-config', preambleApplied: true };
   const service = { repo, spawnJob: async () => full } as never;
   const r = await callTool({ service, catalogs: async () => [cat('codex')] } as HandlerContext, 'spawn_job', { mode: 'review', prompt: 'x', provider: 'codex' });
   assert.equal(r.isError, undefined);
-  assert.deepEqual(body(r), { jobId: 'j9', name: 'Ada', provider: 'codex', model: 'gpt-x', status: 'running', timeoutMs: 1000, repo, unrestricted: false, readOnlyEnforced: true });
+  assert.deepEqual(body(r), { jobId: 'j9', name: 'Ada', workerId: 'j9', turn: 1, provider: 'codex', model: 'gpt-x', status: 'running', timeoutMs: 1000, repo, unrestricted: false, readOnlyEnforced: true });
   assert.ok(text(r).length < 250, text(r));
 });
 
@@ -232,23 +232,46 @@ test('list_jobs: a concise list cut by its limit says so; an uncut one stays a p
   assert.equal(body(whole).length, 3);
 });
 
-test('list_jobs: a turn a steer replaced is left out; its continuation stands for the worker', async () => {
-  const ctx = withService({ list: async () => [summary(2, { steeredFrom: 'implement-smith-1' }), summary(1, { supersededBy: 'implement-smith-2' })] });
-  assert.deepEqual(body(await callTool(ctx, 'list_jobs', {})).map((r: any) => r.jobId), ['implement-smith-2']);
-  assert.deepEqual(body(await callTool(ctx, 'list_jobs', { response_format: 'detailed' })).map((r: any) => r.jobId), ['implement-smith-2']);
+test('list_jobs: groups by workerId across steers and resumes (1 row per worker, latest turn wins)', async () => {
+  const seenFilter: Record<string, unknown>[] = [];
+  const ctx = withService({
+    list: async (f: Record<string, unknown>) => {
+      seenFilter.push(f);
+      return [
+        summary(2, { workerId: 'w1', turn: 2, continuedFrom: 'implement-smith-1', continuationKind: 'steer-queue' }),
+        summary(1, { workerId: 'w1', turn: 1, supersededBy: 'implement-smith-2' }),
+        summary(4, { workerId: 'w2', turn: 2, continuedFrom: 'implement-smith-3', continuationKind: 'resume' }),
+        summary(3, { workerId: 'w2', turn: 1 }),
+      ];
+    },
+  });
+  const concise = body(await callTool(ctx, 'list_jobs', {}));
+  assert.equal(seenFilter[0]!.groupByWorker, true);
+  assert.deepEqual(concise.map((r: any) => r.jobId), ['implement-smith-2', 'implement-smith-4']);
+  assert.deepEqual(concise.map((r: any) => r.turn), [2, 2]);
+  const detailed = body(await callTool(ctx, 'list_jobs', { response_format: 'detailed' }));
+  assert.deepEqual(detailed.map((r: any) => r.jobId), ['implement-smith-2', 'implement-smith-4']);
 });
 
-test('a running job with no progress time is stalled in list_jobs and status, not healthy', async () => {
+test('a running job with no progress time reports liveness silent in list_jobs and status (no stalled alias)', async () => {
   const running = { status: 'running', finishedAt: null, updatedAt: null };
   const ctx = withService({ list: async () => [summary(1, running)], detail: async () => detail(running) });
-  assert.equal(body(await callTool(ctx, 'list_jobs', {}))[0].stalled, true);
-  assert.equal(body(await callTool(ctx, 'status', { jobId: 'implement-smith-1' })).stalled, true);
-  assert.equal(body(await callTool(ctx, 'status', { jobId: 'implement-smith-1', response_format: 'detailed' })).stalled, true);
+  const listed = body(await callTool(ctx, 'list_jobs', {}))[0];
+  assert.equal(listed.liveness.state, 'silent');
+  assert.equal('stalled' in listed, false);
+  const stConcise = body(await callTool(ctx, 'status', { jobId: 'implement-smith-1' }));
+  assert.equal(stConcise.liveness.state, 'silent');
+  assert.equal('stalled' in stConcise, false);
+  const stDetailed = body(await callTool(ctx, 'status', { jobId: 'implement-smith-1', response_format: 'detailed' }));
+  assert.equal(stDetailed.liveness.state, 'silent');
+  assert.equal('stalled' in stDetailed, false);
   const done = withService({ list: async () => [summary(1, { updatedAt: null })] });
-  assert.equal('stalled' in body(await callTool(done, 'list_jobs', {}))[0], false);
+  const doneRow = body(await callTool(done, 'list_jobs', {}))[0];
+  assert.equal('liveness' in doneRow, false);
+  assert.equal('stalled' in doneRow, false);
 });
 
-test('list_jobs: a concise row carries digest, acceptance, changedFileCount and stalled for the whole fleet', async () => {
+test('list_jobs: a concise row carries digest, acceptance, changedFileCount and liveness for the whole fleet', async () => {
   const digest = {
     phase: 'testing', filesRead: 3, searches: 0, edited: ['a.ts', 'b.ts', 'c.ts', 'd.ts', 'e.ts', 'f.ts'],
     editedCount: 6, commands: 2, testRuns: 1, lastTestFailed: false, repeat: { label: 'Bash npm test', count: 3 },
@@ -259,7 +282,8 @@ test('list_jobs: a concise row carries digest, acceptance, changedFileCount and 
     digest,
   })] });
   const row = body(await callTool(ctx, 'list_jobs', {}))[0];
-  assert.equal(row.stalled, true);
+  assert.equal(row.liveness.state, 'silent');
+  assert.equal('stalled' in row, false);
   assert.equal(row.changedFileCount, 2);
   assert.deepEqual(row.acceptance, { state: 'rejected', passed: ['lint'], failed: ['tests'] });
   assert.deepEqual(row.digest, {
@@ -274,19 +298,28 @@ test('list_jobs: a concise row carries digest, acceptance, changedFileCount and 
     digest: { phase: 'starting', filesRead: 0, searches: 0, edited: [], editedCount: 0, commands: 0, testRuns: 0, lastTestFailed: false, repeat: null },
   })] }), 'list_jobs', {}))[0];
   assert.deepEqual(quiet.digest, { phase: 'starting' });
+  assert.equal(quiet.liveness.state, 'active');
   for (const dropped of ['stalled', 'changedFileCount', 'acceptance']) assert.equal(dropped in quiet, false, dropped);
 });
 
-test('status: a steered head lists its earlier turns oldest first, each with its own report', async () => {
+test('status: resolves any turn/worker to latest head and lists unified earlierTurns across steers and resumes oldest first', async () => {
   const turns: Record<string, Record<string, unknown>> = {
-    'implement-smith-3': detail({ jobId: 'implement-smith-3', steeredFrom: 'implement-smith-2', report: 'Third.' }),
-    'implement-smith-2': detail({ jobId: 'implement-smith-2', steeredFrom: 'implement-smith-1', supersededBy: 'implement-smith-3', report: 'Second.' }),
-    'implement-smith-1': detail({ jobId: 'implement-smith-1', supersededBy: 'implement-smith-2', report: LONG }),
+    'implement-smith-3': detail({ jobId: 'implement-smith-3', workerId: 'implement-smith-1', turn: 3, continuedFrom: 'implement-smith-2', continuationKind: 'resume', chainStartedAt: iso(10_000), report: 'Third.' }),
+    'implement-smith-2': detail({ jobId: 'implement-smith-2', workerId: 'implement-smith-1', turn: 2, continuedFrom: 'implement-smith-1', continuationKind: 'steer-queue', supersededBy: 'implement-smith-3', report: 'Second.' }),
+    'implement-smith-1': detail({ jobId: 'implement-smith-1', workerId: 'implement-smith-1', turn: 1, supersededBy: 'implement-smith-2', report: LONG }),
   };
-  const ctx = withService({ resolveHead: () => 'implement-smith-3', detail: async (id: string) => turns[id] });
+  const ctx = {
+    service: { repo: mkdtempSync(path.join(tmpdir(), 'smith-turns-')), resolveWorker: async () => turns['implement-smith-3'], detail: async (id: string) => turns[id] } as never,
+    catalogs: async () => [],
+  } as HandlerContext;
   const st = body(await callTool(ctx, 'status', { jobId: 'implement-smith-1' }));
-  assert.equal(st.jobId, 'implement-smith-3'); assert.equal(st.report, 'Third.');
-  assert.deepEqual(st.earlierTurns.map((t: any) => t.jobId), ['implement-smith-1', 'implement-smith-2']);
+  assert.equal(st.jobId, 'implement-smith-3'); assert.equal(st.turn, 3);
+  assert.equal(st.continuedFrom, 'implement-smith-2'); assert.equal(st.continuationKind, 'resume');
+  assert.equal(st.report, 'Third.');
+  assert.deepEqual(st.earlierTurns.map((t: any) => [t.jobId, t.turn, t.continuationKind]), [
+    ['implement-smith-1', 1, undefined],
+    ['implement-smith-2', 2, 'steer-queue'],
+  ]);
   assert.ok(st.earlierTurns[0].report.length <= 600 && st.earlierTurns[0].report.endsWith('…'));
   assert.match(st.earlierTurns[1].reportPath, /implement-smith-2/);
   const full = body(await callTool(ctx, 'status', { jobId: 'implement-smith-3', response_format: 'detailed' }));
@@ -522,7 +555,7 @@ test('status: a failed job carries a short reason (derived from old errors, stor
   assert.equal(ok.reason, undefined);
 });
 
-test('steer_job forwards worker, prompt, context, files and delivery, and status surfaces supersession and staleReads fields', async () => {
+test('steer_job forwards worker, prompt, context, files, delivery and allowFresh, and status surfaces continuation fields', async () => {
   const seen: Array<Record<string, unknown>> = [];
   const spawned: Array<Record<string, unknown>> = [];
   const ctx = withService({
@@ -532,6 +565,10 @@ test('steer_job forwards worker, prompt, context, files and delivery, and status
         jobId: 'implement-smith-resumed',
         name: 'Ada',
         workerId: 'Ada',
+        turn: req.turn ?? 2,
+        continuedFrom: req.continuedFrom,
+        continuationKind: req.continuationKind,
+        chainStartedAt: '2026-10-11T09:10:00.000Z',
         role: 'implement',
         provider: 'codex',
         status: 'running',
@@ -556,8 +593,10 @@ test('steer_job forwards worker, prompt, context, files and delivery, and status
         jobId: 'implement-smith-1',
         name: 'Ada',
         workerId: 'Ada',
+        turn: 1,
         delivery: req.delivery,
-        status: req.delivery === 'interrupt' ? 'interrupting' : 'queued',
+        status: 'running',
+        action: req.delivery === 'interrupt' ? 'interrupting' : 'queued',
         pendingSteers: 1,
         signalled: true,
         resumable: true,
@@ -569,7 +608,10 @@ test('steer_job forwards worker, prompt, context, files and delivery, and status
       watchedFiles: { 'ARCHITECTURE.md': { repoSig: '1:a', cwdSig: '1:a' } },
       staleReads: ['ARCHITECTURE.md'],
       supersededBy: 'implement-smith-2',
-      steeredFrom: 'implement-smith-0',
+      continuedFrom: 'implement-smith-0',
+      continuationKind: 'steer-interrupt',
+      chainStartedAt: '2026-10-11T09:00:00.000Z',
+      turn: 2,
       pendingSteers: 2,
     }),
   });
@@ -579,6 +621,7 @@ test('steer_job forwards worker, prompt, context, files and delivery, and status
     context: 'Sidebar dropped.',
     files: ['brief.md'],
     delivery: 'interrupt',
+    allowFresh: true,
   });
   assert.equal(res.isError, undefined);
   assert.deepEqual(seen[0], {
@@ -587,12 +630,16 @@ test('steer_job forwards worker, prompt, context, files and delivery, and status
     context: 'Sidebar dropped.',
     files: ['brief.md'],
     delivery: 'interrupt',
+    allowFresh: true,
   });
-  assert.equal(body(res).status, 'interrupting');
+  assert.equal(body(res).status, 'running');
+  assert.equal(body(res).action, 'interrupting');
+  assert.equal(body(res).workerId, 'Ada');
+  assert.equal(body(res).turn, 1);
   assert.match(body(res).note, /^queued The continuation gets a new job ID; status and cancel on .+ follow it\.$/);
   assert.equal(body(res).resumable, true);
 
-  // resume_job merges inherited watchedFiles with new files
+  // resume_job merges inherited watchedFiles with new files and sets continuation fields
   const resumed = await callTool(ctx, 'resume_job', {
     worker: 'implement-smith-1',
     prompt: 'Continue.',
@@ -600,10 +647,84 @@ test('steer_job forwards worker, prompt, context, files and delivery, and status
   });
   assert.equal(resumed.isError, undefined);
   assert.deepEqual(spawned[0]?.files, ['ARCHITECTURE.md', 'extra.md']);
+  assert.equal(spawned[0]?.continuedFrom, 'implement-smith-1');
+  assert.equal(spawned[0]?.continuationKind, 'resume');
+  assert.equal(spawned[0]?.turn, 3);
+  assert.equal(body(resumed).continuedFrom, 'implement-smith-1');
+  assert.equal(body(resumed).continuationKind, 'resume');
 
   const st = body(await callTool(ctx, 'status', { jobId: 'implement-smith-1' }));
   assert.equal(st.supersededBy, 'implement-smith-2');
-  assert.equal(st.steeredFrom, 'implement-smith-0');
+  assert.equal(st.continuedFrom, 'implement-smith-0');
+  assert.equal(st.continuationKind, 'steer-interrupt');
+  assert.equal(st.turn, 2);
   assert.equal(st.pendingSteers, 2);
   assert.deepEqual(st.staleReads, ['ARCHITECTURE.md']);
+});
+
+test('steer_job queue fallthrough resumes settled succeeded workers and fails closed otherwise', async () => {
+  class SteerTargetSettledError extends Error {
+    readonly jobId: string;
+    readonly workerId = 'w-1';
+    readonly status: string;
+    override readonly name = 'Ada';
+    constructor(jobId: string, status: string) {
+      super(`"${jobId}" is already ${status}`);
+      this.jobId = jobId;
+      this.status = status;
+    }
+  }
+  const settledErr = (jobId: string, status: string) => new SteerTargetSettledError(jobId, status);
+
+  let current = detail({ jobId: 'turn-1', workerId: 'w-1', name: 'Ada', turn: 1, status: 'succeeded', conversation: 'conv-1' });
+  const spawned: Record<string, unknown>[] = [];
+  const ctx = withService({
+    steer: async () => { throw settledErr(current.jobId as string, current.status as string); },
+    detail: async () => current,
+    spawnJob: async (req: Record<string, unknown>) => {
+      spawned.push(req);
+      return {
+        jobId: 'turn-2', name: 'Ada', workerId: 'w-1', turn: 2, continuedFrom: req.continuedFrom,
+        continuationKind: req.continuationKind, chainStartedAt: '2026-10-11T09:15:00.000Z',
+        role: 'implement', provider: 'agy', modelResolved: 'm', status: 'running', repo: '/tmp', timeoutMs: 60_000, unrestricted: true,
+      };
+    },
+  });
+
+  // 1. Succeeded, no pending acceptance, has conversation -> seamlessly resumes.
+  const ok = await callTool(ctx, 'steer_job', { worker: 'Ada', prompt: 'Next step.', context: 'Because X.', delivery: 'queue' });
+  assert.equal(ok.isError, undefined, text(ok));
+  assert.deepEqual(
+    { action: body(ok).action, status: body(ok).status, delivery: body(ok).delivery, jobId: body(ok).jobId, workerId: body(ok).workerId, turn: body(ok).turn, continuedFrom: body(ok).continuedFrom, continuationKind: body(ok).continuationKind },
+    { action: 'resumed', status: 'running', delivery: 'queue', jobId: 'turn-2', workerId: 'w-1', turn: 2, continuedFrom: 'turn-1', continuationKind: 'resume' },
+  );
+  assert.equal(spawned[0]!.context, 'Because X.');
+
+  // 2. Pending acceptance -> fails closed.
+  writeAcceptance(ctx.service.repo, 'turn-1', { state: 'unchecked', checks: [], pending: true, running: 'tests' });
+  const pending = await callTool(ctx, 'steer_job', { worker: 'Ada', prompt: 'Next.', delivery: 'queue' });
+  assert.equal(pending.isError, true);
+  assert.match(text(pending), /acceptance checks are still pending/);
+  writeAcceptance(ctx.service.repo, 'turn-1', { state: 'accepted', checks: [] });
+
+  // 3. No conversation -> fails closed.
+  current = detail({ jobId: 'turn-1', workerId: 'w-1', name: 'Ada', turn: 1, status: 'succeeded', conversation: null });
+  const noConv = await callTool(ctx, 'steer_job', { worker: 'Ada', prompt: 'Next.', delivery: 'queue' });
+  assert.equal(noConv.isError, true);
+  assert.match(text(noConv), /no saved conversation/);
+
+  // 4. Failed / canceled -> fails closed.
+  for (const status of ['failed', 'canceled']) {
+    current = detail({ jobId: 'turn-1', workerId: 'w-1', name: 'Ada', turn: 1, status, conversation: 'conv-1' });
+    const r = await callTool(ctx, 'steer_job', { worker: 'Ada', prompt: 'Next.', delivery: 'queue' });
+    assert.equal(r.isError, true);
+    assert.match(text(r), new RegExp(`ended ${status}`));
+  }
+
+  // 5. delivery: 'interrupt' on a settled turn -> fails closed.
+  current = detail({ jobId: 'turn-1', workerId: 'w-1', name: 'Ada', turn: 1, status: 'succeeded', conversation: 'conv-1' });
+  const intr = await callTool(ctx, 'steer_job', { worker: 'Ada', prompt: 'Next.', delivery: 'interrupt' });
+  assert.equal(intr.isError, true);
+  assert.match(text(intr), /delivery: "interrupt" applies only to a running turn/);
+  assert.equal(spawned.length, 1);
 });

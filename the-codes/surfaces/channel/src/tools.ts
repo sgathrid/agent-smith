@@ -4,8 +4,9 @@ import path from 'node:path';
 import { claimMarkerPath } from '../../mod/hooks/notice.ts';
 import type { CallToolResult } from '@modelcontextprotocol/server';
 import type { Server } from '@modelcontextprotocol/server';
-import type { ForgeStatus } from '../../../forge/format.ts';
-import { ENV_KEYS_FILE, type ForgeService, type JobDetail, type SpawnAck } from '../../../forge/service.ts';
+import type { ContinuationKind, ForgeStatus } from '../../../forge/format.ts';
+import * as forgeService from '../../../forge/service.ts';
+import { ENV_KEYS_FILE, type ForgeService, type JobDetail, type JobSummary, type SpawnAck } from '../../../forge/service.ts';
 import { launchPipeline } from '../../../forge/supervisor.ts';
 import { FILES, jobDir, jobFile } from '../../../forge/format.ts';
 import { waitForChange } from '../../../forge/watch.ts';
@@ -18,7 +19,6 @@ import { getCatalogs, getInstalledProviders } from '../../../providers/catalog.t
 import { providerNames } from '../../../providers/registry.ts';
 import { loadModelConfig, resolveRequest, describeAliases } from '../../../providers/aliases.ts';
 import { CONCISE_LIST_LIMIT, EARLIER_TURNS_CAP, conciseCapabilities, conciseRow, conciseStatus, concisePipeline, earlierTurn, jobDiff, jobLiveness, livenessView, parseSince, taskStatus, type ResponseFormat } from './views.ts';
-import { isStalled } from '../../mod/hooks/stale.ts';
 import { PROVIDERS, TOOL_DEFS, MAX_WAIT_MS } from './tool-defs.ts';
 import { allowed, boolean, contextText, filesList, format, keys, number, parseChecks, parseStages, record, text, workingDirectory } from './args.ts';
 import { defaultMixedPipeline, defaultProvider, installedCatalogs, type CatalogSource } from './stage-defaults.ts';
@@ -104,13 +104,37 @@ export function failure(message: string, detail?: unknown): ToolOutcome { return
 /** The full `status` view of one job; Tasks results reuse it. */
 export function fullStatus(detail: JobDetail, acceptance: ReturnType<typeof readAcceptance>, now = Date.now()) {
   const live = jobLiveness(detail, now);
-  return { ...detail, resumable: Boolean(detail.conversation), ...(live === null ? {} : { liveness: livenessView(live) }), stalled: isStalled(live), taskStatus: taskStatus(detail.status), report: detail.report?.slice(0, REPORT_HEAD_CHARS) ?? null, reportTruncated: (detail.report?.length ?? 0) > REPORT_HEAD_CHARS, acceptance };
+  return { ...detail, resumable: Boolean(detail.conversation), ...(live === null ? {} : { liveness: livenessView(live) }), taskStatus: taskStatus(detail.status), report: detail.report?.slice(0, REPORT_HEAD_CHARS) ?? null, reportTruncated: (detail.report?.length ?? 0) > REPORT_HEAD_CHARS, acceptance };
 }
 
 type Args = Record<string, unknown>;
 type Handler = (ctx: HandlerContext, args: Args) => Promise<ToolOutcome>;
 
 const resolveHead = (ctx: HandlerContext, id: string) => typeof ctx.service.resolveHead === 'function' ? ctx.service.resolveHead(id) : id;
+
+/** Resolve worker name, workerId, or any turn's jobId to the worker's latest turn. */
+async function resolveWorkerDetail(ctx: HandlerContext, nameOrId: string): Promise<JobDetail> {
+  if (typeof ctx.service.resolveWorker === 'function') return ctx.service.resolveWorker(nameOrId);
+  return ctx.service.detail(resolveHead(ctx, nameOrId));
+}
+
+type TurnFields = {
+  readonly turn?: number;
+  readonly continuedFrom?: string;
+  readonly continuationKind?: ContinuationKind;
+  readonly chainStartedAt?: string;
+};
+
+type SettledTargetError = Error & { readonly jobId: string; readonly workerId: string; readonly status: ForgeStatus; readonly name: string };
+function isSettledTargetError(err: unknown): err is SettledTargetError {
+  const Ctor = (forgeService as { SteerTargetSettledError?: new (...args: never[]) => SettledTargetError }).SteerTargetSettledError;
+  if (Ctor && err instanceof Ctor) return true;
+  return err instanceof Error
+    && (err.constructor?.name === 'SteerTargetSettledError' || err.name === 'SteerTargetSettledError')
+    && typeof (err as Partial<SettledTargetError>).jobId === 'string'
+    && typeof (err as Partial<SettledTargetError>).workerId === 'string'
+    && typeof (err as Partial<SettledTargetError>).status === 'string';
+}
 
 const listCapabilitiesTool: Handler = async (ctx, args) => {
   const fmt = format(args);
@@ -123,9 +147,14 @@ const listCapabilitiesTool: Handler = async (ctx, args) => {
  * permissions, and any warnings. The full record is one status call away. `repo` and `timeoutMs`
  * also tell the mod and the completion hook where to watch and for how long.
  */
-export function slimAck(ack: SpawnAck) {
+export function slimAck(ack: SpawnAck & TurnFields) {
   const out = {
-    jobId: ack.jobId, name: ack.name, provider: ack.provider, model: ack.modelResolved ?? null, status: ack.status,
+    jobId: ack.jobId, name: ack.name, workerId: ack.workerId,
+    ...(ack.turn !== undefined ? { turn: ack.turn } : {}),
+    ...(ack.continuedFrom ? { continuedFrom: ack.continuedFrom } : {}),
+    ...(ack.continuationKind ? { continuationKind: ack.continuationKind } : {}),
+    ...(ack.chainStartedAt ? { chainStartedAt: ack.chainStartedAt } : {}),
+    provider: ack.provider, model: ack.modelResolved ?? null, status: ack.status,
     timeoutMs: ack.timeoutMs, repo: ack.repo, unrestricted: ack.unrestricted,
     ...(ack.readOnlyRequested || (isModeName(ack.role) && MODE_PRESETS[ack.role].readOnly) ? { readOnlyEnforced: ack.readOnlyEnforced ?? false } : {}),
     ...(ack.envKeys?.length ? { envKeys: ack.envKeys } : {}),
@@ -203,7 +232,7 @@ function overlay(base: Args, over: Args, baseProvider?: string): Args {
 /** spawn_job args with `from` resolved: the earlier worker's first request, overlaid with what this call passes. */
 async function inheritFrom(ctx: HandlerContext, args: Args): Promise<Args> {
   const from = text(args, 'from', true)!;
-  const detail = await ctx.service.resolveWorker(from);
+  const detail = await resolveWorkerDetail(ctx, from);
   const root = detail.workerId || detail.jobId;
   let saved: Args;
   try { saved = JSON.parse(readFileSync(jobFile(ctx.service.repo, root, FILES.request), 'utf8')) as Args; } catch {
@@ -292,40 +321,101 @@ const spawnJob: Handler = async (ctx, args) => {
 
 
 
-const resumeJob: Handler = async (ctx, args) => {
-  const worker = text(args, 'worker', true)!;
-  const detail = await ctx.service.resolveWorker(worker);
-  if (detail.status === 'running') throw new Error(`"${detail.name}" is still running; use steer_job with delivery: "queue" or "interrupt", or wait.`);
-  if (!detail.conversation) throw new Error(`"${detail.name}" has no conversation to resume: the provider did not save a conversation before it stopped. Use spawn_job with the full original brief; on-disk edits remain in ${detail.cwd ?? ctx.service.repo}.`);
-  const resumeModel = resolveRequest({ provider: detail.provider ?? undefined, model: text(args, 'model'), effort: allowed(args, 'effort', EFFORTS) }, loadModelConfig({ repo: ctx.service.repo }));
+async function resumeFromDetail(
+  ctx: HandlerContext,
+  detail: JobDetail,
+  opts: {
+    readonly prompt: string;
+    readonly context?: string | undefined;
+    readonly files?: string[] | undefined;
+    readonly checksArg?: unknown;
+    readonly cwd?: string | undefined;
+    readonly model?: string | undefined;
+    readonly effort?: string | undefined;
+    readonly timeoutMs?: number | undefined;
+    readonly unrestricted?: boolean | undefined;
+    readonly envArg?: unknown;
+  },
+): Promise<{ refused: ToolOutcome } | { ack: Record<string, unknown> }> {
+  const resumeModel = resolveRequest({ provider: detail.provider ?? undefined, model: opts.model, effort: opts.effort }, loadModelConfig({ repo: ctx.service.repo }));
   let inheritedChecks: StageCheck[] | undefined;
-  if (args.checks === undefined) {
+  if (opts.checksArg === undefined) {
     try { inheritedChecks = parseChecks(JSON.parse(readFileSync(jobFile(ctx.service.repo, detail.jobId, FILES.checksSpec), 'utf8'))); } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
   }
-  const checks = args.checks === undefined ? inheritedChecks : parseChecks(args.checks);
+  const checks = opts.checksArg === undefined ? inheritedChecks : parseChecks(opts.checksArg);
   const preparedJobIds: string[] = [];
   const onPrepared = (id: string) => {
     ctx.onJobPrepared?.(id);
     preparedJobIds.push(id);
     if (checks?.length) markAcceptancePending(ctx.service.repo, id, checks);
   };
-  const prompt = text(args, 'prompt', true)!; const cwd = workingDirectory(args) ?? detail.cwd ?? ctx.service.repo;
-  const timeoutMs = number(args, 'timeoutMs'); const unrestricted = boolean(args, 'unrestricted');
+  const cwd = opts.cwd ?? detail.cwd ?? ctx.service.repo;
   const inheritedFiles = Object.keys(detail.watchedFiles ?? {});
-  const mergedFiles = [...new Set([...inheritedFiles, ...(filesList(args) ?? [])])];
+  const mergedFiles = [...new Set([...inheritedFiles, ...(opts.files ?? [])])];
   // Only an explicit unrestricted:true asks; an inherited setting was the original job's.
-  const gate = await confirmUnrestricted(ctx, { unrestricted, provider: detail.provider ?? '', worker: detail.name, cwd });
-  if (gate.refused) return gate.refused;
-  const request = { checks, mode: detail.mode ?? 'task', prompt, files: mergedFiles.length > 0 ? mergedFiles : undefined, ...(detail.watchedFiles ? { previousWatchedFiles: detail.watchedFiles } : {}), provider: detail.provider ?? undefined, model: resumeModel.model ?? detail.model ?? undefined, effort: resumeModel.effort ?? detail.effort ?? undefined, name: detail.name, workerId: detail.workerId, task: detail.task ?? undefined, cwd, conversation: detail.conversation, timeoutMs, unrestricted: unrestricted ?? detail.unrestricted, env: validateEnv(args.env), onPrepared };
+  const gate = await confirmUnrestricted(ctx, { unrestricted: opts.unrestricted, provider: detail.provider ?? '', worker: detail.name, cwd });
+  if (gate.refused) return { refused: gate.refused };
+  const nextTurn = ((detail as TurnFields).turn ?? 1) + 1;
+  const request = {
+    checks,
+    mode: detail.mode ?? 'task',
+    prompt: opts.prompt,
+    ...(opts.context === undefined ? {} : { context: opts.context }),
+    files: mergedFiles.length > 0 ? mergedFiles : undefined,
+    ...(detail.watchedFiles ? { previousWatchedFiles: detail.watchedFiles } : {}),
+    provider: detail.provider ?? undefined,
+    model: resumeModel.model ?? detail.model ?? undefined,
+    effort: resumeModel.effort ?? detail.effort ?? undefined,
+    name: detail.name,
+    workerId: detail.workerId,
+    continuedFrom: detail.jobId,
+    continuationKind: 'resume' as const,
+    turn: nextTurn,
+    task: detail.task ?? undefined,
+    cwd,
+    conversation: detail.conversation!,
+    timeoutMs: opts.timeoutMs,
+    unrestricted: opts.unrestricted ?? detail.unrestricted,
+    env: validateEnv(opts.envArg),
+    onPrepared,
+  };
   const tracked = checks?.length ? await ctx.service.spawnTracked(request) : null;
-  const resumed = tracked?.ack ?? await ctx.service.spawnJob(request);
+  const resumed = (tracked?.ack ?? await ctx.service.spawnJob(request)) as SpawnAck & TurnFields;
   if (tracked && checks) gateAcceptance(ctx, resumed.jobId, tracked.done, checks, preparedJobIds);
   let droppedEnv: string[] = [];
   if (request.env === undefined) { try { droppedEnv = JSON.parse(readFileSync(jobFile(ctx.service.repo, detail.jobId, ENV_KEYS_FILE), 'utf8')) as string[]; } catch { /* the original had no env */ } }
   const allWarnings = [...(resumed.warnings ?? []), ...(gate.warning ? [gate.warning] : []), ...(droppedEnv.length > 0 ? [`The original job set env ${droppedEnv.join(', ')}; values are not stored, so this turn runs without them. Pass env again to keep them.`] : [])];
-  return structured({ ...slimAck(resumed), ...(checks?.length ? { checks: checks.map(c => c.name) } : {}), ...(allWarnings.length > 0 ? { warnings: allWarnings } : {}) }, { compact: true });
+  const baseAck = slimAck({
+    ...resumed,
+    workerId: resumed.workerId ?? detail.workerId,
+    turn: resumed.turn ?? nextTurn,
+    continuedFrom: resumed.continuedFrom ?? detail.jobId,
+    continuationKind: resumed.continuationKind ?? 'resume',
+  });
+  return { ack: { ...baseAck, ...(checks?.length ? { checks: checks.map(c => c.name) } : {}), ...(allWarnings.length > 0 ? { warnings: allWarnings } : {}) } };
+}
+
+const resumeJob: Handler = async (ctx, args) => {
+  const worker = text(args, 'worker', true)!;
+  const detail = await resolveWorkerDetail(ctx, worker);
+  if (detail.status === 'running') throw new Error(`"${detail.name}" is still running; use steer_job with delivery: "queue" or "interrupt", or wait.`);
+  if (!detail.conversation) throw new Error(`"${detail.name}" has no conversation to resume: the provider did not save a conversation before it stopped. Use spawn_job with the full original brief; on-disk edits remain in ${detail.cwd ?? ctx.service.repo}.`);
+  const prompt = text(args, 'prompt', true)!;
+  const result = await resumeFromDetail(ctx, detail, {
+    prompt,
+    files: filesList(args),
+    checksArg: args.checks,
+    cwd: workingDirectory(args),
+    model: text(args, 'model'),
+    effort: allowed(args, 'effort', EFFORTS),
+    timeoutMs: number(args, 'timeoutMs'),
+    unrestricted: boolean(args, 'unrestricted'),
+    envArg: args.env,
+  });
+  if ('refused' in result) return result.refused;
+  return structured(result.ack, { compact: true });
 };
 
 const steerJob: Handler = async (ctx, args) => {
@@ -335,20 +425,101 @@ const steerJob: Handler = async (ctx, args) => {
   const files = filesList(args);
   const delivery = allowed(args, 'delivery', ['queue', 'interrupt']) as 'queue' | 'interrupt' | undefined;
   if (delivery === undefined) throw new Error('delivery is required: choose "queue" (after current turn) or "interrupt" (stop current turn now).');
-  const ack = await ctx.service.steer({ worker, prompt, context, files, delivery });
-  const { dir: _dir, workerId: _w, ...rest } = ack as typeof ack & { dir?: unknown; workerId?: unknown };
-  return structured({ ...rest, note: `${ack.note} The continuation gets a new job ID; status and cancel on ${ack.jobId} follow it.` });
+  const allowFresh = boolean(args, 'allowFresh');
+  try {
+    const ack = await (ctx.service.steer as (req: Record<string, unknown>) => Promise<Record<string, unknown>>)({
+      worker, prompt, context, files, delivery,
+      ...(allowFresh !== undefined ? { allowFresh } : {}),
+    });
+    const { dir: _dir, ...rest } = ack;
+    return structured({
+      ...rest,
+      action: ack.action ?? (delivery === 'interrupt' ? 'interrupting' : 'queued'),
+      note: `${String(ack.note)} The continuation gets a new job ID; status and cancel on ${String(ack.jobId)} follow it.`,
+    });
+  } catch (err) {
+    if (!isSettledTargetError(err)) throw err;
+    if (delivery !== 'queue') {
+      throw new Error(`"${err.name}" (${err.jobId}) is already ${err.status}; delivery: "interrupt" applies only to a running turn.`);
+    }
+    const detail = await resolveWorkerDetail(ctx, err.jobId);
+    if (detail.status === 'running' && !detail.supersededBy) {
+      // Turn chained or restarted concurrently; try steering the live head once.
+      const ack = await (ctx.service.steer as (req: Record<string, unknown>) => Promise<Record<string, unknown>>)({
+        worker: detail.jobId, prompt, context, files, delivery,
+        ...(allowFresh !== undefined ? { allowFresh } : {}),
+      });
+      const { dir: _dir, ...rest } = ack;
+      return structured({
+        ...rest,
+        action: ack.action ?? 'queued',
+        note: `${String(ack.note)} The continuation gets a new job ID; status and cancel on ${String(ack.jobId)} follow it.`,
+      });
+    }
+    if (detail.supersededBy) {
+      throw new Error(`"${detail.name}" (${detail.jobId}) is handing off to ${detail.supersededBy}; retry steer_job.`);
+    }
+    if (detail.status !== 'succeeded') {
+      throw new Error(`"${detail.name}" (${detail.jobId}) ended ${detail.status}; only a succeeded turn can be resumed via queued steer. Use resume_job to continue.`);
+    }
+    const acc = readAcceptance(ctx.service.repo, detail.jobId) as { pending?: boolean; running?: string };
+    if (acc.pending === true) {
+      throw new Error(`"${detail.name}" (${detail.jobId}) exited succeeded, but acceptance checks are still pending${acc.running ? ` (${acc.running})` : ''}; wait for checks to settle.`);
+    }
+    if (!detail.conversation) {
+      throw new Error(`"${detail.name}" (${detail.jobId}) has no saved conversation to resume; use spawn_job with the full brief.`);
+    }
+    const result = await resumeFromDetail(ctx, detail, { prompt, context, files });
+    if ('refused' in result) return result.refused;
+    return structured({
+      ...result.ack,
+      action: 'resumed',
+      delivery: 'queue',
+      resumable: true,
+      note: `Prior turn already succeeded; resumed as turn ${String(result.ack.turn)} (${String(result.ack.jobId)}).`,
+    }, { compact: true });
+  }
 };
+
+function betterHead(a: JobSummary & TurnFields, b: JobSummary & TurnFields): boolean {
+  const aSup = Boolean(a.supersededBy);
+  const bSup = Boolean(b.supersededBy);
+  if (aSup !== bSup) return !aSup;
+  const aRun = a.status === 'running';
+  const bRun = b.status === 'running';
+  if (aRun !== bRun) return aRun;
+  const aTurn = a.turn ?? 1;
+  const bTurn = b.turn ?? 1;
+  if (aTurn !== bTurn) return aTurn > bTurn;
+  const aTime = Date.parse(a.startedAt ?? a.updatedAt ?? '') || 0;
+  const bTime = Date.parse(b.startedAt ?? b.updatedAt ?? '') || 0;
+  return aTime > bTime;
+}
+
+function groupByWorkerHead(jobs: readonly (JobSummary & TurnFields)[]): (JobSummary & TurnFields)[] {
+  const byWorker = new Map<string, JobSummary & TurnFields>();
+  for (const job of jobs) {
+    const key = job.workerId || job.jobId;
+    const prev = byWorker.get(key);
+    if (!prev || betterHead(job, prev)) byWorker.set(key, job);
+  }
+  return [...byWorker.values()];
+}
 
 const listJobs: Handler = async (ctx, args) => {
   const fmt = format(args); const since = text(args, 'since');
   const limit = number(args, 'limit', 500) ?? (fmt === 'concise' ? CONCISE_LIST_LIMIT : undefined);
   // Concise asks for one extra row so a cut list says so instead of looking complete.
-  const jobs = await ctx.service.list({ status: allowed(args, 'status', ['running', 'succeeded', 'failed', 'canceled']) as ForgeStatus | undefined,
-    limit: fmt === 'concise' && limit !== undefined ? limit + 1 : limit, sinceMs: since === undefined ? undefined : parseSince(since), ids: boolean(args, 'session') ? ctx.service.spawnedIds : undefined });
-  // A turn a steer replaced is not a worker; its continuation's row stands for it.
-  const workers = jobs.filter(j => !j.supersededBy);
-  if (fmt !== 'concise') return structured(workers.map(j => { const live = jobLiveness(j); return { ...j, taskStatus: taskStatus(j.status), ...(live === null ? {} : { liveness: livenessView(live), stalled: isStalled(live) }) }; }));
+  const listArgs = {
+    status: allowed(args, 'status', ['running', 'succeeded', 'failed', 'canceled']) as ForgeStatus | undefined,
+    limit: fmt === 'concise' && limit !== undefined ? limit + 1 : limit,
+    sinceMs: since === undefined ? undefined : parseSince(since),
+    ids: boolean(args, 'session') ? ctx.service.spawnedIds : undefined,
+    groupByWorker: true,
+  };
+  const jobs = await (ctx.service.list as (filter: typeof listArgs) => Promise<JobSummary[]>)(listArgs);
+  const workers = groupByWorkerHead(jobs);
+  if (fmt !== 'concise') return structured(workers.map(j => { const live = jobLiveness(j); return { ...j, taskStatus: taskStatus(j.status), ...(live === null ? {} : { liveness: livenessView(live) }) }; }));
   const rows = workers.slice(0, limit).map(j => conciseRow(j));
   return structured(workers.length > rows.length
     ? { items: rows, more: `More than ${rows.length} jobs match; narrow with since, status or session, or raise limit.` }
@@ -367,13 +538,13 @@ function unsettled(ctx: HandlerContext, d: JobDetail): boolean {
 
 const jobStatus: Handler = async (ctx, args) => {
   const jobId = text(args, 'jobId', true)!; const waitMs = number(args, 'wait_ms', MAX_WAIT_MS); const fmt = format(args); const wantDiff = boolean(args, 'include_diff') ?? false;
-  let detail = await ctx.service.detail(resolveHead(ctx, jobId)); let waited = false;
+  let detail = await resolveWorkerDetail(ctx, jobId); let waited = false;
   if (waitMs !== undefined) {
     waited = true; const deadline = Date.now() + waitMs; const fallbackMs = ctx.pollMs ?? WAIT_POLL_MS;
     const maxSlice = ctx.pollMs ?? WATCH_RECHECK_MS;
     while (unsettled(ctx, detail) && Date.now() < deadline) {
       await waitForChange(jobDir(ctx.service.repo, detail.jobId), Math.min(maxSlice, deadline - Date.now()), { fallbackMs });
-      detail = await ctx.service.detail(resolveHead(ctx, detail.jobId));
+      detail = await resolveWorkerDetail(ctx, detail.jobId);
     }
   }
   const reportPath = jobFile(ctx.service.repo, detail.jobId, FILES.report);
@@ -381,11 +552,17 @@ const jobStatus: Handler = async (ctx, args) => {
   const acceptance = readAcceptance(ctx.service.repo, detail.jobId); const wait = waited ? { waited: true, stillRunning: unsettled(ctx, detail) } : {};
   const diff = wantDiff ? await jobDiff(detail) : {};
   // Oldest first, so the turns read in the order the worker took them.
-  const earlier: JobDetail[] = [];
-  for (let id = detail.steeredFrom; id && earlier.length < EARLIER_TURNS_CAP;) {
-    const turn = await ctx.service.detail(id).catch(() => null);
-    if (turn === null) break;
-    earlier.unshift(turn); id = turn.steeredFrom;
+  let earlier: JobDetail[];
+  const svcEarlier = (ctx.service as { earlierTurns?: (head: JobDetail | string, cap?: number) => Promise<JobDetail[]> }).earlierTurns;
+  if (typeof svcEarlier === 'function') {
+    earlier = await svcEarlier.call(ctx.service, detail, EARLIER_TURNS_CAP);
+  } else {
+    earlier = [];
+    for (let id = (detail as TurnFields).continuedFrom; id && earlier.length < EARLIER_TURNS_CAP;) {
+      const turn = await ctx.service.detail(id).catch(() => null);
+      if (turn === null) break;
+      earlier.unshift(turn); id = (turn as TurnFields).continuedFrom;
+    }
   }
   const turns = earlier.length > 0 ? { earlierTurns: earlier.map(t => earlierTurn(t, jobFile(ctx.service.repo, t.jobId, FILES.report), fmt)) } : {};
   if (fmt === 'concise') return structured({ ...conciseStatus(detail, acceptance, wait), reportPath, resumable: Boolean(detail.conversation), ...turns, ...diff });

@@ -20,14 +20,14 @@ import { normalize } from '../../../harness/normalize.ts';
 import { existsSafe, readdirSafe, readJsonSafe } from '../../../harness/safe-fs.ts';
 import { pipelineRecordPath, type PipelineRecord } from '../../../forge/execute.ts';
 import type { ObservedJob } from '../../../harness/types.ts';
-import { isTerminalForgeStatus } from '../../../forge/format.ts';
+import { isTerminalForgeStatus, type ContinuationKind } from '../../../forge/format.ts';
 import { readAcceptance } from '../../../forge/checks.ts';
 // Cross-surface import, and deliberately so. The mod ships as a STANDALONE plugin
 // directory — it cannot reach outside its own folder — so it has to own any
 // constant the channel also needs. One owner, two importers, no drift. The same
 // reasoning puts the dedupe rules in ./policy.ts rather than in the server: the
 // server is the only thing that could not be reused.
-import { isStalled, livenessOf, type Liveness } from '../../mod/hooks/stale.ts';
+import { livenessOf, type Liveness } from '../../mod/hooks/stale.ts';
 import { ACCEPTANCE_HOLD_MS, pipelineOutcome } from '../../mod/hooks/notice.ts';
 import type { WatchableJob, WatchStatus } from './policy.ts';
 
@@ -188,12 +188,20 @@ async function readOne(cwd: string, jobId: string, now: number): Promise<Watchab
       failed: acceptance.checks.flatMap((c) => (c?.ok !== true && typeof c?.name === 'string' ? [c.name] : [])),
     } : null;
 
+  const continuedFrom = typeof raw['continuedFrom'] === 'string' && raw['continuedFrom'] !== '' ? raw['continuedFrom'] : null;
+  const rk = raw['continuationKind'];
+  const continuationKind: ContinuationKind | null =
+    rk === 'steer-queue' || rk === 'steer-interrupt' || rk === 'resume' ? rk : null;
+
   return {
     id: observed.jobId,
+    workerId: typeof raw['workerId'] === 'string' && raw['workerId'] !== '' ? raw['workerId'] : observed.jobId,
     name: typeof observed.raw['name'] === 'string' ? observed.raw['name'] : undefined,
+    turn: typeof raw['turn'] === 'number' && Number.isInteger(raw['turn']) && raw['turn'] >= 1 ? raw['turn'] : 1,
     role: typeof observed.raw['role'] === 'string' ? observed.raw['role'] : observed.mode ?? undefined,
     provider: typeof observed.raw['provider'] === 'string' ? observed.raw['provider'] : undefined,
     startedAt: observed.startedAt,
+    chainStartedAt: typeof raw['chainStartedAt'] === 'string' && raw['chainStartedAt'] !== '' ? raw['chainStartedAt'] : observed.startedAt,
     changedFileCount: Array.isArray(observed.raw['changed_files']) ? observed.raw['changed_files'].length : undefined,
     latestSummary: typeof raw['latestSummary'] === 'string' ? raw['latestSummary'] : null,
     failureReason: [raw['reason'], raw['error']].find((v): v is string => typeof v === 'string' && v !== '') ?? null,
@@ -208,7 +216,8 @@ async function readOne(cwd: string, jobId: string, now: number): Promise<Watchab
     finishedAt: observed.finishedAt,
     warned,
     supersededBy: typeof raw['supersededBy'] === 'string' && raw['supersededBy'] !== '' ? raw['supersededBy'] : null,
-    steeredFrom: typeof raw['steeredFrom'] === 'string' && raw['steeredFrom'] !== '' ? raw['steeredFrom'] : null,
+    continuedFrom,
+    continuationKind,
     ...(observed.warnings.some((w) => w.code === 'steer_not_applied') ? { steerNotApplied: true } : {}),
     ...(Array.isArray(raw['staleReads']) && raw['staleReads'].length > 0
       ? { staleReads: raw['staleReads'].filter((f): f is string => typeof f === 'string' && f.trim() !== '') }
@@ -251,5 +260,6 @@ export function toWatchStatus(observed: ObservedJob, now: number): WatchStatus {
   if (observed.status !== 'running') return observed.status;
   // silent or dead needs eyes; active and in-tool (a long command) do not. No
   // event time at all is `silent`: "we do not know" is never drawn as "fine".
-  return isStalled(watchLiveness(observed, now)) ? 'attention' : 'running';
+  const live = watchLiveness(observed, now);
+  return live !== null && (live.state === 'silent' || live.state === 'dead') ? 'attention' : 'running';
 }

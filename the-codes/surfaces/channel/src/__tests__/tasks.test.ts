@@ -46,6 +46,7 @@ function rawTransport(tasks = true) {
       jobId,
       name: workerName,
       workerId: 'worker-1',
+      turn: 1,
       role: 'review',
       latestSummary: 'Reviewed fixture.',
       summarySource: 'worker',

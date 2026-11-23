@@ -312,6 +312,15 @@ test('a silent job that then dies is pushed again; a dead one is pushed once', (
   assert.equal(shouldPush(cand(job({ ...silent, lastEventAt: null })), NOW), false);
 });
 
+test('toNotice passes continuationKind for steers and resumes without steeredFrom', async () => {
+  const { toNotice } = await import('../policy.ts');
+  const steered = toNotice(job({ status: 'succeeded', finishedAt: '2026-10-03T16:40:00Z', continuedFrom: 'turn-1', continuationKind: 'steer-interrupt' }), 'finished', NOW);
+  assert.equal((steered as { continuationKind?: unknown }).continuationKind, 'steer-interrupt');
+  assert.equal('steered' in steered, false);
+  const resumed = toNotice(job({ status: 'succeeded', finishedAt: '2026-10-03T16:40:00Z', continuedFrom: 'turn-2', continuationKind: 'resume' }), 'finished', NOW);
+  assert.equal((resumed as { continuationKind?: unknown }).continuationKind, 'resume');
+});
+
 test('toWatchStatus: a long open command is running; a stopped heartbeat is attention', async () => {
   const { toWatchStatus } = await import('../watch-source.ts');
   const obs = (raw: Record<string, unknown>) => ({

@@ -1,9 +1,10 @@
 /** Reader-sized views of job and pipeline state: concise by default, detailed is the full record. */
 import { execFile } from 'node:child_process';
 import type { JobDetail, JobSummary } from '../../../forge/service.ts';
+import type { ContinuationKind } from '../../../forge/format.ts';
 import type { Acceptance } from '../../../forge/checks.ts';
 import type { PipelineRecord } from '../../../forge/execute.ts';
-import { isStalled, livenessOf, type Liveness } from '../../mod/hooks/stale.ts';
+import { livenessOf, type Liveness } from '../../mod/hooks/stale.ts';
 import { reasonFromText } from '../../mod/hooks/reasons.ts';
 
 export type ResponseFormat = 'concise' | 'detailed';
@@ -95,17 +96,19 @@ function evidence(j: JobSummary) {
 }
 
 /** One compact row for list_jobs. `now` is injectable so liveness is testable. */
-export function conciseRow(j: JobSummary, now = Date.now()) {
+export function conciseRow(j: JobSummary & { turn?: number; continuedFrom?: string; continuationKind?: ContinuationKind; chainStartedAt?: string }, now = Date.now()) {
   const live = jobLiveness(j, now);
   return compact({
-    jobId: j.jobId, name: j.name, status: j.status, taskStatus: taskStatus(j.status), provider: j.provider, model: j.model, mode: j.mode,
+    jobId: j.jobId, workerId: j.workerId, name: j.name, turn: j.turn ?? 1,
+    status: j.status, taskStatus: taskStatus(j.status), provider: j.provider, model: j.model, mode: j.mode,
     summary: j.latestSummary ? trimWords(j.latestSummary, CONCISE_SUMMARY_CHARS) : null,
     toolCalls: j.toolCalls, lastActivity: lastActivity(j.lastActivity), startedAt: j.startedAt, finishedAt: j.finishedAt,
-    supersededBy: j.supersededBy ?? null, steeredFrom: j.steeredFrom ?? null,
+    chainStartedAt: j.chainStartedAt ?? null,
+    supersededBy: j.supersededBy ?? null, continuedFrom: j.continuedFrom ?? null,
+    continuationKind: j.continuationKind ?? null,
     pendingSteers: j.pendingSteers ? j.pendingSteers : null,
     nextAction: j.nextAction, warningCount: j.warnings.length || null,
     liveness: livenessView(live),
-    stalled: isStalled(live) ? true : null,
     changedFileCount: typeof j.changedFileCount === 'number' ? j.changedFileCount : null,
     ...evidence(j),
     acceptance: j.acceptance && (j.acceptance.state !== 'unchecked' || j.acceptance.pending || j.acceptance.checks.length > 0)
@@ -129,7 +132,7 @@ function checkVerdicts(a: AcceptanceView | null | undefined) {
 }
 
 /** Concise single-job view: identity, verdicts, timing, one report. */
-export function conciseStatus(d: JobDetail, acceptance: AcceptanceView | null, extra: { waited?: boolean; stillRunning?: boolean } = {}, now = Date.now()) {
+export function conciseStatus(d: JobDetail & { turn?: number; continuedFrom?: string; continuationKind?: ContinuationKind; chainStartedAt?: string }, acceptance: AcceptanceView | null, extra: { waited?: boolean; stillRunning?: boolean } = {}, now = Date.now()) {
   const live = jobLiveness(d, now);
   const report = d.report ?? '';
   const cut = report.length > CONCISE_REPORT_CHARS;
@@ -139,14 +142,16 @@ export function conciseStatus(d: JobDetail, acceptance: AcceptanceView | null, e
   const files = d.changedFiles ?? [];
   const warnings = d.warnings.length ? warningTexts(d.warnings, d.error) : [];
   return compact({
-    jobId: d.jobId, name: d.name, provider: d.provider, model: d.model, mode: d.mode, status: d.status, taskStatus: taskStatus(d.status),
+    jobId: d.jobId, workerId: d.workerId, name: d.name, turn: d.turn ?? 1,
+    provider: d.provider, model: d.model, mode: d.mode, status: d.status, taskStatus: taskStatus(d.status),
     resumable: Boolean(d.conversation),
     liveness: livenessView(live),
-    stalled: isStalled(live),
     acceptance: checkVerdicts(acceptance),
-    startedAt: d.startedAt, finishedAt: d.finishedAt, durationMs: Number.isNaN(started) ? null : Math.max(0, ended - started),
+    startedAt: d.startedAt, finishedAt: d.finishedAt, chainStartedAt: d.chainStartedAt ?? null,
+    durationMs: Number.isNaN(started) ? null : Math.max(0, ended - started),
     toolCalls: d.toolCalls, lastActivity: lastActivity(d.lastActivity),
-    supersededBy: d.supersededBy ?? null, steeredFrom: d.steeredFrom ?? null,
+    supersededBy: d.supersededBy ?? null, continuedFrom: d.continuedFrom ?? null,
+    continuationKind: d.continuationKind ?? null,
     pendingSteers: d.pendingSteers ? d.pendingSteers : null,
     changedFileCount: d.changedFiles ? files.length : null, changedFiles: files.length ? files.slice(0, CONCISE_FILES_CAP) : null,
     ...evidence(d),
@@ -161,14 +166,17 @@ export function conciseStatus(d: JobDetail, acceptance: AcceptanceView | null, e
 }
 
 /**
- * One earlier turn of a steered worker. The head's report covers only its own
- * turn, so status lists the turns before it rather than leaving them to a walk
- * Claude cannot make: status on an earlier ID resolves back to the head.
+ * One earlier turn of a worker (steered or resumed). The head's report covers
+ * only its own turn, so status lists the turns before it rather than leaving
+ * them to a walk Claude cannot make: status on an earlier ID resolves to the head.
  */
-export function earlierTurn(d: JobDetail, reportPath: string, fmt: ResponseFormat) {
+export function earlierTurn(d: JobDetail & { turn?: number; continuedFrom?: string; continuationKind?: ContinuationKind }, reportPath: string, fmt: ResponseFormat) {
   const report = d.report ?? '';
   return compact({
-    jobId: d.jobId, status: d.status, finishedAt: d.finishedAt,
+    jobId: d.jobId, turn: d.turn ?? 1,
+    continuedFrom: d.continuedFrom ?? null,
+    continuationKind: d.continuationKind ?? null,
+    status: d.status, finishedAt: d.finishedAt,
     report: report ? (fmt === 'concise' ? trimWords(report, EARLIER_REPORT_CHARS) : report) : null, reportPath,
   });
 }
