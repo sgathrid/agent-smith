@@ -1,4 +1,71 @@
-import {r as reasonFromText,_ as checksReason,$ as toolLabel}from'./chunk-execute.js';/**
+import {watch}from'node:fs';import {r as reasonFromText,$ as checksReason,a0 as toolLabel}from'./chunk-normalize.js';/**
+ * forge/watch.ts — wake when a job's files change, instead of re-reading them on a timer.
+ *
+ * A worker runs in another process (the detached supervisor) and reports only through
+ * its job directory. The OS tells us when that directory changes (FSEvents on macOS,
+ * inotify on Linux) through fs.watch, so a caller waiting on a job wakes the moment the
+ * writer renames a new job.json, progress.json, or acceptance.json into place.
+ *
+ * The timer is a fallback only: when the directory cannot be watched (it does not exist
+ * yet, or the filesystem has no change events) the wait sleeps `fallbackMs` instead.
+ */
+/**
+ * Resolves on the first change in `dir`, after `timeoutMs`, or when `signal` aborts,
+ * whichever is first. `'polled'` means the directory could not be watched and the
+ * fallback sleep ran instead.
+ */
+function waitForChange(dir, timeoutMs, opts = {}) {
+    if (opts.signal?.aborted)
+        return Promise.resolve('aborted');
+    if (!(timeoutMs > 0))
+        return Promise.resolve('timeout');
+    return new Promise((resolve) => {
+        let done = false;
+        let watcher = null;
+        let timer = null;
+        const deadline = Date.now() + timeoutMs;
+        const fallbackMs = Math.min(opts.fallbackMs ?? 500, timeoutMs);
+        const closeWatcher = () => {
+            if (watcher === null)
+                return;
+            const w = watcher;
+            watcher = null;
+            try {
+                w.close();
+            }
+            catch { /* already closed */ }
+        };
+        const finish = (why) => {
+            if (done)
+                return;
+            done = true;
+            if (timer !== null)
+                clearTimeout(timer);
+            opts.signal?.removeEventListener('abort', onAbort);
+            closeWatcher();
+            resolve(why);
+        };
+        const fallBack = () => {
+            if (done)
+                return;
+            closeWatcher();
+            if (timer !== null)
+                clearTimeout(timer);
+            const delay = Math.min(fallbackMs, Math.max(0, deadline - Date.now()));
+            timer = setTimeout(() => finish('polled'), delay);
+        };
+        const onAbort = () => finish('aborted');
+        opts.signal?.addEventListener('abort', onAbort, { once: true });
+        try {
+            watcher = watch(dir, { persistent: false }, () => finish('change'));
+            watcher.on('error', fallBack);
+            timer = setTimeout(() => finish('timeout'), timeoutMs);
+        }
+        catch {
+            fallBack();
+        }
+    });
+}/**
  * format.ts — PURE presentation logic for the /forge pane and the band.
  *
  * WHY THIS FILE IS NOT `register.tsx`:
@@ -168,8 +235,10 @@ function headline(job) {
                 parts.push(`no output${d ? ` for ${d}` : ''}${job.liveness?.tool ? ` (in \`${job.liveness.tool}\`)` : ''}`);
             break;
     }
-    if (job.steered)
+    if (job.continuationKind === 'steer-queue' || job.continuationKind === 'steer-interrupt')
         parts.push('after steer');
+    else if (job.continuationKind === 'resume')
+        parts.push('resumed');
     if (job.steerNotApplied)
         parts.push('queued steer not applied');
     if (job.staleReads && job.staleReads.length > 0) {
@@ -309,6 +378,8 @@ function launchFromPayload(kind, payload) {
         return null;
     if (typeof id !== 'string' || id.length === 0)
         return null;
+    const workerId = kind === 'job' && typeof payload['workerId'] === 'string' && payload['workerId'].length > 0
+        ? payload['workerId'] : undefined;
     let repo = null;
     if (typeof payload['repo'] === 'string' && payload['repo'].length > 0)
         repo = trimSlash(payload['repo']);
@@ -317,7 +388,13 @@ function launchFromPayload(kind, payload) {
     else if (kind === 'run' && typeof payload['recordPath'] === 'string')
         repo = repoAbove(payload['recordPath'], 'pipelines');
     const t = payload['timeoutMs'];
-    return { kind, id, repo, timeoutMs: typeof t === 'number' && Number.isFinite(t) && t > 0 ? t : null };
+    return {
+        kind,
+        id,
+        ...(workerId !== undefined ? { workerId } : {}),
+        repo,
+        timeoutMs: typeof t === 'number' && Number.isFinite(t) && t > 0 ? t : null,
+    };
 }
 /**
  * Pipeline outcome: `2/3 stages passed · test: checks failed: lint`. The first
@@ -401,8 +478,4 @@ function livenessOf(i) {
     if (silentForMs > STALL_GRACE_MS)
         return { state: 'silent', silentForMs, since: lastSeen, forMs: silentForMs };
     return { state: 'active', silentForMs, since: lastSeen, forMs: silentForMs };
-}
-/** The old boolean, derived: true for `silent` or `dead`. */
-function isStalled(l) {
-    return l !== null && (l.state === 'silent' || l.state === 'dead');
-}export{ACCEPTANCE_HOLD_MS as A,LIVENESS_STATES as L,claudeText as a,pipelineOutcome as b,claimMarkerPath as c,isStalled as i,livenessOf as l,parseLaunches as p};
+}export{ACCEPTANCE_HOLD_MS as A,LIVENESS_STATES as L,claudeText as a,pipelineOutcome as b,claimMarkerPath as c,livenessOf as l,parseLaunches as p,unwrapResponse as u,waitForChange as w};

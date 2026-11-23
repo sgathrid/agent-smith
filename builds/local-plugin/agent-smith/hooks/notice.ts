@@ -21,13 +21,18 @@ import { isTerminal } from './format.ts';
  * here, structurally, because the channel compiles this file too and must not
  * pull in the mod's `claude-code` module augmentation.
  */
+export type NoticeContinuationKind = 'steer-queue' | 'steer-interrupt' | 'resume';
+
 export interface NoticeRow {
   readonly id: string;
   readonly status: string;
+  readonly workerId?: string;
+  readonly turn?: number;
   readonly name?: string | null;
   readonly provider?: string | null;
   readonly role?: string | null;
   readonly startedAt: number | null;
+  readonly chainStartedAt?: number | null;
   readonly endedAt: number | null;
   readonly lastEventAt?: number | null;
   readonly changedFileCount?: number | null;
@@ -36,7 +41,8 @@ export interface NoticeRow {
   readonly latestSummary?: string | null;
   readonly summarySource?: 'worker' | null;
   readonly supersededBy?: string | null;
-  readonly steeredFrom?: string | null;
+  readonly continuedFrom?: string | null;
+  readonly continuationKind?: NoticeContinuationKind | null;
   readonly warnings?: readonly { readonly code: string }[] | null;
   readonly staleReads?: readonly string[] | null;
   readonly acceptance?: { readonly pending?: boolean; readonly budgetMs?: number; readonly running?: string; readonly checks: readonly { readonly ok: boolean; readonly name?: string }[] };
@@ -74,8 +80,8 @@ export interface NoticeJob {
   readonly summary?: string | null;
   /** Watched brief files that changed in the repository while the job ran. */
   readonly staleReads?: readonly string[] | null;
-  /** This turn came after a steer, so its report covers only this turn. */
-  readonly steered?: boolean;
+  /** How this turn continued from an earlier turn, when turn > 1. */
+  readonly continuationKind?: NoticeContinuationKind | null;
   /** A queued steer was dropped because this turn did not succeed. */
   readonly steerNotApplied?: boolean;
   /** A pipeline run: the id is a runId and Claude reads it with pipeline_status. */
@@ -177,7 +183,8 @@ export function headline(job: NoticeJob): string {
       else parts.push(`no output${d ? ` for ${d}` : ''}${job.liveness?.tool ? ` (in \`${job.liveness.tool}\`)` : ''}`);
       break;
   }
-  if (job.steered) parts.push('after steer');
+  if (job.continuationKind === 'steer-queue' || job.continuationKind === 'steer-interrupt') parts.push('after steer');
+  else if (job.continuationKind === 'resume') parts.push('resumed');
   if (job.steerNotApplied) parts.push('queued steer not applied');
   if (job.staleReads && job.staleReads.length > 0) {
     const first = job.staleReads[0]!;
@@ -298,11 +305,12 @@ export const STATUS_TOOL = /^mcp__(?:plugin_agent-smith_)?agent-smith__(?:status
 export function parseSettledRead(
   toolName: unknown,
   response: unknown,
-): { readonly kind: 'job' | 'run'; readonly id: string; readonly resolvedFrom?: string } | null {
+): { readonly kind: 'job' | 'run'; readonly id: string; readonly resolvedFrom?: string; readonly workerId?: string } | null {
   if (typeof toolName !== 'string' || !STATUS_TOOL.test(toolName)) return null;
   const payload = unwrapResponse(response);
   if (payload === null || typeof payload['error'] === 'string') return null;
   const bare = toolName.slice(toolName.lastIndexOf('__') + 2);
+  const workerId = typeof payload['workerId'] === 'string' && payload['workerId'].length > 0 ? payload['workerId'] : undefined;
   // Claude cancelled it and the answer says it stopped: a notice would only repeat that.
   if (bare === 'cancel') {
     if (payload['settled'] !== true) return null;
@@ -311,9 +319,12 @@ export function parseSettledRead(
     const jobId = payload['jobId'];
     if (typeof jobId !== 'string' || jobId.length === 0) return null;
     const resolvedFrom = payload['resolvedFrom'];
-    return typeof resolvedFrom === 'string' && resolvedFrom.length > 0 && resolvedFrom !== jobId
-      ? { kind: 'job', id: jobId, resolvedFrom }
-      : { kind: 'job', id: jobId };
+    return {
+      kind: 'job',
+      id: jobId,
+      ...(typeof resolvedFrom === 'string' && resolvedFrom.length > 0 && resolvedFrom !== jobId ? { resolvedFrom } : {}),
+      ...(workerId !== undefined ? { workerId } : {}),
+    };
   }
   if (bare === 'pipeline_status') {
     const runId = payload['runId'];
@@ -330,15 +341,21 @@ export function parseSettledRead(
   if (typeof status !== 'string' || !isTerminal(status)) return null;
   const acceptance = payload['acceptance'];
   if (isObj(acceptance) && acceptance['pending'] === true) return null;
-  return { kind: 'job', id: jobId };
+  return { kind: 'job', id: jobId, ...(workerId !== undefined ? { workerId } : {}) };
 }
 
 export function unclaim(
   owned: readonly Owned[],
-  settled: { readonly kind: 'job' | 'run'; readonly id: string; readonly resolvedFrom?: string },
+  settled: { readonly kind: 'job' | 'run'; readonly id: string; readonly resolvedFrom?: string; readonly workerId?: string },
 ): Owned[] {
   return owned.filter(
-    (o) => !(o.kind === settled.kind && (o.id === settled.id || (settled.resolvedFrom !== undefined && o.id === settled.resolvedFrom))),
+    (o) => !(
+      o.kind === settled.kind && (
+        o.id === settled.id ||
+        (settled.resolvedFrom !== undefined && o.id === settled.resolvedFrom) ||
+        (settled.workerId !== undefined && o.workerId === settled.workerId)
+      )
+    ),
   );
 }
 
@@ -366,6 +383,8 @@ export function claimMarkerPath(repo: string, kind: 'job' | 'run', id: string): 
 export interface Launch {
   readonly kind: 'job' | 'run';
   readonly id: string;
+  /** Stable worker id when the ack carries one (job launches, steers, resumes). */
+  readonly workerId?: string;
   /** The repo the ack names, or null when it names none. */
   readonly repo: string | null;
   /** The job's own budget (ms), when the ack carries one. */
@@ -410,12 +429,20 @@ function launchFromPayload(kind: 'job' | 'run', payload: Record<string, unknown>
   // Hosts may expose only structuredContent and omit the outer MCP metadata.
   if (kind === 'job' && isTerminal(String(payload['status']))) return null;
   if (typeof id !== 'string' || id.length === 0) return null;
+  const workerId = kind === 'job' && typeof payload['workerId'] === 'string' && payload['workerId'].length > 0
+    ? payload['workerId'] : undefined;
   let repo: string | null = null;
   if (typeof payload['repo'] === 'string' && payload['repo'].length > 0) repo = trimSlash(payload['repo']);
   else if (kind === 'job' && typeof payload['dir'] === 'string') repo = repoAbove(payload['dir'], 'jobs');
   else if (kind === 'run' && typeof payload['recordPath'] === 'string') repo = repoAbove(payload['recordPath'], 'pipelines');
   const t = payload['timeoutMs'];
-  return { kind, id, repo, timeoutMs: typeof t === 'number' && Number.isFinite(t) && t > 0 ? t : null };
+  return {
+    kind,
+    id,
+    ...(workerId !== undefined ? { workerId } : {}),
+    repo,
+    timeoutMs: typeof t === 'number' && Number.isFinite(t) && t > 0 ? t : null,
+  };
 }
 
 // ── projections ─────────────────────────────────────────────────────────────
@@ -435,11 +462,12 @@ function kindOf(status: string): NoticeKind | null {
 export function noticeFromRadar(job: NoticeRow, kind: NoticeKind, now: number): NoticeJob {
   const checks = job.acceptance?.checks ?? [];
   const dead = kind === 'attention' && job.liveness?.state === 'dead';
+  const start = job.chainStartedAt ?? job.startedAt;
   const span = dead
     ? (job.liveness?.since != null ? now - job.liveness.since : null)
     : kind === 'attention'
       ? (job.liveness ? job.liveness.silentForMs : job.lastEventAt != null ? now - job.lastEventAt : null)
-      : (job.endedAt != null && job.startedAt != null ? job.endedAt - job.startedAt : null);
+      : (job.endedAt != null && start != null ? job.endedAt - start : null);
   return {
     id: job.id, kind, name: job.name, provider: job.provider, role: job.role,
     durationMs: span,
@@ -450,7 +478,7 @@ export function noticeFromRadar(job: NoticeRow, kind: NoticeKind, now: number): 
     reason: kind === 'failed' ? job.failureDetail || reasonFromText(job.failureReason) : null,
     summary: job.summarySource === 'worker' ? job.latestSummary ?? null : null,
     ...(job.staleReads && job.staleReads.length > 0 ? { staleReads: job.staleReads } : {}),
-    ...(job.steeredFrom ? { steered: true } : {}),
+    ...(job.continuationKind ? { continuationKind: job.continuationKind } : {}),
     ...(job.warnings?.some((w) => w.code === 'steer_not_applied') ? { steerNotApplied: true } : {}),
     ...(kind === 'finished' && job.acceptance?.pending === true ? { checksRunning: job.acceptance.running ?? true } : {}),
     ...(kind === 'attention' ? { liveness: { state: dead ? 'dead' as const : 'silent' as const, ...(job.liveness?.tool ? { tool: job.liveness.tool } : {}) } } : {}),
@@ -526,6 +554,8 @@ export function runFileName(runId: string): string {
 export interface Owned {
   readonly kind: 'job' | 'run';
   readonly id: string;
+  /** Stable worker id for job claims, enabling worker-aware updates across steers and resumes. */
+  readonly workerId?: string;
   /** Epoch ms of the claim. */
   readonly at: number;
   /** Give up silently after this (the job's budget plus an hour): it can no longer be news. */
@@ -547,10 +577,35 @@ export function claim(owned: readonly Owned[], launch: Launch, now: number): Own
   const idx = owned.findIndex((o) => o.id === launch.id && o.kind === launch.kind);
   if (idx >= 0) {
     const existing = owned[idx]!;
-    if (until <= existing.until) return [...owned];
-    return owned.map((o, i) => (i === idx ? { ...o, until } : o));
+    const workerId = launch.workerId ?? existing.workerId;
+    if (until <= existing.until && workerId === existing.workerId) return [...owned];
+    return owned.map((o, i) => (i === idx ? { ...o, ...(workerId ? { workerId } : {}), until: Math.max(o.until, until) } : o));
   }
-  return [...owned, { kind: launch.kind, id: launch.id, at: now, until }];
+  // Worker-aware claim update: resume_job or steer_job (action: 'resumed') replaces
+  // the existing claim for the same worker with the new turn's jobId.
+  if (launch.kind === 'job' && launch.workerId) {
+    const workerIdx = owned.findIndex((o) => o.kind === 'job' && o.workerId === launch.workerId);
+    if (workerIdx >= 0) {
+      return owned.map((o, i) => (i === workerIdx ? { kind: 'job', id: launch.id, workerId: launch.workerId, at: now, until } : o));
+    }
+  }
+  return [...owned, { kind: launch.kind, id: launch.id, ...(launch.workerId ? { workerId: launch.workerId } : {}), at: now, until }];
+}
+
+function isBetterNoticeHead(candidate: NoticeRow, current: NoticeRow): boolean {
+  const cSup = Boolean(candidate.supersededBy);
+  const oSup = Boolean(current.supersededBy);
+  if (cSup !== oSup) return !cSup;
+  const cLive = !isTerminal(candidate.status) || candidate.acceptance?.pending === true;
+  const oLive = !isTerminal(current.status) || current.acceptance?.pending === true;
+  if (cLive !== oLive) return cLive;
+  const cTurn = candidate.turn ?? 1;
+  const oTurn = current.turn ?? 1;
+  if (cTurn !== oTurn) return cTurn > oTurn;
+  const cAt = candidate.startedAt ?? candidate.endedAt ?? 0;
+  const oAt = current.startedAt ?? current.endedAt ?? 0;
+  if (cAt !== oAt) return cAt > oAt;
+  return candidate.id.localeCompare(current.id) > 0;
 }
 
 /**
@@ -568,6 +623,13 @@ export function due(
   now: number,
 ): { notices: NoticeJob[]; owned: Owned[] } {
   const byId = new Map(jobs.map((j) => [j.id, j]));
+  const byWorker = new Map<string, NoticeRow[]>();
+  for (const j of jobs) {
+    if (!j.workerId) continue;
+    const list = byWorker.get(j.workerId);
+    if (list) list.push(j);
+    else byWorker.set(j.workerId, [j]);
+  }
   const notices: NoticeJob[] = [];
   const seenNotices = new Set<string>();
   const pushNotice = (notice: NoticeJob) => {
@@ -579,15 +641,20 @@ export function due(
   };
   const keep: Owned[] = [];
   const pushKeep = (entry: Owned) => {
-    const existingIdx = keep.findIndex((k) => k.kind === entry.kind && k.id === entry.id);
+    const existingIdx = keep.findIndex((k) =>
+      k.kind === entry.kind && (k.id === entry.id || (k.kind === 'job' && entry.workerId !== undefined && k.workerId === entry.workerId)),
+    );
     if (existingIdx >= 0) {
       const prev = keep[existingIdx]!;
+      const sameId = prev.id === entry.id;
       keep[existingIdx] = {
         ...prev,
+        id: sameId ? prev.id : entry.id,
+        ...(entry.workerId ?? prev.workerId ? { workerId: entry.workerId ?? prev.workerId } : {}),
         until: Math.max(prev.until, entry.until),
-        ...(prev.saidAttention || entry.saidAttention ? { saidAttention: true } : {}),
-        ...(prev.saidDead || entry.saidDead ? { saidDead: true } : {}),
-        ...(prev.saidExited || entry.saidExited ? { saidExited: true } : {}),
+        ...(sameId && (prev.saidAttention || entry.saidAttention) ? { saidAttention: true } : {}),
+        ...(sameId && (prev.saidDead || entry.saidDead) ? { saidDead: true } : {}),
+        ...(sameId && (prev.saidExited || entry.saidExited) ? { saidExited: true } : {}),
       };
     } else {
       keep.push(entry);
@@ -619,14 +686,20 @@ export function due(
     }
     let currentOwned = o;
     let job = byId.get(currentOwned.id);
+    let workerId = currentOwned.workerId ?? job?.workerId;
+    if (workerId && !currentOwned.workerId) {
+      currentOwned = { ...currentOwned, workerId };
+    }
     const visited = new Set<string>([currentOwned.id]);
     while (job?.supersededBy && !visited.has(job.supersededBy)) {
       visited.add(job.supersededBy);
       const nextId = job.supersededBy;
       const child = byId.get(nextId);
+      workerId = workerId ?? child?.workerId;
       currentOwned = {
         kind: 'job',
         id: nextId,
+        ...(workerId ? { workerId } : {}),
         at: child ? now : currentOwned.at,
         until: child ? Math.max(currentOwned.until, now + MAX_JOB_MS + 60 * 60_000) : currentOwned.until,
       };
@@ -635,6 +708,25 @@ export function due(
     if (currentOwned.id !== o.id && !job) {
       if (now <= currentOwned.until) pushKeep(currentOwned);
       continue;
+    }
+    // Follow the worker's head turn across both steers and resumes when a newer
+    // turn for the same workerId is present.
+    if (job && workerId) {
+      const siblings = byWorker.get(workerId) ?? [];
+      let head = job;
+      for (const sibling of siblings) {
+        if (sibling.id !== head.id && isBetterNoticeHead(sibling, head)) head = sibling;
+      }
+      if (head.id !== job.id) {
+        job = head;
+        currentOwned = {
+          kind: 'job',
+          id: head.id,
+          workerId,
+          at: now,
+          until: Math.max(currentOwned.until, now + MAX_JOB_MS + 60 * 60_000),
+        };
+      }
     }
     const kind = job ? kindOf(job.status) : null;
     if (job && kind === 'attention') {

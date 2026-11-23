@@ -1,4 +1,4 @@
-import {F as ForgeService}from'./chunk-service.js';import {s as startPipeline,m as markAcceptancePending,e as jobFile,F as FILES,f as settleAcceptance}from'./chunk-execute.js';import {existsSync}from'node:fs';import'node:child_process';import'node:url';import'node:timers/promises';import'node:path';import'node:fs/promises';import'node:crypto';import'node:os';import'node:readline';/** One execution owner per launch; deliberately independent of MCP transport. */
+import {F as ForgeService}from'./chunk-service.js';import {s as startPipeline,m as markAcceptancePending,e as jobFile,F as FILES,f as settleAcceptance}from'./chunk-normalize.js';import {existsSync}from'node:fs';import'node:child_process';import'node:url';import'node:timers/promises';import'node:path';import'node:crypto';import'node:fs/promises';import'node:os';import'node:readline';/** One execution owner per launch; deliberately independent of MCP transport. */
 /** How often a running check set looks for the job's cancel marker; the pump polls at the same order. */
 const CANCEL_POLL_MS = 200;
 /**

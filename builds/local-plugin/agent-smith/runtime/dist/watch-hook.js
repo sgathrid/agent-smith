@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import path from'node:path';import {fileURLToPath}from'node:url';import {existsSync,realpathSync}from'node:fs';import {d as readAcceptance}from'./chunk-execute.js';import {p as parseLaunches,c as claimMarkerPath}from'./chunk-stale.js';import {r as runJobWatch}from'./chunk-monitor.js';import'node:fs/promises';import'node:crypto';import'node:child_process';import'node:os';import'node:readline';/**
+import path from'node:path';import {fileURLToPath}from'node:url';import {existsSync,realpathSync}from'node:fs';import {d as readAcceptance}from'./chunk-normalize.js';import {u as unwrapResponse,p as parseLaunches,c as claimMarkerPath}from'./chunk-stale.js';import {r as runJobWatch}from'./chunk-monitor.js';import'node:crypto';import'node:child_process';import'node:fs/promises';import'node:os';import'node:readline';/**
  * PostToolUse (asyncRewake) hook entrypoint.
  *
  * Reads the hook JSON from stdin; for spawn_job / resume_job / run_pipeline it
@@ -22,6 +22,13 @@ const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 function parseHookInput(input) {
     if (!isObj(input))
         return null;
+    const rawTool = typeof input['tool_name'] === 'string' ? input['tool_name'] : '';
+    const toolName = rawTool.includes('__') ? rawTool.slice(rawTool.lastIndexOf('__') + 2) : rawTool;
+    if (toolName === 'steer_job') {
+        const payload = unwrapResponse(input['tool_response']);
+        if (!isObj(payload) || payload['action'] !== 'resumed')
+            return null;
+    }
     const launches = parseLaunches(input['tool_name'], input['tool_response']);
     const launch = launches[0];
     if (launch === undefined)
@@ -56,6 +63,7 @@ async function runHook(stdin, write, options = {}) {
             return 0;
         const perId = await Promise.all(target.ids.map(async (id) => {
             const lines = [];
+            const emittedIds = new Set();
             await runJobWatch({
                 timeoutMs: target.timeoutMs,
                 ...options,
@@ -67,12 +75,21 @@ async function runHook(stdin, write, options = {}) {
                 // "exited · checks running" if the acceptance budget runs out first. The mod sends both.
                 announceOnce: true,
                 // The notice as written, line breaks kept; the timeout line has no batch.
-                emit: (line, batch) => { lines.push(batch?.content ?? line); },
+                emit: (line, batch) => {
+                    lines.push(batch?.content ?? line);
+                    for (const key of batch?.keys ?? []) {
+                        const hash = key.indexOf('#');
+                        if (hash > 0)
+                            emittedIds.add(key.slice(0, hash));
+                    }
+                },
             });
-            return { id, lines };
+            return { id, emittedIds, lines };
         }));
-        // Drop lines for any job/run whose claim marker exists when the hook writes (e.g. a cancelled variant).
-        const lines = perId.flatMap(({ id, lines: idLines }) => (claimed(target.cwd, target.kind, id) ? [] : idLines));
+        // Drop lines for any job/run whose claim marker exists when the hook writes (e.g. a cancelled variant or post-steer head).
+        const lines = perId.flatMap(({ id, emittedIds, lines: idLines }) => (claimed(target.cwd, target.kind, id) || [...emittedIds].some((eid) => claimed(target.cwd, target.kind, eid))
+            ? []
+            : idLines));
         if (lines.length === 0)
             return 0;
         // Exit 2 is the wake protocol, and the host labels it "Stop hook feedback".

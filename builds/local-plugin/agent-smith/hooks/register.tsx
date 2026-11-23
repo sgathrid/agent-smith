@@ -3,8 +3,8 @@ import { atom, read, update } from 'claude-code';
 import type { EngineInterface, Register, UiRenderEvent } from 'claude-code';
 
 import type { RadarJob } from '../types/index.d.ts';
-import { isTerminal, jobLabel, oneLine, sanitizeText } from './format.ts';
-import { commandTerminalColumns, findWorker, measurePaneTerminalColumns, paneWidthRequest, recordLaunch, scopeLine, sessionBoard, sessionJobs, type Launched } from './dashboard.ts';
+import { jobLabel, oneLine, sanitizeText } from './format.ts';
+import { commandTerminalColumns, findWorker, groupWorkers, isLive, measurePaneTerminalColumns, paneWidthRequest, recordLaunch, scopeLine, sessionBoard, sessionJobs, workerHead, workerTurns, type Launched } from './dashboard.ts';
 import { renderList, renderWorker, type ViewActions, type ViewOptions } from './views.tsx';
 import type { ForgeDetail } from './canonical.ts';
 // ── BAND IMPORTS (band author) ────────────────────────────────────────────────
@@ -19,7 +19,7 @@ import {
 } from './band.ts';
 import type { FsLike } from './fs.ts';
 import { sortForBand } from './format.ts';
-import { readForgeJobs, readForgeDetail } from './canonical.ts';
+import { isSettledForCache, readForgeJobs, readForgeDetail } from './canonical.ts';
 import {
   LAUNCH_TOOL,
   STATUS_TOOL,
@@ -38,6 +38,7 @@ import {
   type RunRecord,
 } from './notice.ts';
 import {
+  hasPendingNativeClose,
   nativeJobsFromRadar,
   syncNativeTasks,
   type NativeTaskClient,
@@ -84,6 +85,8 @@ async function requestPane($: EngineInterface, force = false): Promise<void> {
 // elapsed times that disagree by up to a second.
 
 const selected = atom({ plugin: 'agent-smith', key: 'selected' } as const, null as string | null);
+/** Prior turn jobId explicitly pinned by user click; null auto-follows the worker's live head. */
+const pinnedTurnId = atom({ plugin: 'agent-smith', key: 'pinnedTurnId' } as const, null as string | null);
 const now = atom({ plugin: 'agent-smith', key: 'now' } as const, 0);
 
 /**
@@ -167,8 +170,11 @@ async function sessionRows($: EngineInterface): Promise<RadarJob[]> {
 /** Band clock: 1 s. TERMINAL-UI.md L147 — the seconds digit is all that moves. */
 const BAND_TICK_MS = 1000;
 
-/** Data poll: 3 s. TERMINAL-UI.md L148 — file reads are not free. */
-const POLL_MS = 3000;
+/** Active data poll: 1 s when workers are live, notices are pending, or /forge is open; idle (0 disk reads) when quiet. */
+const POLL_MS = 1000;
+
+/** In-memory cache of immutable settled jobs (keyed by `repo\0id`) for O(active) polling. */
+const settledJobCache = new Map<string, RadarJob>();
 
 /** `$.fs` narrowed to what the readers ask of it. */
 const fsOf = ($: EngineInterface): FsLike => ({
@@ -180,14 +186,17 @@ const fsOf = ($: EngineInterface): FsLike => ({
 /**
  * One sweep of the jobs directory into the `bandJobs` atom.
  *
+ * Immutable settled jobs are served from `settledJobCache` so steady-state polling
+ * is O(active) instead of re-reading every historical job directory on disk.
  * Read failures retain the last snapshot and expose an error to the user.
  */
 async function pollBand($: EngineInterface): Promise<void> {
   const cfg = await read($, bandConfig);
+  if (cfg.repo === '') return;
   const at = await $.clock.now();
   let next: RadarJob[];
   try {
-    next = await readForgeJobs(fsOf($), cfg.repo, at);
+    next = await readForgeJobs(fsOf($), cfg.repo, at, settledJobCache);
     if (await read($, readError) !== null) await update($, readError, () => null);
   } catch (error) {
     const message = `Can't read job state: ${String(error).slice(0, 200)}`;
@@ -195,16 +204,17 @@ async function pollBand($: EngineInterface): Promise<void> {
     return; // Retain the last observed rows; a read failure is not an empty project.
   }
 
-
   // Canonical records are atomic and authoritative; all three surfaces receive
   // exactly that projection.
   const previous = await read($, bandJobs);
 
-  // Only write when something actually changed. A 3 s poll that rewrites an
-  // identical list would invalidate the band on every tick for no reason, and
-  // `ui.invalidate` is rate-limited by the engine for good cause.
+  // Only write when something actually changed so idle or unchanged polls do not
+  // invalidate UI surfaces unnecessarily.
   const before = JSON.stringify(previous);
-  if (before !== JSON.stringify(next)) await update($, bandJobs, () => next);
+  if (before !== JSON.stringify(next)) {
+    detailCache = null;
+    await update($, bandJobs, () => next);
+  }
   await pollNativeTasks($, next);
 }
 
@@ -236,11 +246,20 @@ async function takeLaunch($: EngineInterface, launch: Launch, cwd: string): Prom
   // The ack's repo is where the MCP server keeps its jobs, so it is the repo
   // to watch. The session cwd was only a guess: it differs when the session
   // started, or restarted, somewhere other than where the server did.
-  if (repo !== '' && await adoptRepo($, repo)) await pollBand($).catch(() => {});
+  const switched = repo !== '' && await adoptRepo($, repo);
   const cfg = await read($, bandConfig);
   // Whether this session shows the job is a separate question from who
   // announces it: any launch in this repo is shown, even one the hook keeps.
-  if (cfg.repo !== '' && sameRepo(repo, cfg.repo)) await update($, launched, (l) => recordLaunch(l, launch));
+  const inWatchedRepo = cfg.repo !== '' && sameRepo(repo, cfg.repo);
+  if (inWatchedRepo) await update($, launched, (l) => recordLaunch(l, launch));
+  // Wake immediately on launch (or repo switch) so the band, native tasks, and
+  // /forge pick up the new turn without waiting for the next timer tick.
+  if (switched || inWatchedRepo) {
+    detailCache = null;
+    await pollBand($).catch(() => {});
+    const atNow = await $.clock.now();
+    await update($, now, () => atNow).catch(() => {});
+  }
   // A read error means no rows: the mod could not see this job finish, so the
   // hook keeps it.
   if (cfg.repo === '' || await read($, readError) !== null) return false;
@@ -264,6 +283,8 @@ async function adoptRepo($: EngineInterface, repo: string): Promise<boolean> {
     if (cfg.source !== 'launch') await update($, bandConfig, (c) => ({ ...c, source: 'launch' as const }));
     return false;
   }
+  settledJobCache.clear();
+  detailCache = null;
   await update($, bandConfig, (c) => ({ ...c, repo: trimSlashes(repo), source: 'launch' as const }));
   // The old guess's rows and read error say nothing about the new repo.
   await update($, bandJobs, () => []);
@@ -297,7 +318,13 @@ async function announce($: EngineInterface, repo: string, jobs: readonly RadarJo
     const result = due(owned, jobs, runs, at);
     const ownedChanged =
       result.owned.length !== owned.length ||
-      result.owned.some((o, i) => o.id !== owned[i]?.id || o.kind !== owned[i]?.kind || o.saidAttention !== owned[i]?.saidAttention || o.saidExited !== owned[i]?.saidExited);
+      result.owned.some((o, i) =>
+        o.id !== owned[i]?.id ||
+        o.kind !== owned[i]?.kind ||
+        o.workerId !== owned[i]?.workerId ||
+        o.saidAttention !== owned[i]?.saidAttention ||
+        o.saidDead !== owned[i]?.saidDead ||
+        o.saidExited !== owned[i]?.saidExited);
     const changed = result.notices.length > 0 || ownedChanged;
     if (!changed) return;
     for (const o of result.owned) {
@@ -360,6 +387,8 @@ async function checkForUpdate($: EngineInterface): Promise<void> {
  * NEVER THROWS. A band that fails to configure itself must not take the
  * session's start — or the pane — down with it.
  */
+let polling = false;
+
 export async function startBand($: EngineInterface, cwd?: string): Promise<void> {
   // Reset the module's own state, not the host's atoms. A reload fires
   // session.start again but host-persisted state (paneOpen, selected, ...)
@@ -370,6 +399,8 @@ export async function startBand($: EngineInterface, cwd?: string): Promise<void>
   lastPaneRequest = null;
   followingSite = null;
   detailCache = null;
+  polling = false;
+  settledJobCache.clear();
 
   // NO_COLOR first, because it decides every colour prop from here on.
   // `$.env.get` requires a string LITERAL name (VERIFIED: a computed name is
@@ -416,22 +447,42 @@ export async function startBand($: EngineInterface, cwd?: string): Promise<void>
     void (async () => {
       const at = await $.clock.now();
       const previousTime = await read($, now);
-      const visible = (await sessionRows($)).some(j => isShown(j, previousTime));
+      const visible = groupWorkers(await sessionRows($)).some(j => isShown(j, previousTime));
       // Draw once across the expiry boundary before becoming idle.
       if (visible || await read($, paneOpen)) await update($, now, () => at);
     })().catch(() => {});
   });
 
-  // The data poll, on its own slower cadence. Notices go out from here only:
-  // a timer runs outside any event, which is where `$.prompt.submit` belongs.
-  // The other pollBand caller runs inside a hook (/forge),
-  // where a submit could be refused after the notice was already recorded.
+  // Active data poll at 1 s cadence when workers are live, notices are pending,
+  // or /forge is open. Completely idle (0 disk reads/sec) when quiet; wakes
+  // immediately on tool.call launch or /forge open.
+  // Notices go out from here only: a timer runs outside any event, which is
+  // where `$.prompt.submit` belongs.
   $.clock.every(POLL_MS, () => {
     void (async () => {
-      await pollBand($);
-      const cfg = await read($, bandConfig);
-      if (await read($, readError) !== null) return;
-      await announce($, cfg.repo, await read($, bandJobs), await $.clock.now());
+      if (polling) return;
+      polling = true;
+      try {
+        const cfg = await read($, bandConfig);
+        if (cfg.repo === '') return;
+        const isPaneOpen = await read($, paneOpen);
+        const owned = await read($, notices);
+        const currentJobs = await read($, bandJobs);
+        if (currentJobs.some(isLive) || owned.length > 0 || isPaneOpen || (await read($, readError)) !== null) {
+          await pollBand($);
+          if (await read($, readError) !== null) return;
+          await announce($, cfg.repo, await read($, bandJobs), await $.clock.now());
+        } else {
+          // Completely idle on disk (0 disk reads/sec). Still close any lingering
+          // dismissible completed native task after CLOSE_DELAY_MS using the in-memory rows.
+          const links = await read($, nativeTaskLinks);
+          if (hasPendingNativeClose(currentJobs, links)) {
+            await pollNativeTasks($, currentJobs);
+          }
+        }
+      } finally {
+        polling = false;
+      }
     })().catch(() => {});
   });
 }
@@ -550,7 +601,7 @@ function registerBand(on: Parameters<Register>[0]): void {
       const { Box, Text } = $.ui.resolve(e);
       return <Box flexDirection="column"><Text wrap="truncate-end">{oneLine(error)}</Text>{rest}</Box>;
     }
-    const shown = sortForBand(all).filter((j) => isShown(j, at));
+    const shown = sortForBand(groupWorkers(all)).filter((j) => isShown(j, at));
     // No jobs → render NOTHING (TERMINAL-UI.md L168-171). Not "no jobs", not an
     // empty box: the host's own output, exactly as it was. A band that "appears
     // to say nothing" is noise.
@@ -571,11 +622,10 @@ function registerBand(on: Parameters<Register>[0]): void {
       <Box flexDirection="column">
         {budget.rows.map((job, i) => {
           const line = buildLine(job, at, { colour: cfg.colour, width, longestLabel });
-          const detail = job.acceptance?.pending && isTerminal(job.status) ? 'checking' : line.detail;
           // A bare digit in an empty prompt presses a band Button without focusing
           // the band, so one key opens the sidebar on this worker.
           return (
-            <Button key={`band-${job.id}`} plain hotkey={String(i + 1)} label={line.plain.trim()} onPress={() => openForge($, job.id)}>
+            <Button key={`band-${job.workerId}`} plain hotkey={String(i + 1)} label={line.plain.trim()} onPress={() => openForge($, job.workerId)}>
             <Text dimColor={line.recessive} wrap="truncate-end">
               {/* Segment 1: the GLYPH ALONE, in the accent and bold while live.
                   `accent` is undefined under NO_COLOR and for canceled/unknown,
@@ -597,7 +647,7 @@ function registerBand(on: Parameters<Register>[0]): void {
                   the rule per element. */}
               <Text wrap="truncate-end">{` ${line.label}`}</Text>
               <Text dimColor={!line.recessive} wrap="truncate-end">
-                {` ${detail} ${line.clock}`.replace(/\s+$/, '')}
+                {` ${line.detail} ${line.clock}`.replace(/\s+$/, '')}
               </Text>
             </Text>
             </Button>
@@ -695,7 +745,7 @@ export const register: Register = (on) => {
       await openForge($, null);
       return { text: sessionBoard(scope === 'all' ? jobs : mine, scope, await $.clock.now()) };
     }
-    await openForge($, job?.id ?? null);
+    await openForge($, job?.workerId ?? null);
     return { text: scopeLine(scope === 'all' ? jobs : mine, scope) };
   });
 
@@ -729,9 +779,10 @@ export const register: Register = (on) => {
   });
 };
 
-/** Show one worker (or the list, for null) in the sidebar, following its end. */
-async function show($: EngineInterface, id: string | null): Promise<void> {
-  await update($, selected, () => id);
+/** Show one worker (by workerId, or the list for null) in the sidebar, auto-following its live head. */
+async function show($: EngineInterface, workerId: string | null): Promise<void> {
+  await update($, selected, () => workerId);
+  await update($, pinnedTurnId, () => null);
   await update($, follow, () => true);
   await update($, taskOpen, () => false);
   await update($, expandedTools, () => []);
@@ -739,11 +790,25 @@ async function show($: EngineInterface, id: string | null): Promise<void> {
   await $.ui.scroll({ to: 'start', in: PANE }).catch(() => {});
 }
 
-/** Open the sidebar focused, on one worker or on the list. */
-async function openForge($: EngineInterface, id: string | null): Promise<void> {
-  await show($, id);
-  if (id === null) await update($, listPage, () => 0);
+/** Pin a specific prior turn jobId, or pass null to return to auto-following the worker's live head. */
+async function pinTurn($: EngineInterface, turnJobId: string | null): Promise<void> {
+  await update($, pinnedTurnId, () => turnJobId);
+  await update($, follow, () => turnJobId === null);
+  await update($, taskOpen, () => false);
+  await update($, expandedTools, () => []);
+  followingSite = null;
+  await $.ui.scroll({ to: 'start', in: PANE }).catch(() => {});
+}
+
+/** Open the sidebar focused, on one worker (by workerId) or on the list. */
+async function openForge($: EngineInterface, workerId: string | null): Promise<void> {
+  detailCache = null;
+  await show($, workerId);
+  if (workerId === null) await update($, listPage, () => 0);
   await update($, paneOpen, () => true);
+  const at = await $.clock.now();
+  await update($, now, () => at);
+  await pollBand($).catch(() => {});
   await requestPane($, true);
 }
 
@@ -752,13 +817,17 @@ async function scrollEnd($: EngineInterface): Promise<void> {
   if (result.deny) throw new Error(result.deny);
 }
 
-// Clock and control redraws reuse the bounded detail until the next data cadence.
-let detailCache: { key: string; at: number; detail: ForgeDetail | null } | null = null;
+// Clock and control redraws reuse the bounded detail until the next data cadence;
+// immutable settled turn details stay cached until repo change / reload.
+let detailCache: { key: string; at: number; detail: ForgeDetail | null; settled: boolean } | null = null;
 async function loadDetail($: EngineInterface, repo: string, id: string, t: number): Promise<ForgeDetail | null> {
-  const key = `${repo}:${id}`;
-  if (detailCache?.key === key && t >= detailCache.at && t - detailCache.at < POLL_MS) return detailCache.detail;
-  const detail = await readForgeDetail(fsOf($),repo,id,t);
-  detailCache = { key, at:t, detail };
+  const key = `${repo}\0${id}`;
+  if (detailCache?.key === key && (detailCache.settled || (t >= detailCache.at && t - detailCache.at < POLL_MS))) {
+    return detailCache.detail;
+  }
+  const detail = await readForgeDetail(fsOf($), repo, id, t);
+  const settled = detail !== null && isSettledForCache(detail.job);
+  detailCache = { key, at: t, detail, settled };
   return detail;
 }
 
@@ -771,14 +840,17 @@ async function renderForge($: EngineInterface, e: UiRenderEvent): Promise<JSX.El
   const mine = await sessionRows($);
   const scope = await read($, listScope);
   const pick = await read($, selected);
+  const pinned = await read($, pinnedTurnId);
   const error = await read($, readError);
   const o: ViewOptions = {
     width: e.props.bodyColumns, now: t, colour: cfg.colour, page: await read($, listPage), scope,
     following: await read($, follow), taskOpen: await read($, taskOpen), tools: await read($, expandedTools),
+    pinnedTurnId: pinned,
   };
   const a: ViewActions = {
     scope: async (next: 'session' | 'all') => { await update($, listScope, () => next); await update($, listPage, () => 0); },
-    pick: (job) => show($, job.id),
+    pick: (job) => show($, job.workerId),
+    pickTurn: (jobId) => pinTurn($, jobId),
     page: async (page) => { await update($, listPage, () => page); },
     back: () => show($, null),
     task: async () => { await update($, taskOpen, (open) => !open); },
@@ -788,16 +860,21 @@ async function renderForge($: EngineInterface, e: UiRenderEvent): Promise<JSX.El
   let content = renderList(W, scope === 'all' ? jobs : mine, o, a);
   if (pick !== null) {
     try {
-      const detail = await loadDetail($, cfg.repo, pick, t);
+      const turns = workerTurns(jobs, pick);
+      const head = workerHead(jobs, pick);
+      const targetId = pinned !== null && turns.some((job) => job.id === pinned)
+        ? pinned
+        : (head?.id ?? pick);
+      const detail = await loadDetail($, cfg.repo, targetId, t);
       if (detail) {
-        content = renderWorker(W, detail, o, a, jobs.filter((job) => job.id !== pick && job.workerId != null && job.workerId === detail.job.workerId));
-        if (o.following && followingSite !== pick) {
+        content = renderWorker(W, detail, o, a, turns);
+        if (o.following && followingSite !== targetId) {
           // Host end anchors keep following a growing tree until a person scrolls.
-          try { await scrollEnd($); followingSite = pick; }
+          try { await scrollEnd($); followingSite = targetId; }
           catch (failure) {
             // The testkit has no painted scroll surface. A live refusal is retried
             // after the new tree is installed, rather than treated as success.
-            if (String(failure).includes('no implementation for ui.scroll')) followingSite = pick;
+            if (String(failure).includes('no implementation for ui.scroll')) followingSite = targetId;
           }
         }
       }

@@ -117,18 +117,22 @@ else's repo, and the band would confidently draw their jobs. It is empty now, an
 
 ## Canonical tracking
 
-`hooks/canonical.ts` supplies the same job projection to the band, pane and
+`hooks/canonical.ts` supplies the same worker/turn projection to the band, pane and
 native task bridge. Lists read `job.json`, optional `progress.json` and
-`acceptance.json`, plus an orphan marker; they never scan event logs or reports.
+`acceptance.json`, plus an orphan marker, caching immutable settled jobs in memory
+(O(active) reads on each 1 s active poll, and completely idle with 0 disk reads/sec when
+no workers are active and `/forge` is closed). They never scan event logs or reports.
 An unreadable snapshot shows an error while retaining the last observed rows.
 
-Detail reads the selected job's report and bounded `view.json`: up to 60 tool
+Detail reads the selected turn's report and bounded `view.json`: up to 60 tool
 previews, 200 assistant messages / 64,000 characters, 64,000 prompt characters
-and 4,000 preamble characters. Truncation is explicit. Older jobs without a view
-show a warning, summary and report; the UI does not backfill by scanning logs.
+and 4,000 preamble characters. Truncation is explicit.
 
 The band is only the glance: live workers plus finished ones for the linger
-window, at most four rows. Each row is a plain Button with hotkey `1`–`4`. The
+window, grouped and keyed by `workerId` before sorting (always one row per worker across
+steers and resumes, showing `turn N` when `turn > 1`, `steer queued` when `pendingSteers > 0`,
+and continuous `chainStartedAt` elapsed time across uninterrupted steers), at most four rows.
+Each row is a plain Button with hotkey `1`–`4`. The
 host answers a bare digit in an empty prompt by pressing a band Button without
 focusing the band, so one key opens the sidebar on that worker. `/forge` opens
 the sidebar on this session's list, `/forge all` on the repository's, and
@@ -167,13 +171,12 @@ Escape cannot also mean "back": the host never delivers it to a mod, it returns
 the focus. The engine test harness presses rendered component keys; it does not
 inject physical hotkeys, so verify the digits in a real session.
 
-New writer snapshots add an ordered `timeline` alongside the older fields, with
+Writer snapshots record an ordered `timeline` (`ForgeDetail` is `{ job, timeline, truncated? }`), with
 up to 100 activity rows, 60 tools and 64,000 assistant characters. Tool completion
-updates its original row. Missing timelines show an explicit old-snapshot fallback.
-Recorded worker IDs group invocations into one list row; the worker view links to
-earlier runs. Detail reads are cached for the three-second data cadence.
+updates its original row. Recorded `workerId` values group turns into one list row; the worker view tracks `workerId` (auto-following the live head on steer or resume unless a prior turn is explicitly clicked) and renders prior turns inline above the live turn as compact clickable summary rows from in-memory `bandJobs` with `steered` / `after steer` / `resumed` labels. Detail reads are cached for the one-second active cadence.
 
-Native tasks use real host TaskCreate/TaskUpdate IDs. They are a task projection,
+Native tasks use real host TaskCreate/TaskUpdate IDs keyed by `workerId` (one task per
+worker across spawn, steer, and resume; reopening `in_progress` on resume). They are a task projection,
 not Claude Agent/subagent sessions, and are created only for this session's
 live launches. Pending acceptance keeps them in progress.
 Successful settled tasks close after ten seconds; failed, canceled or rejected

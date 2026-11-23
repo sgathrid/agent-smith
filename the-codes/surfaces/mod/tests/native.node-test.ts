@@ -201,3 +201,38 @@ test('syncNativeTasks keeps 1 worker-keyed native task across steer and reopens 
   assert.equal(recreated['shell']?.taskId, 'native-2', 're-creates task after earlier task was deleted');
   assert.equal(recreated['shell']?.status, 'in_progress');
 });
+
+test('hasPendingNativeClose selects the worker head regardless of fs.list hex order', async () => {
+  const { hasPendingNativeClose } = await import('../hooks/native.ts');
+  const baseRadar = { task: '', warnings: [], report: null, reasoning: null, raw: {} };
+  const turn2Succeeded = {
+    ...baseRadar,
+    id: 'implement-smith-0000', workerId: 'w1', turn: 2, name: 'Ada', provider: 'codex', role: 'implement',
+    status: 'succeeded' as const, activity: 'done', toolCount: 1, startedAt: 2000, endedAt: 3000,
+    continuedFrom: 'implement-smith-ffff', continuationKind: 'steer-interrupt' as const,
+  };
+  const turn1CanceledSuperseded = {
+    ...baseRadar,
+    id: 'implement-smith-ffff', workerId: 'w1', turn: 1, name: 'Ada', provider: 'codex', role: 'implement',
+    status: 'canceled' as const, activity: 'canceled', toolCount: 1, startedAt: 1000, endedAt: 2000,
+    supersededBy: 'implement-smith-0000',
+  };
+  assert.equal(
+    hasPendingNativeClose([turn2Succeeded, turn1CanceledSuperseded], { w1: { taskId: 't1', status: 'completed', fingerprint: 'fp', doneAt: 3000 } }),
+    true,
+  );
+  assert.equal(
+    hasPendingNativeClose([turn2Succeeded, turn1CanceledSuperseded], { w1: { taskId: 't1', status: 'deleted', fingerprint: '', doneAt: 3000 } }),
+    false,
+  );
+  const turn2Rejected = { ...turn2Succeeded, acceptance: { state: 'rejected' as const, checks: [] } };
+  assert.equal(
+    hasPendingNativeClose([turn2Rejected, turn1CanceledSuperseded], { w1: { taskId: 't1', status: 'completed', fingerprint: 'fp', doneAt: 3000 } }),
+    false,
+  );
+  const turn2Failed = { ...turn2Succeeded, status: 'failed' as const };
+  assert.equal(
+    hasPendingNativeClose([turn2Failed, turn1CanceledSuperseded], { w1: { taskId: 't1', status: 'completed', fingerprint: 'fp', doneAt: 3000 } }),
+    false,
+  );
+});

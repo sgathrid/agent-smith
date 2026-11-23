@@ -65,15 +65,20 @@ Only a bad request (unknown provider, bad mode, empty prompt, duplicate active
 name/workerId) rejects.
 
 Identity: `workerId` is the logical worker across follow-ups, `name` the label, `role` the
-mode. `resume_job` starts a new job id with the same `workerId`/`name` and the provider's
+mode, and `turn` the 1-based turn index (`1` on `spawn_job`, `parent.turn + 1` on steers and
+resumes). `resume_job` starts a new job id with the same `workerId`/`name`, `continuedFrom:
+parentJobId`, `continuationKind: 'resume'`, a fresh `chainStartedAt`, and the provider's
 native `conversation` handle; it refuses running workers, missing handles, and ambiguous
 names. `steer_job` steers a running worker via append-only `steer.jsonl` (`delivery:
-'queue'` chains after the active turn finishes; `delivery: 'interrupt'` writes `cancel.steer`
-to stop the active turn once a `conversation` handle is recorded and immediately chains the
-continuation turn). The pump opens the child job anchor before marking the parent
-`supersededBy: nextJobId` (`steeredFrom: parentJobId` on the child) and publishes
-`steer.head` between the two, so `resolveHead` readers (cancel/status) cross the finish
-window while watchers and notice claims transfer across turn chains without firing
+'queue'` chains after the active turn finishes, or seamlessly falls through to resuming when
+the prior turn already ended `succeeded` with a `conversation` handle and no pending checks;
+`delivery: 'interrupt'` writes `cancel.steer` to stop the active turn once a `conversation`
+handle is recorded — failing closed if none exists unless `allowFresh: true` — and
+immediately chains the continuation turn). On a steer, the pump opens the child job anchor
+with `continuedFrom: parentJobId`, `continuationKind: 'steer-queue' | 'steer-interrupt'`,
+and inherited `chainStartedAt` before marking the parent `supersededBy: nextJobId`, and
+publishes `steer.head` between the two, so `resolveHead` readers (cancel/status) cross the
+finish window while watchers and notice claims transfer across turn chains without firing
 intermediate notices. A queued steer the turn cannot deliver is recorded as a warning on
 the terminal job.
 
@@ -169,9 +174,8 @@ running has none. Otherwise, in order:
 The result carries `silentForMs` (since the last event), `since`, `forMs` and, for an open
 call, `tool` (the first command of a shell call, else the tool name). `attention` (channel
 `WatchStatus`, mod `RadarStatus`) means `silent` or `dead`; `status` and `list_jobs` expose
-`liveness {state, silentForMs, tool?}` and keep `stalled` as a derived alias (silent or dead)
-for one release. kimi reports a tool call only when it ends, so a kimi job in a long command
-reads `silent`, not `in-tool`.
+`liveness {state, silentForMs, tool?}` as the sole liveness truth. kimi reports a tool call
+only when it ends, so a kimi job in a long command reads `silent`, not `in-tool`.
 
 `nextActionFor` derives (never stores) an imperative for the orchestrator on
 `failed`/`canceled` jobs: canceled -> nothing to do; orphaned -> `resume_job` if it has a
@@ -392,9 +396,9 @@ Claude                MCP server (dist/server.js)      Claude Code hooks        
   |                          detach pump ----------------------------> provider CLI (events -> job dir)
   | <---- slim ack {jobId, name, provider, model, status, timeoutMs, repo, unrestricted, ...} (ms)
   |
-  |   PostToolUse(matcher: mcp__plugin_agent-smith_agent-smith__{spawn_job|resume_job|run_pipeline})
+  |   PostToolUse(matcher: mcp__plugin_agent-smith_agent-smith__{spawn_job|resume_job|steer_job|run_pipeline})
   |         hook stdin JSON {tool_name, tool_response, cwd} --------> parseHookInput -> {job|run, id, repo}
-  |   (asyncRewake: Claude keeps working)                             runJobWatch: read job every 2 s,
+  |   (asyncRewake: Claude keeps working)                             runJobWatch: waitForChange on job dir,
   |                                                                   no baseline, buildBatch/dedupe
   |                                                                   (job done before start is reported)
   | <==== exit 2 + stderr "Agent Smith · ✓ Ada (codex review) succeeded…" == terminal state seen
@@ -402,7 +406,7 @@ Claude                MCP server (dist/server.js)      Claude Code hooks        
 ```
 
 - **Mod announcer** (`mod/hooks/register.tsx` `takeLaunch`/`announce`, rules in
-  `notice.ts`): when the mod is loaded it wraps the three launch tools in
+  `notice.ts`): when the mod is loaded it wraps the four launch tools in
   `tool.call`, reads the ack from the result, claims the job or run in session
   state (`notices` atom) and writes `.agent-smith/claims/<kind>-<id>`. The hook
   watcher still starts, but at completion it finds the claim and stays silent: one
@@ -411,7 +415,8 @@ Claude                MCP server (dist/server.js)      Claude Code hooks        
   modules, so `tool.call` is the only path. A `status`/`pipeline_status` read of a
   settled job on the main loop (`tool.call` with no `agentId`) retires its notice, as does a `cancel` that returns `settled: true`.
   It declines (calls `next`) in legacy mode, after a read error, or when the ack's
-  repo is not the one it polls. Each 3 s poll announces claimed jobs that ended, or
+  repo is not the one it polls. Each 1 s active poll (idle with 0 disk reads when no workers
+  are active and `/forge` is closed) announces claimed jobs that ended, or
   went quiet (once: `no output for 16m`, with `(in \`npm test\`)` when a call is open), or
   whose process is gone (once more: `process gone 3m`); the text states the fact and never
   asks for an interrupt. It holds a pending acceptance verdict for the checks' budget, with one

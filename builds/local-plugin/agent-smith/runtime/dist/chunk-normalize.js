@@ -1,4 +1,4 @@
-import {readFileSync,existsSync,constants,mkdirSync,writeFileSync,createWriteStream,renameSync,unlinkSync,openSync,fsyncSync,closeSync,statSync,copyFileSync}from'node:fs';import {open,readdir,access,constants as constants$1}from'node:fs/promises';import {randomBytes,randomUUID,createHash}from'node:crypto';import path from'node:path';import {spawn,execFile}from'node:child_process';import os from'node:os';import readline from'node:readline';/**
+import {randomBytes,randomUUID,createHash}from'node:crypto';import {readFileSync,existsSync,mkdirSync,writeFileSync,createWriteStream,renameSync,unlinkSync,openSync,fsyncSync,closeSync,statSync,copyFileSync,constants as constants$1}from'node:fs';import path from'node:path';import {spawn,execFile}from'node:child_process';import {access,constants,open,readdir}from'node:fs/promises';import os from'node:os';import readline from'node:readline';/**
  * reasons.ts — every failure, in two to four words.
  *
  * One vocabulary for every surface: the completion notice, the band, the pane,
@@ -229,6 +229,9 @@ const FILES = {
     /** The spawn_job request (prompt, context, mode, ...), so a later spawn can reuse it with `from`. */
     request: 'request.json',
 };
+function isContinuationKind(v) {
+    return v === 'steer-queue' || v === 'steer-interrupt' || v === 'resume';
+}
 /**
  * The id segment that marks a job as OURS.
  *
@@ -600,592 +603,6 @@ function baseNextAction(i) {
         return 'No output: ask for a final answer via resume_job, or rerun.';
     }
     return 'Read status.error and warnings before retrying.';
-}/** Text sanitising and fixed-width fitting. Dependency-free: everything that puts
- * worker or user prose into a cell goes through here first.
- */
-/**
- * Strip complete ANSI escape sequences (CSI, OSC, DCS/PM/APC/SOS, 2-byte ESC,
- * C1 controls) and remaining forbidden control characters, unpaired surrogates,
- * and noncharacters (`U+FDD0..U+FDEF`), while preserving `\n` and valid UTF-16
- * surrogate pairs.
- *
- * Why this exists: Claude Code's JSX element validator rejects any `<Text>`,
- * `<Button label>`, or `<Markdown text>` containing C0/C1 controls (except `\t`
- * and `\n`), lone surrogates, or `U+FDD0..U+FDEF`. Worker tool output, shell
- * commands, check output, and prompt text routinely contain ANSI colour codes or
- * `\r` progress lines; stripping them at the UI boundary keeps the stored job
- * files intact while preventing a single control byte from aborting the pane.
- */
-const ANSI_ESCAPE = /(?:\x1b\][\s\S]*?(?:\x07|\x1b\\|\x9c)|\x9d[\s\S]*?(?:\x07|\x1b\\|\x9c)|\x1b[PX^_][\s\S]*?(?:\x1b\\|\x9c)|(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]|\x1b[ -/]*[@-~])/gu;
-const FORBIDDEN_CONTROLS = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ud800-\udfff\ufdd0-\ufdef]/gu;
-function sanitizeText(s) {
-    return s
-        .replace(ANSI_ESCAPE, '')
-        .replace(/\r\n?/g, '\n')
-        .replace(/\t/g, '  ')
-        .replace(FORBIDDEN_CONTROLS, '');
-}
-/**
- * Cut to at most `max` UTF-16 units without splitting a surrogate pair.
- *
- * `slice` can leave a high surrogate with no low half. `sanitizeText` removes
- * such halves, so a cut made AFTER sanitizing must not create one: the host
- * draws an unpaired half as U+FFFD, or refuses the tree a Text's string is
- * checked in. `max` stays in UTF-16 units because every caller sizes cells in
- * terminal columns, where a pair already counts as two.
- */
-function clip(s, max) {
-    if (s.length <= max)
-        return s;
-    const cut = s.slice(0, Math.max(0, max));
-    return /[\ud800-\udbff]$/.test(cut) ? cut.slice(0, -1) : cut;
-}
-/** Collapse all whitespace runs to single spaces and cap the length. A hard
- * bound on what one string can cost, for prose with no cell to sit in (a report
- * excerpt, a warning message); the renderer's `wrap="truncate-end"` is the
- * mechanism, this is belt and braces. */
-function oneLine(s, max = 400) {
-    const t = sanitizeText(s).replace(/\s+/g, ' ').trim();
-    return clip(t, Math.max(0, max));
-}/**
- * safe-fs.ts — race-tolerant filesystem primitives shared by every reader.
- *
- * WHY THIS EXISTS
- * ---------------
- * Every reader in this directory observes state that another process is
- * *actively mutating*: a worker rewrites its job files on every event. Claude Code appends to a
- * subagent `.jsonl` while we read it. So between our `readdir` and our `read`,
- * a path can vanish, be truncated mid-write, or be replaced by a directory.
- *
- * Throwing here is never correct: a missing file is *information*, not an
- * error. Every function in this module returns
- * `null` / `[]` / `false` instead of throwing. This is the single most
- * important flake-prevention rule in the harness.
- */
-/** Substrings of fs error codes that mean "the world moved on, carry on". */
-const TRANSIENT_CODES = new Set([
-    "ENOENT", // deleted between readdir and read (hazard A: clean-success cleanup)
-    "EACCES", // macOS TCC / permissions
-    "EPERM",
-    "EISDIR", // a path we expected to be a file is a dir
-    "ENOTDIR", // ...or vice versa
-    "EBUSY",
-    "ELOOP",
-    "EMFILE",
-    "ENFILE",
-]);
-/**
- * Default byte cap for text reads.
- *
- * WHY: `events.jsonl` reached 492KB and a Claude subagent transcript 526KB in
- * the sample corpus. We only ever want the *head* of a stream for display; a
- * viewer that OOMs on a long job is worse than one that truncates. Callers
- * that genuinely need everything pass a bigger number.
- */
-const DEFAULT_MAX_BYTES = 2 * 1024 * 1024;
-function isTransient(err) {
-    if (typeof err !== "object" || err === null)
-        return true; // be paranoid
-    const code = err.code;
-    // A non-Error throw is by definition something we did not anticipate.
-    if (typeof code !== "string")
-        return true;
-    return TRANSIENT_CODES.has(code);
-}
-/** `fs.access(F_OK)` that returns a boolean instead of throwing. */
-async function existsSafe(path) {
-    try {
-        await access(path, constants.F_OK);
-        return true;
-    }
-    catch {
-        return false;
-    }
-}
-/**
- * Read a file as UTF-8 text, capped at `maxBytes`.
- *
- * Returns `null` if the file is gone, unreadable, or a directory. Never throws.
- * A short read is *normal* here — it means we caught a half-written file, which
- * is exactly what we want the JSON parser downstream to survive.
- */
-async function readTextSafe$1(path, maxBytes = DEFAULT_MAX_BYTES) {
-    let handle;
-    try {
-        handle = await open(path, "r");
-        // +4 bytes so a multi-byte UTF-8 sequence straddling the cap does not
-        // become a replacement character at the boundary.
-        const buf = Buffer.allocUnsafe(maxBytes + 4);
-        const { bytesRead } = await handle.read(buf, 0, buf.length, 0);
-        if (bytesRead === 0)
-            return ""; // genuinely empty file is not "missing"
-        return buf.subarray(0, bytesRead).toString("utf8");
-    }
-    catch (err) {
-        if (!isTransient(err))
-            throw err;
-        return null;
-    }
-    finally {
-        await handle?.close().catch(() => { });
-    }
-}
-/**
- * Read and JSON.parse, tolerating every way that can go wrong.
- *
- * Returns `null` for: missing file, unreadable file, empty file, invalid JSON.
- * Invalid JSON is EXPECTED, not exceptional — a writer using a plain
- * `writeFile` can be caught mid-write, so a reader that arrives mid-write sees a truncated document.
- * Treating that as `null` and retrying on the next poll is the whole strategy.
- */
-async function readJsonSafe(path, maxBytes) {
-    const text = await readTextSafe$1(path, maxBytes);
-    if (text === null)
-        return null;
-    const trimmed = text.trim();
-    if (trimmed === "")
-        return null; // empty or all-whitespace ⇒ mid-write
-    try {
-        return JSON.parse(trimmed);
-    }
-    catch {
-        return null; // half-written JSON. Next poll will get it.
-    }
-}
-/**
- * `fs.readdir` that returns `[]` instead of throwing.
- *
- * NOTE: we do NOT `stat` each entry here. That would double the syscalls and
- * reintroduce the very race we are defending against. Callers should treat
- * every returned name as a *hypothesis* to be confirmed by a tolerant read.
- */
-async function readdirSafe(path) {
-    try {
-        return await readdir(path);
-    }
-    catch (err) {
-        if (!isTransient(err))
-            throw err;
-        return [];
-    }
-}/**
- * agent-smith.ts — reads OUR OWN job state from `<repo>/.agent-smith/jobs/`.
- *
- * The source of truth for every job this repo spawned. It is not much code
- * because forge/format.ts made it not much code: owning the state format means
- * three questions, three answers:
- *
- *   - Does this job exist?        → the directory exists and holds a job.json.
- *   - What is its terminal state? → job.json.status. Written atomically, always.
- *   - Is it alive?                → job.json.updatedAt, refreshed on every event.
- *
- * The one hazard to respect is the cancel marker: `cancel` can exist before
- * job.json reaches a terminal state, so it outranks it.
- */
-/**
- * payload keys the normalizer relies on. Cross-referenced by name from
- * harness/normalize.ts's `smithNormalizer`.
- */
-const SMITH_PAYLOAD = {
-    provider: 'provider',
-    mode: 'mode',
-    model: 'model',
-    effort: 'effort',
-    status: 'status',
-    task: 'task',
-    unrestricted: 'unrestricted',
-    conversation: 'conversation',
-    createdAt: 'created_at',
-    updatedAt: 'updated_at',
-    startedAt: 'started_at',
-    finishedAt: 'finished_at',
-    exitCode: 'exit_code',
-    jobStatus: 'job_status',
-    error: 'error',
-    deniedActions: 'denied_actions',
-    usage: 'usage',
-    toolCalls: 'tool_calls',
-    output: 'output',
-    canceled: 'canceled',
-    cancelAt: 'cancel_at',
-    lastEventAt: 'last_event_at',
-    lastAliveAt: 'last_alive_at',
-    recentActivities: 'recent_activities',
-    lastActivity: 'last_activity',
-    latestText: 'latest_text',
-    progressWarnings: 'progress_warnings',
-    pipeline: 'pipeline',
-    stage: 'stage',
-    attempt: 'attempt',
-    schema: 'schema',
-};
-const CANCELED_ORPHAN = { status: 'canceled', suspicious: false, reason: CANCEL_ORPHAN_REASON };
-/**
- * Reads `.agent-smith/jobs`.
- *
- * Every method is fault-tolerant: a reader reads files a live process is
- * rewriting, and one
- * unreadable job is that job's absence rather than a dead band. `discover`
- * NEVER throws; an absent jobs directory is the ordinary case for a repo that
- * has never spawned anything, not an error.
- */
-class AgentSmithReader {
-    provider = 'agent-smith';
-    /**
-     * Enumerate job ids from the jobs directory.
-     *
-     * Keyed on the DIRECTORY: there is no suffix to parse, no "which file proves this job
-     * exists", and no entry that can half-qualify. A job's identity is its
-     * directory, so identity cannot be lost.
-     */
-    async discover(cwd) {
-        const entries = await readdirSafe(jobsDir(cwd));
-        const ids = new Set();
-        for (const entry of entries) {
-            // `readdirSafe` returns names only; a name that is not a directory will
-            // simply fail the job.json read below and contribute nothing. We do not
-            // stat here because a stat per entry is a syscall per entry on a path the
-            // band hits every three seconds.
-            if (!entry.startsWith('.'))
-                ids.add(entry);
-        }
-        return [...ids].sort();
-    }
-    /**
-     * Assemble one snapshot.
-     *
-     * Returns null when the job does not exist to this reader — i.e. no directory
-     * and no job.json. A FINISHED job returns a full snapshot: job.json is never
-     * deleted, which is the whole reason the format has a single anchor.
-     */
-    async read(cwd, jobId) {
-        // The cancel marker outranks job.json: it can exist before the worker has
-        // been reaped.
-        const cancelPath = jobFile(cwd, jobId, FILES.cancel);
-        const cancelRequested = await existsSafe(cancelPath);
-        let cancelAt = null;
-        if (cancelRequested) {
-            const raw = await readTextSafe$1(cancelPath);
-            const t = raw?.trim();
-            cancelAt = t !== undefined && t !== '' ? t : null;
-        }
-        const manifest = await readJsonSafe(jobFile(cwd, jobId, FILES.job));
-        // A marker is a request. The owner may still be working or may finish
-        // successfully before it can stop; only terminal canceled state is proof.
-        const canceled = manifest === null ? cancelRequested : manifest.status === 'canceled';
-        // A manifest from a NEWER writer is refused rather than half-understood.
-        // Reading a v2 file with v1 rules produces exactly the confident wrong
-        // answers this project exists to prevent, and `unknown` is the honest state.
-        if (manifest !== null && typeof manifest.schema === 'number' && manifest.schema > SCHEMA_VERSION) {
-            return {
-                provider: this.provider,
-                jobId,
-                cwd,
-                partial: true,
-                payload: {
-                    [SMITH_PAYLOAD.schema]: manifest.schema,
-                    [SMITH_PAYLOAD.error]: `on-disk schema v${manifest.schema} is newer than this reader (v${SCHEMA_VERSION}); state unknown`,
-                    [SMITH_PAYLOAD.canceled]: canceled,
-                    [SMITH_PAYLOAD.cancelAt]: cancelAt,
-                },
-            };
-        }
-        const report = await readTextSafe$1(jobFile(cwd, jobId, FILES.report));
-        const progress = await readJsonSafe(jobFile(cwd, jobId, FILES.progress));
-        // "Does this job exist?" is asked LAST, and includes the marker: a job
-        // whose only surviving artefact is its cancel request is still a job.
-        //
-        // Note what is NOT consulted: the bare existence of the directory. A
-        // half-created directory (crash between mkdir and the first write) and a
-        // stray directory a human dropped in here are both indistinguishable from a
-        // job by `stat`, and a band that draws "unknown" for a stray folder is
-        // indistinguishable from one that lies. We require evidence of a job.
-        const anyEvidence = manifest !== null || canceled || report !== null;
-        if (!anyEvidence)
-            return null;
-        // Orphan derivation (forge/format.ts deriveOrphan): a `running` anchor with
-        // no terminal result whose supervisor is gone. Derived, never written into
-        // job.json. Only the service reconciler persists the verdict; this reader
-        // is read-only, including when used by notifications and validation.
-        let orphan = null;
-        if (manifest !== null && manifest.status === 'running' && !canceled
-            && !(await existsSafe(jobFile(cwd, jobId, FILES.result)))) {
-            const lastSeen = Math.max(Date.parse(manifest.updatedAt), Date.parse(progress?.lastEventAt ?? ''));
-            orphan = deriveOrphan(manifest, Number.isFinite(lastSeen) ? lastSeen : null, Date.now(), undefined, cancelRequested);
-            // A live supervisor honours a cancel request within seconds. A request that
-            // is a minute old and still has no terminal state means nobody is listening.
-            const cancelAgeMs = cancelAt === null ? NaN : Date.now() - Date.parse(cancelAt);
-            const ownerIsAlive = ownerAlive(manifest);
-            if (orphan === null && cancelRequested && cancelAgeMs > 60_000 && !ownerIsAlive)
-                orphan = CANCELED_ORPHAN;
-        }
-        const payload = {
-            [SMITH_PAYLOAD.schema]: manifest?.schema ?? null,
-            [SMITH_PAYLOAD.provider]: manifest?.provider ?? null,
-            name: manifest?.name ?? null,
-            workerId: manifest?.workerId ?? jobId,
-            role: manifest?.role ?? manifest?.mode ?? null,
-            latestSummary: progress?.latestSummary ?? manifest?.latestSummary ?? null,
-            summarySource: progress?.summarySource ?? manifest?.summarySource ?? null,
-            [SMITH_PAYLOAD.mode]: manifest?.mode ?? null,
-            [SMITH_PAYLOAD.model]: manifest?.model ?? null,
-            [SMITH_PAYLOAD.effort]: manifest?.effort ?? null,
-            [SMITH_PAYLOAD.status]: orphan?.status ?? manifest?.status ?? null,
-            [SMITH_PAYLOAD.task]: manifest?.task ?? null,
-            [SMITH_PAYLOAD.unrestricted]: manifest?.unrestricted ?? null,
-            [SMITH_PAYLOAD.conversation]: manifest?.conversation ?? null,
-            [SMITH_PAYLOAD.createdAt]: manifest?.createdAt ?? null,
-            [SMITH_PAYLOAD.updatedAt]: manifest?.updatedAt ?? null,
-            [SMITH_PAYLOAD.startedAt]: manifest?.startedAt ?? null,
-            [SMITH_PAYLOAD.finishedAt]: manifest?.finishedAt ?? null,
-            [SMITH_PAYLOAD.exitCode]: manifest?.exitCode ?? null,
-            [SMITH_PAYLOAD.jobStatus]: manifest?.jobStatus ?? null,
-            [SMITH_PAYLOAD.error]: orphan?.reason ?? manifest?.error ?? null,
-            [SMITH_PAYLOAD.deniedActions]: manifest?.deniedActions ?? [],
-            [SMITH_PAYLOAD.usage]: manifest?.usage ?? null,
-            ...(Array.isArray(manifest?.changedFiles) && manifest.changedFilesTruncated !== true
-                ? { changed_files: manifest.changedFiles } : {}),
-            // No progress.json and no manifest count is unknown, not zero: a job that
-            // wrote nothing must not claim it made no tool calls.
-            [SMITH_PAYLOAD.toolCalls]: progress?.toolCalls ?? manifest?.toolCalls ?? null,
-            [SMITH_PAYLOAD.pipeline]: manifest?.pipeline ?? null,
-            [SMITH_PAYLOAD.stage]: manifest?.stage ?? null,
-            [SMITH_PAYLOAD.attempt]: manifest?.attempt ?? null,
-            [SMITH_PAYLOAD.output]: report,
-            [SMITH_PAYLOAD.canceled]: canceled,
-            [SMITH_PAYLOAD.cancelAt]: cancelAt,
-            [SMITH_PAYLOAD.lastEventAt]: progress?.lastEventAt ?? manifest?.updatedAt ?? null,
-            // The process owner's heartbeat (providers/ndjson.ts). Absent for jobs
-            // written by older builds: liveness then falls back to event silence.
-            [SMITH_PAYLOAD.lastAliveAt]: progress?.lastAliveAt ?? null,
-            ...(typeof progress?.workerPid === 'number' ? { workerPid: progress.workerPid } : {}),
-            ...(typeof (manifest?.toolErrors ?? progress?.toolErrors) === 'number'
-                ? { toolErrors: manifest?.toolErrors ?? progress?.toolErrors } : {}),
-            ...(manifest?.failedEarly === true ? { failedEarly: true } : {}),
-            ...(manifest?.changedFilesUnknown === true ? { changedFilesUnknown: true } : {}),
-            ...(manifest?.cwdMissingAtFinish === true ? { cwdMissingAtFinish: true } : {}),
-            [SMITH_PAYLOAD.recentActivities]: progress?.recentActivities ?? [],
-            [SMITH_PAYLOAD.lastActivity]: progress?.lastActivity ?? null,
-            [SMITH_PAYLOAD.latestText]: progress?.latestText ?? null,
-            [SMITH_PAYLOAD.progressWarnings]: progress?.warnings ?? [],
-            ...(progress?.digest !== undefined ? { digest: progress.digest } : {}),
-            ...(manifest?.supersededBy !== undefined ? { supersededBy: manifest.supersededBy } : {}),
-            ...(manifest?.steeredFrom !== undefined ? { steeredFrom: manifest.steeredFrom } : {}),
-            ...(typeof (progress?.pendingSteers ?? manifest?.pendingSteers) === 'number'
-                ? { pendingSteers: progress?.pendingSteers ?? manifest?.pendingSteers }
-                : {}),
-            ...(Array.isArray(manifest?.staleReads) && manifest.staleReads.length > 0
-                ? { staleReads: manifest.staleReads }
-                : {}),
-        };
-        // partial=true when the anchor is missing: something is on disk for this
-        // job but we could not read the file that says what state it is in. The
-        // normalizer biases toward `unknown` over a guess, and `unknown` must never
-        // be collapsed into `running`.
-        return {
-            provider: this.provider,
-            jobId,
-            cwd: manifest?.cwd ?? cwd,
-            payload,
-            partial: manifest === null,
-        };
-    }
-}/**
- * normalize.ts — provider-agnostic normalization to ObservedJob.
- *
- * Every provider quirk and every judgement call lives HERE and only here, so
- * this file is the single place a reviewer reads to answer "why did that job
- * show up as failed?". Readers (agent-smith.ts) are dumb parsers; they
- * extract facts and get out of the way.
- *
- * The headline rule, an empty response is not a clean success, is applied
- * once, when the job is written (forge/format.ts `deriveStatus`), and not
- * re-derived here.
- */
-// ── helpers ────────────────────────────────────────────────────────────────
-function asString(v) {
-    return typeof v === "string" && v.length > 0 ? v : null;
-}
-function asNumber(v) {
-    return typeof v === "number" && Number.isFinite(v) ? v : null;
-}
-function asBool(v) {
-    return typeof v === "boolean" ? v : null;
-}
-function asStringArray(v) {
-    if (!Array.isArray(v))
-        return [];
-    return v.filter((x) => typeof x === "string");
-}
-// ── agent-smith normalizer ──────────────────────────────────────────────────
-/**
- * Map an agent-smith payload onto ObservedJob.
- *
- * It is short because we own the format (see forge/format.ts). Three rows, in order:
- *
- *   1. cancel marker exists                    ⇒ canceled   (outranks job.json:
- *      the marker is written the instant cancel is requested, and the worker may
- *      never get to write its own terminal state)
- *   2. job.json.status is a terminal state      ⇒ that state, VERBATIM
- *   3. otherwise                               ⇒ running, or unknown if the
- *      anchor was unreadable
- *
- * ROW 2 HAS NO JUDGEMENT IN IT, and that is deliberate. The suspicious-success
- * downgrade — the headline rule of this whole codebase — is applied ONCE, at the
- * moment of writing, by `forge/format.ts`'s `deriveStatus`. It is not applied
- * again here. A normalizer that re-derived the verdict from the output would be a
- * second, subtly different implementation of the same rule, and the day the two
- * disagree the mod would draw one state while the channel announced another.
- *
- * The reader's job is to report what is on disk. The writer's job is to decide
- * what it means. One decision, one place.
- */
-const smithNormalizer = (raw) => {
-    const p = raw.payload;
-    const warnings = [];
-    const canceled = asBool(p[SMITH_PAYLOAD.canceled]) === true;
-    const status = asString(p[SMITH_PAYLOAD.status]);
-    const output = asString(p[SMITH_PAYLOAD.output]);
-    const denied = p[SMITH_PAYLOAD.deniedActions];
-    const deniedCount = Array.isArray(denied) ? denied.length : 0;
-    const errorText = asString(p[SMITH_PAYLOAD.error]);
-    const progressWarnings = asStringArray(p[SMITH_PAYLOAD.progressWarnings]);
-    // A newer on-disk schema is not a job we understand. `unknown` is the honest
-    // answer and it must survive to the surface: `unknown` is
-    // load-bearing and must never be collapsed.
-    const schema = asNumber(p[SMITH_PAYLOAD.schema]);
-    if (deniedCount > 0) {
-        const failedWithoutOutput = status === "failed" && (output === null || output.trim() === '');
-        warnings.push({
-            code: failedWithoutOutput ? "suspicious_success" : "tool_error",
-            message: `${deniedCount} ${deniedCount === 1 ? 'call' : 'calls'} denied`,
-        });
-    }
-    // The forge's error for a denial restates it ("denied view_file · …"); any other error still shows.
-    if (errorText !== null && !(deniedCount > 0 && /^denied\b/.test(errorText))) {
-        warnings.push({ code: "tool_error", message: errorText });
-    }
-    for (const w of progressWarnings) {
-        warnings.push({ code: STEER_NOT_APPLIED_RE.test(w) ? "steer_not_applied" : "tool_error", message: w });
-    }
-    let resolved;
-    if (canceled) {
-        resolved = "canceled";
-        warnings.push({ code: "canceled", message: "canceled" });
-    }
-    else if (schema !== null && schema > SCHEMA_VERSION) {
-        // A newer writer's file. `unknown`, and NOT `running`: "we cannot read this"
-        // is a different claim from "it is working", and drawing one as the other is
-        // the specific failure `unknown` exists to prevent.
-        resolved = "unknown";
-        warnings.push({
-            code: "incomplete_state",
-            message: `schema v${schema} is newer than this reader (v${SCHEMA_VERSION})`,
-        });
-    }
-    else if (status === "succeeded") {
-        resolved = "succeeded";
-        if (output === null || output.trim() === '') {
-            // Defensive only. deriveStatus cannot produce `succeeded` with an empty
-            // report, so reaching here means job.json was written by something other
-            // than forge/writer.ts. Believe the file, flag the contradiction, and do
-            // not silently upgrade a job with no output to a success.
-            warnings.push({
-                code: "empty_output",
-                message: "done, but no output on disk",
-            });
-        }
-    }
-    else if (status === "failed") {
-        resolved = "failed";
-    }
-    else if (status === "canceled") {
-        resolved = "canceled";
-    }
-    else if (status === "running") {
-        resolved = "running";
-    }
-    else if (raw.partial === true) {
-        // The anchor is missing. NOT `running`: "we cannot tell" and "it is working"
-        // are different claims and a band that draws one as the other is lying.
-        resolved = "unknown";
-        warnings.push({
-            code: "incomplete_state",
-            message: "job.json missing or unreadable",
-        });
-    }
-    else {
-        resolved = "unknown";
-        warnings.push({
-            code: "incomplete_state",
-            message: "no status in job.json",
-        });
-    }
-    return buildSmith(raw, resolved, warnings);
-};
-/** Assemble the ObservedJob for the agent-smith normalizer. */
-function buildSmith(raw, status, warnings) {
-    const p = raw.payload;
-    const usage = asUsage(p[SMITH_PAYLOAD.usage]);
-    const toolCalls = asNumber(p[SMITH_PAYLOAD.toolCalls]);
-    const usageFull = usage === null
-        ? toolCalls === null || toolCalls === 0
-            ? null
-            : { turns: toolCalls }
-        : toolCalls === null
-            ? usage
-            : { ...usage, turns: toolCalls };
-    return {
-        provider: "agent-smith",
-        jobId: raw.jobId,
-        status,
-        warnings,
-        output: asString(p[SMITH_PAYLOAD.output]),
-        startedAt: asString(p[SMITH_PAYLOAD.startedAt]) ?? asString(p[SMITH_PAYLOAD.createdAt]),
-        updatedAt: asString(p[SMITH_PAYLOAD.updatedAt]) ?? asString(p[SMITH_PAYLOAD.lastEventAt]),
-        finishedAt: asString(p[SMITH_PAYLOAD.finishedAt]),
-        mode: asString(p[SMITH_PAYLOAD.mode]),
-        model: asString(p[SMITH_PAYLOAD.model]),
-        // `label` is the pane's provider/permission word. Ours is honest about the
-        // one field an operator must never have to guess: did this run with the
-        // tool-approval prompt bypassed.
-        label: asBool(p[SMITH_PAYLOAD.unrestricted]) === true
-            ? "unrestricted"
-            : asString(p[SMITH_PAYLOAD.provider]),
-        outputTruncated: false,
-        usage: usageFull,
-        partial: raw.partial === true,
-        raw: p,
-    };
-}
-/**
- * Coerce a usage bag into the nullable ObservedUsage shape.
- *
- * Absent is absent. A provider that reports no token counts gets `null`, not a
- * bag of zeroes, because a confident `0` drawn on the pane is a measurement
- * nobody took.
- */
-function asUsage(v) {
-    if (v === null || typeof v !== "object")
-        return null;
-    const src = v;
-    const out = {};
-    const map = [
-        ["inputTokens", "inputTokens"],
-        ["outputTokens", "outputTokens"],
-        ["thinkingTokens", "thinkingTokens"],
-        ["cacheReadTokens", "cacheTokens"],
-    ];
-    for (const [from, to] of map) {
-        const n = asNumber(src[from]);
-        if (n !== null)
-            out[to] = n;
-    }
-    return Object.keys(out).length > 0 ? out : null;
-}
-/** Normalize a raw agent-smith job snapshot. */
-function normalize(raw) {
-    return smithNormalizer(raw);
 }/**
  * pipeline/routing.ts — dynamic model/stage selection.
  *
@@ -2481,7 +1898,7 @@ async function binaryOnPath(bin) {
     if (bin.includes('/') || bin.includes(path.sep)) {
         let direct = false;
         try {
-            await access(bin, constants$1.X_OK);
+            await access(bin, constants.X_OK);
             direct = true;
         }
         catch {
@@ -2501,7 +1918,7 @@ async function binaryOnPath(bin) {
     for (const dir of dirs) {
         const full = path.join(dir, bin);
         try {
-            await access(full, constants$1.X_OK);
+            await access(full, constants.X_OK);
             found = true;
             break;
         }
@@ -3097,7 +2514,7 @@ const runCapture = (bin, args, timeoutMs) => new Promise((resolve) => {
     }
 });
 /** Read a file as text, undefined on any failure. */
-function readTextSafe(file) {
+function readTextSafe$1(file) {
     try {
         return readFileSync(file, 'utf8');
     }
@@ -4315,7 +3732,7 @@ function claudeHome() {
 }
 /** Top-level `model` from <home>/settings.json. Throws on malformed JSON; callers decide how loud to be. */
 function readDefaultModel(home) {
-    const text = readTextSafe(path.join(home, 'settings.json'));
+    const text = readTextSafe$1(path.join(home, 'settings.json'));
     const model = text === undefined ? undefined : JSON.parse(text)?.model;
     return typeof model === 'string' && model !== '' ? model : undefined;
 }
@@ -4948,7 +4365,7 @@ async function listCodexModels(run, options, home = codexHome()) {
             models = parseCodexModels(r.stdout);
         if (models === undefined || models.length === 0) {
             error = r.error ?? '`codex debug models` returned no models';
-            const cached = readTextSafe(path.join(home, 'models_cache.json'));
+            const cached = readTextSafe$1(path.join(home, 'models_cache.json'));
             const fromCache = cached === undefined ? undefined : parseCodexModels(cached);
             if (fromCache !== undefined && fromCache.length > 0) {
                 models = fromCache;
@@ -4980,7 +4397,7 @@ async function listCodexModels(run, options, home = codexHome()) {
 }
 /** Default model/effort from <home>/config.toml. Sync file read only. */
 function codexHarnessDefaults(home = codexHome()) {
-    const cfgText = readTextSafe(path.join(home, 'config.toml'));
+    const cfgText = readTextSafe$1(path.join(home, 'config.toml'));
     if (cfgText === undefined)
         return {};
     const cfg = parseTomlTopLevel(cfgText);
@@ -5604,7 +5021,7 @@ async function listKimiModels(run, options, home = kimiHome()) {
 }
 /** Default model from <home>/config.toml top-level `default_model`. Sync, no CLI, never throws. */
 function kimiHarnessDefaults(home = kimiHome()) {
-    const text = readTextSafe(path.join(home, 'config.toml'));
+    const text = readTextSafe$1(path.join(home, 'config.toml'));
     if (text === undefined)
         return {};
     const model = parseTomlTopLevel(text)['default_model'];
@@ -6473,6 +5890,53 @@ function createMarker(filePath, body) {
         closeSync(fd);
     }
     return true;
+}/** Text sanitising and fixed-width fitting. Dependency-free: everything that puts
+ * worker or user prose into a cell goes through here first.
+ */
+/**
+ * Strip complete ANSI escape sequences (CSI, OSC, DCS/PM/APC/SOS, 2-byte ESC,
+ * C1 controls) and remaining forbidden control characters, unpaired surrogates,
+ * and noncharacters (`U+FDD0..U+FDEF`), while preserving `\n` and valid UTF-16
+ * surrogate pairs.
+ *
+ * Why this exists: Claude Code's JSX element validator rejects any `<Text>`,
+ * `<Button label>`, or `<Markdown text>` containing C0/C1 controls (except `\t`
+ * and `\n`), lone surrogates, or `U+FDD0..U+FDEF`. Worker tool output, shell
+ * commands, check output, and prompt text routinely contain ANSI colour codes or
+ * `\r` progress lines; stripping them at the UI boundary keeps the stored job
+ * files intact while preventing a single control byte from aborting the pane.
+ */
+const ANSI_ESCAPE = /(?:\x1b\][\s\S]*?(?:\x07|\x1b\\|\x9c)|\x9d[\s\S]*?(?:\x07|\x1b\\|\x9c)|\x1b[PX^_][\s\S]*?(?:\x1b\\|\x9c)|(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]|\x1b[ -/]*[@-~])/gu;
+const FORBIDDEN_CONTROLS = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ud800-\udfff\ufdd0-\ufdef]/gu;
+function sanitizeText(s) {
+    return s
+        .replace(ANSI_ESCAPE, '')
+        .replace(/\r\n?/g, '\n')
+        .replace(/\t/g, '  ')
+        .replace(FORBIDDEN_CONTROLS, '');
+}
+/**
+ * Cut to at most `max` UTF-16 units without splitting a surrogate pair.
+ *
+ * `slice` can leave a high surrogate with no low half. `sanitizeText` removes
+ * such halves, so a cut made AFTER sanitizing must not create one: the host
+ * draws an unpaired half as U+FFFD, or refuses the tree a Text's string is
+ * checked in. `max` stays in UTF-16 units because every caller sizes cells in
+ * terminal columns, where a pair already counts as two.
+ */
+function clip(s, max) {
+    if (s.length <= max)
+        return s;
+    const cut = s.slice(0, Math.max(0, max));
+    return /[\ud800-\udbff]$/.test(cut) ? cut.slice(0, -1) : cut;
+}
+/** Collapse all whitespace runs to single spaces and cap the length. A hard
+ * bound on what one string can cost, for prose with no cell to sit in (a report
+ * excerpt, a warning message); the renderer's `wrap="truncate-end"` is the
+ * mechanism, this is belt and braces. */
+function oneLine(s, max = 400) {
+    const t = sanitizeText(s).replace(/\s+/g, ' ').trim();
+    return clip(t, Math.max(0, max));
 }/** Tool name + parameters → a short human phrase. Shared by the legacy reader
  * (jobs.ts) and the progress digest (progress.ts); never raw tool output.
  */
@@ -7019,6 +6483,8 @@ class JobWriter {
      */
     start(input) {
         const now = new Date().toISOString();
+        const turn = typeof input.turn === 'number' && Number.isInteger(input.turn) && input.turn >= 1 ? input.turn : 1;
+        const chainStartedAt = input.chainStartedAt ?? now;
         this.view = { ...this.view, prompt: input.prompt.slice(0, 64_000), preamble: input.preamble?.slice(0, 4_000) ?? null,
             truncated: input.prompt.length > 64_000 || (input.preamble?.length ?? 0) > 4_000 };
         this.conversation = input.conversation;
@@ -7027,6 +6493,7 @@ class JobWriter {
             jobId: this.jobId,
             name: input.name ?? this.jobId,
             workerId: input.workerId ?? this.jobId,
+            turn,
             role: input.mode,
             latestSummary: null,
             summarySource: null,
@@ -7045,6 +6512,7 @@ class JobWriter {
             createdAt: now,
             updatedAt: now,
             startedAt: now,
+            chainStartedAt,
             finishedAt: null,
             exitCode: null,
             jobStatus: null,
@@ -7063,7 +6531,8 @@ class JobWriter {
             ...(input.sandboxFlags === undefined ? {} : { sandboxFlags: input.sandboxFlags }),
             ...(input.readOnlyRequested === undefined ? {} : { readOnlyRequested: input.readOnlyRequested }),
             ...(input.readOnlyEnforced === undefined ? {} : { readOnlyEnforced: input.readOnlyEnforced }),
-            ...(input.steeredFrom ? { steeredFrom: input.steeredFrom } : {}),
+            ...(input.continuedFrom ? { continuedFrom: input.continuedFrom } : {}),
+            ...(input.continuationKind ? { continuationKind: input.continuationKind } : {}),
             ...(input.watchedFiles !== undefined && Object.keys(input.watchedFiles).length > 0
                 ? { watchedFiles: input.watchedFiles }
                 : {}),
@@ -7792,6 +7261,8 @@ function emptyManifest(jobId) {
     return {
         schema: SCHEMA_VERSION,
         jobId,
+        workerId: jobId,
+        turn: 1,
         provider: 'unknown',
         mode: 'unknown',
         model: null,
@@ -7805,6 +7276,7 @@ function emptyManifest(jobId) {
         createdAt: now,
         updatedAt: now,
         startedAt: null,
+        chainStartedAt: now,
         finishedAt: null,
         exitCode: null,
         jobStatus: null,
@@ -9140,4 +8612,558 @@ function startPipeline(service, spec, options = {}) {
         throw error;
     }).finally(() => clearInterval(poll));
     return { runId, recordPath, done, cancel: () => { cancelPipeline(service.repo, runId); } };
-}export{toolLabel as $,AgentSmithReader as A,deriveOrphan as B,deriveStatus as C,DEFAULT_TIMEOUT_MS as D,writeAtomic as E,FILES as F,summaryTail as G,failureFields as H,writeAcceptance as I,getProvider as J,nextActionFor as K,fileSig as L,MODES as M,jobsDir as N,JobWriter as O,PROVIDERS as P,newJobId$1 as Q,REASONS as R,STAGE_PROMPTS as S,humanDuration as T,pipeEvents as U,pipelineRecordPath as V,computeStaleReads as W,SMITH_PAYLOAD as X,isForgeStatus as Y,readJsonSafe as Z,checksReason as _,MODE_PRESETS as a,readPipeline as b,cancelPipeline as c,readAcceptance as d,jobFile as e,settleAcceptance as f,isMode as g,markAcceptanceSuperseded as h,inheritContinuedProviders as i,jobDir as j,isTerminalForgeStatus as k,readManifest as l,markAcceptancePending as m,normalize as n,errMessage as o,providerNames as p,findProvider as q,reasonFromText as r,startPipeline as s,SCHEMA_VERSION as t,validOwnerPid as u,validateSpec as v,writeJsonAtomic as w,ownerAlive as x,reportFor as y,cwdFacts as z};
+}/**
+ * safe-fs.ts — race-tolerant filesystem primitives shared by every reader.
+ *
+ * WHY THIS EXISTS
+ * ---------------
+ * Every reader in this directory observes state that another process is
+ * *actively mutating*: a worker rewrites its job files on every event. Claude Code appends to a
+ * subagent `.jsonl` while we read it. So between our `readdir` and our `read`,
+ * a path can vanish, be truncated mid-write, or be replaced by a directory.
+ *
+ * Throwing here is never correct: a missing file is *information*, not an
+ * error. Every function in this module returns
+ * `null` / `[]` / `false` instead of throwing. This is the single most
+ * important flake-prevention rule in the harness.
+ */
+/** Substrings of fs error codes that mean "the world moved on, carry on". */
+const TRANSIENT_CODES = new Set([
+    "ENOENT", // deleted between readdir and read (hazard A: clean-success cleanup)
+    "EACCES", // macOS TCC / permissions
+    "EPERM",
+    "EISDIR", // a path we expected to be a file is a dir
+    "ENOTDIR", // ...or vice versa
+    "EBUSY",
+    "ELOOP",
+    "EMFILE",
+    "ENFILE",
+]);
+/**
+ * Default byte cap for text reads.
+ *
+ * WHY: `events.jsonl` reached 492KB and a Claude subagent transcript 526KB in
+ * the sample corpus. We only ever want the *head* of a stream for display; a
+ * viewer that OOMs on a long job is worse than one that truncates. Callers
+ * that genuinely need everything pass a bigger number.
+ */
+const DEFAULT_MAX_BYTES = 2 * 1024 * 1024;
+function isTransient(err) {
+    if (typeof err !== "object" || err === null)
+        return true; // be paranoid
+    const code = err.code;
+    // A non-Error throw is by definition something we did not anticipate.
+    if (typeof code !== "string")
+        return true;
+    return TRANSIENT_CODES.has(code);
+}
+/** `fs.access(F_OK)` that returns a boolean instead of throwing. */
+async function existsSafe(path) {
+    try {
+        await access(path, constants$1.F_OK);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+/**
+ * Read a file as UTF-8 text, capped at `maxBytes`.
+ *
+ * Returns `null` if the file is gone, unreadable, or a directory. Never throws.
+ * A short read is *normal* here — it means we caught a half-written file, which
+ * is exactly what we want the JSON parser downstream to survive.
+ */
+async function readTextSafe(path, maxBytes = DEFAULT_MAX_BYTES) {
+    let handle;
+    try {
+        handle = await open(path, "r");
+        // +4 bytes so a multi-byte UTF-8 sequence straddling the cap does not
+        // become a replacement character at the boundary.
+        const buf = Buffer.allocUnsafe(maxBytes + 4);
+        const { bytesRead } = await handle.read(buf, 0, buf.length, 0);
+        if (bytesRead === 0)
+            return ""; // genuinely empty file is not "missing"
+        return buf.subarray(0, bytesRead).toString("utf8");
+    }
+    catch (err) {
+        if (!isTransient(err))
+            throw err;
+        return null;
+    }
+    finally {
+        await handle?.close().catch(() => { });
+    }
+}
+/**
+ * Read and JSON.parse, tolerating every way that can go wrong.
+ *
+ * Returns `null` for: missing file, unreadable file, empty file, invalid JSON.
+ * Invalid JSON is EXPECTED, not exceptional — a writer using a plain
+ * `writeFile` can be caught mid-write, so a reader that arrives mid-write sees a truncated document.
+ * Treating that as `null` and retrying on the next poll is the whole strategy.
+ */
+async function readJsonSafe(path, maxBytes) {
+    const text = await readTextSafe(path, maxBytes);
+    if (text === null)
+        return null;
+    const trimmed = text.trim();
+    if (trimmed === "")
+        return null; // empty or all-whitespace ⇒ mid-write
+    try {
+        return JSON.parse(trimmed);
+    }
+    catch {
+        return null; // half-written JSON. Next poll will get it.
+    }
+}
+/**
+ * `fs.readdir` that returns `[]` instead of throwing.
+ *
+ * NOTE: we do NOT `stat` each entry here. That would double the syscalls and
+ * reintroduce the very race we are defending against. Callers should treat
+ * every returned name as a *hypothesis* to be confirmed by a tolerant read.
+ */
+async function readdirSafe(path) {
+    try {
+        return await readdir(path);
+    }
+    catch (err) {
+        if (!isTransient(err))
+            throw err;
+        return [];
+    }
+}/**
+ * agent-smith.ts — reads OUR OWN job state from `<repo>/.agent-smith/jobs/`.
+ *
+ * The source of truth for every job this repo spawned. It is not much code
+ * because forge/format.ts made it not much code: owning the state format means
+ * three questions, three answers:
+ *
+ *   - Does this job exist?        → the directory exists and holds a job.json.
+ *   - What is its terminal state? → job.json.status. Written atomically, always.
+ *   - Is it alive?                → job.json.updatedAt, refreshed on every event.
+ *
+ * The one hazard to respect is the cancel marker: `cancel` can exist before
+ * job.json reaches a terminal state, so it outranks it.
+ */
+/**
+ * payload keys the normalizer relies on. Cross-referenced by name from
+ * harness/normalize.ts's `smithNormalizer`.
+ */
+const SMITH_PAYLOAD = {
+    provider: 'provider',
+    mode: 'mode',
+    model: 'model',
+    effort: 'effort',
+    status: 'status',
+    task: 'task',
+    unrestricted: 'unrestricted',
+    conversation: 'conversation',
+    createdAt: 'created_at',
+    updatedAt: 'updated_at',
+    startedAt: 'started_at',
+    finishedAt: 'finished_at',
+    exitCode: 'exit_code',
+    jobStatus: 'job_status',
+    error: 'error',
+    deniedActions: 'denied_actions',
+    usage: 'usage',
+    toolCalls: 'tool_calls',
+    output: 'output',
+    canceled: 'canceled',
+    cancelAt: 'cancel_at',
+    lastEventAt: 'last_event_at',
+    lastAliveAt: 'last_alive_at',
+    recentActivities: 'recent_activities',
+    lastActivity: 'last_activity',
+    latestText: 'latest_text',
+    progressWarnings: 'progress_warnings',
+    pipeline: 'pipeline',
+    stage: 'stage',
+    attempt: 'attempt',
+    schema: 'schema',
+};
+const CANCELED_ORPHAN = { status: 'canceled', suspicious: false, reason: CANCEL_ORPHAN_REASON };
+/**
+ * Reads `.agent-smith/jobs`.
+ *
+ * Every method is fault-tolerant: a reader reads files a live process is
+ * rewriting, and one
+ * unreadable job is that job's absence rather than a dead band. `discover`
+ * NEVER throws; an absent jobs directory is the ordinary case for a repo that
+ * has never spawned anything, not an error.
+ */
+class AgentSmithReader {
+    provider = 'agent-smith';
+    /**
+     * Enumerate job ids from the jobs directory.
+     *
+     * Keyed on the DIRECTORY: there is no suffix to parse, no "which file proves this job
+     * exists", and no entry that can half-qualify. A job's identity is its
+     * directory, so identity cannot be lost.
+     */
+    async discover(cwd) {
+        const entries = await readdirSafe(jobsDir(cwd));
+        const ids = new Set();
+        for (const entry of entries) {
+            // `readdirSafe` returns names only; a name that is not a directory will
+            // simply fail the job.json read below and contribute nothing. We do not
+            // stat here because a stat per entry is a syscall per entry on a path the
+            // band hits every three seconds.
+            if (!entry.startsWith('.'))
+                ids.add(entry);
+        }
+        return [...ids].sort();
+    }
+    /**
+     * Assemble one snapshot.
+     *
+     * Returns null when the job does not exist to this reader — i.e. no directory
+     * and no job.json. A FINISHED job returns a full snapshot: job.json is never
+     * deleted, which is the whole reason the format has a single anchor.
+     */
+    async read(cwd, jobId) {
+        // The cancel marker outranks job.json: it can exist before the worker has
+        // been reaped.
+        const cancelPath = jobFile(cwd, jobId, FILES.cancel);
+        const cancelRequested = await existsSafe(cancelPath);
+        let cancelAt = null;
+        if (cancelRequested) {
+            const raw = await readTextSafe(cancelPath);
+            const t = raw?.trim();
+            cancelAt = t !== undefined && t !== '' ? t : null;
+        }
+        const manifest = await readJsonSafe(jobFile(cwd, jobId, FILES.job));
+        // A marker is a request. The owner may still be working or may finish
+        // successfully before it can stop; only terminal canceled state is proof.
+        const canceled = manifest === null ? cancelRequested : manifest.status === 'canceled';
+        // A manifest from a NEWER writer is refused rather than half-understood.
+        // Reading a v2 file with v1 rules produces exactly the confident wrong
+        // answers this project exists to prevent, and `unknown` is the honest state.
+        if (manifest !== null && typeof manifest.schema === 'number' && manifest.schema > SCHEMA_VERSION) {
+            return {
+                provider: this.provider,
+                jobId,
+                cwd,
+                partial: true,
+                payload: {
+                    [SMITH_PAYLOAD.schema]: manifest.schema,
+                    [SMITH_PAYLOAD.error]: `on-disk schema v${manifest.schema} is newer than this reader (v${SCHEMA_VERSION}); state unknown`,
+                    [SMITH_PAYLOAD.canceled]: canceled,
+                    [SMITH_PAYLOAD.cancelAt]: cancelAt,
+                },
+            };
+        }
+        const report = await readTextSafe(jobFile(cwd, jobId, FILES.report));
+        const progress = await readJsonSafe(jobFile(cwd, jobId, FILES.progress));
+        // "Does this job exist?" is asked LAST, and includes the marker: a job
+        // whose only surviving artefact is its cancel request is still a job.
+        //
+        // Note what is NOT consulted: the bare existence of the directory. A
+        // half-created directory (crash between mkdir and the first write) and a
+        // stray directory a human dropped in here are both indistinguishable from a
+        // job by `stat`, and a band that draws "unknown" for a stray folder is
+        // indistinguishable from one that lies. We require evidence of a job.
+        const anyEvidence = manifest !== null || canceled || report !== null;
+        if (!anyEvidence)
+            return null;
+        // Orphan derivation (forge/format.ts deriveOrphan): a `running` anchor with
+        // no terminal result whose supervisor is gone. Derived, never written into
+        // job.json. Only the service reconciler persists the verdict; this reader
+        // is read-only, including when used by notifications and validation.
+        let orphan = null;
+        if (manifest !== null && manifest.status === 'running' && !canceled
+            && !(await existsSafe(jobFile(cwd, jobId, FILES.result)))) {
+            const lastSeen = Math.max(Date.parse(manifest.updatedAt), Date.parse(progress?.lastEventAt ?? ''));
+            orphan = deriveOrphan(manifest, Number.isFinite(lastSeen) ? lastSeen : null, Date.now(), undefined, cancelRequested);
+            // A live supervisor honours a cancel request within seconds. A request that
+            // is a minute old and still has no terminal state means nobody is listening.
+            const cancelAgeMs = cancelAt === null ? NaN : Date.now() - Date.parse(cancelAt);
+            const ownerIsAlive = ownerAlive(manifest);
+            if (orphan === null && cancelRequested && cancelAgeMs > 60_000 && !ownerIsAlive)
+                orphan = CANCELED_ORPHAN;
+        }
+        // Defensive 0.4.x disk-read fallback: older manifests wrote `steeredFrom` and omitted `turn`/`chainStartedAt`.
+        const legacySteeredFrom = manifest?.steeredFrom;
+        const turn = typeof manifest?.turn === 'number' && Number.isInteger(manifest.turn) && manifest.turn >= 1 ? manifest.turn : 1;
+        const continuedFrom = typeof manifest?.continuedFrom === 'string' && manifest.continuedFrom !== ''
+            ? manifest.continuedFrom
+            : typeof legacySteeredFrom === 'string' && legacySteeredFrom !== ''
+                ? legacySteeredFrom
+                : undefined;
+        const continuationKind = isContinuationKind(manifest?.continuationKind) ? manifest.continuationKind : undefined;
+        const chainStartedAt = typeof manifest?.chainStartedAt === 'string' && manifest.chainStartedAt !== ''
+            ? manifest.chainStartedAt
+            : (manifest?.startedAt ?? manifest?.createdAt ?? undefined);
+        const payload = {
+            [SMITH_PAYLOAD.schema]: manifest?.schema ?? null,
+            [SMITH_PAYLOAD.provider]: manifest?.provider ?? null,
+            name: manifest?.name ?? null,
+            workerId: manifest?.workerId ?? jobId,
+            turn,
+            role: manifest?.role ?? manifest?.mode ?? null,
+            latestSummary: progress?.latestSummary ?? manifest?.latestSummary ?? null,
+            summarySource: progress?.summarySource ?? manifest?.summarySource ?? null,
+            [SMITH_PAYLOAD.mode]: manifest?.mode ?? null,
+            [SMITH_PAYLOAD.model]: manifest?.model ?? null,
+            [SMITH_PAYLOAD.effort]: manifest?.effort ?? null,
+            [SMITH_PAYLOAD.status]: orphan?.status ?? manifest?.status ?? null,
+            [SMITH_PAYLOAD.task]: manifest?.task ?? null,
+            [SMITH_PAYLOAD.unrestricted]: manifest?.unrestricted ?? null,
+            [SMITH_PAYLOAD.conversation]: manifest?.conversation ?? null,
+            [SMITH_PAYLOAD.createdAt]: manifest?.createdAt ?? null,
+            [SMITH_PAYLOAD.updatedAt]: manifest?.updatedAt ?? null,
+            [SMITH_PAYLOAD.startedAt]: manifest?.startedAt ?? null,
+            [SMITH_PAYLOAD.finishedAt]: manifest?.finishedAt ?? null,
+            [SMITH_PAYLOAD.exitCode]: manifest?.exitCode ?? null,
+            [SMITH_PAYLOAD.jobStatus]: manifest?.jobStatus ?? null,
+            [SMITH_PAYLOAD.error]: orphan?.reason ?? manifest?.error ?? null,
+            [SMITH_PAYLOAD.deniedActions]: manifest?.deniedActions ?? [],
+            [SMITH_PAYLOAD.usage]: manifest?.usage ?? null,
+            ...(Array.isArray(manifest?.changedFiles) && manifest.changedFilesTruncated !== true
+                ? { changed_files: manifest.changedFiles } : {}),
+            // No progress.json and no manifest count is unknown, not zero: a job that
+            // wrote nothing must not claim it made no tool calls.
+            [SMITH_PAYLOAD.toolCalls]: progress?.toolCalls ?? manifest?.toolCalls ?? null,
+            [SMITH_PAYLOAD.pipeline]: manifest?.pipeline ?? null,
+            [SMITH_PAYLOAD.stage]: manifest?.stage ?? null,
+            [SMITH_PAYLOAD.attempt]: manifest?.attempt ?? null,
+            [SMITH_PAYLOAD.output]: report,
+            [SMITH_PAYLOAD.canceled]: canceled,
+            [SMITH_PAYLOAD.cancelAt]: cancelAt,
+            [SMITH_PAYLOAD.lastEventAt]: progress?.lastEventAt ?? manifest?.updatedAt ?? null,
+            // The process owner's heartbeat (providers/ndjson.ts). Absent for jobs
+            // written by older builds: liveness then falls back to event silence.
+            [SMITH_PAYLOAD.lastAliveAt]: progress?.lastAliveAt ?? null,
+            ...(typeof progress?.workerPid === 'number' ? { workerPid: progress.workerPid } : {}),
+            ...(typeof (manifest?.toolErrors ?? progress?.toolErrors) === 'number'
+                ? { toolErrors: manifest?.toolErrors ?? progress?.toolErrors } : {}),
+            ...(manifest?.failedEarly === true ? { failedEarly: true } : {}),
+            ...(manifest?.changedFilesUnknown === true ? { changedFilesUnknown: true } : {}),
+            ...(manifest?.cwdMissingAtFinish === true ? { cwdMissingAtFinish: true } : {}),
+            [SMITH_PAYLOAD.recentActivities]: progress?.recentActivities ?? [],
+            [SMITH_PAYLOAD.lastActivity]: progress?.lastActivity ?? null,
+            [SMITH_PAYLOAD.latestText]: progress?.latestText ?? null,
+            [SMITH_PAYLOAD.progressWarnings]: progress?.warnings ?? [],
+            ...(progress?.digest !== undefined ? { digest: progress.digest } : {}),
+            ...(manifest?.supersededBy !== undefined ? { supersededBy: manifest.supersededBy } : {}),
+            ...(continuedFrom !== undefined ? { continuedFrom } : {}),
+            ...(continuationKind !== undefined ? { continuationKind } : {}),
+            ...(chainStartedAt !== undefined ? { chainStartedAt } : {}),
+            ...(typeof (progress?.pendingSteers ?? manifest?.pendingSteers) === 'number'
+                ? { pendingSteers: progress?.pendingSteers ?? manifest?.pendingSteers }
+                : {}),
+            ...(Array.isArray(manifest?.staleReads) && manifest.staleReads.length > 0
+                ? { staleReads: manifest.staleReads }
+                : {}),
+        };
+        // partial=true when the anchor is missing: something is on disk for this
+        // job but we could not read the file that says what state it is in. The
+        // normalizer biases toward `unknown` over a guess, and `unknown` must never
+        // be collapsed into `running`.
+        return {
+            provider: this.provider,
+            jobId,
+            cwd: manifest?.cwd ?? cwd,
+            payload,
+            partial: manifest === null,
+        };
+    }
+}/**
+ * normalize.ts — provider-agnostic normalization to ObservedJob.
+ *
+ * Every provider quirk and every judgement call lives HERE and only here, so
+ * this file is the single place a reviewer reads to answer "why did that job
+ * show up as failed?". Readers (agent-smith.ts) are dumb parsers; they
+ * extract facts and get out of the way.
+ *
+ * The headline rule, an empty response is not a clean success, is applied
+ * once, when the job is written (forge/format.ts `deriveStatus`), and not
+ * re-derived here.
+ */
+// ── helpers ────────────────────────────────────────────────────────────────
+function asString(v) {
+    return typeof v === "string" && v.length > 0 ? v : null;
+}
+function asNumber(v) {
+    return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+function asBool(v) {
+    return typeof v === "boolean" ? v : null;
+}
+function asStringArray(v) {
+    if (!Array.isArray(v))
+        return [];
+    return v.filter((x) => typeof x === "string");
+}
+// ── agent-smith normalizer ──────────────────────────────────────────────────
+/**
+ * Map an agent-smith payload onto ObservedJob.
+ *
+ * It is short because we own the format (see forge/format.ts). Three rows, in order:
+ *
+ *   1. cancel marker exists                    ⇒ canceled   (outranks job.json:
+ *      the marker is written the instant cancel is requested, and the worker may
+ *      never get to write its own terminal state)
+ *   2. job.json.status is a terminal state      ⇒ that state, VERBATIM
+ *   3. otherwise                               ⇒ running, or unknown if the
+ *      anchor was unreadable
+ *
+ * ROW 2 HAS NO JUDGEMENT IN IT, and that is deliberate. The suspicious-success
+ * downgrade — the headline rule of this whole codebase — is applied ONCE, at the
+ * moment of writing, by `forge/format.ts`'s `deriveStatus`. It is not applied
+ * again here. A normalizer that re-derived the verdict from the output would be a
+ * second, subtly different implementation of the same rule, and the day the two
+ * disagree the mod would draw one state while the channel announced another.
+ *
+ * The reader's job is to report what is on disk. The writer's job is to decide
+ * what it means. One decision, one place.
+ */
+const smithNormalizer = (raw) => {
+    const p = raw.payload;
+    const warnings = [];
+    const canceled = asBool(p[SMITH_PAYLOAD.canceled]) === true;
+    const status = asString(p[SMITH_PAYLOAD.status]);
+    const output = asString(p[SMITH_PAYLOAD.output]);
+    const denied = p[SMITH_PAYLOAD.deniedActions];
+    const deniedCount = Array.isArray(denied) ? denied.length : 0;
+    const errorText = asString(p[SMITH_PAYLOAD.error]);
+    const progressWarnings = asStringArray(p[SMITH_PAYLOAD.progressWarnings]);
+    // A newer on-disk schema is not a job we understand. `unknown` is the honest
+    // answer and it must survive to the surface: `unknown` is
+    // load-bearing and must never be collapsed.
+    const schema = asNumber(p[SMITH_PAYLOAD.schema]);
+    if (deniedCount > 0) {
+        const failedWithoutOutput = status === "failed" && (output === null || output.trim() === '');
+        warnings.push({
+            code: failedWithoutOutput ? "suspicious_success" : "tool_error",
+            message: `${deniedCount} ${deniedCount === 1 ? 'call' : 'calls'} denied`,
+        });
+    }
+    // The forge's error for a denial restates it ("denied view_file · …"); any other error still shows.
+    if (errorText !== null && !(deniedCount > 0 && /^denied\b/.test(errorText))) {
+        warnings.push({ code: "tool_error", message: errorText });
+    }
+    for (const w of progressWarnings) {
+        warnings.push({ code: STEER_NOT_APPLIED_RE.test(w) ? "steer_not_applied" : "tool_error", message: w });
+    }
+    let resolved;
+    if (canceled) {
+        resolved = "canceled";
+        warnings.push({ code: "canceled", message: "canceled" });
+    }
+    else if (schema !== null && schema > SCHEMA_VERSION) {
+        // A newer writer's file. `unknown`, and NOT `running`: "we cannot read this"
+        // is a different claim from "it is working", and drawing one as the other is
+        // the specific failure `unknown` exists to prevent.
+        resolved = "unknown";
+        warnings.push({
+            code: "incomplete_state",
+            message: `schema v${schema} is newer than this reader (v${SCHEMA_VERSION})`,
+        });
+    }
+    else if (status === "succeeded") {
+        resolved = "succeeded";
+        if (output === null || output.trim() === '') {
+            // Defensive only. deriveStatus cannot produce `succeeded` with an empty
+            // report, so reaching here means job.json was written by something other
+            // than forge/writer.ts. Believe the file, flag the contradiction, and do
+            // not silently upgrade a job with no output to a success.
+            warnings.push({
+                code: "empty_output",
+                message: "done, but no output on disk",
+            });
+        }
+    }
+    else if (status === "failed") {
+        resolved = "failed";
+    }
+    else if (status === "canceled") {
+        resolved = "canceled";
+    }
+    else if (status === "running") {
+        resolved = "running";
+    }
+    else if (raw.partial === true) {
+        // The anchor is missing. NOT `running`: "we cannot tell" and "it is working"
+        // are different claims and a band that draws one as the other is lying.
+        resolved = "unknown";
+        warnings.push({
+            code: "incomplete_state",
+            message: "job.json missing or unreadable",
+        });
+    }
+    else {
+        resolved = "unknown";
+        warnings.push({
+            code: "incomplete_state",
+            message: "no status in job.json",
+        });
+    }
+    return buildSmith(raw, resolved, warnings);
+};
+/** Assemble the ObservedJob for the agent-smith normalizer. */
+function buildSmith(raw, status, warnings) {
+    const p = raw.payload;
+    const usage = asUsage(p[SMITH_PAYLOAD.usage]);
+    const toolCalls = asNumber(p[SMITH_PAYLOAD.toolCalls]);
+    const usageFull = usage === null
+        ? toolCalls === null || toolCalls === 0
+            ? null
+            : { turns: toolCalls }
+        : toolCalls === null
+            ? usage
+            : { ...usage, turns: toolCalls };
+    return {
+        provider: "agent-smith",
+        jobId: raw.jobId,
+        status,
+        warnings,
+        output: asString(p[SMITH_PAYLOAD.output]),
+        startedAt: asString(p[SMITH_PAYLOAD.startedAt]) ?? asString(p[SMITH_PAYLOAD.createdAt]),
+        updatedAt: asString(p[SMITH_PAYLOAD.updatedAt]) ?? asString(p[SMITH_PAYLOAD.lastEventAt]),
+        finishedAt: asString(p[SMITH_PAYLOAD.finishedAt]),
+        mode: asString(p[SMITH_PAYLOAD.mode]),
+        model: asString(p[SMITH_PAYLOAD.model]),
+        // `label` is the pane's provider/permission word. Ours is honest about the
+        // one field an operator must never have to guess: did this run with the
+        // tool-approval prompt bypassed.
+        label: asBool(p[SMITH_PAYLOAD.unrestricted]) === true
+            ? "unrestricted"
+            : asString(p[SMITH_PAYLOAD.provider]),
+        outputTruncated: false,
+        usage: usageFull,
+        partial: raw.partial === true,
+        raw: p,
+    };
+}
+/**
+ * Coerce a usage bag into the nullable ObservedUsage shape.
+ *
+ * Absent is absent. A provider that reports no token counts gets `null`, not a
+ * bag of zeroes, because a confident `0` drawn on the pane is a measurement
+ * nobody took.
+ */
+function asUsage(v) {
+    if (v === null || typeof v !== "object")
+        return null;
+    const src = v;
+    const out = {};
+    const map = [
+        ["inputTokens", "inputTokens"],
+        ["outputTokens", "outputTokens"],
+        ["thinkingTokens", "thinkingTokens"],
+        ["cacheReadTokens", "cacheTokens"],
+    ];
+    for (const [from, to] of map) {
+        const n = asNumber(src[from]);
+        if (n !== null)
+            out[to] = n;
+    }
+    return Object.keys(out).length > 0 ? out : null;
+}
+/** Normalize a raw agent-smith job snapshot. */
+function normalize(raw) {
+    return smithNormalizer(raw);
+}export{checksReason as $,AgentSmithReader as A,deriveOrphan as B,deriveStatus as C,DEFAULT_TIMEOUT_MS as D,writeAtomic as E,FILES as F,summaryTail as G,failureFields as H,writeAcceptance as I,getProvider as J,isContinuationKind as K,nextActionFor as L,MODES as M,fileSig as N,jobsDir as O,PROVIDERS as P,JobWriter as Q,REASONS as R,STAGE_PROMPTS as S,newJobId$1 as T,humanDuration as U,pipeEvents as V,pipelineRecordPath as W,computeStaleReads as X,SMITH_PAYLOAD as Y,isForgeStatus as Z,readJsonSafe as _,MODE_PRESETS as a,toolLabel as a0,readPipeline as b,cancelPipeline as c,readAcceptance as d,jobFile as e,settleAcceptance as f,isMode as g,markAcceptanceSuperseded as h,inheritContinuedProviders as i,jobDir as j,isTerminalForgeStatus as k,readManifest as l,markAcceptancePending as m,normalize as n,errMessage as o,providerNames as p,findProvider as q,reasonFromText as r,startPipeline as s,SCHEMA_VERSION as t,validOwnerPid as u,validateSpec as v,writeJsonAtomic as w,ownerAlive as x,reportFor as y,cwdFacts as z};

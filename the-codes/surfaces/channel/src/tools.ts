@@ -427,7 +427,7 @@ const steerJob: Handler = async (ctx, args) => {
   if (delivery === undefined) throw new Error('delivery is required: choose "queue" (after current turn) or "interrupt" (stop current turn now).');
   const allowFresh = boolean(args, 'allowFresh');
   try {
-    const ack = await (ctx.service.steer as (req: Record<string, unknown>) => Promise<Record<string, unknown>>)({
+    const ack = await ctx.service.steer({
       worker, prompt, context, files, delivery,
       ...(allowFresh !== undefined ? { allowFresh } : {}),
     });
@@ -445,7 +445,7 @@ const steerJob: Handler = async (ctx, args) => {
     const detail = await resolveWorkerDetail(ctx, err.jobId);
     if (detail.status === 'running' && !detail.supersededBy) {
       // Turn chained or restarted concurrently; try steering the live head once.
-      const ack = await (ctx.service.steer as (req: Record<string, unknown>) => Promise<Record<string, unknown>>)({
+      const ack = await ctx.service.steer({
         worker: detail.jobId, prompt, context, files, delivery,
         ...(allowFresh !== undefined ? { allowFresh } : {}),
       });
@@ -475,6 +475,8 @@ const steerJob: Handler = async (ctx, args) => {
       ...result.ack,
       action: 'resumed',
       delivery: 'queue',
+      pendingSteers: 0,
+      signalled: false,
       resumable: true,
       note: `Prior turn already succeeded; resumed as turn ${String(result.ack.turn)} (${String(result.ack.jobId)}).`,
     }, { compact: true });

@@ -31,13 +31,14 @@ function assertValid(tool: string, result: ToolOutcome, label: string): Record<s
 
 const repo = mkdtempSync(path.join(tmpdir(), 'smith-schema-'));
 const ack: SpawnAck = {
-  jobId: 'job-1', name: 'Ada', workerId: 'Ada', role: 'review', provider: 'codex', status: 'running',
+  jobId: 'job-1', name: 'Ada', workerId: 'Ada', turn: 1, role: 'review', provider: 'codex', status: 'running',
   dir: path.join(repo, '.agent-smith', 'jobs', 'job-1'), repo, timeoutMs: 2_700_000, unrestricted: false,
   note: 'spawned', sandbox: 'codex -s read-only', sandboxFlags: ['-s', 'read-only'], readOnlyRequested: true, readOnlyEnforced: true,
   modelRequested: null, modelResolved: 'gpt-x', modelSource: 'harness-config', preambleApplied: true, warnings: ['effort typo'],
+  chainStartedAt: '2026-10-11T09:00:00.000Z',
 };
 const summary: JobSummary = {
-  jobId: 'job-1', name: 'Ada', workerId: 'Ada', role: 'review', latestSummary: 'Found two bugs in the parser.', summarySource: 'worker',
+  jobId: 'job-1', name: 'Ada', workerId: 'Ada', turn: 1, role: 'review', latestSummary: 'Found two bugs in the parser.', summarySource: 'worker',
   status: 'succeeded', provider: 'codex', mode: 'review', model: 'gpt-x', task: 'Review parser', toolCalls: 4,
   currentActivity: null, lastActivity: { stepIndex: 3, tool: 'shell', input: 'npm test', status: 'done' },
   startedAt: '2026-10-11T09:00:00.000Z', updatedAt: '2026-10-11T09:05:00.000Z', finishedAt: '2026-10-11T09:05:00.000Z',

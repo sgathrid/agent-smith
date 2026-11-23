@@ -127,7 +127,7 @@ export async function buildPlugin({ repoRoot = DEFAULT_ROOT, outputRoot = path.j
     writeJson(path.join(staging, 'hooks', 'watch-hooks.json'), {
       hooks: {
         PostToolUse: [{
-          matcher: ['spawn_job', 'run_pipeline', 'resume_job'].map((n) => `${toolPrefix}${n}`).join('|'),
+          matcher: ['spawn_job', 'run_pipeline', 'resume_job', 'steer_job'].map((n) => `${toolPrefix}${n}`).join('|'),
           hooks: [{
             type: 'command',
             command: 'node "${CLAUDE_PLUGIN_ROOT}/runtime/dist/watch-hook.js"',

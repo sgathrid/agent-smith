@@ -405,3 +405,29 @@ test('runHook for a variants ack drops lines for claimed variants and is silent 
     assert.equal(out, '');
   } finally { fs.rmSync(repo, { recursive: true, force: true }); }
 });
+
+test('parseHookInput handles steer_job: ignores queued/interrupting steers and watches action:resumed', () => {
+  assert.equal(parseHookInput(wrap('steer_job', { jobId: 'j1', status: 'running', action: 'queued', repo: '/tmp/r' })), null);
+  assert.equal(parseHookInput(wrap('steer_job', { jobId: 'j1', status: 'running', action: 'interrupting', repo: '/tmp/r' })), null);
+  const resumed = parseHookInput(wrap('steer_job', { jobId: 'j2', status: 'running', action: 'resumed', repo: '/tmp/r', timeoutMs: 120_000 }));
+  assert.deepEqual({ kind: resumed?.kind, id: resumed?.id, cwd: resumed?.cwd }, { kind: 'job', id: 'j2', cwd: '/tmp/r' });
+});
+
+test('runHook suppresses output when the post-steer head jobId has a claim marker', async () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-steer-claim-'));
+  try {
+    const input = JSON.stringify(wrap('spawn_job', { jobId: 'turn-1', status: 'running', repo }));
+    const m = claimMarkerPath(repo, 'job', 'turn-2');
+    fs.mkdirSync(path.dirname(m), { recursive: true });
+    fs.writeFileSync(m, 'c\n');
+    let out = '';
+    const code = await runHook(input, (s) => { out += s; }, {
+      readJob: async (_c: string, id: string) => id === 'turn-1'
+        ? { ...job('turn-1', 'succeeded'), supersededBy: 'turn-2' }
+        : job('turn-2', 'canceled'),
+      intervalMs: 50,
+    });
+    assert.equal(code, 0);
+    assert.equal(out, '');
+  } finally { fs.rmSync(repo, { recursive: true, force: true }); }
+});

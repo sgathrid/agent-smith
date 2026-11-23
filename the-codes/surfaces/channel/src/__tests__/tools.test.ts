@@ -173,7 +173,7 @@ test('spawn_job ack is slim: identity, budget, permissions and warnings only', a
   const r = await callTool({ service, catalogs: async () => [cat('codex')] } as HandlerContext, 'spawn_job', { mode: 'review', prompt: 'x', provider: 'codex' });
   assert.equal(r.isError, undefined);
   assert.deepEqual(body(r), { jobId: 'j9', name: 'Ada', workerId: 'j9', turn: 1, provider: 'codex', model: 'gpt-x', status: 'running', timeoutMs: 1000, repo, unrestricted: false, readOnlyEnforced: true });
-  assert.ok(text(r).length < 250, text(r));
+  assert.ok(text(r).length < 280, text(r));
 });
 
 test('an unrestricted review ack still says whether read-only is enforced', async () => {

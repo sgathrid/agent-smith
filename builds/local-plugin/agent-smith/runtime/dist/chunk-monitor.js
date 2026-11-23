@@ -1,4 +1,4 @@
-import path from'node:path';import {fileURLToPath}from'node:url';import {r as reasonFromText,Z as readJsonSafe,V as pipelineRecordPath,A as AgentSmithReader,n as normalize,d as readAcceptance,k as isTerminalForgeStatus}from'./chunk-execute.js';import {a as claudeText,A as ACCEPTANCE_HOLD_MS,b as pipelineOutcome,l as livenessOf,i as isStalled}from'./chunk-stale.js';/**
+import path from'node:path';import {fileURLToPath}from'node:url';import {r as reasonFromText,_ as readJsonSafe,W as pipelineRecordPath,A as AgentSmithReader,n as normalize,d as readAcceptance,k as isTerminalForgeStatus,O as jobsDir,j as jobDir}from'./chunk-normalize.js';import {a as claudeText,A as ACCEPTANCE_HOLD_MS,b as pipelineOutcome,l as livenessOf,w as waitForChange}from'./chunk-stale.js';/**
  * policy.ts — when the channel is allowed to speak into Claude's context.
  *
  * This file is the whole point of Surface 2, and it is pure so it can be tested
@@ -35,8 +35,6 @@ import path from'node:path';import {fileURLToPath}from'node:url';import {r as re
  * Budget: one short line per job plus a closing next step (the text is
  * mod/hooks/notice.ts claudeText). Worker prose is excerpted, never pasted whole.
  */
-// The words live in the mod (hooks/notice.ts), which announces the same jobs
-// when it is loaded: one renderer, so the hook and the mod cannot drift apart.
 /**
  * Which pushable event, if any, this job's current state represents.
  *
@@ -164,11 +162,12 @@ function buildBatch(candidates, now) {
 function toNotice(job, kind, now) {
     const run = job.role === 'pipeline' && job.outcome !== undefined;
     const dead = kind === 'attention' && job.liveness?.state === 'dead';
+    const start = job.chainStartedAt ?? job.startedAt;
     const span = dead
         ? (job.liveness?.since == null ? NaN : now - job.liveness.since)
         : kind === 'attention'
             ? (job.lastEventAt === null ? NaN : now - Date.parse(job.lastEventAt))
-            : (job.startedAt && job.finishedAt ? Date.parse(job.finishedAt) - Date.parse(job.startedAt) : NaN);
+            : (start && job.finishedAt ? Date.parse(job.finishedAt) - Date.parse(start) : NaN);
     return {
         id: job.id, kind, name: job.name ?? null, provider: job.provider ?? null, role: job.role ?? null,
         run,
@@ -178,7 +177,7 @@ function toNotice(job, kind, now) {
         reason: run ? job.outcome : kind === 'failed' ? job.failureDetail || reasonFromText(job.failureReason) : null,
         summary: job.summarySource === 'worker' ? job.latestSummary ?? null : null,
         ...(job.staleReads && job.staleReads.length > 0 ? { staleReads: job.staleReads } : {}),
-        ...(job.steeredFrom ? { steered: true } : {}),
+        ...(job.continuationKind ? { continuationKind: job.continuationKind } : {}),
         ...(job.steerNotApplied ? { steerNotApplied: true } : {}),
         ...(kind === 'finished' && job.checksRunning !== undefined ? { checksRunning: job.checksRunning } : {}),
         ...(kind === 'attention' && job.liveness ? { liveness: { state: job.liveness.state, ...(job.liveness.tool ? { tool: job.liveness.tool } : {}) } } : {}),
@@ -272,12 +271,18 @@ async function readOne(cwd, jobId, now) {
             passed: acceptance.checks.filter((c) => c?.ok === true).length, total: acceptance.checks.length,
             failed: acceptance.checks.flatMap((c) => (c?.ok !== true && typeof c?.name === 'string' ? [c.name] : [])),
         } : null;
+    const continuedFrom = typeof raw['continuedFrom'] === 'string' && raw['continuedFrom'] !== '' ? raw['continuedFrom'] : null;
+    const rk = raw['continuationKind'];
+    const continuationKind = rk === 'steer-queue' || rk === 'steer-interrupt' || rk === 'resume' ? rk : null;
     return {
         id: observed.jobId,
+        workerId: typeof raw['workerId'] === 'string' && raw['workerId'] !== '' ? raw['workerId'] : observed.jobId,
         name: typeof observed.raw['name'] === 'string' ? observed.raw['name'] : undefined,
+        turn: typeof raw['turn'] === 'number' && Number.isInteger(raw['turn']) && raw['turn'] >= 1 ? raw['turn'] : 1,
         role: typeof observed.raw['role'] === 'string' ? observed.raw['role'] : observed.mode ?? undefined,
         provider: typeof observed.raw['provider'] === 'string' ? observed.raw['provider'] : undefined,
         startedAt: observed.startedAt,
+        chainStartedAt: typeof raw['chainStartedAt'] === 'string' && raw['chainStartedAt'] !== '' ? raw['chainStartedAt'] : observed.startedAt,
         changedFileCount: Array.isArray(observed.raw['changed_files']) ? observed.raw['changed_files'].length : undefined,
         latestSummary: typeof raw['latestSummary'] === 'string' ? raw['latestSummary'] : null,
         failureReason: [raw['reason'], raw['error']].find((v) => typeof v === 'string' && v !== '') ?? null,
@@ -292,7 +297,8 @@ async function readOne(cwd, jobId, now) {
         finishedAt: observed.finishedAt,
         warned,
         supersededBy: typeof raw['supersededBy'] === 'string' && raw['supersededBy'] !== '' ? raw['supersededBy'] : null,
-        steeredFrom: typeof raw['steeredFrom'] === 'string' && raw['steeredFrom'] !== '' ? raw['steeredFrom'] : null,
+        continuedFrom,
+        continuationKind,
         ...(observed.warnings.some((w) => w.code === 'steer_not_applied') ? { steerNotApplied: true } : {}),
         ...(Array.isArray(raw['staleReads']) && raw['staleReads'].length > 0
             ? { staleReads: raw['staleReads'].filter((f) => typeof f === 'string' && f.trim() !== '') }
@@ -334,7 +340,8 @@ function toWatchStatus(observed, now) {
         return observed.status;
     // silent or dead needs eyes; active and in-tool (a long command) do not. No
     // event time at all is `silent`: "we do not know" is never drawn as "fine".
-    return isStalled(watchLiveness(observed, now)) ? 'attention' : 'running';
+    const live = watchLiveness(observed, now);
+    return live !== null && (live.state === 'silent' || live.state === 'dead') ? 'attention' : 'running';
 }/**
  * Job-scoped monitor entrypoint (the `notify.fallback` monitorCommand).
  *
@@ -342,18 +349,36 @@ function toWatchStatus(observed, now) {
  * launch it with `--job`/`--run` and consume one human-readable line per
  * milestone from stdout. Routine running/progress polls produce no stdout.
  */
-function delay(ms, signal) {
-    if (signal?.aborted)
-        return Promise.resolve();
-    return new Promise((resolve) => {
-        const timer = setTimeout(done, ms);
-        function done() {
-            clearTimeout(timer);
-            signal?.removeEventListener('abort', done);
-            resolve();
-        }
-        signal?.addEventListener('abort', done, { once: true });
-    });
+function safeJobDir(cwd, id) {
+    try {
+        return jobDir(cwd, id);
+    }
+    catch {
+        return jobsDir(cwd);
+    }
+}
+async function waitForAnyChange(dirs, fallbackDir, timeoutMs, opts) {
+    if (opts.signal?.aborted || !(timeoutMs > 0))
+        return;
+    const unique = [...new Set(dirs)];
+    if (unique.length === 0) {
+        await waitForChange(fallbackDir, timeoutMs, opts);
+        return;
+    }
+    if (unique.length === 1) {
+        await waitForChange(unique[0], timeoutMs, opts);
+        return;
+    }
+    const slice = new AbortController();
+    const onAbort = () => slice.abort();
+    opts.signal?.addEventListener('abort', onAbort, { once: true });
+    try {
+        await Promise.race(unique.map((dir) => waitForChange(dir, timeoutMs, { signal: slice.signal, fallbackMs: opts.fallbackMs })));
+    }
+    finally {
+        slice.abort();
+        opts.signal?.removeEventListener('abort', onAbort);
+    }
 }
 async function emitStdout(line) {
     if (process.stdout.write(`${line}\n`))
@@ -370,13 +395,17 @@ async function emitStdout(line) {
     });
 }
 const DEFAULT_WATCH_TIMEOUT_MS = 45 * 60_000 + 60_000;
+/** Upper bound on one fs.watch slice so a dead supervisor (no file write) is still reconciled promptly. */
+const WATCH_RECHECK_MS = 5_000;
+const WATCH_FALLBACK_MS = 500;
 /**
  * Watch specific jobs/runs until each is terminal. There is NO silent
  * baseline: a job that already finished before the watcher
  * started is reported on the first observation.
  */
 async function runJobWatch(options) {
-    const intervalMs = Math.max(50, options.intervalMs ?? 2_000);
+    const recheckMs = Math.max(50, options.intervalMs ?? WATCH_RECHECK_MS);
+    const fallbackMs = Math.max(50, options.intervalMs ?? WATCH_FALLBACK_MS);
     const timeoutMs = options.timeoutMs ?? DEFAULT_WATCH_TIMEOUT_MS;
     const now = options.now ?? Date.now;
     const rj = options.readJob ?? readJob;
@@ -389,6 +418,7 @@ async function runJobWatch(options) {
     const done = new Set();
     let startedAt = now();
     while (!options.signal?.aborted) {
+        const watchDirs = [];
         try {
             const t = now();
             const jobs = new Map();
@@ -396,8 +426,11 @@ async function runJobWatch(options) {
             for (let i = 0; i < jobIds.length; i++) {
                 const id = jobIds[i];
                 const job = await rj(options.cwd, id, t);
-                if (!job)
+                if (!job) {
+                    if (!done.has(id))
+                        watchDirs.push(safeJobDir(options.cwd, id));
                     continue;
+                }
                 jobs.set(job.id, job);
                 if (job.supersededBy && job.supersededBy !== job.id) {
                     if (jobIds.includes(job.supersededBy)) {
@@ -416,11 +449,18 @@ async function runJobWatch(options) {
             }
             for (const id of runIds) {
                 const rec = await rr(options.cwd, id);
-                if (!rec)
+                if (!rec) {
+                    if (!done.has(id))
+                        watchDirs.push(path.dirname(pipelineRecordPath(options.cwd, id)));
                     continue;
+                }
                 jobs.set(rec.job.id, rec.job);
                 want.add(rec.job.id);
+                if (!done.has(rec.job.id))
+                    watchDirs.push(path.dirname(pipelineRecordPath(options.cwd, id)));
                 for (const sid of rec.stageJobIds) {
+                    if (!done.has(sid))
+                        watchDirs.push(safeJobDir(options.cwd, sid));
                     if (jobs.has(sid))
                         continue;
                     const sj = await rj(options.cwd, sid, t);
@@ -450,11 +490,15 @@ async function runJobWatch(options) {
                 if (job?.supersededBy) {
                     if (want.has(job.supersededBy))
                         done.add(id);
+                    else
+                        watchDirs.push(safeJobDir(options.cwd, id));
                     continue;
                 }
                 // Exited with checks still running: the verdict is a second notice, so keep watching (unless announcing once).
                 if (job && isTerminalForgeStatus(job.status) && (options.announceOnce === true || job.checksRunning === undefined) && (seen.get(id)?.has(dedupeKey(job)) ?? false))
                     done.add(id);
+                else if (!done.has(id) && !runIds.includes(id))
+                    watchDirs.push(safeJobDir(options.cwd, id));
             }
             if (want.size > 0 && [...want].every((id) => done.has(id)))
                 return 'done';
@@ -462,7 +506,8 @@ async function runJobWatch(options) {
         catch (error) {
             onError(error);
         }
-        if (now() - startedAt >= timeoutMs) {
+        const elapsed = now() - startedAt;
+        if (elapsed >= timeoutMs) {
             const ids = [...jobIds, ...runIds].filter((id) => !done.has(id));
             try {
                 await emit(`Agent Smith · still running: ${ids.join(', ')}`, null);
@@ -472,7 +517,7 @@ async function runJobWatch(options) {
             }
             return 'timeout';
         }
-        await delay(intervalMs, options.signal);
+        await waitForAnyChange(watchDirs, jobsDir(options.cwd), Math.min(recheckMs, Math.max(1, timeoutMs - elapsed)), { signal: options.signal, fallbackMs });
     }
     return 'aborted';
 }

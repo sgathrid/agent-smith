@@ -48,15 +48,15 @@
  * band/pane ordering deviation left to document.
  */
 
-import type { RadarJob, RadarStatus } from '../types/index.d.ts';
+import type { ContinuationKind, RadarJob, RadarStatus } from '../types/index.d.ts';
 import { REASONS, checksReason, reasonFromText } from './reasons.ts';
-import { ELAPSED_WIDTH, clockCell, elapsed, elapsedCell } from './clock.ts';
+import { ELAPSED_WIDTH, clockCell, effectiveStart, elapsed, elapsedCell } from './clock.ts';
 import { fitCell, oneLine, sanitizeText } from './text.ts';
 import { durationWords } from './notice.ts';
 
 // The clock and text helpers live in their own files; format.ts stays the one
 // vocabulary the band, pane and tests import from.
-export { ELAPSED_WIDTH, clockCell, elapsed, elapsedCell, fitCell, oneLine, sanitizeText };
+export { ELAPSED_WIDTH, clockCell, effectiveStart, elapsed, elapsedCell, fitCell, oneLine, sanitizeText };
 
 // ── glyphs ──────────────────────────────────────────────────────────────────
 
@@ -354,14 +354,29 @@ export function livenessWords(job: RadarJob): string {
   }
 }
 
+/** `steer queued` or `N steers queued` when unconsumed steers are waiting, else ''. */
+export function pendingSteersLabel(count: number | null | undefined): string {
+  if (typeof count !== 'number' || !Number.isFinite(count) || count <= 0) return '';
+  const n = Math.floor(count);
+  return n === 1 ? 'steer queued' : `${n} steers queued`;
+}
+
+/** Honest continuation label: `after steer` for steers, `resumed` for resumes, else ''. */
+export function continuationLabel(kind: ContinuationKind | null | undefined): string {
+  if (kind === 'steer-queue' || kind === 'steer-interrupt') return 'after steer';
+  if (kind === 'resume') return 'resumed';
+  return '';
+}
+
 /**
  * What the third cell says.
  *
  * LIVE jobs say what they are doing, in a human verb (see `humanCommand`), plus
- * a tool count — which on a running job is a LIVENESS signal (is the number
- * still climbing?) and on a finished job is noise (TERMINAL-UI.md §Hierarchy
- * puts token counts and tool counts outside a glance row entirely; 504 versus 36
- * tells a reader nothing about which job worked).
+ * any queued steers, turn number (when > 1), and a tool count — which on a
+ * running job is a LIVENESS signal (is the number still climbing?) and on a
+ * finished job is noise (TERMINAL-UI.md §Hierarchy puts token counts and tool
+ * counts outside a glance row entirely; 504 versus 36 tells a reader nothing
+ * about which job worked).
  *
  * TERMINAL jobs say how they ended. A failure names its warning CODE rather than
  * its message: harness/types.ts makes the code the stable grouping key and the
@@ -371,11 +386,17 @@ export function livenessWords(job: RadarJob): string {
 export function jobDetail(job: RadarJob, options: { tools?: boolean } = {}): string {
   const withTools = options.tools !== false;
   if (isTerminal(job.status)) {
+    if (job.acceptance?.pending && !job.supersededBy) {
+      return job.turn > 1 ? `checking ${SEP} turn ${job.turn}` : 'checking';
+    }
     return outcome(job);
   }
   const parts: string[] = [];
   const quiet = livenessWords(job);
   if (quiet !== '') parts.push(quiet);
+  const steers = pendingSteersLabel(job.pendingSteers);
+  if (steers !== '') parts.push(steers);
+  if (job.turn > 1) parts.push(`turn ${job.turn}`);
   // An open call already named by the liveness words needs no second phrase.
   const activity = job.liveness?.state === 'in-tool' && quiet !== '' ? '' : oneLine(job.activity);
   if (activity !== '') parts.push(activity);
@@ -397,23 +418,32 @@ export function jobDetail(job: RadarJob, options: { tools?: boolean } = {}): str
  */
 export function outcome(job: RadarJob): string {
   if (job.supersededBy && isTerminal(job.status)) return 'steered';
+  let base: string;
   switch (job.status) {
     case 'running':
       return '';
     case 'attention':
       return livenessWords(job) || 'no output';
     case 'succeeded':
-      if (job.acceptance?.state === 'rejected' && !job.acceptance.pending && job.acceptance.checks.length > 0) return failedChecks(job);
-      return job.warnings.length > 0 ? `done ${SEP} warnings` : 'done';
+      if (job.acceptance?.state === 'rejected' && !job.acceptance.pending && job.acceptance.checks.length > 0) base = failedChecks(job);
+      else base = job.warnings.length > 0 ? `done ${SEP} warnings` : 'done';
+      break;
     case 'failed': {
       const why = failureWords(job);
-      return why === '' ? 'failed' : `failed ${SEP} ${why}`;
+      base = why === '' ? 'failed' : `failed ${SEP} ${why}`;
+      break;
     }
     case 'canceled':
-      return 'canceled';
+      base = 'canceled';
+      break;
     case 'unknown':
       return 'unknown';
   }
+  const parts = [base];
+  if (job.turn > 1) parts.push(`turn ${job.turn}`);
+  const cont = continuationLabel(job.continuationKind);
+  if (cont !== '') parts.push(cont);
+  return parts.join(` ${SEP} `);
 }
 
 // ── the row ─────────────────────────────────────────────────────────────────
@@ -650,9 +680,9 @@ export function sortJobs(jobs: readonly RadarJob[]): RadarJob[] {
  * linger window is already at most four rows from the top.
  */
 export function sortForBand(jobs: readonly RadarJob[]): RadarJob[] {
+  const rank = (j: RadarJob): number => (isLiveStatus(j.status) || j.acceptance?.pending === true ? 0 : 1);
   return [...jobs].sort((a, b) => {
-    const rank = (s: RadarStatus): number => (isLiveStatus(s) ? 0 : 1);
-    const r = rank(a.status) - rank(b.status);
+    const r = rank(a) - rank(b);
     if (r !== 0) return r;
     return (b.endedAt ?? b.startedAt ?? 0) - (a.endedAt ?? a.startedAt ?? 0);
   });

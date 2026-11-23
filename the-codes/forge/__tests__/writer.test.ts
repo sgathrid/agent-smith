@@ -550,15 +550,14 @@ test('bounded canonical detail round-trips text fragments, tool identity and act
   };
   const detail = await readForgeDetail(fs, r, id, Date.now());
   assert.equal(detail?.job.toolCount, 1, 'a high provider step index is not a tool count');
-  assert.deepEqual(detail?.transcript, ['Found the edge case.']);
   assert.deepEqual(detail?.timeline?.map(e=>e.kind), ['tool','assistant']);
   assert.deepEqual(detail?.timeline?.map(e=>e.sequence), [0,1]);
   assert.equal(detail?.timeline?.[0]?.kind==='tool' ? detail.timeline[0].state : null, 'done');
   assert.equal(detail?.timeline?.[1]?.kind==='assistant' ? detail.timeline[1].text : null, 'Found the edge case.');
   assert.equal(JSON.parse(readFileSync(jobFile(r,id,FILES.progress),'utf8')).recentActivities[0].tool, 'Read');
-  assert.equal(detail?.history[0]?.tool, 'Read', 'completion must retain the original tool name');
-  assert.equal(detail?.history[0]?.label, 'source.ts');
-  assert.equal(detail?.history[0]?.state, 'done');
+  assert.equal(detail?.timeline?.[0]?.kind==='tool' ? detail.timeline[0].tool : null, 'Read', 'completion must retain the original tool name');
+  assert.equal(detail?.timeline?.[0]?.kind==='tool' ? detail.timeline[0].input : null, 'source.ts');
+  assert.equal(detail?.timeline?.[0]?.kind==='tool' ? detail.timeline[0].state : null, 'done');
   assert.match(detail?.job.prompt ?? '', /Dashboard rework/);
 });
 

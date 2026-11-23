@@ -1,6 +1,6 @@
 /** Pure rules for the Forge sidebar: which workers it lists and how it labels them. */
 import type { ActivityEvent, RadarAcceptance, RadarJob } from '../types/index.d.ts';
-import { countSummary, elapsed, elapsedCell, failedChecks, failureWords, isTerminal, jobLabel, livenessWords, oneLine, pickGlyph } from './format.ts';
+import { continuationLabel, countSummary, effectiveStart, elapsed, elapsedCell, failedChecks, failureWords, isTerminal, jobLabel, livenessWords, oneLine, pendingSteersLabel, pickGlyph } from './format.ts';
 import { classify } from './progress.ts';
 
 /** A settled failure or rejection stops asking for attention this long after it ended. */
@@ -88,7 +88,7 @@ export function forgeList(jobs: readonly RadarJob[]): RadarJob[] {
 export function findWorker(jobs: readonly RadarJob[], query: string): RadarJob | undefined {
   const q = query.trim().toLowerCase();
   return jobs.find((job) => job.id === query.trim()) ??
-    forgeList(jobs).find((job) => job.name?.trim().toLowerCase() === q || job.workerId?.toLowerCase() === q);
+    forgeList(jobs).find((job) => job.name?.trim().toLowerCase() === q || job.workerId.toLowerCase() === q);
 }
 export function workerHeading(job: RadarJob): string {
   const role = oneLine(job.role ?? job.provider ?? '');
@@ -100,9 +100,9 @@ export function workerHeading(job: RadarJob): string {
  *
  * A terminal job also carries the facts a reader would otherwise have to open
  * the pane for: how much it changed, whether its checks passed, and whether this
- * turn came after a steer. All of it is EVIDENCE the writer recorded — never a
- * prescription, and never a fabricated `0 files` (an absent edit count means
- * "not visible", not zero; see progress.ts).
+ * turn came after a steer or resume. All of it is EVIDENCE the writer recorded —
+ * never a prescription, and never a fabricated `0 files` (an absent edit count
+ * means "not visible", not zero; see progress.ts).
  */
 export function workerStatus(job: RadarJob): string {
   if (job.supersededBy && isTerminal(job.status)) return 'steered';
@@ -120,10 +120,13 @@ export function workerStatus(job: RadarJob): string {
   } else if (job.acceptance?.state === 'rejected') {
     base = `${job.status} · checks failed`;
   } else if (job.status === 'running') {
+    const steers = pendingSteersLabel(job.pendingSteers);
     const act = livenessWords(job) || oneLine(job.activity);
-    return act ? `Running · ${act}` : 'Running';
+    return ['Running', steers, act].filter(Boolean).join(' · ');
   } else if (job.status === 'attention') {
-    return livenessWords(job) || 'no output';
+    const steers = pendingSteersLabel(job.pendingSteers);
+    const quiet = livenessWords(job) || 'no output';
+    return steers ? `${quiet} · ${steers}` : quiet;
   } else {
     base = job.status === 'succeeded' ? 'done' : job.status;
   }
@@ -138,7 +141,8 @@ export function workerStatus(job: RadarJob): string {
     const label = checksLabel(job.acceptance);
     if (label !== '') parts.push(label);
   }
-  if (job.steeredFrom) parts.push('after steer');
+  const cont = continuationLabel(job.continuationKind);
+  if (cont !== '') parts.push(cont);
   return parts.join(' · ');
 }
 
@@ -151,33 +155,27 @@ export interface WorkerLivenessLine {
 }
 
 /**
- * The detail-pane liveness callout for a live worker, driven by `job.liveness`
- * (from `stale.ts` `livenessOf`). Falls back to a 2-minute silence check for
- * older snapshots that lack `liveness`.
+ * The detail-pane liveness callout for a live worker, driven solely by
+ * `job.liveness` (from `stale.ts` `livenessOf`).
  */
-export function workerLivenessLine(job: RadarJob, now: number): WorkerLivenessLine | null {
+export function workerLivenessLine(job: RadarJob): WorkerLivenessLine | null {
   if (isTerminal(job.status)) return null;
   const l = job.liveness;
-  if (l) {
-    switch (l.state) {
-      case 'in-tool':
-        return null;
-      case 'active':
-        return l.silentForMs >= PANE_QUIET_MS
-          ? { text: `No output ${elapsed(l.silentForMs)} · process alive`, tone: 'dim' }
-          : null;
-      case 'silent':
-        return { text: `Stalled ${elapsed(l.forMs)}`, tone: 'yellow' };
-      case 'dead':
-        return { text: `Worker process gone ${elapsed(l.forMs)}`, tone: 'red' };
-      default:
-        return null;
-    }
+  if (!l) return null;
+  switch (l.state) {
+    case 'in-tool':
+      return null;
+    case 'active':
+      return l.silentForMs >= PANE_QUIET_MS
+        ? { text: `No output ${elapsed(l.silentForMs)} · process alive`, tone: 'dim' }
+        : null;
+    case 'silent':
+      return { text: `No output ${elapsed(l.forMs)}`, tone: 'yellow' };
+    case 'dead':
+      return { text: `Worker process gone ${elapsed(l.forMs)}`, tone: 'red' };
+    default:
+      return null;
   }
-  if (job.status === 'running' && job.lastEventAt != null && now - job.lastEventAt > PANE_QUIET_MS) {
-    return { text: `Stalled ${elapsed(now - job.lastEventAt)}`, tone: 'yellow' };
-  }
-  return null;
 }
 
 /** `3 files changed`, else `2 files edited` from the digest, else '' — never `0 files`. */
@@ -200,11 +198,12 @@ export function statusLine(job: RadarJob, now: number, width: number): string {
   // No start time means no clock: format.ts's clockCell is BLANK, never `0s`,
   // because a confident `0s` about a job that has been working for half an hour
   // is the one lie this surface must not tell.
-  if (job.startedAt === null) return oneLine(workerStatus(job), Math.max(1, width));
-  const clock = elapsedCell((job.endedAt ?? now) - job.startedAt);
+  const start = effectiveStart(job);
+  if (start === null) return oneLine(workerStatus(job), Math.max(1, width));
+  const clock = elapsedCell((job.endedAt ?? now) - start);
   const room = Math.max(1, width - clock.length - 3);
   // A settled row also says when it started, so two workers with alike names can be told apart.
-  const status = isTerminal(job.status) ? `${workerStatus(job)} · started ${clockTime(job.startedAt)}` : workerStatus(job);
+  const status = isTerminal(job.status) ? `${workerStatus(job)} · started ${clockTime(start)}` : workerStatus(job);
   return `${oneLine(status, room).padEnd(room)}   ${clock}`;
 }
 /** Local `HH:MM` of an epoch-ms time. */
@@ -215,13 +214,37 @@ function clockTime(ms: number): string {
 
 /**
  * How many turns this worker has taken across the jobs on hand: one job per
- * turn, steered continuations included. At least 1, so a lone job reads as the
- * first turn.
+ * turn, steered and resumed continuations included. At least `job.turn` (and >= 1).
  */
 export function turnCount(job: RadarJob, allJobs: readonly RadarJob[]): number {
-  const workerId = job.workerId;
-  if (workerId === undefined || workerId === null || workerId === '') return 1;
-  return Math.max(1, allJobs.filter((other) => other.workerId === workerId).length);
+  const observed = allJobs.filter((other) => other.workerId === job.workerId).length;
+  return Math.max(1, job.turn ?? 1, observed);
+}
+
+/** Compact clickable summary for a prior turn row inline above the live turn in `/forge`. */
+export function priorTurnSummary(job: RadarJob, fallbackTurn: number, now: number): string {
+  const turn = job.turn ?? fallbackTurn;
+  let state: string;
+  if (job.supersededBy && isTerminal(job.status)) {
+    state = 'steered';
+  } else if (job.status === 'succeeded') {
+    if (job.acceptance?.state === 'rejected' && !job.acceptance.pending) {
+      state = job.acceptance.checks.length > 0 ? failedChecks(job) : 'checks failed';
+    } else {
+      state = 'done';
+    }
+  } else if (job.status === 'failed') {
+    const why = failureWords(job);
+    state = why === '' ? 'failed' : `failed · ${why}`;
+  } else {
+    state = job.status;
+  }
+  const parts: string[] = [`▸ Turn ${turn}`, state];
+  if (job.toolCount !== null) parts.push(`${job.toolCount} ${job.toolCount === 1 ? 'tool' : 'tools'}`);
+  // Prior-turn rows show each turn's own duration (endedAt - startedAt), not the chain's.
+  const span = job.startedAt === null ? null : (job.endedAt ?? now) - job.startedAt;
+  if (span !== null) parts.push(elapsed(span));
+  return parts.join(' · ');
 }
 
 /** How many worker rows the recap board lists before folding the rest. */
@@ -245,7 +268,8 @@ export function sessionBoard(jobs: readonly RadarJob[], scope: 'session' | 'all'
   const shown = workers.slice(0, BOARD_ROWS);
   for (const job of shown) {
     const turns = turnCount(job, jobs);
-    const span = job.startedAt === null ? null : (job.endedAt ?? now) - job.startedAt;
+    const start = effectiveStart(job);
+    const span = start === null ? null : (job.endedAt ?? now) - start;
     const glyph = job.status === 'succeeded' && job.acceptance?.state === 'rejected' && !job.acceptance.pending
       ? pickGlyph('failed') : pickGlyph(job.status);
     const line = `${glyph} ${workerHeading(job)}${turns > 1 ? ` · turn ${turns}` : ''} — ${workerStatus(job)}${span !== null ? ` · ${elapsed(span)}` : ''}`;
@@ -325,19 +349,60 @@ export function timelineGroupLabel(reads: number, searches: number, commands = 0
   return parts.join(' · ');
 }
 
-/** Group only recorded worker identities. The job id fallback never joins strangers. */
+/**
+ * Head-turn selection rule for one worker across turns (matches ForgeService):
+ * (1) `!supersededBy` > `Boolean(supersededBy)`
+ * (2) `isLive` > terminal
+ * (3) higher `turn`
+ * (4) newer `startedAt ?? endedAt ?? 0`
+ * (5) deterministic `id` tie-breaker
+ */
+export function isBetterHead(candidate: RadarJob, current: RadarJob): boolean {
+  const cSup = Boolean(candidate.supersededBy);
+  const oSup = Boolean(current.supersededBy);
+  if (cSup !== oSup) return !cSup;
+  const cLive = isLive(candidate);
+  const oLive = isLive(current);
+  if (cLive !== oLive) return cLive;
+  const cTurn = candidate.turn ?? 1;
+  const oTurn = current.turn ?? 1;
+  if (cTurn !== oTurn) return cTurn > oTurn;
+  const cAt = candidate.startedAt ?? candidate.endedAt ?? 0;
+  const oAt = current.startedAt ?? current.endedAt ?? 0;
+  if (cAt !== oAt) return cAt > oAt;
+  return candidate.id.localeCompare(current.id) > 0;
+}
+
+/** Group turns by `workerId`, keeping each worker's head turn. */
 export function groupWorkers(jobs: readonly RadarJob[]): RadarJob[] {
-  const groups = new Map<string,RadarJob>();
+  const groups = new Map<string, RadarJob>();
   for (const job of jobs) {
-    const key = job.workerId ?? job.id;
+    const key = job.workerId || job.id;
     const old = groups.get(key);
-    const live = isLive(job);
-    const oldLive = old !== undefined && isLive(old);
-    if (!old || (live && !oldLive) || (live===oldLive &&
-      (job.startedAt??job.endedAt??0)>(old.startedAt??old.endedAt??0))) groups.set(key,job);
+    if (!old || isBetterHead(job, old)) groups.set(key, job);
   }
-  return [...groups.values()].sort((a,b) =>
-    (b.startedAt??b.endedAt??0)-(a.startedAt??a.endedAt??0) || a.id.localeCompare(b.id));
+  return [...groups.values()].sort((a, b) =>
+    (b.startedAt ?? b.endedAt ?? 0) - (a.startedAt ?? a.endedAt ?? 0) || a.id.localeCompare(b.id));
+}
+
+/** All turns belonging to one worker, sorted oldest-first (Turn 1, Turn 2, ...). */
+export function workerTurns(jobs: readonly RadarJob[], workerId: string): RadarJob[] {
+  return jobs
+    .filter((job) => job.workerId === workerId)
+    .sort((a, b) =>
+      (a.turn ?? 1) - (b.turn ?? 1) ||
+      (a.startedAt ?? a.endedAt ?? 0) - (b.startedAt ?? b.endedAt ?? 0) ||
+      a.id.localeCompare(b.id));
+}
+
+/** The head turn for one worker, or undefined when none exist. */
+export function workerHead(jobs: readonly RadarJob[], workerId: string): RadarJob | undefined {
+  let best: RadarJob | undefined;
+  for (const job of jobs) {
+    if (job.workerId !== workerId) continue;
+    if (!best || isBetterHead(job, best)) best = job;
+  }
+  return best;
 }
 
 /** What this session launched: job ids and pipeline run ids, kept for the whole session. */
@@ -346,18 +411,27 @@ export function recordLaunch(prev: Launched, launch: { readonly kind: 'job' | 'r
   const key = launch.kind === 'job' ? 'jobs' : 'runs';
   return prev[key].includes(launch.id) ? prev : { ...prev, [key]: [...prev[key], launch.id] };
 }
-/** The jobs this session launched (including steered continuations), and the stage jobs of the pipeline runs it launched. */
+/** The jobs this session launched (including steered/resumed turns of those workers), and the stage jobs of its pipeline runs. */
 export function sessionJobs(jobs: readonly RadarJob[], launched: Launched): RadarJob[] {
   const ownedIds = new Set(launched.jobs);
+  const ownedWorkers = new Set<string>();
   let changed = true;
   while (changed) {
     changed = false;
     for (const job of jobs) {
+      if (ownedIds.has(job.id) && !ownedWorkers.has(job.workerId)) {
+        ownedWorkers.add(job.workerId);
+        changed = true;
+      }
+      if (ownedWorkers.has(job.workerId) && !ownedIds.has(job.id)) {
+        ownedIds.add(job.id);
+        changed = true;
+      }
       if (ownedIds.has(job.id) && job.supersededBy && !ownedIds.has(job.supersededBy)) {
         ownedIds.add(job.supersededBy);
         changed = true;
       }
-      if (job.steeredFrom && ownedIds.has(job.steeredFrom) && !ownedIds.has(job.id)) {
+      if (job.continuedFrom && ownedIds.has(job.continuedFrom) && !ownedIds.has(job.id)) {
         ownedIds.add(job.id);
         changed = true;
       }

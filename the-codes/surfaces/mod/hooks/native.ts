@@ -185,6 +185,18 @@ function groupNativeWorkers(jobs: readonly NativeJob[]): NativeJob[] {
  * task (reopening `in_progress` and clearing `doneAt` on resume, or re-creating
  * a new task if the earlier one was already deleted after the close delay).
  */
+/** True when any completed native task belongs to a dismissible (succeeded, non-rejected) worker head waiting for CLOSE_DELAY_MS. */
+export function hasPendingNativeClose(rows: readonly RadarJob[], links: NativeTaskLinks): boolean {
+  const byWorker = new Map<string, NativeJob>();
+  for (const job of groupNativeWorkers(nativeJobsFromRadar(rows))) byWorker.set(job.workerId || job.id, job);
+  for (const [key, link] of Object.entries(links)) {
+    if (link.status !== 'completed') continue;
+    const job = byWorker.get(key);
+    if (job && job.status === 'succeeded' && job.acceptance?.state !== 'rejected') return true;
+  }
+  return false;
+}
+
 export async function syncNativeTasks(
   jobs: readonly NativeJob[],
   previous: NativeTaskLinks,

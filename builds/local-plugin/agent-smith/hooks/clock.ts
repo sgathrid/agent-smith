@@ -36,9 +36,15 @@ export function elapsedCell(ms: number): string {
   return elapsed(ms).padStart(ELAPSED_WIDTH);
 }
 
+/** Effective start time for a worker row: continuous across steers, fresh on resume. */
+export function effectiveStart(job: RadarJob): number | null {
+  return job.chainStartedAt ?? job.startedAt;
+}
+
 /** The clock cell for one job, or a BLANK cell when the start is unknown. */
 export function clockCell(job: RadarJob, now: number): string {
-  const span = job.startedAt === null ? null : (job.endedAt ?? now) - job.startedAt;
+  const start = effectiveStart(job);
+  const span = start === null ? null : (job.endedAt ?? now) - start;
   // BLANK, never `0s`: we never invent a start time. A confident `0s` about a job that has been
   // working for half an hour is the one lie this surface must not tell.
   return span === null ? '' : elapsedCell(span);

@@ -48,6 +48,12 @@ const isObj = (v: unknown): v is Record<string, unknown> => v !== null && typeof
  */
 export function parseHookInput(input: unknown): WatchTarget | null {
   if (!isObj(input)) return null;
+  const rawTool = typeof input['tool_name'] === 'string' ? input['tool_name'] : '';
+  const toolName = rawTool.includes('__') ? rawTool.slice(rawTool.lastIndexOf('__') + 2) : rawTool;
+  if (toolName === 'steer_job') {
+    const payload = unwrapResponse(input['tool_response']);
+    if (!isObj(payload) || payload['action'] !== 'resumed') return null;
+  }
   const launches = parseLaunches(input['tool_name'], input['tool_response']);
   const launch = launches[0];
   if (launch === undefined) return null;
@@ -81,6 +87,7 @@ export async function runHook(
     if (target === null) return 0;
     const perId = await Promise.all(target.ids.map(async (id) => {
       const lines: string[] = [];
+      const emittedIds = new Set<string>();
       await runJobWatch({
         timeoutMs: target.timeoutMs,
         ...options,
@@ -92,12 +99,22 @@ export async function runHook(
         // "exited · checks running" if the acceptance budget runs out first. The mod sends both.
         announceOnce: true,
         // The notice as written, line breaks kept; the timeout line has no batch.
-        emit: (line, batch) => { lines.push(batch?.content ?? line); },
+        emit: (line, batch) => {
+          lines.push(batch?.content ?? line);
+          for (const key of batch?.keys ?? []) {
+            const hash = key.indexOf('#');
+            if (hash > 0) emittedIds.add(key.slice(0, hash));
+          }
+        },
       });
-      return { id, lines };
+      return { id, emittedIds, lines };
     }));
-    // Drop lines for any job/run whose claim marker exists when the hook writes (e.g. a cancelled variant).
-    const lines = perId.flatMap(({ id, lines: idLines }) => (claimed(target.cwd, target.kind, id) ? [] : idLines));
+    // Drop lines for any job/run whose claim marker exists when the hook writes (e.g. a cancelled variant or post-steer head).
+    const lines = perId.flatMap(({ id, emittedIds, lines: idLines }) => (
+      claimed(target.cwd, target.kind, id) || [...emittedIds].some((eid) => claimed(target.cwd, target.kind, eid))
+        ? []
+        : idLines
+    ));
     if (lines.length === 0) return 0;
     // Exit 2 is the wake protocol, and the host labels it "Stop hook feedback".
     // This path runs only without the mod (which claims the job and announces it

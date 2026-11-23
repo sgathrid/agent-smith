@@ -335,3 +335,23 @@ test('toWatchStatus: a long open command is running; a stopped heartbeat is atte
   assert.equal(toWatchStatus(obs({ last_activity: open }), NOW), 'attention');
   assert.equal(toWatchStatus({ ...obs({}), updatedAt: null }, NOW), 'attention');
 });
+
+test('toNotice uses chainStartedAt for steered chains and per-turn startedAt on resumes', async () => {
+  const { toNotice } = await import('../policy.ts');
+  const steered = toNotice(job({
+    status: 'succeeded',
+    chainStartedAt: '2026-10-03T16:38:00Z',
+    startedAt: '2026-10-03T16:39:54Z',
+    finishedAt: '2026-10-03T16:40:00Z',
+    continuationKind: 'steer-interrupt',
+  }), 'finished', NOW);
+  assert.equal(steered.durationMs, 120_000);
+  const resumed = toNotice(job({
+    status: 'succeeded',
+    chainStartedAt: '2026-10-03T16:39:54Z',
+    startedAt: '2026-10-03T16:39:54Z',
+    finishedAt: '2026-10-03T16:40:00Z',
+    continuationKind: 'resume',
+  }), 'finished', NOW);
+  assert.equal(resumed.durationMs, 6_000);
+});

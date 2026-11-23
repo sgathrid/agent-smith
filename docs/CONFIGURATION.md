@@ -205,13 +205,13 @@ roleDefaults}`, `aliasConfigErrors?`, `modes[{name,description,readOnly,runsComm
 | `variants` | array | up to 8 entries `{name?, provider?, model?, effort?}`, each an independent job started from the shared params; names must be distinct (default `<name>-<provider>-<model>`). Not available on a task-augmented call |
 | `env` | object | extra worker environment variables, merged over the server's (e.g. a per-worktree `CARGO_TARGET_DIR`); keys `^[A-Za-z_][A-Za-z0-9_]*$`, string values without NUL. Keys that change how the worker binary is found, loaded or configured are refused, because the env applies before any worker sandbox exists: `PATH`, `HOME`, `SHELL`, `TMPDIR`, `NODE_OPTIONS`, `NODE_PATH`, `PYTHONPATH`, `PYTHONHOME`, `PYTHONSTARTUP`, the shell startup files `BASH_ENV`, `ENV`, `ZDOTDIR`, `SHELLOPTS`, `PROMPT_COMMAND`, `PERL5OPT`, `RUBYOPT`, and any key starting `LD_`, `DYLD_`, `XDG_`, `AGENT_SMITH_`, `AGY_`, `CLAUDE_`, `CODEX_`, `OPENCODE_` or `KIMI_` (case-insensitive; `ENV_DENYLIST` in `pipeline/types.ts`). Only the names are stored (`env-keys.json`); values are never written |
 
-Result (slim ack, compact JSON): `jobId, name, provider, model, status:'running', timeoutMs, repo, unrestricted`, plus
-`readOnlyEnforced` for read-only modes, `envKeys` (names, never values) when `env` was given, `warnings?`,
+Result (slim ack, compact JSON): `jobId, name, workerId, turn, provider, model, status:'running', timeoutMs, repo, unrestricted, chainStartedAt`, plus
+`continuedFrom?, continuationKind?` (on resume), `readOnlyEnforced` for read-only modes, `envKeys` (names, never values) when `env` was given, `warnings?`,
 `checks` (names) when checks were given, and `aliasApplied?`/`aliasSource?`. With `variants`:
 `{jobs:[ack | {name, error}]}`. The saved request goes to the job's `request.json`.
 
 ### `resume_job` (structured)
-Params: `worker` (name or job id, required), `prompt` (required), `files` (optional relative paths in `repo`, merged with the previous job's existing watched files and re-synced into `cwd` only when changed in `repo` so worker worktree edits are preserved), `model`, `effort`,
+Params: `worker` (name, `workerId`, or job id, required), `prompt` (required), `files` (optional relative paths in `repo`, merged with the previous job's existing watched files and re-synced into `cwd` only when changed in `repo` so worker worktree edits are preserved), `model`, `effort`,
 `timeoutMs`, `unrestricted` (default: the original job's; an explicit `true` is confirmed as for `spawn_job`), `cwd` (absolute existing directory;
 default: the original job's), `env` (as for `spawn_job`; not inherited, because values are not
 stored: when the original job had env and this call passes none, the ack warns). An explicit cwd changes the process working directory while
@@ -223,35 +223,35 @@ Refuses running workers (pointing to `steer_job`), workers without a conversatio
 the slim ack, as for `spawn_job`.
 
 ### `steer_job` (structured)
-Params: `worker` (name or job id of a running worker, required), `prompt` (required),
-`delivery` enum `queue|interrupt` (required; `queue` appends the steer and chains a continuation turn when the active turn exits; `interrupt` writes `cancel.steer` so the pump stops the active turn after a short wait for a conversation handle and chains the continuation turn; if no handle arrives, the continuation starts fresh), `context` (optional, 1 to 2 000 chars), `files` (optional relative paths in `repo`, merged with the active turn's watched files and re-synced into `cwd` when changed in `repo` or newly added).
-Refuses finished workers (pointing to `resume_job`), pipeline stages, and running workers without a live owner process.
-Result (`SteerAck`): `jobId` (the active turn ID), `name, provider, delivery, status: 'queued'|'interrupting', pendingSteers, signalled, resumable, repo, timeoutMs, note`.
-`resumable` reports whether a conversation handle was known when the steer was accepted; if it is false and no handle arrives before the turn ends, the continuation starts fresh. A queued steer that the turn cannot deliver (for example because it failed) is recorded as a warning on the terminal job rather than being lost silently.
+Params: `worker` (name, `workerId`, or job id of a worker, required), `prompt` (required),
+`delivery` enum `queue|interrupt` (required; `queue` appends the steer and chains a continuation turn when the active turn exits, or seamlessly falls through to resuming when the prior turn already ended `succeeded` with a `conversation` handle and no pending acceptance checks; `interrupt` writes `cancel.steer` to stop the active turn and chain the continuation turn, failing closed when no `conversation` handle exists yet unless `allowFresh: true` is passed), `allowFresh` (optional boolean, allows `delivery: 'interrupt'` to start a fresh continuation if no `conversation` handle exists yet), `context` (optional, 1 to 2 000 chars), `files` (optional relative paths in `repo`, merged with the active turn's watched files and re-synced into `cwd` when changed in `repo` or newly added).
+Refuses `delivery: 'queue'` fallthrough on `failed`/`canceled` turns or pending acceptance checks, `delivery: 'interrupt'` on non-running turns, pipeline stages, and running turns without a live owner process.
+Result (`SteerAck`): `jobId` (the active turn ID when queued/interrupting, or the new turn's ID when `action: 'resumed'`), `name, workerId, provider, delivery, status: 'running', action: 'queued'|'interrupting'|'resumed', turn, pendingSteers, signalled, resumable, repo, timeoutMs, note`, plus `continuedFrom?`, `continuationKind?`, `chainStartedAt?`.
+`resumable` reports whether a conversation handle was known when the steer was accepted. A queued steer that the turn cannot deliver (for example because it failed) is recorded as a warning on the terminal job rather than being lost silently.
 
 ### `list_jobs` (read-only, structured)
 Params: `status` enum
 `running|succeeded|failed|canceled`, `limit` 1-500 (default 20 concise, 50 detailed), `since` (ISO time
 or relative `30m`/`2h`/`1d`; jobs last active at or after it), `session` (only jobs spawned by this server
-process; empty after a restart), `response_format` `concise|detailed` (default `concise`). Running first,
-then newest. Every row (both formats) adds `taskStatus`. Concise rows: `jobId, name, status, provider, model, mode, summary` (trimmed to 200 chars on a
-word boundary), `toolCalls, lastActivity` (one line), `startedAt, finishedAt, nextAction?, warningCount?`,
-`changedFileCount?`, `acceptance?`, `digest?`, and when they apply `liveness`, `stalled`,
+process; empty after a restart), `response_format` `concise|detailed` (default `concise`). Groups by `workerId` by default (one row per worker, selecting the head turn). Running first,
+then newest. Every row (both formats) adds `taskStatus`. Concise rows: `jobId, name, workerId, turn, status, provider, model, mode, summary` (trimmed to 200 chars on a
+word boundary), `toolCalls, lastActivity` (one line), `startedAt, finishedAt, chainStartedAt?, continuedFrom?, continuationKind?, supersededBy?, pendingSteers?, nextAction?, warningCount?`,
+`changedFileCount?`, `acceptance?`, `digest?`, and when they apply `liveness`,
 `toolErrors`, `failedEarly`, `changedFilesUnknown`, `cwdMissingAtFinish` (see `status`).
-Detailed rows (`JobSummary`): `jobId, name, workerId, role, latestSummary, summarySource,
+Detailed rows (`JobSummary`): `jobId, name, workerId, turn, role, latestSummary, summarySource,
 source, status, provider, mode, model, task, toolCalls, currentActivity, lastActivity, startedAt,
-updatedAt, finishedAt, warnings[], nextAction, unrestricted?`, the same evidence fields,
-`lastEventAt`, `lastAliveAt`, and for running jobs `liveness` and `stalled`. `latestSummary` is
+updatedAt, finishedAt, chainStartedAt?, continuedFrom?, continuationKind?, supersededBy?, pendingSteers?, warnings[], nextAction, unrestricted?`, the same evidence fields,
+`lastEventAt`, `lastAliveAt`, and for running jobs `liveness`. `latestSummary` is
 untrusted: the worker's current message while it runs, the end of its final response once done.
 
 ### `status` (read-only, structured)
-Params: `jobId` (required), `wait_ms` 1-60000 (long-poll while running), `response_format`
+Params: `jobId` (required; accepts a job ID, worker name, or `workerId` and resolves to the worker's latest turn across steers and resumes), `wait_ms` 1-60000 (long-poll while running), `response_format`
 `concise|detailed` (default `concise`), `include_diff` (boolean).
 Both formats add `taskStatus`.
-Concise result: `jobId, name, provider, model, mode, status, taskStatus`, `acceptance {state, passed[], failed[]
+Concise result: `jobId, name, workerId, turn, provider, model, mode, status, taskStatus`, `acceptance {state, passed[], failed[]
 (check names), pending?, running?, reason?}` (`running`: the checks running now, while `pending`),
-`liveness` and `stalled` (running jobs), `startedAt, finishedAt, durationMs, toolCalls, lastActivity`,
-`changedFileCount`, `changedFiles` (first 20), `nextAction`, `error`, `warnings` (deduped strings), one `report`
+`liveness` (running jobs), `startedAt, finishedAt, durationMs, chainStartedAt?, continuedFrom?, continuationKind?, supersededBy?, pendingSteers?, toolCalls, lastActivity`,
+`changedFileCount`, `changedFiles` (first 20), `nextAction`, `error`, `warnings` (deduped strings), `earlierTurns` (unified prior turns across steers and resumes), one `report`
 (first 2 000 chars; a trailing note says it was cut and `reportTruncated` is true), `summary` only when
 the report does not already contain it, and with `wait_ms`: `waited`, `stillRunning`. Null fields are omitted.
 `include_diff` (either format) adds `diff`: a unified diff of `changedFiles` against the job's spawn-time
@@ -265,7 +265,7 @@ Liveness, for running jobs (`mod/hooks/stale.ts` `livenessOf`, the rule the band
 event for 15 min while the worker process runs, or, for a job from an older version without a
 heartbeat, no event for 15 min), `dead` (no heartbeat for 2 min though the job still reads
 running), and `waiting`, reserved and not reported yet. `silentForMs` is the time since the last
-event. `stalled` is a deprecated alias, kept for one release: true for `silent` or `dead`.
+event.
 
 Finish evidence, present only when true or nonzero: `toolErrors` (tool calls that ended in an
 error; a warning, not a verdict), `failedEarly` (failed before any tool call: model, region or
@@ -279,7 +279,7 @@ Detailed result (the full record): `JobSummary` fields plus `report` (first 8 00
 `exitCode`, `unrestricted`, `pipeline`, `stage`, `usage`, `conversation`, `effort`, `cwd`,
 `modelRequested/modelResolved/modelSource`, `preambleApplied`, `sandbox`, `sandboxFlags`,
 `readOnlyRequested/readOnlyEnforced`, `cancellable`, `gitBaseline?`, `changedFiles?`,
-`changedFilesTruncated?`, the evidence fields above, `liveness?`, `stalled`, `acceptance
+`changedFilesTruncated?`, the evidence fields above, `liveness?`, `earlierTurns?`, `acceptance
 {state:'accepted|rejected|unchecked', checks[], at?, pending?, budgetMs?, running?, startedAt?,
 reason?}`, and with `wait_ms`: `waited:true`, `stillRunning`.
 

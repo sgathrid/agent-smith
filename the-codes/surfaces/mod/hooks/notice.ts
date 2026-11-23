@@ -462,11 +462,12 @@ function kindOf(status: string): NoticeKind | null {
 export function noticeFromRadar(job: NoticeRow, kind: NoticeKind, now: number): NoticeJob {
   const checks = job.acceptance?.checks ?? [];
   const dead = kind === 'attention' && job.liveness?.state === 'dead';
+  const start = job.chainStartedAt ?? job.startedAt;
   const span = dead
     ? (job.liveness?.since != null ? now - job.liveness.since : null)
     : kind === 'attention'
       ? (job.liveness ? job.liveness.silentForMs : job.lastEventAt != null ? now - job.lastEventAt : null)
-      : (job.endedAt != null && job.startedAt != null ? job.endedAt - job.startedAt : null);
+      : (job.endedAt != null && start != null ? job.endedAt - start : null);
   return {
     id: job.id, kind, name: job.name, provider: job.provider, role: job.role,
     durationMs: span,

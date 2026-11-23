@@ -38,6 +38,7 @@ import {
   type RunRecord,
 } from './notice.ts';
 import {
+  hasPendingNativeClose,
   nativeJobsFromRadar,
   syncNativeTasks,
   type NativeTaskClient,
@@ -210,7 +211,10 @@ async function pollBand($: EngineInterface): Promise<void> {
   // Only write when something actually changed so idle or unchanged polls do not
   // invalidate UI surfaces unnecessarily.
   const before = JSON.stringify(previous);
-  if (before !== JSON.stringify(next)) await update($, bandJobs, () => next);
+  if (before !== JSON.stringify(next)) {
+    detailCache = null;
+    await update($, bandJobs, () => next);
+  }
   await pollNativeTasks($, next);
 }
 
@@ -251,6 +255,7 @@ async function takeLaunch($: EngineInterface, launch: Launch, cwd: string): Prom
   // Wake immediately on launch (or repo switch) so the band, native tasks, and
   // /forge pick up the new turn without waiting for the next timer tick.
   if (switched || inWatchedRepo) {
+    detailCache = null;
     await pollBand($).catch(() => {});
     const atNow = await $.clock.now();
     await update($, now, () => atNow).catch(() => {});
@@ -463,15 +468,15 @@ export async function startBand($: EngineInterface, cwd?: string): Promise<void>
         const isPaneOpen = await read($, paneOpen);
         const owned = await read($, notices);
         const currentJobs = await read($, bandJobs);
-        if (currentJobs.some(isLive) || owned.length > 0 || isPaneOpen) {
+        if (currentJobs.some(isLive) || owned.length > 0 || isPaneOpen || (await read($, readError)) !== null) {
           await pollBand($);
           if (await read($, readError) !== null) return;
           await announce($, cfg.repo, await read($, bandJobs), await $.clock.now());
         } else {
           // Completely idle on disk (0 disk reads/sec). Still close any lingering
-          // completed native task after CLOSE_DELAY_MS using the in-memory rows.
+          // dismissible completed native task after CLOSE_DELAY_MS using the in-memory rows.
           const links = await read($, nativeTaskLinks);
-          if (Object.values(links).some((l) => l.status === 'completed')) {
+          if (hasPendingNativeClose(currentJobs, links)) {
             await pollNativeTasks($, currentJobs);
           }
         }
@@ -797,9 +802,12 @@ async function pinTurn($: EngineInterface, turnJobId: string | null): Promise<vo
 
 /** Open the sidebar focused, on one worker (by workerId) or on the list. */
 async function openForge($: EngineInterface, workerId: string | null): Promise<void> {
+  detailCache = null;
   await show($, workerId);
   if (workerId === null) await update($, listPage, () => 0);
   await update($, paneOpen, () => true);
+  const at = await $.clock.now();
+  await update($, now, () => at);
   await pollBand($).catch(() => {});
   await requestPane($, true);
 }

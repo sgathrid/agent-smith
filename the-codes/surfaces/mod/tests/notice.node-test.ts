@@ -474,3 +474,18 @@ test('parseSettledRead reads a cancel only when it settled', () => {
   assert.equal(parseSettledRead(cancel, { runId: 'r1', status: 'canceling', settled: false }), null);
   assert.equal(parseSettledRead(cancel, { error: 'unknown job', settled: true }), null);
 });
+
+test('noticeFromRadar uses chainStartedAt for steered chains and per-turn startedAt on resumes', () => {
+  const steered = noticeFromRadar(row({
+    id: 't2', status: 'succeeded',
+    startedAt: NOW - 6_000, endedAt: NOW,
+    chainStartedAt: NOW - 120_000, continuationKind: 'steer-queue',
+  }), 'finished', NOW);
+  assert.equal(steered.durationMs, 120_000);
+  const resumed = noticeFromRadar(row({
+    id: 't3', status: 'succeeded',
+    startedAt: NOW - 6_000, endedAt: NOW,
+    chainStartedAt: NOW - 6_000, continuationKind: 'resume',
+  }), 'finished', NOW);
+  assert.equal(resumed.durationMs, 6_000);
+});

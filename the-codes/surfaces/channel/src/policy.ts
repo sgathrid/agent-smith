@@ -272,11 +272,12 @@ export function buildBatch(candidates: readonly Candidate[], now: number): Batch
 export function toNotice(job: WatchableJob, kind: PushKind, now: number): NoticeJob {
   const run = job.role === 'pipeline' && job.outcome !== undefined;
   const dead = kind === 'attention' && job.liveness?.state === 'dead';
+  const start = job.chainStartedAt ?? job.startedAt;
   const span = dead
     ? (job.liveness?.since == null ? NaN : now - job.liveness.since)
     : kind === 'attention'
       ? (job.lastEventAt === null ? NaN : now - Date.parse(job.lastEventAt))
-      : (job.startedAt && job.finishedAt ? Date.parse(job.finishedAt) - Date.parse(job.startedAt) : NaN);
+      : (start && job.finishedAt ? Date.parse(job.finishedAt) - Date.parse(start) : NaN);
   return {
     id: job.id, kind, name: job.name ?? null, provider: job.provider ?? null, role: job.role ?? null,
     run,

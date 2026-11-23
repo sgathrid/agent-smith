@@ -40,6 +40,8 @@ export type RadarStatus =
   | 'attention'
   | 'unknown';
 
+export type ContinuationKind = 'steer-queue' | 'steer-interrupt' | 'resume';
+
 /**
  * One job, as the pane draws it. Immutable; treat as a snapshot.
  *
@@ -55,8 +57,11 @@ export interface RadarJob {
   /** Optional human label for the worker; absent labels fall back to task text. */
   readonly name?: string | null;
 
-  /** Stable worker identity supplied by Agent Smith, or the job id as fallback. */
-  readonly workerId?: string;
+  /** Stable worker identity across all turns (or the job id for legacy 0.4.x files). */
+  readonly workerId: string;
+
+  /** 1-based turn number within the worker's chain. */
+  readonly turn: number;
 
   /** Worker role/stage, when the source records one. */
   readonly role?: string | null;
@@ -97,6 +102,12 @@ export interface RadarJob {
    */
   readonly startedAt: number | null;
 
+  /**
+   * Epoch ms of the start of the continuous steered chain (reset on resume after
+   * an idle gap), or null when unknown.
+   */
+  readonly chainStartedAt?: number | null;
+
   /** Epoch ms once terminal, else null. */
   readonly endedAt: number | null;
 
@@ -128,7 +139,7 @@ export interface RadarJob {
    *
    * Run through `stripSystemNotifications()` (hazard C). Populated only when the
    * reader is asked for it — the pane's detail view asks, the band does not,
-   * because the band would otherwise re-read 256 KB of markdown every 3 s to
+   * because the band would otherwise re-read 256 KB of markdown every 1 s to
    * draw a six-character line. `null` therefore means "not requested" as well as
    * "nothing there", and the band must never read it.
    */
@@ -143,8 +154,11 @@ export interface RadarJob {
   /** Child job ID when this turn was superseded by a steered continuation turn. */
   readonly supersededBy?: string | null;
 
-  /** Parent job ID when this turn was spawned by pump() consuming steer.jsonl. */
-  readonly steeredFrom?: string | null;
+  /** Parent job ID when this turn continued from an earlier turn (steer or resume). */
+  readonly continuedFrom?: string | null;
+
+  /** How this turn continued from its parent: queued steer, interrupt steer, or resume. */
+  readonly continuationKind?: ContinuationKind | null;
 
   /** Unconsumed queued steer count while running. */
   readonly pendingSteers?: number | null;
@@ -173,20 +187,6 @@ export interface RadarAcceptance {
   }[];
 }
 
-/** One tool call, for the detail pane's history. */
-export interface ToolEntry {
-  /** Epoch ms, or null if the event carried no usable time. */
-  readonly at: number | null;
-  /** agy tool name, e.g. `run_command`. */
-  readonly tool: string;
-  /** Terse description of what it was called with. */
-  readonly label: string;
-  /** Truncated output preview, or '' when there was none. */
-  readonly output: string;
-  /** 'done' | 'error' | 'active', from the event's own state field. */
-  readonly state: string;
-}
-
 // ── mod plugin state ────────────────────────────────────────────────────────
 
 declare module 'claude-code' {
@@ -200,8 +200,10 @@ declare module 'claude-code' {
    */
   interface PluginState {
     'agent-smith': {
-      /** Job id open in the sidebar's worker view, or null for the list. */
+      /** Worker id open in the sidebar's worker view, or null for the list. */
       selected: string | null;
+      /** Specific prior turn job id pinned by user click, or null to auto-follow live head. */
+      pinnedTurnId: string | null;
       /** Clock the pane subscribes to so elapsed cells tick. The BAND writes it. */
       now: number;
       /** The worker view keeps its end in view; a person scrolling up pauses it. */
@@ -213,7 +215,7 @@ declare module 'claude-code' {
       expandedTools: string[];
       readError: string | null;
       /**
-       * The band's own snapshot of the jobs directory, from the 3 s poll.
+       * The band's own snapshot of the jobs directory, from the 1 s active poll.
        *
        * SEPARATE FROM THE PANE'S READ ON PURPOSE. The pane re-reads on demand —
        * a keypress is a deliberate act and deserves fresh data — while the band
@@ -222,7 +224,7 @@ declare module 'claude-code' {
        * about the truth, only about when they looked.
        */
       bandJobs: RadarJob[];
-      /** Host-created task IDs for live Agent Smith jobs; keys are Agent Smith job IDs. */
+      /** Host-created task IDs for live Agent Smith workers; keys are worker IDs. */
       nativeTaskLinks: Record<string, {
         taskId: string;
         status: 'in_progress' | 'completed' | 'deleted';
@@ -249,7 +251,7 @@ declare module 'claude-code' {
        * Session state on purpose: another session's jobs are never in it.
        * The shape is hooks/notice.ts `Owned`, spelled out for the validator.
        */
-      notices: { kind: 'job' | 'run'; id: string; at: number; until: number; saidAttention?: boolean }[];
+      notices: { kind: 'job' | 'run'; id: string; workerId?: string; at: number; until: number; saidAttention?: boolean; saidDead?: boolean; saidExited?: boolean; saidStageAttention?: string[] }[];
       /**
        * Job and pipeline run IDs this session launched in this repo, never pruned
        * within the session: what the band, /forge and native tasks show.

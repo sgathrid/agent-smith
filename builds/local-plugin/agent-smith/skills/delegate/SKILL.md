@@ -49,11 +49,21 @@ ends, so don't poll or start your own monitor. A subagent doesn't get that messa
 to the main conversation), and neither does a headless session; either one calls `status`
 with `wait_ms` until the job settles.
 
-To redirect a running worker, use `steer_job`: `queue` runs after the current turn (dropped if
-that turn fails), `interrupt` stops it now, losing the tool call in flight. Each steer starts a
-new turn with its own job ID, so refer to the worker by name; `status` lists earlier turns in
-`earlierTurns`. Once a worker has finished, follow up with `resume_job`. A kimi worker resumes
-only from the directory that spawned it, so leave `cwd` unset for kimi.
+Each worker has a stable `workerId` and `name` across turns (`turn` 1, 2, ...). `list_jobs`
+groups by worker by default (one row per worker, showing its latest turn). `status` accepts a
+worker name, `workerId`, or any turn's `jobId`, resolves to the worker's latest turn across
+both steers and resumes, and returns `earlierTurns`.
+
+To redirect a worker, use `steer_job`:
+- `delivery: "queue"` runs after the current turn (dropped if that turn fails or is canceled).
+  If the worker already ended `succeeded` with no pending checks, `queue` resumes it directly
+  (`action: "resumed"` with the new turn's `jobId`).
+- `delivery: "interrupt"` stops the current turn now, losing the tool call in flight, and
+  continues from its conversation handle. If no conversation handle exists yet, it fails closed
+  unless `allowFresh: true` is passed.
+
+To continue a finished worker in a new turn, use `resume_job`. A kimi worker resumes only from
+the directory that spawned it, so leave `cwd` unset for kimi.
 
 `cancel` waits briefly for the job to stop and returns its final status.
 
