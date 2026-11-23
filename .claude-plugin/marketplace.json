@@ -3,11 +3,15 @@
   "owner": {
     "name": "Agent Smith"
   },
-  "description": "Delegate to Codex, OpenCode, agy, Kimi, and Claude workers from Claude Code, with live progress, resumable conversations, and executable checks.",
+  "description": "Delegate to Codex, OpenCode, agy, Kimi, and Claude workers from Claude Code, and load Construct, a user-invoked engineering skill pack for any repo.",
   "plugins": [
     {
       "name": "agent-smith",
       "source": "./builds/local-plugin/agent-smith"
+    },
+    {
+      "name": "construct",
+      "source": "./construct"
     }
   ]
 }
