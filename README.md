@@ -110,6 +110,14 @@ Name the provider you want. Claude discovers the installed providers and availab
 
 When you attach checks such as `npm test`, Agent Smith runs them after the worker exits and records whether they pass. A finished process and accepted work are tracked separately.
 
+## Pair it with Construct
+
+[Construct](construct/README.md) is a separate, optional plugin in this marketplace: user-invoked skills for understanding, designing, reviewing, debugging and verifying code in any repo. Its skills ask for "a reviewer on another model" when it matters, and Agent Smith is one way to have one.
+
+```sh
+claude plugin install construct --marketplace sgathrid/agent-smith
+```
+
 ## How it fits into Claude Code
 
 Agent Smith is a Claude Code plugin: a delegation skill, an MCP server that runs the provider CLIs, and an integrated terminal UI. Workers appear in the **native task list**; the live band and `/forge` show their activity, results, and check output.

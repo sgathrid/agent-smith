@@ -1,0 +1,11 @@
+{
+  "name": "construct",
+  "version": "0.1.0",
+  "description": "User-invoked engineering skills for any repo: understand, design, review, write, debug and verify. Pairs well with agent-smith, never requires it.",
+  "author": {
+    "name": "Agent Smith"
+  },
+  "homepage": "https://github.com/sgathrid/agent-smith/tree/main/construct#readme",
+  "repository": "https://github.com/sgathrid/agent-smith",
+  "license": "MIT"
+}

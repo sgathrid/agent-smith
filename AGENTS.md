@@ -30,3 +30,7 @@ The plugin talks to two audiences. Keep them apart:
 ## Claude Code hooks
 
 The mod hooks `tool.call`, never `classic.*`. Claude Code's built-in guard sends `classic.*` events past user-installed mods, so a classic handler never runs. See the "completion notices" comment in `surfaces/mod/hooks/register.tsx` and `docs/ARCHITECTURE.md`.
+
+## Construct
+
+`construct/` is a second plugin in this marketplace: plain skill files, no build. It must stay repo-agnostic and tool-agnostic, and it never requires agent-smith. `node construct/scripts/check.mjs` must pass. Raise `construct/.claude-plugin/plugin.json` when anything under `construct/` changes; it versions separately from agent-smith and is tagged `construct--v<version>`.
