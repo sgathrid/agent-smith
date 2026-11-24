@@ -46,6 +46,7 @@ function rawTransport(tasks = true) {
       jobId,
       name: workerName,
       workerId: 'worker-1',
+      turn: 1,
       role: 'review',
       latestSummary: 'Reviewed fixture.',
       summarySource: 'worker',
@@ -102,6 +103,11 @@ function rawTransport(tasks = true) {
         preambleApplied: true,
       };
     },
+    followUp: async () => {
+      launches++;
+      const jobId = `review-smith-0000000${launches}`;
+      return { jobId, name: workerName, workerId: 'worker-1', turn: 2, action: 'started' as const, delivery: 'now' as const, status: 'running' as const, provider: 'codex', repo, timeoutMs: 1_000 };
+    },
     cancel: (jobId: string) => {
       cancels++;
       return { jobId, requested: true, signalled: true, note: 'signalled' };
@@ -154,8 +160,6 @@ function makeRawDispatch(client: Client): RawClientDispatch {
         transport.onmessage = prev;
         reject(new Error(`rawDispatch timed out for ${req.method}`));
       }, options?.context?.requestTimeoutMs ?? scaled(30_000));
-      // Intercept the raw JSON-RPC response for V2 task wire shapes while letting
-      // the SDK client process unrelated traffic.
       transport.onmessage = (message, extra) => {
         if ('id' in message && message.id === reqId) {
           clearTimeout(timer);
@@ -221,10 +225,8 @@ test('ext-tasks V2 client negotiates Tasks, polls tasks/get, and receives comple
       assert.ok(execution.handle?.taskId);
       assert.notEqual(execution.handle.taskId, 'review-smith-00000001');
 
-      // Hold completion behind pending acceptance first, then settle acceptance.
       writeAcceptance(h.repo, 'review-smith-00000001', { state: 'unchecked', checks: [], pending: true });
       h.setStatus('succeeded');
-      // Wait until the client's poll has read the terminal status; the poll reads acceptance synchronously after that, so it has seen it pending and must not complete.
       await waitFor(() => h.terminalReads() >= 1, { intervalMs: 5, message: 'a poll to observe the terminal status while acceptance is pending' });
       writeAcceptance(h.repo, 'review-smith-00000001', {
         state: 'accepted',
@@ -272,7 +274,6 @@ test('per-request capability gating, non-task tools, MRTR approval, and validati
     'io.modelcontextprotocol/clientCapabilities': baseCaps,
   };
   try {
-    // 1. Without extensions["io.modelcontextprotocol/tasks"] on the request, spawn_job returns immediate SpawnAck.
     const immediate = await h.request('tools/call', {
       name: 'spawn_job',
       arguments: { provider: 'codex', mode: 'review', prompt: 'quick check' },
@@ -282,7 +283,6 @@ test('per-request capability gating, non-task tools, MRTR approval, and validati
     assert.equal(immediate.result.structuredContent.status, 'running');
     assert.equal(h.launches(), 1);
 
-    // 2. Non-task tool with task capability still returns immediate complete result.
     const capsCall = await h.request('tools/call', {
       name: 'list_capabilities',
       arguments: {},
@@ -290,7 +290,6 @@ test('per-request capability gating, non-task tools, MRTR approval, and validati
     });
     assert.equal(capsCall.result.resultType, 'complete');
 
-    // 3. Validation error on spawn_job returns ordinary isError result, not a task.
     const invalid = await h.request('tools/call', {
       name: 'spawn_job',
       arguments: { provider: 'codex', mode: 'invalid-mode', prompt: 'x' },
@@ -302,23 +301,21 @@ test('per-request capability gating, non-task tools, MRTR approval, and validati
     const tasksDir = path.join(h.repo, '.agent-smith', 'tasks');
     assert.equal(existsSync(tasksDir) ? readdirSync(tasksDir).length : 0, 0);
 
-    // 4. MRTR approval resolves before launch; decline and rebound state never allocate a task.
     h.setStatus('succeeded');
-    const resumeArgs = { worker: 'review-smith-00000001', prompt: 'follow up', unrestricted: true };
+    const followArgs = { worker: 'review-smith-00000001', prompt: 'follow up', unrestricted: true };
     const round1 = await h.request('tools/call', {
-      name: 'resume_job',
-      arguments: resumeArgs,
+      name: 'follow_up',
+      arguments: followArgs,
       _meta: taskCaps,
     });
     assert.equal(round1.result.resultType, 'input_required');
     assert.equal(h.launches(), 1);
     assert.equal(existsSync(tasksDir) ? readdirSync(tasksDir).length : 0, 0);
 
-    // Rebinding worker name invalidates the prior prompt binding and re-prompts.
     h.setWorkerName('Grace');
     const rebound = await h.request('tools/call', {
-      name: 'resume_job',
-      arguments: resumeArgs,
+      name: 'follow_up',
+      arguments: followArgs,
       requestState: round1.result.requestState,
       inputResponses: { unrestricted: { action: 'accept' } },
       _meta: taskCaps,
@@ -327,10 +324,9 @@ test('per-request capability gating, non-task tools, MRTR approval, and validati
     assert.match(rebound.result.inputRequests.unrestricted.params.message, /Grace/);
     assert.equal(h.launches(), 1);
 
-    // Declining returns ordinary isError tool result and allocates no task.
     const declined = await h.request('tools/call', {
-      name: 'resume_job',
-      arguments: resumeArgs,
+      name: 'follow_up',
+      arguments: followArgs,
       requestState: rebound.result.requestState,
       inputResponses: { unrestricted: { action: 'decline' } },
       _meta: taskCaps,
@@ -340,10 +336,9 @@ test('per-request capability gating, non-task tools, MRTR approval, and validati
     assert.equal(h.launches(), 1);
     assert.equal(existsSync(tasksDir) ? readdirSync(tasksDir).length : 0, 0);
 
-    // Accepting with valid state launches and returns a pure task handle (no content array).
     const accepted = await h.request('tools/call', {
-      name: 'resume_job',
-      arguments: resumeArgs,
+      name: 'follow_up',
+      arguments: followArgs,
       requestState: rebound.result.requestState,
       inputResponses: { unrestricted: { action: 'accept' } },
       _meta: taskCaps,
@@ -367,7 +362,6 @@ test('truthful cancellation, completion-vs-cancel race, update validation, and r
     },
   })._meta;
   try {
-    // Launch task 1: test truthful cancellation (stays working until worker is actually canceled).
     const created1 = await h.request('tools/call', {
       name: 'spawn_job',
       arguments: { provider: 'codex', mode: 'review', prompt: 'cancel me' },
@@ -378,16 +372,13 @@ test('truthful cancellation, completion-vs-cancel race, update validation, and r
     assert.equal(cancelAck.result.resultType, 'complete');
     assert.equal(h.cancels(), 1);
 
-    // Worker is still running -> tasks/get must still report working.
     const stillWorking = await h.request('tasks/get', { taskId: taskId1, _meta: taskMeta });
     assert.equal(stillWorking.result.status, 'working');
 
-    // Once Forge transitions job to canceled, tasks/get reports cancelled.
     h.setStatus('canceled');
     const nowCancelled = await h.request('tasks/get', { taskId: taskId1, _meta: taskMeta });
     assert.equal(nowCancelled.result.status, 'cancelled');
 
-    // Launch task 2: worker finishes before tasks/cancel arrives -> completed result wins.
     h.setStatus('running');
     const created2 = await h.request('tools/call', {
       name: 'spawn_job',
@@ -403,7 +394,6 @@ test('truthful cancellation, completion-vs-cancel race, update validation, and r
     assert.equal(completed2.result.result.isError, false);
     assert.match(completed2.result.result.structuredContent.report, /Completed worker report/);
 
-    // Reconnect a fresh server instance against the same repo and verify terminal snapshot stability.
     const [clientTransport2, serverTransport2] = InMemoryTransport.createLinkedPair();
     const handle2 = serveStdio(
       ({ era }) => createSmithServer({ service: h.service, pollMs: 20, catalogs: async () => [] }, { era, tasks: true }),
@@ -422,7 +412,6 @@ test('truthful cancellation, completion-vs-cancel race, update validation, and r
       await handle2.close();
     }
 
-    // tasks/update validates inputResponses and unknown taskId returns -32602.
     const validUpdate = await h.request('tasks/update', {
       taskId: taskId2,
       inputResponses: { unrestricted: { action: 'accept' } },
@@ -467,7 +456,6 @@ test('crash-gap tasks without a readable job fail with -32603, and dead owners r
     return responses.find(r => r.id === reqId)!;
   }
   try {
-    // 1. Task record with no linked job (launch/persistence crash gap) -> status: 'failed' (-32603).
     const tasksDir = path.join(repo, '.agent-smith', 'tasks');
     const { TaskStore } = await import('../task-store.ts');
     const store = new TaskStore(tasksDir);
@@ -476,7 +464,6 @@ test('crash-gap tasks without a readable job fail with -32603, and dead owners r
     assert.equal(unlinked.result.status, 'failed');
     assert.equal(unlinked.result.error.code, -32603);
 
-    // 2. Task linked to a running job whose ownerPid is dead -> Forge reconciles orphan and settles pending acceptance.
     const orphanJobId = 'review-smith-deadbeef';
     const orphanJobFile = jobFile(repo, orphanJobId, FILES.job);
     mkdirSync(path.dirname(orphanJobFile), { recursive: true });
@@ -522,7 +509,7 @@ test('crash-gap tasks without a readable job fail with -32603, and dead owners r
   }
 });
 
-test('stdio server with AGENT_SMITH_TASKS=1 executes spawn_job and resume_job as Tasks end-to-end', async () => {
+test('stdio server with AGENT_SMITH_TASKS=1 executes spawn_job and follow_up as Tasks end-to-end', async () => {
   const repo = mkdtempSync(path.join(os.tmpdir(), 'smith-tasks-stdio-'));
   const fake = path.join(repo, 'fake-codex.cjs');
   writeFileSync(fake, `#!${process.execPath}
@@ -576,8 +563,7 @@ setTimeout(()=>{
       assert.match(res1.structuredContent.report, /Initial task report/);
       assert.equal(res1.structuredContent.acceptance.state, 'accepted');
 
-      // Now resume the named worker via Tasks.
-      const exec2 = await session.callTool('resume_job', {
+      const exec2 = await session.callTool('follow_up', {
         worker: 'Ada',
         prompt: 'Follow up on edge cases',
       });
@@ -662,7 +648,6 @@ function readPids(file: string): number[] {
   try { return readFileSync(file, 'utf8').split('\n').map(Number).filter(n => Number.isInteger(n) && n > 0); } catch { return []; }
 }
 
-/** Block until every pid has exited or the budget runs out; a pid we cannot signal counts as gone. */
 function awaitExit(pids: number[], budgetMs: number): void {
   const deadline = Date.now() + budgetMs;
   const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };

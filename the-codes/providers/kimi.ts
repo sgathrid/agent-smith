@@ -1,129 +1,3 @@
-/**
- * providers/kimi.ts — Kimi Code CLI adapter (`kimi -p`).
- *
- * ============================================================================
- * VERIFICATION LEVEL: HIGH. LIVE-VERIFIED ON 2.1.1 (fresh turn + resume),
- * SOURCE-VERIFIED FOR FLAGS AND STREAM-JSON.
- * ============================================================================
- *
- * The CLI surface and the stream-json schema below were read from the upstream
- * repository (MoonshotAI/kimi-code, main, 2026-10), then exercised against the
- * installed binary:
- *
- *   apps/kimi-code/src/cli/commands.ts        option definitions
- *   apps/kimi-code/src/cli/options.ts         prompt-mode conflicts
- *   apps/kimi-code/src/cli/prompt-render.ts   the stream-json writer
- *   apps/kimi-code/src/cli/v2/run-v2-print.ts print-mode runner
- *
- * LIVE TRANSCRIPT (2026-10-24, kimi 2.1.1):
- *   $ kimi --output-format stream-json -p 'Reply with exactly: OK'
- *   {"role":"assistant","content":"OK"}
- *   {"role":"meta","type":"session.resume_hint","session_id":"session_...",
- *    "command":"kimi -r session_...","content":"To resume this session: ..."}
- *   -> success, 7.9 s, response "OK", session id captured.
- *   A second run with `--session session_...` and the SAME cwd returned
- *   "RESUMED" in 6.2 s and kept the id.
- *   A third run asked for `printf hello > proof.txt` via Bash: one activity
- *   step carried tool "Bash" (input and output), the file existed afterwards,
- *   and the final response was "DONE" (6.8 s).
- *
- * RESUME REQUIRES THE ORIGINAL CWD. `kimi --session <id>` refuses a session
- * created under a different directory ("Session ... was created under a
- * different directory", exit 1). Agent Smith's resume_job defaults to the
- * original job's cwd, so the normal path works; overriding cwd to a different
- * directory fails loudly with that message. `--continue` is never used: it is
- * cwd-ambiguous and would let parallel workers collide.
- *
- * NO IN-FLIGHT TOOL DISPLAY. The writer buffers assistant text and tool calls
- * and flushes them when the step ends or the tool result arrives, so the band
- * learns about a tool call at completion, not while it runs. A long Bash call
- * is therefore a silent gap. This is a stream-json limitation, not a parser
- * choice.
- *
- * Still source-verified rather than live-exercised: retry meta and `--add-dir`.
- *
- * ----------------------------------------------------------------------------
- * VERIFIED CLI SURFACE
- * ----------------------------------------------------------------------------
- *   kimi -p <prompt> --output-format stream-json
- *     -p, --prompt <prompt>          run one prompt, non-interactively
- *     --output-format <format>       "text" (default) or "stream-json"
- *     -m, --model <model>            model ALIAS from config.toml [models]
- *     -S, --session [id]             resume an existing session by id
- *     -c, --continue                 continue the most recent session for cwd
- *     --add-dir <dir>                extra workspace dir; may be repeated
- *     -y, --yolo / --auto / --plan   interactive permission modes
- *
- * `--session` takes an OPTIONAL value, so the adapter emits the attached
- * `--session=<id>` form: with a space, an id beginning with "-" would be parsed
- * as another option. An id beginning with "-" is rejected before spawn too.
- *
- * CONFLICT: `-p` cannot be combined with `--yolo` (options.ts throws). `--auto`
- * is pointless here because print mode force-sets the auto policy anyway (see
- * below). `-c` is cwd-ambiguous: with several workers in one repository it can
- * resume another worker's session, so this adapter never emits it. Resume uses
- * `--session=<id>` only.
- *
- * ----------------------------------------------------------------------------
- * PERMISSIONS: PRINT MODE IS ALWAYS UNRESTRICTED
- * ----------------------------------------------------------------------------
- * run-v2-print.ts calls forceAuto(agent), which sets the session's permission
- * mode to "auto" before the turn. There is no flag to restrict print mode, no
- * approval prompt, and `--yolo` is rejected with `-p`. Static deny rules from
- * config.toml still apply, but Agent Smith cannot turn them on per run.
- *
- * Consequences, stated plainly:
- *   - `unrestricted` has no effect. spawn_job defaults it to true for kimi
- *     (forge/service.ts) and the ack's sandbox string reports the real posture.
- *   - `readOnly` is not enforceable. describeSandbox reports
- *     readOnlyEnforced:false so a review mode is never silently trusted.
- *   - A job cannot end "denied" from a policy prompt. A config deny rule shows
- *     up as tool output, not as a structured denial, so it is not reclassified;
- *     acceptance checks are the reliable detector for that case.
- *
- * ----------------------------------------------------------------------------
- * EFFORT: NO PER-RUN FLAG
- * ----------------------------------------------------------------------------
- * `kimi` has no --effort. Thinking effort comes from `[thinking].effort` or a
- * model alias's `default_effort` in config.toml. SpawnSpec.effort is therefore
- * ignored: forge/service.ts drops it before recording job.json and adds an ack
- * warning, and the adapter also emits a warning event for direct callers.
- * buildArgv never emits a flag the CLI does not have. listModels() reports
- * efforts:[] for the same reason: advertising efforts would invite a request we
- * cannot honor.
- *
- * ----------------------------------------------------------------------------
- * STREAM-JSON SCHEMA (from prompt-render.ts)
- * ----------------------------------------------------------------------------
- * One JSON object per stdout line, in this vocabulary:
- *
- *   {"role":"meta","type":"system.version","version":"..."}
- *   {"role":"assistant","content":"...","tool_calls":[
- *      {"type":"function","id":"...","function":{"name":"Bash","arguments":"{...}"}}]}
- *   {"role":"tool","tool_call_id":"...","content":"..."}
- *   {"role":"meta","type":"turn.step.retrying","failed_attempt":1,"next_attempt":2,
- *    "max_attempts":10,"delay_ms":...,"error_name":"...","error_message":"..."}
- *   {"role":"meta","type":"session.resume_hint","session_id":"...","command":"kimi -r ...","content":"..."}
- *
- * Assistant text and its tool calls are flushed TOGETHER when the step ends or
- * a tool result arrives. Tool results are a separate line keyed by
- * tool_call_id. Thinking deltas are NOT emitted in JSON mode. Token usage is
- * NOT emitted by this writer; the adapter leaves usage absent rather than
- * fabricating it. The final line carries the session id, which is the only
- * resume handle available: `started` is emitted when it arrives, late in the
- * run, and the job's JobResult.raw.sessionId records it too.
- *
- * TOOL ERRORS: PromptJsonWriter.writeToolResult receives ToolResultEvent.output
- * but drops the sibling `isError` field. The content may still be a JSON object
- * with an isError/status field, so the translator looks for one defensively;
- * otherwise it marks the activity done. A failed shell command is visible in
- * the output text, not in a status bit we were given.
- *
- * EXIT CODE: print mode exits non-zero on failure, but a clean exit is still
- * only corroboration. No assistant text after a zero exit is `malformed`, not
- * an empty success.
- */
-
 import {
   binaryAvailable,
   earlyVerdict,
@@ -164,18 +38,14 @@ import type { RunFn } from './discovery.ts';
 import { noResultText, stderrClause } from './failure-text.ts';
 import path from 'node:path';
 
-export const KIMI_BINARY = process.env['AGENT_SMITH_KIMI_BIN'] ?? 'kimi';
+export function kimiBinary(): string {
+  return process.env['AGENT_SMITH_KIMI_BIN'] ?? 'kimi';
+}
 
-/** Kimi config dir: AGENT_SMITH_KIMI_HOME, then KIMI_CODE_HOME, then ~/.kimi-code. */
 function kimiHome(): string {
   return configDir(['AGENT_SMITH_KIMI_HOME', 'KIMI_CODE_HOME'], '.kimi-code');
 }
 
-/**
- * The posture print mode actually applies, in one line for the spawn ack.
- * `spec` is accepted to match the Provider contract; there is nothing in it
- * this CLI can honor. See the header.
- */
 export function sandboxPlan(spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly'>): SandboxInfo {
   void spec;
   return {
@@ -185,18 +55,6 @@ export function sandboxPlan(spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly'>):
   };
 }
 
-/**
- * Build the exact argv for one Kimi worker.
- *
- * Flags first, prompt last. `-p` takes a value, so a prompt starting with "-"
- * is consumed as that value rather than parsed as an option.
- *
- * NOT EMITTED, deliberately:
- *   --effort    does not exist; effort lives in config.toml.
- *   --continue  cwd-ambiguous and unsafe with parallel workers.
- *   --yolo      rejected in prompt mode.
- *   --auto      redundant: print mode forces auto.
- */
 export function buildArgv(spec: SpawnSpec): string[] {
   const argv: string[] = ['--output-format', 'stream-json'];
   if (spec.model !== undefined && spec.model !== '') argv.push('--model', spec.model);
@@ -217,11 +75,6 @@ export function buildArgv(spec: SpawnSpec): string[] {
   return argv;
 }
 
-// ---------------------------------------------------------------------------
-// Defensive extraction
-// ---------------------------------------------------------------------------
-
-/** Normalize an OpenAI-shaped usage object, if a future version emits one. */
 function toTokenUsage(usage: Record<string, unknown>): TokenUsage | undefined {
   const pick = (...keys: string[]): number | undefined => {
     for (const k of keys) {
@@ -261,7 +114,6 @@ function toolOutputIsError(content: string): boolean {
   return parsed['error'] !== undefined && parsed['error'] !== null && parsed['error'] !== false;
 }
 
-/** Render a tool-result value as text without dropping a non-string payload. */
 function contentText(value: unknown): string {
   if (typeof value === 'string') return value;
   if (value === undefined) return '';
@@ -275,25 +127,16 @@ function contentText(value: unknown): string {
 
 export interface KimiTranslator {
   onEvent(raw: Record<string, unknown>): ProviderEvent[];
-  /** All assistant text, step by step, in stream order. */
   finalText: string;
   sawError: boolean;
-  /** Whether the last error was followed by more work and a final report. */
   recovery: ErrorRecovery;
   error?: string;
   usage?: TokenUsage;
   sessionId?: string;
-  /** Completed tool steps. Used to explain a zero-exit run with no text. */
   completedTools: number;
   unrecognised: Set<string>;
 }
 
-/**
- * Build the translator. Every line is handled by role because that is the
- * writer's actual discriminator; `type` is only read inside meta lines. A shape
- * this parser does not recognise becomes a notice with its payload preserved,
- * never a silent drop.
- */
 export function createKimiTranslator(maxChars: number): KimiTranslator {
   const tx: KimiTranslator = {
     finalText: '',
@@ -323,22 +166,14 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
     const role = str(raw, 'role');
     const type = str(raw, 'type') ?? '';
 
-    // ---- session id: the resume handle arrives on the final meta line -------
-    // It is accepted ONLY there. Any other line carrying a session_id is a
-    // shape the writer does not produce; letting it overwrite the handle would
-    // make a resume point at an id the CLI never issued.
-
-    // ---- usage, if a future writer adds it --------------------------------
     const usage = toTokenUsage(obj(raw, 'usage') ?? obj(raw, 'tokens') ?? {});
     if (usage !== undefined) {
       tx.usage = usage;
       out.push({ kind: 'usage', at, usage });
     }
 
-    // ---- meta lines -------------------------------------------------------
     if (role === 'meta') {
       if (type === 'system.version') {
-        // Version banner. Known, carries nothing a consumer acts on.
         return out;
       }
       if (type === 'session.resume_hint') {
@@ -367,8 +202,6 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
         const message = str(raw, 'error_message') ?? '';
         const attempt = failed !== undefined && max !== undefined ? ` (attempt ${failed} of ${max})` : '';
         const retrying = next !== undefined ? `; retrying as ${next}` : '';
-        // A retry that eventually succeeds is not a failed job, so this is a
-        // warning, not sawError.
         out.push({ kind: 'notice', at, level: 'warn', message: `kimi ${name}${attempt}${retrying}: ${message}`.trim(), raw });
         return out;
       }
@@ -391,7 +224,6 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
       return out;
     }
 
-    // ---- assistant message: text plus the tool calls it invoked -----------
     if (role === 'assistant') {
       const content = str(raw, 'content');
       if (content !== undefined && content !== '') {
@@ -423,9 +255,7 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
             if (typeof args === 'string') {
               try {
                 args = JSON.parse(args) as unknown;
-              } catch {
-                // Keep the raw string; preview() renders it without inventing structure.
-              }
+              } catch {}
             }
             const input = preview(args, maxChars);
             const idx = stepFor(id);
@@ -445,7 +275,6 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
       return out;
     }
 
-    // ---- tool result: closes the matching call ----------------------------
     if (role === 'tool') {
       const id = str(raw, 'tool_call_id') ?? str(raw, 'id') ?? `tool-${step}`;
       if (ended.has(id)) {
@@ -458,8 +287,6 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
         });
         return out;
       }
-      // The writer uses stringifyToolOutput(), but a future/hostile shape may
-      // hand us an object. Coercing it keeps the payload and its error flag.
       const content = contentText(raw['content']);
       const output = truncate(content, maxChars);
       const status: ActivityStatus = toolOutputIsError(content) ? 'error' : 'done';
@@ -470,7 +297,6 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
         output: output.text,
       };
       if (output.truncated) ref.truncated = true;
-      // A result before its call must not be re-opened by the late call line.
       started.add(id);
       ended.add(id);
       tx.completedTools += 1;
@@ -478,7 +304,6 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
       return out;
     }
 
-    // ---- top-level error shape (defensive; the current writer never emits) -
     if (type === 'error' || obj(raw, 'error') !== undefined) {
       tx.sawError = true;
       tx.error = str(obj(raw, 'error'), 'message') ?? str(raw, 'message') ?? 'kimi error';
@@ -487,7 +312,6 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
       return out;
     }
 
-    // ---- fallthrough: never drop data -------------------------------------
     const label = role ?? (type !== '' ? type : 'unknown');
     const key = role === undefined ? `type:${label}` : `role:${label}`;
     tx.unrecognised.add(key);
@@ -509,10 +333,6 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
   return tx;
 }
 
-// ---------------------------------------------------------------------------
-// Result
-// ---------------------------------------------------------------------------
-
 export function buildResult(args: {
   jobId: string;
   startedAtMs: number;
@@ -528,7 +348,6 @@ export function buildResult(args: {
 
   let status: JobStatus;
   let error: string | undefined;
-  // No verified terminal event exists in this stream: recovery needs a clean exit.
   const recovered = tx.recovery.recovered(tx.finalText, exit.code);
   const early = earlyVerdict(exit, durationMs);
   if (early !== undefined) {
@@ -542,10 +361,6 @@ export function buildResult(args: {
       ? `${noResultText({ code: exit.code, signal: exit.signal, stderr: '' })}${unrecognised}${stderrClause(exit.stderr)}`
       : `exited ${exit.code}${unrecognised}${stderrClause(exit.stderr)}`;
   } else if (tx.finalText.trim() === '') {
-    // Zero exit and no assistant text. With a source-verified parser this is
-    // more likely an account/network failure or a silent policy denial than an
-    // empty model reply, and neither is a success. A completed tool step is
-    // still worth naming, because it explains where the turn went.
     const tools = tx.completedTools > 0 ? ` · ${tx.completedTools} tool step(s) completed` : '';
     status = 'malformed';
     error = `no output${unrecognised}${tools}${stderrClause(exit.stderr)}`;
@@ -562,23 +377,6 @@ export function buildResult(args: {
   return out;
 }
 
-// ---------------------------------------------------------------------------
-// Model discovery
-// ---------------------------------------------------------------------------
-
-/**
- * Parse `kimi provider list --json`.
- *
- * Shape (sub/provider.ts + config-manifest.toml):
- *   { providers: { <id>: {...} }, models: { <alias>: {
- *       provider, model, display_name?, support_efforts?, default_effort?, overrides? } } }
- *
- * The key is the alias `-m` accepts. Live 2.1.1 output uses camelCase keys
- * (`supportEfforts`, `defaultEffort`, `displayName`) even though config.toml is
- * snake_case, so both spellings are accepted. `overrides` wins over the
- * top-level field, matching the CLI's own precedence. Efforts are reported as
- * [] because print mode has no per-run effort flag; see the header.
- */
 export function parseKimiModels(stdout: string): ModelInfo[] | undefined {
   let parsed: unknown;
   try {
@@ -607,7 +405,6 @@ export function parseKimiModels(stdout: string): ModelInfo[] | undefined {
   return out;
 }
 
-/** Lazy, never throws. Live-verified on 2.1.1. */
 export async function listKimiModels(
   run: RunFn,
   options?: ListModelsOptions,
@@ -622,7 +419,7 @@ export async function listKimiModels(
     verified: true,
   };
   try {
-    const r = await run(KIMI_BINARY, ['provider', 'list', '--json'], options?.timeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS);
+    const r = await run(kimiBinary(), ['provider', 'list', '--json'], options?.timeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS);
     const models = r.error === undefined ? parseKimiModels(r.stdout) : undefined;
     if (models !== undefined && models.length > 0) cat.models = models;
     else cat.error = r.error ?? '`kimi provider list --json` returned no models';
@@ -640,7 +437,6 @@ export async function listKimiModels(
   return cat;
 }
 
-/** Default model from <home>/config.toml top-level `default_model`. Sync, no CLI, never throws. */
 function kimiHarnessDefaults(home: string = kimiHome()): { model?: string; effort?: string } {
   const text = readTextSafe(path.join(home, 'config.toml'));
   if (text === undefined) return {};
@@ -648,19 +444,13 @@ function kimiHarnessDefaults(home: string = kimiHome()): { model?: string; effor
   return model !== undefined && model !== '' ? { model } : {};
 }
 
-// ---------------------------------------------------------------------------
-// Provider
-// ---------------------------------------------------------------------------
-
 export const kimiProvider: Provider = {
   name: 'kimi',
-  // Print mode has no --effort; effort lives in config.toml. The service must
-  // not record a request it cannot apply.
   supportsEffort: false,
 
   harnessDefaults: () => kimiHarnessDefaults(),
 
-  available: () => binaryAvailable(KIMI_BINARY),
+  available: () => binaryAvailable(kimiBinary()),
 
   describeSandbox: sandboxPlan,
 
@@ -670,12 +460,10 @@ export const kimiProvider: Provider = {
     const tx = createKimiTranslator(spec.maxOutputChars ?? 2000);
     return runNdjsonWorker({
       provider: 'kimi',
-      binary: KIMI_BINARY,
+      binary: kimiBinary(),
       spec,
       buildArgv,
       translate: tx.onEvent,
-      // Do not silently pretend the effort was applied. The CLI reads effort
-      // from config.toml, not from a flag.
       ...(spec.effort !== undefined && spec.effort !== '' ? { preamble: [{
         kind: 'notice' as const,
         at: nowIso(),

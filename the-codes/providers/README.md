@@ -11,7 +11,11 @@ Non-negotiables, enforced in `ndjson.ts` so no adapter can quietly break them:
   is the claude-squad trap: a PTY merges stderr into stdout and destroys NDJSON
   framing, so "just wrap it in a pty" makes every event parser wrong.
 - **stdin is `ignore` by default.** Codex reads stdin when it is a pipe and will
-  block forever waiting for input nobody sends.
+  block forever waiting for input nobody sends, and the other argv-prompt
+  adapters do not read stdin. The one exception is a `Provider.liveInput`
+  adapter (currently `claude`), which passes a `LiveInput` to `runNdjsonWorker`:
+  its stdin is a pipe carrying the initial prompt and mid-turn stream-json
+  messages, and the adapter closes stdin when the turn's result arrives.
 - **Exit code is corroboration, never proof.** A job that produced no work is a
   failure even at exit 0. See "The denial trap" below.
 - **Every terminal path resolves `waitForResult()`** — success, error, timeout,
@@ -24,6 +28,11 @@ interface Provider {
   name: string;
   available(): Promise<boolean>;
   spawn(spec: SpawnSpec): Promise<WorkerHandle>;
+  describeSandbox?(spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly' | 'artifactPath'>): SandboxInfo;
+  readonly supportsEffort?: boolean;
+  readonly liveInput?: boolean; // true only for claude
+  harnessDefaults?(): { model?: string; effort?: string };
+  listModels?(options?: ListModelsOptions): Promise<ModelCatalog>;
 }
 
 interface WorkerHandle {
@@ -33,6 +42,7 @@ interface WorkerHandle {
   waitForResult(): Promise<JobResult>;
   onEvent(listener: (event: ProviderEvent) => void): () => void; // additive
   readonly events: AsyncIterable<ProviderEvent>;               // additive
+  send?(text: string): boolean;                                // liveInput providers only
 }
 ```
 
@@ -208,8 +218,9 @@ and `provider list --json`.
   rather than inviting a knob the adapter cannot turn.
 - **Resume.** `--session <id>` resumes an existing session, but only from the
   directory that created it: a different cwd exits 1 with "Session ... was
-  created under a different directory". `resume_job` defaults to the original
-  job's cwd, so the normal path is fine; overriding cwd fails loudly. A fresh run
+  created under a different directory". `follow_up` and `steer` keep the original
+  job's cwd, so the normal path is fine; passing a different cwd with `--session`
+  fails loudly. A fresh run
   learns its id from the final `role:"meta", type:"session.resume_hint"` line.
   The adapter never emits `--continue`: it is cwd-ambiguous and would let
   parallel workers collide.
@@ -226,16 +237,30 @@ and `provider list --json`.
 ### claude — `claude.ts` (the prober / moderator)
 
 ```
-claude -p --output-format stream-json --verbose --forward-subagent-text
-    [--model <id>] [--add-dir <dir>...]
-    (--dangerously-skip-permissions | --permission-mode dontAsk --permission-prompts none)
-    [--session-id <uuid>] [--setting-sources <list>]
-    <prompt>
+claude -p --input-format stream-json --replay-user-messages
+    --output-format stream-json --verbose --forward-subagent-text
+    [--model <id>] [--effort <low|medium|high|xhigh|max>]
+    [--add-dir <dir>...]
+    (--dangerously-skip-permissions | --permission-mode dontAsk --permission-prompts none [--allowedTools ... --disallowedTools ...])
+    [--resume <conversation>]
+    [--bare | --setting-sources <list>]
 ```
 
-Verified by `--help` on 2.1.295 (re-checked after upgrade from 2.1.292) and by
-executing the invocation against a live model.
+Verified by `--help` on 2.1.295, live execution, and live `stream-json` input
+verification on 2.1.331.
 
+- **Live input (`liveInput: true`).** The prompt is **not** on argv.
+  `ClaudeLiveInput` writes the initial prompt as the first stream-json user
+  message on stdin, followed by any `WorkerHandle.send(text)` messages while
+  the turn runs. A message written while a tool runs does not interrupt it;
+  Claude injects it at the next tool round of the same turn.
+  `--replay-user-messages` re-emits each stdin user message on stdout at the
+  moment Claude reads it, and the translator emits `{kind: 'user-message', at, text}`
+  (the initial prompt's replay is swallowed). That replay is the only proof of
+  delivery: any message written to stdin that was not replayed before the
+  process exits is returned in `JobResult.unreadInput` so the caller can deliver
+  it on the next turn. When the `result` event arrives, the adapter ends stdin
+  so `claude` exits cleanly instead of waiting for further input.
 - `--verbose` is required for the full event stream under `--print`.
 - `--forward-subagent-text` is what makes a moderator usable: without it a
   subagent's reasoning is invisible, and a moderator that cannot see what the
@@ -243,12 +268,14 @@ executing the invocation against a live model.
   `parent_tool_use_id` set; we prefix it `[subagent]` and deliberately **exclude**
   it from `JobResult.response`, so a subagent's chatter cannot corrupt the
   moderated output.
-- `unrestricted:false` → `--permission-mode dontAsk --permission-prompts none`,
-  **not** `manual`. `manual` in print mode means waiting for an approval that
-  can never arrive, so a restricted run would hang until the timeout. `dontAsk`
-  means deny-without-prompting: it fails loudly instead of stalling. The cost is
-  that a restricted moderator may come back with denied tools, which we report as
-  `'denied'` — a moderator with no tools cannot moderate.
+- `unrestricted:false` uses `--permission-mode dontAsk --permission-prompts none`,
+  **not** `manual`. `manual` in print mode waits for an approval that can never
+  arrive, so a restricted run would hang until the timeout. `dontAsk` denies
+  without prompting so it fails loudly instead of stalling. When `readOnly` is
+  also true, `sandboxPlan` adds `--allowedTools` (Read, Grep, Glob, and
+  inspection Bash commands) and `--disallowedTools Edit Write NotebookEdit` so
+  read-only is enforced (`readOnlyEnforced: true`; a read-only pipeline stage
+  may still write its single `artifactPath`).
 - **Hooks run headless.** A `SessionStart` hook from local config fired during
   verification and injected company knowledge into the run. A headless moderator
   can therefore be steered by whatever hooks happen to be configured. Defaults to
@@ -343,11 +370,14 @@ consumer can tail immediately:
 ## Event contract
 
 `providers/types.ts` defines a **self-contained** `ProviderEvent`, `TokenUsage`,
-`JobStatus` and `JobResult`. `ProviderEvent` is deliberately a union of six variants
+`JobStatus` and `JobResult`. `ProviderEvent` is a union of nine variants
 (`started` / `text` / `activity-start` / `activity-update` / `activity-end` /
-`usage` / `notice`) with tool input and output already truncated to
-`SpawnSpec.maxOutputChars`, so the store never receives a multi-megabyte cargo-clip
-dump.
+`usage` / `notice` / `heartbeat` / `user-message`) with tool input and output
+already truncated to `SpawnSpec.maxOutputChars`, so the store never receives a
+multi-megabyte cargo-clip dump. `heartbeat` is emitted on the live bus every
+`HEARTBEAT_MS` (30 s) and never written to `events.jsonl`. `user-message` is
+emitted when a `liveInput` provider replays a message sent through
+`WorkerHandle.send()`.
 
 Two deliberate choices:
 

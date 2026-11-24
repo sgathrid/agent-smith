@@ -1,11 +1,13 @@
-/** Detached execution, with one preparation barrier before a worker may start. */
-import { readManifest } from './format.ts';
+import { FILES, jobFile, ownerAlive, readManifest } from './format.ts';
+import { existsSync } from 'node:fs';
 import { fork } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import type { ForgeService, SpawnRequest, TrackedSpawn } from './service.ts';
 import type { PipelineSpec } from '../pipeline/types.ts';
 import { cancelPipeline, readPipeline, type StartPipelineOptions } from './execute.ts';
 import { setTimeout as delay } from 'node:timers/promises';
+
+export const LAUNCH_ACK_MS = 15_000;
 
 export type SupervisorRequest =
   | { kind: 'job'; repo: string; request: Omit<SpawnRequest, 'onPrepared'> }
@@ -18,7 +20,7 @@ async function launch<T>(url: URL, payload: SupervisorRequest, onPrepared?: Spaw
   });
   return new Promise<T>((resolve, reject) => {
     let settled = false;
-    const timer = setTimeout(() => fail(new Error('execution supervisor did not acknowledge launch within 15s')), 15_000);
+    const timer = setTimeout(() => fail(new Error(`execution supervisor did not acknowledge launch within ${LAUNCH_ACK_MS / 1000}s`)), LAUNCH_ACK_MS);
     function fail(error: Error) {
       if (settled) return;
       settled = true;
@@ -54,17 +56,20 @@ export async function launchJob(service: ForgeService, request: SpawnRequest): P
   const ack = await launch<TrackedSpawn['ack']>(service.supervisorUrl!, { kind: 'job', repo: service.repo, request: serializable }, onPrepared);
   service.spawnedIds.add(ack.jobId);
   const done = (async () => {
+    let id = ack.jobId;
     while (true) {
-      const head = service.resolveHead(ack.jobId);
-      const detail = await service.detail(head);
+      id = service.resolveTurn(id);
+      const detail = await service.detail(id);
+      if (detail.followedBy) { id = detail.followedBy; continue; }
       if (detail.status !== 'running' && !detail.supersededBy) {
-        // Read the canonical manifest, not the surface projection.
-        return readManifest(service.repo, head) as Awaited<TrackedSpawn['done']>;
+        const manifest = readManifest(service.repo, id);
+        if (existsSync(jobFile(service.repo, id, FILES.ownerDone)) || !ownerAlive(manifest)) {
+          return manifest as Awaited<TrackedSpawn['done']>;
+        }
       }
       await delay(100);
     }
   })();
-  // ack-only callers deliberately do not await completion.
   void done.catch(() => {});
   return { ack, done };
 }

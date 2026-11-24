@@ -1,16 +1,9 @@
-/**
- * Projection of live Agent Smith workers into Claude Code's native task list.
- *
- * The mod watches Agent Smith's durable job files; it does not create Claude
- * Agent IDs or enter Claude's Agent/subagent loop. A native task ID is kept only
- * after TaskCreate returns one from the host.
- */
-
 import type { FsLike } from './fs.ts';
-import type { RadarJob, RadarAcceptance } from '../types/index.d.ts';
+import type { ContinuationKind, RadarAcceptance, RadarJob } from '../types/index.d.ts';
 import { readForgeJobs, acceptanceLabel } from './canonical.ts';
 import { isLiveStatus } from './format.ts';
 import { firstTrimmed, record } from './guards.ts';
+import { compareTurnPriority, type TurnLike } from './turns.ts';
 
 export type NativeJobStatus = 'running' | 'attention' | 'succeeded' | 'failed' | 'canceled';
 
@@ -20,6 +13,8 @@ export interface NativeJob {
   readonly task: string;
   readonly name: string | null;
   readonly workerId: string;
+  readonly turn?: number;
+  readonly startedAt?: number | null;
   readonly role: string | null;
   readonly provider: string | null;
   readonly model: string | null;
@@ -27,15 +22,16 @@ export interface NativeJob {
   readonly acceptance?: RadarAcceptance;
   readonly summarySource: 'worker' | null;
   readonly supersededBy?: string | null;
-  readonly steeredFrom?: string | null;
+  readonly followedBy?: string | null;
+  readonly continuedFrom?: string | null;
+  readonly continuationKind?: ContinuationKind | null;
+  readonly pendingSteers?: number | null;
 }
 
 export interface NativeTaskLink {
   readonly taskId: string;
   readonly status: 'in_progress' | 'completed' | 'deleted';
-  /** When this job was first seen finished (epoch ms); starts the close delay. */
   readonly doneAt?: number;
-  /** Last description/status sent successfully; lets the poll avoid no-op writes. */
   readonly fingerprint: string;
 }
 
@@ -57,15 +53,18 @@ export interface NativeTaskClient {
   }): Promise<unknown>;
 }
 
-/** Both native tasks and /forge use the same canonical projection and liveness. */
 export function nativeJobsFromRadar(jobs: readonly RadarJob[]): NativeJob[] {
   return jobs.filter(job => job.status !== 'unknown').map(job => ({
     id: job.id, status: job.status as NativeJobStatus, task: job.task,
-    name: job.name ?? null, workerId: job.workerId ?? job.id, role: job.role ?? null,
-    provider: job.provider ?? null, model: job.model ?? null,
+    name: job.name ?? null, workerId: job.workerId, turn: job.turn, startedAt: job.startedAt,
+    role: job.role ?? null, provider: job.provider ?? null, model: job.model ?? null,
     latestSummary: job.latestSummary ?? null, summarySource: job.summarySource ?? null,
     acceptance: job.acceptance,
-    supersededBy: job.supersededBy ?? null, steeredFrom: job.steeredFrom ?? null,
+    supersededBy: job.supersededBy ?? null,
+    followedBy: job.followedBy ?? null,
+    continuedFrom: job.continuedFrom ?? null,
+    continuationKind: job.continuationKind ?? null,
+    pendingSteers: job.pendingSteers ?? null,
   }));
 }
 export async function readNativeJobs(fs: FsLike, repo: string, now = Date.now()): Promise<NativeJob[]> {
@@ -86,6 +85,7 @@ function descriptionFor(job: NativeJob): string {
   const lines = [
     `Job ID: ${job.id}`,
     `Worker ID: ${job.workerId}`,
+    ...((job.turn ?? 1) > 1 ? [`Turn: ${job.turn}`] : []),
     ...(job.role === null ? [] : [`Role: ${job.role}`]),
     ...(job.provider === null ? [] : [`Provider: ${job.provider}`]),
     ...(job.model === null ? [] : [`Model: ${job.model}`]),
@@ -120,11 +120,15 @@ function updateSucceeded(result: unknown): boolean {
   return output?.success === true;
 }
 
-/** How long a finished job's task stays in the host list before it is closed. */
 const CLOSE_DELAY_MS = 10_000;
 
+function isLiveNative(job: NativeJob): boolean {
+  if ((job.supersededBy || job.followedBy) && !isLiveStatus(job.status)) return false;
+  return isLiveStatus(job.status) || job.acceptance?.pending === true;
+}
+
 function taskStatus(job: NativeJob): 'in_progress' | 'completed' {
-  return isLiveStatus(job.status) || job.acceptance?.pending ? 'in_progress' : 'completed';
+  return isLiveNative(job) ? 'in_progress' : 'completed';
 }
 
 function fingerprint(job: NativeJob): string {
@@ -136,12 +140,34 @@ function fingerprint(job: NativeJob): string {
   });
 }
 
-/**
- * Create tasks only for currently live jobs this session owns, and update only
- * jobs already represented in the host task list. That keeps old finished jobs
- * and other sessions' work from flooding TaskList; a task already linked runs
- * to completion and closes as before, whoever owns its job.
- */
+function nativeTurn(job: NativeJob): TurnLike {
+  return {
+    jobId: job.id, status: job.status, turn: job.turn, supersededBy: job.supersededBy, followedBy: job.followedBy,
+    startedAt: job.startedAt, acceptancePending: job.acceptance?.pending === true, pendingMessages: job.pendingSteers,
+  };
+}
+
+function groupNativeWorkers(jobs: readonly NativeJob[]): NativeJob[] {
+  const byWorker = new Map<string, NativeJob>();
+  for (const job of jobs) {
+    const key = job.workerId || job.id;
+    const prev = byWorker.get(key);
+    if (!prev || compareTurnPriority(nativeTurn(job), nativeTurn(prev)) < 0) byWorker.set(key, job);
+  }
+  return [...byWorker.values()];
+}
+
+export function hasPendingNativeClose(rows: readonly RadarJob[], links: NativeTaskLinks): boolean {
+  const byWorker = new Map<string, NativeJob>();
+  for (const job of groupNativeWorkers(nativeJobsFromRadar(rows))) byWorker.set(job.workerId || job.id, job);
+  for (const [key, link] of Object.entries(links)) {
+    if (link.status !== 'completed') continue;
+    const job = byWorker.get(key);
+    if (job && job.status === 'succeeded' && job.acceptance?.state !== 'rejected') return true;
+  }
+  return false;
+}
+
 export async function syncNativeTasks(
   jobs: readonly NativeJob[],
   previous: NativeTaskLinks,
@@ -150,35 +176,24 @@ export async function syncNativeTasks(
   owned: (id: string) => boolean = () => true,
 ): Promise<NativeTaskLinks> {
   const next: NativeTaskLinks = { ...previous };
-  const byId = new Map(jobs.map((j) => [j.id, j]));
-  for (const job of jobs) {
-    if (!job.supersededBy || !next[job.id]) continue;
-    const seen = new Set<string>([job.id]);
-    let targetId = job.supersededBy;
-    let cur = byId.get(targetId);
-    while (cur?.supersededBy && !seen.has(targetId)) {
-      seen.add(targetId);
-      targetId = cur.supersededBy;
-      cur = byId.get(targetId);
-    }
-    const link = next[job.id]!;
-    delete next[job.id];
-    if (link.status !== 'deleted' && !next[targetId]) {
-      next[targetId] = link;
-    }
-  }
-  for (const job of jobs) {
-    if (job.supersededBy) continue;
-    const old = next[job.id];
-    if (old?.status === 'deleted') continue;
-    const live = isLiveStatus(job.status) || job.acceptance?.pending === true;
-    if (old === undefined && (!live || !owned(job.id))) continue;
+  const workers = groupNativeWorkers(jobs);
+
+  for (const job of workers) {
+    if ((job.supersededBy || job.followedBy) && !isLiveStatus(job.status)) continue;
+
+    const key = job.workerId || job.id;
+    const old = next[key];
+    const live = isLiveNative(job);
+
+    if (old?.status === 'deleted' && !live) continue;
+    const needsCreate = old === undefined || old.status === 'deleted';
+    if (needsCreate && (!live || !owned(job.id))) continue;
 
     const subject = subjectFor(job);
     const description = descriptionFor(job);
     const status = taskStatus(job);
     const currentFingerprint = fingerprint(job);
-    let taskId = old?.taskId;
+    let taskId = needsCreate ? undefined : old?.taskId;
     if (taskId === undefined) {
       try {
         const created = await client.create({
@@ -194,29 +209,32 @@ export async function syncNativeTasks(
         });
         taskId = nativeId(created) ?? undefined;
       } catch {
-        // Host task APIs are an optional projection; workers keep running.
         continue;
       }
       if (taskId === undefined) continue;
-      next[job.id] = { taskId, status: 'in_progress', fingerprint: '' };
+      next[key] = { taskId, status: 'in_progress', fingerprint: '' };
     }
 
-    const link = next[job.id]!;
-    // A finished job's task is closed (deleted from the host list) CLOSE_DELAY_MS
-    // after we first see it finished, so the list does not fill with done work.
+    let link = next[key]!;
+    if (live && link.doneAt !== undefined) {
+      link = { taskId: link.taskId, status: link.status, fingerprint: link.fingerprint };
+      next[key] = link;
+    }
+
     if (!live) {
       const doneAt = link.doneAt ?? now;
       const dismissible = job.status === 'succeeded' && job.acceptance?.state !== 'rejected';
       if (dismissible && now - doneAt >= CLOSE_DELAY_MS && link.status === 'completed') {
         try {
           const closed = await client.update({ taskId, subject, description, status: 'deleted' });
-          if (updateSucceeded(closed)) next[job.id] = { taskId, status: 'deleted', fingerprint: '', doneAt };
-        } catch {
-          // Retried on the next poll.
-        }
+          if (updateSucceeded(closed)) next[key] = { taskId, status: 'deleted', fingerprint: '', doneAt };
+        } catch {}
         continue;
       }
-      if (link.doneAt === undefined) next[job.id] = { ...link, doneAt };
+      if (link.doneAt === undefined) {
+        link = { ...link, doneAt };
+        next[key] = link;
+      }
     }
     if (link.fingerprint === currentFingerprint) continue;
     try {
@@ -228,12 +246,15 @@ export async function syncNativeTasks(
         status,
       });
       if (updateSucceeded(updated)) {
-        const prior = next[job.id];
-        next[job.id] = { taskId, status, fingerprint: currentFingerprint, ...(prior?.doneAt === undefined ? {} : { doneAt: prior.doneAt }) };
+        const prior = next[key];
+        next[key] = {
+          taskId,
+          status,
+          fingerprint: currentFingerprint,
+          ...(!live && prior?.doneAt !== undefined ? { doneAt: prior.doneAt } : {}),
+        };
       }
-    } catch {
-      // Retain the old fingerprint so a later poll retries the update.
-    }
+    } catch {}
   }
   return next;
 }

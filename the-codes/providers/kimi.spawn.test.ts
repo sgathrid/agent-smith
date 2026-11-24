@@ -1,21 +1,10 @@
-/**
- * kimi.spawn.test.ts — the Kimi adapter's process path, against a fake binary.
- *
- * WHY THIS FILE EXISTS SEPARATELY
- * ===============================
- * providers/kimi.ts captures KIMI_BINARY at module scope, exactly like the other
- * adapters. A test that sets the env var after a static import has already lost:
- * the adapter is bound to the real binary. This file assigns the fixture path
- * BEFORE the dynamic import, which is the only reliable ordering. The fixture is
- * a real executable and receives the real argv, so buildArgv, spawnWorker, the
- * translator, result assembly and cancellation are all exercised unchanged.
- */
 import assert from 'node:assert/strict';
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { scaled, waitFor } from '../forge/testing/time.ts';
+import { kimiProvider } from './kimi.ts';
 
 const fixtureDir = mkdtempSync(path.join(os.tmpdir(), 'agent-smith-kimi-fixture-'));
 const fixtureScript = path.join(fixtureDir, 'fake-kimi.mjs');
@@ -55,9 +44,7 @@ if (scenario === 'slow') {
 writeFileSync(fixtureBinary, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(fixtureScript)} "$@"\n`);
 chmodSync(fixtureBinary, 0o755);
 
-// MUST precede the import: the adapter reads this once at module scope.
 process.env['AGENT_SMITH_KIMI_BIN'] = fixtureBinary;
-const { kimiProvider } = await import('./kimi.ts');
 
 const stateDirs: string[] = [];
 const stateDir = (): string => {

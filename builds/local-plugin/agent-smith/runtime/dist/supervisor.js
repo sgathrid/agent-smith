@@ -1,28 +1,6 @@
-import {F as ForgeService}from'./chunk-service.js';import {s as startPipeline,m as markAcceptancePending,e as jobFile,F as FILES,f as settleAcceptance}from'./chunk-execute.js';import {existsSync}from'node:fs';import'node:child_process';import'node:url';import'node:timers/promises';import'node:path';import'node:fs/promises';import'node:crypto';import'node:os';import'node:readline';/** One execution owner per launch; deliberately independent of MCP transport. */
-/** How often a running check set looks for the job's cancel marker; the pump polls at the same order. */
-const CANCEL_POLL_MS = 200;
-/**
- * Settle the job's acceptance, aborting the checks when `cancel` writes the job's marker. The
- * in-process path aborts through an AbortController; the marker is the only signal a detached supervisor gets.
- */
-async function settleCancelable(repo, finalJobId, preparedJobIds, succeeded, checks, baseDir) {
-    const controller = new AbortController();
-    const marker = jobFile(repo, finalJobId, FILES.cancel);
-    const check = () => { if (existsSync(marker))
-        controller.abort(); };
-    check();
-    const timer = setInterval(check, CANCEL_POLL_MS);
-    try {
-        return await settleAcceptance({ repo, finalJobId, preparedJobIds, succeeded, checks, baseDir, signal: controller.signal });
-    }
-    finally {
-        clearInterval(timer);
-    }
-}
-process.once('message', async (raw) => {
+import {F as ForgeService}from'./chunk-service.js';import {s as startPipeline}from'./chunk-normalize.js';import'node:fs';import'node:child_process';import'node:url';import'node:timers/promises';import'node:path';import'node:crypto';import'node:fs/promises';import'node:os';import'node:readline';process.once('message', async (raw) => {
     const payload = raw;
     let started = false;
-    // Before the preparation barrier, a vanished caller means there is no launch.
     const disconnected = () => { if (!started)
         process.exit(1); };
     process.on('disconnect', disconnected);
@@ -37,24 +15,16 @@ process.once('message', async (raw) => {
             await run.done;
         }
         else {
-            const prepared = [];
-            const checks = payload.request.checks;
-            const tracked = await service.spawnTracked({ ...payload.request, onPrepared: async (jobId) => {
-                    prepared.push(jobId);
-                    if (checks?.length)
-                        markAcceptancePending(payload.repo, jobId, checks);
+            const tracked = await service.spawnTracked({ ...payload.request, ownerChecks: true, onPrepared: async (jobId) => {
                     if (started)
-                        return; // Continuations rebind through resolveHead, without an MCP owner.
+                        return;
                     await new Promise((resolve) => {
                         process.once('message', () => { started = true; resolve(); });
                         send({ kind: 'prepared', jobId });
                     });
                 } });
             send({ kind: 'ack', value: tracked.ack });
-            const manifest = await tracked.done;
-            if (checks?.length) {
-                await settleCancelable(payload.repo, manifest.jobId, prepared, manifest.status === 'succeeded', checks, manifest.cwd);
-            }
+            await tracked.done;
         }
     }
     catch (error) {

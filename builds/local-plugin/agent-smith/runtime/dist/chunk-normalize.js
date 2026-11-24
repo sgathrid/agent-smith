@@ -1,18 +1,4 @@
-import {readFileSync,existsSync,constants,mkdirSync,writeFileSync,createWriteStream,renameSync,unlinkSync,openSync,fsyncSync,closeSync,statSync,copyFileSync}from'node:fs';import {open,readdir,access,constants as constants$1}from'node:fs/promises';import {randomBytes,randomUUID,createHash}from'node:crypto';import path from'node:path';import {spawn,execFile}from'node:child_process';import os from'node:os';import readline from'node:readline';/**
- * reasons.ts — every failure, in two to four words.
- *
- * One vocabulary for every surface: the completion notice, the band, the pane,
- * `status`, and the hints Claude reads. The forge stores `reason` (from these
- * helpers) on the job when it fails; readers of older jobs, which have only the
- * long `error` text, derive the same words with `reasonFromText`. The full error
- * always stays one step away (status, the pane), so nothing here needs to
- * explain itself.
- *
- * Lives in the mod for the same reason as progress.ts: the mod loader only
- * admits files inside the plugin folder; the forge imports it from here. Pure:
- * no `claude-code` import, no filesystem.
- */
-const NETWORK_RE = /network issue|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|fetch failed|connection (?:reset|refused|closed|error)|temporarily unavailable/i;
+import {randomBytes,randomUUID,createHash}from'node:crypto';import {readFileSync,existsSync,mkdirSync,writeFileSync,createWriteStream,openSync,fsyncSync,closeSync,renameSync,unlinkSync,statSync,copyFileSync,constants as constants$1}from'node:fs';import path from'node:path';import {spawn,execFile}from'node:child_process';import {access,constants,open,readdir}from'node:fs/promises';import os from'node:os';import readline from'node:readline';const NETWORK_RE = /network issue|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|fetch failed|connection (?:reset|refused|closed|error)|temporarily unavailable/i;
 const TIMEOUT_RE = /timed? ?out|exceeded the .*budget|\btimeout\b/i;
 const AUTH_RE = /\b(?:unauthorized|unauthenticated)\b|authentication (?:failed|required)|invalid (?:api[ _-]?key|access token)|(?:access |auth |refresh )token (?:has )?expired|not (?:logged|signed) in|please (?:log|sign) in/i;
 const BUSY_RE = /resource[_ ]exhausted|no spare capacity|\b503\b|\bservice unavailable\b|\boverloaded\b|provider busy/i;
@@ -20,13 +6,10 @@ const RATE_LIMIT_RE = /\brate[ _-]?limit(?:ed|ing)?\b|too many requests|\b429\b/
 const QUOTA_RE = /insufficient[_ ]quota|insufficient credits|quota (?:exceeded|exhausted)|exceeded.{0,30}quota|credit balance.{0,30}(?:low|exhausted)|billing.{0,30}(?:limit|exhausted)|out of credits|\b402\b|payment required/i;
 const COMPATIBILITY_RE = /unknown (?:option|argument|flag)|unrecognized (?:option|argument|flag|subcommand)|unexpected argument|unsupported (?:option|flag)|invalid value.{0,80}(?:--model|--effort|reasoning_effort)|unknown model|does not support effort|bad flag or model/i;
 const START_RE = /\bENOENT\b|spawn.{0,100}(?:not found|no such file)|couldn't start|could not start/i;
-/** The orphan reason, old and new wording: the process that owned the job is gone. */
 const ORPHAN_RE = /orphaned|supervisor process exited|server stopped/i;
 const DENIED_RE = /\bdenied\b|soft-denied/i;
-/** The warning the forge writes when a queued steer is dropped because its turn did not succeed (forge/service.ts). */
-const STEER_NOT_APPLIED_RE = /^\d+ queued steers? not applied\b/;
+const STEER_NOT_APPLIED_RE = /^\d+ queued (?:steers?|follow-ups?|messages?) (?:not (?:applied|sent)|discarded)\b/i;
 const NO_OUTPUT_RE = /no usable output|empty response|\bno output\b/i;
-/** The words for the cases the forge decides itself. */
 const REASONS = {
     serverStopped: 'server stopped',
     noOutput: 'no output',
@@ -42,44 +25,32 @@ const REASONS = {
     setupFailed: 'setup failed',
     workerError: 'worker error',
 };
-/** `first +N`: one name and a count, so a long list never widens a line. */
 function firstPlus(names) {
     const clean = [...new Set(names.map((n) => n.trim()).filter((n) => n !== ''))];
     if (clean.length === 0)
         return '';
     return clean.length === 1 ? clean[0] : `${clean[0]} +${clean.length - 1}`;
 }
-/** `denied view_file`, `denied view_file +2`, or `denied`. */
 function deniedReason(names) {
     const list = firstPlus(names);
     return list === '' ? 'denied' : `denied ${list}`;
 }
-/** `checks failed: lint`, `checks failed: lint +1`, or `checks failed`. */
 function checksReason(failed) {
     const list = firstPlus(failed);
     return list === '' ? 'checks failed' : `checks failed: ${list}`;
 }
-/** `exit 1`. */
 function exitReason(code) {
     return `exit ${code}`;
 }
-/**
- * Any failure text → the short reason. For jobs recorded before `reason` was
- * stored, and for errors that only exist as prose. Order matters: the most
- * specific cause wins, and an orphan or a denial outranks whatever else the
- * text happens to mention.
- */
 function reasonFromText(text) {
     const t = (text ?? '').trim();
     if (t === '')
         return REASONS.workerError;
     if (ORPHAN_RE.test(t))
         return REASONS.serverStopped;
-    // Already a stored reason ("denied view_file +2"): keep it whole, count included.
     if (/^denied(?: [^\n·]+)?$/.test(t) && t.length <= 64)
         return t;
     if (DENIED_RE.test(t)) {
-        // "soft-denied 2 tool action(s) (view_file, RunCommand)", "denied view_file", "denied: view_file"
         const named = /\(([^()]{2,})\)/.exec(t)?.[1] ?? /\bdenied:? ([A-Za-z_][^·\n]*)/i.exec(t)?.[1] ?? '';
         return deniedReason(named.split(',').map((n) => n.replace(/\s*\+\d+$/, '')));
     }
@@ -110,100 +81,111 @@ function reasonFromText(text) {
     const exit = /\bexit(?:ed)?(?: with)?(?: code)? (\d+)\b/i.exec(t);
     if (exit)
         return exitReason(Number(exit[1]));
-    // Already short and plain: keep it as the worker or provider put it.
     if (t.length <= 32 && !t.includes('\n') && !t.includes(' — '))
         return t;
     return REASONS.workerError;
 }/**
- * format.ts — agent-smith's OWN job-state format, and the pure rules over it.
+ * hooks/turns.ts — one definition of "which turn is a worker's head" and "is a
+ * worker idle", shared by forge (service), the channel (status, watch, notices)
+ * and the mod (band, /forge, notices). Pure, structural, no imports: the mod
+ * loader forbids imports outside the plugin, and forge/channel import from here.
  *
- * ─────────────────────────────────────────────────────────────────────────────
- * THE LAYOUT
- * ─────────────────────────────────────────────────────────────────────────────
- *
- *     <repo>/.agent-smith/jobs/<jobId>/
- *       job.json        THE ANCHOR. Always present, always rewritten whole,
- *                       atomically (write-temp + rename). Carries the full
- *                       terminal verdict AND the liveness evidence.
- *       progress.json   Live snapshot. Advisory. Rewritten at most every
- *                       PROGRESS_FLUSH_MS so a 484-tool job does not do 484
- *                       fsync-ish writes.
- *       events.jsonl    Append-only normalized ProviderEvent NDJSON. Written by
- *                       providers/ndjson.ts because we hand it our job dir as
- *                       SpawnSpec.stateDir — so all four providers get the same
- *                       four files for free.
- *       argv.json       The exact argv + cwd we spawned with. Also ndjson.ts.
- *       stderr.log      The child's stderr, verbatim. Also ndjson.ts.
- *       result.json     The verbatim JobResult from the provider adapter. Also
- *                       ndjson.ts. This is where `denied_actions` evidence
- *                       survives verbatim.
- *       result.md       The report. The thing the pane renders.
- *       cancel          Marker written the instant cancel is requested. Its
- *                       content is the ISO instant. It can exist BEFORE
- *                       job.json reaches a terminal state, so it outranks it.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * WHY A DIRECTORY, NOT FLAT `<jobId>.suffix` FILES
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * Three reasons, all of them about not having to guess:
- *
- *  1. "Does this job exist?" is a stat on the directory. In the flat layout it
- *     is "find the longest suffix that parses", and every reader grows a
- *     fallback chain when the file you keyed on has been deleted.
- *  2. Two files can never collide, so adding a file to the format (we added
- *     `cancel`) cannot break an existing job. In the flat layout a new suffix is
- *     a namespace decision every reader has to learn.
- *  3. `stateDir` in providers/types.ts is ALREADY a per-job directory, and
- *     ndjson.ts writes four files into it. Pointing it at this directory means
- *     the provider layer and our layer write the same directory, instead of us
- *     copying four files across afterwards.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * THE ONE ANCHOR, AND WHY THERE IS ONLY ONE
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * job.json is the terminal anchor and the liveness anchor, and it is the only
- * file a reader MUST be able to read. Everything else may be missing:
- * progress.json is advisory, events.jsonl is a convenience, result.md is empty
- * for a denied job.
- *
- * It is never deleted, so a missing file never has to mean "finished".
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * THE HEADLINE RULE, IN ONE PURE FUNCTION
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * `deriveStatus()` below is the only place a terminal verdict is computed. The
- * rule it encodes, and the reason it exists:
- *
- *   ┌────────────────────────────────────────────────────────────────────┐
- *   │ A JOB THAT EXITED 0 AND DELIVERED NOTHING IS **FAILED**.           │
- *   │ agy runs headless and cannot prompt for tool permission, so a      │
- *   │ denied tool is auto-denied, agy reports status "SUCCESS", response │
- *   │ "", and the process exits 0. We verified this live against the real │
- *   │ binary (see providers/agy.ts, THE TRAP). Recording that as a clean │
- *   │ success is worse than a crash, because it is quiet.                 │
- *   └────────────────────────────────────────────────────────────────────┘
- *
- * It is enforced twice over, because the two signals fail independently:
- *   - `deniedActions` non-empty  → failed  (the adapter's own detection)
- *   - ok === true, report empty  → failed  (the paranoid net; also covers a
- *     provider that does not report denials at all)
+ * Vocabulary:
+ * - A worker is one durable identity (workerId, name) with turns 1..n.
+ * - supersededBy: set only when a steer CUT this turn short; the continuation
+ *   stands in for it, so a jobId lookup follows supersededBy.
+ * - followedBy: set when a follow-up turn started after this turn finished
+ *   normally; this turn's result stands, so a jobId lookup does NOT follow it.
  */
-/** Per-repo job root, relative to the repo. Ours; nothing else reads it as truth. */
-const JOBS_DIR_SEGMENTS = ['.agent-smith', 'jobs'];
+/** 0.4.x / early-0.5 manifests wrote other kinds; map them on read. */
+function normalizeContinuationKind(v) {
+    if (v === 'follow-up' || v === 'steer-queue' || v === 'resume')
+        return 'follow-up';
+    if (v === 'steer' || v === 'steer-interrupt')
+        return 'steer';
+    return null;
+}
+const TERMINAL = new Set(['succeeded', 'failed', 'canceled', 'cancelled', 'unknown']);
+const isTerminalStatus = (s) => TERMINAL.has(s);
+function turnOf(t) {
+    return typeof t.turn === 'number' && Number.isInteger(t.turn) && t.turn >= 1 ? t.turn : 1;
+}
+function timeOf(t) {
+    for (const v of [t.startedAt, t.createdAt, t.updatedAt]) {
+        if (typeof v === 'number' && Number.isFinite(v))
+            return v;
+        if (typeof v === 'string') {
+            const ms = Date.parse(v);
+            if (Number.isFinite(ms))
+                return ms;
+        }
+    }
+    return 0;
+}
 /**
- * Bumped when the on-disk shape changes incompatibly.
- *
- * A reader that finds a manifest with a higher `schema` must refuse it rather
- * than half-understand it: reading a v2 manifest with v1 rules produces exactly
- * the confident wrong answers this project exists to prevent.
+ * Sort comparator, head first:
+ * (1) not handed off (no supersededBy, no followedBy, no steer.head) first
+ * (2) running before terminal
+ * (3) higher turn
+ * (4) newer start
+ * (5) jobId, for a total order
  */
+function compareTurnPriority(a, b) {
+    const aOff = Boolean(a.supersededBy) || Boolean(a.followedBy) || a.hasSteerHead === true;
+    const bOff = Boolean(b.supersededBy) || Boolean(b.followedBy) || b.hasSteerHead === true;
+    if (aOff !== bOff)
+        return aOff ? 1 : -1;
+    const aRun = !isTerminalStatus(a.status);
+    const bRun = !isTerminalStatus(b.status);
+    if (aRun !== bRun)
+        return aRun ? -1 : 1;
+    const dt = turnOf(b) - turnOf(a);
+    if (dt !== 0)
+        return dt;
+    const dm = timeOf(b) - timeOf(a);
+    if (dm !== 0)
+        return dm;
+    return b.jobId.localeCompare(a.jobId);
+}
+/** The head turn of one worker's turns, or null for none. */
+function pickHead(turns) {
+    let head = null;
+    for (const t of turns)
+        if (head === null || compareTurnPriority(t, head) < 0)
+            head = t;
+    return head;
+}
+/**
+ * THE idle rule. A worker is idle when its head turn is terminal, was not
+ * handed off, has no acceptance checks running and no queued messages.
+ * Notices fire on the transition to idle; status(name, wait_ms) waits for it.
+ */
+function isWorkerIdle(head) {
+    if (head === null)
+        return true;
+    return isTerminalStatus(head.status)
+        && !head.supersededBy && !head.followedBy && head.hasSteerHead !== true
+        && head.acceptancePending !== true
+        && !(typeof head.pendingMessages === 'number' && head.pendingMessages > 0);
+}
+const WORKERS_DIR = '.agent-smith/workers';
+const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
+function workerIndexPath(repo, workerId) {
+    if (!SAFE_ID.test(workerId) || workerId === '.' || workerId === '..')
+        throw new Error('Invalid worker id');
+    return repo.replace(/\/+$/, '') + '/' + WORKERS_DIR + '/' + workerId + '.json';
+}
+function parseWorkerIndex(raw) {
+    if (raw === null || typeof raw !== 'object')
+        return null;
+    const r = raw;
+    if (r['schema'] !== 1 || typeof r['workerId'] !== 'string' || typeof r['name'] !== 'string' || !Array.isArray(r['turns']))
+        return null;
+    const turns = r['turns'].filter((t) => typeof t === 'string' && SAFE_ID.test(t));
+    return { schema: 1, workerId: r['workerId'], name: r['name'], turns, updatedAt: typeof r['updatedAt'] === 'string' ? r['updatedAt'] : '' };
+}const JOBS_DIR_SEGMENTS = ['.agent-smith', 'jobs'];
 const SCHEMA_VERSION = 1;
-/** How often progress.json may be rewritten. See forge/writer.ts. */
 const PROGRESS_FLUSH_MS = 250;
-/** File names inside a job directory. Named once, referenced everywhere. */
 const FILES = {
     job: 'job.json',
     progress: 'progress.json',
@@ -214,41 +196,26 @@ const FILES = {
     result: 'result.json',
     report: 'result.md',
     cancel: 'cancel',
-    /** Marker written when a steer interrupts a running turn across or within processes. */
     cancelSteer: 'cancel.steer',
-    /** Append-only NDJSON log of SteerEntry records for this job. */
     steer: 'steer.jsonl',
-    /**
-     * Child job ID, written after the continuation anchor exists but before the
-     * parent's terminal manifest stamps `supersededBy`. Closes the finish window
-     * for `resolveHead` readers (cancel/status) during a chained turn.
-     */
     steerHead: 'steer.head',
-    /** The acceptance checks a job was spawned with, so resume_job can inherit them. */
     checksSpec: 'checks-spec.json',
-    /** The spawn_job request (prompt, context, mode, ...), so a later spawn can reuse it with `from`. */
     request: 'request.json',
+    ownerDone: 'owner.done',
+    checksAbort: 'checks.abort',
+    steerConsumed: 'steer.consumed',
+    steerDiscard: 'steer.discard',
 };
-/**
- * The id segment that marks a job as OURS.
- *
- * WHY A MARKER IN THE ID RATHER THAN ONLY IN THE FILES: the mod band renders
- * ids, and a human should be able to tell an agent-smith job by looking.
- * `implement-smith-3f9a2c71` says it in three characters.
- */
+function senderOf(e) {
+    return e.sender ?? (e.delivery === 'interrupt' ? 'steer' : 'follow_up');
+}
 const ID_MARKER = 'smith';
 function isForgeStatus(v) {
     return v === 'running' || v === 'succeeded' || v === 'failed' || v === 'canceled';
 }
-/** The statuses a job never leaves. `running` is the only non-terminal one. */
 function isTerminalForgeStatus(s) {
     return s === 'succeeded' || s === 'failed' || s === 'canceled';
 }
-/**
- * Pure: split changed paths into those this job's own tool inputs mention (by full
- * path or basename) and those it never touched. With no captured input there is
- * nothing to attribute against, so everything stays attributed.
- */
 function attributeChanged(files, toolInputs) {
     if (toolInputs === '')
         return { mine: [...files], other: [] };
@@ -260,26 +227,16 @@ function attributeChanged(files, toolInputs) {
     }
     return { mine, other };
 }
-/** Max entries kept in `changedFiles`. */
 const CHANGED_FILES_CAP = 200;
-/** Paths that are our own bookkeeping, never a worker's change. */
 function isForgeStatePath(p) {
     return p === '.agent-smith' || p.startsWith('.agent-smith/');
 }
-/**
- * Pure: which paths changed since the baseline.
- *
- * `nowDirty` is the worktree's dirty set at finish; `modifiedBaseline` is the
- * subset of baseline-dirty paths whose content signature moved (writer-computed);
- * `committed` are paths touched by commits made since the baseline HEAD.
- */
 function diffChangedFiles(baseline, nowDirty, modifiedBaseline = [], committed = []) {
     const was = new Set(baseline.dirty);
     const out = new Set();
     for (const p of nowDirty)
         if (!was.has(p))
             out.add(p);
-    // Dirty at start and clean now: the worker reverted/committed it.
     const now = new Set(nowDirty);
     for (const p of baseline.dirty)
         if (!now.has(p))
@@ -291,9 +248,6 @@ function diffChangedFiles(baseline, nowDirty, modifiedBaseline = [], committed =
     const all = [...out].filter((p) => !isForgeStatePath(p)).sort();
     return { files: all.slice(0, CHANGED_FILES_CAP), truncated: all.length > CHANGED_FILES_CAP };
 }
-/* ────────────────────────────────────────────────────────────────────────────
- * Paths — pure string joins, exported so tests never touch a filesystem
- * ──────────────────────────────────────────────────────────────────────────── */
 function jobsDir(repo) {
     return path.join(repo, ...JOBS_DIR_SEGMENTS);
 }
@@ -306,106 +260,50 @@ function jobDir(repo, jobId) {
 function jobFile(repo, jobId, name) {
     return path.join(jobDir(repo, jobId), name);
 }
-/** The anchor, parsed. Throws when absent or malformed: callers decide what that means. */
-function readManifest(repo, jobId) {
-    return JSON.parse(readFileSync(jobFile(repo, jobId, FILES.job), 'utf8'));
+function normalizeDenials(denials) {
+    return (denials ?? []).map((d) => d.nonfatal === undefined && d.action === 'tool' ? { ...d, nonfatal: true } : d);
 }
-/* ────────────────────────────────────────────────────────────────────────────
- * Ids
- * ──────────────────────────────────────────────────────────────────────────── */
-/**
- * A fresh job id: `<mode>-smith-<8 hex>`.
- *
- * The mode is sanitised to `[a-z0-9]` because the id becomes a directory name.
- * A mode of `Review/Docs` must not be able to escape.
- */
+function readManifest(repo, jobId) {
+    const manifest = JSON.parse(readFileSync(jobFile(repo, jobId, FILES.job), 'utf8'));
+    if (!Array.isArray(manifest.deniedActions) || !manifest.deniedActions.some((d) => d.nonfatal === undefined && d.action === 'tool')) {
+        return manifest;
+    }
+    return { ...manifest, deniedActions: normalizeDenials(manifest.deniedActions) };
+}
 function newJobId$1(mode) {
     const safeMode = mode.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 120).replace(/-+$/g, '');
     const prefix = safeMode === '' ? 'job' : safeMode;
     return `${prefix}-${ID_MARKER}-${randomBytes(4).toString('hex')}`;
 }
-/** The first non-empty line of a prompt, `#`-stripped, capped. The task cell. */
 function taskTitle(prompt) {
     const first = prompt.split('\n').find((l) => l.trim().length > 0) ?? '';
     return first.replace(/^#\s*/, '').trim().slice(0, 200);
 }
-/* ────────────────────────────────────────────────────────────────────────────
- * THE HEADLINE RULE
- * ──────────────────────────────────────────────────────────────────────────── */
-/**
- * A nonempty final answer is a deliverable, including deliberately short answers.
- * Provider completion and executable acceptance remain separate requirements.
- */
 const MIN_USEFUL_CHARS = 1;
-/** Is there no usable output? See MIN_USEFUL_CHARS. */
 function looksEmpty(text) {
     if (text === null || text === undefined)
         return true;
     return text.trim().length < MIN_USEFUL_CHARS;
 }
-/** deriveStatus's reason when a writing job's cwd vanished before it could be checked. */
 const CWD_GONE_REASON = 'working directory gone; nothing could be verified';
-/** A failure this soon after start, with no tool call, is a route failure, not the work. */
 const FAILED_EARLY_MS = 20_000;
-/** Writing modes: a vanished cwd makes their success unverifiable. */
 function isWritingMode(mode) {
     return mode === 'implement' || mode === 'verify';
 }
-/**
- * deriveStatus's cwd inputs, from what the caller can prove: whether `cwd`
- * still exists, and whether the job was meant to write (its mode) or is known
- * to have edited. An empty or absent cwd is never "missing" (nothing to check).
- */
 function cwdFacts(cwd, mode, edited = false) {
     return { cwdMissing: typeof cwd === 'string' && cwd !== '' && !existsSync(cwd), writing: isWritingMode(mode) || edited };
 }
-/**
- * THE ONLY PLACE A JOB IS DECLARED FINISHED, AND IT IS PURE.
- *
- * Precedence, highest first. Each row is here because removing it produced a
- * specific, observed lie:
- *
- *   1. alreadyTerminal            ⇒ that state. A cancel marker outranks the
- *      worker exiting, because a job we killed has no trustworthy terminal
- *      state of its own — whatever the CLI managed to flush on the way down is
- *      not what happened to the task.
- *   2. deniedActions non-empty    ⇒ failed, suspicious. agy exited 0, said
- *      "SUCCESS", returned "" and did nothing. THE TRAP. Unless every denial
- *      is nonfatal and a report was delivered: then succeeded, with a note —
- *      but only after rule 3b has passed.
- *   3. ok === false               ⇒ failed. The adapter already weighed exit
- *      code against the result event; we do not second-guess it.
- *   3b. cwd gone, writing job     ⇒ failed, suspicious. Its edits and checks
- *      cannot be verified; a nonfatal denial does not excuse it.
- *   4. ok === true, report empty  ⇒ failed, suspicious. The net for every
- *      provider that does not report denials. "You asked me nothing and I said
- *      nothing" is only a success when the job also made no tool calls — which
- *      the adapter has already ruled on by the time we get here.
- *   5. ok === true                ⇒ succeeded.
- *   6. no verdict yet             ⇒ running.
- *
- * Rule 4 is the one that exists because of what this project is for. Note it
- * fires on EMPTINESS, not on a warning flag: an empty report is empty whether or
- * not the provider was kind enough to mention it, and a warning flag that gates
- * this is a warning flag that can be forgotten.
- */
 function denialNames(denials) {
     return denials
         .map((x) => x.displayName ?? x.action)
         .filter((n) => typeof n === 'string' && n.length > 0);
 }
-/** `view_file` or `view_file +2`; empty when no denial has a name. */
 function deniedNames(denials) {
     const names = [...new Set(denialNames(denials))];
     if (names.length === 0)
         return '';
     return names.length === 1 ? names[0] : `${names[0]} +${names.length - 1}`;
 }
-/**
- * What a failed finish stores: the full `error` (the adapter's own text, else the
- * verdict's reason; never both) and the short `reason`. Not failed: both null-ish.
- */
-/** Keep both ends of a long error: the cause leads, the stderr tail closes. */
 function elide(text, max) {
     if (text.length <= max)
         return text;
@@ -445,10 +343,7 @@ function deriveStatus(d) {
         return { status: 'running', suspicious: false, reason: null };
     }
     const denials = d.deniedActions ?? [];
-    // Denials the adapter marked non-fatal (a delivered report plus denied calls,
-    // e.g. a reviewer that wanted a shell) do not fail the job, whatever the
-    // provider. `action: 'tool'` is the pre-flag claude encoding, still on disk.
-    const nonfatalOnly = denials.length > 0 && d.ok === true && !looksEmpty(d.report) && denials.every((x) => x.nonfatal === true || x.action === 'tool');
+    const nonfatalOnly = denials.length > 0 && d.ok === true && !looksEmpty(d.report) && denials.every((x) => x.nonfatal === true);
     if (denials.length > 0 && !nonfatalOnly) {
         return { status: 'failed', suspicious: true, reason: deniedReason(denialNames(denials)) };
     }
@@ -459,11 +354,6 @@ function deriveStatus(d) {
             reason: d.jobStatus === 'timeout' ? REASONS.timedOut : REASONS.workerError,
         };
     }
-    // A writing job whose cwd vanished cannot show its edits or pass a check:
-    // its "done" is a claim with nothing behind it. A read-only job's report is
-    // the deliverable, so it stands (the writer records a warning instead).
-    // Checked before the nonfatal-denial success, which would otherwise let a
-    // denied call excuse a writing job from it.
     if (d.cwdMissing === true && d.writing === true) {
         return { status: 'failed', suspicious: true, reason: CWD_GONE_REASON };
     }
@@ -484,23 +374,10 @@ function deriveStatus(d) {
     }
     return { status: 'succeeded', suspicious: false, reason: null };
 }
-/**
- * Should progress.json be rewritten now?
- *
- * A 28-minute job made 484 tool calls. Writing a file per event is 484 writes
- * the UI never needed; the band polls every 3 s, so anything under that is
- * invisible. The comparison is `>=` and not `>` so a flush is never starved by
- * an event stream that arrives faster than the interval.
- */
 function shouldFlush(lastFlushMs, nowMs, minMs = PROGRESS_FLUSH_MS) {
     return nowMs - lastFlushMs >= minMs;
 }
-/* ────────────────────────────────────────────────────────────────────────────
- * Orphans — a `running` job whose supervisor died
- * ──────────────────────────────────────────────────────────────────────────── */
-/** Default wall-clock budget for one job (re-exported by service.ts). */
 const DEFAULT_TIMEOUT_MS = 45 * 60_000;
-/** A legacy manifest (no ownerPid) is orphaned only when silent this long. */
 const LEGACY_ORPHAN_AFTER_MS = 2 * DEFAULT_TIMEOUT_MS;
 const ORPHAN_REASON = REASONS.serverStopped;
 const CANCEL_ORPHAN_REASON = 'canceled; server stopped before confirming';
@@ -516,26 +393,14 @@ function isPidAlive(pid) {
         return err.code === 'EPERM';
     }
 }
-/** The recorded owner pid when it is a usable one (positive integer), else null (legacy or malformed). */
 function validOwnerPid(m) {
     const pid = m.ownerPid;
     return typeof pid === 'number' && Number.isInteger(pid) && pid > 0 ? pid : null;
 }
-/** True when the manifest names an owner process that is still running. */
 function ownerAlive(m) {
     const pid = validOwnerPid(m);
     return pid !== null && isPidAlive(pid);
 }
-/**
- * THE orphan rule, pure. The caller guarantees there is no terminal result.
- * Returns the verdict to report, or null if the job is not (provably) orphaned.
- * A cancel request outranks the orphan: when the supervisor is dead or unknown
- * the operator's intent is what happened, so the verdict is `canceled`, not
- * `failed`. A live supervisor still returns null; it will settle the request.
- *
- * `lastSeenMs` is the newest liveness evidence the caller has (updatedAt,
- * progress.lastEventAt); only the legacy no-pid path uses it.
- */
 function deriveOrphan(m, lastSeenMs, nowMs, alive = isPidAlive, cancelRequested = false) {
     if (m.status !== 'running')
         return null;
@@ -551,15 +416,10 @@ function deriveOrphan(m, lastSeenMs, nowMs, alive = isPidAlive, cancelRequested 
     const ref = Math.max(...times);
     return nowMs - ref > LEGACY_ORPHAN_AFTER_MS ? verdict : null;
 }
-/**
- * THE one place a next step is derived. Derived on read, never stored in
- * job.json. Null for running/succeeded jobs. A short imperative for the
- * orchestrating agent, not for a human.
- */
 function nextActionFor(i) {
     const base = baseNextAction(i);
     return base !== null && i.steerNotApplied === true
-        ? `${base} A queued steer was not applied: include it in your resume_job prompt.`
+        ? `${base} A queued message was discarded: send it again with follow_up.`
         : base;
 }
 function baseNextAction(i) {
@@ -568,7 +428,7 @@ function baseNextAction(i) {
         return null;
     const err = i.error ?? '';
     if (ORPHAN_RE.test(err))
-        return 'Server stopped: resume_job if it has a conversation, else rerun.';
+        return 'Server stopped: follow_up if it has a conversation, else rerun.';
     if (i.jobStatus === 'denied' || (i.deniedCount ?? 0) > 0 || DENIED_RE.test(err)) {
         return i.unrestricted === true
             ? 'Denied even with unrestricted:true: narrow the task or give an approved path.'
@@ -577,615 +437,27 @@ function baseNextAction(i) {
     if (AUTH_RE.test(err))
         return 'Not logged in: fix the provider login, then retry.';
     if (BUSY_RE.test(err))
-        return 'Provider busy (temporary); resume_job to continue.';
+        return 'Provider busy (temporary); follow_up to continue.';
     if (QUOTA_RE.test(err))
         return 'Out of credits on the provider account.';
     if (RATE_LIMIT_RE.test(err))
-        return 'Rate limited; resume_job after a short wait.';
+        return 'Rate limited; follow_up after a short wait.';
     if (COMPATIBILITY_RE.test(err))
         return 'Bad flag or model: run agent-smith doctor, then fix the request.';
     if (START_RE.test(err))
         return "Couldn't start: run agent-smith doctor.";
-    // After the specific diagnoses, before the generic ones: resuming a route
-    // that failed before any work just fails again.
     if (i.failedEarly === true && i.jobStatus !== 'timeout') {
         return 'Route failed before any work (model/account): pick another model from list_capabilities or fix the account.';
     }
     if (i.jobStatus === 'timeout' || TIMEOUT_RE.test(err)) {
-        return 'Raise timeoutMs or split the task; resume_job keeps context.';
+        return 'Raise timeoutMs or split the task; follow_up keeps context.';
     }
     if (NETWORK_RE.test(err))
-        return 'Network error: retry once with resume_job or a new spawn.';
+        return 'Network error: retry once with follow_up or a new spawn.';
     if (NO_OUTPUT_RE.test(err) || (i.exitCode === 0 && looksEmpty(i.report))) {
-        return 'No output: ask for a final answer via resume_job, or rerun.';
+        return 'No output: ask for a final answer via follow_up, or rerun.';
     }
     return 'Read status.error and warnings before retrying.';
-}/** Text sanitising and fixed-width fitting. Dependency-free: everything that puts
- * worker or user prose into a cell goes through here first.
- */
-/**
- * Strip complete ANSI escape sequences (CSI, OSC, DCS/PM/APC/SOS, 2-byte ESC,
- * C1 controls) and remaining forbidden control characters, unpaired surrogates,
- * and noncharacters (`U+FDD0..U+FDEF`), while preserving `\n` and valid UTF-16
- * surrogate pairs.
- *
- * Why this exists: Claude Code's JSX element validator rejects any `<Text>`,
- * `<Button label>`, or `<Markdown text>` containing C0/C1 controls (except `\t`
- * and `\n`), lone surrogates, or `U+FDD0..U+FDEF`. Worker tool output, shell
- * commands, check output, and prompt text routinely contain ANSI colour codes or
- * `\r` progress lines; stripping them at the UI boundary keeps the stored job
- * files intact while preventing a single control byte from aborting the pane.
- */
-const ANSI_ESCAPE = /(?:\x1b\][\s\S]*?(?:\x07|\x1b\\|\x9c)|\x9d[\s\S]*?(?:\x07|\x1b\\|\x9c)|\x1b[PX^_][\s\S]*?(?:\x1b\\|\x9c)|(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]|\x1b[ -/]*[@-~])/gu;
-const FORBIDDEN_CONTROLS = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ud800-\udfff\ufdd0-\ufdef]/gu;
-function sanitizeText(s) {
-    return s
-        .replace(ANSI_ESCAPE, '')
-        .replace(/\r\n?/g, '\n')
-        .replace(/\t/g, '  ')
-        .replace(FORBIDDEN_CONTROLS, '');
-}
-/**
- * Cut to at most `max` UTF-16 units without splitting a surrogate pair.
- *
- * `slice` can leave a high surrogate with no low half. `sanitizeText` removes
- * such halves, so a cut made AFTER sanitizing must not create one: the host
- * draws an unpaired half as U+FFFD, or refuses the tree a Text's string is
- * checked in. `max` stays in UTF-16 units because every caller sizes cells in
- * terminal columns, where a pair already counts as two.
- */
-function clip(s, max) {
-    if (s.length <= max)
-        return s;
-    const cut = s.slice(0, Math.max(0, max));
-    return /[\ud800-\udbff]$/.test(cut) ? cut.slice(0, -1) : cut;
-}
-/** Collapse all whitespace runs to single spaces and cap the length. A hard
- * bound on what one string can cost, for prose with no cell to sit in (a report
- * excerpt, a warning message); the renderer's `wrap="truncate-end"` is the
- * mechanism, this is belt and braces. */
-function oneLine(s, max = 400) {
-    const t = sanitizeText(s).replace(/\s+/g, ' ').trim();
-    return clip(t, Math.max(0, max));
-}/**
- * safe-fs.ts — race-tolerant filesystem primitives shared by every reader.
- *
- * WHY THIS EXISTS
- * ---------------
- * Every reader in this directory observes state that another process is
- * *actively mutating*: a worker rewrites its job files on every event. Claude Code appends to a
- * subagent `.jsonl` while we read it. So between our `readdir` and our `read`,
- * a path can vanish, be truncated mid-write, or be replaced by a directory.
- *
- * Throwing here is never correct: a missing file is *information*, not an
- * error. Every function in this module returns
- * `null` / `[]` / `false` instead of throwing. This is the single most
- * important flake-prevention rule in the harness.
- */
-/** Substrings of fs error codes that mean "the world moved on, carry on". */
-const TRANSIENT_CODES = new Set([
-    "ENOENT", // deleted between readdir and read (hazard A: clean-success cleanup)
-    "EACCES", // macOS TCC / permissions
-    "EPERM",
-    "EISDIR", // a path we expected to be a file is a dir
-    "ENOTDIR", // ...or vice versa
-    "EBUSY",
-    "ELOOP",
-    "EMFILE",
-    "ENFILE",
-]);
-/**
- * Default byte cap for text reads.
- *
- * WHY: `events.jsonl` reached 492KB and a Claude subagent transcript 526KB in
- * the sample corpus. We only ever want the *head* of a stream for display; a
- * viewer that OOMs on a long job is worse than one that truncates. Callers
- * that genuinely need everything pass a bigger number.
- */
-const DEFAULT_MAX_BYTES = 2 * 1024 * 1024;
-function isTransient(err) {
-    if (typeof err !== "object" || err === null)
-        return true; // be paranoid
-    const code = err.code;
-    // A non-Error throw is by definition something we did not anticipate.
-    if (typeof code !== "string")
-        return true;
-    return TRANSIENT_CODES.has(code);
-}
-/** `fs.access(F_OK)` that returns a boolean instead of throwing. */
-async function existsSafe(path) {
-    try {
-        await access(path, constants.F_OK);
-        return true;
-    }
-    catch {
-        return false;
-    }
-}
-/**
- * Read a file as UTF-8 text, capped at `maxBytes`.
- *
- * Returns `null` if the file is gone, unreadable, or a directory. Never throws.
- * A short read is *normal* here — it means we caught a half-written file, which
- * is exactly what we want the JSON parser downstream to survive.
- */
-async function readTextSafe$1(path, maxBytes = DEFAULT_MAX_BYTES) {
-    let handle;
-    try {
-        handle = await open(path, "r");
-        // +4 bytes so a multi-byte UTF-8 sequence straddling the cap does not
-        // become a replacement character at the boundary.
-        const buf = Buffer.allocUnsafe(maxBytes + 4);
-        const { bytesRead } = await handle.read(buf, 0, buf.length, 0);
-        if (bytesRead === 0)
-            return ""; // genuinely empty file is not "missing"
-        return buf.subarray(0, bytesRead).toString("utf8");
-    }
-    catch (err) {
-        if (!isTransient(err))
-            throw err;
-        return null;
-    }
-    finally {
-        await handle?.close().catch(() => { });
-    }
-}
-/**
- * Read and JSON.parse, tolerating every way that can go wrong.
- *
- * Returns `null` for: missing file, unreadable file, empty file, invalid JSON.
- * Invalid JSON is EXPECTED, not exceptional — a writer using a plain
- * `writeFile` can be caught mid-write, so a reader that arrives mid-write sees a truncated document.
- * Treating that as `null` and retrying on the next poll is the whole strategy.
- */
-async function readJsonSafe(path, maxBytes) {
-    const text = await readTextSafe$1(path, maxBytes);
-    if (text === null)
-        return null;
-    const trimmed = text.trim();
-    if (trimmed === "")
-        return null; // empty or all-whitespace ⇒ mid-write
-    try {
-        return JSON.parse(trimmed);
-    }
-    catch {
-        return null; // half-written JSON. Next poll will get it.
-    }
-}
-/**
- * `fs.readdir` that returns `[]` instead of throwing.
- *
- * NOTE: we do NOT `stat` each entry here. That would double the syscalls and
- * reintroduce the very race we are defending against. Callers should treat
- * every returned name as a *hypothesis* to be confirmed by a tolerant read.
- */
-async function readdirSafe(path) {
-    try {
-        return await readdir(path);
-    }
-    catch (err) {
-        if (!isTransient(err))
-            throw err;
-        return [];
-    }
-}/**
- * agent-smith.ts — reads OUR OWN job state from `<repo>/.agent-smith/jobs/`.
- *
- * The source of truth for every job this repo spawned. It is not much code
- * because forge/format.ts made it not much code: owning the state format means
- * three questions, three answers:
- *
- *   - Does this job exist?        → the directory exists and holds a job.json.
- *   - What is its terminal state? → job.json.status. Written atomically, always.
- *   - Is it alive?                → job.json.updatedAt, refreshed on every event.
- *
- * The one hazard to respect is the cancel marker: `cancel` can exist before
- * job.json reaches a terminal state, so it outranks it.
- */
-/**
- * payload keys the normalizer relies on. Cross-referenced by name from
- * harness/normalize.ts's `smithNormalizer`.
- */
-const SMITH_PAYLOAD = {
-    provider: 'provider',
-    mode: 'mode',
-    model: 'model',
-    effort: 'effort',
-    status: 'status',
-    task: 'task',
-    unrestricted: 'unrestricted',
-    conversation: 'conversation',
-    createdAt: 'created_at',
-    updatedAt: 'updated_at',
-    startedAt: 'started_at',
-    finishedAt: 'finished_at',
-    exitCode: 'exit_code',
-    jobStatus: 'job_status',
-    error: 'error',
-    deniedActions: 'denied_actions',
-    usage: 'usage',
-    toolCalls: 'tool_calls',
-    output: 'output',
-    canceled: 'canceled',
-    cancelAt: 'cancel_at',
-    lastEventAt: 'last_event_at',
-    lastAliveAt: 'last_alive_at',
-    recentActivities: 'recent_activities',
-    lastActivity: 'last_activity',
-    latestText: 'latest_text',
-    progressWarnings: 'progress_warnings',
-    pipeline: 'pipeline',
-    stage: 'stage',
-    attempt: 'attempt',
-    schema: 'schema',
-};
-const CANCELED_ORPHAN = { status: 'canceled', suspicious: false, reason: CANCEL_ORPHAN_REASON };
-/**
- * Reads `.agent-smith/jobs`.
- *
- * Every method is fault-tolerant: a reader reads files a live process is
- * rewriting, and one
- * unreadable job is that job's absence rather than a dead band. `discover`
- * NEVER throws; an absent jobs directory is the ordinary case for a repo that
- * has never spawned anything, not an error.
- */
-class AgentSmithReader {
-    provider = 'agent-smith';
-    /**
-     * Enumerate job ids from the jobs directory.
-     *
-     * Keyed on the DIRECTORY: there is no suffix to parse, no "which file proves this job
-     * exists", and no entry that can half-qualify. A job's identity is its
-     * directory, so identity cannot be lost.
-     */
-    async discover(cwd) {
-        const entries = await readdirSafe(jobsDir(cwd));
-        const ids = new Set();
-        for (const entry of entries) {
-            // `readdirSafe` returns names only; a name that is not a directory will
-            // simply fail the job.json read below and contribute nothing. We do not
-            // stat here because a stat per entry is a syscall per entry on a path the
-            // band hits every three seconds.
-            if (!entry.startsWith('.'))
-                ids.add(entry);
-        }
-        return [...ids].sort();
-    }
-    /**
-     * Assemble one snapshot.
-     *
-     * Returns null when the job does not exist to this reader — i.e. no directory
-     * and no job.json. A FINISHED job returns a full snapshot: job.json is never
-     * deleted, which is the whole reason the format has a single anchor.
-     */
-    async read(cwd, jobId) {
-        // The cancel marker outranks job.json: it can exist before the worker has
-        // been reaped.
-        const cancelPath = jobFile(cwd, jobId, FILES.cancel);
-        const cancelRequested = await existsSafe(cancelPath);
-        let cancelAt = null;
-        if (cancelRequested) {
-            const raw = await readTextSafe$1(cancelPath);
-            const t = raw?.trim();
-            cancelAt = t !== undefined && t !== '' ? t : null;
-        }
-        const manifest = await readJsonSafe(jobFile(cwd, jobId, FILES.job));
-        // A marker is a request. The owner may still be working or may finish
-        // successfully before it can stop; only terminal canceled state is proof.
-        const canceled = manifest === null ? cancelRequested : manifest.status === 'canceled';
-        // A manifest from a NEWER writer is refused rather than half-understood.
-        // Reading a v2 file with v1 rules produces exactly the confident wrong
-        // answers this project exists to prevent, and `unknown` is the honest state.
-        if (manifest !== null && typeof manifest.schema === 'number' && manifest.schema > SCHEMA_VERSION) {
-            return {
-                provider: this.provider,
-                jobId,
-                cwd,
-                partial: true,
-                payload: {
-                    [SMITH_PAYLOAD.schema]: manifest.schema,
-                    [SMITH_PAYLOAD.error]: `on-disk schema v${manifest.schema} is newer than this reader (v${SCHEMA_VERSION}); state unknown`,
-                    [SMITH_PAYLOAD.canceled]: canceled,
-                    [SMITH_PAYLOAD.cancelAt]: cancelAt,
-                },
-            };
-        }
-        const report = await readTextSafe$1(jobFile(cwd, jobId, FILES.report));
-        const progress = await readJsonSafe(jobFile(cwd, jobId, FILES.progress));
-        // "Does this job exist?" is asked LAST, and includes the marker: a job
-        // whose only surviving artefact is its cancel request is still a job.
-        //
-        // Note what is NOT consulted: the bare existence of the directory. A
-        // half-created directory (crash between mkdir and the first write) and a
-        // stray directory a human dropped in here are both indistinguishable from a
-        // job by `stat`, and a band that draws "unknown" for a stray folder is
-        // indistinguishable from one that lies. We require evidence of a job.
-        const anyEvidence = manifest !== null || canceled || report !== null;
-        if (!anyEvidence)
-            return null;
-        // Orphan derivation (forge/format.ts deriveOrphan): a `running` anchor with
-        // no terminal result whose supervisor is gone. Derived, never written into
-        // job.json. Only the service reconciler persists the verdict; this reader
-        // is read-only, including when used by notifications and validation.
-        let orphan = null;
-        if (manifest !== null && manifest.status === 'running' && !canceled
-            && !(await existsSafe(jobFile(cwd, jobId, FILES.result)))) {
-            const lastSeen = Math.max(Date.parse(manifest.updatedAt), Date.parse(progress?.lastEventAt ?? ''));
-            orphan = deriveOrphan(manifest, Number.isFinite(lastSeen) ? lastSeen : null, Date.now(), undefined, cancelRequested);
-            // A live supervisor honours a cancel request within seconds. A request that
-            // is a minute old and still has no terminal state means nobody is listening.
-            const cancelAgeMs = cancelAt === null ? NaN : Date.now() - Date.parse(cancelAt);
-            const ownerIsAlive = ownerAlive(manifest);
-            if (orphan === null && cancelRequested && cancelAgeMs > 60_000 && !ownerIsAlive)
-                orphan = CANCELED_ORPHAN;
-        }
-        const payload = {
-            [SMITH_PAYLOAD.schema]: manifest?.schema ?? null,
-            [SMITH_PAYLOAD.provider]: manifest?.provider ?? null,
-            name: manifest?.name ?? null,
-            workerId: manifest?.workerId ?? jobId,
-            role: manifest?.role ?? manifest?.mode ?? null,
-            latestSummary: progress?.latestSummary ?? manifest?.latestSummary ?? null,
-            summarySource: progress?.summarySource ?? manifest?.summarySource ?? null,
-            [SMITH_PAYLOAD.mode]: manifest?.mode ?? null,
-            [SMITH_PAYLOAD.model]: manifest?.model ?? null,
-            [SMITH_PAYLOAD.effort]: manifest?.effort ?? null,
-            [SMITH_PAYLOAD.status]: orphan?.status ?? manifest?.status ?? null,
-            [SMITH_PAYLOAD.task]: manifest?.task ?? null,
-            [SMITH_PAYLOAD.unrestricted]: manifest?.unrestricted ?? null,
-            [SMITH_PAYLOAD.conversation]: manifest?.conversation ?? null,
-            [SMITH_PAYLOAD.createdAt]: manifest?.createdAt ?? null,
-            [SMITH_PAYLOAD.updatedAt]: manifest?.updatedAt ?? null,
-            [SMITH_PAYLOAD.startedAt]: manifest?.startedAt ?? null,
-            [SMITH_PAYLOAD.finishedAt]: manifest?.finishedAt ?? null,
-            [SMITH_PAYLOAD.exitCode]: manifest?.exitCode ?? null,
-            [SMITH_PAYLOAD.jobStatus]: manifest?.jobStatus ?? null,
-            [SMITH_PAYLOAD.error]: orphan?.reason ?? manifest?.error ?? null,
-            [SMITH_PAYLOAD.deniedActions]: manifest?.deniedActions ?? [],
-            [SMITH_PAYLOAD.usage]: manifest?.usage ?? null,
-            ...(Array.isArray(manifest?.changedFiles) && manifest.changedFilesTruncated !== true
-                ? { changed_files: manifest.changedFiles } : {}),
-            // No progress.json and no manifest count is unknown, not zero: a job that
-            // wrote nothing must not claim it made no tool calls.
-            [SMITH_PAYLOAD.toolCalls]: progress?.toolCalls ?? manifest?.toolCalls ?? null,
-            [SMITH_PAYLOAD.pipeline]: manifest?.pipeline ?? null,
-            [SMITH_PAYLOAD.stage]: manifest?.stage ?? null,
-            [SMITH_PAYLOAD.attempt]: manifest?.attempt ?? null,
-            [SMITH_PAYLOAD.output]: report,
-            [SMITH_PAYLOAD.canceled]: canceled,
-            [SMITH_PAYLOAD.cancelAt]: cancelAt,
-            [SMITH_PAYLOAD.lastEventAt]: progress?.lastEventAt ?? manifest?.updatedAt ?? null,
-            // The process owner's heartbeat (providers/ndjson.ts). Absent for jobs
-            // written by older builds: liveness then falls back to event silence.
-            [SMITH_PAYLOAD.lastAliveAt]: progress?.lastAliveAt ?? null,
-            ...(typeof progress?.workerPid === 'number' ? { workerPid: progress.workerPid } : {}),
-            ...(typeof (manifest?.toolErrors ?? progress?.toolErrors) === 'number'
-                ? { toolErrors: manifest?.toolErrors ?? progress?.toolErrors } : {}),
-            ...(manifest?.failedEarly === true ? { failedEarly: true } : {}),
-            ...(manifest?.changedFilesUnknown === true ? { changedFilesUnknown: true } : {}),
-            ...(manifest?.cwdMissingAtFinish === true ? { cwdMissingAtFinish: true } : {}),
-            [SMITH_PAYLOAD.recentActivities]: progress?.recentActivities ?? [],
-            [SMITH_PAYLOAD.lastActivity]: progress?.lastActivity ?? null,
-            [SMITH_PAYLOAD.latestText]: progress?.latestText ?? null,
-            [SMITH_PAYLOAD.progressWarnings]: progress?.warnings ?? [],
-            ...(progress?.digest !== undefined ? { digest: progress.digest } : {}),
-            ...(manifest?.supersededBy !== undefined ? { supersededBy: manifest.supersededBy } : {}),
-            ...(manifest?.steeredFrom !== undefined ? { steeredFrom: manifest.steeredFrom } : {}),
-            ...(typeof (progress?.pendingSteers ?? manifest?.pendingSteers) === 'number'
-                ? { pendingSteers: progress?.pendingSteers ?? manifest?.pendingSteers }
-                : {}),
-            ...(Array.isArray(manifest?.staleReads) && manifest.staleReads.length > 0
-                ? { staleReads: manifest.staleReads }
-                : {}),
-        };
-        // partial=true when the anchor is missing: something is on disk for this
-        // job but we could not read the file that says what state it is in. The
-        // normalizer biases toward `unknown` over a guess, and `unknown` must never
-        // be collapsed into `running`.
-        return {
-            provider: this.provider,
-            jobId,
-            cwd: manifest?.cwd ?? cwd,
-            payload,
-            partial: manifest === null,
-        };
-    }
-}/**
- * normalize.ts — provider-agnostic normalization to ObservedJob.
- *
- * Every provider quirk and every judgement call lives HERE and only here, so
- * this file is the single place a reviewer reads to answer "why did that job
- * show up as failed?". Readers (agent-smith.ts) are dumb parsers; they
- * extract facts and get out of the way.
- *
- * The headline rule, an empty response is not a clean success, is applied
- * once, when the job is written (forge/format.ts `deriveStatus`), and not
- * re-derived here.
- */
-// ── helpers ────────────────────────────────────────────────────────────────
-function asString(v) {
-    return typeof v === "string" && v.length > 0 ? v : null;
-}
-function asNumber(v) {
-    return typeof v === "number" && Number.isFinite(v) ? v : null;
-}
-function asBool(v) {
-    return typeof v === "boolean" ? v : null;
-}
-function asStringArray(v) {
-    if (!Array.isArray(v))
-        return [];
-    return v.filter((x) => typeof x === "string");
-}
-// ── agent-smith normalizer ──────────────────────────────────────────────────
-/**
- * Map an agent-smith payload onto ObservedJob.
- *
- * It is short because we own the format (see forge/format.ts). Three rows, in order:
- *
- *   1. cancel marker exists                    ⇒ canceled   (outranks job.json:
- *      the marker is written the instant cancel is requested, and the worker may
- *      never get to write its own terminal state)
- *   2. job.json.status is a terminal state      ⇒ that state, VERBATIM
- *   3. otherwise                               ⇒ running, or unknown if the
- *      anchor was unreadable
- *
- * ROW 2 HAS NO JUDGEMENT IN IT, and that is deliberate. The suspicious-success
- * downgrade — the headline rule of this whole codebase — is applied ONCE, at the
- * moment of writing, by `forge/format.ts`'s `deriveStatus`. It is not applied
- * again here. A normalizer that re-derived the verdict from the output would be a
- * second, subtly different implementation of the same rule, and the day the two
- * disagree the mod would draw one state while the channel announced another.
- *
- * The reader's job is to report what is on disk. The writer's job is to decide
- * what it means. One decision, one place.
- */
-const smithNormalizer = (raw) => {
-    const p = raw.payload;
-    const warnings = [];
-    const canceled = asBool(p[SMITH_PAYLOAD.canceled]) === true;
-    const status = asString(p[SMITH_PAYLOAD.status]);
-    const output = asString(p[SMITH_PAYLOAD.output]);
-    const denied = p[SMITH_PAYLOAD.deniedActions];
-    const deniedCount = Array.isArray(denied) ? denied.length : 0;
-    const errorText = asString(p[SMITH_PAYLOAD.error]);
-    const progressWarnings = asStringArray(p[SMITH_PAYLOAD.progressWarnings]);
-    // A newer on-disk schema is not a job we understand. `unknown` is the honest
-    // answer and it must survive to the surface: `unknown` is
-    // load-bearing and must never be collapsed.
-    const schema = asNumber(p[SMITH_PAYLOAD.schema]);
-    if (deniedCount > 0) {
-        const failedWithoutOutput = status === "failed" && (output === null || output.trim() === '');
-        warnings.push({
-            code: failedWithoutOutput ? "suspicious_success" : "tool_error",
-            message: `${deniedCount} ${deniedCount === 1 ? 'call' : 'calls'} denied`,
-        });
-    }
-    // The forge's error for a denial restates it ("denied view_file · …"); any other error still shows.
-    if (errorText !== null && !(deniedCount > 0 && /^denied\b/.test(errorText))) {
-        warnings.push({ code: "tool_error", message: errorText });
-    }
-    for (const w of progressWarnings) {
-        warnings.push({ code: STEER_NOT_APPLIED_RE.test(w) ? "steer_not_applied" : "tool_error", message: w });
-    }
-    let resolved;
-    if (canceled) {
-        resolved = "canceled";
-        warnings.push({ code: "canceled", message: "canceled" });
-    }
-    else if (schema !== null && schema > SCHEMA_VERSION) {
-        // A newer writer's file. `unknown`, and NOT `running`: "we cannot read this"
-        // is a different claim from "it is working", and drawing one as the other is
-        // the specific failure `unknown` exists to prevent.
-        resolved = "unknown";
-        warnings.push({
-            code: "incomplete_state",
-            message: `schema v${schema} is newer than this reader (v${SCHEMA_VERSION})`,
-        });
-    }
-    else if (status === "succeeded") {
-        resolved = "succeeded";
-        if (output === null || output.trim() === '') {
-            // Defensive only. deriveStatus cannot produce `succeeded` with an empty
-            // report, so reaching here means job.json was written by something other
-            // than forge/writer.ts. Believe the file, flag the contradiction, and do
-            // not silently upgrade a job with no output to a success.
-            warnings.push({
-                code: "empty_output",
-                message: "done, but no output on disk",
-            });
-        }
-    }
-    else if (status === "failed") {
-        resolved = "failed";
-    }
-    else if (status === "canceled") {
-        resolved = "canceled";
-    }
-    else if (status === "running") {
-        resolved = "running";
-    }
-    else if (raw.partial === true) {
-        // The anchor is missing. NOT `running`: "we cannot tell" and "it is working"
-        // are different claims and a band that draws one as the other is lying.
-        resolved = "unknown";
-        warnings.push({
-            code: "incomplete_state",
-            message: "job.json missing or unreadable",
-        });
-    }
-    else {
-        resolved = "unknown";
-        warnings.push({
-            code: "incomplete_state",
-            message: "no status in job.json",
-        });
-    }
-    return buildSmith(raw, resolved, warnings);
-};
-/** Assemble the ObservedJob for the agent-smith normalizer. */
-function buildSmith(raw, status, warnings) {
-    const p = raw.payload;
-    const usage = asUsage(p[SMITH_PAYLOAD.usage]);
-    const toolCalls = asNumber(p[SMITH_PAYLOAD.toolCalls]);
-    const usageFull = usage === null
-        ? toolCalls === null || toolCalls === 0
-            ? null
-            : { turns: toolCalls }
-        : toolCalls === null
-            ? usage
-            : { ...usage, turns: toolCalls };
-    return {
-        provider: "agent-smith",
-        jobId: raw.jobId,
-        status,
-        warnings,
-        output: asString(p[SMITH_PAYLOAD.output]),
-        startedAt: asString(p[SMITH_PAYLOAD.startedAt]) ?? asString(p[SMITH_PAYLOAD.createdAt]),
-        updatedAt: asString(p[SMITH_PAYLOAD.updatedAt]) ?? asString(p[SMITH_PAYLOAD.lastEventAt]),
-        finishedAt: asString(p[SMITH_PAYLOAD.finishedAt]),
-        mode: asString(p[SMITH_PAYLOAD.mode]),
-        model: asString(p[SMITH_PAYLOAD.model]),
-        // `label` is the pane's provider/permission word. Ours is honest about the
-        // one field an operator must never have to guess: did this run with the
-        // tool-approval prompt bypassed.
-        label: asBool(p[SMITH_PAYLOAD.unrestricted]) === true
-            ? "unrestricted"
-            : asString(p[SMITH_PAYLOAD.provider]),
-        outputTruncated: false,
-        usage: usageFull,
-        partial: raw.partial === true,
-        raw: p,
-    };
-}
-/**
- * Coerce a usage bag into the nullable ObservedUsage shape.
- *
- * Absent is absent. A provider that reports no token counts gets `null`, not a
- * bag of zeroes, because a confident `0` drawn on the pane is a measurement
- * nobody took.
- */
-function asUsage(v) {
-    if (v === null || typeof v !== "object")
-        return null;
-    const src = v;
-    const out = {};
-    const map = [
-        ["inputTokens", "inputTokens"],
-        ["outputTokens", "outputTokens"],
-        ["thinkingTokens", "thinkingTokens"],
-        ["cacheReadTokens", "cacheTokens"],
-    ];
-    for (const [from, to] of map) {
-        const n = asNumber(src[from]);
-        if (n !== null)
-            out[to] = n;
-    }
-    return Object.keys(out).length > 0 ? out : null;
-}
-/** Normalize a raw agent-smith job snapshot. */
-function normalize(raw) {
-    return smithNormalizer(raw);
 }/**
  * pipeline/routing.ts — dynamic model/stage selection.
  *
@@ -2431,127 +1703,53 @@ function recoveredErrorText(label, message, at) {
     const detail = flat.length > 140 ? `${flat.slice(0, 139)}…` : flat;
     const clock = /^\d{4}-\d\d-\d\dT(\d\d:\d\d)/.exec(at)?.[1];
     return `recovered from ${label}${clock === undefined ? '' : ` at ${clock} UTC`}${detail === '' ? '' : `: ${detail}`}`;
-}/**
- * providers/ndjson.ts — shared spawn/stream plumbing for every adapter.
- *
- * WHY THIS EXISTS
- * ===============
- * Four CLIs, four JSON dialects, one set of hard-won process rules. Repeating
- * those rules per adapter is how you end up with the claude-squad trap: one
- * adapter quietly wrapping its child in a PTY, another forgetting to cap its
- * stderr buffer, a third leaking a listener. So they live here, once.
- *
- * THE RULES ENFORCED HERE (do not duplicate these in an adapter):
- *   1. stdio is ALWAYS ['ignore'|'pipe', 'pipe', 'pipe']. Never a TTY, never a
- *      PTY, never 'inherit'. ARCHITECTURE.md rules out tmux/claude-squad
- *      scrollback; a PTY would also merge stderr into stdout and destroy NDJSON.
- *   2. stdin is 'ignore' by default. Codex explicitly reads stdin when it is a
- *      pipe and will happily block waiting for input that never comes. agy and
- *      claude take the prompt on argv, so stdin is dead weight.
- *   3. stderr is capped. A worker that spams stderr must not OOM the parent.
- *   4. Every kill path goes through terminate(): SIGTERM, grace, SIGKILL.
- *   5. waitForResult resolves exactly once, on every terminal path including
- *      "the process exited and we never saw a result event".
- *
- * Node builtins only. No dependencies, by requirement and by taste.
- */
-/**
- * Minimal `which`: walk PATH, test for X_OK.
- *
- * WHY NOT execFile('which', ...): spawning a shell helper once per provider per
- * startup is wasteful, and `which` does not exist on Windows. PATH walking is
- * ~20 lines, has zero process overhead, and behaves identically on all three
- * platforms. Cached per (binary, PATH) pair because detectAvailable() probes
- * four providers back to back and PATH does not change mid-run.
- *
- * NOTE: the PATH list separator is path.DELIMITER, not path.SEP. See the
- * comment inside the function below, which has the details.
- */
-const pathProbeCache = new Map();
+}const pathProbeCache = new Map();
 async function binaryOnPath(bin) {
     const pathEnv = process.env['PATH'] ?? '';
     const cacheKey = `${bin}|${pathEnv}`;
     const cached = pathProbeCache.get(cacheKey);
     if (cached !== undefined)
         return cached;
-    // A name containing a path separator is a PATH, not a name. This is what makes
-    // the documented AGENT_SMITH_<NAME>_BIN overrides work at all: without this,
-    // path.join(dir, '/opt/bin/agy') yields '/usr/local/bin/opt/bin/agy' and an
-    // absolute override can never resolve. Same rule as execvp.
     if (bin.includes('/') || bin.includes(path.sep)) {
         let direct = false;
         try {
-            await access(bin, constants$1.X_OK);
+            await access(bin, constants.X_OK);
             direct = true;
         }
-        catch {
-            /* not executable */
-        }
+        catch { }
         pathProbeCache.set(cacheKey, direct);
         return direct;
     }
-    // `path.delimiter`, NOT `path.sep`. The PATH *list* separator is ':' on POSIX
-    // and ';' on Windows; `path.sep` is '/' and '\' — the separator BETWEEN
-    // components of a single path. Splitting PATH by path.sep walks garbage
-    // fragments like 'sers/gathrid/.local/bin' and never finds anything, so
-    // binaryOnPath returned false for every binary on a machine where all four
-    // were installed. Caught by `agent-smith doctor` reporting zero providers.
     const dirs = pathEnv.split(path.delimiter).filter((d) => d !== '');
     let found = false;
     for (const dir of dirs) {
         const full = path.join(dir, bin);
         try {
-            await access(full, constants$1.X_OK);
+            await access(full, constants.X_OK);
             found = true;
             break;
         }
-        catch {
-            /* keep walking */
-        }
+        catch { }
     }
     pathProbeCache.set(cacheKey, found);
     return found;
 }
-// ---------------------------------------------------------------------------
-// Small utilities
-// ---------------------------------------------------------------------------
-/** Root for all provider-written state. Overridable for tests / multi-root setups. */
 function stateRoot() {
     return process.env['AGENT_SMITH_STATE_DIR'] ?? path.join(os.homedir(), '.agent-smith', 'state');
 }
-/**
- * Create the state directory for a job. Returns the absolute path.
- * Called BEFORE spawn() so a consumer can tail events.jsonl the instant the
- * handle exists.
- */
 function writeStateDir(provider, jobId, override) {
     const dir = override ?? path.join(stateRoot(), provider, jobId);
     mkdirSync(dir, { recursive: true });
     return dir;
 }
-/** Persist the exact argv/cwd/env-keys we spawned with. Debugging breadcrumb. */
 function writeArgv(dir, argv, cwd) {
-    // argv[0] is the binary path and can leak into logs; it is not a secret.
     writeFileSync(path.join(dir, 'argv.json'), JSON.stringify({ argv, cwd }, null, 2));
 }
-/**
- * Clamp a string to `max` characters, marking it truncated.
- *
- * WHY CHARACTERS AND NOT BYTES: a surrogate pair or a multi-byte UTF-8 char
- * split at a byte boundary produces replacement characters in the UI. JS strings
- * are already UTF-16, so slicing by code unit is safe for storage (it can split
- * a surrogate pair, hence the ellipsis hint that the text is cut).
- */
 function truncate(text, max) {
     if (text.length <= max)
         return { text, truncated: false };
     return { text: `${text.slice(0, max)}…`, truncated: true };
 }
-/**
- * Coerce an unknown JSON value to a preview string.
- * Tool params come back as objects (`{"CommandLine":"cargo test"}`), which is
- * useless on a one-line band. We render them compactly rather than [object Object].
- */
 function preview(value, max) {
     if (value === undefined || value === null)
         return undefined;
@@ -2568,7 +1766,6 @@ function preview(value, max) {
     }
     return truncate(s, max);
 }
-/** Parse one line of a stream as JSON, or undefined if it is not an object. */
 function tryParseObject(line) {
     const t = line.trim();
     if (t === '' || (t[0] !== '{' && t[0] !== '['))
@@ -2583,19 +1780,16 @@ function tryParseObject(line) {
         return undefined;
     }
 }
-/** Read a string field off an unknown record without fighting the type system. */
 function str(o, key) {
     const v = o?.[key];
     return typeof v === 'string' ? v : undefined;
 }
-/** Read a nested record field. */
 function obj(o, key) {
     const v = o?.[key];
     if (v !== null && typeof v === 'object' && !Array.isArray(v))
         return v;
     return undefined;
 }
-/** Read a finite number field. Strings that parse as numbers are accepted (some CLIs emit "3"). */
 function num(o, key) {
     const v = o?.[key];
     if (typeof v === 'number' && Number.isFinite(v))
@@ -2607,32 +1801,20 @@ function num(o, key) {
     }
     return undefined;
 }
-/** ISO timestamp. One helper so every event sorts lexicographically by time. */
 function nowIso(at = Date.now()) {
     return new Date(at).toISOString();
 }
-/**
- * Bounded-queue bus.
- *
- * WHY THE BOUND: a `--forward-subagent-text` claude run with a chatty
- * subagent can emit events faster than a slow consumer drains them. Unbounded
- * buffering is a memory leak with a long fuse. On overflow we DROP the oldest
- * queued events and record that we did, rather than growing without limit.
- */
 function createEventBus(maxQueue = 4096) {
     const listeners = new Set();
     const queue = [];
     let waiting;
     let done = false;
     function emit(event) {
-        // A throwing listener must not take down the worker pump. Log and continue.
         for (const l of listeners) {
             try {
                 l(event);
             }
-            catch {
-                /* consumer's problem, not the worker's */
-            }
+            catch { }
         }
         if (waiting) {
             const w = waiting;
@@ -2682,23 +1864,11 @@ function createEventBus(maxQueue = 4096) {
         },
     };
 }
-/** Default heartbeat interval; mirrors surfaces/mod/hooks/stale.ts HEARTBEAT_MS. */
 const HEARTBEAT_MS = 30_000;
-const STDERR_CAPTURE_LIMIT = 256 * 1024; // 256 KB retained in memory for JobResult
-const STDERR_LOG_LIMIT = 4 * 1024 * 1024; // 4 MB retained on disk
-/**
- * Spawn a child with piped stdio and wire up the lifecycle.
- *
- * Never rejects for a runtime failure. When the process cannot be started at
- * all (ENOENT, bad cwd) the promise still resolves: `exited` settles with a
- * null code, `spawnError` carries the message, and the same text goes to
- * onStderr. Every outcome, including immediate crash, is delivered through
- * `exited`.
- */
+const STDERR_CAPTURE_LIMIT = 256 * 1024;
+const STDERR_LOG_LIMIT = 4 * 1024 * 1024;
 function spawnWorker(opts) {
     const logStream = createWriteStream(path.join(opts.stateDir, 'stderr.log'), { flags: 'w' });
-    // A full disk or removed state directory must not turn a worker into an
-    // unhandled stream error. stderr is still retained in memory for its result.
     logStream.on('error', () => { });
     const state = {
         captured: '',
@@ -2707,8 +1877,8 @@ function spawnWorker(opts) {
     const handle = spawn(opts.binary, opts.argv, {
         cwd: opts.cwd,
         // RULE 1 + 2: never a TTY, never a PTY. stdin is ignored so CLIs that sniff
-        // for a pipe (codex) do not block on it.
-        stdio: ['ignore', 'pipe', 'pipe'],
+        // for a pipe (codex) do not block on it, unless a LiveInput owns it.
+        stdio: [opts.stdin ?? 'ignore', 'pipe', 'pipe'],
         env: { ...process.env, ...opts.env },
         // Give each worker its own process group so cancellation reaches shell/tool
         // descendants too. We only wait for the CLI process itself; the group is
@@ -2742,7 +1912,7 @@ function spawnWorker(opts) {
     // Some CLIs ignore SIGTERM while a tool call is in flight, hence the SIGKILL.
     function terminate(reason) {
         if (killReason !== undefined)
-            return; // idempotent; first reason wins
+            return;
         killReason = reason;
         proc.killReason = reason;
         if (timeoutTimer !== undefined) {
@@ -2770,7 +1940,6 @@ function spawnWorker(opts) {
     };
     if (opts.timeoutMs > 0) {
         timeoutTimer = setTimeout(() => proc.terminate('timeout'), opts.timeoutMs);
-        // Do not hold the event loop open on our account.
         timeoutTimer.unref?.();
     }
     // Liveness from the process owner. Provider events stop during a long tool
@@ -2811,7 +1980,7 @@ function spawnWorker(opts) {
             try {
                 onHeartbeat(nowIso(), pid);
             }
-            catch { /* a listener must not kill the worker */ }
+            catch { }
         };
         firstBeat = setTimeout(beat, 0);
         firstBeat.unref?.();
@@ -2830,8 +1999,6 @@ function spawnWorker(opts) {
             if (killTimer !== undefined) {
                 clearTimeout(killTimer);
                 killTimer = undefined;
-                // Once the leader is gone there is nothing left to flush. Stop any
-                // surviving tools before acknowledging the terminal cancellation.
                 if (killReason !== undefined)
                     signalTree('SIGKILL');
             }
@@ -2851,7 +2018,6 @@ function spawnWorker(opts) {
         handle.on('close', (code, signal) => finish(code, signal));
     });
     proc.exited = exited;
-    // ---- stdout: NDJSON line pump ------------------------------------------------
     const rl = readline.createInterface({ input: handle.stdout, crlfDelay: Infinity });
     rl.on('line', (line) => {
         if (line.trim() !== '')
@@ -2859,7 +2025,6 @@ function spawnWorker(opts) {
     });
     // readline holds the stream open; closing it frees the fd promptly.
     handle.stdout.on('close', () => rl.close());
-    // ---- stderr: bounded capture + log ------------------------------------------
     handle.stderr.setEncoding('utf8');
     handle.stderr.on('data', (chunk) => {
         if (state.logged < STDERR_LOG_LIMIT) {
@@ -2875,33 +2040,21 @@ function spawnWorker(opts) {
     });
     return Promise.resolve(proc);
 }
-/** Generate a job id when the caller did not supply one. */
 function newJobId() {
     return randomUUID();
 }
-/** Append one normalized event to <stateDir>/events.jsonl. Fire-and-forget. */
 function appendEventLog(stateDir, event) {
     try {
         writeFileSync(path.join(stateDir, 'events.jsonl'), `${JSON.stringify(event)}\n`, { flag: 'a' });
     }
-    catch {
-        // The event log is a convenience for harness/tail consumers. Never let it
-        // fail a worker that is otherwise running fine.
-    }
+    catch { }
 }
-/** Write <stateDir>/result.json once, at job completion. */
 function writeResultFile(stateDir, result) {
     try {
         writeFileSync(path.join(stateDir, 'result.json'), `${JSON.stringify(result, null, 2)}\n`);
     }
-    catch {
-        /* see appendEventLog */
-    }
+    catch { }
 }
-// ---------------------------------------------------------------------------
-// Shared adapter plumbing: availability, exit verdicts, the whole spawn() body
-// ---------------------------------------------------------------------------
-/** PATH probe for `Provider.available()`. Never throws: an unprobeable binary is an absent one. */
 async function binaryAvailable(binary) {
     try {
         return await binaryOnPath(binary);
@@ -2910,13 +2063,6 @@ async function binaryAvailable(binary) {
         return false;
     }
 }
-/**
- * The verdicts that dominate every adapter's own decision ladder: a job we
- * killed has no trustworthy terminal state, and a process that never started has
- * nothing else to interpret (spawnWorker resolves with a null exit code, which
- * would otherwise read as "exited null"). Undefined means "decide from the
- * output".
- */
 function earlyVerdict(exit, durationMs) {
     if (exit.killReason === 'cancelled')
         return { status: 'cancelled', error: 'canceled' };
@@ -2926,24 +2072,11 @@ function earlyVerdict(exit, durationMs) {
         return { status: 'spawn-failed', error: exit.spawnError };
     return undefined;
 }
-/**
- * Did the worker get past an error event? A transient error (a dropped
- * connection the CLI retries) is followed by more work and a final report, yet
- * the CLI may still exit non-zero. An adapter that treats any error event as
- * terminal then fails a job that completed.
- *
- * Recovery needs assistant text after the LAST error and positive completion
- * evidence: a clean exit or an adapter-confirmed terminal event. Further text
- * or tool activity invalidates that event, so a retry preamble followed by a
- * crash cannot masquerade as a completed report.
- */
 class ErrorRecovery {
     last;
-    /** Record an error event. `label` names it in the warning, e.g. "a provider connection error". */
     noteError(label, message, at) {
         this.last = { label, message, at, textAfter: false, completed: false };
     }
-    /** Feed the events the translator just produced. */
     observe(events) {
         if (this.last === undefined)
             return;
@@ -2955,30 +2088,25 @@ class ErrorRecovery {
                 this.last.textAfter = true;
         }
     }
-    /** New work means a previously completed step no longer proves the run ended. */
     invalidateCompletion() {
         if (this.last !== undefined)
             this.last.completed = false;
     }
-    /** Called only for a provider event that explicitly confirms normal completion. */
     noteCompletion() {
         if (this.last?.textAfter)
             this.last.completed = true;
     }
-    /** A failed exit needs explicit completion evidence, not just partial output. */
     recovered(finalText, exitCode) {
         const l = this.last;
         return l !== undefined && l.textAfter && finalText.trim() !== ''
             && exitCode !== null && (exitCode === 0 || l.completed) ? l : undefined;
     }
 }
-/** The warning notice for a run judged a success despite a recovered error. Issued after the verdict. */
 function recoveredErrorNotice(recovered, final) {
     if (recovered === undefined || final.status !== 'success')
         return undefined;
     return { kind: 'notice', at: final.finishedAt, level: 'warn', message: recoveredErrorText(recovered.label, recovered.message, recovered.at) };
 }
-/** The JobResult envelope every adapter fills the same way; callers add their optional fields. */
 function jobResult(args) {
     const { status, error, exit } = args;
     const out = {
@@ -2998,11 +2126,6 @@ function jobResult(args) {
         out.error = error;
     return out;
 }
-/**
- * The spawn() body every adapter shares: state dir, argv breadcrumb, event bus,
- * the stdout/stderr pumps and the result promise. Notices go through `publish`
- * so they land in events.jsonl as well as on the live bus.
- */
 async function runNdjsonWorker(cfg) {
     const { provider, spec } = cfg;
     const jobId = spec.jobId ?? newJobId();
@@ -3029,14 +2152,12 @@ async function runNdjsonWorker(cfg) {
         stateDir,
         jobId,
         mode: spec.mode,
-        // Liveness only: on the bus, never in events.jsonl (see ProviderEvent 'heartbeat').
         onHeartbeat: (at, pid) => bus.emit({ kind: 'heartbeat', at, ...(pid === undefined ? {} : { pid }) }),
         ...(spec.env !== undefined ? { env: spec.env } : {}),
+        ...(cfg.input !== undefined ? { stdin: 'pipe' } : {}),
         onStdoutLine(line) {
             const raw = tryParseObject(line);
             if (raw === undefined) {
-                // NDJSON is one object per line; a banner, stray print or future format
-                // change must be visible rather than silently dropped.
                 notice('warn', `${provider} stdout (non-JSON): ${truncate(line, 400).text}`);
                 return;
             }
@@ -3051,6 +2172,8 @@ async function runNdjsonWorker(cfg) {
             notice(cfg.stderrLevel?.(text) ?? 'info', truncate(text, 800).text);
         },
     });
+    const input = cfg.input;
+    input?.attach(proc.child.stdin);
     let resolveResult = () => { };
     const resultPromise = new Promise((resolve) => {
         resolveResult = resolve;
@@ -3061,6 +2184,12 @@ async function runNdjsonWorker(cfg) {
         if (proc.spawnError !== undefined)
             exit.spawnError = proc.spawnError;
         const final = cfg.buildResult({ jobId, startedAtMs, stateDir, exit });
+        if (input !== undefined) {
+            input.end();
+            const unread = input.unread();
+            if (unread.length > 0)
+                final.unreadInput = unread;
+        }
         if (cfg.afterResult !== undefined)
             publish(cfg.afterResult(final));
         bus.close();
@@ -3074,6 +2203,7 @@ async function runNdjsonWorker(cfg) {
         waitForResult: () => resultPromise,
         onEvent: (listener) => bus.onEvent(listener),
         events: bus.events,
+        ...(input !== undefined ? { send: (text) => input.send(text) } : {}),
     };
 }/**
  * providers/discovery.ts — shared plumbing for lazy `listModels()` implementations.
@@ -3097,7 +2227,7 @@ const runCapture = (bin, args, timeoutMs) => new Promise((resolve) => {
     }
 });
 /** Read a file as text, undefined on any failure. */
-function readTextSafe(file) {
+function readTextSafe$1(file) {
     try {
         return readFileSync(file, 'utf8');
     }
@@ -3201,7 +2331,9 @@ function parseTomlTopLevel(text) {
  * check, because a config-level allow-rule can deny a single command and the
  * flag does not override an explicit deny.
  */
-const AGY_BINARY = process.env['AGENT_SMITH_AGY_BIN'] ?? 'agy';
+function agyBinary() {
+    return process.env['AGENT_SMITH_AGY_BIN'] ?? 'agy';
+}
 // ---------------------------------------------------------------------------
 // argv construction
 // ---------------------------------------------------------------------------
@@ -3672,7 +2804,7 @@ async function listAgyModels(run, options) {
         verified: true,
     };
     try {
-        const r = await run(AGY_BINARY, ['models'], options?.timeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS);
+        const r = await run(agyBinary(), ['models'], options?.timeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS);
         const models = parseAgyModels(r.stdout);
         if (r.error !== undefined && models.length === 0)
             return { ...base, error: r.error };
@@ -3692,7 +2824,7 @@ const agyProvider = {
      * would make startup slow and flaky. A resolvable binary is the contract;
      * auth problems surface as a job error instead.
      */
-    available: () => binaryAvailable(AGY_BINARY),
+    available: () => binaryAvailable(agyBinary()),
     describeSandbox: sandboxPlan$4,
     listModels: (options) => listAgyModels(runCapture, options),
     spawn(spec) {
@@ -3700,7 +2832,7 @@ const agyProvider = {
         let resultEvent;
         return runNdjsonWorker({
             provider: 'agy',
-            binary: AGY_BINARY,
+            binary: agyBinary(),
             spec,
             buildArgv: buildArgv$4,
             translate: translator.onEvent,
@@ -3731,121 +2863,14 @@ const agyProvider = {
             },
         });
     },
-};/**
- * providers/claude.ts — Claude Code headless adapter.
- *
- * This is agent-smith's PROBER / MODERATOR provider. ARCHITECTURE.md is
- * emphatic about why: "Claude proposes, another model probes." Generative
- * agreement between same-family models is correlated (60% agreement when both
- * err, ICML 2025, 350+ models), so self-consistency is not verification — a
- * different model family is. This adapter exists to be that different family,
- * which means it must be as trustworthy about its own failure modes as agy is.
- *
- * ============================================================================
- * VERIFICATION LEVEL: HIGH. Verified by running `claude --help` (2.1.292) and
- * by executing the exact invocation below against a live model.
- * ============================================================================
- *
- * VERIFIED FLAGS (`claude --help`, 2.1.292):
- *
- *   -p, --print                       "Print response and exit (useful for pipes)".
- *                                     Note the help text itself says the workspace
- *                                     trust dialog is skipped when stdout is not
- *                                     a TTY — which is exactly our spawn shape.
- *   --output-format <text|json|stream-json>   "(only works with --print)"
- *   --input-format <text|stream-json>
- *   --verbose                         required for the full stream in print mode
- *   --forward-subagent-text           "Forward subagent text and thinking blocks as
- *                                     assistant/user messages with
- *                                     parent_tool_use_id set (only works with
- *                                     --print and --output-format=stream-json)"
- *                                     ^^^ THIS IS THE FLAG THAT MAKES A MODERATOR
- *                                     USABLE. Without it, a subagent's reasoning
- *                                     is invisible to us, and a moderator that
- *                                     cannot see what the prober did is just
- *                                     another proposer.
- *   --include-partial-messages        partial chunks as they arrive (stream-json)
- *   --model <model>                   alias ('fable', 'opus', 'sonnet') or full name
- *   --permission-mode <acceptEdits|auto|bypassPermissions|manual|dontAsk|plan>
- *   --permission-prompts <host|none>  who answers permission prompts in print mode
- *   --dangerously-skip-permissions    bypass all permission checks
- *   --allow-dangerously-skip-permissions  make it an *option*, not the default
- *   --add-dir <directories...>        additional directories for tool access
- *   --session-id <uuid>               use a specific session id
- *   --allowedTools, --allowed-tools   allowlist tools
- *   --append-system-prompt <prompt>   append to the default system prompt
- *   --bare                            minimal mode: skip hooks, LSP, plugin sync,
- *                                     auto-memory, CLAUDE.md auto-discovery.
- *                                     STRICTLY auth via ANTHROPIC_API_KEY.
- *   --setting-sources <user,project,local>   which settings files to load
- *   --max-turns <n>                   (listed as -n/--name separately; turn cap
- *                                     is accepted in print mode — see UNVERIFIED)
- *
- * VERIFIED EVENT SHAPES (live run of
- *   claude -p --output-format stream-json --verbose --model haiku "Reply with exactly: OK" < /dev/null):
- *
- *   {"type":"system","subtype":"init","cwd":"...","session_id":"fd8a7751-...",
- *    "tools":["Task","Bash","CronCreate",...],"model":"claude-haiku-4-5-20251001", ...}
- *   {"type":"system","subtype":"thinking_tokens","estimated_tokens":157,
- *    "estimated_tokens_delta":107,"session_id":"...","uuid":"..."}
- *   {"type":"system","subtype":"hook_started","hook_id":"...","hook_name":"SessionStart:startup", ...}
- *   {"type":"system","subtype":"hook_response","hook_id":"...","output":"{...}", ...}
- *   {"type":"assistant","message":{"id":"msg_...","role":"assistant",
- *       "content":[{"type":"thinking","thinking":"...","signature":"..."} |
-                   {"type":"text","text":"OK"} | {"type":"tool_use","id":"toolu_...",
-                   "name":"Bash","input":{...}}],
- *       "model":"claude-haiku-4-5-20251001","usage":{...}},"session_id":"..."}
- *   {"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_...",
- *       "content":"...","is_error":false}]},"session_id":"..."}     (documented; not in my run)
- *   {"type":"result","subtype":"success","duration_ms":...,"duration_api_ms":1609,
- *    "is_error":false,"result":"...","session_id":"...","total_cost_usd":0.03089125,
- *    "num_turns":1,"stop_reason":"end_turn",
- *    "usage":{"input_tokens":10,"cache_creation_input_tokens":24425,
- *             "cache_read_input_tokens":0,"output_tokens":70,
- *             "output_tokens_details":{"thinking_tokens":63}}}
- *   Exit code 0.
- *
- * NOTABLE AND IMPORTANT: hooks fire in headless mode. In my run a
- * SessionStart hook from this machine's Claude config ran and injected company
- * knowledge into the run. That means a headless moderator can be steered by
- * whatever hooks happen to be configured. For the prober/moderator role we
- * default to --setting-sources user (so personal hooks still apply) but keep the
- * knob, and `--bare` is available via SpawnSpec.env for callers who need a
- * hermetic run. Documented in the README — this is a real reproducibility trap.
- *
- * TIMEOUT: claude has NO `--print-timeout` equivalent (agy has one, codex does
- * not). We therefore enforce the budget entirely ourselves, via
- * spawnWorker's SIGTERM->SIGKILL escalation. If you kill mid-run, there is no
- * result event and we correctly report 'cancelled'/'timeout', never 'success'.
- */
-const CLAUDE_BINARY = process.env['AGENT_SMITH_CLAUDE_BIN'] ?? 'claude';
-/**
- * Build the exact argv for one claude worker.
- *
- * argv layout: `claude -p <flags> <prompt>`.
- *
- * The prompt is a TRAILING POSITIONAL (help shows `claude [options] [command] [prompt]`),
- * so a prompt beginning with "-" is safe. Combined with `-p`, this is the
- * documented headless invocation.
- */
-/**
- * Sandbox/permission flags for claude. Shared by buildArgv and describeSandbox.
- *
- * unrestricted -> --dangerously-skip-permissions ("trusted in this directory").
- * restricted   -> --permission-mode dontAsk + --permission-prompts none. Claude
- *   cannot prompt in print mode, so anything not already allowed (by the user's
- *   settings allow rules or built-in read-only tools) is DENIED, not stalled.
- *   Denials are surfaced as status 'denied' in the JobResult (detected from
- *   tool_result text), so a restricted worker does not silently pass; but
- *   read-only is NOT enforced: user allow rules may still permit writes.
- */
-/** Tools a read-only worker may use. Shell is limited to inspection commands. */
+};function claudeBinary() {
+    return process.env['AGENT_SMITH_CLAUDE_BIN'] ?? 'claude';
+}
 const READ_ONLY_ALLOWED = [
     'Read', 'Grep', 'Glob',
     ...['cat', 'head', 'tail', 'wc', 'xxd', 'od', 'ls', 'file', 'stat', 'rg', 'grep', 'diff',
         'git diff', 'git show', 'git log', 'git status', 'git blame'].map((c) => `Bash(${c}:*)`),
 ];
-/** Tools a read-only worker may never use, even if user settings would allow them. */
 const READ_ONLY_DENIED = ['Edit', 'Write', 'NotebookEdit'];
 /**
  * Allow rule for the one file a read-only pipeline stage may write.
@@ -3868,12 +2893,6 @@ function sandboxPlan$3(spec) {
     }
     const flags = ['--permission-mode', 'dontAsk', '--permission-prompts', 'none'];
     if (spec.readOnly) {
-        // Read-only modes get an explicit allowlist (so a reviewer can inspect bytes
-        // and history instead of being denied) and an explicit write-tool denylist,
-        // which is what makes read-only enforced rather than merely requested.
-        // A stage's output artifact is its one permitted write: Write comes off the
-        // denylist and only that file goes on the allowlist, so dontAsk still denies
-        // every other write. Edit and NotebookEdit stay denied.
         const artifact = spec.artifactPath;
         const allowed = artifact === undefined ? READ_ONLY_ALLOWED : [...READ_ONLY_ALLOWED, artifactWriteRule(artifact)];
         const denied = artifact === undefined ? READ_ONLY_DENIED : READ_ONLY_DENIED.filter((t) => t !== 'Write');
@@ -3894,19 +2913,23 @@ function sandboxPlan$3(spec) {
 }
 function buildArgv$3(spec) {
     const argv = ['-p'];
-    // NDJSON on stdout. `stream-json` is what lets a moderator show its work.
+    // Live input (Provider.liveInput). Verified live on 2.1.331 through this
+    // adapter (haiku, dontAsk, one send during a 6 s Bash call): a stdin user
+    // message written while a tool runs does not interrupt it; it joins the SAME
+    // turn at the next tool round (one result event), and --replay-user-messages
+    // re-emits it on stdout at that moment, which is our proof it was read. In
+    // this mode claude waits for more stdin after each result, so the adapter
+    // ends stdin when the result arrives (ClaudeLiveInput.end); claude then
+    // exited 0 within a second. The initial prompt's replay is swallowed.
+    argv.push('--input-format', 'stream-json', '--replay-user-messages');
     argv.push('--output-format', 'stream-json');
     // WHY --verbose IS NOT OPTIONAL HERE: with --print, the full event stream is
     // only emitted in verbose mode. Without it claude emits a single result
     // object and we lose every tool call. Verified in my live run, which I
     // passed --verbose to.
     argv.push('--verbose');
-    // Without this, a subagent's text and thinking are dropped from our stream.
-    // For a prober/moderator that is disqualifying: we would be judging a
-    // subagent's work we cannot see. Documented and verified to exist.
     argv.push('--forward-subagent-text');
     if (spec.model !== undefined && spec.model !== '') {
-        // Aliases ('sonnet', 'opus', 'fable') or full model names both work.
         argv.push('--model', spec.model);
     }
     if (spec.effort !== undefined && spec.effort !== '') {
@@ -3922,18 +2945,12 @@ function buildArgv$3(spec) {
         // taken and the first silently dropped. So: one flag, all dirs after it.
         argv.push('--add-dir', ...addDirs);
     }
-    // See sandboxPlan for the unrestricted / restricted (dontAsk) rationale.
     argv.push(...sandboxPlan$3(spec).flags);
     if (spec.conversation !== undefined && spec.conversation !== '') {
         // --session-id starts a new session with a chosen id. --resume is the CLI's
         // continuation path and preserves the prior conversation.
         argv.push('--resume', spec.conversation);
     }
-    // Reproducibility knob. --setting-sources controls which settings files load.
-    // Default here is 'user' so personal skills/hooks work; set
-    // AGENT_SMITH_CLAUDE_SETTING_SOURCES='' to disable the flag entirely, or
-    // AGENT_SMITH_CLAUDE_BARE=1 for --bare (no hooks, no CLAUDE.md, keychain
-    // auth disabled). See the header for why this matters for a moderator.
     const bare = process.env['AGENT_SMITH_CLAUDE_BARE'] === '1';
     if (bare) {
         argv.push('--bare');
@@ -3943,28 +2960,81 @@ function buildArgv$3(spec) {
         if (sources !== '')
             argv.push('--setting-sources', sources);
     }
-    // Trailing positional prompt, last.
-    argv.push(spec.prompt);
     return argv;
 }
-// ---------------------------------------------------------------------------
-// Event translation
-// ---------------------------------------------------------------------------
-/**
- * Anthropic usage field names, verified from the live `result` event:
- *   input_tokens, cache_creation_input_tokens, cache_read_input_tokens,
- *   output_tokens, output_tokens_details.thinking_tokens
- *
- * `cache_creation_input_tokens` maps to our `cacheWriteTokens` so the store can
- * sum cache writes across agy (which does not report them) and claude (which
- * does) without either provider needing to know about the other.
- */
+function streamJsonUserMessage(text) {
+    return `${JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text }] } })}\n`;
+}
+class ClaudeLiveInput {
+    stdin = null;
+    open = true;
+    pending = [];
+    prompt;
+    constructor(prompt) {
+        this.prompt = prompt;
+    }
+    attach(stdin) {
+        this.stdin = stdin;
+        if (stdin === null) {
+            this.open = false;
+            return;
+        }
+        // EPIPE when claude exits (or never started) must not crash the owner.
+        stdin.on('error', () => { this.open = false; });
+        this.write(this.prompt, true);
+    }
+    send(text) {
+        if (text.trim() === '')
+            return false;
+        return this.write(text, false);
+    }
+    end() {
+        this.open = false;
+        const s = this.stdin;
+        if (s !== null && !s.destroyed && !s.writableEnded)
+            s.end();
+    }
+    replayed(text) {
+        let i = this.pending.findIndex((p) => p.text === text);
+        if (i < 0)
+            i = this.pending.findIndex((p) => p.text.trim() === text.trim());
+        if (i < 0)
+            return undefined;
+        const [hit] = this.pending.splice(i, 1);
+        return hit === undefined || hit.initial ? undefined : hit.text;
+    }
+    unread() {
+        return this.pending.filter((p) => !p.initial).map((p) => p.text);
+    }
+    write(text, initial) {
+        const s = this.stdin;
+        if (!this.open || s === null || s.destroyed || s.writableEnded)
+            return false;
+        this.pending.push({ text, initial });
+        s.write(streamJsonUserMessage(text));
+        return true;
+    }
+}
+function userText(content) {
+    if (typeof content === 'string')
+        return content;
+    if (!Array.isArray(content) || content.length === 0)
+        return undefined;
+    const parts = [];
+    for (const block of content) {
+        if (block === null || typeof block !== 'object')
+            return undefined;
+        const b = block;
+        if (str(b, 'type') !== 'text')
+            return undefined;
+        parts.push(str(b, 'text') ?? '');
+    }
+    return parts.join('\n');
+}
 function toTokenUsage$3(usage) {
     if (usage === undefined)
         return undefined;
     const out = {};
-    // Anthropic emits these as JSON NUMBERS, so num() is correct here — str()
-    // would silently return undefined for every single field.
     const input = num(usage, 'input_tokens');
     const output = num(usage, 'output_tokens');
     if (input !== undefined)
@@ -3981,11 +3051,8 @@ function toTokenUsage$3(usage) {
     const write = num(usage, 'cache_creation_input_tokens');
     if (write !== undefined)
         out.cacheWriteTokens = write;
-    // Anthropic does not send a total. Left undefined on purpose — consumers decide
-    // the accounting policy; providers do not invent numbers.
     return Object.keys(out).length > 0 ? out : undefined;
 }
-/** Is this a tool_result block reporting a permission refusal? */
 function isPermissionDenial(text) {
     if (text === undefined)
         return false;
@@ -3993,7 +3060,7 @@ function isPermissionDenial(text) {
     return (hay.includes('permission') &&
         (hay.includes('denied') || hay.includes('not allowed') || hay.includes('requested permissions')));
 }
-function createClaudeTranslator(maxChars) {
+function createClaudeTranslator(maxChars, input) {
     const tx = {
         finalText: '',
         sawResult: false,
@@ -4001,7 +3068,6 @@ function createClaudeTranslator(maxChars) {
         deniedTools: [],
         onEvent: () => [],
     };
-    /** tool_use_id -> stepIndex */
     const toolStep = new Map();
     const deniedIds = new Set();
     let step = 0;
@@ -4027,7 +3093,6 @@ function createClaudeTranslator(maxChars) {
         const sessionId = str(raw, 'session_id');
         if (sessionId !== undefined)
             tx.sessionId = sessionId;
-        // ---- system / init ------------------------------------------------------
         if (type === 'system') {
             const subtype = str(raw, 'subtype');
             if (subtype === 'permission_denied') {
@@ -4052,9 +3117,6 @@ function createClaudeTranslator(maxChars) {
                 return out;
             }
             if (subtype === 'thinking_tokens') {
-                // Not text, but the only live signal that the model is thinking. Show
-                // it as thinking text so the moderator pane feels alive instead of
-                // frozen for 90 seconds.
                 const est = raw['estimated_tokens'];
                 out.push({
                     kind: 'text',
@@ -4065,8 +3127,6 @@ function createClaudeTranslator(maxChars) {
                 return out;
             }
             if (subtype === 'hook_started' || subtype === 'hook_response') {
-                // Hooks genuinely run headless (verified — a SessionStart hook fired in
-                // my run). An operator watching 16 workers should know they are there.
                 out.push({
                     kind: 'notice',
                     at,
@@ -4076,11 +3136,9 @@ function createClaudeTranslator(maxChars) {
                 });
                 return out;
             }
-            // Other system subtypes (compact_boundary, etc.) are informational.
             out.push({ kind: 'notice', at, level: 'info', message: `claude system.${subtype ?? 'unknown'}`, raw });
             return out;
         }
-        // ---- assistant messages --------------------------------------------------
         if (type === 'assistant') {
             const message = obj(raw, 'message');
             const content = Array.isArray(message?.['content']) ? message['content'] : [];
@@ -4141,9 +3199,17 @@ function createClaudeTranslator(maxChars) {
             }
             return out;
         }
-        // ---- user messages: tool_result blocks ----------------------------------
         if (type === 'user') {
             const message = obj(raw, 'message');
+            // A replayed stdin message (--replay-user-messages): top level only, as a
+            // forwarded subagent message carries parent_tool_use_id.
+            const parentId = raw['parent_tool_use_id'];
+            if (input !== undefined && (parentId === undefined || parentId === null)) {
+                const text = userText(message?.['content']);
+                const sent = text === undefined ? undefined : input.replayed(text);
+                if (sent !== undefined)
+                    out.push({ kind: 'user-message', at, text: sent });
+            }
             const content = Array.isArray(message?.['content']) ? message['content'] : [];
             for (const block of content) {
                 if (block === null || typeof block !== 'object')
@@ -4181,9 +3247,10 @@ function createClaudeTranslator(maxChars) {
             }
             return out;
         }
-        // ---- result --------------------------------------------------------------
         if (type === 'result') {
             tx.sawResult = true;
+            // The turn is over: end stdin, or claude waits for another message forever.
+            input?.end();
             const permissionDenials = Array.isArray(raw['permission_denials']) ? raw['permission_denials'] : [];
             for (const denial of permissionDenials) {
                 if (denial === null || typeof denial !== 'object')
@@ -4215,11 +3282,6 @@ function createClaudeTranslator(maxChars) {
             const turns = raw['num_turns'];
             if (typeof turns === 'number')
                 tx.numTurns = turns;
-            // The top-level `result` string is the authoritative final answer. Prefer
-            // it over our concatenation of text blocks: if the run used
-            // --forward-subagent-text, the concatenation includes subagent chatter we
-            // deliberately excluded, but if claude compressed or re-emitted text the
-            // `result` field is still correct.
             const finalAnswer = str(raw, 'result');
             if (finalAnswer !== undefined && finalAnswer !== '')
                 tx.finalText = finalAnswer;
@@ -4240,28 +3302,20 @@ function createClaudeTranslator(maxChars) {
     };
     return tx;
 }
-// ---------------------------------------------------------------------------
-// Result
-// ---------------------------------------------------------------------------
 function buildResult$3(args) {
     const { jobId, startedAtMs, stateDir, exit, tx } = args;
     const durationMs = Date.now() - startedAtMs;
     let status;
     let error;
-    // claude has no --print-timeout, so a timeout kill is entirely ours: never
-    // infer success from "it produced a lot of output".
     const early = earlyVerdict(exit, durationMs);
     if (early !== undefined) {
         ({ status, error } = early);
     }
     else if (tx.deniedTools.length > 0 && !(tx.sawResult && !tx.sawErrorResult && exit.code === 0 && tx.finalText.trim() !== '')) {
-        // Same discipline as agy. A moderator whose tools were denied has not
-        // moderated anything, and claude may still report subtype "success".
         status = 'denied';
         error = deniedText(tx.deniedTools, exit.stderr);
     }
     else if (!tx.sawResult) {
-        // No result event: killed early, crashed, or a CLI output change.
         status = exit.code === 0 ? 'malformed' : 'error';
         error = noResultText(exit);
     }
@@ -4277,9 +3331,6 @@ function buildResult$3(args) {
         status = 'success';
     }
     const out = jobResult({ provider: 'claude', jobId, status, error, exit, response: tx.finalText, startedAtMs, durationMs, stateDir });
-    // A report was delivered despite denied calls: the job succeeded, but the
-    // orchestrator must know some checks did not run (normalize.ts turns this
-    // into a warning).
     if (tx.deniedTools.length > 0) {
         out.deniedActions = tx.deniedTools.map((id) => ({ action: 'tool', displayName: id, nonfatal: true }));
     }
@@ -4298,10 +3349,6 @@ function buildResult$3(args) {
         out.raw = raw;
     return out;
 }
-// ---------------------------------------------------------------------------
-// Provider
-// ---------------------------------------------------------------------------
-/** Aliases documented by `claude --help`. */
 const CLAUDE_ALIASES = [
     { id: 'fable', label: 'Fable' },
     { id: 'opus', label: 'Opus' },
@@ -4309,17 +3356,14 @@ const CLAUDE_ALIASES = [
     { id: 'haiku', label: 'Haiku' },
 ];
 const CLAUDE_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
-/** Claude config dir: AGENT_SMITH_CLAUDE_HOME, CLAUDE_CONFIG_DIR, then ~/.claude. */
 function claudeHome() {
     return configDir(['AGENT_SMITH_CLAUDE_HOME', 'CLAUDE_CONFIG_DIR'], '.claude');
 }
-/** Top-level `model` from <home>/settings.json. Throws on malformed JSON; callers decide how loud to be. */
 function readDefaultModel(home) {
-    const text = readTextSafe(path.join(home, 'settings.json'));
+    const text = readTextSafe$1(path.join(home, 'settings.json'));
     const model = text === undefined ? undefined : JSON.parse(text)?.model;
     return typeof model === 'string' && model !== '' ? model : undefined;
 }
-/** Static alias catalog; default model from <home>/settings.json top-level `model`. Never throws. */
 async function listClaudeModels(_options, home = claudeHome()) {
     const cat = {
         provider: 'claude',
@@ -4341,7 +3385,6 @@ async function listClaudeModels(_options, home = claudeHome()) {
     }
     return cat;
 }
-/** Default model from <home>/settings.json. Sync file read only; never throws. */
 function claudeHarnessDefaults(home = claudeHome()) {
     try {
         const model = readDefaultModel(home);
@@ -4354,15 +3397,18 @@ function claudeHarnessDefaults(home = claudeHome()) {
 const claudeProvider = {
     harnessDefaults: () => claudeHarnessDefaults(),
     name: 'claude',
-    available: () => binaryAvailable(CLAUDE_BINARY),
+    available: () => binaryAvailable(claudeBinary()),
     describeSandbox: sandboxPlan$3,
     listModels: (options) => listClaudeModels(),
+    liveInput: true,
     spawn(spec) {
-        const tx = createClaudeTranslator(spec.maxOutputChars ?? 2000);
+        const input = new ClaudeLiveInput(spec.prompt);
+        const tx = createClaudeTranslator(spec.maxOutputChars ?? 2000, input);
         return runNdjsonWorker({
             provider: 'claude',
-            binary: CLAUDE_BINARY,
+            binary: claudeBinary(),
             spec,
+            input,
             buildArgv: buildArgv$3,
             translate: tx.onEvent,
             buildResult: (ctx) => buildResult$3({ ...ctx, tx }),
@@ -4451,7 +3497,9 @@ const claudeProvider = {
  *    "cache_write_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":0}}
  *   $ echo $?   -> 0
  */
-const CODEX_BINARY = process.env['AGENT_SMITH_CODEX_BIN'] ?? 'codex';
+function codexBinary() {
+    return process.env['AGENT_SMITH_CODEX_BIN'] ?? 'codex';
+}
 /**
  * Map SpawnSpec.unrestricted onto a codex sandbox policy.
  *
@@ -4943,12 +3991,12 @@ async function listCodexModels(run, options, home = codexHome()) {
     try {
         let error;
         let models;
-        const r = await run(CODEX_BINARY, ['debug', 'models'], options?.timeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS);
+        const r = await run(codexBinary(), ['debug', 'models'], options?.timeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS);
         if (r.error === undefined)
             models = parseCodexModels(r.stdout);
         if (models === undefined || models.length === 0) {
             error = r.error ?? '`codex debug models` returned no models';
-            const cached = readTextSafe(path.join(home, 'models_cache.json'));
+            const cached = readTextSafe$1(path.join(home, 'models_cache.json'));
             const fromCache = cached === undefined ? undefined : parseCodexModels(cached);
             if (fromCache !== undefined && fromCache.length > 0) {
                 models = fromCache;
@@ -4980,7 +4028,7 @@ async function listCodexModels(run, options, home = codexHome()) {
 }
 /** Default model/effort from <home>/config.toml. Sync file read only. */
 function codexHarnessDefaults(home = codexHome()) {
-    const cfgText = readTextSafe(path.join(home, 'config.toml'));
+    const cfgText = readTextSafe$1(path.join(home, 'config.toml'));
     if (cfgText === undefined)
         return {};
     const cfg = parseTomlTopLevel(cfgText);
@@ -5002,14 +4050,14 @@ function codexStderrLevel(text) {
 const codexProvider = {
     name: 'codex',
     harnessDefaults: () => codexHarnessDefaults(),
-    available: () => binaryAvailable(CODEX_BINARY),
+    available: () => binaryAvailable(codexBinary()),
     describeSandbox: sandboxPlan$2,
     listModels: (options) => listCodexModels(runCapture, options),
     spawn(spec) {
         const tx = createCodexTranslator(spec.maxOutputChars ?? 2000);
         return runNdjsonWorker({
             provider: 'codex',
-            binary: CODEX_BINARY,
+            binary: codexBinary(),
             spec,
             buildArgv: buildArgv$2,
             translate: tx.onEvent,
@@ -5020,141 +4068,12 @@ const codexProvider = {
             buildResult: (ctx) => buildResult$2({ ...ctx, tx }),
         });
     },
-};/**
- * providers/kimi.ts — Kimi Code CLI adapter (`kimi -p`).
- *
- * ============================================================================
- * VERIFICATION LEVEL: HIGH. LIVE-VERIFIED ON 2.1.1 (fresh turn + resume),
- * SOURCE-VERIFIED FOR FLAGS AND STREAM-JSON.
- * ============================================================================
- *
- * The CLI surface and the stream-json schema below were read from the upstream
- * repository (MoonshotAI/kimi-code, main, 2026-10), then exercised against the
- * installed binary:
- *
- *   apps/kimi-code/src/cli/commands.ts        option definitions
- *   apps/kimi-code/src/cli/options.ts         prompt-mode conflicts
- *   apps/kimi-code/src/cli/prompt-render.ts   the stream-json writer
- *   apps/kimi-code/src/cli/v2/run-v2-print.ts print-mode runner
- *
- * LIVE TRANSCRIPT (2026-10-24, kimi 2.1.1):
- *   $ kimi --output-format stream-json -p 'Reply with exactly: OK'
- *   {"role":"assistant","content":"OK"}
- *   {"role":"meta","type":"session.resume_hint","session_id":"session_...",
- *    "command":"kimi -r session_...","content":"To resume this session: ..."}
- *   -> success, 7.9 s, response "OK", session id captured.
- *   A second run with `--session session_...` and the SAME cwd returned
- *   "RESUMED" in 6.2 s and kept the id.
- *   A third run asked for `printf hello > proof.txt` via Bash: one activity
- *   step carried tool "Bash" (input and output), the file existed afterwards,
- *   and the final response was "DONE" (6.8 s).
- *
- * RESUME REQUIRES THE ORIGINAL CWD. `kimi --session <id>` refuses a session
- * created under a different directory ("Session ... was created under a
- * different directory", exit 1). Agent Smith's resume_job defaults to the
- * original job's cwd, so the normal path works; overriding cwd to a different
- * directory fails loudly with that message. `--continue` is never used: it is
- * cwd-ambiguous and would let parallel workers collide.
- *
- * NO IN-FLIGHT TOOL DISPLAY. The writer buffers assistant text and tool calls
- * and flushes them when the step ends or the tool result arrives, so the band
- * learns about a tool call at completion, not while it runs. A long Bash call
- * is therefore a silent gap. This is a stream-json limitation, not a parser
- * choice.
- *
- * Still source-verified rather than live-exercised: retry meta and `--add-dir`.
- *
- * ----------------------------------------------------------------------------
- * VERIFIED CLI SURFACE
- * ----------------------------------------------------------------------------
- *   kimi -p <prompt> --output-format stream-json
- *     -p, --prompt <prompt>          run one prompt, non-interactively
- *     --output-format <format>       "text" (default) or "stream-json"
- *     -m, --model <model>            model ALIAS from config.toml [models]
- *     -S, --session [id]             resume an existing session by id
- *     -c, --continue                 continue the most recent session for cwd
- *     --add-dir <dir>                extra workspace dir; may be repeated
- *     -y, --yolo / --auto / --plan   interactive permission modes
- *
- * `--session` takes an OPTIONAL value, so the adapter emits the attached
- * `--session=<id>` form: with a space, an id beginning with "-" would be parsed
- * as another option. An id beginning with "-" is rejected before spawn too.
- *
- * CONFLICT: `-p` cannot be combined with `--yolo` (options.ts throws). `--auto`
- * is pointless here because print mode force-sets the auto policy anyway (see
- * below). `-c` is cwd-ambiguous: with several workers in one repository it can
- * resume another worker's session, so this adapter never emits it. Resume uses
- * `--session=<id>` only.
- *
- * ----------------------------------------------------------------------------
- * PERMISSIONS: PRINT MODE IS ALWAYS UNRESTRICTED
- * ----------------------------------------------------------------------------
- * run-v2-print.ts calls forceAuto(agent), which sets the session's permission
- * mode to "auto" before the turn. There is no flag to restrict print mode, no
- * approval prompt, and `--yolo` is rejected with `-p`. Static deny rules from
- * config.toml still apply, but Agent Smith cannot turn them on per run.
- *
- * Consequences, stated plainly:
- *   - `unrestricted` has no effect. spawn_job defaults it to true for kimi
- *     (forge/service.ts) and the ack's sandbox string reports the real posture.
- *   - `readOnly` is not enforceable. describeSandbox reports
- *     readOnlyEnforced:false so a review mode is never silently trusted.
- *   - A job cannot end "denied" from a policy prompt. A config deny rule shows
- *     up as tool output, not as a structured denial, so it is not reclassified;
- *     acceptance checks are the reliable detector for that case.
- *
- * ----------------------------------------------------------------------------
- * EFFORT: NO PER-RUN FLAG
- * ----------------------------------------------------------------------------
- * `kimi` has no --effort. Thinking effort comes from `[thinking].effort` or a
- * model alias's `default_effort` in config.toml. SpawnSpec.effort is therefore
- * ignored: forge/service.ts drops it before recording job.json and adds an ack
- * warning, and the adapter also emits a warning event for direct callers.
- * buildArgv never emits a flag the CLI does not have. listModels() reports
- * efforts:[] for the same reason: advertising efforts would invite a request we
- * cannot honor.
- *
- * ----------------------------------------------------------------------------
- * STREAM-JSON SCHEMA (from prompt-render.ts)
- * ----------------------------------------------------------------------------
- * One JSON object per stdout line, in this vocabulary:
- *
- *   {"role":"meta","type":"system.version","version":"..."}
- *   {"role":"assistant","content":"...","tool_calls":[
- *      {"type":"function","id":"...","function":{"name":"Bash","arguments":"{...}"}}]}
- *   {"role":"tool","tool_call_id":"...","content":"..."}
- *   {"role":"meta","type":"turn.step.retrying","failed_attempt":1,"next_attempt":2,
- *    "max_attempts":10,"delay_ms":...,"error_name":"...","error_message":"..."}
- *   {"role":"meta","type":"session.resume_hint","session_id":"...","command":"kimi -r ...","content":"..."}
- *
- * Assistant text and its tool calls are flushed TOGETHER when the step ends or
- * a tool result arrives. Tool results are a separate line keyed by
- * tool_call_id. Thinking deltas are NOT emitted in JSON mode. Token usage is
- * NOT emitted by this writer; the adapter leaves usage absent rather than
- * fabricating it. The final line carries the session id, which is the only
- * resume handle available: `started` is emitted when it arrives, late in the
- * run, and the job's JobResult.raw.sessionId records it too.
- *
- * TOOL ERRORS: PromptJsonWriter.writeToolResult receives ToolResultEvent.output
- * but drops the sibling `isError` field. The content may still be a JSON object
- * with an isError/status field, so the translator looks for one defensively;
- * otherwise it marks the activity done. A failed shell command is visible in
- * the output text, not in a status bit we were given.
- *
- * EXIT CODE: print mode exits non-zero on failure, but a clean exit is still
- * only corroboration. No assistant text after a zero exit is `malformed`, not
- * an empty success.
- */
-const KIMI_BINARY = process.env['AGENT_SMITH_KIMI_BIN'] ?? 'kimi';
-/** Kimi config dir: AGENT_SMITH_KIMI_HOME, then KIMI_CODE_HOME, then ~/.kimi-code. */
+};function kimiBinary() {
+    return process.env['AGENT_SMITH_KIMI_BIN'] ?? 'kimi';
+}
 function kimiHome() {
     return configDir(['AGENT_SMITH_KIMI_HOME', 'KIMI_CODE_HOME'], '.kimi-code');
 }
-/**
- * The posture print mode actually applies, in one line for the spawn ack.
- * `spec` is accepted to match the Provider contract; there is nothing in it
- * this CLI can honor. See the header.
- */
 function sandboxPlan$1(spec) {
     return {
         sandbox: 'kimi print mode: auto permission policy (no approval prompts; config deny rules still apply)',
@@ -5162,18 +4081,6 @@ function sandboxPlan$1(spec) {
         readOnlyEnforced: false,
     };
 }
-/**
- * Build the exact argv for one Kimi worker.
- *
- * Flags first, prompt last. `-p` takes a value, so a prompt starting with "-"
- * is consumed as that value rather than parsed as an option.
- *
- * NOT EMITTED, deliberately:
- *   --effort    does not exist; effort lives in config.toml.
- *   --continue  cwd-ambiguous and unsafe with parallel workers.
- *   --yolo      rejected in prompt mode.
- *   --auto      redundant: print mode forces auto.
- */
 function buildArgv$1(spec) {
     const argv = ['--output-format', 'stream-json'];
     if (spec.model !== undefined && spec.model !== '')
@@ -5195,10 +4102,6 @@ function buildArgv$1(spec) {
     argv.push('-p', spec.prompt);
     return argv;
 }
-// ---------------------------------------------------------------------------
-// Defensive extraction
-// ---------------------------------------------------------------------------
-/** Normalize an OpenAI-shaped usage object, if a future version emits one. */
 function toTokenUsage$1(usage) {
     const pick = (...keys) => {
         for (const k of keys) {
@@ -5245,7 +4148,6 @@ function toolOutputIsError(content) {
         return true;
     return parsed['error'] !== undefined && parsed['error'] !== null && parsed['error'] !== false;
 }
-/** Render a tool-result value as text without dropping a non-string payload. */
 function contentText(value) {
     if (typeof value === 'string')
         return value;
@@ -5259,12 +4161,6 @@ function contentText(value) {
         return String(value);
     }
 }
-/**
- * Build the translator. Every line is handled by role because that is the
- * writer's actual discriminator; `type` is only read inside meta lines. A shape
- * this parser does not recognise becomes a notice with its payload preserved,
- * never a silent drop.
- */
 function createKimiTranslator(maxChars) {
     const tx = {
         finalText: '',
@@ -5292,20 +4188,13 @@ function createKimiTranslator(maxChars) {
         const at = nowIso();
         const role = str(raw, 'role');
         const type = str(raw, 'type') ?? '';
-        // ---- session id: the resume handle arrives on the final meta line -------
-        // It is accepted ONLY there. Any other line carrying a session_id is a
-        // shape the writer does not produce; letting it overwrite the handle would
-        // make a resume point at an id the CLI never issued.
-        // ---- usage, if a future writer adds it --------------------------------
         const usage = toTokenUsage$1(obj(raw, 'usage') ?? obj(raw, 'tokens') ?? {});
         if (usage !== undefined) {
             tx.usage = usage;
             out.push({ kind: 'usage', at, usage });
         }
-        // ---- meta lines -------------------------------------------------------
         if (role === 'meta') {
             if (type === 'system.version') {
-                // Version banner. Known, carries nothing a consumer acts on.
                 return out;
             }
             if (type === 'session.resume_hint') {
@@ -5336,8 +4225,6 @@ function createKimiTranslator(maxChars) {
                 const message = str(raw, 'error_message') ?? '';
                 const attempt = failed !== undefined && max !== undefined ? ` (attempt ${failed} of ${max})` : '';
                 const retrying = next !== undefined ? `; retrying as ${next}` : '';
-                // A retry that eventually succeeds is not a failed job, so this is a
-                // warning, not sawError.
                 out.push({ kind: 'notice', at, level: 'warn', message: `kimi ${name}${attempt}${retrying}: ${message}`.trim(), raw });
                 return out;
             }
@@ -5359,7 +4246,6 @@ function createKimiTranslator(maxChars) {
             });
             return out;
         }
-        // ---- assistant message: text plus the tool calls it invoked -----------
         if (role === 'assistant') {
             const content = str(raw, 'content');
             if (content !== undefined && content !== '') {
@@ -5393,9 +4279,7 @@ function createKimiTranslator(maxChars) {
                             try {
                                 args = JSON.parse(args);
                             }
-                            catch {
-                                // Keep the raw string; preview() renders it without inventing structure.
-                            }
+                            catch { }
                         }
                         const input = preview(args, maxChars);
                         const idx = stepFor(id);
@@ -5415,7 +4299,6 @@ function createKimiTranslator(maxChars) {
             }
             return out;
         }
-        // ---- tool result: closes the matching call ----------------------------
         if (role === 'tool') {
             const id = str(raw, 'tool_call_id') ?? str(raw, 'id') ?? `tool-${step}`;
             if (ended.has(id)) {
@@ -5428,8 +4311,6 @@ function createKimiTranslator(maxChars) {
                 });
                 return out;
             }
-            // The writer uses stringifyToolOutput(), but a future/hostile shape may
-            // hand us an object. Coercing it keeps the payload and its error flag.
             const content = contentText(raw['content']);
             const output = truncate(content, maxChars);
             const status = toolOutputIsError(content) ? 'error' : 'done';
@@ -5441,14 +4322,12 @@ function createKimiTranslator(maxChars) {
             };
             if (output.truncated)
                 ref.truncated = true;
-            // A result before its call must not be re-opened by the late call line.
             started.add(id);
             ended.add(id);
             tx.completedTools += 1;
             out.push({ kind: 'activity-end', at, activity: ref, status });
             return out;
         }
-        // ---- top-level error shape (defensive; the current writer never emits) -
         if (type === 'error' || obj(raw, 'error') !== undefined) {
             tx.sawError = true;
             tx.error = str(obj(raw, 'error'), 'message') ?? str(raw, 'message') ?? 'kimi error';
@@ -5456,7 +4335,6 @@ function createKimiTranslator(maxChars) {
             out.push({ kind: 'notice', at, level: 'error', message: tx.error, raw });
             return out;
         }
-        // ---- fallthrough: never drop data -------------------------------------
         const label = role ?? (type !== '' ? type : 'unknown');
         const key = role === undefined ? `type:${label}` : `role:${label}`;
         tx.unrecognised.add(key);
@@ -5476,9 +4354,6 @@ function createKimiTranslator(maxChars) {
     };
     return tx;
 }
-// ---------------------------------------------------------------------------
-// Result
-// ---------------------------------------------------------------------------
 function buildResult$1(args) {
     const { jobId, startedAtMs, stateDir, exit, tx } = args;
     const durationMs = Date.now() - startedAtMs;
@@ -5487,7 +4362,6 @@ function buildResult$1(args) {
         : '';
     let status;
     let error;
-    // No verified terminal event exists in this stream: recovery needs a clean exit.
     const recovered = tx.recovery.recovered(tx.finalText, exit.code);
     const early = earlyVerdict(exit, durationMs);
     if (early !== undefined) {
@@ -5504,10 +4378,6 @@ function buildResult$1(args) {
             : `exited ${exit.code}${unrecognised}${stderrClause(exit.stderr)}`;
     }
     else if (tx.finalText.trim() === '') {
-        // Zero exit and no assistant text. With a source-verified parser this is
-        // more likely an account/network failure or a silent policy denial than an
-        // empty model reply, and neither is a success. A completed tool step is
-        // still worth naming, because it explains where the turn went.
         const tools = tx.completedTools > 0 ? ` · ${tx.completedTools} tool step(s) completed` : '';
         status = 'malformed';
         error = `no output${unrecognised}${tools}${stderrClause(exit.stderr)}`;
@@ -5527,22 +4397,6 @@ function buildResult$1(args) {
         out.raw = raw;
     return out;
 }
-// ---------------------------------------------------------------------------
-// Model discovery
-// ---------------------------------------------------------------------------
-/**
- * Parse `kimi provider list --json`.
- *
- * Shape (sub/provider.ts + config-manifest.toml):
- *   { providers: { <id>: {...} }, models: { <alias>: {
- *       provider, model, display_name?, support_efforts?, default_effort?, overrides? } } }
- *
- * The key is the alias `-m` accepts. Live 2.1.1 output uses camelCase keys
- * (`supportEfforts`, `defaultEffort`, `displayName`) even though config.toml is
- * snake_case, so both spellings are accepted. `overrides` wins over the
- * top-level field, matching the CLI's own precedence. Efforts are reported as
- * [] because print mode has no per-run effort flag; see the header.
- */
 function parseKimiModels(stdout) {
     let parsed;
     try {
@@ -5572,7 +4426,6 @@ function parseKimiModels(stdout) {
     }
     return out;
 }
-/** Lazy, never throws. Live-verified on 2.1.1. */
 async function listKimiModels(run, options, home = kimiHome()) {
     const cat = {
         provider: 'kimi',
@@ -5583,7 +4436,7 @@ async function listKimiModels(run, options, home = kimiHome()) {
         verified: true,
     };
     try {
-        const r = await run(KIMI_BINARY, ['provider', 'list', '--json'], options?.timeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS);
+        const r = await run(kimiBinary(), ['provider', 'list', '--json'], options?.timeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS);
         const models = r.error === undefined ? parseKimiModels(r.stdout) : undefined;
         if (models !== undefined && models.length > 0)
             cat.models = models;
@@ -5602,36 +4455,28 @@ async function listKimiModels(run, options, home = kimiHome()) {
     }
     return cat;
 }
-/** Default model from <home>/config.toml top-level `default_model`. Sync, no CLI, never throws. */
 function kimiHarnessDefaults(home = kimiHome()) {
-    const text = readTextSafe(path.join(home, 'config.toml'));
+    const text = readTextSafe$1(path.join(home, 'config.toml'));
     if (text === undefined)
         return {};
     const model = parseTomlTopLevel(text)['default_model'];
     return model !== undefined && model !== '' ? { model } : {};
 }
-// ---------------------------------------------------------------------------
-// Provider
-// ---------------------------------------------------------------------------
 const kimiProvider = {
     name: 'kimi',
-    // Print mode has no --effort; effort lives in config.toml. The service must
-    // not record a request it cannot apply.
     supportsEffort: false,
     harnessDefaults: () => kimiHarnessDefaults(),
-    available: () => binaryAvailable(KIMI_BINARY),
+    available: () => binaryAvailable(kimiBinary()),
     describeSandbox: sandboxPlan$1,
     listModels: (options) => listKimiModels(runCapture, options),
     spawn(spec) {
         const tx = createKimiTranslator(spec.maxOutputChars ?? 2000);
         return runNdjsonWorker({
             provider: 'kimi',
-            binary: KIMI_BINARY,
+            binary: kimiBinary(),
             spec,
             buildArgv: buildArgv$1,
             translate: tx.onEvent,
-            // Do not silently pretend the effort was applied. The CLI reads effort
-            // from config.toml, not from a flag.
             ...(spec.effort !== undefined && spec.effort !== '' ? { preamble: [{
                         kind: 'notice',
                         at: nowIso(),
@@ -5726,7 +4571,9 @@ const kimiProvider = {
  * looks like a variant and otherwise append `#<effort>` only if the caller gave
  * an effort AND no `#` is already present. See buildArgv.
  */
-const OPENCODE_BINARY = process.env['AGENT_SMITH_OPENCODE_BIN'] ?? 'opencode';
+function opencodeBinary() {
+    return process.env['AGENT_SMITH_OPENCODE_BIN'] ?? 'opencode';
+}
 /** Sandbox flags for opencode. Shared by buildArgv and describeSandbox. */
 function sandboxPlan(spec) {
     if (spec.unrestricted) {
@@ -6296,7 +5143,7 @@ async function listOpencodeModels(run, options) {
         verified: false,
     };
     try {
-        const r = await run(OPENCODE_BINARY, ['models'], options?.timeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS);
+        const r = await run(opencodeBinary(), ['models'], options?.timeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS);
         const models = parseOpencodeModels(r.stdout);
         if (models.length > 0)
             return { ...base, models };
@@ -6311,14 +5158,14 @@ async function listOpencodeModels(run, options) {
 }
 const opencodeProvider = {
     name: 'opencode',
-    available: () => binaryAvailable(OPENCODE_BINARY),
+    available: () => binaryAvailable(opencodeBinary()),
     describeSandbox: sandboxPlan,
     listModels: (options) => listOpencodeModels(runCapture, options),
     spawn(spec) {
         const tx = createOpencodeTranslator(spec.maxOutputChars ?? 2000);
         return runNdjsonWorker({
             provider: 'opencode',
-            binary: OPENCODE_BINARY,
+            binary: opencodeBinary(),
             spec,
             buildArgv,
             // `run --format json` is documented as raw JSON events, but --format
@@ -6473,6 +5320,53 @@ function createMarker(filePath, body) {
         closeSync(fd);
     }
     return true;
+}/** Text sanitising and fixed-width fitting. Dependency-free: everything that puts
+ * worker or user prose into a cell goes through here first.
+ */
+/**
+ * Strip complete ANSI escape sequences (CSI, OSC, DCS/PM/APC/SOS, 2-byte ESC,
+ * C1 controls) and remaining forbidden control characters, unpaired surrogates,
+ * and noncharacters (`U+FDD0..U+FDEF`), while preserving `\n` and valid UTF-16
+ * surrogate pairs.
+ *
+ * Why this exists: Claude Code's JSX element validator rejects any `<Text>`,
+ * `<Button label>`, or `<Markdown text>` containing C0/C1 controls (except `\t`
+ * and `\n`), lone surrogates, or `U+FDD0..U+FDEF`. Worker tool output, shell
+ * commands, check output, and prompt text routinely contain ANSI colour codes or
+ * `\r` progress lines; stripping them at the UI boundary keeps the stored job
+ * files intact while preventing a single control byte from aborting the pane.
+ */
+const ANSI_ESCAPE = /(?:\x1b\][\s\S]*?(?:\x07|\x1b\\|\x9c)|\x9d[\s\S]*?(?:\x07|\x1b\\|\x9c)|\x1b[PX^_][\s\S]*?(?:\x1b\\|\x9c)|(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]|\x1b[ -/]*[@-~])/gu;
+const FORBIDDEN_CONTROLS = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ud800-\udfff\ufdd0-\ufdef]/gu;
+function sanitizeText(s) {
+    return s
+        .replace(ANSI_ESCAPE, '')
+        .replace(/\r\n?/g, '\n')
+        .replace(/\t/g, '  ')
+        .replace(FORBIDDEN_CONTROLS, '');
+}
+/**
+ * Cut to at most `max` UTF-16 units without splitting a surrogate pair.
+ *
+ * `slice` can leave a high surrogate with no low half. `sanitizeText` removes
+ * such halves, so a cut made AFTER sanitizing must not create one: the host
+ * draws an unpaired half as U+FFFD, or refuses the tree a Text's string is
+ * checked in. `max` stays in UTF-16 units because every caller sizes cells in
+ * terminal columns, where a pair already counts as two.
+ */
+function clip(s, max) {
+    if (s.length <= max)
+        return s;
+    const cut = s.slice(0, Math.max(0, max));
+    return /[\ud800-\udbff]$/.test(cut) ? cut.slice(0, -1) : cut;
+}
+/** Collapse all whitespace runs to single spaces and cap the length. A hard
+ * bound on what one string can cost, for prose with no cell to sit in (a report
+ * excerpt, a warning message); the renderer's `wrap="truncate-end"` is the
+ * mechanism, this is belt and braces. */
+function oneLine(s, max = 400) {
+    const t = sanitizeText(s).replace(/\s+/g, ' ').trim();
+    return clip(t, Math.max(0, max));
 }/** Tool name + parameters → a short human phrase. Shared by the legacy reader
  * (jobs.ts) and the progress digest (progress.ts); never raw tool output.
  */
@@ -6906,51 +5800,10 @@ class ProgressTracker {
             return 'running';
         return 'exploring';
     }
-}/**
- * writer.ts — one job, from `spawn()` to the terminal anchor.
- *
- * This is the module that makes the two halves of this repo one system. It takes
- * a `WorkerHandle` from providers/, translates its event stream into OUR state
- * format (format.ts), computes the verdict (format.deriveStatus), writes the
- * anchor.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * WHY THE WRITER, AND NOT THE SURFACE, OWNS THE FILES
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * Because a job outlives the tool call that started it. `spawn_job` returns a
- * job id in under a millisecond; the job then runs for 28 minutes across an MCP
- * server restart, a session close, and a pane that was never opened. If the
- * surface owned the state, a Claude Code restart would lose every running job.
- *
- * The filesystem is the only thing in this system that survives all three.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * WRITE AMOUNT, BECAUSE THIS RUNS 484 TIMES ON A GOOD JOB
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * The reference job made 484 tool calls. Naively, that is 484 progress.json
- * rewrites. That is invisible — the band polls
- * at 3 s, the channel at 5 s — so we coalesce: at most one progress flush every
- * PROGRESS_FLUSH_MS, with a trailing flush on every terminal transition so the
- * last state is never lost.
- *
- * What is NOT throttled: the terminal writes, the cancel marker, and the
- * append-only event log. Those are the ones a reader is waiting on.
- */
-// Shared with the mod, which renders the digest; the mod loader cannot import forge, so it lives there.
-/** How many recent activities we keep. Matches the pane's rendering cap. */
+}// Shared with the mod, which renders the digest; the mod loader cannot import forge, so it lives there.
 const RECENT_ACTIVITIES = 5;
-/** How much assistant text we keep as the "reasoning" cell. */
 const LATEST_TEXT_CHARS = 4_000;
-/** Max length of `latestSummary`. */
 const SUMMARY_CHARS = 1_000;
-/**
- * Owns the on-disk state of exactly one job.
- *
- * Not thread-safe and does not need to be: one job has one owner (the coroutine
- * that spawned it), and `forge/service.ts` keeps that ownership in a map.
- */
 class JobWriter {
     jobId;
     repo;
@@ -6963,15 +5816,11 @@ class JobWriter {
     toolCalls = 0;
     toolSteps = new Set();
     latestText = null;
-    /** The current assistant message only (reset at each tool call): what `latestSummary` shows while running. */
     currentMessage = '';
-    /** Steps whose tool call ended in an error state. */
     toolErrorSteps = new Set();
-    /** Last heartbeat and the worker pid it named; carried through every progress rebuild. */
     lastAliveAt = null;
     workerPid;
     lastHeartbeatFlushMs = 0;
-    /** Whether the first substantive event (not `started`/`usage`) was an error notice. */
     firstEventSeen = false;
     firstEventWasError = false;
     tracker = new ProgressTracker();
@@ -6983,42 +5832,22 @@ class JobWriter {
     cancelRequestedAt = null;
     cwd = '';
     baselinePending = null;
-    /** In-memory size:mtime signatures of baseline-dirty files, to detect further edits. */
     baselineSigs = new Map();
     changed = null;
     unattributed = [];
     staleReads = [];
-    /** Concatenated tool inputs of this job, used to attribute changed files to it. */
     toolInputs = '';
-    /** Concatenated inputs of edit tool calls only, so read calls never attribute an external edit to the worker. */
     editToolInputs = '';
-    /**
-     * Steps whose edit tool call ENDED without error. The writing-job evidence
-     * for the cwd rule: an edit that errored or was denied changed nothing, so
-     * it must not turn a review into a writing job. (The progress digest counts
-     * edits at start, which is right for the pane but not for a verdict.)
-     */
     editStepsCompleted = new Set();
     constructor(options) {
         this.repo = options.repo;
         this.jobId = options.jobId;
         this.flushMs = options.flushMs ?? PROGRESS_FLUSH_MS;
     }
-    /**
-     * Write the initial snapshot, BEFORE the process is spawned.
-     *
-     * The ordering is the whole point. A reader that finds nothing has to answer
-     * "does this job exist?" with "no", and then the job's whole life is invisible
-     * until its first event — which for a slow provider is seconds, and for a
-     * spawn failure is forever. Writing first means the job exists from the
-     * instant it was accepted, and a spawn that throws turns an existing job from
-     * `running` into `failed` instead of leaving a hole.
-     *
-     * `claim()` runs first: if the id belongs to somebody else's job we refuse
-     * before writing a single byte.
-     */
     start(input) {
         const now = new Date().toISOString();
+        const turn = typeof input.turn === 'number' && Number.isInteger(input.turn) && input.turn >= 1 ? input.turn : 1;
+        const chainStartedAt = input.chainStartedAt ?? now;
         this.view = { ...this.view, prompt: input.prompt.slice(0, 64_000), preamble: input.preamble?.slice(0, 4_000) ?? null,
             truncated: input.prompt.length > 64_000 || (input.preamble?.length ?? 0) > 4_000 };
         this.conversation = input.conversation;
@@ -7027,6 +5856,7 @@ class JobWriter {
             jobId: this.jobId,
             name: input.name ?? this.jobId,
             workerId: input.workerId ?? this.jobId,
+            turn,
             role: input.mode,
             latestSummary: null,
             summarySource: null,
@@ -7045,6 +5875,7 @@ class JobWriter {
             createdAt: now,
             updatedAt: now,
             startedAt: now,
+            chainStartedAt,
             finishedAt: null,
             exitCode: null,
             jobStatus: null,
@@ -7063,7 +5894,8 @@ class JobWriter {
             ...(input.sandboxFlags === undefined ? {} : { sandboxFlags: input.sandboxFlags }),
             ...(input.readOnlyRequested === undefined ? {} : { readOnlyRequested: input.readOnlyRequested }),
             ...(input.readOnlyEnforced === undefined ? {} : { readOnlyEnforced: input.readOnlyEnforced }),
-            ...(input.steeredFrom ? { steeredFrom: input.steeredFrom } : {}),
+            ...(input.continuedFrom ? { continuedFrom: input.continuedFrom } : {}),
+            ...(input.continuationKind ? { continuationKind: input.continuationKind } : {}),
             ...(input.watchedFiles !== undefined && Object.keys(input.watchedFiles).length > 0
                 ? { watchedFiles: input.watchedFiles }
                 : {}),
@@ -7081,7 +5913,6 @@ class JobWriter {
         };
         this.writeManifest();
         this.flushProgress(this.manifest.createdAt);
-        // Fire and forget: spawn never waits on git. Merged into the manifest when it lands.
         this.cwd = input.cwd;
         this.baselinePending = isInsideGitRepo(input.cwd) ? this.captureBaseline(input.cwd) : null;
         return manifest;
@@ -7099,18 +5930,16 @@ class JobWriter {
             this.manifest = { ...this.manifest, gitBaseline: { head: snap.head, dirty: snap.dirty } };
             this.writeManifest();
         }
-        catch { /* best effort */ }
+        catch { }
     }
-    /** Wait for the async git baseline capture and return the dirty paths, if any. */
     async awaitBaseline() {
         try {
             if (this.baselinePending !== null)
                 await this.baselinePending;
         }
-        catch { /* best effort */ }
+        catch { }
         return (this.manifest?.gitBaseline?.dirty ?? []).filter((p) => !isForgeStatePath(p));
     }
-    /** Update `view.preamble` when the async brief enrichment lands before spawn. */
     updatePreamble(preamble) {
         this.view = {
             ...this.view,
@@ -7119,7 +5948,6 @@ class JobWriter {
         };
         writeJsonAtomic(jobFile(this.repo, this.jobId, FILES.view), this.view);
     }
-    /** Candidate paths that this worker's own edit tool calls touched. */
     editedFiles(candidates) {
         const fromTracker = this.tracker.editedPaths(this.cwd);
         if (candidates === undefined)
@@ -7127,18 +5955,12 @@ class JobWriter {
         const fromEditInputs = this.editToolInputs !== '' ? attributeChanged(candidates, this.editToolInputs).mine : [];
         return [...new Set([...fromTracker.filter((p) => candidates.includes(p)), ...fromEditInputs])];
     }
-    /**
-     * Compute `changedFiles` against the baseline. Call (awaited) just before
-     * `finish()`; finish stays synchronous. Bounded by the git ~2s cap, never throws.
-     */
     async prepareFinish() {
         try {
             if (this.baselinePending !== null)
                 await this.baselinePending;
             if (this.manifest === null)
                 return;
-            // A vanished cwd has nothing to diff or compare; finish() records it as
-            // cwdMissingAtFinish + changedFilesUnknown instead of a silent "no edits".
             if (!existsSync(this.cwd))
                 return;
             const watched = this.manifest.watchedFiles;
@@ -7191,13 +6013,8 @@ class JobWriter {
                 this.staleReads = computeStaleReads(this.repo, this.cwd, watched, [...editedWatchedSet]);
             }
         }
-        catch { /* best effort */ }
+        catch { }
     }
-    /**
-     * Record that the worker's process is alive: progress.json `lastAliveAt` (and
-     * `workerPid`). Not activity: `updatedAt`, `lastEventAt` and the timeline
-     * stay untouched, and only progress.json is rewritten.
-     */
     heartbeat(at, pid) {
         if (this.finished || this.manifest === null || this.progress === null)
             return;
@@ -7205,14 +6022,12 @@ class JobWriter {
         if (typeof pid === 'number')
             this.workerPid = pid;
         this.progress = { ...this.progress, lastAliveAt: at, ...(this.workerPid === undefined ? {} : { workerPid: this.workerPid }) };
-        // Coalesced like every progress write; heartbeats are HEARTBEAT_MS apart, so in practice each lands.
         const nowMs = Date.parse(at);
         if (!shouldFlush(this.lastHeartbeatFlushMs, Number.isNaN(nowMs) ? Date.now() : nowMs, this.flushMs))
             return;
         this.lastHeartbeatFlushMs = Number.isNaN(nowMs) ? Date.now() : nowMs;
         writeJsonAtomic(jobFile(this.repo, this.jobId, FILES.progress), this.progress);
     }
-    /** Feed one normalized provider event into the snapshot. */
     onEvent(event) {
         if (this.finished || this.manifest === null)
             return;
@@ -7232,7 +6047,6 @@ class JobWriter {
                 this.onText(event);
                 return;
             case 'notice':
-                // Info notices (lifecycle chatter) are not "the first thing that happened".
                 if (event.level !== 'info')
                     this.noteFirstEvent(event.level === 'error');
                 if (event.level === 'warn' || event.level === 'error') {
@@ -7253,12 +6067,9 @@ class JobWriter {
         if (typeof event.conversationId === 'string' && event.conversationId.trim() !== '') {
             this.conversation = event.conversationId;
             this.manifest = { ...this.manifest, conversation: this.conversation };
-            // Resume identity must survive a supervisor crash even inside the
-            // progress coalescing window, before finish() can publish it.
             this.writeManifest();
         }
         if (typeof event.model === 'string' && this.manifest.model === null) {
-            // Provider-reported (structured event, never worker text) beats "unknown"/harness-config guesses.
             this.manifest = {
                 ...this.manifest,
                 model: event.model,
@@ -7275,8 +6086,6 @@ class JobWriter {
         this.deltaOpen = false;
         const ref = event.activity;
         const isStart = event.kind === 'activity-start';
-        // An update is an in-flight call: it keeps the row active and must NOT
-        // count as a new tool call when its step was already registered.
         const status = isStart || event.kind === 'activity-update'
             ? 'active'
             : event.status === 'denied'
@@ -7288,13 +6097,6 @@ class JobWriter {
             this.toolSteps.add(ref.stepIndex);
             this.toolCalls += 1;
         }
-        // A tool's DONE record frequently carries no `input` (the provider split
-        // ACTIVE and DONE for the same step_index, and only ACTIVE had the
-        // parameters — 14,900 archived records confirm it). So the DONE row
-        // INHERITS the input from the ACTIVE row rather than dropping it, which is
-        // what keeps the pane's activity phrase readable on a finished job. The
-        // same applies to an update, and to a later update that finally names the
-        // parameters the start did not have.
         const idx = this.recent.findIndex((a) => a.stepIndex === ref.stepIndex);
         const previousRow = idx >= 0 ? this.recent[idx] : undefined;
         const input = ref.input ?? previousRow?.input;
@@ -7305,8 +6107,6 @@ class JobWriter {
             status,
             ...(input === undefined ? {} : { input }),
         };
-        // Only an input that arrived AFTER a start without one is "new" evidence:
-        // re-sent parameters on every update must not fill the attribution buffer.
         if (ref.input !== undefined && previousRow?.input === undefined) {
             if (this.toolInputs.length < TOOL_INPUTS_CAP)
                 this.toolInputs += ref.input + '\n';
@@ -7321,7 +6121,6 @@ class JobWriter {
         if (event.kind === 'activity-end' && status === 'done' && classify(tool, input).kind === 'edit') {
             this.editStepsCompleted.add(ref.stepIndex);
         }
-        // A tool call ends the assistant message before it: the next text is a new one.
         if (isStart)
             this.currentMessage = '';
         if (status === 'error')
@@ -7332,9 +6131,6 @@ class JobWriter {
             this.recent[idx] = row;
         else
             this.recent.push(row);
-        // The pane picks the HIGHEST step_index, not the last entry, because a
-        // rewritten array mid-poll is not guaranteed sorted. Keeping the array
-        // short is what stops that from mattering.
         if (this.recent.length > RECENT_ACTIVITIES)
             this.recent = this.recent.slice(-RECENT_ACTIVITIES);
         const tools = [...this.view.tools];
@@ -7401,33 +6197,15 @@ class JobWriter {
         this.manifest = { ...this.manifest, latestSummary: summaryTail(this.currentMessage, SUMMARY_CHARS) || this.manifest.latestSummary || null, summarySource: 'worker' };
         this.touch(at);
     }
-    /**
-     * The cwd facts deriveStatus needs: is the cwd gone, and was this job meant
-     * to write (mode) or seen editing (one of its own edit tool calls completed
-     * without error). Every verdict for this job (finish, the steer chain) reads
-     * them from here.
-     */
     verdictFacts() {
         return cwdFacts(this.cwd, this.manifest?.mode, this.editStepsCompleted.size > 0);
     }
-    /**
-     * Write the terminal state.
-     *
-     * Every path out of a job goes through here, including the ones where the
-     * process died without producing a JobResult — a cancel that raced the exit,
-     * a throw from the adapter. A job that never gets a terminal write stays
-     * `running` forever, which is a lie with a very long fuse.
-     */
     finish(result, report) {
         if (this.finished || this.manifest === null) {
-            // A second terminal write is a bug in the caller, but returning the
-            // manifest we already have is strictly better than rewriting history.
             return this.manifest ?? emptyManifest(this.jobId);
         }
         this.finished = true;
         const finishedAt = result.finishedAt;
-        // A marker records a request, not proof that the worker stopped. Only the
-        // adapter's terminal cancellation verdict can make the job canceled.
         const alreadyTerminal = result.status === 'cancelled' ? 'canceled' : null;
         const { cwdMissing, writing } = this.verdictFacts();
         const verdict = deriveStatus({
@@ -7439,12 +6217,10 @@ class JobWriter {
             cwdMissing,
             writing,
         });
-        // deriveStatus warns for a writing job (via `suspicious`); a read-only job keeps its verdict and gets this.
         if (cwdMissing && !verdict.suspicious) {
             this.addWarning(`working directory ${this.cwd} was gone at finish; changed files and checks could not be verified`);
         }
         const failure = failureFields(verdict, result);
-        // Failed before doing anything: a route (model/region/account) problem, not the work.
         const failedEarly = verdict.status === 'failed' && !result.ok && result.status !== 'timeout' && result.status !== 'cancelled' &&
             this.toolCalls === 0 && (result.durationMs <= FAILED_EARLY_MS || this.firstEventWasError);
         const response = result.response.trim();
@@ -7459,7 +6235,6 @@ class JobWriter {
             startedAt: this.manifest.startedAt ?? result.startedAt,
             exitCode: result.exitCode,
             jobStatus: result.status,
-            // The adapter's own text when it has one, else the verdict's reason; never both.
             error: failure.error,
             reason: failure.reason,
             deniedActions: (result.deniedActions ?? []).map((d) => ({
@@ -7472,7 +6247,6 @@ class JobWriter {
             ...(this.toolErrorSteps.size === 0 ? {} : { toolErrors: this.toolErrorSteps.size }),
             ...(failedEarly ? { failedEarly: true } : {}),
             conversation: this.conversation,
-            // A worker's conclusion is at the END of its final response, not the start.
             latestSummary: summaryTail(response, SUMMARY_CHARS) || this.manifest.latestSummary || null,
             summarySource: response || this.manifest.latestSummary ? 'worker' : null,
             ...(this.changed === null
@@ -7495,12 +6269,6 @@ class JobWriter {
             this.addWarning(verdict.reason ?? 'suspicious success');
         return manifest;
     }
-    /**
-     * Record a terminal state with no JobResult at all.
-     *
-     * Used when the adapter throws or never resolves. Same guarantee as `finish`:
-     * the job stops claiming to be `running`.
-     */
     abort(status, reason) {
         if (this.finished || this.manifest === null)
             return this.manifest;
@@ -7525,36 +6293,20 @@ class JobWriter {
         this.flushProgress(now);
         return manifest;
     }
-    /**
-     * Request cancellation. Writes the marker FIRST, then the caller kills.
-     *
-     * Marker before kill because the kill is asynchronous and a reader polling in
-     * between must already see the intent: a cancellation caught mid-flight is
-     * still a cancellation, and the worker may never get to write its own
-     * terminal state.
-     */
     requestCancel(at = new Date().toISOString()) {
         if (this.finished)
             return;
         if (this.cancelRequestedAt === null) {
             this.cancelRequestedAt = at;
             createMarker(jobFile(this.repo, this.jobId, FILES.cancel), at);
-            // Legacy readers treat a marker as already stopped. Keep the request
-            // canonical until finish() publishes an acknowledged terminal state.
         }
     }
-    /** Did this job get cancelled? True once a marker exists, terminal or not. */
     get cancelled() {
         return this.cancelRequestedAt !== null;
     }
-    /** Latest conversation ID known to this writer (from start() or the provider's init event). */
     currentConversation() {
         return this.conversation;
     }
-    /**
-     * Stamp `supersededBy` in memory before `finish()` or `abort()` so the
-     * terminal anchor write includes `supersededBy` atomically.
-     */
     markSuperseded(nextJobId) {
         if (this.manifest === null)
             return;
@@ -7563,7 +6315,14 @@ class JobWriter {
             this.progress = { ...this.progress, pendingSteers: 0 };
         }
     }
-    /** Update the published count of unconsumed queued steers in the writer-owned files. */
+    markFollowedBy(nextJobId) {
+        if (this.manifest === null)
+            return;
+        this.manifest = { ...this.manifest, followedBy: nextJobId, pendingSteers: 0 };
+        if (this.progress !== null) {
+            this.progress = { ...this.progress, pendingSteers: 0 };
+        }
+    }
     setPendingSteers(count, at = new Date().toISOString()) {
         if (this.finished || this.manifest === null)
             return;
@@ -7574,25 +6333,27 @@ class JobWriter {
         }
         this.flushProgress(at);
     }
-    /** Record a supervisor-level warning on this job's progress. */
+    recordMessage(text, delivery, sender, at = new Date().toISOString()) {
+        if (this.manifest === null)
+            return;
+        const timeline = [...this.view.timeline ?? [], { kind: 'message', sequence: this.viewSequence++, at, text: text.slice(0, 2_000), delivery, sender }];
+        const bounded = boundTimeline(timeline);
+        this.view = { ...this.view, timeline: bounded.events, truncated: this.view.truncated || bounded.truncated };
+        this.deltaOpen = false;
+        if (this.finished)
+            writeJsonAtomic(jobFile(this.repo, this.jobId, FILES.view), this.view);
+        else
+            this.flushProgress(at);
+    }
     warn(message) {
         this.addWarning(message);
     }
-    /**
-     * The recent tool rows, in step order.
-     *
-     * Exposed so the pipeline runner can build `Observation[]` for routing.ts
-     * without opening a second subscription to the provider's event stream — this
-     * process already owns that stream.
-     */
     activities() {
         return [...this.recent].sort((a, b) => a.stepIndex - b.stepIndex);
     }
-    /** The current manifest, for a status() read that does not re-parse the file. */
     snapshot() {
         return this.manifest;
     }
-    /* ── internals ─────────────────────────────────────────────────────────── */
     touch(at) {
         if (this.manifest === null)
             return;
@@ -7609,7 +6370,6 @@ class JobWriter {
             lastActivity: this.lastActivity,
             latestText: this.latestText,
             toolCalls: this.toolCalls,
-            // Always written, even 0: recovery must tell "no edit completed" from a pre-counter file.
             editsCompleted: this.editStepsCompleted.size,
             ...(this.toolErrorSteps.size === 0 ? {} : { toolErrors: this.toolErrorSteps.size }),
             ...(this.lastAliveAt === null ? {} : { lastAliveAt: this.lastAliveAt }),
@@ -7636,7 +6396,6 @@ class JobWriter {
             return;
         this.progress = { ...this.progress, warnings: [...this.progress.warnings, message] };
     }
-    /** Persist the anchor. Always whole, always atomic. */
     writeManifest() {
         if (this.manifest === null)
             return;
@@ -7656,8 +6415,6 @@ class JobWriter {
         this.lastFlushMs = Number.isNaN(ms) ? Date.now() : ms;
     }
 }
-/* ── git baseline helpers ─────────────────────────────────────────────────── */
-/** Per git call. AGENT_SMITH_GIT_TIMEOUT_MS raises it on slow or loaded machines, where a capped-out snapshot loses changedFiles. */
 function gitCapMs() {
     const n = Number(process.env['AGENT_SMITH_GIT_TIMEOUT_MS']);
     return Number.isFinite(n) && n > 0 ? n : 2_000;
@@ -7680,7 +6437,6 @@ function git(cwd, args) {
         execFile('git', args, { cwd, timeout: gitCapMs(), maxBuffer: 8 * 1024 * 1024, env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' } }, (err, stdout) => (err ? reject(err) : resolve(stdout)));
     });
 }
-/** HEAD + dirty paths, or null when cwd is not a git repo / git fails / is slow. */
 async function gitSnapshot(cwd) {
     try {
         const [status, head] = await Promise.all([
@@ -7761,20 +6517,12 @@ function computeStaleReads(repo, cwd, watchedFiles, changedFiles) {
     }
     return stale.sort();
 }
-/** Append `add` to `base`, bounded. Pure, so the bounding rule is testable. */
 function appendBounded(base, add, max) {
     const joined = base === '' ? add : `${base}${add}`;
     if (joined.length <= max)
         return joined;
-    // Cut from the FRONT: the newest text is what the pane shows, and a stale
-    // opening paragraph is worth less than the sentence the worker just wrote.
     return joined.slice(joined.length - max);
 }
-/**
- * The last `max` chars of `text`, starting at a paragraph (else line) boundary
- * so the summary opens on a whole thought, not mid-sentence. A worker's
- * conclusion is at the end of its message. Pure; exported for tests.
- */
 function summaryTail(text, max) {
     const t = text.trim().replace(/^Status:[^\n]*(?:\n|$)/, '').trim();
     if (t.length <= max)
@@ -7792,6 +6540,8 @@ function emptyManifest(jobId) {
     return {
         schema: SCHEMA_VERSION,
         jobId,
+        workerId: jobId,
+        turn: 1,
         provider: 'unknown',
         mode: 'unknown',
         model: null,
@@ -7805,6 +6555,7 @@ function emptyManifest(jobId) {
         createdAt: now,
         updatedAt: now,
         startedAt: null,
+        chainStartedAt: now,
         finishedAt: null,
         exitCode: null,
         jobStatus: null,
@@ -7817,31 +6568,19 @@ function emptyManifest(jobId) {
         attempt: null,
     };
 }
-/**
- * Subscribe to a handle's events and drive this writer from them.
- *
- * Returns an unsubscribe. Event listeners run synchronously in stream order, so
- * this does no async work — the only awaits are in `onEvent`, and there are none.
- */
 function pipeEvents(writer, handle) {
     return handle.onEvent((event) => {
         try {
             writer.onEvent(event);
         }
-        catch {
-            // A state write must never kill a worker that is otherwise fine. Losing
-            // one progress snapshot costs one stale poll tick; killing the job costs
-            // the user 28 minutes.
-        }
+        catch { }
     });
 }
-/** The report text a JobResult implies, under the headline rule. Exported for tests. */
 function reportFor(result) {
     if (typeof result.response === 'string' && !looksEmpty(result.response))
         return result.response;
     return '';
 }
-/** Ordered previews use the same bounded budget as the other detail fields. */
 function boundTimeline(input) {
     const events = [...input];
     let truncated = false;
@@ -7851,7 +6590,7 @@ function boundTimeline(input) {
         const removed = events.shift();
         if (removed.kind === 'assistant')
             chars -= removed.text.length;
-        else
+        else if (removed.kind === 'tool')
             tools--;
         truncated = true;
     }
@@ -8107,7 +6846,7 @@ function runCheck(check, options = {}) {
         // 'not-configured' is ABSENT, not broken: it must be visible in the report
         // but must not manufacture a failure no rerun could ever fix. The other two
         // reasons are real problems and do block.
-        blocking: blocking && reason !== 'not-configured',
+        blocking: blocking && (options.blockOnUnconfigured === true || reason !== 'not-configured'),
     });
     // Pre-flight: a missing working directory is the single most common config
     // error, and `spawn` would report it as a generic ENOENT on the *shell*.
@@ -8283,77 +7022,31 @@ async function runChecks(checks, options = {}) {
         verdicts: present,
         failing,
         durationMs: (options.now ?? Date.now)() - started,
-        incomplete: present.some((v) => v.skipped !== undefined),
+        incomplete: present.some((v) => v.skipped !== undefined && (options.blockOnUnconfigured === true ? v.blocking : true)),
     };
-}/**
- * forge/checks.ts — executable acceptance, shared by pipeline stages and spawn_job.
- *
- * Completion proves execution only. Acceptance is a separate fact, derived from
- * exit codes of checks run against the working tree (verify/runner.ts), never
- * from anything the worker wrote.
- *
- * Rules (`evaluateAcceptance`):
- *   - job did not succeed (failed/canceled)  -> 'rejected'  (checks are NOT run:
- *     a failed job's tree is not a candidate for acceptance)
- *   - no checks configured                    -> 'unchecked'
- *   - job succeeded, all blocking checks pass -> 'accepted'
- *   - job succeeded, a blocking check fails   -> 'rejected'
- *   Non-blocking checks (blocking: false) are reported but never gate.
- */
-const ACCEPTANCE_FILE = 'acceptance.json';
+}const ACCEPTANCE_FILE = 'acceptance.json';
 const DEFAULT_CHECK_TIMEOUT_MS = 60_000;
 const ACCEPTANCE_GRACE_MS = 30_000;
 const ACCEPTANCE_BUDGET_CAP_MS = 30 * 60_000;
-/** Upper bound on how long checks can run: their timeouts summed (they may overlap), plus a grace, capped. */
 function acceptanceBudgetMs(checks) {
     const total = checks.reduce((sum, c) => sum + (c.timeoutMs ?? DEFAULT_CHECK_TIMEOUT_MS), 0);
     return Math.min(ACCEPTANCE_BUDGET_CAP_MS, total + ACCEPTANCE_GRACE_MS);
 }
-/** The placeholder written at spawn: checks will run once the job ends. */
 function pendingAcceptance(checks) {
     return { state: 'unchecked', checks: [], pending: true, ...(checks?.length ? { budgetMs: acceptanceBudgetMs(checks) } : {}) };
 }
-/** Normalize a runner report into the persisted acceptance shape. */
-function acceptanceChecksFromReport(report, configuredChecks) {
-    return report.verdicts.map((v, index) => {
-        const configured = configuredChecks[index];
-        // runCheck deliberately treats an empty command as absent/non-blocking for
-        // generic callers. At an acceptance boundary, a declared required check
-        // that never ran must still fail closed.
-        const blocking = v.skipped === 'not-configured'
-            ? configured.blocking !== false
-            : v.blocking;
-        return {
-            name: v.check.name, ok: v.passed, exitCode: v.exitCode, durationMs: v.durationMs, blocking,
-            timedOut: v.timedOut, signal: v.signal,
-            ...(v.skipped === undefined ? {} : { skipped: v.skipped }),
-            ...(v.reason === undefined ? {} : { reason: v.reason }),
-            outputTail: `${v.stdoutTail}${v.stderrTail === '' ? '' : `\n${v.stderrTail}`}`.slice(-2e3),
-        };
-    });
-}
-/** Apply configured acceptance policy to the generic runner report. */
-function normalizeAcceptanceReport(report, configuredChecks) {
-    const verdicts = report.verdicts.map((verdict, index) => {
-        const configured = configuredChecks[index];
-        const blocking = verdict.skipped === 'not-configured'
-            ? configured.blocking !== false
-            : verdict.blocking;
-        return blocking === verdict.blocking ? verdict : { ...verdict, blocking };
-    });
-    const failing = verdicts.filter((verdict) => !verdict.passed && verdict.blocking);
-    return {
-        ...report,
-        verdicts,
-        failing,
-        passed: failing.length === 0,
-        incomplete: verdicts.some((verdict) => verdict.skipped !== undefined && verdict.blocking),
-    };
+function acceptanceChecksFromReport(report) {
+    return report.verdicts.map((v) => ({
+        name: v.check.name, ok: v.passed, exitCode: v.exitCode, durationMs: v.durationMs, blocking: v.blocking,
+        timedOut: v.timedOut, signal: v.signal,
+        ...(v.skipped === undefined ? {} : { skipped: v.skipped }),
+        ...(v.reason === undefined ? {} : { reason: v.reason }),
+        outputTail: `${v.stdoutTail}${v.stderrTail === '' ? '' : `\n${v.stderrTail}`}`.slice(-2e3),
+    }));
 }
 function acceptanceState(checks) {
     return checks.some((check) => check.blocking && !check.ok) ? 'rejected' : 'accepted';
 }
-/** StageCheck -> verify Check, resolving cwd against baseDir. */
 function toVerifyChecks(checks, baseDir) {
     return checks.map((check) => ({
         name: check.name,
@@ -8363,11 +7056,6 @@ function toVerifyChecks(checks, baseDir) {
         ...(check.blocking === undefined ? {} : { blocking: check.blocking }),
     }));
 }
-/**
- * Run the checks once and return both the persisted verdict and the raw report.
- * Pipeline stages need the report (its verdicts become stage evidence); every
- * other caller only wants the Acceptance, via `evaluateAcceptance`.
- */
 async function evaluateAcceptanceReport(input) {
     const stamp = () => (input.now ?? (() => new Date()))().toISOString();
     if (!input.checks?.length)
@@ -8376,8 +7064,9 @@ async function evaluateAcceptanceReport(input) {
         return { acceptance: { state: 'rejected', checks: [], at: stamp(), reason: 'job did not succeed; checks not run' }, report: null };
     }
     const running = new Set();
-    const rawReport = await runChecks(toVerifyChecks(input.checks, input.baseDir), {
+    const report = await runChecks(toVerifyChecks(input.checks, input.baseDir), {
         signal: input.signal,
+        blockOnUnconfigured: true,
         ...(input.onProgress === undefined ? {} : {
             onCheck: ({ check, state }) => {
                 if (state === 'start')
@@ -8388,8 +7077,7 @@ async function evaluateAcceptanceReport(input) {
             },
         }),
     });
-    const report = normalizeAcceptanceReport(rawReport, input.checks);
-    const checks = acceptanceChecksFromReport(report, input.checks);
+    const checks = acceptanceChecksFromReport(report);
     return { acceptance: { state: acceptanceState(checks), at: stamp(), checks }, report };
 }
 async function evaluateAcceptance(input) {
@@ -8398,23 +7086,12 @@ async function evaluateAcceptance(input) {
 function writeAcceptance(repo, jobId, acceptance) {
     writeJsonAtomic(path.join(jobDir(repo, jobId), ACCEPTANCE_FILE), acceptance);
 }
-/**
- * The placeholder written when a job is prepared, before it is terminal, so a
- * reader can tell "checks still to run" from "no checks attached". With the
- * checks it also records how long they may take (`budgetMs`).
- */
 function markAcceptancePending(repo, jobId, checks) {
     writeAcceptance(repo, jobId, pendingAcceptance(checks));
 }
-/** A steered job's earlier turns never get checks of their own; the final turn carries the verdict. */
 function markAcceptanceSuperseded(repo, jobId) {
     writeAcceptance(repo, jobId, { state: 'unchecked', checks: [], reason: 'superseded by steered turn' });
 }
-/**
- * evaluateAcceptance for a job on disk: keeps acceptance.json's pending placeholder
- * current with the checks running, then returns the verdict (the caller writes it).
- * An abort records `unchecked: checks canceled` instead of a verdict from killed checks.
- */
 async function runAcceptance(input) {
     const budgetMs = acceptanceBudgetMs(input.checks ?? []);
     const startedAt = new Date().toISOString();
@@ -8429,27 +7106,28 @@ async function runAcceptance(input) {
                     ...(running.length > 0 ? { running: running.join(', ') } : {}),
                 });
             }
-            catch { /* progress is advisory; the verdict write is not */ }
+            catch { }
         },
     });
     return input.signal?.aborted
         ? { state: 'unchecked', checks: [], at: acceptance.at ?? startedAt, reason: 'checks canceled' }
         : acceptance;
 }
-/**
- * Evaluate the finished job (progress and cancel as in `runAcceptance`), record
- * the verdict on its final turn, and mark every other prepared turn superseded.
- * Returns the verdict written.
- */
-async function settleAcceptance(input) {
-    const acceptance = await runAcceptance({ ...input, jobId: input.finalJobId });
-    writeAcceptance(input.repo, input.finalJobId, acceptance);
-    for (const id of input.preparedJobIds)
-        if (id !== input.finalJobId)
-            markAcceptanceSuperseded(input.repo, id);
-    return acceptance;
+function verdictBlock(acceptance) {
+    const a = acceptance;
+    if (a.pending === true)
+        return undefined;
+    const checks = a.checks ?? [];
+    if (checks.length === 0)
+        return a.reason === undefined ? undefined : `[ACCEPTANCE] ${a.state}: ${a.reason}`;
+    const lines = checks.map((c) => `${c.name}: ${c.ok ? 'pass' : 'FAIL'}${c.exitCode === null ? (c.timedOut ? ' (timed out)' : '') : ` (exit ${c.exitCode})`}`);
+    const tails = checks.filter((c) => !c.ok && c.outputTail.trim() !== '')
+        .map((c) => `--- ${c.name} output (tail) ---\n${c.outputTail.slice(-1e3)}`);
+    return [`[ACCEPTANCE] ${a.state}`, ...lines, ...tails].join('\n');
 }
-/** Sidecar contents, or {state:'unchecked'} when absent or unreadable. */
+function checksAbortRequested(repo, jobId) {
+    return existsSync(jobFile(repo, jobId, FILES.checksAbort));
+}
 function readAcceptance(repo, jobId) {
     try {
         const parsed = JSON.parse(readFileSync(path.join(jobDir(repo, jobId), ACCEPTANCE_FILE), 'utf8'));
@@ -8719,10 +7397,7 @@ function createForgeRunner(deps) {
             cwd: ctx.workDir,
             artifactPath: path.resolve(stageArtifactPath(artifactRoot, stage.name, stage.resultPath)),
             ...(continuesAttempt ? {} : { context: stage.context, checks: stage.checks }),
-            // 0 means "use the service default" (clampTimeout's DEFAULT_TIMEOUT_MS).
-            // A stage timeout is ALSO enforced by the DAG via ctx.signal, so this is a
-            // second, independent line of defence rather than the only one.
-            timeoutMs: stage.timeoutMs ?? 0,
+            ...(stage.timeoutMs === undefined ? {} : { timeoutMs: stage.timeoutMs }),
             unrestricted: deps.unrestricted,
             ...(stage.env === undefined ? {} : { env: stage.env }),
             pipeline: ctx.pipeline,
@@ -9140,4 +7815,484 @@ function startPipeline(service, spec, options = {}) {
         throw error;
     }).finally(() => clearInterval(poll));
     return { runId, recordPath, done, cancel: () => { cancelPipeline(service.repo, runId); } };
-}export{toolLabel as $,AgentSmithReader as A,deriveOrphan as B,deriveStatus as C,DEFAULT_TIMEOUT_MS as D,writeAtomic as E,FILES as F,summaryTail as G,failureFields as H,writeAcceptance as I,getProvider as J,nextActionFor as K,fileSig as L,MODES as M,jobsDir as N,JobWriter as O,PROVIDERS as P,newJobId$1 as Q,REASONS as R,STAGE_PROMPTS as S,humanDuration as T,pipeEvents as U,pipelineRecordPath as V,computeStaleReads as W,SMITH_PAYLOAD as X,isForgeStatus as Y,readJsonSafe as Z,checksReason as _,MODE_PRESETS as a,readPipeline as b,cancelPipeline as c,readAcceptance as d,jobFile as e,settleAcceptance as f,isMode as g,markAcceptanceSuperseded as h,inheritContinuedProviders as i,jobDir as j,isTerminalForgeStatus as k,readManifest as l,markAcceptancePending as m,normalize as n,errMessage as o,providerNames as p,findProvider as q,reasonFromText as r,startPipeline as s,SCHEMA_VERSION as t,validOwnerPid as u,validateSpec as v,writeJsonAtomic as w,ownerAlive as x,reportFor as y,cwdFacts as z};
+}/**
+ * safe-fs.ts — race-tolerant filesystem primitives shared by every reader.
+ *
+ * WHY THIS EXISTS
+ * ---------------
+ * Every reader in this directory observes state that another process is
+ * *actively mutating*: a worker rewrites its job files on every event. Claude Code appends to a
+ * subagent `.jsonl` while we read it. So between our `readdir` and our `read`,
+ * a path can vanish, be truncated mid-write, or be replaced by a directory.
+ *
+ * Throwing here is never correct: a missing file is *information*, not an
+ * error. Every function in this module returns
+ * `null` / `[]` / `false` instead of throwing. This is the single most
+ * important flake-prevention rule in the harness.
+ */
+/** Substrings of fs error codes that mean "the world moved on, carry on". */
+const TRANSIENT_CODES = new Set([
+    "ENOENT", // deleted between readdir and read (hazard A: clean-success cleanup)
+    "EACCES", // macOS TCC / permissions
+    "EPERM",
+    "EISDIR", // a path we expected to be a file is a dir
+    "ENOTDIR", // ...or vice versa
+    "EBUSY",
+    "ELOOP",
+    "EMFILE",
+    "ENFILE",
+]);
+/**
+ * Default byte cap for text reads.
+ *
+ * WHY: `events.jsonl` reached 492KB and a Claude subagent transcript 526KB in
+ * the sample corpus. We only ever want the *head* of a stream for display; a
+ * viewer that OOMs on a long job is worse than one that truncates. Callers
+ * that genuinely need everything pass a bigger number.
+ */
+const DEFAULT_MAX_BYTES = 2 * 1024 * 1024;
+function isTransient(err) {
+    if (typeof err !== "object" || err === null)
+        return true; // be paranoid
+    const code = err.code;
+    // A non-Error throw is by definition something we did not anticipate.
+    if (typeof code !== "string")
+        return true;
+    return TRANSIENT_CODES.has(code);
+}
+/** `fs.access(F_OK)` that returns a boolean instead of throwing. */
+async function existsSafe(path) {
+    try {
+        await access(path, constants$1.F_OK);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+/**
+ * Read a file as UTF-8 text, capped at `maxBytes`.
+ *
+ * Returns `null` if the file is gone, unreadable, or a directory. Never throws.
+ * A short read is *normal* here — it means we caught a half-written file, which
+ * is exactly what we want the JSON parser downstream to survive.
+ */
+async function readTextSafe(path, maxBytes = DEFAULT_MAX_BYTES) {
+    let handle;
+    try {
+        handle = await open(path, "r");
+        // +4 bytes so a multi-byte UTF-8 sequence straddling the cap does not
+        // become a replacement character at the boundary.
+        const buf = Buffer.allocUnsafe(maxBytes + 4);
+        const { bytesRead } = await handle.read(buf, 0, buf.length, 0);
+        if (bytesRead === 0)
+            return ""; // genuinely empty file is not "missing"
+        return buf.subarray(0, bytesRead).toString("utf8");
+    }
+    catch (err) {
+        if (!isTransient(err))
+            throw err;
+        return null;
+    }
+    finally {
+        await handle?.close().catch(() => { });
+    }
+}
+/**
+ * Read and JSON.parse, tolerating every way that can go wrong.
+ *
+ * Returns `null` for: missing file, unreadable file, empty file, invalid JSON.
+ * Invalid JSON is EXPECTED, not exceptional — a writer using a plain
+ * `writeFile` can be caught mid-write, so a reader that arrives mid-write sees a truncated document.
+ * Treating that as `null` and retrying on the next poll is the whole strategy.
+ */
+async function readJsonSafe(path, maxBytes) {
+    const text = await readTextSafe(path, maxBytes);
+    if (text === null)
+        return null;
+    const trimmed = text.trim();
+    if (trimmed === "")
+        return null; // empty or all-whitespace ⇒ mid-write
+    try {
+        return JSON.parse(trimmed);
+    }
+    catch {
+        return null; // half-written JSON. Next poll will get it.
+    }
+}
+/**
+ * `fs.readdir` that returns `[]` instead of throwing.
+ *
+ * NOTE: we do NOT `stat` each entry here. That would double the syscalls and
+ * reintroduce the very race we are defending against. Callers should treat
+ * every returned name as a *hypothesis* to be confirmed by a tolerant read.
+ */
+async function readdirSafe(path) {
+    try {
+        return await readdir(path);
+    }
+    catch (err) {
+        if (!isTransient(err))
+            throw err;
+        return [];
+    }
+}const SMITH_PAYLOAD = {
+    provider: 'provider',
+    mode: 'mode',
+    model: 'model',
+    effort: 'effort',
+    status: 'status',
+    task: 'task',
+    unrestricted: 'unrestricted',
+    conversation: 'conversation',
+    createdAt: 'created_at',
+    updatedAt: 'updated_at',
+    startedAt: 'started_at',
+    finishedAt: 'finished_at',
+    exitCode: 'exit_code',
+    jobStatus: 'job_status',
+    error: 'error',
+    deniedActions: 'denied_actions',
+    usage: 'usage',
+    toolCalls: 'tool_calls',
+    output: 'output',
+    canceled: 'canceled',
+    cancelAt: 'cancel_at',
+    lastEventAt: 'last_event_at',
+    lastAliveAt: 'last_alive_at',
+    recentActivities: 'recent_activities',
+    lastActivity: 'last_activity',
+    latestText: 'latest_text',
+    progressWarnings: 'progress_warnings',
+    pipeline: 'pipeline',
+    stage: 'stage',
+    attempt: 'attempt',
+    schema: 'schema',
+};
+const CANCELED_ORPHAN = { status: 'canceled', suspicious: false, reason: CANCEL_ORPHAN_REASON };
+class AgentSmithReader {
+    provider = 'agent-smith';
+    async discover(cwd) {
+        const entries = await readdirSafe(jobsDir(cwd));
+        const ids = new Set();
+        for (const entry of entries) {
+            if (!entry.startsWith('.'))
+                ids.add(entry);
+        }
+        return [...ids].sort();
+    }
+    async read(cwd, jobId) {
+        const cancelPath = jobFile(cwd, jobId, FILES.cancel);
+        const cancelRequested = await existsSafe(cancelPath);
+        let cancelAt = null;
+        if (cancelRequested) {
+            const raw = await readTextSafe(cancelPath);
+            const t = raw?.trim();
+            cancelAt = t !== undefined && t !== '' ? t : null;
+        }
+        const manifest = await readJsonSafe(jobFile(cwd, jobId, FILES.job));
+        const canceled = manifest === null ? cancelRequested : manifest.status === 'canceled';
+        if (manifest !== null && typeof manifest.schema === 'number' && manifest.schema > SCHEMA_VERSION) {
+            return {
+                provider: this.provider,
+                jobId,
+                cwd,
+                partial: true,
+                payload: {
+                    [SMITH_PAYLOAD.schema]: manifest.schema,
+                    [SMITH_PAYLOAD.error]: `on-disk schema v${manifest.schema} is newer than this reader (v${SCHEMA_VERSION}); state unknown`,
+                    [SMITH_PAYLOAD.canceled]: canceled,
+                    [SMITH_PAYLOAD.cancelAt]: cancelAt,
+                },
+            };
+        }
+        const report = await readTextSafe(jobFile(cwd, jobId, FILES.report));
+        const progress = await readJsonSafe(jobFile(cwd, jobId, FILES.progress));
+        const anyEvidence = manifest !== null || canceled || report !== null;
+        if (!anyEvidence)
+            return null;
+        let orphan = null;
+        if (manifest !== null && manifest.status === 'running' && !canceled
+            && !(await existsSafe(jobFile(cwd, jobId, FILES.result)))) {
+            const lastSeen = Math.max(Date.parse(manifest.updatedAt), Date.parse(progress?.lastEventAt ?? ''));
+            orphan = deriveOrphan(manifest, Number.isFinite(lastSeen) ? lastSeen : null, Date.now(), undefined, cancelRequested);
+            const cancelAgeMs = cancelAt === null ? NaN : Date.now() - Date.parse(cancelAt);
+            const ownerIsAlive = ownerAlive(manifest);
+            if (orphan === null && cancelRequested && cancelAgeMs > 60_000 && !ownerIsAlive)
+                orphan = CANCELED_ORPHAN;
+        }
+        const legacySteeredFrom = manifest?.steeredFrom;
+        const turn = typeof manifest?.turn === 'number' && Number.isInteger(manifest.turn) && manifest.turn >= 1 ? manifest.turn : 1;
+        const continuedFrom = typeof manifest?.continuedFrom === 'string' && manifest.continuedFrom !== ''
+            ? manifest.continuedFrom
+            : typeof legacySteeredFrom === 'string' && legacySteeredFrom !== ''
+                ? legacySteeredFrom
+                : undefined;
+        const continuationKind = normalizeContinuationKind(manifest?.continuationKind) ?? (continuedFrom !== undefined ? 'follow-up' : undefined);
+        const chainStartedAt = typeof manifest?.chainStartedAt === 'string' && manifest.chainStartedAt !== ''
+            ? manifest.chainStartedAt
+            : (manifest?.startedAt ?? manifest?.createdAt ?? undefined);
+        const payload = {
+            [SMITH_PAYLOAD.schema]: manifest?.schema ?? null,
+            [SMITH_PAYLOAD.provider]: manifest?.provider ?? null,
+            name: manifest?.name ?? null,
+            workerId: manifest?.workerId ?? jobId,
+            turn,
+            role: manifest?.role ?? manifest?.mode ?? null,
+            latestSummary: progress?.latestSummary ?? manifest?.latestSummary ?? null,
+            summarySource: progress?.summarySource ?? manifest?.summarySource ?? null,
+            [SMITH_PAYLOAD.mode]: manifest?.mode ?? null,
+            [SMITH_PAYLOAD.model]: manifest?.model ?? null,
+            [SMITH_PAYLOAD.effort]: manifest?.effort ?? null,
+            [SMITH_PAYLOAD.status]: orphan?.status ?? manifest?.status ?? null,
+            [SMITH_PAYLOAD.task]: manifest?.task ?? null,
+            [SMITH_PAYLOAD.unrestricted]: manifest?.unrestricted ?? null,
+            [SMITH_PAYLOAD.conversation]: manifest?.conversation ?? null,
+            [SMITH_PAYLOAD.createdAt]: manifest?.createdAt ?? null,
+            [SMITH_PAYLOAD.updatedAt]: manifest?.updatedAt ?? null,
+            [SMITH_PAYLOAD.startedAt]: manifest?.startedAt ?? null,
+            [SMITH_PAYLOAD.finishedAt]: manifest?.finishedAt ?? null,
+            [SMITH_PAYLOAD.exitCode]: manifest?.exitCode ?? null,
+            [SMITH_PAYLOAD.jobStatus]: manifest?.jobStatus ?? null,
+            [SMITH_PAYLOAD.error]: orphan?.reason ?? manifest?.error ?? null,
+            [SMITH_PAYLOAD.deniedActions]: normalizeDenials(manifest?.deniedActions),
+            [SMITH_PAYLOAD.usage]: manifest?.usage ?? null,
+            ...(Array.isArray(manifest?.changedFiles) && manifest.changedFilesTruncated !== true
+                ? { changed_files: manifest.changedFiles } : {}),
+            [SMITH_PAYLOAD.toolCalls]: progress?.toolCalls ?? manifest?.toolCalls ?? null,
+            [SMITH_PAYLOAD.pipeline]: manifest?.pipeline ?? null,
+            [SMITH_PAYLOAD.stage]: manifest?.stage ?? null,
+            [SMITH_PAYLOAD.attempt]: manifest?.attempt ?? null,
+            [SMITH_PAYLOAD.output]: report,
+            [SMITH_PAYLOAD.canceled]: canceled,
+            [SMITH_PAYLOAD.cancelAt]: cancelAt,
+            [SMITH_PAYLOAD.lastEventAt]: progress?.lastEventAt ?? manifest?.updatedAt ?? null,
+            [SMITH_PAYLOAD.lastAliveAt]: progress?.lastAliveAt ?? null,
+            ...(typeof progress?.workerPid === 'number' ? { workerPid: progress.workerPid } : {}),
+            ...(typeof (manifest?.toolErrors ?? progress?.toolErrors) === 'number'
+                ? { toolErrors: manifest?.toolErrors ?? progress?.toolErrors } : {}),
+            ...(manifest?.failedEarly === true ? { failedEarly: true } : {}),
+            ...(manifest?.changedFilesUnknown === true ? { changedFilesUnknown: true } : {}),
+            ...(manifest?.cwdMissingAtFinish === true ? { cwdMissingAtFinish: true } : {}),
+            [SMITH_PAYLOAD.recentActivities]: progress?.recentActivities ?? [],
+            [SMITH_PAYLOAD.lastActivity]: progress?.lastActivity ?? null,
+            [SMITH_PAYLOAD.latestText]: progress?.latestText ?? null,
+            [SMITH_PAYLOAD.progressWarnings]: progress?.warnings ?? [],
+            ...(progress?.digest !== undefined ? { digest: progress.digest } : {}),
+            ...(manifest?.supersededBy !== undefined ? { supersededBy: manifest.supersededBy } : {}),
+            ...(typeof manifest?.followedBy === 'string' && manifest.followedBy !== '' ? { followedBy: manifest.followedBy } : {}),
+            ...(continuedFrom !== undefined ? { continuedFrom } : {}),
+            ...(continuationKind !== undefined ? { continuationKind } : {}),
+            ...(chainStartedAt !== undefined ? { chainStartedAt } : {}),
+            ...(typeof (progress?.pendingSteers ?? manifest?.pendingSteers) === 'number'
+                ? { pendingSteers: progress?.pendingSteers ?? manifest?.pendingSteers }
+                : {}),
+            ...(Array.isArray(manifest?.staleReads) && manifest.staleReads.length > 0
+                ? { staleReads: manifest.staleReads }
+                : {}),
+        };
+        return {
+            provider: this.provider,
+            jobId,
+            cwd: manifest?.cwd ?? cwd,
+            payload,
+            partial: manifest === null,
+        };
+    }
+}/**
+ * normalize.ts — provider-agnostic normalization to ObservedJob.
+ *
+ * Every provider quirk and every judgement call lives HERE and only here, so
+ * this file is the single place a reviewer reads to answer "why did that job
+ * show up as failed?". Readers (agent-smith.ts) are dumb parsers; they
+ * extract facts and get out of the way.
+ *
+ * The headline rule, an empty response is not a clean success, is applied
+ * once, when the job is written (forge/format.ts `deriveStatus`), and not
+ * re-derived here.
+ */
+// ── helpers ────────────────────────────────────────────────────────────────
+function asString(v) {
+    return typeof v === "string" && v.length > 0 ? v : null;
+}
+function asNumber(v) {
+    return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+function asBool(v) {
+    return typeof v === "boolean" ? v : null;
+}
+function asStringArray(v) {
+    if (!Array.isArray(v))
+        return [];
+    return v.filter((x) => typeof x === "string");
+}
+// ── agent-smith normalizer ──────────────────────────────────────────────────
+/**
+ * Map an agent-smith payload onto ObservedJob.
+ *
+ * It is short because we own the format (see forge/format.ts). Three rows, in order:
+ *
+ *   1. cancel marker exists                    ⇒ canceled   (outranks job.json:
+ *      the marker is written the instant cancel is requested, and the worker may
+ *      never get to write its own terminal state)
+ *   2. job.json.status is a terminal state      ⇒ that state, VERBATIM
+ *   3. otherwise                               ⇒ running, or unknown if the
+ *      anchor was unreadable
+ *
+ * ROW 2 HAS NO JUDGEMENT IN IT, and that is deliberate. The suspicious-success
+ * downgrade — the headline rule of this whole codebase — is applied ONCE, at the
+ * moment of writing, by `forge/format.ts`'s `deriveStatus`. It is not applied
+ * again here. A normalizer that re-derived the verdict from the output would be a
+ * second, subtly different implementation of the same rule, and the day the two
+ * disagree the mod would draw one state while the channel announced another.
+ *
+ * The reader's job is to report what is on disk. The writer's job is to decide
+ * what it means. One decision, one place.
+ */
+const smithNormalizer = (raw) => {
+    const p = raw.payload;
+    const warnings = [];
+    const canceled = asBool(p[SMITH_PAYLOAD.canceled]) === true;
+    const status = asString(p[SMITH_PAYLOAD.status]);
+    const output = asString(p[SMITH_PAYLOAD.output]);
+    const denied = p[SMITH_PAYLOAD.deniedActions];
+    const deniedCount = Array.isArray(denied) ? denied.length : 0;
+    const errorText = asString(p[SMITH_PAYLOAD.error]);
+    const progressWarnings = asStringArray(p[SMITH_PAYLOAD.progressWarnings]);
+    // A newer on-disk schema is not a job we understand. `unknown` is the honest
+    // answer and it must survive to the surface: `unknown` is
+    // load-bearing and must never be collapsed.
+    const schema = asNumber(p[SMITH_PAYLOAD.schema]);
+    if (deniedCount > 0) {
+        const failedWithoutOutput = status === "failed" && (output === null || output.trim() === '');
+        warnings.push({
+            code: failedWithoutOutput ? "suspicious_success" : "tool_error",
+            message: `${deniedCount} ${deniedCount === 1 ? 'call' : 'calls'} denied`,
+        });
+    }
+    // The forge's error for a denial restates it ("denied view_file · …"); any other error still shows.
+    if (errorText !== null && !(deniedCount > 0 && /^denied\b/.test(errorText))) {
+        warnings.push({ code: "tool_error", message: errorText });
+    }
+    for (const w of progressWarnings) {
+        warnings.push({ code: STEER_NOT_APPLIED_RE.test(w) ? "steer_not_applied" : "tool_error", message: w });
+    }
+    let resolved;
+    if (canceled) {
+        resolved = "canceled";
+        warnings.push({ code: "canceled", message: "canceled" });
+    }
+    else if (schema !== null && schema > SCHEMA_VERSION) {
+        // A newer writer's file. `unknown`, and NOT `running`: "we cannot read this"
+        // is a different claim from "it is working", and drawing one as the other is
+        // the specific failure `unknown` exists to prevent.
+        resolved = "unknown";
+        warnings.push({
+            code: "incomplete_state",
+            message: `schema v${schema} is newer than this reader (v${SCHEMA_VERSION})`,
+        });
+    }
+    else if (status === "succeeded") {
+        resolved = "succeeded";
+        if (output === null || output.trim() === '') {
+            // Defensive only. deriveStatus cannot produce `succeeded` with an empty
+            // report, so reaching here means job.json was written by something other
+            // than forge/writer.ts. Believe the file, flag the contradiction, and do
+            // not silently upgrade a job with no output to a success.
+            warnings.push({
+                code: "empty_output",
+                message: "done, but no output on disk",
+            });
+        }
+    }
+    else if (status === "failed") {
+        resolved = "failed";
+    }
+    else if (status === "canceled") {
+        resolved = "canceled";
+    }
+    else if (status === "running") {
+        resolved = "running";
+    }
+    else if (raw.partial === true) {
+        // The anchor is missing. NOT `running`: "we cannot tell" and "it is working"
+        // are different claims and a band that draws one as the other is lying.
+        resolved = "unknown";
+        warnings.push({
+            code: "incomplete_state",
+            message: "job.json missing or unreadable",
+        });
+    }
+    else {
+        resolved = "unknown";
+        warnings.push({
+            code: "incomplete_state",
+            message: "no status in job.json",
+        });
+    }
+    return buildSmith(raw, resolved, warnings);
+};
+/** Assemble the ObservedJob for the agent-smith normalizer. */
+function buildSmith(raw, status, warnings) {
+    const p = raw.payload;
+    const usage = asUsage(p[SMITH_PAYLOAD.usage]);
+    const toolCalls = asNumber(p[SMITH_PAYLOAD.toolCalls]);
+    const usageFull = usage === null
+        ? toolCalls === null || toolCalls === 0
+            ? null
+            : { turns: toolCalls }
+        : toolCalls === null
+            ? usage
+            : { ...usage, turns: toolCalls };
+    return {
+        provider: "agent-smith",
+        jobId: raw.jobId,
+        status,
+        warnings,
+        output: asString(p[SMITH_PAYLOAD.output]),
+        startedAt: asString(p[SMITH_PAYLOAD.startedAt]) ?? asString(p[SMITH_PAYLOAD.createdAt]),
+        updatedAt: asString(p[SMITH_PAYLOAD.updatedAt]) ?? asString(p[SMITH_PAYLOAD.lastEventAt]),
+        finishedAt: asString(p[SMITH_PAYLOAD.finishedAt]),
+        mode: asString(p[SMITH_PAYLOAD.mode]),
+        model: asString(p[SMITH_PAYLOAD.model]),
+        // `label` is the pane's provider/permission word. Ours is honest about the
+        // one field an operator must never have to guess: did this run with the
+        // tool-approval prompt bypassed.
+        label: asBool(p[SMITH_PAYLOAD.unrestricted]) === true
+            ? "unrestricted"
+            : asString(p[SMITH_PAYLOAD.provider]),
+        outputTruncated: false,
+        usage: usageFull,
+        partial: raw.partial === true,
+        raw: p,
+    };
+}
+/**
+ * Coerce a usage bag into the nullable ObservedUsage shape.
+ *
+ * Absent is absent. A provider that reports no token counts gets `null`, not a
+ * bag of zeroes, because a confident `0` drawn on the pane is a measurement
+ * nobody took.
+ */
+function asUsage(v) {
+    if (v === null || typeof v !== "object")
+        return null;
+    const src = v;
+    const out = {};
+    const map = [
+        ["inputTokens", "inputTokens"],
+        ["outputTokens", "outputTokens"],
+        ["thinkingTokens", "thinkingTokens"],
+        ["cacheReadTokens", "cacheTokens"],
+    ];
+    for (const [from, to] of map) {
+        const n = asNumber(src[from]);
+        if (n !== null)
+            out[to] = n;
+    }
+    return Object.keys(out).length > 0 ? out : null;
+}
+/** Normalize a raw agent-smith job snapshot. */
+function normalize(raw) {
+    return smithNormalizer(raw);
+}export{verdictBlock as $,AgentSmithReader as A,normalizeDenials as B,deriveOrphan as C,DEFAULT_TIMEOUT_MS as D,deriveStatus as E,FILES as F,summaryTail as G,failureFields as H,writeAcceptance as I,createMarker as J,jobsDir as K,parseWorkerIndex as L,MODES as M,getProvider as N,normalizeContinuationKind as O,PROVIDERS as P,nextActionFor as Q,REASONS as R,STAGE_PROMPTS as S,fileSig as T,JobWriter as U,newJobId$1 as V,WORKERS_DIR as W,markAcceptancePending as X,humanDuration as Y,pipeEvents as Z,checksAbortRequested as _,MODE_PRESETS as a,runAcceptance as a0,senderOf as a1,markAcceptanceSuperseded as a2,pipelineRecordPath as a3,pickHead as a4,compareTurnPriority as a5,computeStaleReads as a6,SMITH_PAYLOAD as a7,isForgeStatus as a8,readJsonSafe as a9,workerIndexPath as aa,checksReason as ab,toolLabel as ac,inheritContinuedProviders as b,readPipeline as c,jobFile as d,readAcceptance as e,isWorkerIdle as f,isMode as g,cancelPipeline as h,isTerminalStatus as i,jobDir as j,isTerminalForgeStatus as k,readManifest as l,errMessage as m,findProvider as n,ownerAlive as o,providerNames as p,normalize as q,reasonFromText as r,startPipeline as s,writeAtomic as t,SCHEMA_VERSION as u,validateSpec as v,writeJsonAtomic as w,validOwnerPid as x,reportFor as y,cwdFacts as z};

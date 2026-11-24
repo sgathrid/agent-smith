@@ -1,27 +1,21 @@
-/**
- * summary.ts — the read-side shapes (a list row, one job in full) and the pure
- * projection from an ObservedJob onto them.
- */
-
 import type { ObservedJob } from '../harness/types.ts';
 import type { ProgressDigest } from '../surfaces/mod/hooks/progress.ts';
-import { nextActionFor, type ForgeActivity, type ForgeStatus, type WatchedFileSigs } from './format.ts';
+import { normalizeContinuationKind, nextActionFor, type ContinuationKind, type ForgeActivity, type ForgeStatus, type WatchedFileSigs } from './format.ts';
 import type { Acceptance } from './checks.ts';
 
 export interface ListFilter {
-  /** Only jobs in this state. */
   readonly status?: ForgeStatus | undefined;
   readonly limit?: number | undefined;
-  /** Only jobs last touched (finished, updated or started) at or after this epoch ms. */
   readonly sinceMs?: number | undefined;
-  /** Only these job IDs (e.g. the ones this process spawned). */
   readonly ids?: ReadonlySet<string> | undefined;
+  readonly groupByWorker?: boolean | undefined;
 }
 
 export interface JobSummary {
   readonly jobId: string;
   readonly name: string;
   readonly workerId: string;
+  readonly turn: number;
   readonly role: string | null;
   readonly latestSummary: string | null;
   readonly summarySource: 'worker' | null;
@@ -37,40 +31,28 @@ export interface JobSummary {
   readonly updatedAt: string | null;
   readonly finishedAt: string | null;
   readonly warnings: readonly { code: string; message: string }[];
-  /** Derived (never stored) imperative for the orchestrator on failed/canceled jobs; null otherwise. */
   readonly nextAction: string | null;
-  /** True when the job ran with the approval prompt bypassed. */
   readonly unrestricted?: boolean;
-  /** Set when this job turn was superseded by a steered continuation turn. */
   readonly supersededBy?: string | null;
-  /** Set when this job turn was spawned by steering an earlier turn. */
-  readonly steeredFrom?: string | null;
-  /** Count of unconsumed queued steers waiting for the current turn to finish. */
+  readonly followedBy?: string;
+  readonly continuedFrom?: string;
+  readonly continuationKind?: ContinuationKind;
+  readonly chainStartedAt?: string;
   readonly pendingSteers?: number;
-  /** Files changed since the spawn baseline, once the job has finished. */
   readonly changedFileCount?: number | null;
-  /** What the worker has done so far, read from progress.json (pure projection of the file). */
   readonly digest?: ProgressDigest | null;
-  /** Acceptance results attached to the job, when checks have been configured or have run. */
   readonly acceptance?: Acceptance | null;
-  /** Tool calls that ended in an error state; evidence, not a verdict. Absent when none. */
   readonly toolErrors?: number;
-  /** Failed before any tool call (route, model or account). Absent otherwise. */
   readonly failedEarly?: boolean;
-  /** changedFiles could not be computed at finish; absent changedFiles then means unknown, not none. */
   readonly changedFilesUnknown?: boolean;
-  /** The cwd no longer existed at finish. */
   readonly cwdMissingAtFinish?: boolean;
-  /** Last provider event (progress.json lastEventAt). */
   readonly lastEventAt?: string | null;
-  /** Last heartbeat from the worker's process owner; null for jobs from older builds. */
   readonly lastAliveAt?: string | null;
 }
 
 export interface JobDetail extends JobSummary {
   readonly report: string | null;
   readonly error: string | null;
-  /** Why it failed, in two to four words; null unless failed. */
   readonly reason?: string | null;
   readonly exitCode: number | null;
   readonly unrestricted: boolean;
@@ -88,23 +70,15 @@ export interface JobDetail extends JobSummary {
   readonly sandboxFlags?: readonly string[];
   readonly readOnlyRequested?: boolean;
   readonly readOnlyEnforced?: boolean;
-  /** False when a cancel was requested but this process holds no live handle. */
   readonly cancellable: boolean;
-  /** Git reference at spawn (only when cwd was a git repo). */
   readonly gitBaseline?: { readonly head: string | null; readonly dirty: readonly string[] };
-  /**
-   * Paths changed since the baseline (set at finish). A worktree diff, so
-   * concurrent jobs in one worktree can attribute each other's edits.
-   */
   readonly changedFiles?: readonly string[];
   readonly changedFilesTruncated?: boolean;
   readonly unattributedFiles?: readonly string[];
   readonly watchedFiles?: Readonly<Record<string, WatchedFileSigs>>;
-  /** Watched brief files whose repository or external cwd copy changed after the turn started. */
   readonly staleReads?: readonly string[];
 }
 
-/** Project an ObservedJob onto what a list actually needs. */
 export function toSummary(observed: ObservedJob): JobSummary {
   const raw = observed.raw;
   const toolCalls = typeof raw['tool_calls'] === 'number' ? raw['tool_calls'] : null;
@@ -115,10 +89,18 @@ export function toSummary(observed: ObservedJob): JobSummary {
   const currentActivity = observed.status === 'running'
     ? [...activities].reverse().find(isActiveForgeActivity) ?? null
     : null;
+  const turn = typeof raw['turn'] === 'number' && Number.isInteger(raw['turn']) && raw['turn'] >= 1 ? raw['turn'] : 1;
+  const continuedFrom = typeof raw['continuedFrom'] === 'string' && raw['continuedFrom'] !== '' ? raw['continuedFrom'] : undefined;
+  const continuationKind = normalizeContinuationKind(raw['continuationKind']) ?? (continuedFrom !== undefined ? 'follow-up' : undefined);
+  const chainStartedAt =
+    typeof raw['chainStartedAt'] === 'string' && raw['chainStartedAt'] !== ''
+      ? raw['chainStartedAt']
+      : (observed.startedAt ?? undefined);
   return {
     jobId: observed.jobId,
     name: typeof raw['name'] === 'string' && raw['name'] ? raw['name'] : observed.jobId,
-    workerId: typeof raw['workerId'] === 'string' ? raw['workerId'] : observed.jobId,
+    workerId: typeof raw['workerId'] === 'string' && raw['workerId'] !== '' ? raw['workerId'] : observed.jobId,
+    turn,
     role: typeof raw['role'] === 'string' ? raw['role'] : observed.mode,
     latestSummary: raw['summarySource'] === 'worker' && typeof raw['latestSummary'] === 'string' ? raw['latestSummary'] : null,
     summarySource: raw['summarySource'] === 'worker' ? 'worker' : null,
@@ -150,9 +132,10 @@ export function toSummary(observed: ObservedJob): JobSummary {
     ...(typeof raw['supersededBy'] === 'string' || raw['supersededBy'] === null
       ? { supersededBy: raw['supersededBy'] as string | null }
       : {}),
-    ...(typeof raw['steeredFrom'] === 'string' || raw['steeredFrom'] === null
-      ? { steeredFrom: raw['steeredFrom'] as string | null }
-      : {}),
+    ...(typeof raw['followedBy'] === 'string' && raw['followedBy'] !== '' ? { followedBy: raw['followedBy'] } : {}),
+    ...(continuedFrom !== undefined ? { continuedFrom } : {}),
+    ...(continuationKind !== undefined ? { continuationKind } : {}),
+    ...(chainStartedAt !== undefined ? { chainStartedAt } : {}),
     ...(typeof raw['pendingSteers'] === 'number'
       ? { pendingSteers: raw['pendingSteers'] }
       : {}),
@@ -167,7 +150,6 @@ export function toSummary(observed: ObservedJob): JobSummary {
   };
 }
 
-/** progress.json `digest`, accepted only when it has the shape the writer produces. */
 function readDigest(v: unknown): ProgressDigest | null {
   if (v === null || typeof v !== 'object' || Array.isArray(v)) return null;
   const d = v as Record<string, unknown>;

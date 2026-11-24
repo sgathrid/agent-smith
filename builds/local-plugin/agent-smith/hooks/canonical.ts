@@ -1,24 +1,27 @@
-/** Canonical Forge projection shared by the band, pane and native task bridge.
- * Lists never read reports or event logs. Detail reads one bounded writer view.
- * Kept inside the plugin because the mod loader forbids imports from forge/.
- */
-import type { RadarJob, RadarStatus, ToolEntry, RadarAcceptance, ActivityEvent } from '../types/index.d.ts';
+import type { ActivityEvent, ContinuationKind, ProgressDigest, RadarAcceptance, RadarJob, RadarStatus } from '../types/index.d.ts';
 import { toEpoch, type FsLike } from './fs.ts';
-import type { ProgressDigest } from '../types/index.d.ts';
 import { classify, progressPhrase } from './progress.ts';
-import { isStalled, livenessOf } from './stale.ts';
+import { livenessOf } from './stale.ts';
 import { firstText, record } from './guards.ts';
-import { isLiveStatus } from './format.ts';
-import { REASONS, STEER_NOT_APPLIED_RE, reasonFromText } from './reasons.ts';
+import { isLiveStatus, isTerminal } from './format.ts';
+import { REASONS, STEER_NOT_APPLIED_RE } from './reasons.ts';
+import { normalizeContinuationKind } from './turns.ts';
 
 type RecordValue = Record<string, unknown>;
 const STATUSES = new Set(['running', 'attention', 'succeeded', 'failed', 'canceled']);
+
 function number(v: unknown): number | null {
   return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null;
 }
+function positiveInt(v: unknown): number | null {
+  return typeof v === 'number' && Number.isFinite(v) && v >= 1 ? Math.floor(v) : null;
+}
+function normalizeRepo(repo: string): string {
+  return repo.replace(/\/+$/, '');
+}
 function forgeJobDir(repo: string, id: string): string {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/.test(id) || id === '.' || id === '..') throw new Error('Invalid job id');
-  return `${repo.replace(/\/+$/, '')}/.agent-smith/jobs/${id}`;
+  return `${normalizeRepo(repo)}/.agent-smith/jobs/${id}`;
 }
 async function json(fs: FsLike, path: string): Promise<RecordValue | null> {
   if (!await fs.exists(path)) return null;
@@ -47,6 +50,10 @@ export function acceptanceLabel(value?: RadarAcceptance): string {
   return value?.pending ? 'checking' : value?.state ?? 'unchecked';
 }
 
+export function isSettledForCache(job: RadarJob): boolean {
+  return isTerminal(job.status) && job.acceptance?.pending !== true && !((job.pendingMessages ?? 0) > 0);
+}
+
 async function readForgeJob(fs: FsLike, repo: string, id: string, now: number): Promise<RadarJob | null> {
   const dir = forgeJobDir(repo, id);
   const m = await json(fs, `${dir}/job.json`);
@@ -61,20 +68,15 @@ async function readForgeJob(fs: FsLike, repo: string, id: string, now: number): 
   const warnings = (Array.isArray(p?.warnings) ? p.warnings : []).filter((w): w is string => typeof w === 'string')
     .map(message => ({ code: STEER_NOT_APPLIED_RE.test(message) ? 'steer_not_applied' : 'tool_error', message }));
   if (live && await fs.exists(`${dir}/orphaned`) && !await fs.exists(`${dir}/result.json`)) {
-    // The marker proves the supervisor is gone, so a cancel request it never
-    // confirmed is a cancellation, not a failure (mirrors forge deriveOrphan).
     const canceled = await fs.exists(`${dir}/cancel`);
     status = canceled ? 'canceled' : 'failed';
-    // The supervisor is gone; its spawn-time placeholder cannot settle itself.
     a = { ...a, pending: false };
     if (!canceled) warnings.unshift({ code: 'orphaned', message: REASONS.serverStopped });
   }
-  // One liveness rule for band, pane, notices and the channel (stale.ts):
-  // attention is silent or dead; a long open tool call stays running.
   const liveness = live && status !== 'failed' && status !== 'canceled'
     ? livenessOf({ status: 'running', lastEventAt: lastSeen, lastAliveAt: firstText(p?.lastAliveAt), lastActivity: record(p?.lastActivity), now })
     : null;
-  if (liveness !== null) status = isStalled(liveness) ? 'attention' : 'running';
+  if (liveness !== null) status = (liveness.state === 'silent' || liveness.state === 'dead') ? 'attention' : 'running';
   if (typeof m.error === 'string' && m.error !== '') warnings.unshift({ code: 'tool_error', message: m.error });
   const activities = Array.isArray(p?.recentActivities) ? p.recentActivities.map(record).filter(v => v !== null) : [];
   const recent = activities.reduce<RecordValue | null>((last, row) =>
@@ -86,12 +88,21 @@ async function readForgeJob(fs: FsLike, repo: string, id: string, now: number): 
   const progress = digest(p?.digest);
   const now0 = latest ? classify(firstText(latest.tool) ?? '', firstText(latest.input)).label : '';
   const staleReads = (Array.isArray(m.staleReads) ? m.staleReads : []).filter((f): f is string => typeof f === 'string' && f.trim() !== '');
+  const startedAt = toEpoch(firstText(m.startedAt, m.createdAt));
+  const chainStartedAt = toEpoch(firstText(m.chainStartedAt)) ?? startedAt;
+  const legacySteeredFrom = firstText(m['steeredFrom']);
+  const continuedFrom = firstText(m.continuedFrom) ?? legacySteeredFrom;
+  const continuationKind: ContinuationKind | null = normalizeContinuationKind(m.continuationKind) ?? (continuedFrom !== null ? 'follow-up' : null);
+  const rawPendingSteers = number(p?.pendingSteers) ?? number(m.pendingSteers);
+  const pendingSteers = isLiveStatus(status) && rawPendingSteers !== null && rawPendingSteers > 0 ? rawPendingSteers : null;
+  const pendingMessages = rawPendingSteers !== null && rawPendingSteers > 0 ? rawPendingSteers : null;
   return {
     id, name: firstText(m.name, resolved?.name, p?.name), workerId: firstText(m.workerId, resolved?.workerId, p?.workerId) ?? id,
+    turn: positiveInt(m.turn) ?? 1,
     role: firstText(m.role, resolved?.role, p?.role, resolved?.mode, m.mode),
     provider: firstText(m.provider), model: firstText(m.modelResolved, m.model),
     lastEventAt: lastSeen, ...(liveness !== null ? { liveness } : {}), pipeline: firstText(m.pipeline), stage: firstText(m.stage), attempt: number(m.attempt),
-    status, startedAt: toEpoch(firstText(m.startedAt, m.createdAt)), endedAt: toEpoch(firstText(m.finishedAt)) ?? (status === 'failed' && live ? lastSeen : null),
+    status, startedAt, chainStartedAt, endedAt: toEpoch(firstText(m.finishedAt)) ?? (status === 'failed' && live ? lastSeen : null),
     toolCount: number(p?.toolCalls) ?? number(m.toolCalls),
     activity: progress && isLiveStatus(status) ? progressPhrase(progress, now0) : now0,
     progress,
@@ -100,13 +111,12 @@ async function readForgeJob(fs: FsLike, repo: string, id: string, now: number): 
     changedFileCount: Array.isArray(m.changedFiles) && m.changedFilesTruncated !== true ? m.changedFiles.length : null,
     acceptance: a, failureReason: firstText(m.reason, m.failureReason, m.error, status === 'failed' ? warnings[0]?.message : null),
     failureDetail: firstText(m.error),
-    supersededBy: firstText(m.supersededBy), steeredFrom: firstText(m.steeredFrom),
-    pendingSteers: number(p?.pendingSteers) ?? number(m.pendingSteers),
+    supersededBy: firstText(m.supersededBy), followedBy: firstText(m.followedBy), continuedFrom, continuationKind,
+    pendingSteers, pendingMessages,
     ...(staleReads.length > 0 ? { staleReads } : {}),
     warnings, report: null, reasoning: firstText(p?.latestText), raw: {},
   };
 }
-/** progress.json `digest`, accepted only when it has the shape the writer produces. */
 function digest(v: unknown): ProgressDigest | null {
   const d = record(v);
   if (d === null || typeof d.phase !== 'string' || !Array.isArray(d.edited)) return null;
@@ -121,20 +131,68 @@ function digest(v: unknown): ProgressDigest | null {
   };
 }
 
-export async function readForgeJobs(fs: FsLike, repo: string, now: number): Promise<RadarJob[]> {
-  const dir = `${repo.replace(/\/+$/, '')}/.agent-smith/jobs`;
-  if (!await fs.exists(dir)) return [];
+export async function readForgeJobs(
+  fs: FsLike,
+  repo: string,
+  now: number,
+  cache?: Map<string, RadarJob>,
+): Promise<RadarJob[]> {
+  const normRepo = normalizeRepo(repo);
+  const prefix = `${normRepo}\0`;
+  const dir = `${normRepo}/.agent-smith/jobs`;
+  if (!await fs.exists(dir)) {
+    if (cache) {
+      for (const key of cache.keys()) {
+        if (key.startsWith(prefix)) cache.delete(key);
+      }
+    }
+    return [];
+  }
   const jobs: RadarJob[] = [];
+  const seenKeys = new Set<string>();
+  const freshlyRead: RadarJob[] = [];
   for (const entry of await fs.list(dir)) {
     if (entry.kind !== 'dir' || entry.name.startsWith('.')) continue;
+    const key = `${prefix}${entry.name}`;
+    seenKeys.add(key);
+    const cached = cache?.get(key);
+    if (cached !== undefined) {
+      jobs.push(cached);
+      continue;
+    }
     const job = await readForgeJob(fs, repo, entry.name, now);
-    if (job) jobs.push(job);
+    if (job) {
+      jobs.push(job);
+      freshlyRead.push(job);
+      if (cache && isSettledForCache(job)) cache.set(key, job);
+    }
+  }
+  if (cache) {
+    for (const key of cache.keys()) {
+      if (key.startsWith(prefix) && !seenKeys.has(key)) cache.delete(key);
+    }
+    for (const child of freshlyRead) {
+      if (!child.continuedFrom || child.continuationKind === null || child.continuationKind === undefined) continue;
+      const parentKey = `${prefix}${child.continuedFrom}`;
+      const cachedParent = cache.get(parentKey);
+      if (cachedParent && cachedParent.supersededBy !== child.id && cachedParent.followedBy !== child.id) {
+        cache.delete(parentKey);
+        const refreshed = await readForgeJob(fs, repo, child.continuedFrom, now);
+        if (refreshed) {
+          const idx = jobs.findIndex((j) => j.id === refreshed.id);
+          if (idx >= 0) jobs[idx] = refreshed;
+          if (isSettledForCache(refreshed)) cache.set(parentKey, refreshed);
+        }
+      }
+    }
   }
   return jobs;
 }
-export interface ForgeDetail { job: RadarJob; history: ToolEntry[]; transcript: string[]; timeline: ActivityEvent[] | null;
-  /** The writer bounded this snapshot, so the timeline is a preview, not the whole run. */
-  truncated?: boolean; }
+export interface ForgeDetail {
+  job: RadarJob;
+  timeline: ActivityEvent[];
+  truncated?: boolean;
+}
 export async function readForgeDetail(fs: FsLike, repo: string, id: string, now: number): Promise<ForgeDetail | null> {
   const job = await readForgeJob(fs, repo, id, now);
   if (!job) return null;
@@ -143,23 +201,20 @@ export async function readForgeDetail(fs: FsLike, repo: string, id: string, now:
   if (view && view.schema !== 1) throw new Error('Unsupported Forge detail schema');
   let report: string | null = null;
   if (await fs.exists(`${dir}/result.md`)) report = await fs.read(`${dir}/result.md`);
-  const history: ToolEntry[] = (Array.isArray(view?.tools) ? view.tools : []).flatMap(t => {
-    const tool = record(t);
-    if (!tool || typeof tool.tool !== 'string') return [];
-    return [{ at: toEpoch(firstText(tool.at)), tool: tool.tool, label: firstText(tool.input) ?? '',
-      output: firstText(tool.output) ?? '', state: firstText(tool.state) ?? 'done' }];
-  });
-  const transcript = (Array.isArray(view?.transcript) ? view.transcript : []).filter((t): t is string => typeof t === 'string');
-  const timeline: ActivityEvent[] | null = Array.isArray(view?.timeline) ? view.timeline.flatMap(value => {
+  const timeline: ActivityEvent[] = Array.isArray(view?.timeline) ? view.timeline.flatMap(value => {
     const item = record(value);
     if (!item || typeof item.sequence !== 'number' || typeof item.at !== 'string') return [];
     if (item.kind === 'assistant' && typeof item.text === 'string') return [item as ActivityEvent];
+    if (item.kind === 'message' && typeof item.text === 'string') {
+      return [{ sequence: item.sequence, kind: 'message', at: item.at, text: item.text,
+        delivery: item.delivery === 'turn-start' ? 'turn-start' : 'next-step',
+        sender: item.sender === 'steer' ? 'steer' : 'follow_up' } as ActivityEvent];
+    }
     if (item.kind === 'tool' && typeof item.tool === 'string' && typeof item.stepIndex === 'number' &&
       typeof item.input === 'string' && typeof item.output === 'string' && typeof item.state === 'string') return [item as ActivityEvent];
     return [];
-  }) : null;
+  }) : [];
   return { job: { ...job, report, prompt: firstText(view?.prompt), preamble: firstText(view?.preamble),
-    // A bounded preview is normal for a long job, not a warning.
-    warnings: [...job.warnings, ...(view === null ? [{code:'detail_unavailable',message:'This older job has no detail snapshot; summary and report are shown.'}] : [])] }, history, transcript, timeline,
+    warnings: [...job.warnings, ...(view === null ? [{code:'detail_unavailable',message:'This older job has no detail snapshot; summary and report are shown.'}] : [])] }, timeline,
     truncated: view?.truncated === true };
 }

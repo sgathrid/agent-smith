@@ -1,7 +1,5 @@
 #!/usr/bin/env node
-// Isolated MCP stdio smoke runner. All job and provider state lives in one
-// temporary tree; no command here targets the caller's working repository.
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
@@ -10,7 +8,6 @@ import { readFileSync } from 'node:fs';
 import { buildSmokeServerEnv } from './testing/smoke-env.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-// Failure-bound deadlines stretch with AGENT_SMITH_TEST_TIME_SCALE (same knob as forge/testing/time.ts).
 const timeScale = (() => { const n = Number(process.env.AGENT_SMITH_TEST_TIME_SCALE); return Number.isFinite(n) && n > 0 ? n : 1; })();
 const scaled = (ms) => Math.round(ms * timeScale);
 const keep = process.argv.includes('--keep');
@@ -60,7 +57,7 @@ try {
   fakeEnv.AGENT_SMITH_AGY_BIN = fakeAgy;
   client = await openClient('agent-smith-smoke-fake', fakeEnv);
   const tools = (await client.listTools()).tools.map((tool) => tool.name);
-  const required = ['spawn_job', 'resume_job', 'status', 'list_jobs', 'run_pipeline', 'pipeline_status', 'cancel', 'list_capabilities'];
+  const required = ['spawn_job', 'follow_up', 'steer', 'status', 'list_jobs', 'run_pipeline', 'pipeline_status', 'cancel', 'list_capabilities'];
   await record('MCP stdio tool discovery', async () => {
     for (const name of required) if (!tools.includes(name)) throw new Error(`Missing MCP tool ${name}`);
     return { tools: required };
@@ -73,7 +70,6 @@ try {
     return parsed;
   };
   const waitStatus = async (tool, key, id, timeoutMs = 90_000, progressLabel) => {
-    // Deadline only bounds a broken run; the job's own outcome decides pass/fail.
     const end = Date.now() + scaled(timeoutMs);
     let progressAt = Date.now() + 10_000;
     while (Date.now() < end) {
@@ -87,16 +83,55 @@ try {
     }
     throw new Error(`${tool} timed out for ${id}`);
   };
-  const solo = await record('solo review and named resume', async () => {
+  const nextTurn = async (name, afterJobId, timeoutMs = 90_000) => {
+    const end = Date.now() + scaled(timeoutMs);
+    while (Date.now() < end) {
+      const value = await data(await client.callTool({ name: 'status', arguments: { id: name, response_format: 'detailed' } }));
+      if (value.jobId !== afterJobId && value.status !== 'running') return value;
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+    throw new Error(`no turn after ${afterJobId} for ${name}`);
+  };
+  const resumeArgv = (jobId) => {
+    const argv = JSON.parse(readFileSync(path.join(repo, '.agent-smith', 'jobs', jobId, 'argv.json'), 'utf8')).argv;
+    if (!Array.isArray(argv) || argv[0] !== 'exec' || argv[1] !== 'resume' || !argv[2]) throw new Error('The follow-up turn did not reuse its recorded conversation handle');
+    return argv;
+  };
+  const solo = await record('solo review, then follow_up on the idle worker', async () => {
     const ack = await data(await client.callTool({ name: 'spawn_job', arguments: { provider: 'codex', mode: 'review', name: 'Smoke Reviewer', task: 'Review the smoke fixture', prompt: 'Review the fixture', model: 'smoke-fixture', effort: 'low', cwd: repo } }));
-    const finished = await waitStatus('status', 'jobId', ack.jobId);
+    const finished = await waitStatus('status', 'id', ack.jobId);
     if (finished.status !== 'succeeded') throw new Error(`Review ended ${finished.status}`);
-    const resumed = await data(await client.callTool({ name: 'resume_job', arguments: { worker: 'Smoke Reviewer', prompt: 'Check the same fixture again' } }));
-    const continued = await waitStatus('status', 'jobId', resumed.jobId);
-    if (continued.status !== 'succeeded' || continued.workerId !== finished.workerId) throw new Error('Named resume did not preserve worker identity');
-    const argv = JSON.parse(readFileSync(path.join(repo, '.agent-smith', 'jobs', resumed.jobId, 'argv.json'), 'utf8')).argv;
-    if (!Array.isArray(argv) || argv[0] !== 'exec' || argv[1] !== 'resume' || !argv[2]) throw new Error('Resume did not reuse its recorded conversation handle');
-    return { review: finished.status, resume: continued.status, workerId: finished.workerId, conversation: argv[2] };
+    const followed = await data(await client.callTool({ name: 'follow_up', arguments: { worker: 'Smoke Reviewer', prompt: 'Check the same fixture again' } }));
+    if (followed.action !== 'started' || followed.delivery !== 'now' || followed.jobId === finished.jobId) throw new Error(`follow_up on an idle worker must start a new turn: ${JSON.stringify(followed)}`);
+    const continued = await nextTurn('Smoke Reviewer', finished.jobId);
+    if (continued.status !== 'succeeded' || continued.workerId !== finished.workerId || continued.turn !== 2) throw new Error('follow_up did not continue the same worker');
+    const argv = resumeArgv(continued.jobId);
+    return { review: finished.status, followUp: continued.status, action: followed.action, delivery: followed.delivery, workerId: finished.workerId, conversation: argv[2] };
+  });
+  await record('follow_up queued behind a running turn', async () => {
+    const tag = `queued-${Date.now()}`;
+    const ack = await data(await client.callTool({ name: 'spawn_job', arguments: { provider: 'codex', mode: 'review', name: 'Smoke Queue', task: 'Queued follow-up fixture', prompt: `SMOKE_BARRIER:${tag}:0 queued fixture`, model: 'smoke-fixture', effort: 'low', cwd: repo } }));
+    const queued = await data(await client.callTool({ name: 'follow_up', arguments: { worker: 'Smoke Queue', prompt: 'Then check the edge case' } }));
+    if (queued.action !== 'queued' || queued.jobId !== ack.jobId || queued.delivery !== 'turn-end') throw new Error(`Expected queued at turn end on ${ack.jobId}: ${JSON.stringify(queued)}`);
+    mkdirSync(path.join(barrierRoot, tag), { recursive: true });
+    writeFileSync(path.join(barrierRoot, tag, 'release'), '');
+    const continued = await nextTurn('Smoke Queue', ack.jobId);
+    const first = await data(await client.callTool({ name: 'status', arguments: { id: ack.jobId } }));
+    if (continued.status !== 'succeeded' || continued.turn !== 2) throw new Error(`Queued follow-up ended ${continued.status} (turn ${continued.turn})`);
+    if (first.jobId !== ack.jobId || first.status !== 'succeeded') throw new Error('Turn 1 lost its own result to the follow-up');
+    resumeArgv(continued.jobId);
+    return { action: queued.action, delivery: queued.delivery, turn1: first.status, turn2: continued.status };
+  });
+  await record('steer interrupts a running turn', async () => {
+    const tag = `steer-${Date.now()}`;
+    const ack = await data(await client.callTool({ name: 'spawn_job', arguments: { provider: 'codex', mode: 'review', name: 'Smoke Steer', task: 'Steer fixture', prompt: `SMOKE_BARRIER:${tag}:0 steer fixture`, model: 'smoke-fixture', effort: 'low', cwd: repo } }));
+    const steered = await data(await client.callTool({ name: 'steer', arguments: { worker: 'Smoke Steer', prompt: 'Stop and review only the README', allowFresh: true } }));
+    if (steered.action !== 'interrupting' || steered.jobId !== ack.jobId) throw new Error(`Expected interrupting on ${ack.jobId}: ${JSON.stringify(steered)}`);
+    const done = await waitStatus('status', 'id', ack.jobId);
+    mkdirSync(path.join(barrierRoot, tag), { recursive: true });
+    writeFileSync(path.join(barrierRoot, tag, 'release'), '');
+    if (done.status !== 'succeeded' || done.jobId === ack.jobId || done.turn !== 2) throw new Error(`Steered turn ended ${done.status} as ${done.jobId}`);
+    return { action: steered.action, status: done.status, turn: done.turn };
   });
   const pipeline = await record('cross-provider implement to review with executable check', async () => {
     const result = await data(await client.callTool({ name: 'run_pipeline', arguments: { spec: { name: 'smoke pipeline', workDir: repo, stages: [
@@ -129,23 +164,19 @@ try {
   });
   await record('cancellation', async () => {
     const ack = await data(await client.callTool({ name: 'spawn_job', arguments: { provider: 'codex', mode: 'review', name: 'Smoke Cancel', task: 'Cancel fixture', prompt: 'SMOKE_SLOW cancellation fixture', model: 'smoke-fixture', effort: 'low', cwd: repo } }));
-    const cancellation = await data(await client.callTool({ name: 'cancel', arguments: { jobId: ack.jobId } }));
-    const terminal = await waitStatus('status', 'jobId', ack.jobId);
-    if (cancellation.settled !== true || terminal.status !== 'canceled') throw new Error(`Cancellation ended ${terminal.status}`);
-    return { settled: cancellation.settled, status: terminal.status };
+    const cancellation = await data(await client.callTool({ name: 'cancel', arguments: { id: 'Smoke Cancel' } }));
+    const terminal = await waitStatus('status', 'id', ack.jobId);
+    if (cancellation.settled !== true || cancellation.jobId !== ack.jobId || terminal.status !== 'canceled') throw new Error(`Cancellation ended ${terminal.status}: ${JSON.stringify(cancellation)}`);
+    if (existsSync(path.join(repo, '.agent-smith', 'claims', `job-${encodeURIComponent('Smoke Cancel')}`))) throw new Error('cancel claimed the worker name instead of its job');
+    return { settled: cancellation.settled, status: terminal.status, by: 'name' };
   });
   await record('timeout', async () => {
     const ack = await data(await client.callTool({ name: 'spawn_job', arguments: { provider: 'codex', mode: 'review', name: 'Smoke Timeout', task: 'Timeout fixture', prompt: 'SMOKE_SLOW timeout fixture', model: 'smoke-fixture', effort: 'low', timeoutMs: 1_000, cwd: repo } }));
-    const terminal = await waitStatus('status', 'jobId', ack.jobId, 60_000);
+    const terminal = await waitStatus('status', 'id', ack.jobId, 60_000);
     if (terminal.status !== 'failed' || !/timeout|timed out/i.test(terminal.error ?? '')) throw new Error(`Timeout did not surface as timeout failure: ${JSON.stringify(terminal)}`);
     return { status: terminal.status, reason: 'timeout' };
   });
   await record('concurrency limit', async () => {
-    // Event-driven, no fixed waits. At limit 2 the two fixtures rendezvous through marker
-    // files: each waits (up to a generous deadline) until it sees the other, so overlap is
-    // proven. At limit 1 (waitMs 0) the first fixture blocks until this script releases it;
-    // we release only after a single pipeline_status read shows one stage running and the
-    // other not started, so a second concurrent stage cannot be missed by waiting too briefly.
     const run = async (name, concurrency, waitMs) => {
       const tag = `${concurrency}-${Date.now()}`;
       const started = await data(await client.callTool({ name: 'run_pipeline', arguments: { spec: { name, workDir: repo, concurrency, stages: [
@@ -201,9 +232,9 @@ try {
     for (const provider of available) await record(`live minimal review: ${provider.name}`, async () => {
       const ack = await data(await client.callTool({ name: 'spawn_job', arguments: { provider: provider.name, mode: 'review', name: `Smoke ${provider.name}`, task: 'Minimal live provider smoke', prompt: 'Reply with exactly: smoke passed.', timeoutMs: 120_000, cwd: repo } }));
       let done;
-      try { done = await waitStatus('status', 'jobId', ack.jobId, 125_000, `live provider ${provider.name}`); }
+      try { done = await waitStatus('status', 'id', ack.jobId, 125_000, `live provider ${provider.name}`); }
       catch (error) {
-        try { await data(await client.callTool({ name: 'cancel', arguments: { jobId: ack.jobId } })); } catch { /* cancel best-effort before scratch cleanup */ }
+        try { await data(await client.callTool({ name: 'cancel', arguments: { id: ack.jobId } })); } catch { }
         throw error;
       }
       if (done.status !== 'succeeded') throw new Error(`${provider.name} ended ${done.status}`);
@@ -216,7 +247,7 @@ try {
   summary.exitCode = 1;
   summary.scenarios.push({ name: 'runner setup', status: 'fail', error: String(error?.stack ?? error) });
 } finally {
-  try { await client?.close(); } catch { /* close is best-effort after transport failure */ }
+  try { await client?.close(); } catch { }
   if (keep) summary.cleanup = 'preserved';
   else { rmSync(scratch, { recursive: true, force: true }); summary.cleanup = 'removed'; }
 }

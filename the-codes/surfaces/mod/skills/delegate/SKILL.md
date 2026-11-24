@@ -16,14 +16,14 @@ that were already modified before it started. You supply the rest in `spawn_job`
 - `context`: why the work matters and who it's for.
 - `cwd`: the absolute directory to work in. It defaults to the server's repository.
 - `files`: relative paths of shared brief or spec files in the repository. When `cwd` is a
-  worktree, Agent Smith syncs them into `cwd` before the worker runs (and re-syncs them on
-  `steer_job` or `resume_job`), and `status` reports `staleReads` if you edit them in the
-  repository while the worker is running.
+  worktree, Agent Smith syncs them into `cwd` before the worker runs (and before each later
+  turn), and `status` reports `staleReads` if you edit them in the repository while the worker
+  is running.
 - `checks`: commands that decide acceptance, such as tests or a build. The worker sees them,
   and they run after it finishes.
 - `mode`: `implement`, `review`, `moderate` or `verify`. Review and moderate request
   read-only access; the ack's `readOnlyEnforced` says whether the provider enforces it.
-- `name`: a readable worker name, used by `steer_job` and `resume_job`.
+- `name`: a readable worker name; `follow_up` and `steer` address the worker by it.
 - `from`: an earlier worker or job ID whose brief to reuse; anything you pass overrides it.
 - `variants`: run the same brief as several independent jobs, each with its own `name` and
   optionally `provider`, `model` or `effort`.
@@ -49,13 +49,15 @@ ends, so don't poll or start your own monitor. A subagent doesn't get that messa
 to the main conversation), and neither does a headless session; either one calls `status`
 with `wait_ms` until the job settles.
 
-To redirect a running worker, use `steer_job`: `queue` runs after the current turn (dropped if
-that turn fails), `interrupt` stops it now, losing the tool call in flight. Each steer starts a
-new turn with its own job ID, so refer to the worker by name; `status` lists earlier turns in
-`earlierTurns`. Once a worker has finished, follow up with `resume_job`. A kimi worker resumes
-only from the directory that spawned it, so leave `cwd` unset for kimi.
+## Talking to a worker
 
-`cancel` waits briefly for the job to stop and returns its final status.
+The worker's name is its handle; you don't need to know whether it is running or idle.
+- `follow_up`: "do this next". Never cuts the turn. Ack `delivery` is `next-step` (a claude worker reads it at its next tool round), `turn-end` (other providers), or `now` (idle). During checks, it waits for the verdict and gets it.
+- `steer`: "stop and do this instead". Cuts the running turn (in-flight tool call lost) or running checks.
+- Queued messages deliver whatever the turn's outcome; `cancel` discards them and reports the count.
+- `env` lives only in memory: ack `env` is `set`, `kept`, or `dropped` (pass `env` again after a restart).
+
+`status` and `cancel` take a name (latest turn) or a `jobId` (that turn). `cancel` waits briefly and returns final status.
 
 ## Reading the result
 
@@ -69,13 +71,13 @@ returns the full record.
 When a job fails, its `nextAction` field suggests one next step:
 
 - canceled: nothing to do.
-- orphaned: `resume_job` if it has a conversation handle, otherwise rerun.
+- orphaned: `follow_up` if it has a conversation handle, otherwise rerun.
 - denied: see Permissions, or narrow the task if it was already unrestricted.
 - timeout: raise `timeoutMs` or split the task.
 - quiet (`liveness.state` silent): no event for 15 minutes but the worker process is running.
   kimi reports a tool call only when it finishes, so a silent kimi job is often a long command.
   `dead` means the process is gone while the job still reads running.
 - network-like error: retry once.
-- empty output: ask the worker what happened with `resume_job`.
+- empty output: ask the worker what happened with `follow_up`.
 
 Otherwise read `error` and `warnings`.

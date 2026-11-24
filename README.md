@@ -63,7 +63,9 @@ claude plugin update agent-smith@agent-smith --scope project # run inside the re
 
 Always pass `--scope`. Without it, a command run inside a repository can update that repository's install and leave your user-wide one behind.
 
-To update automatically, run `/plugin`, open **Marketplaces**, select `agent-smith` and choose **Enable auto-update**. Otherwise Agent Smith shows a short session-start toast naming the new version (`agent-smith v0.4.2 available · /plugin`); update in `/plugin`, then restart Claude Code. It skips that check when `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set.
+To update automatically, run `/plugin`, open **Marketplaces**, select `agent-smith` and choose **Enable auto-update**. Otherwise Agent Smith shows a short session-start toast naming the new version (`agent-smith v0.5.0 available · /plugin`); update in `/plugin`, then restart Claude Code. It skips that check when `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set.
+
+**Upgrading to 0.5.0:** `resume_job` and `steer_job` were replaced by `follow_up` and `steer`. If your Claude Code permission allowlist includes `mcp__plugin_agent-smith_agent-smith__resume_job` or `mcp__plugin_agent-smith_agent-smith__steer_job`, update those entries to `mcp__plugin_agent-smith_agent-smith__follow_up` and `mcp__plugin_agent-smith_agent-smith__steer`.
 
 To remove it: `claude plugin uninstall agent-smith@agent-smith --scope <scope>`, run inside the repository for `local` or `project`.
 
@@ -86,7 +88,7 @@ When Ada finishes, Claude receives a completion notice and can read the report. 
 
 > Ask Ada for a minimal reproducer for her top finding.
 
-Follow-ups resume a finished worker, or steer a running one mid-run.
+Follow-ups queue a message for a running worker (read at its next step on Claude, or when the turn ends on other providers) or start a new turn on an idle one. Steers interrupt a running worker right away.
 
 ## Put different models to work
 

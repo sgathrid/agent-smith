@@ -75,11 +75,11 @@ test('modern envelope validation and approval state prevent invalid calls from l
     const declined = await request('tools/call', { name: 'spawn_job', arguments: args, requestState: first.result.requestState, inputResponses: { unrestricted: { action: 'decline' } }, _meta: meta });
     assert.equal(declined.result.isError, true);
     assert.equal(h.launches(), 0);
-    const resumeArgs = { worker: 'job-1', prompt: 'follow up', unrestricted: true };
-    const resume = await request('tools/call', { name: 'resume_job', arguments: resumeArgs, _meta: meta });
-    assert.equal(resume.result.resultType, 'input_required');
+    const followArgs = { worker: 'job-1', prompt: 'follow up', unrestricted: true };
+    const followed = await request('tools/call', { name: 'follow_up', arguments: followArgs, _meta: meta });
+    assert.equal(followed.result.resultType, 'input_required');
     h.renameWorker('Grace');
-    const rebound = await request('tools/call', { name: 'resume_job', arguments: resumeArgs, requestState: resume.result.requestState, inputResponses: { unrestricted: { action: 'accept' } }, _meta: meta });
+    const rebound = await request('tools/call', { name: 'follow_up', arguments: followArgs, requestState: followed.result.requestState, inputResponses: { unrestricted: { action: 'accept' } }, _meta: meta });
     assert.equal(rebound.result.resultType, 'input_required');
     assert.match(rebound.result.inputRequests.unrestricted.params.message, /Grace/);
     assert.equal(h.launches(), 0);

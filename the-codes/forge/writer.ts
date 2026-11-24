@@ -1,36 +1,3 @@
-/**
- * writer.ts — one job, from `spawn()` to the terminal anchor.
- *
- * This is the module that makes the two halves of this repo one system. It takes
- * a `WorkerHandle` from providers/, translates its event stream into OUR state
- * format (format.ts), computes the verdict (format.deriveStatus), writes the
- * anchor.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * WHY THE WRITER, AND NOT THE SURFACE, OWNS THE FILES
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * Because a job outlives the tool call that started it. `spawn_job` returns a
- * job id in under a millisecond; the job then runs for 28 minutes across an MCP
- * server restart, a session close, and a pane that was never opened. If the
- * surface owned the state, a Claude Code restart would lose every running job.
- *
- * The filesystem is the only thing in this system that survives all three.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * WRITE AMOUNT, BECAUSE THIS RUNS 484 TIMES ON A GOOD JOB
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * The reference job made 484 tool calls. Naively, that is 484 progress.json
- * rewrites. That is invisible — the band polls
- * at 3 s, the channel at 5 s — so we coalesce: at most one progress flush every
- * PROGRESS_FLUSH_MS, with a trailing flush on every terminal transition so the
- * last state is never lost.
- *
- * What is NOT throttled: the terminal writes, the cancel marker, and the
- * append-only event log. Those are the ones a reader is waiting on.
- */
-
 // Shared with the mod, which renders the digest; the mod loader cannot import forge, so it lives there.
 import { classify, ProgressTracker } from '../surfaces/mod/hooks/progress.ts';
 import { execFile } from 'node:child_process';
@@ -54,6 +21,7 @@ import {
   looksEmpty,
   shouldFlush,
   taskTitle,
+  type ContinuationKind,
   type ForgeActivity,
   type GitBaseline,
   type ForgeManifest,
@@ -61,23 +29,20 @@ import {
   type ForgeStatus,
   type ForgeView,
   type ForgeViewEvent,
+  type MessageSender,
   type WatchedFileSigs,
 } from './format.ts';
 import type { JobResult, ProviderEvent, WorkerHandle } from '../providers/types.ts';
 
-/** How many recent activities we keep. Matches the pane's rendering cap. */
 const RECENT_ACTIVITIES = 5;
 
-/** How much assistant text we keep as the "reasoning" cell. */
 const LATEST_TEXT_CHARS = 4_000;
 
-/** Max length of `latestSummary`. */
 const SUMMARY_CHARS = 1_000;
 
 export interface JobWriterOptions {
   readonly repo: string;
   readonly jobId: string;
-  /** Progress coalescing window, ms. Overridable so tests need not sleep. */
   readonly flushMs?: number;
 }
 
@@ -91,7 +56,6 @@ export interface StartInput {
   readonly effort: string | null;
   readonly cwd: string;
   readonly prompt: string;
-  /** The brief the service prepended before the provider saw the prompt (forge/brief.ts). */
   readonly preamble?: string;
   readonly unrestricted: boolean;
   readonly conversation: string | null;
@@ -107,16 +71,13 @@ export interface StartInput {
   readonly sandboxFlags?: readonly string[];
   readonly readOnlyRequested?: boolean;
   readonly readOnlyEnforced?: boolean;
-  readonly steeredFrom?: string | null;
+  readonly turn?: number;
+  readonly continuedFrom?: string | undefined;
+  readonly continuationKind?: ContinuationKind | undefined;
+  readonly chainStartedAt?: string | undefined;
   readonly watchedFiles?: Readonly<Record<string, WatchedFileSigs>>;
 }
 
-/**
- * Owns the on-disk state of exactly one job.
- *
- * Not thread-safe and does not need to be: one job has one owner (the coroutine
- * that spawned it), and `forge/service.ts` keeps that ownership in a map.
- */
 export class JobWriter {
   readonly jobId: string;
   private readonly repo: string;
@@ -130,15 +91,11 @@ export class JobWriter {
   private toolCalls = 0;
   private toolSteps = new Set<number>();
   private latestText: string | null = null;
-  /** The current assistant message only (reset at each tool call): what `latestSummary` shows while running. */
   private currentMessage = '';
-  /** Steps whose tool call ended in an error state. */
   private toolErrorSteps = new Set<number>();
-  /** Last heartbeat and the worker pid it named; carried through every progress rebuild. */
   private lastAliveAt: string | null = null;
   private workerPid: number | undefined;
   private lastHeartbeatFlushMs = 0;
-  /** Whether the first substantive event (not `started`/`usage`) was an error notice. */
   private firstEventSeen = false;
   private firstEventWasError = false;
   private readonly tracker = new ProgressTracker();
@@ -150,21 +107,12 @@ export class JobWriter {
   private cancelRequestedAt: string | null = null;
   private cwd = '';
   private baselinePending: Promise<void> | null = null;
-  /** In-memory size:mtime signatures of baseline-dirty files, to detect further edits. */
   private baselineSigs = new Map<string, string>();
   private changed: { files: string[]; truncated: boolean } | null = null;
   private unattributed: string[] = [];
   private staleReads: string[] = [];
-  /** Concatenated tool inputs of this job, used to attribute changed files to it. */
   private toolInputs = '';
-  /** Concatenated inputs of edit tool calls only, so read calls never attribute an external edit to the worker. */
   private editToolInputs = '';
-  /**
-   * Steps whose edit tool call ENDED without error. The writing-job evidence
-   * for the cwd rule: an edit that errored or was denied changed nothing, so
-   * it must not turn a review into a writing job. (The progress digest counts
-   * edits at start, which is right for the pane but not for a verdict.)
-   */
   private readonly editStepsCompleted = new Set<number>();
 
   constructor(options: JobWriterOptions) {
@@ -173,21 +121,10 @@ export class JobWriter {
     this.flushMs = options.flushMs ?? PROGRESS_FLUSH_MS;
   }
 
-  /**
-   * Write the initial snapshot, BEFORE the process is spawned.
-   *
-   * The ordering is the whole point. A reader that finds nothing has to answer
-   * "does this job exist?" with "no", and then the job's whole life is invisible
-   * until its first event — which for a slow provider is seconds, and for a
-   * spawn failure is forever. Writing first means the job exists from the
-   * instant it was accepted, and a spawn that throws turns an existing job from
-   * `running` into `failed` instead of leaving a hole.
-   *
-   * `claim()` runs first: if the id belongs to somebody else's job we refuse
-   * before writing a single byte.
-   */
   start(input: StartInput): ForgeManifest {
     const now = new Date().toISOString();
+    const turn = typeof input.turn === 'number' && Number.isInteger(input.turn) && input.turn >= 1 ? input.turn : 1;
+    const chainStartedAt = input.chainStartedAt ?? now;
     this.view = { ...this.view, prompt: input.prompt.slice(0, 64_000), preamble: input.preamble?.slice(0, 4_000) ?? null,
       truncated: input.prompt.length > 64_000 || (input.preamble?.length ?? 0) > 4_000 };
     this.conversation = input.conversation;
@@ -196,6 +133,7 @@ export class JobWriter {
       jobId: this.jobId,
       name: input.name ?? this.jobId,
       workerId: input.workerId ?? this.jobId,
+      turn,
       role: input.mode,
       latestSummary: null,
       summarySource: null,
@@ -214,6 +152,7 @@ export class JobWriter {
       createdAt: now,
       updatedAt: now,
       startedAt: now,
+      chainStartedAt,
       finishedAt: null,
       exitCode: null,
       jobStatus: null,
@@ -232,7 +171,8 @@ export class JobWriter {
       ...(input.sandboxFlags === undefined ? {} : { sandboxFlags: input.sandboxFlags }),
       ...(input.readOnlyRequested === undefined ? {} : { readOnlyRequested: input.readOnlyRequested }),
       ...(input.readOnlyEnforced === undefined ? {} : { readOnlyEnforced: input.readOnlyEnforced }),
-      ...(input.steeredFrom ? { steeredFrom: input.steeredFrom } : {}),
+      ...(input.continuedFrom ? { continuedFrom: input.continuedFrom } : {}),
+      ...(input.continuationKind ? { continuationKind: input.continuationKind } : {}),
       ...(input.watchedFiles !== undefined && Object.keys(input.watchedFiles).length > 0
         ? { watchedFiles: input.watchedFiles }
         : {}),
@@ -251,7 +191,6 @@ export class JobWriter {
 
     this.writeManifest();
     this.flushProgress(this.manifest.createdAt);
-    // Fire and forget: spawn never waits on git. Merged into the manifest when it lands.
     this.cwd = input.cwd;
     this.baselinePending = isInsideGitRepo(input.cwd) ? this.captureBaseline(input.cwd) : null;
     return manifest;
@@ -268,18 +207,16 @@ export class JobWriter {
       for (const p of snap.dirty.slice(0, CHANGED_FILES_SIG_CAP)) this.baselineSigs.set(p, fileSig(cwd, p));
       this.manifest = { ...this.manifest, gitBaseline: { head: snap.head, dirty: snap.dirty } };
       this.writeManifest();
-    } catch { /* best effort */ }
+    } catch {}
   }
 
-  /** Wait for the async git baseline capture and return the dirty paths, if any. */
   async awaitBaseline(): Promise<readonly string[]> {
     try {
       if (this.baselinePending !== null) await this.baselinePending;
-    } catch { /* best effort */ }
+    } catch {}
     return (this.manifest?.gitBaseline?.dirty ?? []).filter((p) => !isForgeStatePath(p));
   }
 
-  /** Update `view.preamble` when the async brief enrichment lands before spawn. */
   updatePreamble(preamble: string): void {
     this.view = {
       ...this.view,
@@ -289,7 +226,6 @@ export class JobWriter {
     writeJsonAtomic(jobFile(this.repo, this.jobId, FILES.view), this.view);
   }
 
-  /** Candidate paths that this worker's own edit tool calls touched. */
   editedFiles(candidates?: readonly string[]): string[] {
     const fromTracker = this.tracker.editedPaths(this.cwd);
     if (candidates === undefined) return fromTracker;
@@ -298,16 +234,10 @@ export class JobWriter {
     return [...new Set([...fromTracker.filter((p) => candidates.includes(p)), ...fromEditInputs])];
   }
 
-  /**
-   * Compute `changedFiles` against the baseline. Call (awaited) just before
-   * `finish()`; finish stays synchronous. Bounded by the git ~2s cap, never throws.
-   */
   async prepareFinish(): Promise<void> {
     try {
       if (this.baselinePending !== null) await this.baselinePending;
       if (this.manifest === null) return;
-      // A vanished cwd has nothing to diff or compare; finish() records it as
-      // cwdMissingAtFinish + changedFilesUnknown instead of a silent "no edits".
       if (!existsSync(this.cwd)) return;
       const watched = this.manifest.watchedFiles;
       const watchedKeys = watched !== undefined ? Object.keys(watched) : [];
@@ -357,27 +287,20 @@ export class JobWriter {
       if (watched !== undefined) {
         this.staleReads = computeStaleReads(this.repo, this.cwd, watched, [...editedWatchedSet]);
       }
-    } catch { /* best effort */ }
+    } catch {}
   }
 
-  /**
-   * Record that the worker's process is alive: progress.json `lastAliveAt` (and
-   * `workerPid`). Not activity: `updatedAt`, `lastEventAt` and the timeline
-   * stay untouched, and only progress.json is rewritten.
-   */
   heartbeat(at: string, pid?: number): void {
     if (this.finished || this.manifest === null || this.progress === null) return;
     this.lastAliveAt = at;
     if (typeof pid === 'number') this.workerPid = pid;
     this.progress = { ...this.progress, lastAliveAt: at, ...(this.workerPid === undefined ? {} : { workerPid: this.workerPid }) };
-    // Coalesced like every progress write; heartbeats are HEARTBEAT_MS apart, so in practice each lands.
     const nowMs = Date.parse(at);
     if (!shouldFlush(this.lastHeartbeatFlushMs, Number.isNaN(nowMs) ? Date.now() : nowMs, this.flushMs)) return;
     this.lastHeartbeatFlushMs = Number.isNaN(nowMs) ? Date.now() : nowMs;
     writeJsonAtomic(jobFile(this.repo, this.jobId, FILES.progress), this.progress);
   }
 
-  /** Feed one normalized provider event into the snapshot. */
   onEvent(event: ProviderEvent): void {
     if (this.finished || this.manifest === null) return;
     switch (event.kind) {
@@ -388,7 +311,6 @@ export class JobWriter {
       case 'activity-end': this.onActivity(event); return;
       case 'text': this.onText(event); return;
       case 'notice':
-        // Info notices (lifecycle chatter) are not "the first thing that happened".
         if (event.level !== 'info') this.noteFirstEvent(event.level === 'error');
         if (event.level === 'warn' || event.level === 'error') {
           this.addWarning(event.message.slice(0, 400));
@@ -406,12 +328,9 @@ export class JobWriter {
     if (typeof event.conversationId === 'string' && event.conversationId.trim() !== '') {
       this.conversation = event.conversationId;
       this.manifest = { ...this.manifest, conversation: this.conversation };
-      // Resume identity must survive a supervisor crash even inside the
-      // progress coalescing window, before finish() can publish it.
       this.writeManifest();
     }
     if (typeof event.model === 'string' && this.manifest.model === null) {
-      // Provider-reported (structured event, never worker text) beats "unknown"/harness-config guesses.
       this.manifest = {
         ...this.manifest,
         model: event.model,
@@ -428,8 +347,6 @@ export class JobWriter {
     this.deltaOpen = false;
     const ref = event.activity;
     const isStart = event.kind === 'activity-start';
-    // An update is an in-flight call: it keeps the row active and must NOT
-    // count as a new tool call when its step was already registered.
     const status =
       isStart || event.kind === 'activity-update'
         ? ('active' as const)
@@ -444,13 +361,6 @@ export class JobWriter {
       this.toolCalls += 1;
     }
 
-    // A tool's DONE record frequently carries no `input` (the provider split
-    // ACTIVE and DONE for the same step_index, and only ACTIVE had the
-    // parameters — 14,900 archived records confirm it). So the DONE row
-    // INHERITS the input from the ACTIVE row rather than dropping it, which is
-    // what keeps the pane's activity phrase readable on a finished job. The
-    // same applies to an update, and to a later update that finally names the
-    // parameters the start did not have.
     const idx = this.recent.findIndex((a) => a.stepIndex === ref.stepIndex);
     const previousRow = idx >= 0 ? this.recent[idx] : undefined;
     const input = ref.input ?? previousRow?.input;
@@ -461,8 +371,6 @@ export class JobWriter {
       status,
       ...(input === undefined ? {} : { input }),
     };
-    // Only an input that arrived AFTER a start without one is "new" evidence:
-    // re-sent parameters on every update must not fill the attribution buffer.
     if (ref.input !== undefined && previousRow?.input === undefined) {
       if (this.toolInputs.length < TOOL_INPUTS_CAP) this.toolInputs += ref.input + '\n';
       if (classify(tool, input).kind === 'edit' && this.editToolInputs.length < TOOL_INPUTS_CAP) {
@@ -474,16 +382,12 @@ export class JobWriter {
     if (event.kind === 'activity-end' && status === 'done' && classify(tool, input).kind === 'edit') {
       this.editStepsCompleted.add(ref.stepIndex);
     }
-    // A tool call ends the assistant message before it: the next text is a new one.
     if (isStart) this.currentMessage = '';
     if (status === 'error') this.toolErrorSteps.add(ref.stepIndex);
     this.noteFirstEvent(false);
     this.lastActivity = row;
     if (idx >= 0) this.recent[idx] = row;
     else this.recent.push(row);
-    // The pane picks the HIGHEST step_index, not the last entry, because a
-    // rewritten array mid-poll is not guaranteed sorted. Keeping the array
-    // short is what stops that from mattering.
     if (this.recent.length > RECENT_ACTIVITIES) this.recent = this.recent.slice(-RECENT_ACTIVITIES);
 
     const tools = [...this.view.tools];
@@ -539,35 +443,17 @@ export class JobWriter {
     this.manifest = { ...this.manifest, latestSummary: summaryTail(this.currentMessage, SUMMARY_CHARS) || this.manifest.latestSummary || null, summarySource: 'worker' };
     this.touch(at);  }
 
-  /**
-   * The cwd facts deriveStatus needs: is the cwd gone, and was this job meant
-   * to write (mode) or seen editing (one of its own edit tool calls completed
-   * without error). Every verdict for this job (finish, the steer chain) reads
-   * them from here.
-   */
   verdictFacts(): { cwdMissing: boolean; writing: boolean } {
     return cwdFacts(this.cwd, this.manifest?.mode, this.editStepsCompleted.size > 0);
   }
 
-  /**
-   * Write the terminal state.
-   *
-   * Every path out of a job goes through here, including the ones where the
-   * process died without producing a JobResult — a cancel that raced the exit,
-   * a throw from the adapter. A job that never gets a terminal write stays
-   * `running` forever, which is a lie with a very long fuse.
-   */
   finish(result: JobResult, report: string | null): ForgeManifest {
     if (this.finished || this.manifest === null) {
-      // A second terminal write is a bug in the caller, but returning the
-      // manifest we already have is strictly better than rewriting history.
       return this.manifest ?? emptyManifest(this.jobId);
     }
     this.finished = true;
 
     const finishedAt = result.finishedAt;
-    // A marker records a request, not proof that the worker stopped. Only the
-    // adapter's terminal cancellation verdict can make the job canceled.
     const alreadyTerminal: ForgeStatus | null = result.status === 'cancelled' ? 'canceled' : null;
 
     const { cwdMissing, writing } = this.verdictFacts();
@@ -580,13 +466,11 @@ export class JobWriter {
       cwdMissing,
       writing,
     });
-    // deriveStatus warns for a writing job (via `suspicious`); a read-only job keeps its verdict and gets this.
     if (cwdMissing && !verdict.suspicious) {
       this.addWarning(`working directory ${this.cwd} was gone at finish; changed files and checks could not be verified`);
     }
 
     const failure = failureFields(verdict, result);
-    // Failed before doing anything: a route (model/region/account) problem, not the work.
     const failedEarly =
       verdict.status === 'failed' && !result.ok && result.status !== 'timeout' && result.status !== 'cancelled' &&
       this.toolCalls === 0 && (result.durationMs <= FAILED_EARLY_MS || this.firstEventWasError);
@@ -607,7 +491,6 @@ export class JobWriter {
       startedAt: this.manifest.startedAt ?? result.startedAt,
       exitCode: result.exitCode,
       jobStatus: result.status,
-      // The adapter's own text when it has one, else the verdict's reason; never both.
       error: failure.error,
       reason: failure.reason,
       deniedActions: (result.deniedActions ?? []).map((d) => ({
@@ -620,7 +503,6 @@ export class JobWriter {
       ...(this.toolErrorSteps.size === 0 ? {} : { toolErrors: this.toolErrorSteps.size }),
       ...(failedEarly ? { failedEarly: true } : {}),
       conversation: this.conversation,
-      // A worker's conclusion is at the END of its final response, not the start.
       latestSummary: summaryTail(response, SUMMARY_CHARS) || this.manifest.latestSummary || null,
       summarySource: response || this.manifest.latestSummary ? 'worker' : null,
       ...(this.changed === null
@@ -645,12 +527,6 @@ export class JobWriter {
     return manifest;
   }
 
-  /**
-   * Record a terminal state with no JobResult at all.
-   *
-   * Used when the adapter throws or never resolves. Same guarantee as `finish`:
-   * the job stops claiming to be `running`.
-   */
   abort(status: Exclude<ForgeStatus, 'running'>, reason: string): ForgeManifest | null {
     if (this.finished || this.manifest === null) return this.manifest;
     this.finished = true;
@@ -675,38 +551,22 @@ export class JobWriter {
     return manifest;
   }
 
-  /**
-   * Request cancellation. Writes the marker FIRST, then the caller kills.
-   *
-   * Marker before kill because the kill is asynchronous and a reader polling in
-   * between must already see the intent: a cancellation caught mid-flight is
-   * still a cancellation, and the worker may never get to write its own
-   * terminal state.
-   */
   requestCancel(at: string = new Date().toISOString()): void {
     if (this.finished) return;
     if (this.cancelRequestedAt === null) {
       this.cancelRequestedAt = at;
       createMarker(jobFile(this.repo, this.jobId, FILES.cancel), at);
-      // Legacy readers treat a marker as already stopped. Keep the request
-      // canonical until finish() publishes an acknowledged terminal state.
     }
   }
 
-  /** Did this job get cancelled? True once a marker exists, terminal or not. */
   get cancelled(): boolean {
     return this.cancelRequestedAt !== null;
   }
 
-  /** Latest conversation ID known to this writer (from start() or the provider's init event). */
   currentConversation(): string | null {
     return this.conversation;
   }
 
-  /**
-   * Stamp `supersededBy` in memory before `finish()` or `abort()` so the
-   * terminal anchor write includes `supersededBy` atomically.
-   */
   markSuperseded(nextJobId: string): void {
     if (this.manifest === null) return;
     this.manifest = { ...this.manifest, supersededBy: nextJobId, pendingSteers: 0 };
@@ -715,7 +575,14 @@ export class JobWriter {
     }
   }
 
-  /** Update the published count of unconsumed queued steers in the writer-owned files. */
+  markFollowedBy(nextJobId: string): void {
+    if (this.manifest === null) return;
+    this.manifest = { ...this.manifest, followedBy: nextJobId, pendingSteers: 0 };
+    if (this.progress !== null) {
+      this.progress = { ...this.progress, pendingSteers: 0 };
+    }
+  }
+
   setPendingSteers(count: number, at: string = new Date().toISOString()): void {
     if (this.finished || this.manifest === null) return;
     const next = Math.max(0, count);
@@ -726,28 +593,27 @@ export class JobWriter {
     this.flushProgress(at);
   }
 
-  /** Record a supervisor-level warning on this job's progress. */
+  recordMessage(text: string, delivery: 'next-step' | 'turn-start', sender: MessageSender, at: string = new Date().toISOString()): void {
+    if (this.manifest === null) return;
+    const timeline = [...this.view.timeline ?? [], { kind: 'message' as const, sequence: this.viewSequence++, at, text: text.slice(0, 2_000), delivery, sender }];
+    const bounded = boundTimeline(timeline);
+    this.view = { ...this.view, timeline: bounded.events, truncated: this.view.truncated || bounded.truncated };
+    this.deltaOpen = false;
+    if (this.finished) writeJsonAtomic(jobFile(this.repo, this.jobId, FILES.view), this.view);
+    else this.flushProgress(at);
+  }
+
   warn(message: string): void {
     this.addWarning(message);
   }
 
-  /**
-   * The recent tool rows, in step order.
-   *
-   * Exposed so the pipeline runner can build `Observation[]` for routing.ts
-   * without opening a second subscription to the provider's event stream — this
-   * process already owns that stream.
-   */
   activities(): readonly ForgeActivity[] {
     return [...this.recent].sort((a, b) => a.stepIndex - b.stepIndex);
   }
 
-  /** The current manifest, for a status() read that does not re-parse the file. */
   snapshot(): ForgeManifest | null {
     return this.manifest;
   }
-
-  /* ── internals ─────────────────────────────────────────────────────────── */
 
   private touch(at: string): void {
     if (this.manifest === null) return;
@@ -764,7 +630,6 @@ export class JobWriter {
       lastActivity: this.lastActivity,
       latestText: this.latestText,
       toolCalls: this.toolCalls,
-      // Always written, even 0: recovery must tell "no edit completed" from a pre-counter file.
       editsCompleted: this.editStepsCompleted.size,
       ...(this.toolErrorSteps.size === 0 ? {} : { toolErrors: this.toolErrorSteps.size }),
       ...(this.lastAliveAt === null ? {} : { lastAliveAt: this.lastAliveAt }),
@@ -790,7 +655,6 @@ export class JobWriter {
     this.progress = { ...this.progress, warnings: [...this.progress.warnings, message] };
   }
 
-  /** Persist the anchor. Always whole, always atomic. */
   private writeManifest(): void {
     if (this.manifest === null) return;
     writeJsonAtomic(jobFile(this.repo, this.jobId, FILES.job), this.manifest);
@@ -810,9 +674,6 @@ export class JobWriter {
   }
 }
 
-/* ── git baseline helpers ─────────────────────────────────────────────────── */
-
-/** Per git call. AGENT_SMITH_GIT_TIMEOUT_MS raises it on slow or loaded machines, where a capped-out snapshot loses changedFiles. */
 function gitCapMs(): number {
   const n = Number(process.env['AGENT_SMITH_GIT_TIMEOUT_MS']);
   return Number.isFinite(n) && n > 0 ? n : 2_000;
@@ -841,7 +702,6 @@ function git(cwd: string, args: string[]): Promise<string> {
   });
 }
 
-/** HEAD + dirty paths, or null when cwd is not a git repo / git fails / is slow. */
 async function gitSnapshot(cwd: string): Promise<GitBaseline | null> {
   try {
     const [status, head] = await Promise.all([
@@ -924,20 +784,12 @@ export function computeStaleReads(
   return stale.sort();
 }
 
-/** Append `add` to `base`, bounded. Pure, so the bounding rule is testable. */
 export function appendBounded(base: string, add: string, max: number): string {
   const joined = base === '' ? add : `${base}${add}`;
   if (joined.length <= max) return joined;
-  // Cut from the FRONT: the newest text is what the pane shows, and a stale
-  // opening paragraph is worth less than the sentence the worker just wrote.
   return joined.slice(joined.length - max);
 }
 
-/**
- * The last `max` chars of `text`, starting at a paragraph (else line) boundary
- * so the summary opens on a whole thought, not mid-sentence. A worker's
- * conclusion is at the end of its message. Pure; exported for tests.
- */
 export function summaryTail(text: string, max: number): string {
   const t = text.trim().replace(/^Status:[^\n]*(?:\n|$)/, '').trim();
   if (t.length <= max) return t;
@@ -949,7 +801,6 @@ export function summaryTail(text: string, max: number): string {
   return tail.trim();
 }
 
-/** Read back a report we wrote. Used by abort(), where we never had one. */
 function reportText(repo: string, jobId: string): string {
   try {
     return readFileSync(jobFile(repo, jobId, FILES.report), 'utf8');
@@ -963,6 +814,8 @@ function emptyManifest(jobId: string): ForgeManifest {
   return {
     schema: SCHEMA_VERSION,
     jobId,
+    workerId: jobId,
+    turn: 1,
     provider: 'unknown',
     mode: 'unknown',
     model: null,
@@ -976,6 +829,7 @@ function emptyManifest(jobId: string): ForgeManifest {
     createdAt: now,
     updatedAt: now,
     startedAt: null,
+    chainStartedAt: now,
     finishedAt: null,
     exitCode: null,
     jobStatus: null,
@@ -989,31 +843,19 @@ function emptyManifest(jobId: string): ForgeManifest {
   };
 }
 
-/**
- * Subscribe to a handle's events and drive this writer from them.
- *
- * Returns an unsubscribe. Event listeners run synchronously in stream order, so
- * this does no async work — the only awaits are in `onEvent`, and there are none.
- */
 export function pipeEvents(writer: JobWriter, handle: WorkerHandle): () => void {
   return handle.onEvent((event) => {
     try {
       writer.onEvent(event);
-    } catch {
-      // A state write must never kill a worker that is otherwise fine. Losing
-      // one progress snapshot costs one stale poll tick; killing the job costs
-      // the user 28 minutes.
-    }
+    } catch {}
   });
 }
 
-/** The report text a JobResult implies, under the headline rule. Exported for tests. */
 export function reportFor(result: JobResult): string {
   if (typeof result.response === 'string' && !looksEmpty(result.response)) return result.response;
   return '';
 }
 
-/** Ordered previews use the same bounded budget as the other detail fields. */
 function boundTimeline(input: ForgeViewEvent[]): { events: ForgeViewEvent[]; truncated: boolean } {
   const events = [...input];
   let truncated = false;
@@ -1022,7 +864,7 @@ function boundTimeline(input: ForgeViewEvent[]): { events: ForgeViewEvent[]; tru
   while (events.length > 1 && (events.length > 100 || chars > 64_000 || tools > 60)) {
     const removed = events.shift()!;
     if (removed.kind === 'assistant') chars -= removed.text.length;
-    else tools--;
+    else if (removed.kind === 'tool') tools--;
     truncated = true;
   }
   const first = events[0];

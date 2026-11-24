@@ -1,19 +1,13 @@
-/**
- * format.test.ts — the state format's pure rules, and above all THE HEADLINE RULE.
- *
- * `deriveStatus` is the single function that decides whether work happened. It is
- * pure, so this suite is exhaustive about it rather than representative: every row
- * of the precedence table gets a test that would fail if the row were deleted, and
- * the two rows that exist because of a REAL observed failure get the specific
- * input that caused it.
- */
-
 import assert from 'node:assert/strict';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { test } from 'node:test';
 
 import { REASONS } from '../../surfaces/mod/hooks/reasons.ts';
 import {
   CWD_GONE_REASON,
+  DEFAULT_TIMEOUT_MS,
   FILES,
   MIN_USEFUL_CHARS,
   SCHEMA_VERSION,
@@ -21,7 +15,9 @@ import {
   deriveStatus,
   isForgeStatus,
   isTerminalForgeStatus,
+  normalizeDenials,
   ownerAlive,
+  readManifest,
   validOwnerPid,
   jobDir,
   jobFile,
@@ -33,8 +29,7 @@ import {
   warningsFor,
   type ForgeProgress,
 } from '../format.ts';
-
-// ── paths ────────────────────────────────────────────────────────────────────
+import { MAX_TIMEOUT_MS, MIN_TIMEOUT_MS, resolveTimeoutMs } from '../spawn-request.ts';
 
 test('the job root is .agent-smith/jobs', () => {
   assert.equal(jobsDir('/repo'), '/repo/.agent-smith/jobs');
@@ -43,27 +38,27 @@ test('the job root is .agent-smith/jobs', () => {
 });
 
 test('every file name in the format is one the writer and the reader share', () => {
-  // If the writer renamed a file and the reader kept the old name, the anchor
-  // would silently become unreadable and every job would read as `unknown`.
   assert.deepEqual(Object.values(FILES).sort(), [
     'argv.json',
     'cancel',
     'cancel.steer',
     'checks-spec.json',
+    'checks.abort',
     'events.jsonl',
     'job.json',
+    'owner.done',
     'progress.json',
     'request.json',
     'result.json',
     'result.md',
     'stderr.log',
+    'steer.consumed',
+    'steer.discard',
     'steer.head',
     'steer.jsonl',
     'view.json',
   ]);
 });
-
-// ── ids ──────────────────────────────────────────────────────────────────────
 
 test('a job id carries the mode and the smith marker', () => {
   const id = newJobId('implement');
@@ -71,7 +66,6 @@ test('a job id carries the mode and the smith marker', () => {
 });
 
 test('a mode with path characters in it cannot escape the jobs directory', () => {
-  // The id becomes a DIRECTORY name. `../../etc` must not survive.
   const id = newJobId('../../etc/passwd');
   assert.equal(id.includes('/'), false);
   assert.equal(id.includes('..'), false);
@@ -89,16 +83,12 @@ test('multiword modes keep the id shape and job paths reject traversal', () => {
   assert.throws(() => jobDir('/repo', '../outside'), /invalid job id/);
 });
 
-// ── the task cell ────────────────────────────────────────────────────────────
-
 test('the task is the first non-empty prompt line, hash-stripped and capped', () => {
   assert.equal(taskTitle('\n\n# Dashboard rework\n\ndo the thing'), 'Dashboard rework');
   assert.equal(taskTitle('no heading here'), 'no heading here');
   assert.equal(taskTitle('x'.repeat(400)).length, 200);
   assert.equal(taskTitle('   \n  '), '');
 });
-
-// ── emptiness ────────────────────────────────────────────────────────────────
 
 test('a deliberately short final answer is a deliverable; whitespace is not', () => {
   assert.equal(MIN_USEFUL_CHARS, 1);
@@ -115,11 +105,7 @@ test('structured success with a one-word final answer succeeds', () => {
   assert.equal(deriveStatus({ ok: false, jobStatus: 'error', report: 'ready' }).status, 'failed');
 });
 
-// ── THE HEADLINE RULE ────────────────────────────────────────────────────────
-
 test('THE TRAP: exit 0, SUCCESS, denied_actions, empty response ⇒ FAILED', () => {
-  // This is the exact record agy produced in the verified live run. It exits 0,
-  // reports status "SUCCESS", returns "" and did nothing at all.
   const v = deriveStatus({
     ok: false,
     jobStatus: 'denied',
@@ -136,35 +122,29 @@ test('a delivered report with non-fatal tool denials succeeds with a warning', (
   const v = deriveStatus({
     ok: true,
     jobStatus: 'success',
-    deniedActions: [{ action: 'tool', displayName: 'toolu_1' }],
+    deniedActions: [{ action: 'tool', displayName: 'toolu_1', nonfatal: true }],
     report: 'No defects found; could not check exact bytes.',
   });
   assert.equal(v.status, 'succeeded');
   assert.equal(v.suspicious, false);
   assert.match(v.note ?? '', /^1 call denied/);
-  // Same denial with no report is still a failure.
-  assert.equal(deriveStatus({ ok: true, jobStatus: 'success', deniedActions: [{ action: 'tool' }], report: '' }).status, 'failed');
+  assert.equal(deriveStatus({ ok: true, jobStatus: 'success', deniedActions: [{ action: 'tool', nonfatal: true }], report: '' }).status, 'failed');
+  assert.equal(deriveStatus({ ok: true, jobStatus: 'success', deniedActions: [{ action: 'tool' }], report: 'report' }).status, 'failed');
 });
 
 test('a nonfatal denial does not excuse a writing job whose cwd vanished', () => {
   const base = { ok: true, jobStatus: 'success', report: 'Implemented change.', cwdMissing: true } as const;
   const bash = [{ action: 'Bash', nonfatal: true }];
-  // Without and with the denial: both failed, same reason.
   assert.deepEqual(deriveStatus({ ...base, writing: true }), { status: 'failed', suspicious: true, reason: CWD_GONE_REASON });
   assert.deepEqual(deriveStatus({ ...base, writing: true, deniedActions: bash }), { status: 'failed', suspicious: true, reason: CWD_GONE_REASON });
-  // A read-only job keeps its nonfatal-denial success.
   const ro = deriveStatus({ ...base, writing: false, deniedActions: bash });
   assert.equal(ro.status, 'succeeded');
   assert.match(ro.note ?? '', /^1 call denied: Bash/);
-  // Fatal denials and ok === false still outrank the cwd rule.
   assert.match(deriveStatus({ ...base, writing: true, deniedActions: [{ action: 'Bash' }] }).reason ?? '', /denied/);
   assert.equal(deriveStatus({ ...base, ok: false, jobStatus: 'timeout', writing: true }).reason, REASONS.timedOut);
 });
 
 test('the paranoid net: SUCCESS, no denials reported, empty response ⇒ FAILED', () => {
-  // For a provider that does not report denials at all, emptiness is the only
-  // evidence left. Reporting this as a clean success is the quiet failure this
-  // project exists to eliminate.
   const v = deriveStatus({ ok: true, jobStatus: 'success', deniedActions: [], report: '' });
   assert.equal(v.status, 'failed');
   assert.equal(v.suspicious, true);
@@ -190,8 +170,6 @@ test('a real deliverable with SUCCESS ⇒ succeeded, no suspicion', () => {
 });
 
 test('a hard failure with output is still a failure', () => {
-  // Output is not redemption. A job that says it failed and printed a stack trace
-  // has failed.
   const v = deriveStatus({
     ok: false,
     jobStatus: 'error',
@@ -215,8 +193,6 @@ test('denials outrank a success verdict even when output exists', () => {
 });
 
 test('a cancel outranks everything, including a result the worker flushed', () => {
-  // A job we killed has no trustworthy terminal state of its own: whatever the
-  // CLI managed to write on the way down is not what happened to the task.
   for (const ok of [true, false]) {
     const v = deriveStatus({
       alreadyTerminal: 'canceled',
@@ -247,13 +223,9 @@ test('timeout and cancelled from the adapter are failures-or-cancellations, neve
 });
 
 test('a malformed stream with no result event is a failure', () => {
-  // The adapter reports 'malformed' precisely because the process ended and we
-  // never saw a terminal event. There is no reading of that as success.
   const v = deriveStatus({ ok: false, jobStatus: 'malformed', deniedActions: [], report: '' });
   assert.equal(v.status, 'failed');
 });
-
-// ── warnings ─────────────────────────────────────────────────────────────────
 
 test('a suspicious success always produces exactly one warning', () => {
   const v = deriveStatus({ ok: true, deniedActions: [], report: '' });
@@ -277,10 +249,7 @@ test('warnings from progress are carried through', () => {
   ]);
 });
 
-// ── progress flushing ────────────────────────────────────────────────────────
-
 test('progress writes are coalesced, so a 484-tool job is not 484 writes', () => {
-  // The band polls at 3 s and the channel at 5 s; anything under that is invisible.
   assert.equal(shouldFlush(0, 249, 250), false);
   assert.equal(shouldFlush(0, 250, 250), true, 'exactly at the window must flush, or it starves');
   assert.equal(shouldFlush(1000, 1100, 250), false);
@@ -288,15 +257,9 @@ test('progress writes are coalesced, so a 484-tool job is not 484 writes', () =>
 });
 
 test('a clock that went backwards does not deadlock the flusher', () => {
-  // NTP correction mid-job. A backwards stamp suppresses one flush, which is
-  // harmless; what would NOT be harmless is never flushing again. So the rule is
-  // that the very next forward-looking stamp flushes, which is what the second
-  // assertion pins: the flusher is suppressed, never wedged.
   assert.equal(shouldFlush(1000, 500, 250), false, 'a backwards stamp suppresses one flush');
   assert.equal(shouldFlush(500, 800, 250), true, 'and the next forward stamp flushes immediately');
 });
-
-// ── the status enum ──────────────────────────────────────────────────────────
 
 test('isForgeStatus accepts exactly the four states and nothing else', () => {
   for (const s of ['running', 'succeeded', 'failed', 'canceled']) {
@@ -315,7 +278,6 @@ test('changed files are attributed to the job whose tool inputs mention them', (
   const r = attributeChanged(['smoketest/a.txt', 'smoketest/b.txt'], '{"TargetFile":"/repo/smoketest/a.txt"}\n');
   assert.deepEqual(r.mine, ['smoketest/a.txt']);
   assert.deepEqual(r.other, ['smoketest/b.txt']);
-  // No captured input: nothing to attribute against, so nothing is disowned.
   assert.deepEqual(attributeChanged(['x'], ''), { mine: ['x'], other: [] });
 });
 
@@ -331,4 +293,32 @@ test('ownerAlive needs a usable pid that is running', () => {
   }
   assert.equal(validOwnerPid({ ownerPid: 7 }), 7);
   assert.equal(validOwnerPid({ ownerPid: 0 }), null);
+});
+
+test('readManifest normalizes legacy tool denials to nonfatal:true', () => {
+  const repo = mkdtempSync(path.join(tmpdir(), 'format-manifest-'));
+  const jobId = 'review-smith-12345678';
+  mkdirSync(jobDir(repo, jobId), { recursive: true });
+  writeFileSync(jobFile(repo, jobId, FILES.job), JSON.stringify({
+    schema: SCHEMA_VERSION,
+    jobId,
+    deniedActions: [{ action: 'tool', displayName: 'Bash' }, { action: 'command' }, { action: 'tool', nonfatal: false }],
+  }));
+  const m = readManifest(repo, jobId);
+  assert.deepEqual(m.deniedActions, [
+    { action: 'tool', displayName: 'Bash', nonfatal: true },
+    { action: 'command' },
+    { action: 'tool', nonfatal: false },
+  ]);
+  assert.deepEqual(normalizeDenials(undefined), []);
+});
+
+test('resolveTimeoutMs accepts undefined or positive finite numbers and rejects 0/negatives', () => {
+  assert.equal(resolveTimeoutMs(undefined), DEFAULT_TIMEOUT_MS);
+  assert.equal(resolveTimeoutMs(1), MIN_TIMEOUT_MS);
+  assert.equal(resolveTimeoutMs(5_000.9), 5_000);
+  assert.equal(resolveTimeoutMs(MAX_TIMEOUT_MS + 1), MAX_TIMEOUT_MS);
+  for (const bad of [0, -1, -1000, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+    assert.throws(() => resolveTimeoutMs(bad), RangeError);
+  }
 });

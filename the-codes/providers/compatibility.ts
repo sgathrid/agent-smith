@@ -1,4 +1,3 @@
-/** Explicit doctor probes. Availability/spawn stay cheap and do not call these. */
 import { execFile } from 'node:child_process';
 
 export interface CompatibilityProbe {
@@ -23,7 +22,8 @@ const HELP: Record<string, readonly { args: readonly string[]; flags: readonly s
   ],
   claude: [{ args: ['--help'], flags: ['--print', '--output-format', '--verbose', '--forward-subagent-text',
     '--model', '--effort', '--add-dir', '--permission-mode', '--permission-prompts',
-    '--dangerously-skip-permissions', '--allowedTools', '--disallowedTools', '--resume', '--bare', '--setting-sources'] }],
+    '--dangerously-skip-permissions', '--allowedTools', '--disallowedTools', '--resume', '--bare', '--setting-sources',
+    '--input-format', '--replay-user-messages'] }],
   opencode: [{ args: ['run', '--help'], flags: ['--standalone', '--format', '--model', '--auto', '--session'] }],
   kimi: [
     { args: ['--help'], flags: ['--prompt', '--output-format', '--model', '--session', '--add-dir'] },
@@ -46,13 +46,11 @@ export const probeCommand: ProbeCommand = (binary, args, timeoutMs) => new Promi
   });
 });
 
-/** AGENT_SMITH_PROBE_TIMEOUT_MS overrides the default probe budget (slow or loaded machines). */
 function envProbeTimeout(): number | undefined {
   const n = Number(process.env['AGENT_SMITH_PROBE_TIMEOUT_MS']);
   return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
-/** Checks the actual CLI surface, never authenticates or submits a prompt. */
 export async function checkCompatibility(provider: string, binary: string,
   options: { timeoutMs?: number; probe?: ProbeCommand } = {}): Promise<ProviderCompatibility> {
   const commands = HELP[provider];
@@ -73,7 +71,6 @@ export async function checkCompatibility(provider: string, binary: string,
     const invocation = `${binary} ${command.args.join(' ')}`;
     if (result.error !== undefined) { unknown.push(`${invocation}: ${result.error}`); return; }
     if (result.output.trim() === '') { unknown.push(`${invocation}: empty help output`); return; }
-    // Match whole option names; --permission-mode cannot stand in for --permission-prompts.
     const flags = new Set(result.output.match(/--?[A-Za-z][A-Za-z0-9-]*/g) ?? []);
     const absent = command.flags.filter(flag => !flags.has(flag));
     if (absent.length) missing.push(`${invocation}: missing ${absent.join(', ')}`);

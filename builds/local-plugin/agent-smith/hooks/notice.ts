@@ -1,33 +1,19 @@
-/**
- * notice.ts: the words Agent Smith uses to say a job finished, and which jobs
- * this session may announce. Pure; no host API, no `node:` imports.
- *
- * One owner, two speakers. The mod announces through `$.ui.log` (the user's
- * line) and `$.prompt.submit` (Claude's turn, credited to the plugin). Without
- * the mod, the PostToolUse command hook (channel/src/watch-hook.ts) wakes Claude
- * with exit 2. Both render here, so the two paths cannot drift apart.
- *
- * Who announces is decided once per launch, when the mod sees the launch
- * (`tool.call`): the mod claims the job and writes a claim marker; the command
- * hook, which still starts, finds the marker when the job ends and stays silent. Nothing else
- * announces a claimed job (see register.tsx, `takeLaunch`).
- */
-
-import { checksReason, reasonFromText } from './reasons.ts';
+import { STEER_NOT_APPLIED_RE, checksReason, reasonFromText } from './reasons.ts';
 import { isTerminal } from './format.ts';
+import { isWorkerIdle, pickHead, type ContinuationKind, type TurnLike } from './turns.ts';
 
-/**
- * The fields of a Forge row (types/index.d.ts RadarJob) a notice reads. Declared
- * here, structurally, because the channel compiles this file too and must not
- * pull in the mod's `claude-code` module augmentation.
- */
+export type NoticeContinuationKind = ContinuationKind;
+
 export interface NoticeRow {
   readonly id: string;
   readonly status: string;
+  readonly workerId?: string;
+  readonly turn?: number;
   readonly name?: string | null;
   readonly provider?: string | null;
   readonly role?: string | null;
   readonly startedAt: number | null;
+  readonly chainStartedAt?: number | null;
   readonly endedAt: number | null;
   readonly lastEventAt?: number | null;
   readonly changedFileCount?: number | null;
@@ -36,68 +22,43 @@ export interface NoticeRow {
   readonly latestSummary?: string | null;
   readonly summarySource?: 'worker' | null;
   readonly supersededBy?: string | null;
-  readonly steeredFrom?: string | null;
-  readonly warnings?: readonly { readonly code: string }[] | null;
+  readonly followedBy?: string | null;
+  readonly continuedFrom?: string | null;
+  readonly continuationKind?: NoticeContinuationKind | null;
+  readonly pendingMessages?: number | null;
+  readonly warnings?: readonly { readonly code: string; readonly message?: string }[] | null;
   readonly staleReads?: readonly string[] | null;
   readonly acceptance?: { readonly pending?: boolean; readonly budgetMs?: number; readonly running?: string; readonly checks: readonly { readonly ok: boolean; readonly name?: string }[] };
-  /** stale.ts livenessOf, for a running job. */
   readonly liveness?: { readonly state: string; readonly silentForMs: number; readonly since: number | null; readonly tool?: string } | null;
 }
 
-// ── vocabulary ──────────────────────────────────────────────────────────────
-
-/** The four things worth telling Claude. Progress is never one of them. */
 export type NoticeKind = 'finished' | 'failed' | 'cancelled' | 'attention';
 
-/**
- * Acceptance checks run after a job ends, so a finished job briefly carries a
- * pending placeholder. Hold its notice until the verdict lands, never longer
- * than this: a crashed checker must not silence a finished job. A placeholder
- * that carries its own `budgetMs` (the checks' timeouts summed) holds that long.
- */
 export const ACCEPTANCE_HOLD_MS = 5 * 60_000;
 
-/** Everything a notice says about one job. Built from either reader's row. */
 export interface NoticeJob {
   readonly id: string;
   readonly kind: NoticeKind;
   readonly name?: string | null;
   readonly provider?: string | null;
   readonly role?: string | null;
-  /** Start to end for a terminal job; for `attention`, time since the last event (silent) or the last heartbeat (dead). */
   readonly durationMs?: number | null;
   readonly changedFiles?: number | null;
-  readonly checks?: { readonly passed: number; readonly total: number; /** Names of the failed checks. */ readonly failed?: readonly string[] } | null;
-  /** Runtime-owned: a failure reason, or a pipeline's stage verdicts. */
+  readonly checks?: { readonly passed: number; readonly total: number; readonly failed?: readonly string[] } | null;
   readonly reason?: string | null;
-  /** Worker-authored prose. A claim, never an instruction. */
   readonly summary?: string | null;
-  /** Watched brief files that changed in the repository while the job ran. */
   readonly staleReads?: readonly string[] | null;
-  /** This turn came after a steer, so its report covers only this turn. */
-  readonly steered?: boolean;
-  /** A queued steer was dropped because this turn did not succeed. */
+  readonly continuationKind?: NoticeContinuationKind | null;
   readonly steerNotApplied?: boolean;
-  /** A pipeline run: the id is a runId and Claude reads it with pipeline_status. */
+  readonly droppedMessage?: string;
+  readonly alsoRan?: { readonly from: number; readonly to: number };
   readonly run?: boolean;
-  /**
-   * The worker exited but its acceptance checks have no verdict yet: the names of
-   * those running (true when unnamed). The notice must not say "done".
-   */
   readonly checksRunning?: string | true;
-  /**
-   * For `attention`: why. `dead` = the worker process stopped while the job is
-   * still running; otherwise silent (no output). `tool` = a call still open.
-   */
   readonly liveness?: { readonly state: 'silent' | 'dead'; readonly tool?: string };
 }
 
 const GLYPH: Record<NoticeKind, string> = { finished: '✓', failed: '✗', cancelled: '■', attention: '!' };
 
-// ── text ────────────────────────────────────────────────────────────────────
-
-/** Bound prose at a sentence or word boundary, never mid-word. The channel's
- * views.ts `trimWords` is its near-twin. */
 export function compactExcerpt(value: string, max: number): string {
   const text = value.replace(/\s+/g, ' ').trim();
   if (text.length <= max) return text;
@@ -107,7 +68,6 @@ export function compactExcerpt(value: string, max: number): string {
   return `${end > 0 ? prefix.slice(0, end).trimEnd() : ''}…`;
 }
 
-/** `43s`, `12m`, `1h05m`; '' for an unknown or negative span. */
 export function durationWords(ms: number | null | undefined): string {
   if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return '';
   const s = Math.round(ms / 1000);
@@ -117,16 +77,11 @@ export function durationWords(ms: number | null | undefined): string {
   return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}m`;
 }
 
-/**
- * The service names an unnamed worker `<mode>-<last 8 of the job id>`. Beside
- * the job id that reads as a typo, so it counts as no name.
- */
 function chosenName(job: NoticeJob): string | null {
   if (!job.name) return null;
   return !job.run && job.id.length >= 8 && job.name.endsWith(`-${job.id.slice(-8)}`) ? null : job.name;
 }
 
-/** `Ada (codex review)`, `review-smith-1a2b3c4d (agy review)`, or `job <id>`. */
 function who(job: NoticeJob): string {
   const identity = [job.provider, job.role].filter(Boolean).join(' ');
   const name = chosenName(job);
@@ -135,23 +90,10 @@ function who(job: NoticeJob): string {
   return identity ? `${job.id} (${identity})` : `job ${job.id}`;
 }
 
-/** Execution succeeded but a check failed: the work is not done. */
 function rejected(job: NoticeJob): boolean {
   return job.kind === 'finished' && !job.run && job.checks != null && job.checks.passed < job.checks.total;
 }
 
-/**
- * One line, the outcome last:
- *   ✓ Ada (codex review) 43s · done · checks 2/2
- *   ✗ Bo (agy implement) 45m · failed: timed out
- *   ✗ Cy (codex implement) 3m · checks failed: lint
- *   ✓ Ed (codex review) 6s · done · after steer
- *   ✗ Flo (codex review) 4s · failed: timed out · queued steer not applied
- *   ! Di (opencode research) · no output for 16m
- *   ! Di (opencode research) · no output for 16m (in `npm test`)
- *   ! Di (opencode research) · process gone 3m
- * A quiet job is stated as a fact, never as a prompt to interrupt it.
- */
 export function headline(job: NoticeJob): string {
   const d = durationWords(job.durationMs);
   const reason = job.reason ? compactExcerpt(job.reason, 160) : '';
@@ -177,8 +119,10 @@ export function headline(job: NoticeJob): string {
       else parts.push(`no output${d ? ` for ${d}` : ''}${job.liveness?.tool ? ` (in \`${job.liveness.tool}\`)` : ''}`);
       break;
   }
-  if (job.steered) parts.push('after steer');
-  if (job.steerNotApplied) parts.push('queued steer not applied');
+  if (job.continuationKind === 'follow-up') parts.push('follow-up');
+  else if (job.continuationKind === 'steer') parts.push('steered');
+  if (job.alsoRan) parts.push(job.alsoRan.from === job.alsoRan.to ? `also ran turn ${job.alsoRan.from}` : `also ran turns ${job.alsoRan.from}–${job.alsoRan.to}`);
+  if (job.steerNotApplied) parts.push(`queued follow-up not sent${job.droppedMessage ? `: "${compactExcerpt(job.droppedMessage, 80)}"` : ''}`);
   if (job.staleReads && job.staleReads.length > 0) {
     const first = job.staleReads[0]!;
     const extra = job.staleReads.length > 1 ? ` +${job.staleReads.length - 1}` : '';
@@ -189,12 +133,6 @@ export function headline(job: NoticeJob): string {
 
 const CLAUDE_JOBS = 8;
 
-/**
- * What Claude reads. One line per job, then how to read it:
- *   Agent Smith · ✗ pp-engine (agy implement) 21m · failed: denied view_file
- *   status implement-smith-6b456b3d
- * The worker's own summary is left out: Claude reads the result with status.
- */
 export function claudeText(jobs: readonly NoticeJob[]): string {
   if (jobs.length === 0) return '';
   const one = jobs.length === 1;
@@ -217,7 +155,6 @@ export function claudeText(jobs: readonly NoticeJob[]): string {
   return lines.join('\n');
 }
 
-/** Counts in the order a reader scans them: done first, then what needs a look. */
 function shown(counts: ReadonlyMap<string, number>): [string, number][] {
   return ['done', 'exited', 'failed', 'canceled', 'no output', 'process gone'].flatMap((k) => (counts.has(k) ? [[k, counts.get(k)!] as [string, number]] : []));
 }
@@ -232,13 +169,8 @@ const HOST_FRAME = [
   /^This is how Claude Code surfaces (?:a prompt|prompts) a plugin submits\b/,
 ];
 
-/** The line telling Claude how to read the job: for Claude, not for the user. */
 const READ_LINE = /^(?:status|pipeline_status) /;
 
-/**
- * The text drawn for the user on a UserMessage from this plugin:
- * the notice's own lines, without the host frame or the read-it-with line.
- */
 export function displayNoticeText(text: string): string {
   const lines = text
     .split('\n')
@@ -252,11 +184,8 @@ const STATE: Record<NoticeKind, string> = {
   finished: 'done', failed: 'failed', cancelled: 'canceled', attention: 'no output',
 };
 
-// ── launch acks ─────────────────────────────────────────────────────────────
-
 const isObj = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v);
 
-/** Normalise any MCP result shape to the tool's payload object, or null on error/unparseable. */
 export function unwrapResponse(response: unknown, depth = 0): Record<string, unknown> | null {
   if (depth > 4) return null;
   if (typeof response === 'string') {
@@ -273,37 +202,26 @@ export function unwrapResponse(response: unknown, depth = 0): Record<string, unk
   }
   if (!isObj(response)) return null;
   if (response['isError'] === true) return null;
-  // Tasks clients deliver this result themselves; neither notice path owns it.
   if (isObj(response['_meta']) && response['_meta']['io.agent-smith/task-result'] === true) return null;
   if (isObj(response['structuredContent'])) return response['structuredContent'];
   if (Array.isArray(response['content'])) return unwrapResponse(response['content'], depth + 1);
   return response;
 }
 
-/** The launch tools, by bare name. */
-const LAUNCH: Record<string, 'job' | 'run'> = { spawn_job: 'job', resume_job: 'job', steer_job: 'job', run_pipeline: 'run' };
+const LAUNCH: Record<string, 'job' | 'run'> = { spawn_job: 'job', follow_up: 'job', steer: 'job', run_pipeline: 'run' };
 
-/**
- * The launch tools under any server name that ends in `agent-smith`: the built
- * plugin (`mcp__plugin_agent-smith_agent-smith__`) and dev.sh (`mcp__agent-smith__`).
- */
-export const LAUNCH_TOOL = /^mcp__(?:plugin_agent-smith_)?agent-smith__(?:spawn_job|resume_job|steer_job|run_pipeline)$/;
+export const LAUNCH_TOOL = /^mcp__(?:plugin_agent-smith_)?agent-smith__(?:spawn_job|follow_up|steer|run_pipeline)$/;
 export const STATUS_TOOL = /^mcp__(?:plugin_agent-smith_)?agent-smith__(?:status|pipeline_status|cancel)$/;
 
-/**
- * When Claude reads a job or pipeline run that has already settled (including
- * acceptance checks), or cancels one and the answer says it stopped, return its { kind, id } so the session can retire its
- * pending completion notice instead of waking Claude a second time.
- */
 export function parseSettledRead(
   toolName: unknown,
   response: unknown,
-): { readonly kind: 'job' | 'run'; readonly id: string; readonly resolvedFrom?: string } | null {
+): { readonly kind: 'job' | 'run'; readonly id: string; readonly resolvedFrom?: string; readonly workerId?: string } | null {
   if (typeof toolName !== 'string' || !STATUS_TOOL.test(toolName)) return null;
   const payload = unwrapResponse(response);
   if (payload === null || typeof payload['error'] === 'string') return null;
   const bare = toolName.slice(toolName.lastIndexOf('__') + 2);
-  // Claude cancelled it and the answer says it stopped: a notice would only repeat that.
+  const workerId = typeof payload['workerId'] === 'string' && payload['workerId'].length > 0 ? payload['workerId'] : undefined;
   if (bare === 'cancel') {
     if (payload['settled'] !== true) return null;
     const runId = payload['runId'];
@@ -311,9 +229,12 @@ export function parseSettledRead(
     const jobId = payload['jobId'];
     if (typeof jobId !== 'string' || jobId.length === 0) return null;
     const resolvedFrom = payload['resolvedFrom'];
-    return typeof resolvedFrom === 'string' && resolvedFrom.length > 0 && resolvedFrom !== jobId
-      ? { kind: 'job', id: jobId, resolvedFrom }
-      : { kind: 'job', id: jobId };
+    return {
+      kind: 'job',
+      id: jobId,
+      ...(typeof resolvedFrom === 'string' && resolvedFrom.length > 0 && resolvedFrom !== jobId ? { resolvedFrom } : {}),
+      ...(workerId !== undefined ? { workerId } : {}),
+    };
   }
   if (bare === 'pipeline_status') {
     const runId = payload['runId'];
@@ -330,16 +251,19 @@ export function parseSettledRead(
   if (typeof status !== 'string' || !isTerminal(status)) return null;
   const acceptance = payload['acceptance'];
   if (isObj(acceptance) && acceptance['pending'] === true) return null;
-  return { kind: 'job', id: jobId };
+  return { kind: 'job', id: jobId, ...(workerId !== undefined ? { workerId } : {}) };
 }
 
 export function unclaim(
   owned: readonly Owned[],
-  settled: { readonly kind: 'job' | 'run'; readonly id: string; readonly resolvedFrom?: string },
+  settled: { readonly kind: 'job' | 'run'; readonly id: string; readonly resolvedFrom?: string; readonly workerId?: string },
 ): Owned[] {
-  return owned.filter(
-    (o) => !(o.kind === settled.kind && (o.id === settled.id || (settled.resolvedFrom !== undefined && o.id === settled.resolvedFrom))),
-  );
+  const matches = (o: Owned) => o.kind === settled.kind && (
+    o.id === settled.id ||
+    (settled.resolvedFrom !== undefined && o.id === settled.resolvedFrom) ||
+    (settled.workerId !== undefined && o.workerId === settled.workerId));
+  if (settled.kind === 'run') return owned.filter((o) => !matches(o));
+  return owned.map((o) => (matches(o) ? { ...o, readHead: settled.id } : o));
 }
 
 function launchKind(toolName: unknown): 'job' | 'run' | null {
@@ -349,16 +273,11 @@ function launchKind(toolName: unknown): 'job' | 'run' | null {
 }
 
 const trimSlash = (p: string): string => p.replace(/\/+$/, '');
-/** `/repo/.agent-smith/<dir>/<leaf>` → `/repo`, else null. */
 function repoAbove(file: string, dir: 'jobs' | 'pipelines'): string | null {
   const parts = trimSlash(file).split('/');
   return parts.length >= 3 && parts.at(-2) === dir && parts.at(-3) === '.agent-smith' ? parts.slice(0, -3).join('/') || '/' : null;
 }
 
-/**
- * The file the mod writes when it claims a launch. The command hook checks it
- * before waking Claude, so a launch the mod claimed is announced once.
- */
 export function claimMarkerPath(repo: string, kind: 'job' | 'run', id: string): string {
   return `${repo.replace(/\/+$/, '')}/.agent-smith/claims/${kind}-${encodeURIComponent(id)}`;
 }
@@ -366,13 +285,12 @@ export function claimMarkerPath(repo: string, kind: 'job' | 'run', id: string): 
 export interface Launch {
   readonly kind: 'job' | 'run';
   readonly id: string;
-  /** The repo the ack names, or null when it names none. */
+  readonly workerId?: string;
+  readonly startsTurn?: true;
   readonly repo: string | null;
-  /** The job's own budget (ms), when the ack carries one. */
   readonly timeoutMs: number | null;
 }
 
-/** What a successful launch ack started, or null for an error or another tool. */
 export function parseLaunch(toolName: unknown, response: unknown): Launch | null {
   const kind = launchKind(toolName);
   if (kind === null) return null;
@@ -381,11 +299,6 @@ export function parseLaunch(toolName: unknown, response: unknown): Launch | null
   return launchFromPayload(kind, payload);
 }
 
-/**
- * Every launch an ack started. A `variants` spawn answers `{ jobs: [ack | {name, error}, ...] }`:
- * one launch per item that started a job, none for an item that failed. Any other ack is
- * the single launch parseLaunch reads.
- */
 export function parseLaunches(toolName: unknown, response: unknown): Launch[] {
   const kind = launchKind(toolName);
   if (kind === null) return [];
@@ -410,17 +323,23 @@ function launchFromPayload(kind: 'job' | 'run', payload: Record<string, unknown>
   // Hosts may expose only structuredContent and omit the outer MCP metadata.
   if (kind === 'job' && isTerminal(String(payload['status']))) return null;
   if (typeof id !== 'string' || id.length === 0) return null;
+  const workerId = kind === 'job' && typeof payload['workerId'] === 'string' && payload['workerId'].length > 0
+    ? payload['workerId'] : undefined;
   let repo: string | null = null;
   if (typeof payload['repo'] === 'string' && payload['repo'].length > 0) repo = trimSlash(payload['repo']);
   else if (kind === 'job' && typeof payload['dir'] === 'string') repo = repoAbove(payload['dir'], 'jobs');
   else if (kind === 'run' && typeof payload['recordPath'] === 'string') repo = repoAbove(payload['recordPath'], 'pipelines');
   const t = payload['timeoutMs'];
-  return { kind, id, repo, timeoutMs: typeof t === 'number' && Number.isFinite(t) && t > 0 ? t : null };
+  return {
+    kind,
+    id,
+    ...(workerId !== undefined ? { workerId } : {}),
+    ...(payload['action'] === 'started' ? { startsTurn: true as const } : {}),
+    repo,
+    timeoutMs: typeof t === 'number' && Number.isFinite(t) && t > 0 ? t : null,
+  };
 }
 
-// ── projections ─────────────────────────────────────────────────────────────
-
-/** The pushable kind for a job state, or null for progress and unknowns. */
 function kindOf(status: string): NoticeKind | null {
   switch (status) {
     case 'succeeded': return 'finished';
@@ -431,15 +350,15 @@ function kindOf(status: string): NoticeKind | null {
   }
 }
 
-/** A Forge row (canonical.ts) as a notice. */
 export function noticeFromRadar(job: NoticeRow, kind: NoticeKind, now: number): NoticeJob {
   const checks = job.acceptance?.checks ?? [];
   const dead = kind === 'attention' && job.liveness?.state === 'dead';
+  const start = job.chainStartedAt ?? job.startedAt;
   const span = dead
     ? (job.liveness?.since != null ? now - job.liveness.since : null)
     : kind === 'attention'
       ? (job.liveness ? job.liveness.silentForMs : job.lastEventAt != null ? now - job.lastEventAt : null)
-      : (job.endedAt != null && job.startedAt != null ? job.endedAt - job.startedAt : null);
+      : (job.endedAt != null && start != null ? job.endedAt - start : null);
   return {
     id: job.id, kind, name: job.name, provider: job.provider, role: job.role,
     durationMs: span,
@@ -450,14 +369,27 @@ export function noticeFromRadar(job: NoticeRow, kind: NoticeKind, now: number): 
     reason: kind === 'failed' ? job.failureDetail || reasonFromText(job.failureReason) : null,
     summary: job.summarySource === 'worker' ? job.latestSummary ?? null : null,
     ...(job.staleReads && job.staleReads.length > 0 ? { staleReads: job.staleReads } : {}),
-    ...(job.steeredFrom ? { steered: true } : {}),
-    ...(job.warnings?.some((w) => w.code === 'steer_not_applied') ? { steerNotApplied: true } : {}),
+    ...(job.continuationKind ? { continuationKind: job.continuationKind } : {}),
+    ...steerNotAppliedFields(job.warnings),
     ...(kind === 'finished' && job.acceptance?.pending === true ? { checksRunning: job.acceptance.running ?? true } : {}),
     ...(kind === 'attention' ? { liveness: { state: dead ? 'dead' as const : 'silent' as const, ...(job.liveness?.tool ? { tool: job.liveness.tool } : {}) } } : {}),
   };
 }
 
-/** The pipeline record fields a notice needs (forge/execute.ts PipelineRecord). */
+export function steerNotAppliedFields(warnings: NoticeRow['warnings']): { steerNotApplied?: true; droppedMessage?: string } {
+  const w = warnings?.find((x) => x.code === 'steer_not_applied' || (typeof x.message === 'string' && STEER_NOT_APPLIED_RE.test(x.message)));
+  if (!w) return {};
+  const quote = droppedMessageQuote(w.message);
+  return { steerNotApplied: true, ...(quote ? { droppedMessage: quote } : {}) };
+}
+
+export function droppedMessageQuote(message: string | null | undefined): string | null {
+  if (typeof message !== 'string') return null;
+  const m = /"([^"\n]+)|“([^”\n]+)/.exec(message);
+  const text = (m?.[1] ?? m?.[2] ?? '').trim();
+  return text === '' ? null : text;
+}
+
 export interface RunRecord {
   readonly runId: string;
   readonly pipeline: string;
@@ -468,10 +400,6 @@ export interface RunRecord {
   readonly stageResults: Readonly<Record<string, { stage?: unknown; status?: unknown; acceptance?: unknown; jobId?: unknown; failure?: unknown; verification?: unknown } | null>>;
 }
 
-/**
- * Pipeline outcome: `2/3 stages passed · test: checks failed: lint`. The first
- * stage that did not pass says why, in the shared short words.
- */
 export function pipelineOutcome(run: RunRecord): string {
   const stages = Object.values(run.stageResults)
     .filter((s): s is NonNullable<typeof s> => s !== null && typeof s === 'object' && typeof s.stage === 'string');
@@ -492,7 +420,6 @@ function stageReason(s: NonNullable<RunRecord['stageResults'][string]>): string 
   return reasonFromText(typeof f?.['message'] === 'string' ? f['message'] : typeof f?.['code'] === 'string' ? f['code'] : null);
 }
 
-/** Validate a parsed pipeline record; null when malformed. */
 export function asRunRecord(value: unknown): RunRecord | null {
   if (!isObj(value)) return null;
   const r = value as Partial<RunRecord>;
@@ -502,7 +429,6 @@ export function asRunRecord(value: unknown): RunRecord | null {
   return r as RunRecord;
 }
 
-/** A finished pipeline run as a notice; null while it runs. */
 function noticeFromRun(run: RunRecord): NoticeJob | null {
   if (run.status === 'running' || run.finishedAt === null) return null;
   return {
@@ -515,52 +441,61 @@ export function stageJobIds(run: RunRecord): string[] {
   return Object.values(run.stageResults).flatMap((s) => (s && typeof s.jobId === 'string' ? [s.jobId] : []));
 }
 
-/** forge/execute.ts safeRunId: the pipeline record's file name. */
 export function runFileName(runId: string): string {
   return `${runId.replace(/[^A-Za-z0-9._-]+/g, '-').slice(0, 100) || 'pipeline'}.json`;
 }
 
-// ── ownership ───────────────────────────────────────────────────────────────
-
-/** One launch this session claimed. Kept in session state until announced. */
 export interface Owned {
   readonly kind: 'job' | 'run';
   readonly id: string;
-  /** Epoch ms of the claim. */
+  readonly workerId?: string;
+  readonly fromTurn?: number;
+  readonly readHead?: string;
   readonly at: number;
-  /** Give up silently after this (the job's budget plus an hour): it can no longer be news. */
   readonly until: number;
-  /** True once its silence was announced; silence is said once. */
   readonly saidAttention?: boolean;
-  /** True once "process gone" was announced; said once, even after a silence notice. */
   readonly saidDead?: boolean;
-  /** True once "exited, checks running" was announced; the verdict is announced again when it lands. */
   readonly saidExited?: boolean;
   readonly saidStageAttention?: readonly string[];
 }
 
-/** Longest job a spawn may request (forge MAX_TIMEOUT_MS = 6h). */
 const MAX_JOB_MS = 6 * 60 * 60_000;
 
 export function claim(owned: readonly Owned[], launch: Launch, now: number): Owned[] {
   const until = now + (launch.timeoutMs ?? MAX_JOB_MS) + 60 * 60_000;
-  const idx = owned.findIndex((o) => o.id === launch.id && o.kind === launch.kind);
-  if (idx >= 0) {
-    const existing = owned[idx]!;
-    if (until <= existing.until) return [...owned];
-    return owned.map((o, i) => (i === idx ? { ...o, until } : o));
+  const idx = owned.findIndex((o) => o.kind === launch.kind && (
+    o.id === launch.id || (launch.kind === 'job' && launch.workerId !== undefined && o.workerId === launch.workerId)));
+  if (idx < 0) {
+    return [...owned, { kind: launch.kind, id: launch.id, ...(launch.workerId ? { workerId: launch.workerId } : {}), at: now, until }];
   }
-  return [...owned, { kind: launch.kind, id: launch.id, at: now, until }];
+  if (launch.startsTurn === true && owned[idx]!.id !== launch.id) {
+    const fresh: Owned = { kind: launch.kind, id: launch.id, ...(launch.workerId ? { workerId: launch.workerId } : {}), at: now, until };
+    return owned.map((o, i) => (i === idx ? fresh : o));
+  }
+  const { readHead, ...existing } = owned[idx]!;
+  const workerId = launch.workerId ?? existing.workerId;
+  const next: Owned = {
+    ...existing,
+    ...(workerId ? { workerId } : {}),
+    until: Math.max(existing.until, until),
+    ...(readHead !== undefined && launch.id === readHead ? { readHead } : {}),
+  };
+  return owned.map((o, i) => (i === idx ? next : o));
 }
 
-/**
- * The announcement decision for one poll. PURE.
- *
- * Only claimed ids are considered, so another session's jobs in the same repo
- * are never announced here. A claimed job that is already terminal on first
- * sight is announced (there is no baseline: the claim itself is the baseline).
- * Stage jobs of a claimed run are announced with the run, once it ends.
- */
+export function noticeTurn(row: NoticeRow): TurnLike {
+  return {
+    jobId: row.id, status: row.status, turn: row.turn, supersededBy: row.supersededBy, followedBy: row.followedBy,
+    startedAt: row.startedAt ?? row.endedAt, acceptancePending: row.acceptance?.pending === true,
+    pendingMessages: row.pendingMessages,
+  };
+}
+
+function alsoRan(fromTurn: number | undefined, head: NoticeRow): { from: number; to: number } | null {
+  const turn = head.turn ?? 1;
+  return fromTurn !== undefined && fromTurn < turn ? { from: fromTurn, to: turn - 1 } : null;
+}
+
 export function due(
   owned: readonly Owned[],
   jobs: readonly NoticeRow[],
@@ -568,6 +503,13 @@ export function due(
   now: number,
 ): { notices: NoticeJob[]; owned: Owned[] } {
   const byId = new Map(jobs.map((j) => [j.id, j]));
+  const byWorker = new Map<string, NoticeRow[]>();
+  for (const j of jobs) {
+    if (!j.workerId) continue;
+    const list = byWorker.get(j.workerId);
+    if (list) list.push(j);
+    else byWorker.set(j.workerId, [j]);
+  }
   const notices: NoticeJob[] = [];
   const seenNotices = new Set<string>();
   const pushNotice = (notice: NoticeJob) => {
@@ -579,20 +521,28 @@ export function due(
   };
   const keep: Owned[] = [];
   const pushKeep = (entry: Owned) => {
-    const existingIdx = keep.findIndex((k) => k.kind === entry.kind && k.id === entry.id);
+    const existingIdx = keep.findIndex((k) =>
+      k.kind === entry.kind && (k.id === entry.id || (k.kind === 'job' && entry.workerId !== undefined && k.workerId === entry.workerId)),
+    );
     if (existingIdx >= 0) {
       const prev = keep[existingIdx]!;
+      const sameId = prev.id === entry.id;
+      const fromTurn = Math.min(prev.fromTurn ?? Infinity, entry.fromTurn ?? Infinity);
       keep[existingIdx] = {
         ...prev,
+        id: sameId ? prev.id : entry.id,
+        ...(entry.workerId ?? prev.workerId ? { workerId: entry.workerId ?? prev.workerId } : {}),
+        ...(Number.isFinite(fromTurn) ? { fromTurn } : {}),
         until: Math.max(prev.until, entry.until),
-        ...(prev.saidAttention || entry.saidAttention ? { saidAttention: true } : {}),
-        ...(prev.saidDead || entry.saidDead ? { saidDead: true } : {}),
-        ...(prev.saidExited || entry.saidExited ? { saidExited: true } : {}),
+        ...(sameId && (prev.saidAttention || entry.saidAttention) ? { saidAttention: true } : {}),
+        ...(sameId && (prev.saidDead || entry.saidDead) ? { saidDead: true } : {}),
+        ...(sameId && (prev.saidExited || entry.saidExited) ? { saidExited: true } : {}),
       };
     } else {
       keep.push(entry);
     }
   };
+  const refreshed = (until: number) => Math.max(until, now + MAX_JOB_MS + 60 * 60_000);
   for (const o of owned) {
     if (o.kind === 'run') {
       const run = runs.get(o.id);
@@ -617,53 +567,67 @@ export function due(
       if (now <= o.until) pushKeep({ ...o, saidStageAttention: [...said] });
       continue;
     }
-    let currentOwned = o;
-    let job = byId.get(currentOwned.id);
-    const visited = new Set<string>([currentOwned.id]);
-    while (job?.supersededBy && !visited.has(job.supersededBy)) {
-      visited.add(job.supersededBy);
-      const nextId = job.supersededBy;
-      const child = byId.get(nextId);
-      currentOwned = {
-        kind: 'job',
-        id: nextId,
-        at: child ? now : currentOwned.at,
-        until: child ? Math.max(currentOwned.until, now + MAX_JOB_MS + 60 * 60_000) : currentOwned.until,
-      };
-      job = child;
-    }
-    if (currentOwned.id !== o.id && !job) {
-      if (now <= currentOwned.until) pushKeep(currentOwned);
+    const own = byId.get(o.id);
+    const workerId = o.workerId ?? own?.workerId;
+    const fromTurn = o.fromTurn ?? own?.turn ?? (own ? 1 : undefined);
+    let current: Owned = { ...o, ...(workerId ? { workerId } : {}), ...(fromTurn !== undefined ? { fromTurn } : {}) };
+    if (!own) {
+      if (now <= current.until) pushKeep(current);
       continue;
     }
-    const kind = job ? kindOf(job.status) : null;
-    if (job && kind === 'attention') {
-      const dead = job.liveness?.state === 'dead';
-      if (!currentOwned.saidAttention || (dead && !currentOwned.saidDead)) {
-        pushNotice(noticeFromRadar(job, kind, now));
-        pushKeep({ ...currentOwned, saidAttention: true, ...(dead ? { saidDead: true } : {}) });
+    const turns = workerId ? byWorker.get(workerId) ?? [own] : [own];
+    const head = pickHead(turns.map((t) => ({ ...noticeTurn(t), row: t })))?.row ?? own;
+    if (head.id !== current.id) {
+      const { saidAttention: _a, saidDead: _d, saidExited: _e, ...rest } = current;
+      current = { ...rest, id: head.id, at: now, until: refreshed(current.until) };
+    }
+    const successor = head.supersededBy ?? head.followedBy;
+    if (successor && isTerminal(head.status) && !byId.has(successor)) {
+      const { saidAttention: _a, saidDead: _d, saidExited: _e, ...rest } = current;
+      pushKeep({ ...rest, id: successor, at: now, until: refreshed(current.until) });
+      continue;
+    }
+    const kind = kindOf(head.status);
+    if (kind === 'attention') {
+      const dead = head.liveness?.state === 'dead';
+      if (!current.saidAttention || (dead && !current.saidDead)) {
+        pushNotice(noticeFromRadar(head, kind, now));
+        pushKeep({ ...current, saidAttention: true, ...(dead ? { saidDead: true } : {}) });
       } else {
-        pushKeep(currentOwned);
+        pushKeep(current);
       }
       continue;
     }
-    if (job && kind && !held(job, now)) {
-      const notice = noticeFromRadar(job, kind, now);
-      if (notice.checksRunning === undefined) {
-        pushNotice(notice);
-        continue;
-      }
-      // Held past its budget with checks still pending: say so once, then wait for the verdict.
-      if (!currentOwned.saidExited) pushNotice(notice);
-      if (now <= currentOwned.until) pushKeep({ ...currentOwned, saidExited: true });
+    if (kind === null) {
+      if (now <= current.until) pushKeep(current);
       continue;
     }
-    if (now <= currentOwned.until) pushKeep(currentOwned);
+    if (head.acceptance?.pending === true && kind !== 'finished' && !held(head, now)) {
+      if (current.readHead !== head.id) pushNotice(withAlso(noticeFromRadar(head, kind, now), alsoRan(current.fromTurn, head)));
+      continue;
+    }
+    if (head.acceptance?.pending === true) {
+      if (!held(head, now) && !current.saidExited && current.readHead !== head.id) {
+        pushNotice(withAlso(noticeFromRadar(head, kind, now), alsoRan(current.fromTurn, head)));
+        current = { ...current, saidExited: true };
+      }
+      if (now <= current.until) pushKeep(current);
+      continue;
+    }
+    if (!isWorkerIdle(noticeTurn(head))) {
+      if (now <= current.until) pushKeep(current);
+      continue;
+    }
+    if (current.readHead === head.id) continue;
+    pushNotice(withAlso(noticeFromRadar(head, kind, now), current.saidExited ? null : alsoRan(current.fromTurn, head)));
   }
   return { notices, owned: keep };
 }
 
-/** A finished job whose acceptance verdict is still being written. */
+function withAlso(notice: NoticeJob, also: { from: number; to: number } | null): NoticeJob {
+  return also === null ? notice : { ...notice, alsoRan: also };
+}
+
 function held(job: NoticeRow, now: number): boolean {
   if (job.acceptance?.pending !== true) return false;
   return job.endedAt == null || now - job.endedAt <= (job.acceptance.budgetMs ?? ACCEPTANCE_HOLD_MS);

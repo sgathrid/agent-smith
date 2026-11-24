@@ -1,4 +1,4 @@
-import {l as readManifest,b as readPipeline,c as cancelPipeline,A as AgentSmithReader,n as normalize,P as PROVIDERS,o as errMessage,q as findProvider,w as writeJsonAtomic,e as jobFile,F as FILES,t as SCHEMA_VERSION,u as validOwnerPid,x as ownerAlive,k as isTerminalForgeStatus,y as reportFor,z as cwdFacts,B as deriveOrphan,C as deriveStatus,E as writeAtomic,G as summaryTail,H as failureFields,R as REASONS,d as readAcceptance,I as writeAcceptance,p as providerNames,J as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,K as nextActionFor,j as jobDir,L as fileSig,N as jobsDir,O as JobWriter,g as isMode,Q as newJobId,T as humanDuration,U as pipeEvents,V as pipelineRecordPath,W as computeStaleReads,X as SMITH_PAYLOAD,Y as isForgeStatus}from'./chunk-execute.js';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import {readFileSync,existsSync,mkdirSync,appendFileSync,realpathSync,lstatSync,copyFileSync,statSync,readdirSync,unlinkSync}from'node:fs';import path from'node:path';/** Detached execution, with one preparation barrier before a worker may start. */
+import {l as readManifest,d as jobFile,F as FILES,o as ownerAlive,c as readPipeline,h as cancelPipeline,P as PROVIDERS,m as errMessage,n as findProvider,w as writeJsonAtomic,A as AgentSmithReader,q as normalize,t as writeAtomic,j as jobDir,u as SCHEMA_VERSION,x as validOwnerPid,k as isTerminalForgeStatus,y as reportFor,z as cwdFacts,B as normalizeDenials,C as deriveOrphan,E as deriveStatus,G as summaryTail,H as failureFields,R as REASONS,e as readAcceptance,I as writeAcceptance,J as createMarker,W as WORKERS_DIR,K as jobsDir,L as parseWorkerIndex,p as providerNames,N as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,O as normalizeContinuationKind,Q as nextActionFor,T as fileSig,U as JobWriter,i as isTerminalStatus,g as isMode,V as newJobId,X as markAcceptancePending,Y as humanDuration,Z as pipeEvents,_ as checksAbortRequested,$ as verdictBlock,a0 as runAcceptance,a1 as senderOf,a2 as markAcceptanceSuperseded,a3 as pipelineRecordPath,a4 as pickHead,f as isWorkerIdle,a5 as compareTurnPriority,a6 as computeStaleReads,a7 as SMITH_PAYLOAD,a8 as isForgeStatus}from'./chunk-normalize.js';import {existsSync,readFileSync,mkdirSync,appendFileSync,openSync,writeSync,closeSync,unlinkSync,statSync,renameSync,linkSync,readdirSync,realpathSync,lstatSync,copyFileSync}from'node:fs';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import path from'node:path';import {createHash}from'node:crypto';const LAUNCH_ACK_MS = 15_000;
 async function launch(url, payload, onPrepared) {
     const child = fork(fileURLToPath(url), [], {
         detached: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
@@ -6,7 +6,7 @@ async function launch(url, payload, onPrepared) {
     });
     return new Promise((resolve, reject) => {
         let settled = false;
-        const timer = setTimeout(() => fail(new Error('execution supervisor did not acknowledge launch within 15s')), 15_000);
+        const timer = setTimeout(() => fail(new Error(`execution supervisor did not acknowledge launch within ${LAUNCH_ACK_MS / 1000}s`)), LAUNCH_ACK_MS);
         function fail(error) {
             if (settled)
                 return;
@@ -49,17 +49,23 @@ async function launchJob(service, request) {
     const ack = await launch(service.supervisorUrl, { kind: 'job', repo: service.repo, request: serializable }, onPrepared);
     service.spawnedIds.add(ack.jobId);
     const done = (async () => {
+        let id = ack.jobId;
         while (true) {
-            const head = service.resolveHead(ack.jobId);
-            const detail = await service.detail(head);
+            id = service.resolveTurn(id);
+            const detail = await service.detail(id);
+            if (detail.followedBy) {
+                id = detail.followedBy;
+                continue;
+            }
             if (detail.status !== 'running' && !detail.supersededBy) {
-                // Read the canonical manifest, not the surface projection.
-                return readManifest(service.repo, head);
+                const manifest = readManifest(service.repo, id);
+                if (existsSync(jobFile(service.repo, id, FILES.ownerDone)) || !ownerAlive(manifest)) {
+                    return manifest;
+                }
             }
             await setTimeout$1(100);
         }
     })();
-    // ack-only callers deliberately do not await completion.
     void done.catch(() => { });
     return { ack, done };
 }
@@ -76,66 +82,108 @@ async function launchPipeline(service, spec, options) {
     })();
     return { ...ack, done, cancel: () => { cancelPipeline(service.repo, ack.runId); } };
 }/**
- * registry.ts — `readObservedJob()`, one fault-isolating read of one job.
+ * pipeline/types.ts — vocabulary for mixed-provider stage pipelines.
  *
- * WHY FAULT ISOLATION MATTERS: readers read state a live worker is rewriting. A
- * reader that throws (bad symlink, exotic errno) must degrade to an `unknown`
- * job, never to a crashed band. Every call here is wrapped.
+ * The headline feature this file exists for:
+ *
+ *     implement → gemini   ·   review → codex   ·   moderate → claude-sonnet
+ *
+ * One task, a different worker per stage. Nothing in this file knows how to
+ * talk to any worker; `StageRunner` (below) is the seam, and it is injected.
+ *
+ * WHY NO IMPORT FROM providers/
+ * providers/ is written concurrently by another engineer. If pipeline/ imported
+ * a concrete provider client we would have a compile-order dependency on work
+ * that does not exist yet, and pipeline/ could not be tested without spawning
+ * real agents. So the dependency points *inward*: pipeline/ declares the shape
+ * it needs, forge/ supplies an implementation over providers/ at the composition
+ * root (forge/runner.ts, forge/execute.ts). See `createRunnerRouter` in pipeline.ts for the wiring point.
  */
-const READER = new AgentSmithReader();
 /**
- * Read + normalize one job, isolating failures.
+ * Reasoning effort, where the worker supports it.
  *
- * Returns `null` if the reader returns null (job not known to it), and an
- * `unknown` job if either the read or the normalize threw. A throw here
- * is a bug we want visible in tests, but it must not take down a caller that
- * is polling every 100ms.
+ * Evidence (measured on this user's own jobs): raising effort to `high` cost
+ * **+50% wall clock and 1.9x thinking tokens for ZERO accuracy gain** on an
+ * in-band task. That is why `low` is the default everywhere in this codebase
+ * and why escalation — not the default — is what buys effort.
  */
-async function readObservedJob(cwd, jobId) {
-    const provider = READER.provider;
-    let raw;
-    try {
-        raw = await READER.read(cwd, jobId);
-    }
-    catch (err) {
-        // Surface as unknown rather than propagating.
-        return unknownJob(provider, jobId, errText(err));
-    }
-    if (raw === null)
-        return null;
-    try {
-        return normalize(raw);
-    }
-    catch (err) {
-        return unknownJob(provider, jobId, `normalize: ${errText(err)}`);
-    }
+const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/**
+ * Worker `env` keys that are refused, because they change how the worker
+ * binary is found, loaded or configured. The env is applied when the CLI is
+ * spawned, BEFORE any sandbox it sets up exists: `PATH` can swap the binary
+ * for a shim, `NODE_OPTIONS=--import=…` or `DYLD_INSERT_LIBRARIES` run code
+ * ahead of the worker, and a provider config dir can drop its read-only
+ * settings, while the ack would still report the sandbox as enforced.
+ * Matched case-insensitively (Windows env names are).
+ */
+const ENV_DENYLIST = {
+    PATH: 'would change which worker binary runs',
+    HOME: 'would change which config the worker loads',
+    SHELL: 'would change the shell the worker runs commands with',
+    TMPDIR: 'would move the worker\'s temporary and sandbox files',
+    NODE_OPTIONS: 'would run code before the worker starts',
+    NODE_PATH: 'would change which modules the worker loads',
+    PYTHONPATH: 'would change which modules the worker loads',
+    PYTHONHOME: 'would change which runtime the worker loads',
+    PYTHONSTARTUP: 'would run code before the worker starts',
+    // Shell startup files: a shell-based launcher sources these before the worker body runs.
+    BASH_ENV: 'would run code before the worker starts',
+    ENV: 'would run code before the worker starts',
+    ZDOTDIR: 'would run code before the worker starts',
+    SHELLOPTS: 'would change how the shell runs the worker',
+    PROMPT_COMMAND: 'would run code before the worker starts',
+    PERL5OPT: 'would run code before the worker starts',
+    RUBYOPT: 'would run code before the worker starts',
+};
+/**
+ * Key prefixes refused for the same reason: the dynamic loader (`LD_`, `DYLD_`),
+ * XDG config/data dirs, Agent Smith's own settings (`AGENT_SMITH_*_BIN`,
+ * `_HOME`, `_CODEX_SANDBOX`, …) and each provider's config (`CLAUDE_CONFIG_DIR`,
+ * `CODEX_HOME`, `KIMI_CODE_HOME`, `OPENCODE_*`, `AGY_*`). The adapters' own
+ * keys are all covered here; do not list them again above.
+ */
+const ENV_DENY_PREFIXES = {
+    LD_: 'would change which libraries the worker loads',
+    DYLD_: 'would change which libraries the worker loads',
+    XDG_: 'would change which config the worker loads',
+    AGENT_SMITH_: 'is Agent Smith\'s own setting, not the worker\'s',
+    AGY_: 'would change the provider\'s config',
+    CLAUDE_: 'would change the provider\'s config',
+    CODEX_: 'would change the provider\'s config',
+    OPENCODE_: 'would change the provider\'s config',
+    KIMI_: 'would change the provider\'s config',
+};
+/** Why a worker `env` key is refused, or null when it is allowed. */
+function deniedEnvReason(key) {
+    const upper = key.toUpperCase();
+    const exact = ENV_DENYLIST[upper];
+    if (exact !== undefined)
+        return exact;
+    for (const [prefix, why] of Object.entries(ENV_DENY_PREFIXES))
+        if (upper.startsWith(prefix))
+            return why;
+    return null;
 }
-/** A defensive `unknown` ObservedJob used when a read/normalize fails. */
-function unknownJob(provider, jobId, detail) {
-    return {
-        provider,
-        jobId,
-        status: "unknown",
-        warnings: [
-            { code: "incomplete_state", message: `Failed to read state: ${detail}` },
-        ],
-        output: null,
-        startedAt: null,
-        updatedAt: null,
-        finishedAt: null,
-        mode: null,
-        model: null,
-        label: null,
-        outputTruncated: false,
-        usage: null,
-        partial: true,
-        raw: {},
-    };
-}
-function errText(err) {
-    if (err instanceof Error)
-        return err.message;
-    return String(err);
+/** Validate a worker `env` map: plain identifier keys not on the denylist, string values without NUL. Returns it unchanged, or undefined when absent. */
+function validateEnv(raw, label = 'env') {
+    if (raw === undefined)
+        return undefined;
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw))
+        throw new Error(`${label} must be an object of string values.`);
+    const out = {};
+    for (const [key, value] of Object.entries(raw)) {
+        if (!ENV_KEY.test(key))
+            throw new Error(`${label} key "${key}" is not a valid variable name (letters, digits, underscore; no leading digit).`);
+        const denied = deniedEnvReason(key);
+        if (denied !== null)
+            throw new Error(`${label}.${key} ${denied}; it is not allowed in a worker env.`);
+        if (typeof value !== 'string' || value.includes('\0'))
+            throw new Error(`${label}.${key} must be a string without NUL characters.`);
+        out[key] = value;
+    }
+    return out;
 }/**
  * providers/catalog.ts — cached model discovery across providers.
  *
@@ -289,6 +337,67 @@ async function getCatalogs(options = {}) {
     catch (e) {
         return [failed('*', errMessage(e))];
     }
+}/**
+ * registry.ts — `readObservedJob()`, one fault-isolating read of one job.
+ *
+ * WHY FAULT ISOLATION MATTERS: readers read state a live worker is rewriting. A
+ * reader that throws (bad symlink, exotic errno) must degrade to an `unknown`
+ * job, never to a crashed band. Every call here is wrapped.
+ */
+const READER = new AgentSmithReader();
+/**
+ * Read + normalize one job, isolating failures.
+ *
+ * Returns `null` if the reader returns null (job not known to it), and an
+ * `unknown` job if either the read or the normalize threw. A throw here
+ * is a bug we want visible in tests, but it must not take down a caller that
+ * is polling every 100ms.
+ */
+async function readObservedJob(cwd, jobId) {
+    const provider = READER.provider;
+    let raw;
+    try {
+        raw = await READER.read(cwd, jobId);
+    }
+    catch (err) {
+        // Surface as unknown rather than propagating.
+        return unknownJob(provider, jobId, errText(err));
+    }
+    if (raw === null)
+        return null;
+    try {
+        return normalize(raw);
+    }
+    catch (err) {
+        return unknownJob(provider, jobId, `normalize: ${errText(err)}`);
+    }
+}
+/** A defensive `unknown` ObservedJob used when a read/normalize fails. */
+function unknownJob(provider, jobId, detail) {
+    return {
+        provider,
+        jobId,
+        status: "unknown",
+        warnings: [
+            { code: "incomplete_state", message: `Failed to read state: ${detail}` },
+        ],
+        output: null,
+        startedAt: null,
+        updatedAt: null,
+        finishedAt: null,
+        mode: null,
+        model: null,
+        label: null,
+        outputTruncated: false,
+        usage: null,
+        partial: true,
+        raw: {},
+    };
+}
+function errText(err) {
+    if (err instanceof Error)
+        return err.message;
+    return String(err);
 }const DIRTY_FILES_CAP = 20;
 function workspaceLine(mode, cwd) {
     if (mode === 'review' || mode === 'moderate')
@@ -339,6 +448,122 @@ function buildBrief(input) {
             "Only claim what you can point to (command output, file contents, a diff); say what you couldn't verify. " +
             'If the task conflicts with what you find, say so rather than guess.',
     ].join('\n');
+}function appendSteerEntry(repo, jobId, entry) {
+    const dir = jobDir(repo, jobId);
+    mkdirSync(dir, { recursive: true });
+    appendFileSync(jobFile(repo, jobId, FILES.steer), `${JSON.stringify(entry)}\n`, 'utf8');
+}
+function readSteerEntries(repo, jobId) {
+    const file = jobFile(repo, jobId, FILES.steer);
+    let text;
+    try {
+        text = readFileSync(file, 'utf8');
+    }
+    catch {
+        return [];
+    }
+    const out = [];
+    const seenIds = new Set();
+    for (const line of text.split('\n')) {
+        const trimmed = line.trim();
+        if (trimmed === '')
+            continue;
+        try {
+            const parsed = JSON.parse(trimmed);
+            if (typeof parsed.id === 'string' &&
+                typeof parsed.createdAt === 'string' &&
+                typeof parsed.prompt === 'string' &&
+                (parsed.delivery === 'queue' || parsed.delivery === 'interrupt') &&
+                !seenIds.has(parsed.id)) {
+                seenIds.add(parsed.id);
+                out.push(parsed);
+            }
+        }
+        catch { }
+    }
+    return out;
+}
+function readCount(repo, jobId, name) {
+    try {
+        const n = Number.parseInt(readFileSync(jobFile(repo, jobId, name), 'utf8').trim(), 10);
+        return Number.isInteger(n) && n >= 0 ? n : 0;
+    }
+    catch {
+        return 0;
+    }
+}
+function readConsumedCount(repo, jobId) {
+    return readCount(repo, jobId, FILES.steerConsumed);
+}
+function writeConsumedCount(repo, jobId, n) {
+    writeAtomic(jobFile(repo, jobId, FILES.steerConsumed), `${n}\n`);
+}
+function readDiscardCut(repo, jobId) {
+    return readCount(repo, jobId, FILES.steerDiscard);
+}
+function writeDiscardCut(repo, jobId, n) {
+    writeAtomic(jobFile(repo, jobId, FILES.steerDiscard), `${n}\n`);
+}
+function undeliveredEntries(repo, jobId) {
+    const discarded = existsSync(jobFile(repo, jobId, FILES.steerDiscard)) ? readDiscardCut(repo, jobId) : 0;
+    return readSteerEntries(repo, jobId).slice(Math.max(readConsumedCount(repo, jobId), discarded));
+}
+function quoted(entries) {
+    return `"${entries[0]?.prompt.replace(/\s+/g, ' ').trim().slice(0, 80) ?? ''}"`;
+}
+function messages(n) {
+    return `${n} queued message${n === 1 ? '' : 's'}`;
+}
+function notSentWarning(entries, reason) {
+    return `${messages(entries.length)} not sent (${reason}): ${quoted(entries)}`;
+}
+function discardedWarning(discarded) {
+    return `${messages(discarded.length)} discarded: ${quoted(discarded)}`;
+}
+function liveDeliverable(e) {
+    return e.delivery === 'queue'
+        && (e.overrides === undefined || Object.keys(e.overrides).length === 0)
+        && (e.files === undefined || e.files.length === 0)
+        && e.context === undefined;
+}
+function liveMessageText(e) {
+    return e.prompt;
+}
+function buildSteeredPrompt(input) {
+    const steerBody = input.entries.length === 1
+        ? input.entries[0].prompt
+        : input.entries.map((e, idx) => `[Steer ${idx + 1} (${e.createdAt})]\n${e.prompt}`).join('\n\n');
+    const tag = input.freshContinuation
+        ? '[FRESH CONTINUATION]'
+        : input.wasInterrupted
+            ? '[TURN INTERRUPTED]'
+            : `[FOLLOW-UP STEER · ${input.entries.length} queued update${input.entries.length === 1 ? '' : 's'}]`;
+    const statusLine = input.wasInterrupted
+        ? `Your previous turn (${input.parentJobId}) was interrupted after ${input.toolCalls} tool call(s) with updated instructions from the orchestrator. Inspect your working tree before repeating any completed steps.`
+        : `Your previous turn (${input.parentJobId}) ${input.priorStatus === undefined || input.priorStatus === 'succeeded' ? 'completed' : `ended ${input.priorStatus}`} after ${input.toolCalls} tool call(s), and the orchestrator queued follow-up instructions for you.`;
+    const syncedLine = input.syncedFiles !== undefined && input.syncedFiles.length > 0
+        ? `\nSynced brief file(s) in your working tree: ${input.syncedFiles.join(', ')} (re-read before continuing).`
+        : '';
+    const tailBlock = input.responseTail
+        ? `\nLast response excerpt from previous turn:\n${input.responseTail}\n`
+        : '';
+    const verdictBlock = input.verdict ? `\n${input.verdict}\n` : '';
+    const header = `[STEERED TURN CONTINUITY] ${tag}\n${statusLine}${syncedLine}${verdictBlock}${tailBlock}\n[ORCHESTRATOR UPDATE]\n${steerBody}`;
+    const prependBrief = input.brief !== '' && !header.startsWith(input.brief);
+    const sentPrompt = prependBrief ? `${input.brief}\n\n${header}` : header;
+    return { rawPrompt: header, sentPrompt, prependBrief };
+}
+function readSteerHead(repo, jobId) {
+    try {
+        const line = readFileSync(jobFile(repo, jobId, FILES.steerHead), 'utf8')
+            .split('\n')
+            .map((s) => s.trim())
+            .find((s) => s !== '');
+        return line ?? null;
+    }
+    catch {
+        return null;
+    }
 }/** Service-owned recovery of abandoned jobs. Readers never write job records. */
 /**
  * A dead recorded supervisor cannot complete another write. Do not persist the
@@ -359,6 +584,7 @@ function reconcileOrphan(repo, jobId, now = Date.now()) {
             if (isTerminalForgeStatus(manifest.status)
                 && typeof manifest.finishedAt === 'string')
                 abandonPendingAcceptance(repo, jobId, manifest.finishedAt);
+            abandonQueue(repo, jobId);
             return false;
         }
         const resultFile = jobFile(repo, jobId, FILES.result);
@@ -371,12 +597,13 @@ function reconcileOrphan(repo, jobId, now = Date.now()) {
         // Without the writer, the cwd and the mode (plus the completed-edit count
         // in progress.json) are all recovery can prove about a writing job.
         const facts = cwdFacts(manifest.cwd, manifest.mode, editedOnDisk(repo, jobId));
+        const deniedActions = result === null ? [] : normalizeDenials(result.deniedActions);
         const verdict = result === null
             ? deriveOrphan(manifest, null, now, undefined, canceled)
             : deriveStatus({
                 alreadyTerminal: canceled || result.status === 'cancelled' ? 'canceled' : null,
                 ok: result.ok, jobStatus: result.status,
-                deniedActions: result.deniedActions ?? [], report,
+                deniedActions, report,
                 ...facts,
             });
         if (verdict === null)
@@ -399,8 +626,8 @@ function reconcileOrphan(repo, jobId, now = Date.now()) {
                 updatedAt: result.finishedAt, finishedAt: result.finishedAt,
                 startedAt: manifest.startedAt ?? result.startedAt, exitCode: result.exitCode,
                 conversation: recoveredConversation(result) ?? manifest.conversation,
-                ...failureFields(verdict, result),
-                deniedActions: (result.deniedActions ?? []).map(({ action, displayName, nonfatal }) => ({
+                ...failureFields(verdict, { ...result, deniedActions }),
+                deniedActions: deniedActions.map(({ action, displayName, nonfatal }) => ({
                     ...(action === undefined ? {} : { action }),
                     ...(displayName === undefined ? {} : { displayName }),
                     ...(nonfatal === true ? { nonfatal: true } : {}),
@@ -414,6 +641,7 @@ function reconcileOrphan(repo, jobId, now = Date.now()) {
                 ...(facts.cwdMissing ? { cwdMissingAtFinish: true } : {}),
             });
             abandonPendingAcceptance(repo, jobId, result.finishedAt);
+            abandonQueue(repo, jobId);
             return true;
         }
         const at = new Date(now).toISOString();
@@ -423,6 +651,7 @@ function reconcileOrphan(repo, jobId, now = Date.now()) {
             updatedAt: at, finishedAt: at,
         });
         abandonPendingAcceptance(repo, jobId, at);
+        abandonQueue(repo, jobId);
         return true;
     }
     catch {
@@ -437,6 +666,33 @@ function abandonPendingAcceptance(repo, jobId, at) {
             reason: 'server stopped; checks not run',
         });
     }
+}
+function abandonQueue(repo, jobId) {
+    const ownerDone = jobFile(repo, jobId, FILES.ownerDone);
+    if (existsSync(ownerDone))
+        return;
+    const undelivered = undeliveredEntries(repo, jobId);
+    for (const name of [FILES.job, FILES.progress]) {
+        const file = jobFile(repo, jobId, name);
+        let doc;
+        try {
+            doc = JSON.parse(readFileSync(file, 'utf8'));
+        }
+        catch {
+            continue;
+        }
+        const warnings = Array.isArray(doc['warnings']) ? doc['warnings'] : [];
+        const warning = undelivered.length > 0 && name === FILES.progress ? notSentWarning(undelivered, 'owner stopped') : null;
+        const pending = typeof doc['pendingSteers'] === 'number' && doc['pendingSteers'] > 0;
+        if (!pending && (warning === null || warnings.includes(warning)))
+            continue;
+        writeJsonAtomic(file, {
+            ...doc, pendingSteers: 0,
+            ...(warning === null || warnings.includes(warning) ? {} : { warnings: [...warnings, warning] }),
+        });
+    }
+    if (undelivered.length > 0)
+        createMarker(ownerDone, new Date().toISOString());
 }
 /**
  * progress.json recorded at least one completed edit (evidence the job wrote).
@@ -501,61 +757,418 @@ function recoveredConversation(result) {
             : result.provider === 'claude' || result.provider === 'opencode' || result.provider === 'kimi' ? 'sessionId' : null;
     const value = key === null ? null : raw[key];
     return typeof value === 'string' && value.trim() !== '' ? value : null;
-}/**
- * spawn-request.ts — what a caller may ask the forge for, and the pure checks on it.
- *
- * Nothing here touches the job directory or a live job: it is the request and
- * ack shapes, the timeout clamp, provider/mode validation and the model catalog
- * check. forge/service.ts owns everything that has state.
- */
-/** Floor and ceiling on a caller-supplied timeout. */
-const MIN_TIMEOUT_MS = 1_000;
-const MAX_TIMEOUT_MS = 6 * 60 * 60_000;
-/**
- * Clamp a timeout into the range we are willing to enforce. Pure; unit-tested.
- *
- * ZERO IS "UNSET", NOT "NO TIMEOUT", and that is a deliberate reading of an
- * otherwise ambiguous value. `SpawnSpec.timeoutMs: 0` means "do not arm the timer"
- * to providers/ndjson.ts, so a caller passing 0 would otherwise get an unbounded
- * job whose only kill path is an operator who happens to be watching. And a
- * pipeline stage that does not name a timeout — which is every stage in
- * ARCHITECTURE.md's own example — would have no budget at all.
- *
- * So 0 resolves to the default, exactly like an absent value. Anyone who genuinely
- * wants a very long job passes MAX_TIMEOUT_MS and says so out loud.
- */
-function clampTimeout(ms) {
-    if (ms === undefined || !Number.isFinite(ms) || ms <= 0)
-        return DEFAULT_TIMEOUT_MS$1;
-    return Math.min(MAX_TIMEOUT_MS, Math.max(MIN_TIMEOUT_MS, Math.floor(ms)));
+}const LOCK_WAIT_MS = 5_000;
+const EMPTY_LOCK_STALE_MS = 2_000;
+const POLL_MS = 10;
+const SAFE_ID$1 = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
+const heldHere = new Set();
+let breakCounter = 0;
+function workerFileKey(workerId) {
+    if (SAFE_ID$1.test(workerId) && workerId !== '.' && workerId !== '..')
+        return workerId;
+    if (workerId === '')
+        throw new Error('Invalid worker id');
+    return `h-${createHash('sha256').update(workerId).digest('hex').slice(0, 40)}`;
+}
+function workerLockPath(repo, workerId) {
+    return path.join(repo, WORKERS_DIR, `${workerFileKey(workerId)}.lock`);
+}
+function holdsWorkerLock(repo, workerId) {
+    return heldHere.has(key(repo, workerId));
+}
+function key(repo, workerId) {
+    return `${path.resolve(repo)}\0${workerId}`;
+}
+function pidAlive(pid) {
+    try {
+        process.kill(pid, 0);
+        return true;
+    }
+    catch (err) {
+        // EPERM: the process exists but belongs to someone else.
+        return err.code === 'EPERM';
+    }
+}
+function parsePid(body) {
+    const pid = Number.parseInt(body.split('\n')[0] ?? '', 10);
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+function isStale(body, mtimeMs, now) {
+    const pid = parsePid(body);
+    if (pid === null)
+        return now - mtimeMs > EMPTY_LOCK_STALE_MS;
+    return !pidAlive(pid);
+}
+function tryAcquire(file) {
+    mkdirSync(path.dirname(file), { recursive: true });
+    const body = `${process.pid}\n${new Date().toISOString()}\n`;
+    let fd;
+    try {
+        fd = openSync(file, 'wx');
+    }
+    catch (err) {
+        if (err.code === 'EEXIST') {
+            breakIfStale(file);
+            return null;
+        }
+        throw err;
+    }
+    try {
+        writeSync(fd, body);
+    }
+    finally {
+        closeSync(fd);
+    }
+    return body;
 }
 /**
- * The word to put in a SpawnSpec for a provider that is not installed.
- *
- * Throwing rather than defaulting: `getProvider` on an unknown name is a typo in
- * a stage config, and a typo that silently runs zero workers and reports green is
- * the exact failure class this codebase is organised against. A KNOWN provider
- * whose binary is missing is different — that becomes a `failed` job with the
- * ENOENT in it, which is a report an operator can act on.
+ * Break a stale lock without the read-then-unlink race: move it aside under a
+ * unique name, then look at what was moved. If it turns out to be live (it was
+ * replaced between our read and the rename), put it back with link(), which
+ * fails rather than overwrite a lock created meanwhile.
  */
+function breakIfStale(file) {
+    let body;
+    let mtimeMs;
+    try {
+        body = readFileSync(file, 'utf8');
+        mtimeMs = statSync(file).mtimeMs;
+    }
+    catch {
+        return;
+    }
+    if (!isStale(body, mtimeMs, Date.now()))
+        return;
+    breakCounter += 1;
+    const aside = `${file}.stale-${process.pid}-${breakCounter}`;
+    try {
+        renameSync(file, aside);
+    }
+    catch {
+        return;
+    }
+    let moved = '';
+    try {
+        moved = readFileSync(aside, 'utf8');
+    }
+    catch { }
+    if (moved !== body && !isStale(moved, Date.now(), Date.now())) {
+        try {
+            linkSync(aside, file);
+        }
+        catch { }
+    }
+    try {
+        unlinkSync(aside);
+    }
+    catch { }
+}
+function release(file, body) {
+    try {
+        if (readFileSync(file, 'utf8') === body)
+            unlinkSync(file);
+    }
+    catch { }
+}
+const sleepSync = (ms) => {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+};
+function holderOf(file) {
+    try {
+        return readFileSync(file, 'utf8').split('\n')[0] || 'unknown';
+    }
+    catch {
+        return 'unknown';
+    }
+}
+function timeoutError(workerId, file, waitMs) {
+    return new Error(`worker "${workerId}" is locked by pid ${holderOf(file)}; gave up after ${waitMs} ms (${file}).`);
+}
+function withWorkerLockSync(repo, workerId, fn, options = {}) {
+    const file = workerLockPath(repo, workerId);
+    const k = key(repo, workerId);
+    if (heldHere.has(k))
+        throw new Error(`worker "${workerId}" lock is already held by this process (not reentrant).`);
+    const waitMs = options.waitMs ?? LOCK_WAIT_MS;
+    const deadline = Date.now() + waitMs;
+    let body = tryAcquire(file);
+    while (body === null) {
+        if (Date.now() >= deadline)
+            throw timeoutError(workerId, file, waitMs);
+        sleepSync(POLL_MS);
+        body = tryAcquire(file);
+    }
+    heldHere.add(k);
+    try {
+        return fn();
+    }
+    finally {
+        heldHere.delete(k);
+        release(file, body);
+    }
+}
+async function withWorkerLock(repo, workerId, fn, options = {}) {
+    const file = workerLockPath(repo, workerId);
+    const k = key(repo, workerId);
+    const waitMs = options.waitMs ?? LOCK_WAIT_MS;
+    const startedAt = Date.now();
+    let nextNotice = startedAt + LOCK_WAIT_MS;
+    let body = heldHere.has(k) ? null : tryAcquire(file);
+    while (body === null) {
+        const now = Date.now();
+        if (now - startedAt >= waitMs)
+            throw timeoutError(workerId, file, waitMs);
+        if (options.onWait !== undefined && now >= nextNotice) {
+            options.onWait(now - startedAt, holderOf(file));
+            nextNotice = now + LOCK_WAIT_MS;
+        }
+        await new Promise((r) => setTimeout(r, POLL_MS));
+        body = heldHere.has(k) ? null : tryAcquire(file);
+    }
+    heldHere.add(k);
+    try {
+        return await fn();
+    }
+    finally {
+        heldHere.delete(k);
+        release(file, body);
+    }
+}const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
+const INDEX_FILE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}\.json$/;
+function workerIndexFile(repo, workerId) {
+    return path.join(repo, WORKERS_DIR, `${workerFileKey(workerId)}.json`);
+}
+function readIndexFile(file) {
+    try {
+        return parseWorkerIndex(JSON.parse(readFileSync(file, 'utf8')));
+    }
+    catch {
+        return null;
+    }
+}
+function startMs(m) {
+    const ms = Date.parse(m.startedAt ?? m.createdAt ?? '');
+    return Number.isFinite(ms) ? ms : 0;
+}
+const MTIME_SETTLE_MS = 50;
+function settled(mtimeMs) {
+    return Date.now() - mtimeMs > MTIME_SETTLE_MS ? mtimeMs : Number.NaN;
+}
+function mtimeOf(dir) {
+    try {
+        return statSync(dir).mtimeMs;
+    }
+    catch {
+        return -1;
+    }
+}
+function readWorkerIndex(repo, workerId) {
+    if (workerId === '')
+        return null;
+    const index = readIndexFile(workerIndexFile(repo, workerId));
+    return index !== null && index.workerId === workerId ? index : null;
+}
+function writeWorkerIndex(repo, index) {
+    writeJsonAtomic(workerIndexFile(repo, index.workerId), index);
+}
+function appendTurnsLocked(repo, workerId, name, jobIds, legacyTurns = []) {
+    const current = readWorkerIndex(repo, workerId);
+    const turns = [...(current?.turns ?? legacyTurns)];
+    const have = new Set(turns);
+    for (const id of jobIds)
+        if (!have.has(id)) {
+            turns.push(id);
+            have.add(id);
+        }
+    const next = { schema: 1, workerId, name: current?.name ?? name, turns, updatedAt: new Date().toISOString() };
+    writeWorkerIndex(repo, next);
+    return next;
+}
+function underLock(repo, workerId, lockHeld, fn) {
+    return lockHeld || holdsWorkerLock(repo, workerId) ? fn() : withWorkerLockSync(repo, workerId, fn);
+}
+class WorkerIndexStore {
+    repo;
+    read;
+    byName = new Map();
+    names = new Map();
+    jobWorker = new Map();
+    seenIndexFiles = new Set();
+    seenJobs = new Set();
+    workersMtime = Number.NaN;
+    jobsMtime = Number.NaN;
+    constructor(repo, options = {}) {
+        this.repo = repo;
+        this.read = options.readManifest ?? ((id) => { try {
+            return readManifest(repo, id);
+        }
+        catch {
+            return null;
+        } });
+    }
+    remember(index) {
+        this.names.set(index.workerId, index.name);
+        let set = this.byName.get(index.name);
+        if (set === undefined)
+            this.byName.set(index.name, (set = new Set()));
+        set.add(index.workerId);
+        for (const id of index.turns) {
+            this.jobWorker.set(id, index.workerId);
+            this.seenJobs.add(id);
+        }
+    }
+    get(workerId) {
+        const index = readWorkerIndex(this.repo, workerId);
+        if (index !== null)
+            this.remember(index);
+        return index;
+    }
+    workersNamed(name) {
+        this.refresh();
+        return [...(this.byName.get(name) ?? [])];
+    }
+    refresh() {
+        const workersDir = path.join(this.repo, WORKERS_DIR);
+        const wm = mtimeOf(workersDir);
+        if (wm !== this.workersMtime) {
+            // A directory mtime advances in ticks (ms on Linux): an entry created in the
+            // same tick as the last one seen leaves it unchanged. Trust an mtime only
+            // once it is older than one tick window, so the next call re-reads.
+            this.workersMtime = settled(wm);
+            let files = [];
+            try {
+                files = readdirSync(workersDir);
+            }
+            catch { }
+            for (const f of files) {
+                if (this.seenIndexFiles.has(f))
+                    continue;
+                if (!INDEX_FILE.test(f))
+                    continue;
+                const index = readIndexFile(path.join(workersDir, f));
+                if (index === null)
+                    continue;
+                this.seenIndexFiles.add(f);
+                this.remember(index);
+            }
+        }
+        const jdir = jobsDir(this.repo);
+        const jm = mtimeOf(jdir);
+        if (jm === this.jobsMtime)
+            return;
+        let ids = [];
+        try {
+            ids = readdirSync(jdir);
+        }
+        catch { }
+        const unindexed = new Map();
+        let complete = true;
+        for (const id of ids) {
+            if (this.seenJobs.has(id) || !SAFE_ID.test(id))
+                continue;
+            const manifest = this.read(id);
+            if (manifest === null) {
+                complete = false;
+                continue;
+            }
+            if (typeof manifest.turn === 'number') {
+                this.seenJobs.add(id);
+                continue;
+            }
+            const workerId = typeof manifest.workerId === 'string' && manifest.workerId !== '' ? manifest.workerId : id;
+            const list = unindexed.get(workerId);
+            if (list === undefined)
+                unindexed.set(workerId, [manifest]);
+            else
+                list.push(manifest);
+        }
+        for (const [workerId, manifests] of unindexed) {
+            try {
+                this.indexLegacy(workerId, manifests);
+            }
+            catch {
+                complete = false;
+            }
+        }
+        if (complete)
+            this.jobsMtime = settled(jm);
+    }
+    indexLegacy(workerId, manifests) {
+        const fresh = this.get(workerId);
+        const missing = manifests.filter((m) => !(fresh?.turns ?? []).includes(m.jobId));
+        if (missing.length === 0) {
+            for (const m of manifests)
+                this.seenJobs.add(m.jobId);
+            return;
+        }
+        const sorted = [...missing].sort((a, b) => startMs(a) - startMs(b) || a.jobId.localeCompare(b.jobId));
+        const name = [...sorted].reverse().find((m) => typeof m.name === 'string' && m.name !== '')?.name ?? workerId;
+        const index = underLock(this.repo, workerId, false, () => {
+            const existing = readWorkerIndex(this.repo, workerId);
+            if (existing === null) {
+                return appendTurnsLocked(this.repo, workerId, name, sorted.map((m) => m.jobId));
+            }
+            return appendTurnsLocked(this.repo, workerId, name, sorted.map((m) => m.jobId).filter((id) => !existing.turns.includes(id)));
+        });
+        this.remember(index);
+        for (const m of manifests)
+            this.seenJobs.add(m.jobId);
+    }
+    scanWorker(workerId, exclude) {
+        let ids = [];
+        try {
+            ids = readdirSync(jobsDir(this.repo));
+        }
+        catch {
+            return [];
+        }
+        const found = [];
+        for (const id of ids) {
+            if (id === exclude || !SAFE_ID.test(id))
+                continue;
+            const m = this.read(id);
+            if (m !== null && (m.workerId ?? id) === workerId)
+                found.push(m);
+        }
+        return found.sort((a, b) => startMs(a) - startMs(b) || a.jobId.localeCompare(b.jobId)).map((m) => m.jobId);
+    }
+    recordTurnStart(input) {
+        const { workerId, name, jobId } = input;
+        const index = underLock(this.repo, workerId, input.lockHeld === true, () => {
+            const needsLegacy = input.continuation && !existsSync(workerIndexFile(this.repo, workerId));
+            const legacy = needsLegacy ? this.scanWorker(workerId, jobId) : [];
+            const next = appendTurnsLocked(this.repo, workerId, name, [jobId], legacy);
+            input.alsoLocked?.();
+            return next;
+        });
+        this.remember(index);
+        return index;
+    }
+    workerOf(jobId) {
+        return this.jobWorker.get(jobId);
+    }
+}const MIN_TIMEOUT_MS = 1_000;
+const MAX_TIMEOUT_MS = 6 * 60 * 60_000;
+function resolveTimeoutMs(ms) {
+    if (ms === undefined)
+        return DEFAULT_TIMEOUT_MS$1;
+    if (!Number.isFinite(ms) || ms <= 0) {
+        throw new RangeError(`timeoutMs must be a positive finite number, got ${ms}`);
+    }
+    return Math.min(MAX_TIMEOUT_MS, Math.max(MIN_TIMEOUT_MS, Math.floor(ms)));
+}
 function requireProvider(name) {
     if (findProvider(name) === undefined) {
         throw new Error(`unknown provider "${name}". Known providers: ${providerNames().join(', ')}.`);
     }
     return getProvider(name);
 }
-/** The teaching error for a mode outside the closed set. */
 function modeError(mode) {
     const lines = MODES.map((m) => `  ${m}: ${MODE_PRESETS[m].description}`).join('\n');
     return new Error(`${mode === '' ? 'mode is required' : `unknown mode "${mode}"`}. Valid modes:\n${lines}`);
 }
-/** Sidecar naming the env variables a job's worker was given. Keys only. */
 const ENV_KEYS_FILE = 'env-keys.json';
 const AGY_EFFORT_SUFFIX = /-(low|medium|high)$/;
-/**
- * Check model/effort against a catalog. Pure. Throws only when the catalog is
- * fresh and nonempty AND positively says the value is wrong; otherwise warns.
- */
 function checkAgainstCatalog(provider, model, effort, catalog) {
     const warnings = [];
     if (model === undefined && effort === undefined)
@@ -593,7 +1206,6 @@ function checkAgainstCatalog(provider, model, effort, catalog) {
     }
     if (effort !== undefined) {
         const target = match ?? (catalog.defaultModel === undefined ? undefined : catalog.models.find((m) => m.id === catalog.defaultModel));
-        // Defensive: a catalog from disk or a provider could carry a model without an efforts array.
         const efforts = Array.isArray(target?.efforts) ? target.efforts : [];
         if (target !== undefined && efforts.length > 0 && !efforts.includes(effort)) {
             throw new Error(`effort "${effort}" is not valid for ${provider} model "${target.id}". Valid efforts: ${efforts.join(', ')}.`);
@@ -601,7 +1213,6 @@ function checkAgainstCatalog(provider, model, effort, catalog) {
     }
     return warnings;
 }
-/** The anchor one turn writes: the spec's fixed fields plus what differs per turn. */
 function turnStartInput(provider, spec, turn) {
     return {
         name: spec.name,
@@ -628,15 +1239,13 @@ function turnStartInput(provider, spec, turn) {
         sandboxFlags: [...spec.sandboxFlags],
         readOnlyRequested: spec.readOnlyRequested,
         readOnlyEnforced: spec.readOnlyEnforced,
-        ...(turn.steeredFrom === undefined ? {} : { steeredFrom: turn.steeredFrom }),
+        ...(turn.turn === undefined ? {} : { turn: turn.turn }),
+        ...(turn.continuedFrom === undefined ? {} : { continuedFrom: turn.continuedFrom }),
+        ...(turn.continuationKind === undefined ? {} : { continuationKind: turn.continuationKind }),
+        ...(turn.chainStartedAt === undefined ? {} : { chainStartedAt: turn.chainStartedAt }),
         ...(turn.watchedFiles === undefined ? {} : { watchedFiles: turn.watchedFiles }),
     };
-}/**
- * summary.ts — the read-side shapes (a list row, one job in full) and the pure
- * projection from an ObservedJob onto them.
- */
-/** Project an ObservedJob onto what a list actually needs. */
-function toSummary(observed) {
+}function toSummary(observed) {
     const raw = observed.raw;
     const toolCalls = typeof raw['tool_calls'] === 'number' ? raw['tool_calls'] : null;
     const task = typeof raw['task'] === 'string' && raw['task'] !== '' ? raw['task'] : null;
@@ -646,10 +1255,17 @@ function toSummary(observed) {
     const currentActivity = observed.status === 'running'
         ? [...activities].reverse().find(isActiveForgeActivity) ?? null
         : null;
+    const turn = typeof raw['turn'] === 'number' && Number.isInteger(raw['turn']) && raw['turn'] >= 1 ? raw['turn'] : 1;
+    const continuedFrom = typeof raw['continuedFrom'] === 'string' && raw['continuedFrom'] !== '' ? raw['continuedFrom'] : undefined;
+    const continuationKind = normalizeContinuationKind(raw['continuationKind']) ?? (continuedFrom !== undefined ? 'follow-up' : undefined);
+    const chainStartedAt = typeof raw['chainStartedAt'] === 'string' && raw['chainStartedAt'] !== ''
+        ? raw['chainStartedAt']
+        : (observed.startedAt ?? undefined);
     return {
         jobId: observed.jobId,
         name: typeof raw['name'] === 'string' && raw['name'] ? raw['name'] : observed.jobId,
-        workerId: typeof raw['workerId'] === 'string' ? raw['workerId'] : observed.jobId,
+        workerId: typeof raw['workerId'] === 'string' && raw['workerId'] !== '' ? raw['workerId'] : observed.jobId,
+        turn,
         role: typeof raw['role'] === 'string' ? raw['role'] : observed.mode,
         latestSummary: raw['summarySource'] === 'worker' && typeof raw['latestSummary'] === 'string' ? raw['latestSummary'] : null,
         summarySource: raw['summarySource'] === 'worker' ? 'worker' : null,
@@ -681,9 +1297,10 @@ function toSummary(observed) {
         ...(typeof raw['supersededBy'] === 'string' || raw['supersededBy'] === null
             ? { supersededBy: raw['supersededBy'] }
             : {}),
-        ...(typeof raw['steeredFrom'] === 'string' || raw['steeredFrom'] === null
-            ? { steeredFrom: raw['steeredFrom'] }
-            : {}),
+        ...(typeof raw['followedBy'] === 'string' && raw['followedBy'] !== '' ? { followedBy: raw['followedBy'] } : {}),
+        ...(continuedFrom !== undefined ? { continuedFrom } : {}),
+        ...(continuationKind !== undefined ? { continuationKind } : {}),
+        ...(chainStartedAt !== undefined ? { chainStartedAt } : {}),
         ...(typeof raw['pendingSteers'] === 'number'
             ? { pendingSteers: raw['pendingSteers'] }
             : {}),
@@ -697,7 +1314,6 @@ function toSummary(observed) {
         ...(typeof raw['last_alive_at'] === 'string' ? { lastAliveAt: raw['last_alive_at'] } : {}),
     };
 }
-/** progress.json `digest`, accepted only when it has the shape the writer produces. */
 function readDigest(v) {
     if (v === null || typeof v !== 'object' || Array.isArray(v))
         return null;
@@ -734,81 +1350,6 @@ function isActiveForgeActivity(value) {
         return false;
     const activity = value;
     return typeof activity['stepIndex'] === 'number' && typeof activity['tool'] === 'string' && activity['status'] === 'active';
-}/**
- * steer-log.ts — the durable record of steers (`steer.jsonl`) and the prompt a
- * continuation turn is built from. Pure over the job directory: the pump in
- * forge/service.ts decides WHEN to chain; this decides what is said.
- */
-function appendSteerEntry(repo, jobId, entry) {
-    const dir = jobDir(repo, jobId);
-    mkdirSync(dir, { recursive: true });
-    appendFileSync(jobFile(repo, jobId, FILES.steer), `${JSON.stringify(entry)}\n`, 'utf8');
-}
-function readSteerEntries(repo, jobId) {
-    const file = jobFile(repo, jobId, FILES.steer);
-    let text;
-    try {
-        text = readFileSync(file, 'utf8');
-    }
-    catch {
-        return [];
-    }
-    const out = [];
-    const seenIds = new Set();
-    for (const line of text.split('\n')) {
-        const trimmed = line.trim();
-        if (trimmed === '')
-            continue;
-        try {
-            const parsed = JSON.parse(trimmed);
-            if (typeof parsed.id === 'string' &&
-                typeof parsed.createdAt === 'string' &&
-                typeof parsed.prompt === 'string' &&
-                (parsed.delivery === 'queue' || parsed.delivery === 'interrupt') &&
-                !seenIds.has(parsed.id)) {
-                seenIds.add(parsed.id);
-                out.push(parsed);
-            }
-        }
-        catch { /* ignore truncated line */ }
-    }
-    return out;
-}
-function buildSteeredPrompt(input) {
-    const steerBody = input.entries.length === 1
-        ? input.entries[0].prompt
-        : input.entries.map((e, idx) => `[Steer ${idx + 1} (${e.createdAt})]\n${e.prompt}`).join('\n\n');
-    const tag = input.freshContinuation
-        ? '[FRESH CONTINUATION]'
-        : input.wasInterrupted
-            ? '[TURN INTERRUPTED]'
-            : `[FOLLOW-UP STEER · ${input.entries.length} queued update${input.entries.length === 1 ? '' : 's'}]`;
-    const statusLine = input.wasInterrupted
-        ? `Your previous turn (${input.parentJobId}) was interrupted after ${input.toolCalls} tool call(s) with updated instructions from the orchestrator. Inspect your working tree before repeating any completed steps.`
-        : `Your previous turn (${input.parentJobId}) completed after ${input.toolCalls} tool call(s), and the orchestrator queued follow-up instructions for you.`;
-    const syncedLine = input.syncedFiles !== undefined && input.syncedFiles.length > 0
-        ? `\nSynced brief file(s) in your working tree: ${input.syncedFiles.join(', ')} (re-read before continuing).`
-        : '';
-    const tailBlock = input.responseTail
-        ? `\nLast response excerpt from previous turn:\n${input.responseTail}\n`
-        : '';
-    const header = `[STEERED TURN CONTINUITY] ${tag}\n${statusLine}${syncedLine}${tailBlock}\n[ORCHESTRATOR UPDATE]\n${steerBody}`;
-    const prependBrief = input.brief !== '' && !header.startsWith(input.brief);
-    const sentPrompt = prependBrief ? `${input.brief}\n\n${header}` : header;
-    return { rawPrompt: header, sentPrompt, prependBrief };
-}
-/** The child job id the pump published before stamping `supersededBy`, if any. */
-function readSteerHead(repo, jobId) {
-    try {
-        const line = readFileSync(jobFile(repo, jobId, FILES.steerHead), 'utf8')
-            .split('\n')
-            .map((s) => s.trim())
-            .find((s) => s !== '');
-        return line ?? null;
-    }
-    catch {
-        return null;
-    }
 }/**
  * watched-files.ts — brief/spec files a worker is told to read, copied into its
  * cwd and tracked by signature so a later edit on either side is noticed.
@@ -929,173 +1470,46 @@ function syncWatchedFiles(repo, cwd, files, previousWatched, onWarning) {
             ? prev : { repoSig, cwdSig };
     }
     return out;
-}/**
- * pipeline/types.ts — vocabulary for mixed-provider stage pipelines.
- *
- * The headline feature this file exists for:
- *
- *     implement → gemini   ·   review → codex   ·   moderate → claude-sonnet
- *
- * One task, a different worker per stage. Nothing in this file knows how to
- * talk to any worker; `StageRunner` (below) is the seam, and it is injected.
- *
- * WHY NO IMPORT FROM providers/
- * providers/ is written concurrently by another engineer. If pipeline/ imported
- * a concrete provider client we would have a compile-order dependency on work
- * that does not exist yet, and pipeline/ could not be tested without spawning
- * real agents. So the dependency points *inward*: pipeline/ declares the shape
- * it needs, forge/ supplies an implementation over providers/ at the composition
- * root (forge/runner.ts, forge/execute.ts). See `createRunnerRouter` in pipeline.ts for the wiring point.
- */
-/**
- * Reasoning effort, where the worker supports it.
- *
- * Evidence (measured on this user's own jobs): raising effort to `high` cost
- * **+50% wall clock and 1.9x thinking tokens for ZERO accuracy gain** on an
- * in-band task. That is why `low` is the default everywhere in this codebase
- * and why escalation — not the default — is what buys effort.
- */
-const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
-const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
-/**
- * Worker `env` keys that are refused, because they change how the worker
- * binary is found, loaded or configured. The env is applied when the CLI is
- * spawned, BEFORE any sandbox it sets up exists: `PATH` can swap the binary
- * for a shim, `NODE_OPTIONS=--import=…` or `DYLD_INSERT_LIBRARIES` run code
- * ahead of the worker, and a provider config dir can drop its read-only
- * settings, while the ack would still report the sandbox as enforced.
- * Matched case-insensitively (Windows env names are).
- */
-const ENV_DENYLIST = {
-    PATH: 'would change which worker binary runs',
-    HOME: 'would change which config the worker loads',
-    SHELL: 'would change the shell the worker runs commands with',
-    TMPDIR: 'would move the worker\'s temporary and sandbox files',
-    NODE_OPTIONS: 'would run code before the worker starts',
-    NODE_PATH: 'would change which modules the worker loads',
-    PYTHONPATH: 'would change which modules the worker loads',
-    PYTHONHOME: 'would change which runtime the worker loads',
-    PYTHONSTARTUP: 'would run code before the worker starts',
-    // Shell startup files: a shell-based launcher sources these before the worker body runs.
-    BASH_ENV: 'would run code before the worker starts',
-    ENV: 'would run code before the worker starts',
-    ZDOTDIR: 'would run code before the worker starts',
-    SHELLOPTS: 'would change how the shell runs the worker',
-    PROMPT_COMMAND: 'would run code before the worker starts',
-    PERL5OPT: 'would run code before the worker starts',
-    RUBYOPT: 'would run code before the worker starts',
-};
-/**
- * Key prefixes refused for the same reason: the dynamic loader (`LD_`, `DYLD_`),
- * XDG config/data dirs, Agent Smith's own settings (`AGENT_SMITH_*_BIN`,
- * `_HOME`, `_CODEX_SANDBOX`, …) and each provider's config (`CLAUDE_CONFIG_DIR`,
- * `CODEX_HOME`, `KIMI_CODE_HOME`, `OPENCODE_*`, `AGY_*`). The adapters' own
- * keys are all covered here; do not list them again above.
- */
-const ENV_DENY_PREFIXES = {
-    LD_: 'would change which libraries the worker loads',
-    DYLD_: 'would change which libraries the worker loads',
-    XDG_: 'would change which config the worker loads',
-    AGENT_SMITH_: 'is Agent Smith\'s own setting, not the worker\'s',
-    AGY_: 'would change the provider\'s config',
-    CLAUDE_: 'would change the provider\'s config',
-    CODEX_: 'would change the provider\'s config',
-    OPENCODE_: 'would change the provider\'s config',
-    KIMI_: 'would change the provider\'s config',
-};
-/** Why a worker `env` key is refused, or null when it is allowed. */
-function deniedEnvReason(key) {
-    const upper = key.toUpperCase();
-    const exact = ENV_DENYLIST[upper];
-    if (exact !== undefined)
-        return exact;
-    for (const [prefix, why] of Object.entries(ENV_DENY_PREFIXES))
-        if (upper.startsWith(prefix))
-            return why;
-    return null;
-}
-/** Validate a worker `env` map: plain identifier keys not on the denylist, string values without NUL. Returns it unchanged, or undefined when absent. */
-function validateEnv(raw, label = 'env') {
-    if (raw === undefined)
-        return undefined;
-    if (raw === null || typeof raw !== 'object' || Array.isArray(raw))
-        throw new Error(`${label} must be an object of string values.`);
-    const out = {};
-    for (const [key, value] of Object.entries(raw)) {
-        if (!ENV_KEY.test(key))
-            throw new Error(`${label} key "${key}" is not a valid variable name (letters, digits, underscore; no leading digit).`);
-        const denied = deniedEnvReason(key);
-        if (denied !== null)
-            throw new Error(`${label}.${key} ${denied}; it is not allowed in a worker env.`);
-        if (typeof value !== 'string' || value.includes('\0'))
-            throw new Error(`${label}.${key} must be a string without NUL characters.`);
-        out[key] = value;
-    }
-    return out;
-}/**
- * service.ts — the composition root that can START a worker.
- *
- * It wires providers/ (adapters) and pipeline/ (StageRunner) to the job
- * directory (forge/format.ts, writer.ts), and answers four questions: spawn a job, list
- * them, describe one, cancel one. `surfaces/channel` exposes exactly these as
- * MCP tools; nothing else in the repo may call a provider directly.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * WHY spawn_job RETURNS IN UNDER A MILLISECOND
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * A reference job in the corpus took 28 minutes. A tool call that waits for it
- * would time out, and a tool call that blocks the MCP server would stop the
- * channel from pushing anything at all for the duration — so a 28-minute job
- * would also blind the surface that exists to report it.
- *
- * So `spawnJob` does exactly three things synchronously: validate the request,
- * write the anchor (forge/writer.ts `start`), and hand the rest to a detached
- * async pump. The job id comes back and the job exists on disk before the caller
- * has finished reading the response. The 20 real jobs took 16.3 hours at a
- * concurrency of 3; a spawn path that holds the caller is that failure again.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * SAFETY: --dangerously-skip-permissions IS OFF BY DEFAULT (EXCEPT FOR agy AND kimi)
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * `SpawnSpec.unrestricted` is a required field and this module defaults it to
- * `false`. It has to: a provider that can prompt must not bypass prompts by
- * default. agy and kimi cannot prompt headless: agy's restricted mode silently
- * denies tools and reports success with an empty response (verified live — see
- * providers/agy.ts, THE TRAP), so it defaults to unrestricted with an env
- * opt-out. kimi's print mode force-sets the auto policy and has no restricted
- * mode, so it is always unrestricted. `job.json` records the effective posture,
- * not a request that had no effect; everything else is opt-in per call.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * WHY THIS IS NOT A CLI
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * It was going to be. The arguments against, which are the only ones that matter
- * here: this product is driven FROM WITHIN a harness, not from a terminal. A
- * `agent-smith run` binary would be a second way to do the same job as the MCP
- * tool, and a user driving agent-smith from Claude Code has a shell already —
- * it has Claude. Everything below is a plain function so it can be called from a
- * tool handler, a test, or a future entrypoint, and there is exactly one
- * implementation.
- */
-function newLiveJob(writer, timeoutMs) {
+}function newLiveJob(writer, timeoutMs) {
     return {
         writer,
         handle: null,
         timeoutMs,
         consumedSteers: 0,
+        liveSent: 0,
         interruptRequested: false,
         interruptFired: false,
         userCanceled: false,
     };
 }
 const STEER_CONVERSATION_WAIT_MS = 2_000;
-/** A worker name that no job answers to, or that more than one worker does. */
+const OWNER_CHECKS_POLL_MS = 200;
+function checksFollow(spec) {
+    return spec.ownerChecks && (spec.checks?.length ?? 0) > 0;
+}
+function mergeOverrides(entries) {
+    let out = {};
+    for (const e of entries)
+        if (e.overrides !== undefined)
+            out = { ...out, ...e.overrides };
+    return out;
+}
+function applyOverrides(spec, o, provider) {
+    if (Object.keys(o).length === 0)
+        return spec;
+    const unrestricted = o.unrestricted === undefined ? spec.unrestricted : provider.name === 'kimi' ? true : o.unrestricted;
+    return {
+        ...spec,
+        ...(o.model === undefined ? {} : { model: o.model, modelRequested: o.model, modelResolved: o.model, modelSource: 'requested' }),
+        ...(o.effort === undefined || provider.supportsEffort === false ? {} : { effort: o.effort }),
+        ...(o.timeoutMs === undefined ? {} : { timeoutMs: resolveTimeoutMs(o.timeoutMs) }),
+        ...(o.checks === undefined ? {} : { checks: o.checks }),
+        unrestricted,
+        readOnlyRequested: spec.preset?.readOnly === true && !unrestricted,
+    };
+}
 class WorkerLookupError extends Error {
     kind;
-    /** The job ids that matched, for an ambiguous name. */
     jobIds;
     constructor(message, kind, jobIds = []) {
         super(message);
@@ -1104,44 +1518,29 @@ class WorkerLookupError extends Error {
         this.jobIds = jobIds;
     }
 }
-/**
- * How long a spawn waits for the model catalog before passing the model through
- * unchecked. Cold discovery shells out (`agy models` alone took 2.1 s), so the
- * first spawn, when no catalog has been seen yet, waits longer; every later
- * spawn finds the TTL cache warm or gives up quickly.
- */
 const CATALOG_WAIT_MS = 2_000;
 const CATALOG_COLD_WAIT_MS = 5_000;
-/**
- * The forge. One instance per process; the live-handle map is per instance.
- *
- * The map is bounded by the number of jobs this process started, and it is
- * deliberately NOT the source of truth — job.json is. A restart of this server
- * loses the ability to `kill()` an in-flight worker, and that is stated in the
- * cancel result rather than papered over: an honest "I marked it cancelled but
- * there is no handle here to signal" beats a `signalled: true` that never
- * happened. Service reads recover jobs whose recorded supervisor has died,
- * provided no terminal result is already present. PID-less legacy jobs remain
- * read-only observations because the service cannot prove their writer died.
- */
 class ForgeService {
     repo;
     supervisorUrl;
     live = new Map();
-    /** Job IDs spawned by this process, for `list_jobs session`. */
     spawnedIds = new Set();
     spawnedRuns = new Set();
     flushMs;
     catalogSource;
     catalogWaitMs;
-    /** Set once any catalog lookup has completed; until then a spawn waits the cold budget. */
     catalogSeen = false;
     catalogWarm;
     harnessDefaults;
     providerSource;
     describeSandbox;
+    workers;
+    hooks;
+    envVault = new Map();
     constructor(options) {
         this.repo = options.repo;
+        this.hooks = options.hooks ?? {};
+        this.workers = new WorkerIndexStore(options.repo, { readManifest: (id) => this.readManifestRaw(id) });
         this.supervisorUrl = options.supervisorUrl;
         this.flushMs = options.flushMs;
         this.providerSource = options.providerSource ?? requireProvider;
@@ -1149,17 +1548,14 @@ class ForgeService {
         this.catalogWaitMs = { warm: options.catalogWaitMs?.warm ?? CATALOG_WAIT_MS, cold: options.catalogWaitMs?.cold ?? CATALOG_COLD_WAIT_MS };
         this.harnessDefaults = options.harnessDefaults ?? getHarnessDefaults;
         this.describeSandbox = options.describeSandbox ?? ((p, spec) => p.describeSandbox?.(spec));
-        // Publish abandoned-job recovery when the owner service starts, so the
-        // read-only pane agrees before an operator makes its first MCP status call.
         try {
             for (const entry of readdirSync(jobsDir(this.repo), { withFileTypes: true })) {
                 if (entry.isDirectory())
                     reconcileOrphan(this.repo, entry.name);
             }
         }
-        catch { /* A missing job store is the ordinary fresh-repo case. */ }
+        catch { }
     }
-    /** One writer per job, configured like every other writer this service makes. */
     newWriter(jobId) {
         return new JobWriter({
             repo: this.repo,
@@ -1167,10 +1563,9 @@ class ForgeService {
             ...(this.flushMs === undefined ? {} : { flushMs: this.flushMs }),
         });
     }
-    /** A worker is one running job at a time: refuse a name or identity that is already busy, on disk or live here. */
     assertNameFree(name, workerId) {
         const busy = (jobId) => new Error(`"${name}" is busy (${jobId}); wait, cancel, or use another name.`);
-        const canonicalConflict = findActiveIdentity(this.repo, name, workerId);
+        const canonicalConflict = this.findActiveIdentity(name, workerId);
         if (canonicalConflict !== null)
             throw busy(canonicalConflict.jobId);
         for (const { writer } of this.live.values()) {
@@ -1179,10 +1574,42 @@ class ForgeService {
                 throw busy(active.jobId);
         }
     }
-    /**
-     * Start model discovery in the background so the first spawn finds it cached.
-     * Never blocks, never rejects; a second call is a no-op.
-     */
+    nextTurnAfter(parentId, parent, workerId) {
+        if (parent !== null && typeof parent.turn === 'number' && Number.isInteger(parent.turn) && parent.turn >= 1)
+            return parent.turn + 1;
+        this.workers.refresh();
+        const turns = this.workers.get(workerId)?.turns ?? [];
+        return turns.includes(parentId) ? turns.length + 1 : 2;
+    }
+    recordTurnStart(input) {
+        const parentId = input.continuedFrom;
+        this.workers.recordTurnStart({
+            workerId: input.workerId,
+            name: input.name,
+            jobId: input.jobId,
+            continuation: parentId !== undefined,
+            lockHeld: input.lockHeld,
+            alsoLocked: () => {
+                if (parentId === undefined || this.live.has(parentId))
+                    return;
+                if (!this.isSafeJobId(parentId))
+                    return;
+                let parent;
+                try {
+                    parent = readManifest(this.repo, parentId);
+                }
+                catch {
+                    return;
+                }
+                if (!isTerminalStatus(parent.status) || parent.followedBy || parent.supersededBy)
+                    return;
+                const link = input.replacesParent ? { supersededBy: input.jobId } : { followedBy: input.jobId };
+                writeJsonAtomic(jobFile(this.repo, parentId, FILES.job), { ...parent, ...link, ...(parent.pendingSteers ? { pendingSteers: 0 } : {}) });
+                if (parent.pendingSteers)
+                    this.setSettledPending(parentId, 0);
+            },
+        });
+    }
     warmCatalogs() {
         if (this.catalogWarm !== undefined)
             return;
@@ -1190,10 +1617,8 @@ class ForgeService {
             .then(() => this.catalogSource())
             .then((all) => { this.catalogSeen = true; return all; })
             .catch(() => [])
-            // Once settled the provider TTL cache owns freshness; later lookups must not reuse this snapshot.
             .finally(() => { this.catalogWarm = undefined; });
     }
-    /** Never throws, never waits long: a catalog is advice, not a gate on starting. */
     async catalogFor(provider) {
         let timer;
         try {
@@ -1202,7 +1627,6 @@ class ForgeService {
                 timer = setTimeout(() => resolve(undefined), waitMs);
                 timer.unref?.();
             });
-            // Join a warm-up still in flight rather than starting a second discovery.
             const warm = this.catalogWarm;
             const all = await Promise.race([warm ?? this.catalogSource([provider]), timeout]);
             if (all !== undefined)
@@ -1217,32 +1641,26 @@ class ForgeService {
                 clearTimeout(timer);
         }
     }
-    /**
-     * Start one job. Returns as soon as the anchor is on disk.
-     *
-     * Rejects only for a bad REQUEST (unknown provider, empty prompt). Everything
-     * that can go wrong afterwards — binary missing, auth expired, tool denied,
-     * killed by the OS — arrives as a `failed` job, because a rejected promise has
-     * no job id and therefore nothing a pane can ever draw.
-     */
     async spawnJob(request) {
         const { ack } = await this.spawnTracked(request);
         return ack;
     }
-    /**
-     * spawnJob, plus the terminal manifest promise.
-     *
-     * Split out for exactly one caller — forge/runner.ts, which runs a pipeline
-     * stage and must wait for it. Everything else wants the ack and the channel.
-     */
     async spawnTracked(request) {
-        if (this.supervisorUrl)
-            return launchJob(this, request);
+        const tracked = this.supervisorUrl ? await launchJob(this, request) : await this.startOwned(request);
+        if (request.env !== undefined && Object.keys(request.env).length > 0) {
+            this.envVault.set(tracked.ack.workerId, { ...(this.envVault.get(tracked.ack.workerId) ?? {}), ...request.env });
+        }
+        return tracked;
+    }
+    async startOwned(request) {
+        const prepared = await this.prepareTurn(request);
+        const done = this.own(this.pump(prepared.writer, prepared.provider, prepared.spec, prepared.turn));
+        return { ack: prepared.ack, done };
+    }
+    async prepareTurn(request) {
         const provider = this.providerSource(request.provider ?? (() => { throw new Error('provider is required.'); })());
         const rawMode = request.mode.trim();
         const resuming = request.conversation !== undefined && request.conversation !== null;
-        // Closed set for fresh, non-pipeline spawns. Pipeline stages keep arbitrary
-        // roles; a resume may carry a legacy mode from an older job.
         if (request.pipeline == null && !resuming && !isMode(rawMode))
             throw modeError(rawMode);
         const mode = rawMode === '' ? 'task' : rawMode;
@@ -1251,14 +1669,10 @@ class ForgeService {
         if (prompt.trim() === '') {
             throw new Error('prompt is empty; there is nothing to hand the worker.');
         }
-        const timeoutMs = clampTimeout(request.timeoutMs);
+        const timeoutMs = resolveTimeoutMs(request.timeoutMs);
         const env = validateEnv(request.env);
         const envKeys = env === undefined ? [] : Object.keys(env);
         const cwd = request.cwd ?? this.repo;
-        // agy and kimi cannot prompt headless. agy has an env opt-out; kimi's print
-        // mode force-sets the auto policy and has no restricted mode, so the
-        // EFFECTIVE posture is always unrestricted. Record that, not the request,
-        // and warn when the two differ so the durable job is not a lie.
         const unrestrictedRequested = request.unrestricted;
         const unrestricted = provider.name === 'kimi'
             ? true
@@ -1267,20 +1681,16 @@ class ForgeService {
         if (unrestrictedRequested === false && provider.name === 'kimi') {
             warnings.push('kimi print mode force-sets the auto permission policy; unrestricted:false cannot restrict it. The ack and job.json record the effective posture.');
         }
-        // A provider that cannot apply a per-run effort must not have one recorded
-        // as applied. Drop it at the service boundary (so job.json is truthful) and
-        // tell the caller; the adapter also emits an event for direct users.
         const effort = provider.supportsEffort === false ? undefined : request.effort;
         if (request.effort !== undefined && provider.supportsEffort === false) {
             warnings.push(`kimi has no per-run effort flag; effort "${request.effort}" was ignored. Set [thinking].effort or a model alias default_effort in config.toml.`);
         }
-        if (request.model !== undefined || effort !== undefined) {
+        if ((request.model !== undefined || effort !== undefined) && request.lockHeldByCaller !== true) {
             warnings.push(...checkAgainstCatalog(provider.name, request.model, effort, await this.catalogFor(provider.name)));
         }
         let modelResolved = request.model ?? null;
         let modelSource = request.model === undefined ? 'unknown' : 'requested';
         if (request.model === undefined) {
-            // Config-file read only: no CLI, so spawn stays instant (see server.ts no-long-call rule).
             const configured = this.harnessDefaults(provider.name).model;
             if (configured) {
                 modelResolved = configured;
@@ -1309,7 +1719,6 @@ class ForgeService {
             pipelineStage: request.pipeline !== undefined && request.pipeline !== null,
             resuming,
         });
-        // A caller that already starts its prompt with the brief gets it once, not twice.
         const prependBrief = brief !== '' && !prompt.startsWith(brief);
         const preambleApplied = brief !== '';
         const sentPrompt = prependBrief ? `${brief}\n\n${prompt}` : prompt;
@@ -1320,17 +1729,10 @@ class ForgeService {
         const workerId = request.workerId ?? jobId;
         this.assertNameFree(name, workerId);
         const writer = this.newWriter(jobId);
-        const requestedFiles = request.files !== undefined && request.previousWatchedFiles !== undefined
-            ? request.files.filter((f) => {
-                if (!(f in request.previousWatchedFiles) || existsSync(path.resolve(this.repo, f)))
-                    return true;
-                warnings.push(`dropped deleted watched file "${f}" from previous turn`);
-                return false;
-            })
-            : request.files;
-        const watchedFiles = requestedFiles !== undefined && requestedFiles.length > 0
-            ? syncWatchedFiles(this.repo, cwd, requestedFiles, request.previousWatchedFiles, (w) => warnings.push(w))
-            : undefined;
+        warnings.push(...request.notes ?? []);
+        const watchedFiles = request.watchedFiles ?? (request.files !== undefined && request.files.length > 0
+            ? syncWatchedFiles(this.repo, cwd, request.files, undefined, (w) => warnings.push(w))
+            : undefined);
         const spec = {
             jobId,
             name,
@@ -1360,27 +1762,56 @@ class ForgeService {
             stage: request.stage ?? null,
             attempt: request.attempt ?? null,
             onPrepared: request.onPrepared,
+            ownerChecks: request.ownerChecks === true,
         };
-        // Anchor first. Everything after this point can fail loudly; nothing after
-        // this point can make the job invisible.
-        writer.start(turnStartInput(provider.name, spec, {
+        const parentManifest = request.continuedFrom ? this.readManifestSync(request.continuedFrom) : null;
+        const continuationKind = request.continuedFrom
+            ? normalizeContinuationKind(request.continuationKind) ?? 'follow-up'
+            : undefined;
+        const turn = typeof request.turn === 'number' && Number.isInteger(request.turn) && request.turn >= 1
+            ? request.turn
+            : request.continuedFrom
+                ? this.nextTurnAfter(request.continuedFrom, parentManifest, workerId)
+                : 1;
+        const startedManifest = writer.start(turnStartInput(provider.name, spec, {
             prompt,
-            // Exactly what was prepended, so the /forge pane's "Show preamble" matches what the worker read.
             preamble: prependBrief ? brief : undefined,
             preambleApplied,
             conversation: request.conversation ?? null,
             task: request.task,
             watchedFiles,
+            turn,
+            continuedFrom: request.continuedFrom,
+            continuationKind,
+            chainStartedAt: continuationKind === 'follow-up' ? undefined : request.chainStartedAt,
         }));
         try {
+            this.recordTurnStart({
+                workerId, name, jobId,
+                continuedFrom: request.continuedFrom,
+                continuationKind,
+                replacesParent: request.replacesParent === true,
+                lockHeld: request.lockHeldByCaller === true,
+            });
             if (request.checks !== undefined)
                 writeJsonAtomic(jobFile(this.repo, jobId, FILES.checksSpec), request.checks);
-            if (envKeys.length > 0)
-                writeJsonAtomic(jobFile(this.repo, jobId, ENV_KEYS_FILE), envKeys);
+            const trackedKeys = [...new Set([...(request.continuedFrom ? this.envKeysOf(request.continuedFrom) : []), ...envKeys])];
+            if (trackedKeys.length > 0)
+                writeJsonAtomic(jobFile(this.repo, jobId, ENV_KEYS_FILE), trackedKeys);
+            for (const m of request.messages ?? [])
+                writer.recordMessage(m.text, 'turn-start', m.sender);
+            for (const note of request.notes ?? [])
+                writer.warn(note);
+            if (spec.ownerChecks && request.checks?.length)
+                markAcceptancePending(this.repo, jobId, request.checks);
             await request.onPrepared?.(jobId);
         }
         catch (error) {
             writer.abort('failed', `setup failed · ${String(error)}`);
+            try {
+                createMarker(jobFile(this.repo, jobId, FILES.ownerDone), new Date().toISOString());
+            }
+            catch { }
             throw error;
         }
         this.spawnedIds.add(jobId);
@@ -1388,6 +1819,10 @@ class ForgeService {
             jobId,
             name,
             workerId,
+            turn: startedManifest.turn ?? turn,
+            ...(startedManifest.continuedFrom ? { continuedFrom: startedManifest.continuedFrom } : {}),
+            ...(startedManifest.continuationKind ? { continuationKind: startedManifest.continuationKind } : {}),
+            chainStartedAt: startedManifest.chainStartedAt ?? startedManifest.startedAt ?? startedManifest.createdAt,
             role: mode,
             provider: provider.name,
             status: 'running',
@@ -1407,42 +1842,44 @@ class ForgeService {
             preambleApplied,
             ...(warnings.length === 0 ? {} : { warnings }),
         };
-        const done = this.pump(writer, provider, spec, {
-            rawPrompt: prompt,
-            prependBrief,
-            resuming,
-            context: request.context,
-        });
-        return { ack, done };
+        return { ack, writer, provider, spec, turn: { rawPrompt: prompt, prependBrief, resuming, context: request.context } };
     }
-    /**
-     * The detached pump: spawn, stream, record, chain steered turns, resolve.
-     *
-     * Never rejects. Every exit path lands on writer.finish() or writer.abort(),
-     * because a job that stops being `running` is the only promise this function
-     * makes to every reader on the other side of the filesystem. When a steer is
-     * queued or interrupts the turn, this loop is the sole owner that opens the
-     * child anchor and marks the parent superseded.
-     */
-    async pump(initialWriter, provider, spec, initialTurn) {
+    async pump(initialWriter, provider, initialSpec, initialTurn, initialLive) {
+        let spec = initialSpec;
         let currentWriter = initialWriter;
         let currentJobId = spec.jobId;
         let currentPrompt = spec.prompt;
         let currentConversation = spec.conversation;
         let currentTurn = initialTurn;
-        let liveEntry = newLiveJob(currentWriter, spec.timeoutMs);
-        // Register synchronously before the first await so a steer or cancel arriving
-        // right after spawn_job finds the live entry in this.live.
+        let liveEntry = initialLive ?? newLiveJob(currentWriter, spec.timeoutMs);
         this.live.set(currentJobId, liveEntry);
+        const ended = (manifest) => ({
+            manifest: manifest ?? currentWriter.snapshot() ?? { jobId: currentJobId },
+            spec, provider, consumed: liveEntry.consumedSteers,
+        });
+        const abortTurn = (status, reason) => this.ownerLocked(spec.workerId, async () => {
+            const jobId = currentJobId;
+            this.live.delete(jobId);
+            const end = ended(currentWriter.abort(status, reason));
+            writeConsumedCount(this.repo, jobId, liveEntry.consumedSteers);
+            if (status === 'canceled')
+                this.discardAtCancel(jobId, readSteerEntries(this.repo, jobId), liveEntry, (w) => this.warnSettled(jobId, w));
+            const waiting = undeliveredEntries(this.repo, jobId).length;
+            if (waiting > 0) {
+                this.setSettledPending(jobId, waiting);
+                return end;
+            }
+            if (checksFollow(spec))
+                return end;
+            this.markOwnerDone(jobId);
+            return { ...end, ownerDone: true };
+        });
         while (true) {
             if (currentTurn.prependBrief && !currentTurn.resuming && spec.pipeline === null && currentWriter.hasPendingBaseline()) {
                 const dirty = await currentWriter.awaitBaseline();
                 if (liveEntry.userCanceled || currentWriter.cancelled || existsSync(jobFile(this.repo, currentJobId, FILES.cancel))) {
                     currentWriter.requestCancel();
-                    this.live.delete(currentJobId);
-                    return (currentWriter.abort('canceled', 'canceled by user') ??
-                        currentWriter.snapshot() ??
-                        { jobId: currentJobId });
+                    return abortTurn('canceled', 'canceled by user');
                 }
                 if (dirty.length > 0) {
                     const fullBrief = buildBrief({
@@ -1473,56 +1910,66 @@ class ForgeService {
                     ...(spec.effort === undefined ? {} : { effort: spec.effort }),
                     ...(currentConversation === undefined ? {} : { conversation: currentConversation }),
                     ...(spec.env === undefined ? {} : { env: { ...spec.env } }),
-                    // THE KEY LINE. Handing the provider adapter OUR job directory as its
-                    // stateDir means events.jsonl / argv.json / stderr.log / result.json are
-                    // written by the already-verified plumbing in providers/ndjson.ts, for
-                    // all four providers, instead of being copied across afterwards by us.
                     stateDir: jobDir(this.repo, currentJobId),
                     jobId: currentJobId,
                 });
             }
             catch (err) {
-                this.live.delete(currentJobId);
-                return (currentWriter.abort('failed', `couldn't start · ${describe(err)}`) ??
-                    currentWriter.snapshot() ??
-                    { jobId: currentJobId });
+                return abortTurn('failed', `couldn't start · ${describe(err)}`);
             }
             liveEntry.handle = handle;
             const unsubscribe = pipeEvents(currentWriter, handle);
             let interruptDetectedAt = null;
             let lastPendingSteers = 0;
             let pollWarned = false;
+            const live = liveEntry;
+            const writer = currentWriter;
+            const jobId = currentJobId;
+            const liveInput = provider.liveInput === true && typeof handle.send === 'function';
+            const publishConsumed = (entries) => {
+                writeConsumedCount(this.repo, jobId, live.consumedSteers);
+                const pending = Math.max(0, entries.length - live.consumedSteers);
+                lastPendingSteers = pending;
+                writer.setPendingSteers(pending);
+            };
             const syncSteerAndCancel = () => {
-                if (existsSync(jobFile(this.repo, currentJobId, FILES.cancel))) {
-                    liveEntry.userCanceled = true;
+                if (existsSync(jobFile(this.repo, jobId, FILES.cancel))) {
+                    live.userCanceled = true;
                 }
-                if (liveEntry.userCanceled) {
-                    currentWriter.requestCancel();
+                if (live.userCanceled) {
+                    writer.requestCancel();
                     handle.cancel();
                     return;
                 }
-                const entries = readSteerEntries(this.repo, currentJobId);
-                const unconsumed = entries.slice(liveEntry.consumedSteers);
+                const entries = readSteerEntries(this.repo, jobId);
+                const unconsumed = entries.slice(live.consumedSteers);
                 if (unconsumed.length !== lastPendingSteers) {
                     lastPendingSteers = unconsumed.length;
-                    currentWriter.setPendingSteers(unconsumed.length);
+                    writer.setPendingSteers(unconsumed.length);
                 }
-                if (unconsumed.some((e) => e.delivery === 'interrupt') || existsSync(jobFile(this.repo, currentJobId, FILES.cancelSteer))) {
-                    liveEntry.interruptRequested = true;
+                if (unconsumed.some((e) => e.delivery === 'interrupt') || existsSync(jobFile(this.repo, jobId, FILES.cancelSteer))) {
+                    live.interruptRequested = true;
                 }
-                if (liveEntry.interruptRequested && !liveEntry.interruptFired) {
+                if (liveInput && !live.interruptRequested) {
+                    for (let i = live.consumedSteers + live.liveSent; i < entries.length; i++) {
+                        const e = entries[i];
+                        if (!liveDeliverable(e) || handle.send(liveMessageText(e)) !== true)
+                            break;
+                        live.liveSent += 1;
+                    }
+                }
+                if (live.interruptRequested && !live.interruptFired) {
                     if (interruptDetectedAt === null)
                         interruptDetectedAt = Date.now();
-                    const hasConversation = currentWriter.currentConversation() !== null;
+                    const hasConversation = writer.currentConversation() !== null;
+                    const allowFresh = unconsumed.some((e) => e.allowFresh === true);
                     const waitElapsed = Date.now() - interruptDetectedAt >= STEER_CONVERSATION_WAIT_MS;
-                    if (hasConversation || waitElapsed) {
-                        liveEntry.interruptFired = true;
+                    if (hasConversation || allowFresh || waitElapsed) {
+                        live.interruptFired = true;
                         handle.cancel();
                     }
                 }
             };
-            // A poll or an event tap must not be able to reject the pump: a disk error
-            // in setPendingSteers is a warning, not the end of the worker.
             const safeSyncSteerAndCancel = () => {
                 try {
                     syncSteerAndCancel();
@@ -1530,13 +1977,49 @@ class ForgeService {
                 catch (err) {
                     if (!pollWarned) {
                         pollWarned = true;
-                        process.stderr.write(`agent-smith steer poll ${currentJobId}: ${describe(err)}\n`);
+                        process.stderr.write(`agent-smith steer poll ${jobId}: ${describe(err)}\n`);
                     }
                 }
             };
+            const replayed = [];
+            const markLiveRead = (texts, at) => {
+                replayed.push(...texts);
+                const entries = readSteerEntries(this.repo, jobId);
+                while (live.liveSent > 0) {
+                    const e = entries[live.consumedSteers];
+                    const i = e === undefined ? -1 : replayed.indexOf(liveMessageText(e));
+                    if (i < 0)
+                        break;
+                    replayed.splice(i, 1);
+                    writer.recordMessage(liveMessageText(e), 'next-step', senderOf(e), at);
+                    live.consumedSteers += 1;
+                    live.liveSent -= 1;
+                }
+                publishConsumed(entries);
+            };
+            const readAtResult = (unread) => {
+                const left = [...unread];
+                return readSteerEntries(this.repo, jobId).slice(live.consumedSteers, live.consumedSteers + live.liveSent)
+                    .map(liveMessageText)
+                    .filter((text) => {
+                    const i = left.indexOf(text);
+                    if (i < 0)
+                        return true;
+                    left.splice(i, 1);
+                    return false;
+                });
+            };
             const unsubSteerTap = handle.onEvent((ev) => {
-                if (ev.kind === 'started' && liveEntry.interruptRequested && !liveEntry.interruptFired) {
+                if (ev.kind === 'started' && live.interruptRequested && !live.interruptFired) {
                     safeSyncSteerAndCancel();
+                }
+                if (ev.kind === 'user-message' && live.liveSent > 0) {
+                    try {
+                        markLiveRead([ev.text], ev.at);
+                    }
+                    catch (err) {
+                        process.stderr.write(`agent-smith live input ${jobId}: ${describe(err)}\n`);
+                    }
                 }
             });
             safeSyncSteerAndCancel();
@@ -1547,112 +2030,305 @@ class ForgeService {
                 clearInterval(cancelPoll);
                 unsubSteerTap();
                 unsubscribe();
-                await currentWriter.prepareFinish();
+                if (live.liveSent > 0)
+                    markLiveRead(readAtResult(result.unreadInput ?? []), result.finishedAt);
+                live.liveSent = 0;
+                await writer.prepareFinish();
                 const report = reportFor(result);
-                safeSyncSteerAndCancel();
-                const entries = readSteerEntries(this.repo, currentJobId);
-                const unconsumed = entries.slice(liveEntry.consumedSteers);
-                const alreadyTerminal = result.status === 'cancelled' ? 'canceled' : null;
-                const verdict = deriveStatus({
-                    alreadyTerminal,
-                    ok: result.ok,
-                    jobStatus: result.status,
-                    deniedActions: result.deniedActions ?? [],
-                    report: report === '' ? null : report,
-                    // Same cwd rule as finish(): a writing turn whose cwd vanished failed,
-                    // so a queued steer must not chain onto it.
-                    ...currentWriter.verdictFacts(),
-                });
-                const shouldChain = !liveEntry.userCanceled &&
-                    unconsumed.length > 0 &&
-                    (liveEntry.interruptRequested || verdict.status === 'succeeded');
-                if (!shouldChain && !liveEntry.userCanceled && unconsumed.length > 0) {
-                    const count = unconsumed.length;
-                    currentWriter.warn(`${count} queued steer${count === 1 ? '' : 's'} not applied: the turn ended ${verdict.status}. ` +
-                        'Use resume_job or steer_job again.');
-                }
-                if (shouldChain) {
-                    const next = await this.chainContinuation({
-                        provider, spec, parent: { writer: currentWriter, jobId: currentJobId, live: liveEntry },
-                        result, report, entries, unconsumed, verdictStatus: verdict.status,
+                const decision = await this.ownerLocked(spec.workerId, async () => {
+                    safeSyncSteerAndCancel();
+                    const entries = readSteerEntries(this.repo, jobId);
+                    if (live.userCanceled)
+                        this.discardAtCancel(jobId, entries, live, (w) => writer.warn(w));
+                    const unconsumed = entries.slice(live.consumedSteers);
+                    await this.hooks.afterFinalRead?.(jobId);
+                    const alreadyTerminal = result.status === 'cancelled' ? 'canceled' : null;
+                    const verdict = deriveStatus({
+                        alreadyTerminal,
+                        ok: result.ok,
+                        jobStatus: result.status,
+                        deniedActions: result.deniedActions ?? [],
+                        report: report === '' ? null : report,
+                        ...writer.verdictFacts(),
                     });
-                    currentWriter = next.writer;
-                    currentJobId = next.jobId;
-                    currentPrompt = next.prompt;
-                    currentConversation = next.conversation;
-                    currentTurn = next.turn;
-                    liveEntry = next.live;
-                    continue;
+                    if (unconsumed.length > 0) {
+                        const next = await this.chainContinuation({
+                            provider, spec, parent: { writer, jobId, live },
+                            result, report, entries, unconsumed, verdictStatus: verdict.status, lockHeld: true,
+                        });
+                        return { next };
+                    }
+                    const manifest = writer.finish(result, report === '' ? null : report);
+                    writeConsumedCount(this.repo, jobId, live.consumedSteers);
+                    this.live.delete(jobId);
+                    const done = !checksFollow(spec);
+                    if (done)
+                        this.markOwnerDone(jobId);
+                    return { manifest, ownerDone: done };
+                });
+                if (decision.next === undefined) {
+                    const end = ended(decision.manifest ?? null);
+                    return decision.ownerDone === true ? { ...end, ownerDone: true } : end;
                 }
-                const manifest = currentWriter.finish(result, report === '' ? null : report);
-                this.live.delete(currentJobId);
-                return manifest;
+                const next = decision.next;
+                spec = next.spec;
+                currentWriter = next.writer;
+                currentJobId = next.jobId;
+                currentPrompt = next.prompt;
+                currentConversation = next.conversation;
+                currentTurn = next.turn;
+                liveEntry = next.live;
+                continue;
             }
             catch (err) {
                 clearInterval(cancelPoll);
                 unsubSteerTap();
                 unsubscribe();
-                this.live.delete(currentJobId);
-                return (currentWriter.abort('failed', `crashed · ${describe(err)}`) ??
-                    currentWriter.snapshot() ??
-                    { jobId: currentJobId });
+                return abortTurn('failed', `crashed · ${describe(err)}`);
             }
         }
     }
-    /**
-     * Open the child turn of a steered chain and hand the job over to it.
-     *
-     * The order is the contract readers rely on: the child anchor is on disk
-     * before the parent is finished, so anyone following `supersededBy` or
-     * `steer.head` always finds a real job.
-     */
+    ownerLocked(workerId, fn) {
+        return withWorkerLock(this.repo, workerId, fn, {
+            waitMs: Number.POSITIVE_INFINITY,
+            onWait: (waitedMs, holder) => process.stderr.write(`agent-smith owner ${workerId}: waiting ${Math.round(waitedMs / 1000)} s for the worker lock held by pid ${holder}\n`),
+        });
+    }
+    discardAtCancel(jobId, entries, live, warn) {
+        const cut = existsSync(jobFile(this.repo, jobId, FILES.steerDiscard)) ? readDiscardCut(this.repo, jobId) : entries.length;
+        const end = Math.min(cut, entries.length);
+        if (end <= live.consumedSteers)
+            return;
+        warn(discardedWarning(entries.slice(live.consumedSteers, end)));
+        live.consumedSteers = end;
+        writeConsumedCount(this.repo, jobId, end);
+    }
+    markOwnerDone(jobId) {
+        createMarker(jobFile(this.repo, jobId, FILES.ownerDone), new Date().toISOString());
+    }
+    async own(first) {
+        let end = await first;
+        try {
+            while (true) {
+                if (end.ownerDone === true)
+                    return end.manifest;
+                const head = end.manifest;
+                const checks = end.spec.ownerChecks ? end.spec.checks : undefined;
+                const acceptance = checks?.length ? await this.ownerRunChecks(head, checks) : undefined;
+                await this.hooks.beforeOwnerDecision?.(head.jobId);
+                const next = await this.ownerLocked(end.spec.workerId, async () => {
+                    if (acceptance !== undefined)
+                        writeAcceptance(this.repo, head.jobId, acceptance);
+                    const entries = readSteerEntries(this.repo, head.jobId);
+                    const live = { consumedSteers: Math.max(end.consumed, readConsumedCount(this.repo, head.jobId)) };
+                    if (existsSync(jobFile(this.repo, head.jobId, FILES.cancel))) {
+                        this.discardAtCancel(head.jobId, entries, live, (w) => this.warnSettled(head.jobId, w));
+                    }
+                    const unconsumed = entries.slice(live.consumedSteers);
+                    if (unconsumed.length === 0) {
+                        this.markOwnerDone(head.jobId);
+                        return null;
+                    }
+                    let prepared;
+                    try {
+                        const request = this.continuationRequest({
+                            head, spec: end.spec, provider: end.provider.name, entries: unconsumed,
+                            verdict: acceptance === undefined ? undefined : verdictBlock(acceptance),
+                            env: end.spec.env,
+                            replacesHead: checksAbortRequested(this.repo, head.jobId),
+                        });
+                        prepared = await this.prepareTurn(request);
+                    }
+                    catch (err) {
+                        this.warnSettled(head.jobId, notSentWarning(unconsumed, describe(err)));
+                        this.setSettledPending(head.jobId, 0);
+                        this.markOwnerDone(head.jobId);
+                        return null;
+                    }
+                    writeConsumedCount(this.repo, head.jobId, entries.length);
+                    const nextLive = newLiveJob(prepared.writer, prepared.spec.timeoutMs);
+                    this.live.set(prepared.spec.jobId, nextLive);
+                    return { prepared, live: nextLive };
+                });
+                if (next === null)
+                    return end.manifest;
+                end = await this.pump(next.prepared.writer, next.prepared.provider, next.prepared.spec, next.prepared.turn, next.live);
+            }
+        }
+        catch (err) {
+            process.stderr.write(`agent-smith owner ${end.manifest.jobId}: ${describe(err)}\n`);
+            try {
+                createMarker(jobFile(this.repo, end.manifest.jobId, FILES.ownerDone), new Date().toISOString());
+            }
+            catch { }
+            return end.manifest;
+        }
+    }
+    async ownerRunChecks(head, checks) {
+        const controller = new AbortController();
+        let abortedBy = null;
+        const poll = () => {
+            if (abortedBy !== null)
+                return;
+            if (existsSync(jobFile(this.repo, head.jobId, FILES.cancel)))
+                abortedBy = 'cancel';
+            else if (checksAbortRequested(this.repo, head.jobId))
+                abortedBy = 'steer';
+            if (abortedBy !== null)
+                controller.abort();
+        };
+        poll();
+        const timer = setInterval(poll, OWNER_CHECKS_POLL_MS);
+        timer.unref?.();
+        let acceptance;
+        try {
+            acceptance = await runAcceptance({
+                repo: this.repo, jobId: head.jobId, succeeded: head.status === 'succeeded', checks,
+                baseDir: head.cwd ?? this.repo, signal: controller.signal,
+            });
+        }
+        finally {
+            clearInterval(timer);
+        }
+        if (abortedBy === 'steer') {
+            acceptance = { state: 'unchecked', checks: [], at: new Date().toISOString(), reason: 'aborted by steer' };
+        }
+        return acceptance;
+    }
+    warnSettled(jobId, message) {
+        const file = jobFile(this.repo, jobId, FILES.progress);
+        try {
+            const progress = JSON.parse(readFileSync(file, 'utf8'));
+            const warnings = Array.isArray(progress.warnings) ? progress.warnings : [];
+            if (!warnings.includes(message))
+                writeJsonAtomic(file, { ...progress, warnings: [...warnings, message] });
+        }
+        catch { }
+    }
+    setSettledPending(jobId, pending) {
+        for (const name of [FILES.job, FILES.progress]) {
+            const file = jobFile(this.repo, jobId, name);
+            try {
+                const doc = JSON.parse(readFileSync(file, 'utf8'));
+                writeJsonAtomic(file, { ...doc, pendingSteers: pending });
+            }
+            catch { }
+        }
+    }
+    continuationRequest(input) {
+        const { head, spec, entries } = input;
+        const o = mergeOverrides(entries);
+        const conversation = typeof head.conversation === 'string' && head.conversation !== '' ? head.conversation : undefined;
+        const steered = entries.some((e) => senderOf(e) === 'steer');
+        let responseTail = '';
+        try {
+            responseTail = readFileSync(jobFile(this.repo, head.jobId, FILES.report), 'utf8').trim().slice(-600);
+        }
+        catch { }
+        const cwd = spec?.cwd ?? head.cwd ?? this.repo;
+        const { watchedFiles, syncedFiles, notes } = this.syncContinuationFiles(cwd, head.watchedFiles, entries.flatMap((e) => e.files ?? []));
+        const { rawPrompt } = buildSteeredPrompt({
+            parentJobId: head.jobId,
+            wasInterrupted: false,
+            priorStatus: head.status,
+            verdict: input.verdict,
+            freshContinuation: conversation === undefined,
+            toolCalls: head.toolCalls ?? 0,
+            responseTail,
+            entries,
+            syncedFiles,
+            brief: '',
+        });
+        const context = [...entries].reverse().find((e) => e.context !== undefined)?.context ?? spec?.context;
+        const checks = o.checks ?? spec?.checks ?? input.headChecks;
+        const env = input.env !== undefined && Object.keys(input.env).length > 0 ? input.env : undefined;
+        return {
+            mode: spec?.mode ?? head.mode ?? 'task',
+            prompt: rawPrompt,
+            provider: input.provider,
+            name: head.name,
+            workerId: head.workerId ?? head.jobId,
+            task: head.task ?? undefined,
+            cwd,
+            model: o.model ?? spec?.model ?? head.model ?? undefined,
+            effort: o.effort ?? spec?.effort ?? head.effort ?? undefined,
+            timeoutMs: o.timeoutMs ?? spec?.timeoutMs ?? head.timeoutMs,
+            unrestricted: o.unrestricted ?? spec?.unrestricted ?? head.unrestricted,
+            ...(context === undefined ? {} : { context }),
+            ...(checks === undefined ? {} : { checks }),
+            ...(watchedFiles === undefined ? {} : { watchedFiles }),
+            ...(notes.length === 0 ? {} : { notes }),
+            ...(conversation === undefined ? {} : { conversation }),
+            ...(env === undefined ? {} : { env }),
+            continuedFrom: head.jobId,
+            continuationKind: steered ? 'steer' : 'follow-up',
+            ...(steered && input.replacesHead
+                ? { replacesParent: true, chainStartedAt: head.chainStartedAt ?? head.startedAt ?? head.createdAt }
+                : {}),
+            lockHeldByCaller: true,
+            ownerChecks: spec === undefined ? true : spec.ownerChecks,
+            messages: entries.map((e) => ({ text: e.prompt, sender: senderOf(e) })),
+        };
+    }
+    withSandbox(spec, before, provider) {
+        if (spec.unrestricted === before.unrestricted)
+            return spec;
+        const info = this.describeSandbox(provider, {
+            unrestricted: spec.unrestricted,
+            readOnly: spec.readOnlyRequested,
+            ...(spec.artifactPath === undefined ? {} : { artifactPath: spec.artifactPath }),
+        });
+        return {
+            ...spec,
+            sandbox: info?.sandbox ?? 'unknown',
+            sandboxFlags: [...(info?.flags ?? [])],
+            readOnlyEnforced: info?.readOnlyEnforced ?? false,
+        };
+    }
+    syncContinuationFiles(cwd, previous, added) {
+        const notes = [];
+        const paths = [...new Set([...Object.keys(previous ?? {}), ...added])].filter((f) => {
+            if (existsSync(path.resolve(this.repo, f)))
+                return true;
+            notes.push(`dropped deleted watched file "${f}" from continuation turn`);
+            return false;
+        });
+        if (paths.length === 0)
+            return { watchedFiles: undefined, syncedFiles: [], notes };
+        let watchedFiles;
+        try {
+            watchedFiles = syncWatchedFiles(this.repo, cwd, paths, previous, (w) => notes.push(w));
+        }
+        catch (err) {
+            notes.push(`watched file sync warning: ${describe(err)}`);
+            return { watchedFiles: undefined, syncedFiles: [], notes };
+        }
+        const syncedFiles = Object.entries(watchedFiles)
+            .filter(([rel, sigs]) => {
+            const prev = previous?.[rel];
+            return prev === undefined || (prev.repoSig !== sigs.repoSig && sigs.cwdSig === sigs.repoSig);
+        })
+            .map(([rel]) => rel);
+        return { watchedFiles, syncedFiles, notes };
+    }
     async chainContinuation(input) {
-        const { provider, spec, parent, result, report, entries, unconsumed, verdictStatus } = input;
+        const { provider, parent, result, report, entries, unconsumed, verdictStatus } = input;
+        const spec = this.withSandbox(applyOverrides(input.spec, mergeOverrides(unconsumed), provider), input.spec, provider);
         const conversation = parent.writer.currentConversation();
         const wasInterrupted = parent.live.interruptRequested && verdictStatus !== 'succeeded';
         if (conversation === null && !wasInterrupted) {
             parent.writer.warn('provider did not report a resumable conversation ID; continuing in a fresh session');
         }
-        parent.live.consumedSteers = entries.length;
         try {
             unlinkSync(jobFile(this.repo, parent.jobId, FILES.cancelSteer));
         }
-        catch { /* no steer marker present */ }
+        catch { }
         const nextJobId = newJobId(spec.mode);
         const nextWriter = this.newWriter(nextJobId);
         const latestContext = [...unconsumed].reverse().find((e) => e.context !== undefined)?.context ?? spec.context;
         const resuming = conversation !== null;
         const parentWatched = parent.writer.snapshot()?.watchedFiles;
-        const explicitSteerFiles = new Set(unconsumed.flatMap((e) => e.files ?? []));
-        const inheritedWatchedPaths = Object.keys(parentWatched ?? {}).filter((f) => {
-            if (existsSync(path.resolve(this.repo, f)))
-                return true;
-            parent.writer.warn(`dropped deleted watched file "${f}" from continuation turn`);
-            return false;
-        });
-        const mergedWatchedPaths = [
-            ...new Set([
-                ...inheritedWatchedPaths,
-                ...explicitSteerFiles,
-            ]),
-        ];
-        let nextWatchedFiles;
-        const syncedFiles = [];
-        const syncWarnings = [];
-        if (mergedWatchedPaths.length > 0) {
-            try {
-                nextWatchedFiles = syncWatchedFiles(this.repo, spec.cwd, mergedWatchedPaths, parentWatched, (w) => syncWarnings.push(w));
-                for (const [rel, sigs] of Object.entries(nextWatchedFiles)) {
-                    const prev = parentWatched?.[rel];
-                    if (prev === undefined || (prev.repoSig !== sigs.repoSig && sigs.cwdSig === sigs.repoSig)) {
-                        syncedFiles.push(rel);
-                    }
-                }
-            }
-            catch (err) {
-                parent.writer.warn(`watched file sync warning: ${describe(err)}`);
-            }
-        }
+        const { watchedFiles: nextWatchedFiles, syncedFiles, notes: syncWarnings } = this.syncContinuationFiles(spec.cwd, parentWatched, unconsumed.flatMap((e) => e.files ?? []));
         const nextBrief = buildBrief({
             mode: spec.mode,
             preset: spec.preset,
@@ -1665,6 +2341,7 @@ class ForgeService {
         const { rawPrompt, sentPrompt, prependBrief } = buildSteeredPrompt({
             parentJobId: parent.jobId,
             wasInterrupted,
+            priorStatus: verdictStatus,
             freshContinuation: !resuming,
             toolCalls: parent.writer.snapshot()?.toolCalls ?? 0,
             responseTail: result.response.trim().slice(-600),
@@ -1673,86 +2350,151 @@ class ForgeService {
             brief: nextBrief,
         });
         const nextLiveEntry = newLiveJob(nextWriter, spec.timeoutMs);
-        // 1. Open child anchor on disk BEFORE finishing the parent so any reader
-        //    following `supersededBy` finds the child anchor immediately.
+        const parentSnap = parent.writer.snapshot();
+        const nextTurn = (parentSnap?.turn ?? 1) + 1;
+        const continuationKind = parent.live.interruptRequested ? 'steer' : 'follow-up';
+        const chainStartedAt = continuationKind === 'steer'
+            ? parentSnap?.chainStartedAt ?? parentSnap?.startedAt ?? parentSnap?.createdAt
+            : undefined;
         nextWriter.start(turnStartInput(provider.name, spec, {
             prompt: rawPrompt,
             preamble: prependBrief ? nextBrief : undefined,
             preambleApplied: nextBrief !== '',
             conversation,
-            task: parent.writer.snapshot()?.task ?? spec.task,
+            task: parentSnap?.task ?? spec.task,
             watchedFiles: nextWatchedFiles,
-            steeredFrom: parent.jobId,
+            turn: nextTurn,
+            continuedFrom: parent.jobId,
+            continuationKind,
+            chainStartedAt,
         }));
         if (spec.checks !== undefined)
             writeJsonAtomic(jobFile(this.repo, nextJobId, FILES.checksSpec), spec.checks);
-        if (spec.env !== undefined && Object.keys(spec.env).length > 0)
-            writeJsonAtomic(jobFile(this.repo, nextJobId, ENV_KEYS_FILE), Object.keys(spec.env));
+        parent.live.consumedSteers = entries.length;
+        writeConsumedCount(this.repo, parent.jobId, entries.length);
+        for (const e of unconsumed)
+            nextWriter.recordMessage(e.prompt, 'turn-start', senderOf(e));
+        if (spec.ownerChecks && spec.checks?.length)
+            markAcceptancePending(this.repo, nextJobId, spec.checks);
+        const trackedKeys = [...new Set([...this.envKeysOf(parent.jobId), ...Object.keys(spec.env ?? {})])];
+        if (trackedKeys.length > 0)
+            writeJsonAtomic(jobFile(this.repo, nextJobId, ENV_KEYS_FILE), trackedKeys);
         for (const w of syncWarnings)
             nextWriter.warn(w);
-        // The child anchor exists; publish its id before the parent's terminal
-        // write so resolveHead can cross the finish window.
-        writeAtomic(jobFile(this.repo, parent.jobId, FILES.steerHead), `${nextJobId}\n`);
-        // 2. Register child in spawnedIds and live map before removing parent.
+        const workerId = parentSnap?.workerId ?? spec.workerId;
+        const recordChild = () => {
+            this.workers.recordTurnStart({
+                workerId, name: parentSnap?.name ?? spec.name, jobId: nextJobId, continuation: true, lockHeld: true,
+            });
+        };
+        try {
+            if (input.lockHeld === true)
+                recordChild();
+            else
+                await withWorkerLock(this.repo, workerId, recordChild);
+        }
+        catch (err) {
+            nextWriter.warn(`worker index not updated: ${describe(err)}`);
+        }
+        if (continuationKind === 'steer') {
+            writeAtomic(jobFile(this.repo, parent.jobId, FILES.steerHead), `${nextJobId}\n`);
+        }
         this.spawnedIds.add(nextJobId);
         this.live.set(nextJobId, nextLiveEntry);
         try {
             await spec.onPrepared?.(nextJobId);
         }
-        catch { /* best-effort callback for continuation turn */ }
-        // 3. Stamp supersededBy on parent and write parent's terminal manifest atomically.
-        parent.writer.markSuperseded(nextJobId);
+        catch { }
+        if (continuationKind === 'steer')
+            parent.writer.markSuperseded(nextJobId);
+        else
+            parent.writer.markFollowedBy(nextJobId);
         parent.writer.finish(result, report === '' ? null : report);
         this.live.delete(parent.jobId);
+        if (input.spec.checks !== undefined && input.spec.checks.length > 0) {
+            try {
+                if (continuationKind === 'follow-up')
+                    writeAcceptance(this.repo, parent.jobId, { state: 'unchecked', checks: [], reason: 'continued by follow-up' });
+                else
+                    markAcceptanceSuperseded(this.repo, parent.jobId);
+            }
+            catch (err) {
+                process.stderr.write(`agent-smith acceptance ${parent.jobId}: ${describe(err)}\n`);
+            }
+        }
         return {
+            spec: { ...spec, jobId: nextJobId },
             writer: nextWriter,
             jobId: nextJobId,
             live: nextLiveEntry,
             prompt: sentPrompt,
             conversation: conversation ?? undefined,
-            // A continuation's baseline holds the worker's own earlier edits: no already-modified line.
             turn: { rawPrompt, prependBrief: false, resuming, context: latestContext },
         };
     }
-    /**
-     * Cancel a job.
-     *
-     * TWO STAGES, and the split is the honest answer rather than a hedge:
-     *   - Marker written, live handle signalled. The worker is actually stopped and
-     *     the state file says `canceled` within one poll interval.
-     *   - Marker written, NO live handle. This process did not start the job (the
-     *     server restarted, or the job belongs to another session). We record the
-     * *intent* so every reader agrees the job was asked to stop, and we say so.
-     *     We do NOT claim it was stopped, because we have no pid to signal and
-     *     `WorkerHandle` does not expose one — inventing that field in four
-     *     verified adapters for one cosmetic gain is not worth it.
-     */
-    cancel(jobId) {
-        const known = this.live.has(jobId) || existsSync(jobDir(this.repo, jobId));
-        if (!known) {
-            throw new Error(`no job "${jobId}" in ${jobsDir(this.repo)}; call list_jobs for valid job IDs.`);
+    cancel(id) {
+        const trimmed = id.trim();
+        const isJob = this.isJobId(trimmed);
+        let headId;
+        try {
+            headId = isJob ? this.resolveTurn(trimmed) : this.resolveWorkerHeadId(trimmed);
         }
-        const headId = this.resolveHead(jobId);
-        for (const id of new Set([jobId, headId])) {
-            try {
-                unlinkSync(jobFile(this.repo, id, FILES.cancelSteer));
+        catch (err) {
+            if (err instanceof WorkerLookupError && err.kind === 'missing') {
+                throw new Error(`no job "${id}" in ${jobsDir(this.repo)}; call list_jobs for valid job IDs.`);
             }
-            catch { /* no steer marker present */ }
-            const live = this.live.get(id);
+            throw err;
+        }
+        const known = this.live.has(headId) || (this.isSafeJobId(headId) && existsSync(jobDir(this.repo, headId)));
+        if (!known) {
+            throw new Error(`no job "${id}" in ${jobsDir(this.repo)}; call list_jobs for valid job IDs.`);
+        }
+        const resolvedFrom = headId !== trimmed ? trimmed : null;
+        const discarded = this.cutQueue(headId);
+        const dropped = discarded.length === 0 ? {} : { discarded: discarded.length, warnings: [discardedWarning(discarded)] };
+        const headManifest = this.readManifestSync(headId);
+        if (!this.live.has(headId) && headManifest !== null && headManifest.status !== 'running') {
+            const checksPending = readAcceptance(this.repo, headId).pending === true;
+            if (checksPending || discarded.length > 0)
+                createMarker(jobFile(this.repo, headId, FILES.cancel), new Date().toISOString());
+            if (discarded.length > 0)
+                this.setSettledPending(headId, 0);
+            return {
+                jobId: headId,
+                ...(resolvedFrom === null ? {} : { resolvedFrom }),
+                ...dropped,
+                requested: checksPending,
+                signalled: false,
+                status: headManifest.status,
+                note: checksPending
+                    ? `Already ${headManifest.status}; asked its owner to stop the acceptance checks still running.`
+                    : `Already ${headManifest.status}; nothing to cancel.`,
+            };
+        }
+        const targets = new Set([headId]);
+        if (isJob && trimmed !== headId && (this.live.has(trimmed) || this.readManifestSync(trimmed)?.status === 'running')) {
+            targets.add(trimmed);
+        }
+        for (const target of targets) {
+            try {
+                unlinkSync(jobFile(this.repo, target, FILES.cancelSteer));
+            }
+            catch { }
+            const live = this.live.get(target);
             const writer = live?.writer ??
-                this.newWriter(id);
+                this.newWriter(target);
             writer.requestCancel();
             if (live !== undefined) {
                 live.userCanceled = true;
                 live.handle?.cancel();
             }
         }
-        const resolvedFrom = headId !== jobId ? jobId : null;
         const headLive = this.live.get(headId);
         if (headLive === undefined) {
             return {
                 jobId: headId,
                 ...(resolvedFrom === null ? {} : { resolvedFrom }),
+                ...dropped,
                 requested: true,
                 signalled: false,
                 note: 'Cancel recorded; no live worker here to signal directly. A live owning supervisor will stop it.',
@@ -1761,6 +2503,7 @@ class ForgeService {
         return {
             jobId: headId,
             ...(resolvedFrom === null ? {} : { resolvedFrom }),
+            ...dropped,
             requested: true,
             signalled: headLive.handle !== null,
             note: headLive.handle === null
@@ -1768,94 +2511,253 @@ class ForgeService {
                 : 'Canceled.',
         };
     }
-    /**
-     * Steer a running worker by recording durable intent (`steer.jsonl`) and,
-     * when `delivery: 'interrupt'`, signalling the running turn to stop so the
-     * pump can open the continuation turn.
-     */
+    ownerLive(jobId, m) {
+        if (this.live.has(jobId))
+            return true;
+        if (!ownerAlive(m) || existsSync(jobFile(this.repo, jobId, FILES.ownerDone)))
+            return false;
+        if (!isTerminalStatus(m.status))
+            return true;
+        return this.checksPending(jobId) || readSteerEntries(this.repo, jobId).length > readConsumedCount(this.repo, jobId);
+    }
+    checksPending(jobId) {
+        const acc = readAcceptance(this.repo, jobId);
+        return 'pending' in acc && acc.pending === true;
+    }
+    cutQueue(jobId) {
+        if (!this.isSafeJobId(jobId))
+            return [];
+        const undelivered = undeliveredEntries(this.repo, jobId);
+        writeDiscardCut(this.repo, jobId, readSteerEntries(this.repo, jobId).length);
+        return undelivered;
+    }
+    async messageTarget(ref) {
+        const { headId, head } = this.messageHead(ref.trim());
+        if (!this.ownerLive(headId, head))
+            this.assertResumable(head);
+        return this.numberedDetail(headId);
+    }
+    messageHead(ref) {
+        if (existsSync(pipelineRecordPath(this.repo, ref))) {
+            throw new Error(`"${ref}" is a pipeline run; follow_up and steer apply to workers, not runs.`);
+        }
+        let headId;
+        try {
+            headId = this.resolveWorkerHeadId(ref);
+        }
+        catch (err) {
+            throw err instanceof WorkerLookupError ? new Error(err.message) : err;
+        }
+        const head = this.readManifestSync(headId);
+        if (head === null)
+            throw new Error(`No worker "${ref}"; see list_jobs.`);
+        if (head.pipeline !== null && head.pipeline !== undefined) {
+            throw new Error(`"${head.name ?? headId}" is a pipeline stage (${headId}); run_pipeline manages its turns.`);
+        }
+        return { headId, head };
+    }
+    assertResumable(head) {
+        if (typeof head.conversation === 'string' && head.conversation !== '')
+            return;
+        const name = head.name ?? head.jobId;
+        throw new Error(`"${name}" (${head.jobId}) has no saved conversation; spawn_job with from:"${name}" starts it fresh with the original brief.`);
+    }
+    async followUp(request) {
+        return this.deliver('follow_up', request);
+    }
     async steer(request) {
+        return this.deliver('steer', request);
+    }
+    async deliver(sender, request) {
         const prompt = request.prompt;
-        if (prompt.trim() === '') {
+        if (typeof prompt !== 'string' || prompt.trim() === '') {
             throw new Error('prompt is empty; there is nothing to hand the worker.');
         }
-        if (request.delivery !== 'queue' && request.delivery !== 'interrupt') {
-            throw new Error('delivery is required; must be "queue" or "interrupt".');
+        const ref = request.worker.trim();
+        const { headId: firstHeadId, head: first } = this.messageHead(ref);
+        const env = sender === 'follow_up' ? validateEnv(request.env) : undefined;
+        const files = request.files !== undefined && request.files.length > 0 ? validateWatchedFiles(this.repo, request.files) : undefined;
+        const workerId = first.workerId ?? firstHeadId;
+        const overrides = sender === 'steer' ? {} : {
+            ...(request.checks === undefined ? {} : { checks: request.checks }),
+            ...(request.model === undefined ? {} : { model: request.model }),
+            ...(request.effort === undefined ? {} : { effort: request.effort }),
+            ...(request.timeoutMs === undefined ? {} : { timeoutMs: resolveTimeoutMs(request.timeoutMs) }),
+            ...(request.unrestricted === undefined ? {} : { unrestricted: request.unrestricted }),
+        };
+        const warnings = [];
+        if (overrides.model !== undefined || overrides.effort !== undefined) {
+            warnings.push(...checkAgainstCatalog(first.provider, overrides.model, overrides.effort, await this.catalogFor(first.provider)));
         }
-        const target = await this.resolveSteerTarget(request.worker);
-        const latestManifest = this.readManifestSync(target.jobId) ?? target.manifest;
-        if (latestManifest.pipeline !== null && latestManifest.pipeline !== undefined) {
-            throw new Error(`Cannot steer pipeline stage "${latestManifest.name}" (${target.jobId}); pipeline stages are managed by run_pipeline.`);
-        }
-        if (latestManifest.status !== 'running') {
-            throw new Error(`"${latestManifest.name}" (${target.jobId}) is already ${latestManifest.status}; use resume_job to continue a finished worker.`);
-        }
-        const live = this.live.get(target.jobId);
-        if (live?.userCanceled || existsSync(jobFile(this.repo, target.jobId, FILES.cancel))) {
-            throw new Error(`"${latestManifest.name}" (${target.jobId}) is already canceling; use resume_job after it stops.`);
-        }
-        if (live === undefined) {
-            if (!ownerAlive(latestManifest)) {
-                reconcileOrphan(this.repo, target.jobId);
-                throw new Error(`"${latestManifest.name}" (${target.jobId}) has no live owner process; it cannot be steered. Use resume_job to continue it.`);
-            }
-        }
-        const resumable = (typeof latestManifest.conversation === 'string' && latestManifest.conversation !== '') ||
-            (live?.writer.currentConversation() ?? null) !== null;
-        const resumableNote = resumable
-            ? ''
-            : ' No conversation handle is known yet; if none arrives before this turn ends, the continuation starts fresh.';
-        const validFiles = request.files !== undefined && request.files.length > 0
-            ? validateWatchedFiles(this.repo, request.files)
-            : undefined;
-        const at = new Date().toISOString();
         const entry = {
-            id: `steer-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-            createdAt: at,
+            id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            createdAt: new Date().toISOString(),
             prompt,
             ...(request.context === undefined ? {} : { context: request.context }),
-            ...(validFiles === undefined ? {} : { files: validFiles }),
-            delivery: request.delivery,
+            ...(files === undefined ? {} : { files }),
+            delivery: sender === 'steer' ? 'interrupt' : 'queue',
+            ...(sender === 'steer' && request.allowFresh === true ? { allowFresh: true } : {}),
+            sender,
+            ...(Object.keys(overrides).length === 0 ? {} : { overrides }),
         };
-        appendSteerEntry(this.repo, target.jobId, entry);
-        const allEntries = readSteerEntries(this.repo, target.jobId);
-        const pendingSteers = Math.max(1, allEntries.length - (live?.consumedSteers ?? 0));
-        if (live !== undefined) {
-            live.writer.setPendingSteers(pendingSteers, at);
-        }
-        if (request.delivery === 'interrupt') {
-            writeAtomic(jobFile(this.repo, target.jobId, FILES.cancelSteer), `${at}\n`);
-            if (live !== undefined) {
-                live.interruptRequested = true;
-                if (live.handle !== null && live.writer.currentConversation() !== null && !live.interruptFired) {
-                    live.interruptFired = true;
-                    live.handle.cancel();
-                }
+        return withWorkerLock(this.repo, workerId, async () => {
+            const headId = this.workerHeadId(workerId) ?? firstHeadId;
+            const head = this.readManifestSync(headId);
+            if (head === null)
+                throw new Error(`No worker "${ref}"; see list_jobs.`);
+            if (this.ownerLive(headId, head))
+                return this.enqueue(sender, headId, head, entry, env, warnings);
+            return this.coldStart(sender, head, entry, env, warnings);
+        }, { waitMs: LAUNCH_ACK_MS + LOCK_WAIT_MS });
+    }
+    enqueue(sender, headId, head, entry, env, warnings) {
+        const live = this.live.get(headId);
+        const running = head.status === 'running';
+        const name = head.name ?? headId;
+        if (sender === 'steer' && running) {
+            if (live?.userCanceled || existsSync(jobFile(this.repo, headId, FILES.cancel))) {
+                throw new Error(`"${name}" (${headId}) is being canceled; send the message after it stops.`);
+            }
+            const resumable = (typeof head.conversation === 'string' && head.conversation !== '') ||
+                (live !== undefined && live.writer.currentConversation() !== null);
+            if (!resumable && entry.allowFresh !== true) {
+                throw new Error(`Cannot interrupt "${name}" (${headId}): no resumable conversation handle exists yet, so interrupting now would discard in-flight context and start fresh. Wait for a conversation ID, use follow_up, or pass allowFresh: true.`);
             }
         }
-        const signalled = Boolean(live?.handle);
-        const status = request.delivery === 'interrupt' ? 'interrupting' : 'queued';
-        const note = request.delivery === 'interrupt'
-            ? live !== undefined
-                ? `Interrupting current turn; continuation turn will start automatically.${resumableNote}`
-                : `Interrupt recorded for owner process; continuation turn will start after current turn stops.${resumableNote}`
-            : `Queued behind current turn (${pendingSteers} pending).${resumableNote}`;
+        const checksRunning = !running && this.checksPending(headId);
+        appendSteerEntry(this.repo, headId, entry);
+        const at = entry.createdAt;
+        if (sender === 'steer') {
+            if (running) {
+                writeAtomic(jobFile(this.repo, headId, FILES.cancelSteer), `${at}\n`);
+                if (live !== undefined) {
+                    live.interruptRequested = true;
+                    if (live.handle !== null && (live.writer.currentConversation() !== null || entry.allowFresh === true) && !live.interruptFired) {
+                        live.interruptFired = true;
+                        live.handle.cancel();
+                    }
+                }
+            }
+            else if (checksRunning) {
+                createMarker(jobFile(this.repo, headId, FILES.checksAbort), at);
+            }
+        }
+        const entries = readSteerEntries(this.repo, headId);
+        const consumed = live !== undefined ? live.consumedSteers : readConsumedCount(this.repo, headId);
+        const pending = Math.max(1, entries.length - consumed);
+        if (live !== undefined)
+            live.writer.setPendingSteers(pending, at);
+        else if (!running)
+            this.setSettledPending(headId, pending);
+        const workerId = head.workerId ?? headId;
+        const envAck = this.envForLiveOwner(workerId, headId, env, warnings);
+        const provider = this.providerSafe(head.provider);
+        const canDeliverLive = running
+            && provider?.liveInput === true
+            && !live?.interruptRequested
+            && !existsSync(jobFile(this.repo, headId, FILES.cancelSteer))
+            && !existsSync(jobFile(this.repo, headId, FILES.cancel))
+            && liveDeliverable(entry)
+            && entries.slice(consumed).every(liveDeliverable);
+        const delivery = sender === 'steer'
+            ? 'now'
+            : canDeliverLive ? 'next-step' : 'turn-end';
+        const checks = (entry.overrides?.checks ?? this.headChecks(headId))?.map((c) => c.name);
+        const turn = typeof head.turn === 'number' && head.turn >= 1 ? head.turn : 1;
+        const note = sender === 'steer'
+            ? running ? 'Interrupting; the steered turn starts next.'
+                : checksRunning ? 'Aborting the checks; the steered turn starts next.' : 'Queued; the steered turn starts next.'
+            : delivery === 'next-step' ? 'Sent into the running turn; read at its next step.'
+                : running ? 'Queued; runs when this turn ends.'
+                    : checksRunning ? 'Queued; runs after the checks.' : 'Queued; runs as the next turn.';
         return {
-            jobId: target.jobId,
-            name: latestManifest.name ?? target.jobId,
-            workerId: latestManifest.workerId ?? target.jobId,
-            provider: latestManifest.provider,
-            delivery: request.delivery,
-            status,
-            pendingSteers,
-            signalled,
-            resumable,
-            repo: this.repo,
-            dir: jobDir(this.repo, target.jobId),
-            timeoutMs: live?.timeoutMs ?? latestManifest.timeoutMs ?? DEFAULT_TIMEOUT_MS$1,
+            jobId: headId, name, workerId, turn,
+            action: sender === 'steer' && (running || checksRunning) ? 'interrupting' : 'queued',
+            delivery, status: 'running', provider: head.provider, repo: this.repo,
+            timeoutMs: entry.overrides?.timeoutMs ?? head.timeoutMs ?? DEFAULT_TIMEOUT_MS$1,
+            pendingMessages: pending,
+            ...envAck,
+            ...(checks !== undefined && checks.length > 0 ? { checks } : {}),
+            ...(warnings.length === 0 ? {} : { warnings }),
             note,
         };
     }
+    async coldStart(sender, head, entry, env, warnings) {
+        this.assertResumable(head);
+        const workerId = head.workerId ?? head.jobId;
+        const passed = env !== undefined && Object.keys(env).length > 0;
+        const known = { ...(this.envVault.get(workerId) ?? {}), ...(env ?? {}) };
+        const runEnv = Object.keys(known).length > 0 ? known : undefined;
+        const missing = this.envKeysOf(head.jobId).filter((k) => !(k in known));
+        if (missing.length > 0)
+            warnings.push(`env ${missing.join(', ')} not set: values live only in memory and were lost; pass env again.`);
+        const envAck = missing.length > 0 ? { env: 'dropped', envKeys: missing }
+            : passed ? { env: 'set' } : runEnv !== undefined ? { env: 'kept' } : {};
+        const acceptance = readAcceptance(this.repo, head.jobId);
+        const onDisk = readSteerEntries(this.repo, head.jobId).length;
+        const request = this.continuationRequest({
+            head, provider: head.provider, entries: [...undeliveredEntries(this.repo, head.jobId), entry],
+            verdict: verdictBlock(acceptance), env: runEnv, headChecks: this.headChecks(head.jobId), replacesHead: false,
+        });
+        const { ack } = await this.spawnTracked({ ...request, ownerChecks: true, lockHeldByCaller: true });
+        writeConsumedCount(this.repo, head.jobId, onDisk);
+        const checks = request.checks?.map((c) => c.name);
+        return {
+            jobId: ack.jobId, name: ack.name, workerId: ack.workerId, turn: ack.turn,
+            action: 'started', delivery: 'now', status: 'running', provider: ack.provider, repo: this.repo,
+            timeoutMs: ack.timeoutMs,
+            ...envAck,
+            ...(checks !== undefined && checks.length > 0 ? { checks } : {}),
+            ...((warnings.length + (ack.warnings?.length ?? 0)) === 0 ? {} : { warnings: [...warnings, ...(ack.warnings ?? [])] }),
+            note: sender === 'steer' ? `Started turn ${ack.turn} with the steer.` : `Started turn ${ack.turn}.`,
+        };
+    }
+    envForLiveOwner(workerId, headId, env, warnings) {
+        const vault = this.envVault.get(workerId);
+        if (env !== undefined && Object.keys(env).length > 0) {
+            const same = vault !== undefined && Object.entries(env).every(([k, v]) => vault[k] === v);
+            this.envVault.set(workerId, { ...(vault ?? {}), ...env });
+            if (!same)
+                warnings.push('env applies from the next new turn after this worker goes idle; the running worker keeps the environment it started with.');
+            return { env: 'kept' };
+        }
+        return this.envKeysOf(headId).length > 0 || (vault !== undefined && Object.keys(vault).length > 0) ? { env: 'kept' } : {};
+    }
+    envKeysOf(jobId) {
+        try {
+            const keys = JSON.parse(readFileSync(jobFile(this.repo, jobId, ENV_KEYS_FILE), 'utf8'));
+            return Array.isArray(keys) ? keys.filter((k) => typeof k === 'string') : [];
+        }
+        catch {
+            return [];
+        }
+    }
+    headChecks(jobId) {
+        try {
+            const checks = JSON.parse(readFileSync(jobFile(this.repo, jobId, FILES.checksSpec), 'utf8'));
+            return Array.isArray(checks) ? checks : undefined;
+        }
+        catch {
+            return undefined;
+        }
+    }
+    providerSafe(name) {
+        try {
+            return this.providerSource(name);
+        }
+        catch {
+            return null;
+        }
+    }
+    isSafeJobId(id) {
+        return /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/.test(id) && id !== '.' && id !== '..';
+    }
+    isJobId(id) {
+        return this.isSafeJobId(id) && (this.live.has(id) || existsSync(jobFile(this.repo, id, FILES.job)));
+    }
     readManifestSync(id) {
+        if (!this.isSafeJobId(id))
+            return null;
         const inMem = this.live.get(id)?.writer.snapshot();
         if (inMem !== null && inMem !== undefined)
             return inMem;
@@ -1867,101 +2769,193 @@ class ForgeService {
             return null;
         }
     }
-    /**
-     * Follow a steered chain to its latest turn.
-     *
-     * `supersededBy` is authoritative once the parent's terminal manifest lands,
-     * but the pump writes the child anchor first. `steer.head` covers that
-     * finish window, so a cancel or status arriving between the two resolves to
-     * the child instead of the turn that is already exiting.
-     */
-    resolveHead(jobId) {
+    readManifestRaw(id) {
+        if (!this.isSafeJobId(id))
+            return null;
+        const inMem = this.live.get(id)?.writer.snapshot();
+        if (inMem !== null && inMem !== undefined)
+            return inMem;
+        try {
+            return readManifest(this.repo, id);
+        }
+        catch {
+            return null;
+        }
+    }
+    resolveTurn(jobId) {
         const trimmed = jobId.trim();
         const seen = new Set();
         let curId = trimmed;
-        let curManifest = this.readManifestSync(curId);
-        if (curManifest === null)
+        let cur = this.readManifestSync(curId);
+        if (cur === null)
             return trimmed;
         while (!seen.has(curId)) {
             seen.add(curId);
-            const nextId = curManifest.supersededBy ?? readSteerHead(this.repo, curId);
+            const nextId = cur.supersededBy ?? readSteerHead(this.repo, curId);
             if (nextId === null || nextId === undefined || nextId === '')
                 break;
-            const nextManifest = this.readManifestSync(nextId);
-            if (nextManifest === null)
+            const next = this.readManifestSync(nextId);
+            if (next === null)
                 break;
             curId = nextId;
-            curManifest = nextManifest;
+            cur = next;
         }
         return curId;
     }
-    async resolveSteerTarget(worker) {
-        const trimmed = worker.trim();
-        if (existsSync(pipelineRecordPath(this.repo, trimmed))) {
-            throw new Error(`Cannot steer pipeline run "${trimmed}"; steer_job only applies to solo workers.`);
-        }
-        const followChain = (startId) => {
-            const headId = this.resolveHead(startId);
-            const manifest = this.readManifestSync(headId);
-            return manifest === null ? null : { jobId: headId, manifest };
-        };
-        if (this.live.has(trimmed) || existsSync(jobDir(this.repo, trimmed))) {
-            const resolved = followChain(trimmed);
-            if (resolved !== null)
-                return resolved;
-        }
-        for (const [id, live] of this.live.entries()) {
-            const snap = live.writer.snapshot();
-            if (snap !== null && snap.name === trimmed && snap.status === 'running') {
-                return { jobId: id, manifest: snap };
-            }
-        }
-        const candidates = (await this.list({ limit: 500 })).filter((j) => j.name === trimmed);
-        if (candidates.length === 0) {
-            throw new Error(`No worker "${trimmed}"; see list_jobs.`);
-        }
-        const running = candidates.filter((j) => j.status === 'running');
-        if (running.length === 1) {
-            const resolved = followChain(running[0].jobId);
-            if (resolved !== null)
-                return resolved;
-        }
-        if (running.length > 1) {
-            throw new Error(`"${trimmed}" matches ${running.length} running workers; pass a job ID from list_jobs.`);
-        }
-        const identities = new Set(candidates.map((j) => j.workerId));
-        if (identities.size !== 1) {
-            throw new Error(`"${trimmed}" matches ${identities.size} workers; pass a job ID from list_jobs.`);
-        }
-        candidates.sort((a, b) => Date.parse(b.startedAt ?? b.updatedAt ?? '') - Date.parse(a.startedAt ?? a.updatedAt ?? ''));
-        const latest = followChain(candidates[0].jobId);
-        if (latest !== null)
-            return latest;
-        throw new Error(`No worker "${trimmed}"; see list_jobs.`);
-    }
     /**
-     * One worker by job id or name, as the detail of its latest turn.
-     *
-     * An id (any turn of a steered chain) wins; otherwise the name must belong to
-     * exactly one worker, and its newest turn is returned. Throws
-     * WorkerLookupError when nothing matches or the name is ambiguous.
+     * @deprecated Use resolveTurn (a jobId) or resolveWorkerHead (a worker).
+     * Kept for callers outside forge (channel tools/tasks): same as resolveTurn.
      */
-    async resolveWorker(nameOrId) {
-        try {
-            return await this.detail(this.resolveHead(nameOrId));
-        }
-        catch { /* not a job id: try it as a worker name */ }
-        const candidates = (await this.list({ limit: 500 })).filter((j) => j.name === nameOrId);
-        const identities = new Set(candidates.map((j) => j.workerId));
-        if (candidates.length === 0)
-            throw new WorkerLookupError(`No worker "${nameOrId}"; see list_jobs.`, 'missing');
-        if (identities.size !== 1) {
-            throw new WorkerLookupError(`"${nameOrId}" matches ${identities.size} workers; pass a job ID from list_jobs.`, 'ambiguous', candidates.map((j) => j.jobId));
-        }
-        candidates.sort((a, b) => Date.parse(b.startedAt ?? b.updatedAt ?? '') - Date.parse(a.startedAt ?? a.updatedAt ?? ''));
-        return this.detail(this.resolveHead(candidates[0].jobId));
+    resolveHead(jobId) {
+        return this.resolveTurn(jobId);
     }
-    /** Jobs the pane would draw. */
+    workerTurns(workerId) {
+        const index = this.workers.get(workerId);
+        if (index === null)
+            return [];
+        const out = [];
+        index.turns.forEach((jobId, pos) => {
+            let m = this.readManifestRaw(jobId);
+            if (m === null)
+                return;
+            if (m.status === 'running' && !this.live.has(jobId))
+                m = this.readManifestSync(jobId) ?? m;
+            const turn = typeof m.turn === 'number' && Number.isInteger(m.turn) && m.turn >= 1 ? m.turn : pos + 1;
+            out.push({ jobId, manifest: m, turn });
+        });
+        return out;
+    }
+    turnLike(t) {
+        return {
+            jobId: t.jobId,
+            status: t.manifest.status,
+            turn: t.turn,
+            supersededBy: t.manifest.supersededBy,
+            followedBy: t.manifest.followedBy,
+            startedAt: t.manifest.startedAt,
+            createdAt: t.manifest.createdAt,
+            updatedAt: t.manifest.updatedAt,
+            hasSteerHead: readSteerHead(this.repo, t.jobId) !== null,
+            acceptancePending: this.checksPending(t.jobId),
+            pendingMessages: t.manifest.pendingSteers ?? 0,
+        };
+    }
+    workerHead(workerId) {
+        return pickHead(this.workerTurns(workerId).map((t) => this.turnLike(t)));
+    }
+    workerHeadId(workerId) {
+        let turns = this.workerTurns(workerId);
+        if (turns.length === 0) {
+            this.workers.refresh();
+            turns = this.workerTurns(workerId);
+        }
+        const head = pickHead(turns.map((t) => this.turnLike(t)));
+        return head === null ? null : this.resolveTurn(head.jobId);
+    }
+    resolveWorkerHeadId(ref) {
+        const trimmed = ref.trim();
+        if (trimmed === '')
+            throw new WorkerLookupError('worker is empty; pass a worker name, workerId or jobId.', 'missing');
+        this.workers.refresh();
+        if (this.isJobId(trimmed)) {
+            const m = this.readManifestRaw(trimmed);
+            const workerId = m?.workerId ?? trimmed;
+            return this.workerHeadId(workerId) ?? this.resolveTurn(trimmed);
+        }
+        if (this.isSafeJobId(trimmed)) {
+            const byWorkerId = this.workerHeadId(trimmed);
+            if (byWorkerId !== null)
+                return byWorkerId;
+        }
+        return this.resolveName(trimmed);
+    }
+    resolveName(name) {
+        const workerIds = this.workers.workersNamed(name);
+        const heads = [];
+        for (const wid of workerIds) {
+            const turns = this.workerTurns(wid);
+            const head = pickHead(turns.map((t) => this.turnLike(t)));
+            if (head === null)
+                continue;
+            const headId = this.resolveTurn(head.jobId);
+            const manifest = this.readManifestSync(headId) ?? turns.find((t) => t.jobId === head.jobId).manifest;
+            heads.push({ jobId: headId, manifest, session: turns.some((t) => this.spawnedIds.has(t.jobId)), idle: isWorkerIdle(head) });
+        }
+        if (heads.length === 0)
+            throw new WorkerLookupError(`No worker "${name}"; see list_jobs.`, 'missing');
+        const startOf = (h) => Date.parse(h.manifest.startedAt ?? h.manifest.createdAt ?? '') || 0;
+        const latest = (xs) => [...xs].sort((a, b) => startOf(b) - startOf(a) || b.jobId.localeCompare(a.jobId))[0];
+        const running = heads.filter((h) => !h.idle);
+        if (running.length === 1)
+            return running[0].jobId;
+        const pool = running.length > 1 ? running : heads;
+        const session = pool.filter((h) => h.session);
+        if (session.length > 0)
+            return latest(session).jobId;
+        if (pool.length === 1)
+            return pool[0].jobId;
+        const candidates = [...pool].sort((a, b) => startOf(b) - startOf(a)).map((h) => isTerminalStatus(h.manifest.status)
+            ? `${name} (${h.jobId}, finished ${h.manifest.finishedAt ?? h.manifest.updatedAt ?? 'unknown'})`
+            : `${name} (${h.jobId}, ${h.manifest.status})`);
+        throw new WorkerLookupError(`"${name}" matches ${pool.length} workers: ${candidates.join(', ')}; pass a jobId.`, 'ambiguous', pool.map((h) => h.jobId));
+    }
+    async resolveWorkerHead(nameOrWorkerIdOrJobId) {
+        return this.numberedDetail(this.resolveWorkerHeadId(nameOrWorkerIdOrJobId));
+    }
+    async resolveWorker(nameOrId) {
+        const trimmed = nameOrId.trim();
+        if (this.isJobId(trimmed))
+            return this.numberedDetail(this.resolveTurn(trimmed));
+        return this.resolveWorkerHead(trimmed);
+    }
+    async numberedDetail(jobId) {
+        const d = await this.detail(jobId);
+        const raw = this.readManifestRaw(jobId);
+        if (raw === null || (typeof raw.turn === 'number' && raw.turn >= 1))
+            return d;
+        const pos = this.workers.get(d.workerId)?.turns.indexOf(jobId) ?? -1;
+        return pos >= 0 ? { ...d, turn: pos + 1 } : d;
+    }
+    async earlierTurns(headOrId, cap = 20) {
+        const head = typeof headOrId === 'string' ? await this.resolveWorker(headOrId) : headOrId;
+        if (cap <= 0)
+            return [];
+        let index = this.workers.get(head.workerId);
+        if (index === null || !index.turns.includes(head.jobId)) {
+            this.workers.refresh();
+            index = this.workers.get(head.workerId);
+        }
+        if (index === null)
+            return [];
+        const pos = index.turns.indexOf(head.jobId);
+        const before = pos >= 0 ? index.turns.slice(0, pos) : [];
+        const wanted = before.slice(-cap);
+        const offset = before.length - wanted.length;
+        const out = [];
+        for (let i = 0; i < wanted.length; i++) {
+            const id = wanted[i];
+            const d = await this.detail(id).catch(() => null);
+            if (d === null)
+                continue;
+            const raw = this.readManifestRaw(id);
+            const numbered = raw !== null && typeof raw.turn === 'number' && raw.turn >= 1;
+            out.push(numbered ? d : { ...d, turn: offset + i + 1 });
+        }
+        return out;
+    }
+    findActiveIdentity(name, workerId) {
+        const own = this.workerTurns(workerId).find((t) => t.manifest.status === 'running');
+        if (own !== undefined)
+            return this.turnLike(own);
+        for (const wid of this.workers.workersNamed(name)) {
+            if (wid === workerId)
+                continue;
+            const head = this.workerHead(wid);
+            if (!isWorkerIdle(head))
+                return head;
+        }
+        return null;
+    }
     async list(filter = {}) {
         for (const id of this.spawnedRuns) {
             for (const stage of Object.values(readPipeline(this.repo, id)?.stageResults ?? {})) {
@@ -1969,15 +2963,60 @@ class ForgeService {
                     this.spawnedIds.add(stage.jobId);
             }
         }
-        for (const id of this.spawnedIds)
-            this.spawnedIds.add(this.resolveHead(id));
-        const out = await this.readJobs();
+        const all = await this.readJobs();
+        let pool = all;
+        if (filter.ids !== undefined) {
+            const matchedWorkers = new Set();
+            for (const j of all) {
+                if (filter.ids.has(j.jobId) || filter.ids.has(j.workerId)) {
+                    matchedWorkers.add(j.workerId);
+                }
+            }
+            pool = all.filter((j) => filter.ids.has(j.jobId) || matchedWorkers.has(j.workerId));
+        }
+        const groupByWorker = filter.groupByWorker ?? true;
+        let rows;
+        if (groupByWorker) {
+            const byId = new Map();
+            const groups = new Map();
+            for (const j of pool) {
+                byId.set(j.jobId, j);
+                const list = groups.get(j.workerId);
+                if (list !== undefined)
+                    list.push(j);
+                else
+                    groups.set(j.workerId, [j]);
+            }
+            rows = [];
+            for (const turns of groups.values()) {
+                const sorted = [...turns].sort((a, b) => compareTurnPriority({ ...a, hasSteerHead: readSteerHead(this.repo, a.jobId) !== null }, { ...b, hasSteerHead: readSteerHead(this.repo, b.jobId) !== null }));
+                let head = sorted[0];
+                const liveHeadId = this.resolveTurn(head.jobId);
+                if (liveHeadId && liveHeadId !== head.jobId) {
+                    const fromPool = byId.get(liveHeadId);
+                    if (fromPool !== undefined) {
+                        head = fromPool;
+                    }
+                    else {
+                        const observed = await readObservedJob(this.repo, liveHeadId);
+                        if (observed !== null) {
+                            const summary = toSummary(observed);
+                            const found = readAcceptance(this.repo, liveHeadId);
+                            const acceptance = 'checks' in found ? found : { state: 'unchecked', checks: [] };
+                            const meaningful = acceptance.state !== 'unchecked' || acceptance.pending === true || acceptance.checks.length > 0;
+                            head = meaningful ? { ...summary, acceptance } : summary;
+                        }
+                    }
+                }
+                rows.push(head);
+            }
+        }
+        else {
+            rows = pool;
+        }
         const touched = (j) => Date.parse(j.finishedAt ?? j.updatedAt ?? j.startedAt ?? '');
-        const filtered = out.filter((j) => (filter.status === undefined || j.status === filter.status) &&
-            (filter.ids === undefined || filter.ids.has(j.jobId)) &&
+        const filtered = rows.filter((j) => (filter.status === undefined || j.status === filter.status) &&
             (filter.sinceMs === undefined || touched(j) >= filter.sinceMs));
-        // Live first, then newest — the same ordering the band draws, so the list a
-        // model reads and the list a human sees put the same job on top.
         filtered.sort((a, b) => {
             const rank = (s) => (s === 'running' ? 0 : 1);
             const r = rank(a.status) - rank(b.status);
@@ -1988,13 +3027,6 @@ class ForgeService {
         const limit = filter.limit ?? 50;
         return filtered.slice(0, Math.max(1, limit));
     }
-    /**
-     * One job in full.
-     *
-     * Reads from DISK, not from the in-memory map, so `status` works for a job this
-     * process did not start. The in-memory manifest is only consulted to answer
-     * `cancellable`.
-     */
     async detail(jobId) {
         reconcileOrphan(this.repo, jobId);
         const observed = await readObservedJob(this.repo, jobId);
@@ -2014,7 +3046,7 @@ class ForgeService {
         try {
             manifest = readManifest(this.repo, jobId);
         }
-        catch { /* partial state */ }
+        catch { }
         const liveStale = manifest?.status === 'running' && manifest.watchedFiles !== undefined
             ? computeStaleReads(this.repo, manifest.cwd, manifest.watchedFiles, this.live.get(jobId)?.writer.editedFiles(Object.keys(manifest.watchedFiles)) ?? manifest.changedFiles)
             : [];
@@ -2053,15 +3085,6 @@ class ForgeService {
             cancellable: this.live.has(jobId) || (manifest?.status === 'running' && ownerAlive(manifest)),
         };
     }
-    /**
-     * The job's recent tool rows, for the pipeline runner's observation tap.
-     *
-     * LIVE FIRST, disk second. While the job runs this process holds the writer,
-     * and asking the writer is exact. Once it is over (or if it was started by
-     * another process) we fall back to reading progress.json back through the
-     * reader — which is the same file the pane draws from, so the observations
-     * routing.ts escalates on are literally the tool calls a human would see.
-     */
     async activities(jobId) {
         const live = this.live.get(jobId);
         if (live !== undefined)
@@ -2075,14 +3098,6 @@ class ForgeService {
             return [];
         }
     }
-    /**
-     * The job's current state, terminal or not.
-     *
-     * `unknown` is returned AS `unknown`, never coerced to `running`. The runner's
-     * poll loop depends on being able to tell "still going" from "cannot tell",
-     * and collapsing the second into the first is how an observation series gets
-     * silently truncated.
-     */
     async state(jobId) {
         reconcileOrphan(this.repo, jobId);
         const live = this.live.get(jobId)?.writer.snapshot();
@@ -2106,9 +3121,6 @@ class ForgeService {
             if (observed === null)
                 continue;
             const summary = toSummary(observed);
-            // Attach acceptance from the sidecar so a list row carries the verdict the
-            // caller would otherwise have to poll `status` for once per job. Absent
-            // (unchecked, no checks) means nothing to say: the row stays as it was.
             const found = readAcceptance(this.repo, id);
             const acceptance = 'checks' in found ? found : { state: 'unchecked', checks: [] };
             const meaningful = acceptance.state !== 'unchecked' || acceptance.pending === true || acceptance.checks.length > 0;
@@ -2117,31 +3129,8 @@ class ForgeService {
         return out;
     }
 }
-function findActiveIdentity(repo, name, workerId) {
-    let entries;
-    try {
-        entries = readdirSync(jobsDir(repo));
-    }
-    catch {
-        return null;
-    }
-    for (const id of entries) {
-        let manifest;
-        try {
-            manifest = readManifest(repo, id);
-        }
-        catch {
-            continue;
-        }
-        if (manifest.status !== 'running')
-            continue;
-        if (manifest.workerId === workerId || manifest.name === name)
-            return manifest;
-    }
-    return null;
-}
 function describe(err) {
     if (err instanceof Error)
         return err.message;
     return String(err);
-}export{EFFORTS as E,ForgeService as F,MAX_WATCHED_FILES as M,ENV_KEYS_FILE as a,getInstalledProviders as b,getCatalogs as g,launchPipeline as l,validateEnv as v};
+}export{EFFORTS as E,ForgeService as F,MAX_WATCHED_FILES as M,getInstalledProviders as a,getCatalogs as g,launchPipeline as l,validateEnv as v};

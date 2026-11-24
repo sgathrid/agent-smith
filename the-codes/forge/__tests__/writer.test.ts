@@ -1,12 +1,3 @@
-/**
- * writer.test.ts — the state writer, and the round trip through our own reader.
- *
- * The round trip is the test that matters here. A writer whose output its own
- * reader cannot read is a system where the pane draws `unknown` forever and
- * nothing errors, so every terminal state is written and then read BACK through
- * harness/agent-smith.ts + normalize.ts and asserted on the normalized verdict.
- */
-
 import assert from 'node:assert/strict';
 import {
   existsSync,
@@ -34,8 +25,6 @@ function repo(): string {
   return mkdtempSync(path.join(tmpdir(), 'agent-smith-writer-'));
 }
 
-/** A stamp the writer's flusher will accept: the coalescing window is 0 here, so
- *  what matters is that it is not in the PAST relative to `start()`. */
 function now(): string {
   return new Date().toISOString();
 }
@@ -76,8 +65,6 @@ function result(over: Partial<JobResult> = {}): JobResult {
   };
 }
 
-/* ── the atomic primitives ─────────────────────────────────────────────────── */
-
 test('fragmented assistant output stays coherent and final summary reaches every reader', async () => {
   const r = repo(); const id = 'implement-smith-abcd1234'; const w = start(r);
   w.onEvent({ kind: 'text', at: now(), stream: 'assistant', text: 'Found the ' });
@@ -100,8 +87,6 @@ test('writeAtomic leaves no temp file behind on success', () => {
 });
 
 test('writeAtomic replaces the whole body, never splices it', () => {
-  // The property the whole single-anchor design rests on: a reader sees either
-  // the entire previous file or the entire new one.
   const r = repo();
   const at = path.join(r, 'f.json');
   writeAtomic(at, '{"status":"running","pad":"aaaaaaaaaaaaaaaaaaaa"}');
@@ -138,11 +123,7 @@ test('writeJsonAtomic round-trips a manifest through disk unchanged', () => {
   });
 });
 
-/* ── start ─────────────────────────────────────────────────────────────────── */
-
 test('the anchor exists the instant start() returns, before any process runs', () => {
-  // A reader that finds nothing has to answer "does this job exist?" with "no",
-  // and then the job's whole life is invisible. So the anchor is written FIRST.
   const r = repo();
   const w = start(r);
   const m = JSON.parse(readFileSync(jobFile(r, w.jobId, FILES.job), 'utf8')) as ForgeManifest;
@@ -161,8 +142,6 @@ test('the manifest records the full prompt LENGTH but never the prompt', () => {
   assert.equal(body.includes('do the thing'), false, 'the prompt body is megabytes of the user\'s source code');
 });
 
-/* ── events ────────────────────────────────────────────────────────────────── */
-
 test('a tool call is counted and the newest step wins the activity cell', () => {
   const r = repo();
   const w = start(r);
@@ -178,15 +157,10 @@ test('a tool call is counted and the newest step wins the activity cell', () => 
     recentActivities: { stepIndex: number; tool: string }[];
   };
   assert.equal(p.toolCalls, 3, 'count observed calls rather than gaps in provider step indices');
-  // Highest step_index, not last-in-array: a rewritten array mid-poll is not
-  // guaranteed sorted, and the pane picks by index for exactly that reason.
   assert.equal(p.recentActivities[p.recentActivities.length - 1]?.tool, 'tool_4');
 });
 
 test('a DONE record inherits the input from its ACTIVE record', () => {
-  // Verified against the corpus: agy splits ACTIVE/DONE at the same step_index and
-  // only ACTIVE carries tool_info.parameters. Dropping it would leave every
-  // finished job's activity cell blank.
   const r = repo();
   const w = start(r);
   w.onEvent({
@@ -208,9 +182,6 @@ test('a DONE record inherits the input from its ACTIVE record', () => {
 });
 
 test('an activity UPDATE keeps the call alive, fills in its input and never counts twice', () => {
-  // A tool that runs for minutes emits updates, not new calls. Ignoring them
-  // left `lastEventAt` frozen (a live job looked stalled), and treating them as
-  // starts would inflate the tool count.
   const r = repo();
   const w = start(r);
   const first = new Date(Date.now() + 1_000).toISOString();
@@ -299,8 +270,6 @@ test('thinking text is not mixed into the reasoning cell', () => {
 });
 
 test('the conversation id from the started event is captured for resume', () => {
-  // This is what makes an escalation a CONTINUATION rather than a restart: the
-  // runner passes it back as `--conversation <id>` on attempt 2.
   const r = repo();
   const w = start(r);
   w.onEvent({ kind: 'started', at: now(), conversationId: 'conv-xyz' } satisfies ProviderEvent);
@@ -310,8 +279,6 @@ test('the conversation id from the started event is captured for resume', () => 
   const m = JSON.parse(readFileSync(jobFile(r, w.jobId, FILES.job), 'utf8')) as ForgeManifest;
   assert.equal(m.conversation, 'conv-xyz');
 });
-
-/* ── finish, and the round trip ────────────────────────────────────────────── */
 
 test('a successful job round-trips through our own reader as succeeded', async () => {
   const r = repo();
@@ -386,11 +353,6 @@ test('a running job reads as running, and a started job is discoverable', async 
 });
 
 test('a FINISHED job whose anchor is lost reads as unknown, never as succeeded', async () => {
-  // "We cannot tell" and "it succeeded" are different claims, and a band that
-  // draws one as the other is lying. This is the single most load-bearing rule in
-  // harness/types.ts, and it is why the writer never deletes the anchor: the
-  // report is still on disk, so the job is visible, but we refuse to assert a
-  // verdict we cannot point at a source for.
   const r = repo();
   const w = start(r);
   w.finish(result(), '# Report\n\nthe deliverable text');
@@ -405,9 +367,6 @@ test('a FINISHED job whose anchor is lost reads as unknown, never as succeeded',
 });
 
 test('a RUNNING job with no anchor at all is not a job we will invent', async () => {
-  // Identity requires evidence of a job, not just a directory: a half-created
-  // directory (crash between mkdir and the first write) must not draw as `unknown`
-  // forever next to the jobs that are real.
   const r = repo();
   const w = start(r);
   unlinkSync(jobFile(r, w.jobId, FILES.job));
@@ -416,8 +375,6 @@ test('a RUNNING job with no anchor at all is not a job we will invent', async ()
 });
 
 test('a manifest from a NEWER writer is refused, not half-understood', async () => {
-  // Reading a v2 file with v1 rules produces exactly the confident wrong answers
-  // this project exists to prevent.
   const r = repo();
   const w = start(r);
   writeJsonAtomic(jobFile(r, w.jobId, FILES.job), {
@@ -433,8 +390,6 @@ test('a manifest from a NEWER writer is refused, not half-understood', async () 
 });
 
 test('a stray directory in the jobs root is not reported as a job', async () => {
-  // A band that draws `unknown` for a folder a human dropped here is drawing a
-  // lie. Identity requires evidence of a job.
   const r = repo();
   start(r);
   mkdirSync(jobDir(r, 'notes'), { recursive: true });
@@ -452,8 +407,6 @@ test('an unknown job is null, not a throw', async () => {
 test('an absent jobs directory yields [], which is the ordinary case', async () => {
   assert.deepEqual(await new AgentSmithReader().discover(repo()), []);
 });
-
-/* ── cancel ────────────────────────────────────────────────────────────────── */
 
 test('cancel writes a request marker without claiming the worker has stopped', async () => {
   const r = repo();
@@ -483,8 +436,6 @@ test('a cancel request does not rewrite a successful worker completion as cancel
   assert.equal(jobs[0]?.status, 'succeeded');
 });
 
-/* ── idempotence and abort ─────────────────────────────────────────────────── */
-
 test('a second terminal write does not rewrite history', async () => {
   const r = repo();
   const w = start(r);
@@ -496,8 +447,6 @@ test('a second terminal write does not rewrite history', async () => {
 });
 
 test('abort with no result event still terminates the job', async () => {
-  // A job that never gets a terminal write stays `running` forever, which is a
-  // lie with a very long fuse.
   const r = repo();
   const w = start(r);
   const m = w.abort('failed', 'the adapter threw before it returned');
@@ -515,9 +464,6 @@ test('events after the terminal state are ignored', async () => {
   assert.equal(p.latestText, null);
 });
 
-/* ── helpers ───────────────────────────────────────────────────────────────── */
-
-/** appendBounded cuts from the FRONT, because the newest text is what is shown. */
 test('appendBounded keeps the tail, not the head', () => {
   assert.equal(appendBounded('aaa', 'bbb', 10), 'aaabbb');
   assert.equal(appendBounded('', 'bbb', 10), 'bbb');
@@ -526,7 +472,6 @@ test('appendBounded keeps the tail, not the head', () => {
   assert.equal(long.length, 10, 'the bound is a bound, not a suggestion');
 });
 
-/** Node's fs, reached once so the suite stays a single import surface. */
 function require$fs(): typeof import('node:fs') {
   return fsModule;
 }
@@ -550,15 +495,14 @@ test('bounded canonical detail round-trips text fragments, tool identity and act
   };
   const detail = await readForgeDetail(fs, r, id, Date.now());
   assert.equal(detail?.job.toolCount, 1, 'a high provider step index is not a tool count');
-  assert.deepEqual(detail?.transcript, ['Found the edge case.']);
   assert.deepEqual(detail?.timeline?.map(e=>e.kind), ['tool','assistant']);
   assert.deepEqual(detail?.timeline?.map(e=>e.sequence), [0,1]);
   assert.equal(detail?.timeline?.[0]?.kind==='tool' ? detail.timeline[0].state : null, 'done');
   assert.equal(detail?.timeline?.[1]?.kind==='assistant' ? detail.timeline[1].text : null, 'Found the edge case.');
   assert.equal(JSON.parse(readFileSync(jobFile(r,id,FILES.progress),'utf8')).recentActivities[0].tool, 'Read');
-  assert.equal(detail?.history[0]?.tool, 'Read', 'completion must retain the original tool name');
-  assert.equal(detail?.history[0]?.label, 'source.ts');
-  assert.equal(detail?.history[0]?.state, 'done');
+  assert.equal(detail?.timeline?.[0]?.kind==='tool' ? detail.timeline[0].tool : null, 'Read', 'completion must retain the original tool name');
+  assert.equal(detail?.timeline?.[0]?.kind==='tool' ? detail.timeline[0].input : null, 'source.ts');
+  assert.equal(detail?.timeline?.[0]?.kind==='tool' ? detail.timeline[0].state : null, 'done');
   assert.match(detail?.job.prompt ?? '', /Dashboard rework/);
 });
 
@@ -613,7 +557,7 @@ test('last activity follows the newest event even when an earlier concurrent too
 
 test('successful report with denied tools keeps a factual nonfatal warning', async () => {
   const r = repo(); const w = start(r);
-  w.finish(result({ deniedActions: [{ action: 'tool', displayName: 'Bash' }] }), '# Review\n\nThe implementation handles the edge case correctly.');
+  w.finish(result({ deniedActions: [{ action: 'tool', displayName: 'Bash', nonfatal: true }] }), '# Review\n\nThe implementation handles the edge case correctly.');
   const raw = await new AgentSmithReader().read(r, w.jobId);
   const observed = normalize(raw!);
   assert.equal(observed.status, 'succeeded');
@@ -664,8 +608,6 @@ test('progress.json carries a digest of what the worker has done', () => {
   assert.equal(p.digest.testRuns, 1);
   assert.equal(p.digest.lastTestFailed, true);
 });
-
-/* ── failure reason ────────────────────────────────────────────────────────── */
 
 function failedManifest(over: Partial<JobResult>, report = ''): ForgeManifest {
   const r = repo();
@@ -721,8 +663,6 @@ test('an unrelated error still shows beside a denial warning', async () => {
   assert.ok(messages.some((m) => /denied/.test(m)), messages.join(' | '));
   assert.ok(messages.includes('exited 3, no result'), messages.join(' | '));
 });
-
-/* ── honest state: cwd gone, tool errors, summary, early failure ───────────── */
 
 function startIn(r: string, cwd: string, mode: string, jobId = `${mode}-smith-abcd1234`): JobWriter {
   const w = new JobWriter({ repo: r, jobId, flushMs: 0 });
@@ -900,7 +840,6 @@ test('a fast failure with no tool calls is marked failedEarly; a slow or busy on
   assert.equal(m.failedEarly, true);
   assert.equal(m.error, 'Selected model is not supported in the selected location', 'provider text kept verbatim');
 
-  // Slow, but the first thing it ever said was an error: still a route failure.
   const slow = startIn(r, r, 'review', 'review-smith-early002');
   slow.onEvent({ kind: 'notice', at: now(), level: 'error', message: 'HTTP 402: Insufficient account funds' });
   assert.equal(slow.finish(result({ ok: false, status: 'error', error: 'HTTP 402: Insufficient account funds', durationMs: 90_000, response: '' }), '').failedEarly, true);
@@ -917,8 +856,6 @@ test('a fast failure with no tool calls is marked failedEarly; a slow or busy on
   assert.equal(timedOut.finish(result({ ok: false, status: 'timeout', error: 'timed out', durationMs: 1_000, response: '' }), '').failedEarly, undefined);
 });
 
-/* ── liveness: the process owner's heartbeat ───────────────────────────────── */
-
 test('a heartbeat records lastAliveAt and workerPid without moving lastEventAt, updatedAt or the timeline', async () => {
   const r = repo();
   const w = start(r);
@@ -934,7 +871,6 @@ test('a heartbeat records lastAliveAt and workerPid without moving lastEventAt, 
   assert.equal(p['lastEventAt'], t0, 'a heartbeat is not activity');
   assert.equal(readManifest(r, w.jobId).updatedAt, before.updatedAt);
   assert.equal(readFileSync(jobFile(r, w.jobId, FILES.view), 'utf8'), view, 'not in the timeline');
-  // The next event keeps the heartbeat; the reader exposes it.
   const t1 = new Date(Date.now() + 90_000).toISOString();
   w.onEvent({ kind: 'activity-end', at: t1, activity: { stepIndex: 1, tool: 'run_command' }, status: 'done' });
   const after = JSON.parse(readFileSync(jobFile(r, w.jobId, FILES.progress), 'utf8')) as Record<string, unknown>;

@@ -17,7 +17,7 @@ const cat = (provider: string, extra: Partial<ModelCatalog> = {}): ModelCatalog 
 const ctxWith = (cats: ModelCatalog[]) => ({ service: { repo: mkdtempSync(path.join(tmpdir(), 'agent-smith-tools-')) } as never, catalogs: async () => cats }) as HandlerContext;
 const body = (r: { content: unknown }) => JSON.parse(((r.content as { text: string }[])[0]!).text);
 
-test('spawn and resume validate and forward absolute working directories', async () => {
+test('spawn_job validates and forwards an absolute working directory', async () => {
   const repo = mkdtempSync(path.join(tmpdir(), 'smith-cwd-store-'));
   const cwd = mkdtempSync(path.join(tmpdir(), 'smith-cwd-work-'));
   const seen: Array<Record<string, unknown>> = [];
@@ -28,17 +28,11 @@ test('spawn and resume validate and forward absolute working directories', async
   const ctx = { service, catalogs: async () => [cat('codex')] } as HandlerContext;
   assert.equal((await callTool(ctx, 'spawn_job', { mode: 'review', provider: 'codex', prompt: 'review', cwd })).isError, undefined);
   assert.equal(seen[0]!.cwd, cwd);
-  assert.equal((await callTool(ctx, 'resume_job', { worker: 'Ada', prompt: 'continue' })).isError, undefined);
-  assert.equal(seen[1]!.cwd, cwd);
-  assert.equal((await callTool(ctx, 'resume_job', { worker: 'Ada', prompt: 'continue', cwd: repo })).isError, undefined);
-  assert.equal(seen[2]!.cwd, repo);
   for (const invalid of ['relative', path.join(cwd, 'missing')]) {
-    for (const tool of ['spawn_job', 'resume_job']) {
-      const args = tool === 'spawn_job' ? { mode: 'review', provider: 'codex', prompt: 'review' } : { worker: 'Ada', prompt: 'continue' };
-      assert.equal((await callTool(ctx, tool, { ...args, cwd: invalid })).isError, true);
-    }
+    assert.equal((await callTool(ctx, 'spawn_job', { mode: 'review', provider: 'codex', prompt: 'review', cwd: invalid })).isError, true);
   }
-  assert.equal(seen.length, 3, 'invalid cwd must not launch a worker');
+  assert.match(text(await callTool(ctx, 'follow_up', { worker: 'Ada', prompt: 'continue', cwd })), /Unknown field cwd/);
+  assert.equal(seen.length, 1, 'invalid cwd must not launch a worker');
 });
 
 test('spawn_job with no configured default: the only installed provider, else a short error', async () => {
@@ -76,12 +70,13 @@ test('annotations are present', () => {
   const by = Object.fromEntries(TOOL_DEFS.map(t => [t.name, t.annotations]));
   for (const n of ['status', 'list_jobs', 'pipeline_status', 'list_capabilities']) assert.equal(by[n]?.readOnlyHint, true, n);
   assert.deepEqual([by.cancel?.destructiveHint, by.cancel?.idempotentHint], [true, true]);
-  assert.equal(by.steer_job?.destructiveHint, true, 'steer_job can interrupt a running turn');
-  for (const n of ['spawn_job', 'run_pipeline', 'resume_job', 'steer_job']) assert.deepEqual([by[n]?.readOnlyHint, by[n]?.openWorldHint], [false, true], n);
+  assert.equal(by.steer?.destructiveHint, true, 'steer can interrupt a running turn');
+  assert.equal(by.follow_up?.destructiveHint, undefined, 'follow_up never cuts a turn');
+  for (const n of ['spawn_job', 'run_pipeline', 'follow_up', 'steer']) assert.deepEqual([by[n]?.readOnlyHint, by[n]?.openWorldHint], [false, true], n);
 });
 
 test('files is bounded in the schema, matching the service cap', () => {
-  for (const name of ['spawn_job', 'resume_job', 'steer_job']) {
+  for (const name of ['spawn_job', 'follow_up', 'steer']) {
     const files = (TOOL_DEFS.find(t => t.name === name)!.inputSchema as any).properties.files;
     assert.equal(files?.maxItems, 32, name);
   }
@@ -166,14 +161,14 @@ test('pipelines expand aliases in explicit stages and apply roleDefaults to the 
 
 test('spawn_job ack is slim: identity, budget, permissions and warnings only', async () => {
   const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-ack-'));
-  const full = { jobId: 'j9', name: 'Ada', workerId: 'j9', role: 'review', provider: 'codex', status: 'running', dir: `${repo}/.agent-smith/jobs/j9`, repo, timeoutMs: 1000,
+  const full = { jobId: 'j9', name: 'Ada', workerId: 'j9', turn: 1, role: 'review', provider: 'codex', status: 'running', dir: `${repo}/.agent-smith/jobs/j9`, repo, timeoutMs: 1000,
     unrestricted: false, note: 'queued', sandbox: 'codex -s read-only', sandboxFlags: ['-s', 'read-only'], readOnlyRequested: true, readOnlyEnforced: true,
     modelRequested: null, modelResolved: 'gpt-x', modelSource: 'harness-config', preambleApplied: true };
   const service = { repo, spawnJob: async () => full } as never;
   const r = await callTool({ service, catalogs: async () => [cat('codex')] } as HandlerContext, 'spawn_job', { mode: 'review', prompt: 'x', provider: 'codex' });
   assert.equal(r.isError, undefined);
-  assert.deepEqual(body(r), { jobId: 'j9', name: 'Ada', provider: 'codex', model: 'gpt-x', status: 'running', timeoutMs: 1000, repo, unrestricted: false, readOnlyEnforced: true });
-  assert.ok(text(r).length < 250, text(r));
+  assert.deepEqual(body(r), { jobId: 'j9', name: 'Ada', workerId: 'j9', turn: 1, provider: 'codex', model: 'gpt-x', status: 'running', timeoutMs: 1000, repo, unrestricted: false, readOnlyEnforced: true });
+  assert.ok(text(r).length < 280, text(r));
 });
 
 test('an unrestricted review ack still says whether read-only is enforced', async () => {
@@ -187,12 +182,37 @@ test('an unrestricted review ack still says whether read-only is enforced', asyn
 
 test('cancel of a job it cannot read is not reported as settled', async () => {
   const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-cancel-'));
-  const service = { repo, cancel: (id: string) => ({ jobId: id, requested: true, signalled: false, note: 'x' }), detail: async () => { throw new Error('gone'); } } as never;
-  const r = await callTool({ service, cancelSettleMs: 0 } as HandlerContext, 'cancel', { jobId: 'j1' });
+  const service = withWorkerLookup({ repo, cancel: (id: string) => ({ jobId: id, requested: true, signalled: false, note: 'x' }), detail: async () => { throw new Error('gone'); } }) as never;
+  const r = await callTool({ service, cancelSettleMs: 0 } as HandlerContext, 'cancel', { id: 'j1' });
   assert.deepEqual(body(r), { jobId: 'j1', status: 'unknown', settled: false });
 });
 
-// ── concise responses, diff on demand, recoverable errors ────────────────────
+test('cancel by worker name stops its head turn, claims that job (never the name), and reports discarded messages', async () => {
+  const { existsSync } = await import('node:fs');
+  const { claimMarkerPath } = await import('../../../mod/hooks/notice.ts');
+  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-cancel-name-'));
+  const asked: string[] = [];
+  const service = withWorkerLookup({
+    repo,
+    resolveWorker: async () => ({ jobId: 'implement-smith-2', status: 'running' }),
+    cancel: (id: string) => { asked.push(id); return { jobId: 'implement-smith-2', resolvedFrom: id, requested: true, signalled: true, discarded: 1, warnings: ['1 queued message discarded: "add the edge-case test"'], note: 'Canceled.' }; },
+    detail: async () => ({ jobId: 'implement-smith-2', workerId: 'implement-smith-1', status: 'canceled', warnings: [] }),
+  }) as never;
+  const r = await callTool({ service, cancelSettleMs: 1_000 } as HandlerContext, 'cancel', { id: 'Ada' });
+  assert.deepEqual(asked, ['Ada'], 'the service resolves the name');
+  assert.deepEqual(body(r), { jobId: 'implement-smith-2', workerId: 'implement-smith-1', resolvedFrom: 'Ada', status: 'canceled', settled: true, discarded: 1, warnings: ['1 queued message discarded: "add the edge-case test"'] });
+  assert.ok(existsSync(claimMarkerPath(repo, 'job', 'implement-smith-2')));
+  assert.equal(existsSync(claimMarkerPath(repo, 'job', 'Ada')), false);
+});
+
+test('concise status and list_jobs are compact JSON; detailed stays indented', async () => {
+  const ctx = withService({ list: async () => [summary(1)], detail: async () => detail() });
+  for (const [tool, args] of [['status', { id: 'implement-smith-1' }], ['list_jobs', {}]] as const) {
+    assert.equal(text(await callTool(ctx, tool, args)).includes('\n'), false, tool);
+    assert.equal(text(await callTool(ctx, tool, { ...args, response_format: 'detailed' })).includes('\n'), true, tool);
+  }
+});
+
 const text = (r: { content: unknown }) => (r.content as { text: string }[])[0]!.text;
 const iso = (agoMs: number) => new Date(Date.now() - agoMs).toISOString();
 const LONG = 'The worker refactored the parser and then ran the full suite twice. '.repeat(20);
@@ -211,9 +231,9 @@ test('list_jobs: concise rows trim summaries on a word boundary and default to l
   const ctx = withService({ list: async (f: Record<string, unknown>) => { seen.push(f); return [summary(1)]; } });
   const concise = await callTool(ctx, 'list_jobs', {});
   const row = body(concise)[0];
-  assert.equal(seen[0]!.limit, 21); // one extra row detects a cut list
-  assert.ok(row.summary.length <= 200 && LONG.startsWith(row.summary.slice(0, -1)) && LONG[row.summary.length - 1] === ' ', row.summary);
-  assert.match(row.lastActivity, /^step 12: Bash npm test .*\(done\)$/); assert.ok(row.lastActivity.length < 120);
+  assert.equal(seen[0]!.limit, 21);
+  assert.ok(row.summary.length <= 160 && LONG.startsWith(row.summary.slice(0, -1)) && LONG[row.summary.length - 1] === ' ', row.summary);
+  assert.equal('lastActivity' in row, false);
   assert.equal('latestSummary' in row, false);
   assert.deepEqual(concise.structuredContent, { items: body(concise) });
   const detailed = await callTool(ctx, 'list_jobs', { response_format: 'detailed' });
@@ -232,66 +252,110 @@ test('list_jobs: a concise list cut by its limit says so; an uncut one stays a p
   assert.equal(body(whole).length, 3);
 });
 
-test('list_jobs: a turn a steer replaced is left out; its continuation stands for the worker', async () => {
-  const ctx = withService({ list: async () => [summary(2, { steeredFrom: 'implement-smith-1' }), summary(1, { supersededBy: 'implement-smith-2' })] });
-  assert.deepEqual(body(await callTool(ctx, 'list_jobs', {})).map((r: any) => r.jobId), ['implement-smith-2']);
-  assert.deepEqual(body(await callTool(ctx, 'list_jobs', { response_format: 'detailed' })).map((r: any) => r.jobId), ['implement-smith-2']);
+test('list_jobs: asks the service for one row per worker and keeps its rows and order', async () => {
+  const seenFilter: Record<string, unknown>[] = [];
+  const ctx = withService({
+    list: async (f: Record<string, unknown>) => {
+      seenFilter.push(f);
+      return [
+        summary(2, { workerId: 'w1', turn: 2, continuedFrom: 'implement-smith-1', continuationKind: 'steer' }),
+        summary(4, { workerId: 'w2', turn: 3, continuedFrom: 'implement-smith-3', continuationKind: 'follow-up' }),
+      ];
+    },
+  });
+  const concise = body(await callTool(ctx, 'list_jobs', {}));
+  assert.equal(seenFilter[0]!.groupByWorker, true);
+  assert.deepEqual(concise.map((r: any) => [r.jobId, r.turn]), [['implement-smith-2', 2], ['implement-smith-4', 3]]);
+  for (const r of concise) for (const k of ['workerId', 'continuedFrom', 'continuationKind', 'taskStatus']) assert.equal(k in r, false, k);
+  const detailed = body(await callTool(ctx, 'list_jobs', { response_format: 'detailed' }));
+  assert.deepEqual(detailed.map((r: any) => r.jobId), ['implement-smith-2', 'implement-smith-4']);
 });
 
-test('a running job with no progress time is stalled in list_jobs and status, not healthy', async () => {
+test('status names the id it resolved from when it answers with another turn', async () => {
+  const ctx = withService({ detail: async () => detail() });
+  assert.equal(body(await callTool(ctx, 'status', { id: 'w1' })).resolvedFrom, 'w1');
+  assert.equal(body(await callTool(ctx, 'status', { id: 'w1', response_format: 'detailed' })).resolvedFrom, 'w1');
+  assert.equal('resolvedFrom' in body(await callTool(ctx, 'status', { id: 'implement-smith-1' })), false);
+});
+
+test('a running job with no progress time reports liveness silent in list_jobs and status (no stalled alias)', async () => {
   const running = { status: 'running', finishedAt: null, updatedAt: null };
   const ctx = withService({ list: async () => [summary(1, running)], detail: async () => detail(running) });
-  assert.equal(body(await callTool(ctx, 'list_jobs', {}))[0].stalled, true);
-  assert.equal(body(await callTool(ctx, 'status', { jobId: 'implement-smith-1' })).stalled, true);
-  assert.equal(body(await callTool(ctx, 'status', { jobId: 'implement-smith-1', response_format: 'detailed' })).stalled, true);
+  const listed = body(await callTool(ctx, 'list_jobs', {}))[0];
+  assert.equal(listed.liveness.state, 'silent');
+  assert.equal('stalled' in listed, false);
+  const stConcise = body(await callTool(ctx, 'status', { id: 'implement-smith-1' }));
+  assert.equal(stConcise.liveness.state, 'silent');
+  assert.equal('stalled' in stConcise, false);
+  const stDetailed = body(await callTool(ctx, 'status', { id: 'implement-smith-1', response_format: 'detailed' }));
+  assert.equal(stDetailed.liveness.state, 'silent');
+  assert.equal('stalled' in stDetailed, false);
   const done = withService({ list: async () => [summary(1, { updatedAt: null })] });
-  assert.equal('stalled' in body(await callTool(done, 'list_jobs', {}))[0], false);
+  const doneRow = body(await callTool(done, 'list_jobs', {}))[0];
+  assert.equal('liveness' in doneRow, false);
+  assert.equal('stalled' in doneRow, false);
 });
 
-test('list_jobs: a concise row carries digest, acceptance, changedFileCount and stalled for the whole fleet', async () => {
+test('list_jobs: a concise row carries digest and liveness when running, and acceptance and changedFileCount when settled', async () => {
   const digest = {
     phase: 'testing', filesRead: 3, searches: 0, edited: ['a.ts', 'b.ts', 'c.ts', 'd.ts', 'e.ts', 'f.ts'],
     editedCount: 6, commands: 2, testRuns: 1, lastTestFailed: false, repeat: { label: 'Bash npm test', count: 3 },
   };
-  const ctx = withService({ list: async () => [summary(1, {
-    status: 'running', finishedAt: null, updatedAt: iso(20 * 60_000), changedFileCount: 2,
-    acceptance: { state: 'rejected', checks: [{ name: 'tests', ok: false }, { name: 'lint', ok: true }] },
-    digest,
-  })] });
-  const row = body(await callTool(ctx, 'list_jobs', {}))[0];
-  assert.equal(row.stalled, true);
-  assert.equal(row.changedFileCount, 2);
-  assert.deepEqual(row.acceptance, { state: 'rejected', passed: ['lint'], failed: ['tests'] });
-  assert.deepEqual(row.digest, {
+  const ctx = withService({ list: async () => [
+    summary(1, { status: 'running', finishedAt: null, updatedAt: iso(20 * 60_000), digest }),
+    summary(2, {
+      status: 'succeeded', changedFileCount: 2,
+      acceptance: { state: 'rejected', checks: [{ name: 'tests', ok: false }, { name: 'lint', ok: true }] },
+    }),
+  ] });
+  const [runningRow, settledRow] = body(await callTool(ctx, 'list_jobs', {}));
+  assert.equal(runningRow.liveness.state, 'silent');
+  assert.equal('stalled' in runningRow, false);
+  assert.deepEqual(runningRow.digest, {
     phase: 'testing', filesRead: 3, edited: ['a.ts', 'b.ts', 'c.ts', 'd.ts', 'e.ts'],
     editedCount: 6, testRuns: 1, repeat: { label: 'Bash npm test', count: 3 },
   });
+  assert.equal(settledRow.changedFileCount, 2);
+  assert.deepEqual(settledRow.acceptance, { state: 'rejected', passed: ['lint'], failed: ['tests'] });
 
-  // Zero counters, an unchecked acceptance and a fresh timestamp say nothing: the row stays lean.
-  const quiet = body(await callTool(withService({ list: async () => [summary(2, {
+  const quiet = body(await callTool(withService({ list: async () => [summary(3, {
     status: 'running', finishedAt: null, updatedAt: iso(30_000),
     acceptance: { state: 'unchecked', checks: [] },
     digest: { phase: 'starting', filesRead: 0, searches: 0, edited: [], editedCount: 0, commands: 0, testRuns: 0, lastTestFailed: false, repeat: null },
   })] }), 'list_jobs', {}))[0];
   assert.deepEqual(quiet.digest, { phase: 'starting' });
+  assert.equal(quiet.liveness.state, 'active');
   for (const dropped of ['stalled', 'changedFileCount', 'acceptance']) assert.equal(dropped in quiet, false, dropped);
 });
 
-test('status: a steered head lists its earlier turns oldest first, each with its own report', async () => {
+test('status: resolves any turn/worker to latest head and lists unified earlierTurns across steers and resumes oldest first', async () => {
   const turns: Record<string, Record<string, unknown>> = {
-    'implement-smith-3': detail({ jobId: 'implement-smith-3', steeredFrom: 'implement-smith-2', report: 'Third.' }),
-    'implement-smith-2': detail({ jobId: 'implement-smith-2', steeredFrom: 'implement-smith-1', supersededBy: 'implement-smith-3', report: 'Second.' }),
-    'implement-smith-1': detail({ jobId: 'implement-smith-1', supersededBy: 'implement-smith-2', report: LONG }),
+    'implement-smith-3': detail({ jobId: 'implement-smith-3', workerId: 'w-ada', turn: 3, continuedFrom: 'implement-smith-2', continuationKind: 'follow-up', chainStartedAt: iso(10_000), report: 'Third.' }),
+    'implement-smith-2': detail({ jobId: 'implement-smith-2', workerId: 'w-ada', turn: 2, continuedFrom: 'implement-smith-1', continuationKind: 'steer', followedBy: 'implement-smith-3', report: 'Second.' }),
+    'implement-smith-1': detail({ jobId: 'implement-smith-1', workerId: 'w-ada', turn: 1, supersededBy: 'implement-smith-2', report: LONG }),
   };
-  const ctx = withService({ resolveHead: () => 'implement-smith-3', detail: async (id: string) => turns[id] });
-  const st = body(await callTool(ctx, 'status', { jobId: 'implement-smith-1' }));
-  assert.equal(st.jobId, 'implement-smith-3'); assert.equal(st.report, 'Third.');
-  assert.deepEqual(st.earlierTurns.map((t: any) => t.jobId), ['implement-smith-1', 'implement-smith-2']);
-  assert.ok(st.earlierTurns[0].report.length <= 600 && st.earlierTurns[0].report.endsWith('…'));
-  assert.match(st.earlierTurns[1].reportPath, /implement-smith-2/);
-  const full = body(await callTool(ctx, 'status', { jobId: 'implement-smith-3', response_format: 'detailed' }));
+  const asked: string[] = [];
+  const ctx = withService({
+    resolveWorker: async (id: string) => { asked.push(id); return turns['implement-smith-3']; },
+    earlierTurns: async (head: { jobId: string }) => (head.jobId === 'implement-smith-3' ? [turns['implement-smith-1'], turns['implement-smith-2']] : []),
+    detail: async (id: string) => turns[id],
+  });
+  const st = body(await callTool(ctx, 'status', { id: 'w-ada' }));
+  assert.deepEqual(asked, ['w-ada']);
+  assert.equal(st.jobId, 'implement-smith-3'); assert.equal(st.turn, 3);
+  assert.equal('continuedFrom' in st, false); assert.equal('continuationKind' in st, false);
+  assert.equal(st.report, 'Third.');
+  assert.deepEqual(st.earlierTurns.map((t: any) => [t.jobId, t.turn, t.status]), [
+    ['implement-smith-1', 1, 'succeeded'],
+    ['implement-smith-2', 2, 'succeeded'],
+  ]);
+  assert.ok(st.earlierTurns[0].summary.length <= 120 && st.earlierTurns[0].summary.endsWith('…'));
+  assert.equal('report' in st.earlierTurns[0], false);
+  assert.equal('reportPath' in st.earlierTurns[1], false);
+  const full = body(await callTool(ctx, 'status', { id: 'w-ada', response_format: 'detailed' }));
   assert.equal(full.earlierTurns[0].report, LONG);
-  const plain = body(await callTool(withService({ detail: async () => detail() }), 'status', { jobId: 'implement-smith-1' }));
+  assert.match(full.earlierTurns[1].reportPath, /implement-smith-2/);
+  const plain = body(await callTool(withService({ detail: async () => detail() }), 'status', { id: 'implement-smith-1' }));
   assert.equal('earlierTurns' in plain, false);
 });
 
@@ -302,7 +366,6 @@ test('list_jobs: since parses ISO and relative times; session restricts to jobs 
   const before = Date.now();
   await callTool(ctx, 'list_jobs', { since: '2h', session: true });
   const after = Date.now();
-  // The tool reads the clock once, somewhere between `before` and `after`; no absolute tolerance to outrun.
   assert.ok((seen[0]!.sinceMs as number) >= before - 7_200_000 && (seen[0]!.sinceMs as number) <= after - 7_200_000);
   assert.equal(seen[0]!.ids, spawned);
   await callTool(ctx, 'list_jobs', { since: '2026-10-01T00:00:00Z' });
@@ -315,7 +378,7 @@ test('status: concise merges identity, verdicts, timing and one report; detailed
   const d = detail({ changedFiles: ['a.ts', 'b.ts'], warnings: [{ code: 'x', message: 'careful' }, { code: 'y', message: 'careful' }], latestSummary: 'All done.' });
   const ctx = withService({ detail: async () => d });
   writeAcceptance(ctx.service.repo, 'implement-smith-1', { state: 'rejected', checks: [{ name: 'tests', ok: true }, { name: 'lint', ok: false }] } as never);
-  const r = await callTool(ctx, 'status', { jobId: 'implement-smith-1' });
+  const r = await callTool(ctx, 'status', { id: 'implement-smith-1' });
   const b = body(r);
   assert.deepEqual(b.acceptance, { state: 'rejected', passed: ['tests'], failed: ['lint'] });
   assert.equal(b.report, 'All done.'); assert.equal('latestSummary' in b, false); assert.equal('summary' in b, false, 'summary duplicating the report is dropped');
@@ -325,17 +388,17 @@ test('status: concise merges identity, verdicts, timing and one report; detailed
   for (const dropped of ['usage', 'conversation', 'cwd', 'exitCode', 'sandbox']) assert.equal(dropped in b, false, dropped);
   assert.deepEqual(r.structuredContent, b, 'structuredContent matches the text');
   console.log('concise status:', JSON.stringify(b, null, 2));
-  const full = body(await callTool(ctx, 'status', { jobId: 'implement-smith-1', response_format: 'detailed' }));
+  const full = body(await callTool(ctx, 'status', { id: 'implement-smith-1', response_format: 'detailed' }));
   assert.equal(full.usage.input, 1); assert.equal(full.latestSummary, 'All done.'); assert.equal(full.reportTruncated, false); assert.equal(full.cwd, '/x');
 });
 
 test('status: concise report is bounded with an explicit truncation note; a distinct summary is kept', async () => {
   const ctx = withService({ detail: async () => detail({ report: 'x'.repeat(5_000), latestSummary: 'Different summary.' }) });
-  const b = body(await callTool(ctx, 'status', { jobId: 'j' }));
+  const b = body(await callTool(ctx, 'status', { id: 'j' }));
   assert.equal(b.reportTruncated, true);
   assert.match(b.report, /\[truncated: 2000 of 5000 chars; use response_format: "detailed" for more\]$/);
   assert.ok(b.report.length < 2_150); assert.equal(b.summary, 'Different summary.');
-  assert.equal(body(await callTool(ctx, 'status', { jobId: 'j', response_format: 'detailed' })).report.length, 5_000);
+  assert.equal(body(await callTool(ctx, 'status', { id: 'j', response_format: 'detailed' })).report.length, 5_000);
 });
 
 test('pipeline_status: concise drops observations and repeats; detailed is the raw record', async () => {
@@ -378,37 +441,37 @@ test('status include_diff: returns the diff of changedFiles against the baseline
   const { cwd, head } = gitRepo();
   writeFileSync(path.join(cwd, 'a.txt'), 'one\ntwo\n'); writeFileSync(path.join(cwd, 'new.txt'), 'n\n');
   const ctx = withService({ detail: async () => detail({ cwd, gitBaseline: { head, dirty: [] }, changedFiles: ['a.txt', 'new.txt'] }) });
-  const b = body(await callTool(ctx, 'status', { jobId: 'j', include_diff: true }));
+  const b = body(await callTool(ctx, 'status', { id: 'j', include_diff: true }));
   assert.match(b.diff, /^diff --git a\/a\.txt b\/a\.txt[\s\S]*\+two/);
   assert.match(b.diffNote, /Untracked, not in diff.*new\.txt/);
-  assert.equal('diff' in body(await callTool(ctx, 'status', { jobId: 'j' })), false, 'off by default');
-  assert.equal(body(await callTool(ctx, 'status', { jobId: 'j', include_diff: true, response_format: 'detailed' })).diff, b.diff);
+  assert.equal('diff' in body(await callTool(ctx, 'status', { id: 'j' })), false, 'off by default');
+  assert.equal(body(await callTool(ctx, 'status', { id: 'j', include_diff: true, response_format: 'detailed' })).diff, b.diff);
 });
 
 test('status include_diff: flags changed files that were already dirty at spawn', async () => {
   const { cwd, head } = gitRepo();
   writeFileSync(path.join(cwd, 'a.txt'), 'one\nmine\njob\n');
   const ctx = withService({ detail: async () => detail({ cwd, gitBaseline: { head, dirty: ['a.txt'] }, changedFiles: ['a.txt'] }) });
-  assert.match(body(await callTool(ctx, 'status', { jobId: 'j', include_diff: true })).diffNote, /Dirty before the job.*a\.txt/);
+  assert.match(body(await callTool(ctx, 'status', { id: 'j', include_diff: true })).diffNote, /Dirty before the job.*a\.txt/);
 });
 
 test('status include_diff: bounded at 40000 chars on a line boundary, with a note saying how to see the rest', async () => {
   const { cwd, head } = gitRepo();
   writeFileSync(path.join(cwd, 'a.txt'), Array.from({ length: 6_000 }, (_, i) => `line ${i}`).join('\n') + '\n');
   const ctx = withService({ detail: async () => detail({ cwd, gitBaseline: { head, dirty: [] }, changedFiles: ['a.txt'] }) });
-  const b = body(await callTool(ctx, 'status', { jobId: 'j', include_diff: true }));
+  const b = body(await callTool(ctx, 'status', { id: 'j', include_diff: true }));
   assert.ok(b.diff.length <= 40_000 && b.diff.endsWith('\n'));
   assert.ok(b.diffNote.includes(`Diff cut at 40000 chars. Rest: git diff ${head} -- <file>`), b.diffNote);
 });
 
 test('status include_diff: says so without a baseline, while running, or with no changes, instead of failing', async () => {
-  const none = await callTool(withService({ detail: async () => detail({ changedFiles: ['a'] }) }), 'status', { jobId: 'j', include_diff: true });
+  const none = await callTool(withService({ detail: async () => detail({ changedFiles: ['a'] }) }), 'status', { id: 'j', include_diff: true });
   assert.equal(none.isError, undefined); assert.equal(body(none).diff, null);
   assert.match(body(none).diffNote, /No diff: no git commit at spawn/);
-  const running = body(await callTool(withService({ detail: async () => detail({ status: 'running', gitBaseline: { head: 'abc', dirty: [] }, cwd: '/x' }) }), 'status', { jobId: 'j', include_diff: true }));
+  const running = body(await callTool(withService({ detail: async () => detail({ status: 'running', gitBaseline: { head: 'abc', dirty: [] }, cwd: '/x' }) }), 'status', { id: 'j', include_diff: true }));
   assert.match(running.diffNote, /No diff yet/);
   const { cwd, head } = gitRepo();
-  const empty = body(await callTool(withService({ detail: async () => detail({ cwd, gitBaseline: { head, dirty: [] }, changedFiles: [] }) }), 'status', { jobId: 'j', include_diff: true }));
+  const empty = body(await callTool(withService({ detail: async () => detail({ cwd, gitBaseline: { head, dirty: [] }, changedFiles: [] }) }), 'status', { id: 'j', include_diff: true }));
   assert.equal(empty.diff, ''); assert.match(empty.diffNote, /No files changed/);
 });
 
@@ -423,27 +486,24 @@ test('tool failures are isError results that say what to do next', async () => {
   };
   await fail('spawn_job', { mode: 'review', prompt: 'x', cwd: 'rel' }, /absolute path/);
   await fail('spawn_job', { mode: 'review', prompt: 'x', cwd: path.join(cwd, 'nope') }, /is not a directory/);
-  await fail('resume_job', { worker: 'ghost', prompt: 'x' }, /No worker "ghost"; see list_jobs/);
-  await fail('resume_job', { worker: 'Ada', prompt: 'x' }, /matches 2 workers; pass a job ID from list_jobs/);
-  current = detail({ name: 'Ada', status: 'running' });
-  await fail('resume_job', { worker: 'job-1', prompt: 'x' }, /^"Ada" is still running; use steer_job with delivery: "queue" or "interrupt", or wait\.$/);
-  await fail('steer_job', { prompt: 'x', delivery: 'queue' }, /worker is required/);
-  await fail('steer_job', { worker: 'Ada', delivery: 'queue' }, /prompt is required/);
-  await fail('steer_job', { worker: 'Ada', prompt: 'x' }, /delivery is required: choose "queue"/);
-  await fail('steer_job', { worker: 'Ada', prompt: 'x', delivery: 'soon' }, /delivery must be one of queue, interrupt/);
-  current = detail({ name: 'Ada', conversation: null });
-  await fail('resume_job', { worker: 'job-1', prompt: 'x' }, /no conversation to resume.*spawn_job/);
-  await fail('status', {}, /jobId is required: get one from spawn_job or list_jobs/);
-  await fail('cancel', {}, /jobId is required/);
+  await fail('follow_up', { worker: 'ghost', prompt: 'x', model: 'm' }, /No worker "ghost"; see list_jobs/);
+  await fail('follow_up', { worker: 'Ada', prompt: 'x', model: 'm' }, /matches 2 workers; pass a jobId/);
+  for (const tool of ['follow_up', 'steer']) {
+    await fail(tool, { prompt: 'x' }, /worker is required/);
+    await fail(tool, { worker: 'Ada' }, /prompt is required/);
+  }
+  await fail('steer', { worker: 'Ada', prompt: 'x', delivery: 'queue' }, /Unknown field delivery/);
+  await fail('follow_up', { worker: 'Ada', prompt: 'x', checks: 'npm test' }, /checks must be an array/);
+  await fail('status', {}, /id is required: a worker name or job ID/);
+  await fail('cancel', {}, /id is required/);
   await fail('pipeline_status', { runId: 'nope' }, /No pipeline run "nope"/);
   await fail('pipeline_status', {}, /runId is required/);
-  await fail('status', { jobId: 'j', bogus: 1 }, /Unknown field bogus; valid fields: jobId, wait_ms, include_diff, response_format/);
+  await fail('status', { id: 'j', bogus: 1 }, /Unknown field bogus; valid fields: id, wait_ms, include_diff, response_format/);
   await fail('nope', {}, /Unknown tool nope; available: list_capabilities/);
 });
 
 test('a failed job preparation never leaves checks pending', async () => {
   const repo = mkdtempSync(path.join(tmpdir(), 'smith-prepare-fail-'));
-  // Like ForgeService: onPrepared throws, the job is aborted and the error rethrown.
   const service = { repo, spawnTracked: async (request: { onPrepared: (id: string) => void }) => {
     request.onPrepared('job-prep');
     throw new Error('unreachable');
@@ -511,99 +571,90 @@ test('detailed list_capabilities keeps every discovered model, label, mode and t
 
 test('status: a failed job carries a short reason (derived from old errors, stored ones pass through) and warnings do not repeat the error', async () => {
   const longError = 'agy soft-denied 2 tool action(s) (run_command, RunCommand). agy exited with an empty response.';
-  const old = body(await callTool(withService({ detail: async () => detail({ status: 'failed', error: longError, warnings: [{ code: 'x', message: longError }, { code: 'y', message: 'other note' }] }) }), 'status', { jobId: 'j' }));
+  const old = body(await callTool(withService({ detail: async () => detail({ status: 'failed', error: longError, warnings: [{ code: 'x', message: longError }, { code: 'y', message: 'other note' }] }) }), 'status', { id: 'j' }));
   assert.match(old.reason, /^denied/);
   assert.ok(old.reason.length < 40);
   assert.equal(old.error, longError);
   assert.deepEqual(old.warnings, ['other note']);
-  const fresh = body(await callTool(withService({ detail: async () => detail({ status: 'failed', error: longError, reason: 'exit 1' }) }), 'status', { jobId: 'j' }));
+  const fresh = body(await callTool(withService({ detail: async () => detail({ status: 'failed', error: longError, reason: 'exit 1' }) }), 'status', { id: 'j' }));
   assert.equal(fresh.reason, 'exit 1');
-  const ok = body(await callTool(withService({ detail: async () => detail() }), 'status', { jobId: 'j' }));
+  const ok = body(await callTool(withService({ detail: async () => detail() }), 'status', { id: 'j' }));
   assert.equal(ok.reason, undefined);
 });
 
-test('steer_job forwards worker, prompt, context, files and delivery, and status surfaces supersession and staleReads fields', async () => {
+const messageAck = (extra: Record<string, unknown> = {}) => ({
+  jobId: 'implement-smith-1', name: 'Ada', workerId: 'w-ada', turn: 1, action: 'queued', delivery: 'turn-end', status: 'running',
+  provider: 'codex', repo: '/tmp/r', timeoutMs: 60_000, pendingMessages: 1, note: 'Queued; runs when this turn ends.', ...extra,
+});
+
+test('follow_up forwards the message and its next-turn settings to the service and returns its ack compact', async () => {
   const seen: Array<Record<string, unknown>> = [];
-  const spawned: Array<Record<string, unknown>> = [];
   const ctx = withService({
-    spawnJob: async (req: Record<string, unknown>) => {
-      spawned.push(req);
-      return {
-        jobId: 'implement-smith-resumed',
-        name: 'Ada',
-        workerId: 'Ada',
-        role: 'implement',
-        provider: 'codex',
-        status: 'running',
-        dir: '/tmp/job',
-        repo: '/tmp',
-        timeoutMs: 60_000,
-        unrestricted: false,
-        note: 'spawned',
-        sandbox: 'workspace-write',
-        sandboxFlags: [],
-        readOnlyRequested: false,
-        readOnlyEnforced: false,
-        modelRequested: null,
-        modelResolved: null,
-        modelSource: 'unknown',
-        preambleApplied: true,
-      };
-    },
-    steer: async (req: Record<string, unknown>) => {
-      seen.push(req);
-      return {
-        jobId: 'implement-smith-1',
-        name: 'Ada',
-        workerId: 'Ada',
-        delivery: req.delivery,
-        status: req.delivery === 'interrupt' ? 'interrupting' : 'queued',
-        pendingSteers: 1,
-        signalled: true,
-        resumable: true,
-        note: 'queued',
-      };
-    },
-    detail: async () => detail({
-      conversation: 'conv-1',
-      watchedFiles: { 'ARCHITECTURE.md': { repoSig: '1:a', cwdSig: '1:a' } },
-      staleReads: ['ARCHITECTURE.md'],
-      supersededBy: 'implement-smith-2',
-      steeredFrom: 'implement-smith-0',
-      pendingSteers: 2,
-    }),
+    followUp: async (req: Record<string, unknown>) => { seen.push(req); return messageAck(); },
+    detail: async () => detail({ name: 'Ada', provider: 'codex', status: 'running' }),
   });
-  const res = await callTool(ctx, 'steer_job', {
-    worker: 'Ada',
-    prompt: 'Pivot to profile menu.',
-    context: 'Sidebar dropped.',
-    files: ['brief.md'],
-    delivery: 'interrupt',
+  const res = await callTool(ctx, 'follow_up', {
+    worker: 'Ada', prompt: 'Add the edge-case test.', context: 'Review found it.', files: ['brief.md'],
+    checks: [{ name: 'unit', command: 'npm test' }], timeoutMs: 120_000, env: { CARGO_TARGET_DIR: '/tmp/t' },
   });
-  assert.equal(res.isError, undefined);
+  assert.equal(res.isError, undefined, text(res));
   assert.deepEqual(seen[0], {
-    worker: 'Ada',
-    prompt: 'Pivot to profile menu.',
-    context: 'Sidebar dropped.',
-    files: ['brief.md'],
-    delivery: 'interrupt',
+    worker: 'Ada', prompt: 'Add the edge-case test.', context: 'Review found it.', files: ['brief.md'],
+    checks: [{ name: 'unit', command: 'npm test', cwd: undefined, timeoutMs: undefined, blocking: undefined }],
+    model: undefined, effort: undefined, timeoutMs: 120_000, env: { CARGO_TARGET_DIR: '/tmp/t' }, unrestricted: undefined,
   });
-  assert.equal(body(res).status, 'interrupting');
-  assert.match(body(res).note, /^queued The continuation gets a new job ID; status and cancel on .+ follow it\.$/);
-  assert.equal(body(res).resumable, true);
+  assert.deepEqual(body(res), messageAck());
+  assert.equal(text(res).includes('\n'), false, 'the ack is compact');
+  assert.deepEqual(res.structuredContent, body(res));
+});
 
-  // resume_job merges inherited watchedFiles with new files
-  const resumed = await callTool(ctx, 'resume_job', {
-    worker: 'implement-smith-1',
-    prompt: 'Continue.',
-    files: ['extra.md'],
+test('follow_up expands a model alias for the worker\'s provider before it reaches the service', async () => {
+  const { mkdirSync } = await import('node:fs');
+  const seen: Array<Record<string, unknown>> = [];
+  const ctx = withService({
+    followUp: async (req: Record<string, unknown>) => { seen.push(req); return messageAck({ action: 'started', delivery: 'now', jobId: 'implement-smith-2', turn: 2 }); },
+    detail: async () => detail({ name: 'Ada', provider: 'codex' }),
   });
-  assert.equal(resumed.isError, undefined);
-  assert.deepEqual(spawned[0]?.files, ['ARCHITECTURE.md', 'extra.md']);
+  mkdirSync(path.join(ctx.service.repo, '.agent-smith'));
+  writeFileSync(path.join(ctx.service.repo, '.agent-smith', 'models.json'), JSON.stringify({ aliases: { 'sol-high': { provider: 'codex', model: 'gpt-6.1-sol', effort: 'high' } } }));
+  const res = await callTool(ctx, 'follow_up', { worker: 'Ada', prompt: 'Next.', model: 'sol-high' });
+  assert.equal(res.isError, undefined, text(res));
+  assert.deepEqual([seen[0]!.model, seen[0]!.effort], ['gpt-6.1-sol', 'high']);
+  assert.deepEqual([body(res).action, body(res).delivery, body(res).jobId], ['started', 'now', 'implement-smith-2']);
+});
 
-  const st = body(await callTool(ctx, 'status', { jobId: 'implement-smith-1' }));
-  assert.equal(st.supersededBy, 'implement-smith-2');
-  assert.equal(st.steeredFrom, 'implement-smith-0');
-  assert.equal(st.pendingSteers, 2);
-  assert.deepEqual(st.staleReads, ['ARCHITECTURE.md']);
+test('steer forwards worker, prompt, context, files and allowFresh, and passes service errors through', async () => {
+  const seen: Array<Record<string, unknown>> = [];
+  let fail: Error | null = null;
+  const ctx = withService({
+    steer: async (req: Record<string, unknown>) => { seen.push(req); if (fail) throw fail; return messageAck({ action: 'interrupting', delivery: 'now', note: 'Interrupting; the steered turn starts next.' }); },
+  });
+  const res = await callTool(ctx, 'steer', { worker: 'Ada', prompt: 'Pivot to the profile menu.', context: 'Sidebar dropped.', files: ['brief.md'], allowFresh: true });
+  assert.equal(res.isError, undefined, text(res));
+  assert.deepEqual(seen[0], { worker: 'Ada', prompt: 'Pivot to the profile menu.', context: 'Sidebar dropped.', files: ['brief.md'], allowFresh: true });
+  assert.equal(body(res).action, 'interrupting');
+  await callTool(ctx, 'steer', { worker: 'Ada', prompt: 'x' });
+  assert.equal('allowFresh' in seen[1]!, false, 'allowFresh is sent only when passed');
+  fail = new Error('"Ada" (implement-smith-1) has no saved conversation; spawn_job with from:"Ada" starts it fresh with the original brief.');
+  const err = await callTool(ctx, 'steer', { worker: 'Ada', prompt: 'x' });
+  assert.equal(err.isError, true);
+  assert.equal(text(err), fail.message);
+});
+
+test('status wait_ms on a worker waits until it is idle; on a job ID only until that turn settles', async () => {
+  let head = detail({ jobId: 'implement-smith-1', workerId: 'w-ada', status: 'succeeded', pendingSteers: 1 });
+  const turn1 = head;
+  const ctx = { ...withService({
+    resolveWorker: async (id: string) => (id === 'implement-smith-1' ? turn1 : head),
+    resolveTurn: (id: string) => id,
+  }), pollMs: 5 } as HandlerContext;
+  setTimeout(() => { head = detail({ jobId: 'implement-smith-2', workerId: 'w-ada', turn: 2, status: 'succeeded' }); }, 60);
+  const byJob = body(await callTool(ctx, 'status', { id: 'implement-smith-1', wait_ms: 2_000 }));
+  assert.deepEqual([byJob.jobId, byJob.stillRunning], ['implement-smith-1', false], 'a jobId settles with its own turn');
+  const started = Date.now();
+  head = turn1;
+  setTimeout(() => { head = detail({ jobId: 'implement-smith-2', workerId: 'w-ada', turn: 2, status: 'succeeded' }); }, 60);
+  const byWorker = body(await callTool(ctx, 'status', { id: 'w-ada', wait_ms: 2_000 }));
+  assert.ok(Date.now() - started >= 50, 'did not return while a follow-up was queued');
+  assert.deepEqual([byWorker.jobId, byWorker.turn, byWorker.stillRunning], ['implement-smith-2', 2, false]);
 });

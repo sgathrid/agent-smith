@@ -1,30 +1,24 @@
-/** Reader-sized views of job and pipeline state: concise by default, detailed is the full record. */
 import { execFile } from 'node:child_process';
 import type { JobDetail, JobSummary } from '../../../forge/service.ts';
+import type { ContinuationKind } from '../../../forge/format.ts';
 import type { Acceptance } from '../../../forge/checks.ts';
 import type { PipelineRecord } from '../../../forge/execute.ts';
-import { isStalled, livenessOf, type Liveness } from '../../mod/hooks/stale.ts';
+import { livenessOf, type Liveness } from '../../mod/hooks/stale.ts';
+import { isTerminalStatus } from '../../mod/hooks/turns.ts';
 import { reasonFromText } from '../../mod/hooks/reasons.ts';
 
 export type ResponseFormat = 'concise' | 'detailed';
 export const CONCISE_LIST_LIMIT = 20;
-const CONCISE_SUMMARY_CHARS = 200;
+const CONCISE_SUMMARY_CHARS = 160;
 const CONCISE_REPORT_CHARS = 2_000;
 const CONCISE_FILES_CAP = 20;
 export const EARLIER_TURNS_CAP = 5;
-const EARLIER_REPORT_CHARS = 600;
+const EARLIER_SUMMARY_CHARS = 120;
 const OUTPUT_TAIL_CHARS = 500;
 const DIFF_MAX_CHARS = 40_000;
 const DETAIL_HINT = 'use response_format: "detailed"';
 const flat = (s: string): string => s.replace(/\s+/g, ' ').trim();
 
-/**
- * Job lifecycle in the vocabulary of the MCP Tasks extension (protocol 2026-07-28):
- * working | input_required | completed | failed | cancelled. Reported beside `status`
- * so a later Tasks adapter is a translation, not a redesign. `input_required` is
- * reserved: no job pauses for input today. `unknown` (state not yet determinable,
- * never terminal) maps to `working`.
- */
 export type TaskStatus = 'working' | 'input_required' | 'completed' | 'failed' | 'cancelled';
 export function taskStatus(status: JobSummary['status']): TaskStatus {
   switch (status) {
@@ -35,7 +29,6 @@ export function taskStatus(status: JobSummary['status']): TaskStatus {
   }
 }
 
-/** Cut at a word boundary within max chars, marking the cut with an ellipsis. */
 function trimWords(text: string, max: number): string {
   const t = flat(text);
   if (t.length <= max) return t;
@@ -44,7 +37,6 @@ function trimWords(text: string, max: number): string {
   return `${(space > max / 2 ? cut.slice(0, space) : cut).trimEnd()}…`;
 }
 
-/** ISO time, or relative like 30m / 2h / 1d / 90s, to epoch ms. */
 export function parseSince(value: string, now = Date.now()): number {
   const rel = /^(\d+)\s*([smhd])$/i.exec(value.trim());
   if (rel) return now - Number(rel[1]) * { s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000 }[rel[2]!.toLowerCase() as 's' | 'm' | 'h' | 'd'];
@@ -56,35 +48,26 @@ export function parseSince(value: string, now = Date.now()): number {
 function lastActivity(a: JobSummary['lastActivity']): string | undefined {
   return a ? `step ${a.stepIndex}: ${a.tool}${a.input ? ` ${trimWords(a.input, 80)}` : ''} (${a.status})` : undefined;
 }
-/** Drop null/undefined so concise output carries only fields that say something. */
 function compact<T extends Record<string, unknown>>(o: T): Partial<T> {
   return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== null && v !== undefined)) as Partial<T>;
 }
-/** Warning texts, minus any that only repeat the error. */
 const warningTexts = (ws: JobSummary['warnings'], error: string | null): string[] => {
   const e = error ? flat(error) : '';
   return [...new Set(ws.map(w => flat(w.message)).filter(m => e === '' || !(e.includes(m) || m.includes(e))).map(m => trimWords(m, 200)))];
 };
-/** The short failure reason: the stored one, else derived from the long error. Failed jobs only. */
 function failedReason(d: JobDetail): string | null {
   if (d.status !== 'failed') return null;
   const stored = d.reason;
   return stored ? stored : reasonFromText(d.error);
 }
 
-/**
- * The job's liveness (mod/hooks/stale.ts livenessOf, shared with the band), or
- * null when it is not running. One call site per view so every surface agrees.
- */
 export function jobLiveness(j: JobSummary, now = Date.now()): Liveness | null {
   return livenessOf({ status: j.status, updatedAt: j.updatedAt, lastEventAt: j.lastEventAt, lastAliveAt: j.lastAliveAt,
     lastActivity: j.lastActivity, now });
 }
-/** `liveness` as Claude reads it: the state, how long since the last event, and the open tool call. */
 export function livenessView(l: Liveness | null) {
   return l === null ? null : { state: l.state, silentForMs: l.silentForMs, ...(l.tool ? { tool: l.tool } : {}) };
 }
-/** Evidence the writer recorded at finish; each only when set. */
 function evidence(j: JobSummary) {
   return {
     toolErrors: j.toolErrors ? j.toolErrors : null,
@@ -94,27 +77,45 @@ function evidence(j: JobSummary) {
   };
 }
 
-/** One compact row for list_jobs. `now` is injectable so liveness is testable. */
-export function conciseRow(j: JobSummary, now = Date.now()) {
+export function conciseRow(j: JobSummary & { turn?: number; continuedFrom?: string; continuationKind?: ContinuationKind; chainStartedAt?: string }, now = Date.now()) {
+  const turn = j.turn ?? 1;
+  const started = j.startedAt ? Date.parse(j.startedAt) : NaN;
+  const base = {
+    name: j.name,
+    jobId: j.jobId,
+    turn: turn > 1 ? turn : null,
+    status: j.status,
+    provider: j.provider,
+    model: j.model,
+    mode: j.mode,
+  };
+  if (isTerminalStatus(j.status)) {
+    const ended = j.finishedAt ? Date.parse(j.finishedAt) : NaN;
+    return compact({
+      ...base,
+      summary: j.latestSummary ? trimWords(j.latestSummary, CONCISE_SUMMARY_CHARS) : null,
+      durationMs: !Number.isNaN(started) && !Number.isNaN(ended) ? Math.max(0, ended - started) : null,
+      finishedAt: j.finishedAt,
+      acceptance: j.acceptance && (j.acceptance.state !== 'unchecked' || j.acceptance.pending || j.acceptance.checks.length > 0)
+        ? checkVerdicts(j.acceptance) : null,
+      changedFileCount: typeof j.changedFileCount === 'number' && j.changedFileCount > 0 ? j.changedFileCount : null,
+      warningCount: j.warnings.length || null,
+      ...evidence(j),
+    });
+  }
   const live = jobLiveness(j, now);
   return compact({
-    jobId: j.jobId, name: j.name, status: j.status, taskStatus: taskStatus(j.status), provider: j.provider, model: j.model, mode: j.mode,
-    summary: j.latestSummary ? trimWords(j.latestSummary, CONCISE_SUMMARY_CHARS) : null,
-    toolCalls: j.toolCalls, lastActivity: lastActivity(j.lastActivity), startedAt: j.startedAt, finishedAt: j.finishedAt,
-    supersededBy: j.supersededBy ?? null, steeredFrom: j.steeredFrom ?? null,
-    pendingSteers: j.pendingSteers ? j.pendingSteers : null,
-    nextAction: j.nextAction, warningCount: j.warnings.length || null,
+    ...base,
     liveness: livenessView(live),
-    stalled: isStalled(live) ? true : null,
-    changedFileCount: typeof j.changedFileCount === 'number' ? j.changedFileCount : null,
-    ...evidence(j),
-    acceptance: j.acceptance && (j.acceptance.state !== 'unchecked' || j.acceptance.pending || j.acceptance.checks.length > 0)
-      ? checkVerdicts(j.acceptance) : null,
+    lastActivity: lastActivity(j.lastActivity),
     digest: j.digest ? compact({
       phase: j.digest.phase, filesRead: j.digest.filesRead || null,
       editedCount: j.digest.editedCount || null, edited: j.digest.edited.length ? j.digest.edited.slice(0, 5) : null,
       testRuns: j.digest.testRuns || null, lastTestFailed: j.digest.lastTestFailed ? true : null, repeat: j.digest.repeat,
     }) : null,
+    elapsedMs: Number.isNaN(started) ? null : Math.max(0, now - started),
+    toolCalls: j.toolCalls,
+    pendingMessages: j.pendingSteers ? j.pendingSteers : null,
   });
 }
 
@@ -128,52 +129,66 @@ function checkVerdicts(a: AcceptanceView | null | undefined) {
   });
 }
 
-/** Concise single-job view: identity, verdicts, timing, one report. */
-export function conciseStatus(d: JobDetail, acceptance: AcceptanceView | null, extra: { waited?: boolean; stillRunning?: boolean } = {}, now = Date.now()) {
-  const live = jobLiveness(d, now);
+export function conciseStatus(d: JobDetail & { turn?: number; continuedFrom?: string; continuationKind?: ContinuationKind; chainStartedAt?: string; resolvedFrom?: string | null }, acceptance: AcceptanceView | null, extra: { waited?: boolean; stillRunning?: boolean } = {}, now = Date.now()) {
   const report = d.report ?? '';
   const cut = report.length > CONCISE_REPORT_CHARS;
-  const summary = d.latestSummary?.trim();
+  const turn = d.turn ?? 1;
+  const running = !isTerminalStatus(d.status);
+  const live = running ? jobLiveness(d, now) : null;
   const started = d.startedAt ? Date.parse(d.startedAt) : NaN;
   const ended = d.finishedAt ? Date.parse(d.finishedAt) : now;
   const files = d.changedFiles ?? [];
   const warnings = d.warnings.length ? warningTexts(d.warnings, d.error) : [];
+  const summary = d.latestSummary?.trim();
   return compact({
-    jobId: d.jobId, name: d.name, provider: d.provider, model: d.model, mode: d.mode, status: d.status, taskStatus: taskStatus(d.status),
-    resumable: Boolean(d.conversation),
-    liveness: livenessView(live),
-    stalled: isStalled(live),
+    jobId: d.jobId,
+    workerId: d.workerId,
+    name: d.name,
+    turn: turn > 1 ? turn : null,
+    status: d.status,
+    provider: d.provider, model: d.model, mode: d.mode,
     acceptance: checkVerdicts(acceptance),
-    startedAt: d.startedAt, finishedAt: d.finishedAt, durationMs: Number.isNaN(started) ? null : Math.max(0, ended - started),
-    toolCalls: d.toolCalls, lastActivity: lastActivity(d.lastActivity),
-    supersededBy: d.supersededBy ?? null, steeredFrom: d.steeredFrom ?? null,
-    pendingSteers: d.pendingSteers ? d.pendingSteers : null,
-    changedFileCount: d.changedFiles ? files.length : null, changedFiles: files.length ? files.slice(0, CONCISE_FILES_CAP) : null,
-    ...evidence(d),
+    supersededBy: d.supersededBy || null,
+    resolvedFrom: d.resolvedFrom || null,
+    liveness: live ? livenessView(live) : null,
+    lastActivity: running ? lastActivity(d.lastActivity) : null,
+    durationMs: Number.isNaN(started) ? null : Math.max(0, ended - started),
+    pendingMessages: d.pendingSteers ? d.pendingSteers : null,
+    changedFileCount: d.changedFiles && files.length > 0 ? files.length : null,
+    changedFiles: files.length ? files.slice(0, CONCISE_FILES_CAP) : null,
     changedFilesNote: files.length > CONCISE_FILES_CAP || d.changedFilesTruncated ? `First ${Math.min(files.length, CONCISE_FILES_CAP)} shown; ${DETAIL_HINT} or include_diff for all.` : null,
+    ...evidence(d),
     staleReads: d.staleReads?.length ? d.staleReads : null,
-    nextAction: d.nextAction, reason: failedReason(d), error: d.error ? trimWords(d.error, 500) : null,
+    nextAction: d.nextAction,
+    reason: failedReason(d),
+    error: d.error ? trimWords(d.error, 500) : null,
     warnings: warnings.length ? warnings : null,
     summary: summary && !report.includes(summary) ? trimWords(summary, 300) : null,
     report: report ? (cut ? `${report.slice(0, CONCISE_REPORT_CHARS)}\n…[truncated: ${CONCISE_REPORT_CHARS} of ${report.length} chars; ${DETAIL_HINT} for more]` : report) : null,
-    reportTruncated: cut, ...extra,
+    reportTruncated: cut || null,
+    ...extra,
   });
 }
 
-/**
- * One earlier turn of a steered worker. The head's report covers only its own
- * turn, so status lists the turns before it rather than leaving them to a walk
- * Claude cannot make: status on an earlier ID resolves back to the head.
- */
-export function earlierTurn(d: JobDetail, reportPath: string, fmt: ResponseFormat) {
+export function earlierTurn(d: JobDetail & { turn?: number; continuedFrom?: string; continuationKind?: ContinuationKind }, reportPath: string, fmt: ResponseFormat) {
   const report = d.report ?? '';
+  const firstLine = report.split(/\r?\n/).find(l => l.trim().length > 0) ?? '';
+  const rawSummary = d.latestSummary?.trim() || firstLine.trim();
+  const summary = rawSummary ? trimWords(rawSummary, EARLIER_SUMMARY_CHARS) : null;
+  const base = {
+    turn: d.turn ?? 1,
+    jobId: d.jobId,
+    status: d.status,
+    summary,
+  };
+  if (fmt === 'concise') return compact(base);
   return compact({
-    jobId: d.jobId, status: d.status, finishedAt: d.finishedAt,
-    report: report ? (fmt === 'concise' ? trimWords(report, EARLIER_REPORT_CHARS) : report) : null, reportPath,
+    ...base,
+    report: report || null,
+    reportPath,
   });
 }
 
-/** Concise pipeline view: per-stage verdicts and output tail, no observations list. */
 export function concisePipeline(r: PipelineRecord) {
   return compact({
     runId: r.runId, pipeline: r.pipeline, status: r.status, startedAt: r.startedAt, finishedAt: r.finishedAt,
@@ -191,14 +206,12 @@ function git(cwd: string, args: string[]): Promise<{ out: string; clipped: boole
   return new Promise((resolve, reject) => {
     execFile('git', args, { cwd, timeout: 10_000, maxBuffer: 4 * 1024 * 1024, env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' } }, (err, stdout) => {
       if (!err) return resolve({ out: stdout, clipped: false });
-      // maxBuffer overflow still hands back what was read; anything else is a real failure.
       if ((err as { code?: string }).code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') return resolve({ out: String((err as { stdout?: string }).stdout ?? ''), clipped: true });
       reject(err);
     });
   });
 }
 
-/** Unified diff of the job's changedFiles against its spawn-time HEAD. Evidence, not attribution. Never throws. */
 export async function jobDiff(d: JobDetail): Promise<{ diff: string | null; diffNote?: string }> {
   const head = d.gitBaseline?.head;
   if (!d.gitBaseline || !head || !d.cwd) return { diff: null, diffNote: 'No diff: no git commit at spawn.' };
@@ -217,7 +230,6 @@ export async function jobDiff(d: JobDetail): Promise<{ diff: string | null; diff
     }
     const added = untracked.out.split('\n').filter(Boolean);
     if (added.length) notes.push(`Untracked, not in diff: ${added.join(', ')}.`);
-    // The diff is against HEAD, so a file already dirty at spawn carries edits the job did not make.
     const preDirty = d.changedFiles.filter(f => d.gitBaseline!.dirty.includes(f));
     if (preDirty.length) notes.push(`Dirty before the job, so the diff includes earlier edits: ${preDirty.join(', ')}.`);
     return { diff, ...(notes.length ? { diffNote: notes.join(' ') } : {}) };
@@ -226,11 +238,7 @@ export async function jobDiff(d: JobDetail): Promise<{ diff: string | null; diff
   }
 }
 
-// ── capabilities ─────────────────────────────────────────────────────────────
-
-/** Concise list_capabilities lists a provider's models inline up to this many; beyond it, a count and a hint. */
 export const CONCISE_MODELS_CAP = 15;
-/** Models that cannot run a coding job: embeddings, speech, image, video, music, live audio, computer use, research. */
 const NON_CODING_MODEL = /embedding|(?:^|[-/])tts(?:$|-)|-tts\b|image|(?:^|\/)veo-|(?:^|\/)lyria-|-live-|computer-use|deep-research|translate/i;
 export interface CapabilityModel { readonly id: string; readonly label?: string; readonly efforts?: readonly string[]; readonly defaultEffort?: string | null }
 export interface CapabilityProvider {
@@ -240,12 +248,6 @@ export interface CapabilityProvider {
   readonly stale?: boolean; readonly verified?: boolean; readonly error?: string;
 }
 
-/**
- * The orchestrator needs enough to pick a provider, model and effort, and no
- * more. Drop fields that repeat a default or say nothing, models that cannot
- * code, while retaining every exact route ID. A provider with more models than the
- * cap reports a count; naming it in `provider` lists them all.
- */
 export function conciseCapabilities(providers: readonly CapabilityProvider[], only: string | undefined) {
   return providers.map((p) => {
     if (!p.available) return { name: p.name, available: false };
@@ -270,7 +272,6 @@ export function conciseCapabilities(providers: readonly CapabilityProvider[], on
   });
 }
 
-/** The effort list most models share, stated once on the provider; models list theirs only when it differs. */
 function commonEfforts(lists: ReadonlyArray<readonly string[]>): readonly string[] | undefined {
   const counts = new Map<string, { list: readonly string[]; n: number }>();
   for (const list of lists) {

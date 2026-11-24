@@ -24,22 +24,22 @@ every job in the repository.
 One line per job, in this order — TERMINAL-UI.md's own hierarchy (identity →
 liveness → outcome), with the **elapsed time last**:
 
-| state | glyph | colour | line |
+| state | glyph | colour | detail |
 |---|---|---|---|
-| running | `●` | yellow, bold | `● <id> <activity> · N tools · 12m04s` |
-| running, one call open for over a minute | `●` | yellow, bold | ``● <id> in `cargo test` 16m · N tools · 38m10s`` |
-| quiet: no output (`silent`) | `!` | cyan, bold | `! <id> no output 16m · N tools · 1h02m03s` |
-| quiet: process gone (`dead`) | `!` | cyan, bold | `! <id> process gone 3m · N tools · 1h02m03s` |
-| succeeded | `✓` | green | `✓ <id> finished · N tools · 48s` |
-| succeeded with warnings | `✓` | green | `✓ <id> finished, warnings · 48s` |
-| failed | `✗` | red | `✗ <id> failed · suspicious success · 48s` |
-| cancelled | `·` | dim only | `· <id> canceled · 48s` |
-| unknown | `?` | dim only | `? <id> no state yet · 48s` |
+| running | `⏺` | blue, bold | `<activity> ∙ 12m04s` (shows `N queued` while `pendingMessages > 0`, `turn N` when `turn > 1`) |
+| running, one call open for over a minute | `⏺` | blue, bold | ``in `cargo test` 16m ∙ 38m10s`` |
+| quiet: no output (`silent`) | `!` | cyan, bold | `no output 16m ∙ 1h02m03s` |
+| quiet: process gone (`dead`) | `!` | cyan, bold | `process gone 3m ∙ 1h02m03s` |
+| succeeded | `✓` | green | `done ∙ 48s` |
+| succeeded with warnings | `✓` | green | `done ∙ warnings ∙ 48s` |
+| failed | `✗` | red | `failed ∙ <reason> ∙ 48s` |
+| cancelled | `∙` | dim only | `canceled ∙ 48s` |
+| unknown | `?` | dim only | `unknown ∙ 48s` |
 
 Rules, all from `agent-configs/shared/TERMINAL-UI.md`, cited in the code by line
 number:
 
-- **Glyphs are `● ✓ ✗ ! · ?` only.** Never emoji. `⏳` and `✅` are
+- **Glyphs are `⏺ ✓ ✗ ! ∙ ?` only.** Never emoji. `⏳` and `✅` are
   East-Asian-Wide and silently break every column after them — the bug
   TERMINAL-UI.md L99-101 attributes to the shipped `review-watch` mod.
 - **Colour is never the only channel.** Every state has its own glyph, so
@@ -117,18 +117,25 @@ else's repo, and the band would confidently draw their jobs. It is empty now, an
 
 ## Canonical tracking
 
-`hooks/canonical.ts` supplies the same job projection to the band, pane and
+`hooks/canonical.ts` supplies the same worker/turn projection to the band, pane and
 native task bridge. Lists read `job.json`, optional `progress.json` and
-`acceptance.json`, plus an orphan marker; they never scan event logs or reports.
+`acceptance.json`, plus an orphan marker, caching immutable settled jobs in memory
+(O(active) reads on each 1 s active poll; when nothing is live and `/forge` is
+closed, an idle tick does one `readdir` of `.agent-smith/jobs` with no parsing,
+and a new entry wakes active polling). They never scan event logs or reports.
 An unreadable snapshot shows an error while retaining the last observed rows.
 
-Detail reads the selected job's report and bounded `view.json`: up to 60 tool
+Detail reads the selected turn's report and bounded `view.json`: up to 60 tool
 previews, 200 assistant messages / 64,000 characters, 64,000 prompt characters
-and 4,000 preamble characters. Truncation is explicit. Older jobs without a view
-show a warning, summary and report; the UI does not backfill by scanning logs.
+and 4,000 preamble characters. Truncation is explicit.
 
 The band is only the glance: live workers plus finished ones for the linger
-window, at most four rows. Each row is a plain Button with hotkey `1`–`4`. The
+window, grouped and keyed by `workerId` before sorting (always one row per worker across
+follow-ups and steers, showing `turn N` when `turn > 1`, `N queued` while `pendingMessages > 0`
+(and nothing about messages otherwise), and continuous `chainStartedAt` elapsed time across steers, reset on follow-up), at most four rows.
+Completion notices fire once per worker idle transition (`isWorkerIdle` in `hooks/turns.ts`),
+covering all turns completed since the last notice.
+Each row is a plain Button with hotkey `1`–`4`. The
 host answers a bare digit in an empty prompt by pressing a band Button without
 focusing the band, so one key opens the sidebar on that worker. `/forge` opens
 the sidebar on this session's list, `/forge all` on the repository's, and
@@ -167,13 +174,13 @@ Escape cannot also mean "back": the host never delivers it to a mod, it returns
 the focus. The engine test harness presses rendered component keys; it does not
 inject physical hotkeys, so verify the digits in a real session.
 
-New writer snapshots add an ordered `timeline` alongside the older fields, with
+Writer snapshots record an ordered `timeline` (`ForgeDetail` is `{ job, timeline, truncated? }`), with
 up to 100 activity rows, 60 tools and 64,000 assistant characters. Tool completion
-updates its original row. Missing timelines show an explicit old-snapshot fallback.
-Recorded worker IDs group invocations into one list row; the worker view links to
-earlier runs. Detail reads are cached for the three-second data cadence.
+updates its original row, and `follow_up`/`steer` messages appear inline in the timeline at the
+point the worker read them (`kind: 'message'`, `delivery: 'next-step' | 'turn-start'`). Recorded `workerId` values group turns into one list row; the worker view tracks `workerId` (auto-following the live head on follow-up or steer unless a prior turn is explicitly clicked) and renders prior turns inline above the live turn as compact clickable summary rows from in-memory `bandJobs` with `follow-up` / `steered` labels. Detail reads are cached for the one-second active cadence.
 
-Native tasks use real host TaskCreate/TaskUpdate IDs. They are a task projection,
+Native tasks use real host TaskCreate/TaskUpdate IDs keyed by `workerId` (one task per
+worker across spawn, follow-up, and steer; reopening `in_progress` on follow-up or steer). They are a task projection,
 not Claude Agent/subagent sessions, and are created only for this session's
 live launches. Pending acceptance keeps them in progress.
 Successful settled tasks close after ten seconds; failed, canceled or rejected
@@ -190,6 +197,7 @@ hooks/canonical.ts          THE READER — over `.agent-smith/jobs`, via an inje
 hooks/fs.ts                 `FsLike` and `toEpoch`, shared by the readers
 hooks/format.ts             pure formatting, shared by band and pane
 hooks/stale.ts              livenessOf and its thresholds, shared by band and channel
+hooks/turns.ts              turn/head/idle rules and WorkerIndex parser, shared by forge, channel and mod
 hooks/notice.ts             completion notice words and who may announce
 types/index.d.ts            RadarJob + the PluginState declaration
 tests/                      node --test: the RULES
@@ -362,7 +370,7 @@ The coupling that *does* exist is one-directional and written down:
 
 | in the mod | must stay in step with | if it drifts |
 |---|---|---|
-| `hooks/stale.ts STALL_GRACE_MS` | `surfaces/channel/src/watch-source.ts` (imports it) | the band says healthy while the channel says stalled — the exact contradiction this project exists to prevent |
+| `hooks/stale.ts STALL_GRACE_MS` | `surfaces/channel/src/watch-source.ts` (imports it) | the band says healthy while the channel says silent — the exact contradiction this project exists to prevent |
 | `hooks/canonical.ts readForgeJob()` | `harness/normalize.ts` | the band draws `✓` where the channel draws `failed` |
 
 Each restatement says so at the point of use and names the counterpart.

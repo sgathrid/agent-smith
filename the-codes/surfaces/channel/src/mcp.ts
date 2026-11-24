@@ -1,4 +1,3 @@
-/** Shared tool handlers, served by the SDK's modern/legacy stdio dispatcher. */
 import { randomBytes } from 'node:crypto';
 import {
   Server, createRequestStateCodec, inputRequired,
@@ -34,8 +33,6 @@ class SmithServer extends Server {
 export function createSmithServer(context: Omit<HandlerContext, 'server'>, options: {
   era: 'legacy' | 'modern'; instructions?: string; tasks?: boolean;
 }): Server {
-  // Stdio runs every round in this process. Bind approval to the exact call;
-  // clients cannot forge approval state or reuse it with broader arguments.
   const state = createRequestStateCodec<{ call: string; prompt: string }>({ key: randomBytes(32) });
   const tasks = options.era === 'modern' && (options.tasks ?? process.env['AGENT_SMITH_TASKS'] === '1') ? new ForgeTasks(context) : undefined;
   const server = new SmithServer({ name: 'agent-smith', version: '0.2.0' }, {
@@ -64,12 +61,10 @@ export function createSmithServer(context: Omit<HandlerContext, 'server'>, optio
           inputRequests: { unrestricted: params.mode === 'url' ? inputRequired.elicitUrl(params) : inputRequired.elicit(params) },
           requestState: await state.mint({ call, prompt: JSON.stringify(params) }),
         });
-        // Stop the existing launch gate; the response below carries the request
-        // for input. No worker launches until a validated round returns accept.
         return { action: 'cancel' };
       },
     };
-    const taskCapable = tasks && ['spawn_job', 'resume_job'].includes(request.params.name) &&
+    const taskCapable = tasks && ['spawn_job', 'follow_up'].includes(request.params.name) &&
       hasTaskClientCapabilityV2({ _meta: ctx.mcpReq.envelope });
     const result = taskCapable
       ? await tasks.launch({ ...context, server: facade }, request.params.name, request.params.arguments ?? {})

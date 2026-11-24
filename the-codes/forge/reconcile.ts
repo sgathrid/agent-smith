@@ -1,10 +1,11 @@
 /** Service-owned recovery of abandoned jobs. Readers never write job records. */
 import { existsSync, readFileSync } from 'node:fs';
 import { REASONS } from '../surfaces/mod/hooks/reasons.ts';
-import { FILES, SCHEMA_VERSION, cwdFacts, deriveOrphan, failureFields, deriveStatus, isTerminalForgeStatus, jobFile, ownerAlive, validOwnerPid, type ForgeManifest } from './format.ts';
-import { writeAtomic, writeJsonAtomic } from './atomic.ts';
+import { FILES, SCHEMA_VERSION, cwdFacts, deriveOrphan, failureFields, deriveStatus, isTerminalForgeStatus, jobFile, normalizeDenials, ownerAlive, validOwnerPid, type ForgeManifest } from './format.ts';
+import { createMarker, writeAtomic, writeJsonAtomic } from './atomic.ts';
 import { readAcceptance, writeAcceptance } from './checks.ts';
 import { reportFor, summaryTail } from './writer.ts';
+import { notSentWarning, undeliveredEntries } from './steer-log.ts';
 import type { JobResult } from '../providers/types.ts';
 
 /**
@@ -24,6 +25,7 @@ export function reconcileOrphan(repo: string, jobId: string, now = Date.now()): 
     if (manifest.status !== 'running') {
       if (isTerminalForgeStatus(manifest.status)
           && typeof manifest.finishedAt === 'string') abandonPendingAcceptance(repo, jobId, manifest.finishedAt);
+      abandonQueue(repo, jobId);
       return false;
     }
     const resultFile = jobFile(repo, jobId, FILES.result);
@@ -36,12 +38,13 @@ export function reconcileOrphan(repo: string, jobId: string, now = Date.now()): 
     // Without the writer, the cwd and the mode (plus the completed-edit count
     // in progress.json) are all recovery can prove about a writing job.
     const facts = cwdFacts(manifest.cwd, manifest.mode, editedOnDisk(repo, jobId));
+    const deniedActions = result === null ? [] : normalizeDenials(result.deniedActions);
     const verdict = result === null
       ? deriveOrphan(manifest, null, now, undefined, canceled)
       : deriveStatus({
         alreadyTerminal: canceled || result.status === 'cancelled' ? 'canceled' : null,
         ok: result.ok, jobStatus: result.status,
-        deniedActions: result.deniedActions ?? [], report,
+        deniedActions, report,
         ...facts,
       });
     if (verdict === null) return false;
@@ -61,8 +64,8 @@ export function reconcileOrphan(repo: string, jobId: string, now = Date.now()): 
         updatedAt: result.finishedAt, finishedAt: result.finishedAt,
         startedAt: manifest.startedAt ?? result.startedAt, exitCode: result.exitCode,
         conversation: recoveredConversation(result) ?? manifest.conversation,
-        ...failureFields(verdict, result),
-        deniedActions: (result.deniedActions ?? []).map(({ action, displayName, nonfatal }) => ({
+        ...failureFields(verdict, { ...result, deniedActions }),
+        deniedActions: deniedActions.map(({ action, displayName, nonfatal }) => ({
           ...(action === undefined ? {} : { action }),
           ...(displayName === undefined ? {} : { displayName }),
           ...(nonfatal === true ? { nonfatal: true } : {}),
@@ -77,6 +80,7 @@ export function reconcileOrphan(repo: string, jobId: string, now = Date.now()): 
         ...(facts.cwdMissing ? { cwdMissingAtFinish: true } : {}),
       });
       abandonPendingAcceptance(repo, jobId, result.finishedAt);
+      abandonQueue(repo, jobId);
       return true;
     }
     const at = new Date(now).toISOString();
@@ -86,6 +90,7 @@ export function reconcileOrphan(repo: string, jobId: string, now = Date.now()): 
       updatedAt: at, finishedAt: at,
     });
     abandonPendingAcceptance(repo, jobId, at);
+    abandonQueue(repo, jobId);
     return true;
   } catch { return false; } // An unreadable anchor remains unknown; do not invent it.
 }
@@ -98,6 +103,26 @@ function abandonPendingAcceptance(repo: string, jobId: string, at: string): void
       reason: 'server stopped; checks not run',
     });
   }
+}
+
+function abandonQueue(repo: string, jobId: string): void {
+  const ownerDone = jobFile(repo, jobId, FILES.ownerDone);
+  if (existsSync(ownerDone)) return;
+  const undelivered = undeliveredEntries(repo, jobId);
+  for (const name of [FILES.job, FILES.progress]) {
+    const file = jobFile(repo, jobId, name);
+    let doc: Record<string, unknown>;
+    try { doc = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>; } catch { continue; }
+    const warnings = Array.isArray(doc['warnings']) ? doc['warnings'] as unknown[] : [];
+    const warning = undelivered.length > 0 && name === FILES.progress ? notSentWarning(undelivered, 'owner stopped') : null;
+    const pending = typeof doc['pendingSteers'] === 'number' && doc['pendingSteers'] > 0;
+    if (!pending && (warning === null || warnings.includes(warning))) continue;
+    writeJsonAtomic(file, {
+      ...doc, pendingSteers: 0,
+      ...(warning === null || warnings.includes(warning) ? {} : { warnings: [...warnings, warning] }),
+    });
+  }
+  if (undelivered.length > 0) createMarker(ownerDone, new Date().toISOString());
 }
 
 /**

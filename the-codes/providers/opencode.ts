@@ -110,7 +110,9 @@ import type { RunFn } from './discovery.ts';
 import { deniedText, stderrClause } from './failure-text.ts';
 
 
-export const OPENCODE_BINARY = process.env['AGENT_SMITH_OPENCODE_BIN'] ?? 'opencode';
+export function opencodeBinary(): string {
+  return process.env['AGENT_SMITH_OPENCODE_BIN'] ?? 'opencode';
+}
 
 /** Sandbox flags for opencode. Shared by buildArgv and describeSandbox. */
 export function sandboxPlan(spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly'>): SandboxInfo {
@@ -711,7 +713,7 @@ export async function listOpencodeModels(run: RunFn, options?: ListModelsOptions
     verified: false,
   };
   try {
-    const r = await run(OPENCODE_BINARY, ['models'], options?.timeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS);
+    const r = await run(opencodeBinary(), ['models'], options?.timeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS);
     const models = parseOpencodeModels(r.stdout);
     if (models.length > 0) return { ...base, models };
     return {
@@ -726,7 +728,7 @@ export async function listOpencodeModels(run: RunFn, options?: ListModelsOptions
 export const opencodeProvider: Provider = {
   name: 'opencode',
 
-  available: () => binaryAvailable(OPENCODE_BINARY),
+  available: () => binaryAvailable(opencodeBinary()),
 
   describeSandbox: sandboxPlan,
 
@@ -736,7 +738,7 @@ export const opencodeProvider: Provider = {
     const tx = createOpencodeTranslator(spec.maxOutputChars ?? 2000);
     return runNdjsonWorker({
       provider: 'opencode',
-      binary: OPENCODE_BINARY,
+      binary: opencodeBinary(),
       spec,
       buildArgv,
       // `run --format json` is documented as raw JSON events, but --format

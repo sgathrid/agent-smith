@@ -46,26 +46,27 @@ setTimeout(()=>{console.log(JSON.stringify({type:'item.completed',item:{id:'answ
   try {
     await client.connect(transport);
     const names = (await client.listTools()).tools.map(t => t.name);
-    for (const name of ['spawn_job', 'resume_job', 'run_pipeline', 'pipeline_status', 'cancel']) assert.ok(names.includes(name));
+    for (const name of ['spawn_job', 'follow_up', 'steer', 'run_pipeline', 'pipeline_status', 'cancel']) assert.ok(names.includes(name));
     const invalid = await client.callTool({ name: 'spawn_job', arguments: { mode: 'review', prompt: 'x', effort: 'typo' } });
     assert.equal(invalid.isError, true);
     const ack = data(await client.callTool({ name: 'spawn_job', arguments: { provider: 'codex', mode: 'review', name: 'Ada', task: 'Review fixture', prompt: 'Review the fixture', model: 'fixture-model', effort: 'xhigh' } }));
-    const detail = await until(async () => data(await client.callTool({ name: 'status', arguments: { jobId: ack.jobId, response_format: 'detailed' } })), r => r.status !== 'running');
+    const detail = await until(async () => data(await client.callTool({ name: 'status', arguments: { id: ack.jobId, response_format: 'detailed' } })), r => r.status !== 'running');
     assert.equal(detail.status, 'succeeded'); assert.equal(detail.name, 'Ada'); assert.equal(detail.role, 'review');
     assert.equal(detail.summarySource, 'worker'); assert.match(detail.latestSummary, /Worker findings/); assert.ok(!detail.latestSummary.includes('PRIVATE THINKING'));
-    // The SDK Client validates structuredContent against each tool's outputSchema, so these calls are the end-to-end schema check.
     assert.equal(ack.status, 'running'); assert.equal(ack.repo, repo); assert.equal('taskHandle' in ack, false);
     assert.equal(detail.taskStatus, 'completed');
-    assert.equal(data(await client.callTool({ name: 'status', arguments: { jobId: ack.jobId, include_diff: true } })).taskStatus, 'completed');
-    for (const response_format of ['concise', 'detailed']) {
-      const listed = await client.callTool({ name: 'list_jobs', arguments: { response_format } });
-      assert.equal((listed.structuredContent as { items: { taskStatus: string }[] }).items[0]!.taskStatus, 'completed', response_format);
-    }
-    const resumed = data(await client.callTool({ name: 'resume_job', arguments: { worker: 'Ada', prompt: 'Address the edge case' } }));
-    assert.equal(resumed.status, 'running'); assert.equal(resumed.name, 'Ada');
-    const followup = await until(async () => data(await client.callTool({ name: 'status', arguments: { jobId: resumed.jobId, response_format: 'detailed' } })), r => r.status !== 'running');
-    assert.equal(followup.workerId, detail.workerId); assert.equal(followup.name, 'Ada'); assert.match(followup.report, /follow-up/);
-    const argv = JSON.parse(readFileSync(path.join(repo, '.agent-smith', 'jobs', resumed.jobId, 'argv.json'), 'utf8')).argv;
+    const withDiff = data(await client.callTool({ name: 'status', arguments: { id: ack.jobId, include_diff: true } }));
+    assert.equal(withDiff.status, 'succeeded'); assert.equal('taskStatus' in withDiff, false);
+    const detailedList = await client.callTool({ name: 'list_jobs', arguments: { response_format: 'detailed' } });
+    assert.equal((detailedList.structuredContent as { items: { taskStatus: string }[] }).items[0]!.taskStatus, 'completed');
+    const conciseList = await client.callTool({ name: 'list_jobs', arguments: {} });
+    assert.equal((conciseList.structuredContent as { items: { status: string }[] }).items[0]!.status, 'succeeded');
+    const followed = data(await client.callTool({ name: 'follow_up', arguments: { worker: 'Ada', prompt: 'Address the edge case' } }));
+    assert.equal(followed.status, 'running'); assert.equal(followed.name, 'Ada'); assert.ok(['queued', 'started'].includes(followed.action), followed.action);
+    const followup = await until(async () => data(await client.callTool({ name: 'status', arguments: { id: 'Ada', response_format: 'detailed' } })), r => r.jobId !== ack.jobId && r.status !== 'running');
+    assert.equal(followup.workerId, detail.workerId); assert.equal(followup.name, 'Ada'); assert.equal(followup.turn, 2); assert.match(followup.report, /follow-up/);
+    assert.equal(data(await client.callTool({ name: 'status', arguments: { id: ack.jobId } })).jobId, ack.jobId);
+    const argv = JSON.parse(readFileSync(path.join(repo, '.agent-smith', 'jobs', followup.jobId, 'argv.json'), 'utf8')).argv;
     assert.deepEqual(argv.slice(0, 3), ['exec', 'resume', 'fixture-thread']);
     for (const exitCode of [0, 7]) {
       const run = data(await client.callTool({ name: 'run_pipeline', arguments: { spec: { name: 'fixture', stages: [{ name: 'implement', provider: 'codex', prompt: 'Write detailed findings', checks: [{ name: 'acceptance', command: `node -e 'process.exit(${exitCode})'` }] }] } } }));
@@ -135,38 +136,45 @@ else setTimeout(finish,1800);
     await first.client.close();
     const second = await connect();
     const call = async (name: string, args: Record<string, unknown>) => data(await second.client.callTool({ name, arguments: args }));
-    const running = await call('status', { jobId: ack.jobId });
-    assert.equal(running.status, 'running'); assert.equal(running.cancellable, undefined); // concise omits this field
-    const detailed = await until(() => call('status', { jobId: ack.jobId, response_format: 'detailed' }), r => r.resumable === true);
+    const running = await call('status', { id: ack.jobId });
+    assert.equal(running.status, 'running'); assert.equal(running.cancellable, undefined);
+    const detailed = await until(() => call('status', { id: ack.jobId, response_format: 'detailed' }), r => r.resumable === true);
     assert.equal(detailed.cancellable, true); assert.equal(detailed.resumable, true);
-    await call('steer_job', { worker: ack.jobId, prompt: 'Finish now', delivery: 'interrupt' });
-    const finished = await until(() => call('status', { jobId: ack.jobId, response_format: 'detailed' }), r => r.status === 'succeeded' && r.acceptance?.state === 'accepted');
+    const steered = await call('steer', { worker: ack.jobId, prompt: 'Finish now' });
+    assert.equal(steered.action, 'interrupting');
+    const finished = await until(() => call('status', { id: ack.jobId, response_format: 'detailed' }), r => r.status === 'succeeded' && r.acceptance?.state === 'accepted');
     assert.ok(existsSync(path.join(repo, 'checked')));
-    const report = await call('status', { jobId: finished.jobId, report_only: true });
-    assert.equal(report.status, 'succeeded'); assert.equal(report.taskStatus, 'completed');
+    const report = await call('status', { id: finished.jobId, report_only: true });
+    assert.equal(report.status, 'succeeded'); assert.equal(report.taskStatus, undefined);
     assert.ok(report.report.length > 9000); assert.equal(report.provider, undefined); assert.equal(readFileSync(report.reportPath, 'utf8'), report.report);
-    const resumed = await call('resume_job', { worker: finished.jobId, prompt: 'follow up' });
-    const accepted = await until(() => call('status', { jobId: resumed.jobId }), r => r.status !== 'running' && r.acceptance?.state === 'accepted');
+    const nextTurn = (name: string, after: string) => until(() => call('status', { id: name }), r => r.jobId !== after && r.status !== 'running' && r.acceptance?.pending !== true);
+    await call('follow_up', { worker: finished.jobId, prompt: 'follow up' });
+    const accepted = await nextTurn('survivor', finished.jobId);
+    assert.equal(accepted.acceptance.state, 'accepted');
     assert.equal(accepted.acceptance.passed[0], 'verified');
     const canceled = await call('spawn_job', { mode: 'review', provider: 'codex', prompt: 'wait-long cancel', name: 'cancel-me' });
-    await call('cancel', { jobId: canceled.jobId });
-    assert.equal((await until(() => call('status', { jobId: canceled.jobId }), r => r.status !== 'running')).status, 'canceled');
+    await call('cancel', { id: canceled.jobId });
+    assert.equal((await until(() => call('status', { id: canceled.jobId }), r => r.status !== 'running')).status, 'canceled');
     const queued = await call('spawn_job', { mode: 'review', provider: 'codex', prompt: 'first turn', name: 'queue-me' });
-    await call('steer_job', { worker: queued.jobId, prompt: 'queued continuation', delivery: 'queue' });
-    // The first turn ends only once the continuation is queued, however slow this call was.
+    const queuedAck = await call('follow_up', { worker: queued.jobId, prompt: 'queued continuation' });
+    assert.deepEqual([queuedAck.action, queuedAck.jobId], ['queued', queued.jobId]);
     writeFileSync(path.join(repo, 'release-first-turn'), '');
-    const queuedResult = await until(() => call('status', { jobId: queued.jobId }), r => r.jobId !== queued.jobId && r.status === 'succeeded');
-    assert.notEqual(queuedResult.jobId, queued.jobId);
+    const idle = await call('status', { id: 'queue-me', wait_ms: 30_000 });
+    assert.deepEqual([idle.turn, idle.stillRunning, idle.status], [2, false, 'succeeded']);
+    const queuedResult = await nextTurn('queue-me', queued.jobId);
+    assert.equal(queuedResult.status, 'succeeded'); assert.equal(queuedResult.turn, 2);
+    const turn1 = await call('status', { id: queued.jobId, wait_ms: 1_000 });
+    assert.deepEqual([turn1.jobId, turn1.status], [queued.jobId, 'succeeded']);
     const listed = await call('list_jobs', { session: true });
     assert.ok((listed.items ?? listed).some((j: any) => j.jobId === queuedResult.jobId));
-    const replacement = await call('resume_job', { worker: resumed.jobId, prompt: 'replace checks', checks: [{ name: 'replacement', command: `${JSON.stringify(process.execPath)} -e "process.exit(0)"` }] });
+    const replacement = await call('follow_up', { worker: 'survivor', prompt: 'replace checks', checks: [{ name: 'replacement', command: `${JSON.stringify(process.execPath)} -e "process.exit(0)"` }] });
     assert.deepEqual(replacement.checks, ['replacement']);
-    const replaced = await until(() => call('status', { jobId: replacement.jobId }), r => r.status === 'succeeded' && r.acceptance?.state === 'accepted');
-    assert.deepEqual(replaced.acceptance.passed, ['replacement']);
-    const cleared = await call('resume_job', { worker: replacement.jobId, prompt: 'clear checks', checks: [] });
+    const replaced = await nextTurn('survivor', accepted.jobId);
+    assert.equal(replaced.status, 'succeeded'); assert.deepEqual(replaced.acceptance.passed, ['replacement']);
+    const cleared = await call('follow_up', { worker: 'survivor', prompt: 'clear checks', checks: [] });
     assert.equal('checks' in cleared, false);
-    const unchecked = await until(() => call('status', { jobId: cleared.jobId }), r => r.status === 'succeeded');
-    assert.equal(unchecked.acceptance.state, 'unchecked');
+    const unchecked = await nextTurn('survivor', replaced.jobId);
+    assert.equal(unchecked.status, 'succeeded'); assert.equal(unchecked.acceptance.state, 'unchecked');
     const pipeline = await call('run_pipeline', { spec: { name: 'reload-pipeline', stages: [
       { name: 'one', provider: 'codex', prompt: 'first', checks },
       { name: 'two', provider: 'codex', prompt: 'second', dependsOn: ['one'], checks },
@@ -200,17 +208,17 @@ console.log(JSON.stringify(event));process.exitCode=1;
     await client.connect(transport);
     for (const provider of ['codex', 'opencode']) {
       const ack = data(await client.callTool({ name: 'spawn_job', arguments: { provider, mode: 'review', prompt: 'review' } }));
-      const detail = await until(async () => data(await client.callTool({ name: 'status', arguments: { jobId: ack.jobId, response_format: 'detailed' } })), d => d.status === 'failed');
+      const detail = await until(async () => data(await client.callTool({ name: 'status', arguments: { id: ack.jobId, response_format: 'detailed' } })), d => d.status === 'failed');
       assert.match(detail.error, provider === 'codex' ? /out of credits/ : /402: payment required/);
       assert.equal(detail.reason, 'out of credits');
       assert.equal(detail.resumable, false);
-      const resumed = await client.callTool({ name: 'resume_job', arguments: { worker: ack.jobId, prompt: 'continue' } });
-      assert.equal(resumed.isError, true);
-      assert.match((resumed.content as Array<{ text: string }>)[0]!.text, /full original brief/);
+      const followed = await client.callTool({ name: 'follow_up', arguments: { worker: ack.jobId, prompt: 'continue' } });
+      assert.equal(followed.isError, true);
+      assert.match((followed.content as Array<{ text: string }>)[0]!.text, /no saved conversation; spawn_job with from:.* the original brief/);
       const { readJob } = await import('../watch-source.ts');
       const { buildBatch } = await import('../policy.ts');
       const observed = (await readJob(repo, ack.jobId, Date.now()))!;
-      const notice = buildBatch([{ job: observed, seen: new Set(), knownBefore: true }], Date.now());
+      const notice = buildBatch([{ job: observed, seen: new Set(), observedInPriorPoll: true }], Date.now());
       assert.match(notice.content!, provider === 'codex' ? /out of credits/ : /402: payment required/);
     }
   } finally { await client.close(); rmSync(repo, { recursive: true, force: true }); }

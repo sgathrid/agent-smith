@@ -6,7 +6,6 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildSmokeServerEnv } from './smoke-env.mjs';
 
-// Failure bound only; scaled like forge/testing/time.ts (.mjs cannot import .ts).
 const scale = Number(process.env.AGENT_SMITH_TEST_TIME_SCALE);
 const scaled = (ms) => Math.round(ms * (Number.isFinite(scale) && scale > 0 ? scale : 1));
 
@@ -21,7 +20,9 @@ test('smoke runner exercises isolated MCP scenarios and reports cleanup', () => 
   assert.equal(summary.cleanup, 'removed');
   for (const name of [
     'MCP stdio tool discovery',
-    'solo review and named resume',
+    'solo review, then follow_up on the idle worker',
+    'follow_up queued behind a running turn',
+    'steer interrupts a running turn',
     'cross-provider implement to review with executable check',
     'cancellation',
     'timeout',
