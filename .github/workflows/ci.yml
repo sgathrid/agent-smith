@@ -63,6 +63,17 @@ jobs:
             exit 1
           fi
 
+  construct:
+    # Construct ships as plain files; the check catches dangling references,
+    # bad frontmatter, oversize skills and named tools or models.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - run: node construct/scripts/check.mjs
+
   plugin-version-bumped:
     # Installed copies are keyed by version: a changed build under an unchanged
     # version never reaches users, and `claude plugin update` says they're current.
