@@ -13,7 +13,7 @@ through unchanged and each harness uses its own configured default.
 | `<repo>/.agent-smith/models.json` | project (`<repo>` = the MCP server's repo) |
 | `<home>/.agent-smith/models.json` | user; `<home>` = `$AGENT_SMITH_HOME`, else `os.homedir()` |
 
-Both are read on every `spawn_job`, `resume_job`, `run_pipeline` and `list_capabilities`
+Both are read on every `spawn_job`, `follow_up`, `run_pipeline` and `list_capabilities`
 call (no caching, no restart needed). A missing file is fine; unreadable/invalid JSON or bad
 entries are skipped and reported as `models.json: ...` ack `warnings` and
 `aliasConfigErrors` in `list_capabilities`.
@@ -39,7 +39,7 @@ entries are skipped and reported as `models.json: ...` ack `warnings` and
   and model; call `effort` beats alias `effort`; a different call `provider` is an error;
   (2) no `provider` and no `model` and the mode has a `roleDefaults` alias -> that alias
   (`effort` still overridable); (3) call values as given. `spawn_job` acks add `aliasApplied`
-  and `aliasSource` (`alias|roleDefault`). `resume_job` expands aliases but never applies
+  and `aliasSource` (`alias|roleDefault`). `follow_up` expands aliases but never applies
   `roleDefaults`. `run_pipeline` expands aliases in explicit stages and uses `roleDefaults`
   for the default implement/review/moderate stages.
 - The resolved model/effort are then checked against the provider catalog (see
@@ -65,9 +65,9 @@ Only variables the code reads.
 | `AGENT_SMITH_KIMI_HOME`, then `KIMI_CODE_HOME` | `providers/kimi.ts` | `~/.kimi-code` | Kimi config dir: `config.toml` top-level `default_model` (and `[thinking].effort`, model alias `default_effort`). |
 | `AGENT_SMITH_HOME` | `providers/aliases.ts` | `os.homedir()` | Where the user-level `.agent-smith/models.json` is looked up. |
 | `AGENT_SMITH_STATE_DIR` | `providers/ndjson.ts` | `~/.agent-smith/state` | Provider state root used only when a spawn gives no `stateDir`. The forge always passes the job directory, so MCP/CLI jobs do not use it. |
-| `AGENT_SMITH_TASKS` | `surfaces/channel/src/mcp.ts` | unset (`0`) | `1` advertises `extensions['io.modelcontextprotocol/tasks']` on modern (`2026-07-28`) connections and registers `tasks/get`, `tasks/update` and `tasks/cancel`, returning `resultType: 'task'` for `spawn_job`/`resume_job` requests that advertise client Tasks support. |
+| `AGENT_SMITH_TASKS` | `surfaces/channel/src/mcp.ts` | unset (`0`) | `1` advertises `extensions['io.modelcontextprotocol/tasks']` on modern (`2026-07-28`) connections and registers `tasks/get`, `tasks/update` and `tasks/cancel`, returning `resultType: 'task'` for `spawn_job`/`follow_up` requests that advertise client Tasks support. |
 | `AGENT_SMITH_NO_CATALOG_WARMUP` | `surfaces/channel/src/server.ts` | unset | `1` skips the background model discovery the MCP server starts at launch. The first spawn that names a model then waits up to `CATALOG_COLD_WAIT_MS` for a cold catalog, unless a fresh `.agent-smith/catalogs/<provider>.json` already holds it. |
-| `AGENT_SMITH_CONFIRM_UNRESTRICTED` | `surfaces/channel/src/tools.ts` | enabled | `0` stops `spawn_job`/`resume_job` asking the user to confirm an explicit `unrestricted: true` for codex, claude or opencode, and drops the "not confirmed" ack warning. For automation with no one to answer. |
+| `AGENT_SMITH_CONFIRM_UNRESTRICTED` | `surfaces/channel/src/tools.ts` | enabled | `0` stops `spawn_job`/`follow_up` asking the user to confirm an explicit `unrestricted: true` for codex, claude or opencode, and drops the "not confirmed" ack warning. For automation with no one to answer. |
 | `HOME`, `PATH` | `discovery.ts`, `ndjson.ts` | process env | `HOME` roots the default config dirs; `PATH` is probed for provider binaries (cached per binary+PATH). |
 
 Repo selection: the MCP server takes a positional repo path, else its process cwd.
@@ -93,7 +93,8 @@ Sandbox posture per provider (recorded in `job.json`; the ack carries only `unre
 or `AGENT_SMITH_AGY_RESTRICTED=1`, which gives no flag and auto-denies unapproved tools;
 read-only is not enforceable). codex default = `-s workspace-write`, `-s read-only` for
 read-only modes, bypass flag when unrestricted (resume uses `-c sandbox_mode=...`). claude
-default = `--permission-mode dontAsk --permission-prompts none` (no read-only enforcement),
+default = `--permission-mode dontAsk --permission-prompts none` (enforces read-only in read-only
+modes with `--allowedTools` and `--disallowedTools Edit Write NotebookEdit`),
 `--dangerously-skip-permissions` when unrestricted. opencode default = the agent's own rules
 (no flag), `--auto` when unrestricted. kimi print mode force-sets the auto permission policy
 (it cannot prompt and has no restricted flag), so `unrestricted` is always true and
@@ -119,7 +120,7 @@ not the Kimi CLI.
 | Discovery timeout | 10 000 per provider (+1 000 guard) | `catalog.ts` |
 | `CATALOG_COLD_WAIT_MS` / `CATALOG_WAIT_MS` | 5 000 until a catalog lookup has completed in the process (warm-up or a spawn), then 2 000; spawn-time catalog race. A supervisor's lookup is instant while the disk catalog cache (`CATALOG_TTL_MS` 5 min) is fresh | `service.ts`, `providers/catalog.ts` |
 | `PROGRESS_FLUSH_MS` | 250 | `format.ts` |
-| Cancel marker poll | 200 ms (job), 250 ms (pipeline) | `service.ts`, `execute.ts` |
+| Cancel marker poll | 100 ms (running turn), 200 ms (owner checks), 250 ms (pipeline) | `service.ts`, `execute.ts` |
 | Legacy orphan rule | 2 x default = 90 min silence (no `ownerPid`) | `format.ts` |
 | Stale cancel | marker older than 60 s with no live owner | `harness/agent-smith.ts` |
 | `HEARTBEAT_MS` | 30 000; the process owner records `progress.json` `lastAliveAt` while the worker CLI runs | `providers/ndjson.ts`, `mod/hooks/stale.ts` |
@@ -132,7 +133,7 @@ not the Kimi CLI.
 | `changedFiles` cap | 200 paths (`changedFilesTruncated`); git calls capped at 2 s | `format.ts`, `writer.ts` |
 | List | default 50, max 500 | `tools.ts` |
 | Pipeline concurrency | 1 to 32 | `pipeline/pipeline.ts` |
-| Hook | `timeout: 21900` s; watch budget = the job's `timeoutMs` + 60 s (pipelines: 6 h + 60 s); `monitor.js` standalone default 46 min | `build-plugin.mjs`, `watch-hook.ts`, `monitor.ts` |
+| Hook | `timeout: 21900` s; watch budget = the job's `timeoutMs` + acceptance `budgetMs` + 60 s (capped at 21 840 s; pipelines: 6 h + 60 s); `monitor.js` standalone default 46 min | `build-plugin.mjs`, `watch-hook.ts`, `monitor.ts` |
 | Worker name | at most 80 chars | `service.ts` |
 
 ## MCP tools
@@ -141,27 +142,32 @@ The server uses MCP TypeScript SDK `server`/`core` 2.3.1 and supports the
 2026-07-28 protocol plus legacy clients through the SDK's stdio dispatcher.
 Modern approval uses `input_required`; legacy clients use form elicitation.
 
+In 0.5.0, `resume_job` and `steer_job` were removed and replaced by `follow_up` and `steer`.
+If your Claude Code permission allowlist names `mcp__plugin_agent-smith_agent-smith__resume_job`
+or `mcp__plugin_agent-smith_agent-smith__steer_job`, replace them with
+`mcp__plugin_agent-smith_agent-smith__follow_up` and `mcp__plugin_agent-smith_agent-smith__steer`.
+
 All tools reject unknown fields. Failures return `isError` with a sentence to act on.
 Efforts (`EFFORTS`): `low|medium|high|xhigh|max|ultra`; each model lists the efforts it
 accepts. Providers: `agy|codex|opencode|claude|kimi`. Tools marked structured also return
 `structuredContent` (arrays wrapped as `{items}`) and declare a per-tool `outputSchema` that types the
 fields below and allows extra ones (`additionalProperties: true`); clients validate against it.
 
-Tasks vocabulary and opt-in extension: `status`/`list_jobs` rows carry `taskStatus` beside `status`: `running`/`unknown` ->
+Tasks vocabulary and opt-in extension: detailed `status`/`list_jobs` rows carry `taskStatus` beside `status`: `running`/`unknown` ->
 `working`, `succeeded` -> `completed`, `failed` -> `failed`, `canceled` -> `cancelled`. Jobs in
 `.agent-smith/jobs/` are kept until `agent-smith gc` is run. When `AGENT_SMITH_TASKS=1` is set on a
 2026-07-28 connection and the request's `_meta['io.modelcontextprotocol/clientCapabilities'].extensions`
-includes `io.modelcontextprotocol/tasks`, `spawn_job` and `resume_job` return a protocol task handle
+includes `io.modelcontextprotocol/tasks`, `spawn_job` and `follow_up` return a protocol task handle
 (`resultType: 'task'`, 24 h `ttlMs`) backed by `<repo>/.agent-smith/tasks/` and served via `tasks/get`,
 `tasks/update` and `tasks/cancel`.
 
-Confirming `unrestricted`: an explicit `unrestricted: true` on `spawn_job` or `resume_job` for codex,
+Confirming `unrestricted`: an explicit `unrestricted: true` on `spawn_job` or `follow_up` for codex,
 claude or opencode asks the user first via MCP form elicitation ("Allow codex worker "Ada" to run
 without approval prompts in <cwd>? It will be able to run any command."). Accept launches; decline,
 cancel or no answer within 10 minutes returns `isError` (`The user declined unrestricted access; rerun
 without unrestricted, or ask the user.`) and launches nothing. A client without form elicitation gets
 the launch as before plus an ack warning that it was not confirmed. Never asked for agy or kimi, for
-`unrestricted: false` or absent, for a setting `resume_job` inherits, or with
+`unrestricted: false` or absent, for a setting `follow_up` inherits, or with
 `AGENT_SMITH_CONFIRM_UNRESTRICTED=0`. `run_pipeline`'s `unrestricted` is not confirmed.
 
 ### `list_capabilities` (read-only, structured)
@@ -191,7 +197,7 @@ roleDefaults}`, `aliasConfigErrors?`, `modes[{name,description,readOnly,runsComm
 | `mode` | enum `implement|review|moderate|verify` | required |
 | `prompt` | string | required, nonempty |
 | `context` | string | optional, 1 to 2 000 chars; why the work matters and who it is for, shown to the worker in its brief |
-| `name` | string | worker label for `resume_job`; default `<mode>-<8 hex of id>`; max 80; must not collide with an active job |
+| `name` | string | worker label for `follow_up`, `steer`, `status`, and `cancel`; default `<mode>-<8 hex of id>`; max 80; must not collide with an active job |
 | `task` | string | short description; default first prompt line |
 | `provider` | enum | default: alias/roleDefault provider, else the only installed provider; with several installed the call fails with `provider is required: installed are …` |
 | `model`, `effort` | string, enum | optional; validated against a fresh catalog, otherwise warnings only |
@@ -205,55 +211,86 @@ roleDefaults}`, `aliasConfigErrors?`, `modes[{name,description,readOnly,runsComm
 | `variants` | array | up to 8 entries `{name?, provider?, model?, effort?}`, each an independent job started from the shared params; names must be distinct (default `<name>-<provider>-<model>`). Not available on a task-augmented call |
 | `env` | object | extra worker environment variables, merged over the server's (e.g. a per-worktree `CARGO_TARGET_DIR`); keys `^[A-Za-z_][A-Za-z0-9_]*$`, string values without NUL. Keys that change how the worker binary is found, loaded or configured are refused, because the env applies before any worker sandbox exists: `PATH`, `HOME`, `SHELL`, `TMPDIR`, `NODE_OPTIONS`, `NODE_PATH`, `PYTHONPATH`, `PYTHONHOME`, `PYTHONSTARTUP`, the shell startup files `BASH_ENV`, `ENV`, `ZDOTDIR`, `SHELLOPTS`, `PROMPT_COMMAND`, `PERL5OPT`, `RUBYOPT`, and any key starting `LD_`, `DYLD_`, `XDG_`, `AGENT_SMITH_`, `AGY_`, `CLAUDE_`, `CODEX_`, `OPENCODE_` or `KIMI_` (case-insensitive; `ENV_DENYLIST` in `pipeline/types.ts`). Only the names are stored (`env-keys.json`); values are never written |
 
-Result (slim ack, compact JSON): `jobId, name, workerId, turn, provider, model, status:'running', timeoutMs, repo, unrestricted, chainStartedAt`, plus
-`continuedFrom?, continuationKind?` (on resume), `readOnlyEnforced` for read-only modes, `envKeys` (names, never values) when `env` was given, `warnings?`,
+Result (slim ack, compact JSON): `jobId, name, workerId, turn, provider, model, status:'running', timeoutMs, repo, unrestricted`, plus
+`readOnlyEnforced` for read-only modes, `envKeys` (names, never values) when `env` was given, `warnings?`,
 `checks` (names) when checks were given, and `aliasApplied?`/`aliasSource?`. With `variants`:
 `{jobs:[ack | {name, error}]}`. The saved request goes to the job's `request.json`.
 
-### `resume_job` (structured)
-Params: `worker` (name, `workerId`, or job id, required), `prompt` (required), `files` (optional relative paths in `repo`, merged with the previous job's existing watched files and re-synced into `cwd` only when changed in `repo` so worker worktree edits are preserved), `model`, `effort`,
-`timeoutMs`, `unrestricted` (default: the original job's; an explicit `true` is confirmed as for `spawn_job`), `cwd` (absolute existing directory;
-default: the original job's), `env` (as for `spawn_job`; not inherited, because values are not
-stored: when the original job had env and this call passes none, the ack warns). An explicit cwd changes the process working directory while
-retaining the prior conversation, which can still mention its previous workspace. kimi is
-stricter: it resumes a session only from the directory that created it, so keeping the default
-cwd is required there. Provider, mode,
-name, watched files, acceptance checks and conversation come from the finished job; no `provider` parameter, and `checks` replaces the inherited checks (`[]` clears them).
-Refuses running workers (pointing to `steer_job`), workers without a conversation handle, ambiguous names. Result:
-the slim ack, as for `spawn_job`.
+### `follow_up` (structured)
+Sends the next message to a worker ("do this next"); never cuts the current turn.
+Params: `worker` (worker name or any turn `jobId`, required), `prompt` (required),
+`context` (optional, 1 to 2 000 chars), `files` (optional relative paths in `repo`, merged with
+the worker's watched files and re-synced into `cwd` when changed in `repo` or newly added),
+`checks` (replaces inherited checks for the next turn; `[]` clears them), `model`, `effort`,
+`timeoutMs`, `env` (overlays the launching process environment; kept in memory for the Claude
+Code session via the service env vault and passed to owners over IPC, never written to disk),
+`unrestricted` (default: inherited from the head turn; an explicit `true` for codex, claude,
+or opencode is confirmed as for `spawn_job`). Provider, mode, name, cwd, and conversation
+come from the worker; no `provider` parameter.
 
-### `steer_job` (structured)
-Params: `worker` (name, `workerId`, or job id of a worker, required), `prompt` (required),
-`delivery` enum `queue|interrupt` (required; `queue` appends the steer and chains a continuation turn when the active turn exits, or seamlessly falls through to resuming when the prior turn already ended `succeeded` with a `conversation` handle and no pending acceptance checks; `interrupt` writes `cancel.steer` to stop the active turn and chain the continuation turn, failing closed when no `conversation` handle exists yet unless `allowFresh: true` is passed), `allowFresh` (optional boolean, allows `delivery: 'interrupt'` to start a fresh continuation if no `conversation` handle exists yet), `context` (optional, 1 to 2 000 chars), `files` (optional relative paths in `repo`, merged with the active turn's watched files and re-synced into `cwd` when changed in `repo` or newly added).
-Refuses `delivery: 'queue'` fallthrough on `failed`/`canceled` turns or pending acceptance checks, `delivery: 'interrupt'` on non-running turns, pipeline stages, and running turns without a live owner process.
-Result (`SteerAck`): `jobId` (the active turn ID when queued/interrupting, or the new turn's ID when `action: 'resumed'`), `name, workerId, provider, delivery, status: 'running', action: 'queued'|'interrupting'|'resumed', turn, pendingSteers, signalled, resumable, repo, timeoutMs, note`, plus `continuedFrom?`, `continuationKind?`, `chainStartedAt?`.
-`resumable` reports whether a conversation handle was known when the steer was accepted. A queued steer that the turn cannot deliver (for example because it failed) is recorded as a warning on the terminal job rather than being lost silently.
+Behaviour:
+- Running worker on a `liveInput` provider (`claude`) with a plain message (no overrides, `files`, or `context`): written to stdin, `action: 'queued'`, `delivery: 'next-step'` (read at the next tool round of the same turn, no new turn). If not replayed before the turn ends, it runs as the next turn.
+- Running worker on other providers (or with overrides, `files`, or `context`): `action: 'queued'`, `delivery: 'turn-end'`. Delivered as the next turn when the current turn ends, whatever its outcome (succeeded or failed; only `cancel` discards queued messages). Intermediate turns skip checks (`unchecked`, reason `"continued by follow-up"`); checks run when the worker would go idle.
+- Turn done, checks running: `action: 'queued'`, `delivery: 'turn-end'`. Waits for the check verdict and includes a bounded verdict block in the next turn's brief.
+- Idle worker (succeeded, failed, or canceled): cold-starts a new turn with a new owner (`action: 'started'`, `delivery: 'now'`). Refuses idle workers with no saved conversation handle (`"<name>" (<jobId>) has no saved conversation; spawn_job with from:"<name>" starts it fresh with the original brief.`).
+
+Ambiguous names resolve running workers first, then this session's latest worker, then a unique
+match, else return an error listing candidates.
+
+Result (`MessageAck`): `jobId` (the running head turn when `action: 'queued'`, or the new
+turn's ID when `action: 'started'`), `name, workerId, turn, action: 'queued'|'started',
+delivery: 'next-step'|'turn-end'|'now', status: 'running', provider, repo, timeoutMs`, plus
+`pendingMessages?`, `env?: 'set'|'kept'|'dropped'` (omitted when the worker never had `env`;
+`'dropped'` with `envKeys` naming the keys that have no value and a warning when values were lost
+after a restart, else `'set'` when passed on a cold start, `'kept'` when supplied by the session vault
+or live owner), `envKeys?`,
+`checks?` (names), `warnings?`, `note?`.
+
+### `steer` (structured)
+Redirects a worker immediately ("stop and do this instead"); cuts an in-flight turn or running checks.
+Params: `worker` (worker name or any turn `jobId`, required), `prompt` (required),
+`context` (optional, 1 to 2 000 chars), `files` (optional relative paths in `repo`, merged and
+re-synced as for `follow_up`), `allowFresh` (optional boolean; allows interrupting a running
+turn before a conversation handle is recorded by starting a fresh continuation).
+
+Behaviour:
+- Running worker: writes `cancel.steer` and returns `action: 'interrupting'`, `delivery: 'now'` (fails closed before a conversation handle exists unless `allowFresh: true`).
+- Checks running: writes `checks.abort` and returns `action: 'interrupting'`, `delivery: 'now'`; the owner aborts checks (`aborted by steer`) and chains the steered turn.
+- Idle worker (succeeded, failed, or canceled): starts a new turn (`action: 'started'`, `delivery: 'now'`). Same no-conversation error and name resolution as `follow_up`.
+
+Result (`MessageAck`): `jobId` (the head turn when `action: 'interrupting'`, or the new
+turn's ID when `action: 'started'`), `name, workerId, turn, action: 'interrupting'|'started',
+delivery: 'now', status: 'running', provider, repo, timeoutMs`, plus `pendingMessages?`,
+`checks?` (names), `warnings?`, `note?`.
 
 ### `list_jobs` (read-only, structured)
 Params: `status` enum
 `running|succeeded|failed|canceled`, `limit` 1-500 (default 20 concise, 50 detailed), `since` (ISO time
 or relative `30m`/`2h`/`1d`; jobs last active at or after it), `session` (only jobs spawned by this server
 process; empty after a restart), `response_format` `concise|detailed` (default `concise`). Groups by `workerId` by default (one row per worker, selecting the head turn). Running first,
-then newest. Every row (both formats) adds `taskStatus`. Concise rows: `jobId, name, workerId, turn, status, provider, model, mode, summary` (trimmed to 200 chars on a
-word boundary), `toolCalls, lastActivity` (one line), `startedAt, finishedAt, chainStartedAt?, continuedFrom?, continuationKind?, supersededBy?, pendingSteers?, nextAction?, warningCount?`,
-`changedFileCount?`, `acceptance?`, `digest?`, and when they apply `liveness`,
-`toolErrors`, `failedEarly`, `changedFilesUnknown`, `cwdMissingAtFinish` (see `status`).
+then newest.
+Concise rows (compact JSON):
+- Settled: `name, jobId, turn` (only if `> 1`), `status, provider, model, mode, summary` (<= 160 chars), `durationMs, finishedAt, acceptance` (verdict), `changedFileCount` (only if `> 0`), `warningCount?`, and finish evidence fields when they apply (`toolErrors, failedEarly, changedFilesUnknown, cwdMissingAtFinish`).
+- Running: `name, jobId, turn` (only if `> 1`), `status, provider, model, mode, liveness, lastActivity, digest, elapsedMs, toolCalls, pendingMessages?`.
+Concise rows omit `workerId`, `taskStatus`, `chainStartedAt`, `startedAt` (settled), `continuedFrom`, `continuationKind`, `supersededBy`, and `followedBy`.
 Detailed rows (`JobSummary`): `jobId, name, workerId, turn, role, latestSummary, summarySource,
-source, status, provider, mode, model, task, toolCalls, currentActivity, lastActivity, startedAt,
-updatedAt, finishedAt, chainStartedAt?, continuedFrom?, continuationKind?, supersededBy?, pendingSteers?, warnings[], nextAction, unrestricted?`, the same evidence fields,
+source, status, taskStatus, provider, mode, model, task, toolCalls, currentActivity, lastActivity, startedAt,
+updatedAt, finishedAt, chainStartedAt?, continuedFrom?, continuationKind?, supersededBy?, followedBy?, pendingMessages?, warnings[], nextAction, unrestricted?`, the same evidence fields,
 `lastEventAt`, `lastAliveAt`, and for running jobs `liveness`. `latestSummary` is
 untrusted: the worker's current message while it runs, the end of its final response once done.
 
 ### `status` (read-only, structured)
-Params: `jobId` (required; accepts a job ID, worker name, or `workerId` and resolves to the worker's latest turn across steers and resumes), `wait_ms` 1-60000 (long-poll while running), `response_format`
-`concise|detailed` (default `concise`), `include_diff` (boolean).
-Both formats add `taskStatus`.
-Concise result: `jobId, name, workerId, turn, provider, model, mode, status, taskStatus`, `acceptance {state, passed[], failed[]
+Params: `id` (required; a worker name resolves to the worker's latest turn; a `jobId` resolves to that exact turn, following only `supersededBy` steer replacements, not `followedBy`), `wait_ms` 1-60000 (long-poll while running), `response_format`
+`concise|detailed` (default `concise`), `include_diff` (boolean), `report_only` (boolean).
+Concise result: `jobId, workerId, name, turn` (only if `> 1`), `status, provider, model, mode`, `acceptance {state, passed[], failed[]
 (check names), pending?, running?, reason?}` (`running`: the checks running now, while `pending`),
-`liveness` (running jobs), `startedAt, finishedAt, durationMs, chainStartedAt?, continuedFrom?, continuationKind?, supersededBy?, pendingSteers?, toolCalls, lastActivity`,
-`changedFileCount`, `changedFiles` (first 20), `nextAction`, `error`, `warnings` (deduped strings), `earlierTurns` (unified prior turns across steers and resumes), one `report`
-(first 2 000 chars; a trailing note says it was cut and `reportTruncated` is true), `summary` only when
-the report does not already contain it, and with `wait_ms`: `waited`, `stillRunning`. Null fields are omitted.
+`supersededBy?` (only if set), `resolvedFrom?` (only if set), `liveness` and `lastActivity` (running jobs),
+`durationMs, pendingMessages?`, `changedFileCount`, `changedFiles` (first 20), `changedFilesNote?`,
+finish evidence fields (`toolErrors, failedEarly, changedFilesUnknown, cwdMissingAtFinish`), `staleReads?`,
+`nextAction`, `reason`, `error` (<= 500 chars), `warnings` (deduped strings),
+`earlierTurns` (`[{turn, jobId, status, summary (<= 120 chars)}]`), `report`
+(first 2 000 chars; a trailing note says it was cut and `reportTruncated` is true), `reportPath`,
+`summary` only when the report does not already contain it, and with `wait_ms`: `waited`, `stillRunning`. Null fields are omitted.
 `include_diff` (either format) adds `diff`: a unified diff of `changedFiles` against the job's spawn-time
 `gitBaseline.head`, run in the job's `cwd`, capped at 40 000 chars on a line boundary. `diffNote` says how
 to see the rest (`git diff <head> -- <file>`), lists new untracked files (which a diff cannot show), or
@@ -275,21 +312,19 @@ unknown, not none), `cwdMissingAtFinish` (the cwd was gone at finish; a writing 
 with reason `working directory gone`).
 The diff is evidence, not attribution: parallel workers in one tree see each other's edits, and edits that
 were already uncommitted at spawn in a changed file are included.
-Detailed result (the full record): `JobSummary` fields plus `report` (first 8 000 chars), `reportTruncated`, `error`,
+Detailed result (the full record): `JobSummary` fields plus `report` (first 8 000 chars), `reportPath`, `reportTruncated`, `error`,
 `exitCode`, `unrestricted`, `pipeline`, `stage`, `usage`, `conversation`, `effort`, `cwd`,
 `modelRequested/modelResolved/modelSource`, `preambleApplied`, `sandbox`, `sandboxFlags`,
 `readOnlyRequested/readOnlyEnforced`, `cancellable`, `gitBaseline?`, `changedFiles?`,
-`changedFilesTruncated?`, the evidence fields above, `liveness?`, `earlierTurns?`, `acceptance
+`changedFilesTruncated?`, the evidence fields above, `liveness?`, `earlierTurns?` (concise fields plus `report`, `reportPath`), `acceptance
 {state:'accepted|rejected|unchecked', checks[], at?, pending?, budgetMs?, running?, startedAt?,
 reason?}`, and with `wait_ms`: `waited:true`, `stillRunning`.
 
 ### `cancel` (destructive, idempotent)
-Params: `jobId` (a job id or a pipeline run id; a run record is tried first). Waits up to 5 s for the job or run to
-settle. Job result: `{jobId, status, settled, resolvedFrom?}` (`resolvedFrom` when a steer redirected the id to its
-continuation), plus `checksCanceled: true` when the worker had already exited and this process aborted its running
-acceptance checks (acceptance then reads `unchecked`, reason `checks canceled`). When a detached supervisor owns the
-checks, the result instead carries `checksCanceled: false` and a `checksNote` (the supervisor stops them within about
-200 ms, same outcome). Run result: `{runId, status, settled}`. A settled cancel writes the claim marker, so the hook
+Params: `id` (a worker name, job ID, or pipeline run ID; a run record is tried first; a worker name resolves to the worker's latest turn, while a `jobId` resolves to that turn, following only `supersededBy`). Waits up to 5 s for the job or run to
+settle. Discards any queued follow-ups on the target turn. Job result: `{jobId, workerId, status, settled, resolvedFrom?, discarded?, warnings?}` (`resolvedFrom` when a steer redirected the id to its
+continuation; `discarded` is the count of discarded queued messages, omitted when 0, with `warnings` quoting the first discarded message), plus `checksCanceled: true` when running
+acceptance checks stopped before `cancel` returned (acceptance then reads `unchecked`, reason `checks canceled`), or `checksCanceled: false` with `checksNote` if a detached supervisor is still stopping them. Run result: `{runId, status, settled}`. A settled cancel writes the claim marker, so the hook
 stays silent, and the mod retires its pending notice; `settled: false` means the worker has not stopped yet, so check
 `status`.
 
@@ -345,6 +380,7 @@ completion notice or call cancel.`).
 | Path | Content | Git |
 |---|---|---|
 | `<repo>/.agent-smith/jobs/<jobId>/` | job directory (see ARCHITECTURE.md) | ignored (`.agent-smith/`) |
+| `<repo>/.agent-smith/workers/` | per-worker turn index (`<workerId>.json`) and exclusive lock (`<workerId>.lock`) | ignored |
 | `<repo>/.agent-smith/tasks/` | durable MCP Tasks records (`<taskId>.json`, `<taskId>.terminal`; 24 h TTL, max 1 000) | ignored |
 | `<repo>/.agent-smith/pipelines/` | run records, `.cancel` markers, `<runId>/artifacts/` | ignored |
 | `<repo>/.agent-smith/models.json` | project aliases | ignored by this repo's `.gitignore`; in a consuming repo, commit it or ignore it as you prefer |

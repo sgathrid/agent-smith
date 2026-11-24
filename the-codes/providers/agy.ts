@@ -101,7 +101,9 @@ import type { RunFn } from './discovery.ts';
 import { exitReason } from '../surfaces/mod/hooks/reasons.ts';
 import { deniedText, noResultText, stderrClause } from './failure-text.ts';
 
-export const AGY_BINARY = process.env['AGENT_SMITH_AGY_BIN'] ?? 'agy';
+export function agyBinary(): string {
+  return process.env['AGENT_SMITH_AGY_BIN'] ?? 'agy';
+}
 
 /** agy's own enum, verified from `agy --help` and from 14.9k live records. */
 type AgyStepType = 'tool' | 'agent_response' | 'user_input' | 'system_message' | 'error_message' | 'checkpoint';
@@ -650,7 +652,7 @@ export async function listAgyModels(run: RunFn, options?: ListModelsOptions): Pr
     verified: true,
   };
   try {
-    const r = await run(AGY_BINARY, ['models'], options?.timeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS);
+    const r = await run(agyBinary(), ['models'], options?.timeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS);
     const models = parseAgyModels(r.stdout);
     if (r.error !== undefined && models.length === 0) return { ...base, error: r.error };
     if (models.length === 0) return { ...base, error: '`agy models` printed no models' };
@@ -669,7 +671,7 @@ export const agyProvider: Provider = {
    * would make startup slow and flaky. A resolvable binary is the contract;
    * auth problems surface as a job error instead.
    */
-  available: () => binaryAvailable(AGY_BINARY),
+  available: () => binaryAvailable(agyBinary()),
 
   describeSandbox: sandboxPlan,
 
@@ -681,7 +683,7 @@ export const agyProvider: Provider = {
 
     return runNdjsonWorker({
       provider: 'agy',
-      binary: AGY_BINARY,
+      binary: agyBinary(),
       spec,
       buildArgv,
       translate: translator.onEvent,

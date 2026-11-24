@@ -1,7 +1,3 @@
-/** Canonical Forge projection shared by the band, pane and native task bridge.
- * Lists never read reports or event logs. Detail reads one bounded writer view.
- * Kept inside the plugin because the mod loader forbids imports from forge/.
- */
 import type { ActivityEvent, ContinuationKind, ProgressDigest, RadarAcceptance, RadarJob, RadarStatus } from '../types/index.d.ts';
 import { toEpoch, type FsLike } from './fs.ts';
 import { classify, progressPhrase } from './progress.ts';
@@ -9,10 +5,10 @@ import { livenessOf } from './stale.ts';
 import { firstText, record } from './guards.ts';
 import { isLiveStatus, isTerminal } from './format.ts';
 import { REASONS, STEER_NOT_APPLIED_RE } from './reasons.ts';
+import { normalizeContinuationKind } from './turns.ts';
 
 type RecordValue = Record<string, unknown>;
 const STATUSES = new Set(['running', 'attention', 'succeeded', 'failed', 'canceled']);
-const CONTINUATION_KINDS = new Set<ContinuationKind>(['steer-queue', 'steer-interrupt', 'resume']);
 
 function number(v: unknown): number | null {
   return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null;
@@ -54,9 +50,8 @@ export function acceptanceLabel(value?: RadarAcceptance): string {
   return value?.pending ? 'checking' : value?.state ?? 'unchecked';
 }
 
-/** True when a job's on-disk summary files are immutable and safe to cache across polls. */
 export function isSettledForCache(job: RadarJob): boolean {
-  return isTerminal(job.status) && job.acceptance?.pending !== true;
+  return isTerminal(job.status) && job.acceptance?.pending !== true && !((job.pendingMessages ?? 0) > 0);
 }
 
 async function readForgeJob(fs: FsLike, repo: string, id: string, now: number): Promise<RadarJob | null> {
@@ -73,16 +68,11 @@ async function readForgeJob(fs: FsLike, repo: string, id: string, now: number): 
   const warnings = (Array.isArray(p?.warnings) ? p.warnings : []).filter((w): w is string => typeof w === 'string')
     .map(message => ({ code: STEER_NOT_APPLIED_RE.test(message) ? 'steer_not_applied' : 'tool_error', message }));
   if (live && await fs.exists(`${dir}/orphaned`) && !await fs.exists(`${dir}/result.json`)) {
-    // The marker proves the supervisor is gone, so a cancel request it never
-    // confirmed is a cancellation, not a failure (mirrors forge deriveOrphan).
     const canceled = await fs.exists(`${dir}/cancel`);
     status = canceled ? 'canceled' : 'failed';
-    // The supervisor is gone; its spawn-time placeholder cannot settle itself.
     a = { ...a, pending: false };
     if (!canceled) warnings.unshift({ code: 'orphaned', message: REASONS.serverStopped });
   }
-  // One liveness rule for band, pane, notices and the channel (stale.ts):
-  // attention is silent or dead; a long open tool call stays running.
   const liveness = live && status !== 'failed' && status !== 'canceled'
     ? livenessOf({ status: 'running', lastEventAt: lastSeen, lastAliveAt: firstText(p?.lastAliveAt), lastActivity: record(p?.lastActivity), now })
     : null;
@@ -100,14 +90,12 @@ async function readForgeJob(fs: FsLike, repo: string, id: string, now: number): 
   const staleReads = (Array.isArray(m.staleReads) ? m.staleReads : []).filter((f): f is string => typeof f === 'string' && f.trim() !== '');
   const startedAt = toEpoch(firstText(m.startedAt, m.createdAt));
   const chainStartedAt = toEpoch(firstText(m.chainStartedAt)) ?? startedAt;
-  // Defensive fallback for old 0.4.x job.json files on disk only.
   const legacySteeredFrom = firstText(m['steeredFrom']);
   const continuedFrom = firstText(m.continuedFrom) ?? legacySteeredFrom;
-  const rawKind = typeof m.continuationKind === 'string' && CONTINUATION_KINDS.has(m.continuationKind as ContinuationKind)
-    ? (m.continuationKind as ContinuationKind) : null;
-  const continuationKind: ContinuationKind | null = rawKind ?? (m.continuedFrom === undefined && legacySteeredFrom !== null ? 'steer-queue' : null);
+  const continuationKind: ContinuationKind | null = normalizeContinuationKind(m.continuationKind) ?? (continuedFrom !== null ? 'follow-up' : null);
   const rawPendingSteers = number(p?.pendingSteers) ?? number(m.pendingSteers);
   const pendingSteers = isLiveStatus(status) && rawPendingSteers !== null && rawPendingSteers > 0 ? rawPendingSteers : null;
+  const pendingMessages = rawPendingSteers !== null && rawPendingSteers > 0 ? rawPendingSteers : null;
   return {
     id, name: firstText(m.name, resolved?.name, p?.name), workerId: firstText(m.workerId, resolved?.workerId, p?.workerId) ?? id,
     turn: positiveInt(m.turn) ?? 1,
@@ -123,13 +111,12 @@ async function readForgeJob(fs: FsLike, repo: string, id: string, now: number): 
     changedFileCount: Array.isArray(m.changedFiles) && m.changedFilesTruncated !== true ? m.changedFiles.length : null,
     acceptance: a, failureReason: firstText(m.reason, m.failureReason, m.error, status === 'failed' ? warnings[0]?.message : null),
     failureDetail: firstText(m.error),
-    supersededBy: firstText(m.supersededBy), continuedFrom, continuationKind,
-    pendingSteers,
+    supersededBy: firstText(m.supersededBy), followedBy: firstText(m.followedBy), continuedFrom, continuationKind,
+    pendingSteers, pendingMessages,
     ...(staleReads.length > 0 ? { staleReads } : {}),
     warnings, report: null, reasoning: firstText(p?.latestText), raw: {},
   };
 }
-/** progress.json `digest`, accepted only when it has the shape the writer produces. */
 function digest(v: unknown): ProgressDigest | null {
   const d = record(v);
   if (d === null || typeof d.phase !== 'string' || !Array.isArray(d.edited)) return null;
@@ -184,13 +171,11 @@ export async function readForgeJobs(
     for (const key of cache.keys()) {
       if (key.startsWith(prefix) && !seenKeys.has(key)) cache.delete(key);
     }
-    // Self-heal mid-flight steer handoff: if a steered child appears while its parent was
-    // cached right before `supersededBy` landed on disk, re-read that parent once.
     for (const child of freshlyRead) {
-      if (!child.continuedFrom || (child.continuationKind !== 'steer-queue' && child.continuationKind !== 'steer-interrupt')) continue;
+      if (!child.continuedFrom || child.continuationKind === null || child.continuationKind === undefined) continue;
       const parentKey = `${prefix}${child.continuedFrom}`;
       const cachedParent = cache.get(parentKey);
-      if (cachedParent && !cachedParent.supersededBy) {
+      if (cachedParent && cachedParent.supersededBy !== child.id && cachedParent.followedBy !== child.id) {
         cache.delete(parentKey);
         const refreshed = await readForgeJob(fs, repo, child.continuedFrom, now);
         if (refreshed) {
@@ -206,7 +191,6 @@ export async function readForgeJobs(
 export interface ForgeDetail {
   job: RadarJob;
   timeline: ActivityEvent[];
-  /** The writer bounded this snapshot, so the timeline is a preview, not the whole run. */
   truncated?: boolean;
 }
 export async function readForgeDetail(fs: FsLike, repo: string, id: string, now: number): Promise<ForgeDetail | null> {
@@ -221,12 +205,16 @@ export async function readForgeDetail(fs: FsLike, repo: string, id: string, now:
     const item = record(value);
     if (!item || typeof item.sequence !== 'number' || typeof item.at !== 'string') return [];
     if (item.kind === 'assistant' && typeof item.text === 'string') return [item as ActivityEvent];
+    if (item.kind === 'message' && typeof item.text === 'string') {
+      return [{ sequence: item.sequence, kind: 'message', at: item.at, text: item.text,
+        delivery: item.delivery === 'turn-start' ? 'turn-start' : 'next-step',
+        sender: item.sender === 'steer' ? 'steer' : 'follow_up' } as ActivityEvent];
+    }
     if (item.kind === 'tool' && typeof item.tool === 'string' && typeof item.stepIndex === 'number' &&
       typeof item.input === 'string' && typeof item.output === 'string' && typeof item.state === 'string') return [item as ActivityEvent];
     return [];
   }) : [];
   return { job: { ...job, report, prompt: firstText(view?.prompt), preamble: firstText(view?.preamble),
-    // A bounded preview is normal for a long job, not a warning.
     warnings: [...job.warnings, ...(view === null ? [{code:'detail_unavailable',message:'This older job has no detail snapshot; summary and report are shown.'}] : [])] }, timeline,
     truncated: view?.truncated === true };
 }

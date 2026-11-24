@@ -1,6 +1,3 @@
-/**
- * steer-git.test.ts — steering with watched brief files (worktree copies, stale reads, re-sync).
- */
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -26,7 +23,6 @@ test('watched brief files: copies into worktree cwd, excludes unmodified copy fr
   const worktree = mkdtempSync(path.join(tmpdir(), 'agent-smith-wt-'));
   seedRepo(worktree);
 
-  // Edit ARCHITECTURE.md in repo before spawn so repo has v2 while worktree still has v1
   writeFileSync(path.join(repo, 'ARCHITECTURE.md'), '# Architecture v2\nPackEngine export.\n');
 
   const turn1Ready = ctrl.nextTurn();
@@ -38,24 +34,17 @@ test('watched brief files: copies into worktree cwd, excludes unmodified copy fr
     prompt: 'Implement according to ARCHITECTURE.md.',
   });
 
-  // Immediately after spawnTracked, ARCHITECTURE.md in worktree should be synced to v2
   assert.equal(readFileSync(path.join(worktree, 'ARCHITECTURE.md'), 'utf8'), '# Architecture v2\nPackEngine export.\n');
 
   const turn1 = await turn1Ready;
-  // Wait for async gitBaseline capture on start() before simulating worker file edits
   await waitFor(() => JSON.parse(readFileSync(jobFile(repo, ack.jobId, FILES.job), 'utf8')).gitBaseline, { message: 'gitBaseline' });
   turn1.emit({ kind: 'started', at: new Date().toISOString(), conversationId: 'thread-f' });
-  // Worker reads ARCHITECTURE.md (so toolInputs mentions ARCHITECTURE.md) and edits src.ts
   turn1.emit({ kind: 'activity-start', at: new Date().toISOString(), activity: { stepIndex: 1, tool: 'Read', input: 'ARCHITECTURE.md' } });
   writeFileSync(path.join(worktree, 'src.ts'), 'export const x = 1;\n');
   turn1.emit({ kind: 'activity-start', at: new Date().toISOString(), activity: { stepIndex: 2, tool: 'Write', input: 'src.ts' } });
 
-  // While turn 1 is running, orchestrator edits ARCHITECTURE.md in main repo to v3!
   writeFileSync(path.join(repo, 'ARCHITECTURE.md'), '# Architecture v3\nUpdated export.\n');
 
-  // Live detail() while running detects staleReads!
-  // The manifest only reads 'running' once the 'started' event is persisted (async under load), and
-  // live staleness is only computed for a running job, so wait for that state, then assert.
   const runningDetail = await waitFor(
     async () => {
       const d = await service.detail(ack.jobId);
@@ -65,34 +54,29 @@ test('watched brief files: copies into worktree cwd, excludes unmodified copy fr
   );
   assert.deepEqual(runningDetail.staleReads, ['ARCHITECTURE.md']);
 
-  // Queue a steer that also adds a new watched file docs/extra.md
   writeFileSync(path.join(repo, 'docs', 'extra.md'), 'Extra spec.\n');
-  await service.steer({
+  await service.followUp({
     worker: 'worker-f',
     prompt: 'Re-read ARCHITECTURE.md and docs/extra.md.',
     files: ['docs/extra.md'],
-    delivery: 'queue',
   });
 
   const turn2Ready = ctrl.nextTurn();
   turn1.finish({ status: 'success', response: 'Finished initial implementation according to v2.' });
 
   const turn2 = await turn2Ready;
-  // Parent turn finished before re-sync: parent's changedFiles must include src.ts and MUST NOT include ARCHITECTURE.md!
-  // The parent's changedFiles land when its finish is persisted, which can trail the continuation's start.
   const parentDetail = await waitFor(async () => { const d = await service.detail(ack.jobId); return d.changedFiles !== undefined ? d : null; },
     { message: 'the parent turn to record its changedFiles' });
   assert.deepEqual(parentDetail.changedFiles, ['src.ts']);
   assert.deepEqual(parentDetail.staleReads, ['ARCHITECTURE.md']);
 
-  // Before turn 2 started, pump re-synced ARCHITECTURE.md (to v3) and docs/extra.md into worktree!
   assert.equal(readFileSync(path.join(worktree, 'ARCHITECTURE.md'), 'utf8'), '# Architecture v3\nUpdated export.\n');
   assert.equal(readFileSync(path.join(worktree, 'docs', 'extra.md'), 'utf8'), 'Extra spec.\n');
   assert.match(turn2.spec.prompt, /Synced brief file\(s\) in your working tree: ARCHITECTURE\.md, docs\/extra\.md/);
 
-  // In turn 2, wait for turn 2's gitBaseline capture, then worker modifies docs/brief.md in its worktree
   const parentAfterSteer = await service.detail(ack.jobId);
-  const turn2JobId = parentAfterSteer.supersededBy!;
+  const turn2JobId = parentAfterSteer.followedBy!;
+  assert.equal(parentAfterSteer.supersededBy, undefined);
   await waitFor(() => JSON.parse(readFileSync(jobFile(repo, turn2JobId, FILES.job), 'utf8')).gitBaseline, { message: 'turn 2 gitBaseline' });
   writeFileSync(path.join(worktree, 'docs', 'brief.md'), 'Worker edited brief.\n');
   turn2.emit({ kind: 'activity-start', at: new Date().toISOString(), activity: { stepIndex: 1, tool: 'Write', input: 'docs/brief.md' } });
@@ -100,8 +84,6 @@ test('watched brief files: copies into worktree cwd, excludes unmodified copy fr
 
   const finalManifest = await done;
   const finalDetail = await service.detail(finalManifest.jobId);
-  // Because worker modified docs/brief.md in worktree, it IS in changedFiles, and NOT in staleReads.
-  // Meanwhile ARCHITECTURE.md and docs/extra.md (synced from repo, unmodified by worker) are NOT in changedFiles!
   assert.ok(finalDetail.changedFiles?.includes('docs/brief.md'), 'worker-modified watched file is in changedFiles');
   assert.equal(finalDetail.changedFiles?.includes('ARCHITECTURE.md'), false, 'unmodified synced watched file is excluded from changedFiles');
   assert.equal(finalDetail.changedFiles?.includes('docs/extra.md'), false, 'unmodified newly synced watched file is excluded from changedFiles');
@@ -143,7 +125,6 @@ test('watched brief files in same-root cwd (cwd === repo): reading ARCHITECTURE.
   const turn = await turnReady;
   await waitFor(() => JSON.parse(readFileSync(jobFile(repo, ack.jobId, FILES.job), 'utf8')).gitBaseline, { message: 'gitBaseline' });
   turn.emit({ kind: 'started', at: new Date().toISOString(), conversationId: 'thread-same-root' });
-  // Worker reads ARCHITECTURE.md and edits src.ts in the same repository root (cwd === repo).
   turn.emit({
     kind: 'activity-start',
     at: new Date().toISOString(),
@@ -156,10 +137,8 @@ test('watched brief files in same-root cwd (cwd === repo): reading ARCHITECTURE.
     activity: { stepIndex: 2, tool: 'Write', input: 'src.ts' },
   });
 
-  // Orchestrator edits ARCHITECTURE.md in repo while worker is running.
   writeFileSync(path.join(repo, 'ARCHITECTURE.md'), '# Architecture v2\nOrchestrator update.\n');
 
-  // Live staleReads are computed only once the manifest reads running, which trails the started event.
   const liveDetail = await waitFor(async () => { const d = await service.detail(ack.jobId); return d.status === 'running' && d.staleReads !== undefined ? d : null; },
     { message: 'live staleReads while running' });
   assert.deepEqual(liveDetail.staleReads, ['ARCHITECTURE.md']);
@@ -171,7 +150,6 @@ test('watched brief files in same-root cwd (cwd === repo): reading ARCHITECTURE.
   assert.deepEqual(finalDetail.changedFiles, ['src.ts']);
   assert.deepEqual(finalDetail.staleReads, ['ARCHITECTURE.md']);
 
-  // Completion notice also surfaces staleReads at finish time.
   const now = Date.now();
   const owned = claim([], { kind: 'job', id: ack.jobId, repo, timeoutMs: 60_000 }, now);
   const noticeRes = due(
@@ -211,7 +189,6 @@ test('watched brief files: re-sync on steer preserves worker edits in worktree w
   const turn1 = await turn1Ready;
   turn1.emit({ kind: 'started', at: new Date().toISOString(), conversationId: 'thread-preserve' });
 
-  // Worker edits docs/brief.md in its worktree; repo copy of docs/brief.md stays unchanged.
   writeFileSync(path.join(worktree, 'docs', 'brief.md'), '# worker edit\n');
   turn1.emit({
     kind: 'activity-start',
@@ -219,11 +196,9 @@ test('watched brief files: re-sync on steer preserves worker edits in worktree w
     activity: { stepIndex: 1, tool: 'Write', input: 'docs/brief.md' },
   });
 
-  // Steer the worker without changing repo/docs/brief.md.
-  await service.steer({
+  await service.followUp({
     worker: ack.jobId,
     prompt: 'Continue turn 2.',
-    delivery: 'queue',
   });
 
   const turn2Ready = ctrl.nextTurn();
@@ -237,13 +212,11 @@ test('watched brief files: re-sync on steer preserves worker edits in worktree w
   );
   assert.doesNotMatch(turn2.spec.prompt, /Synced brief file\(s\) in your working tree/);
 
-  // Now modify ARCHITECTURE.md in BOTH repo and worktree before turn 3 steer: worktree copy must not be clobbered.
   writeFileSync(path.join(repo, 'ARCHITECTURE.md'), '# repo conflicting edit\n');
   writeFileSync(path.join(worktree, 'ARCHITECTURE.md'), '# worktree conflicting edit\n');
-  await service.steer({
+  await service.followUp({
     worker: ack.jobId,
     prompt: 'Continue turn 3.',
-    delivery: 'queue',
   });
 
   const turn3Ready = ctrl.nextTurn();
@@ -289,7 +262,6 @@ test('watched brief files: rejects symlink escaping repo, enforces 32-file cap, 
     /exceeds maximum of 32 watched files/,
   );
 
-  // Spawn a job with docs/brief.md, finish it, delete docs/brief.md from repo, then resume_job:
   const t1Ready = ctrl.nextTurn();
   const { ack, done } = await service.spawnTracked({
     mode: 'implement',
@@ -308,7 +280,7 @@ test('watched brief files: rejects symlink escaping repo, enforces 32-file cap, 
   const t2Ready = ctrl.nextTurn();
   const resumeOut = await callTool(
     { service, catalogs: async () => [] },
-    'resume_job',
+    'follow_up',
     { worker: ack.jobId, prompt: 'Resume after docs/brief.md was deleted.' },
   );
   assert.notEqual(resumeOut.isError, true);
@@ -386,7 +358,6 @@ test('steer ack reports the job timeoutMs from the manifest when another process
   });
   const t1 = await t1Ready;
 
-  // A second service on the same repo has no live entry for the job: it is owned elsewhere (ownerPid is this process, alive).
   const other = new ForgeService({
     repo,
    
@@ -394,8 +365,8 @@ test('steer ack reports the job timeoutMs from the manifest when another process
     providerSource: () => ctrl.provider,
     catalogSource: async () => [],
   });
-  const steered = await other.steer({ worker: ack.jobId, prompt: 'Adjust.', delivery: 'queue' });
-  assert.equal(steered.signalled, false);
+  const steered = await other.followUp({ worker: ack.jobId, prompt: 'Adjust.' });
+  assert.equal(steered.action, 'queued');
   assert.equal(steered.timeoutMs, 4000);
 
   const t2Ready = ctrl.nextTurn();
@@ -403,7 +374,6 @@ test('steer ack reports the job timeoutMs from the manifest when another process
   (await t2Ready).finish({ status: 'success', response: 'Done.' });
   await done;
 });
-
 
 test('a steer continuation that starts fresh does not list the worker\'s own edits as already modified', async () => {
   const ctrl = controlledProvider();
@@ -416,8 +386,7 @@ test('a steer continuation that starts fresh does not list the worker\'s own edi
   assert.match(turn1.spec.prompt, /Already modified before you started[^\n]*pre\.ts/);
   writeFileSync(path.join(repo, 'src.ts'), 'export const x = 1;\n');
   const turn2Ready = ctrl.nextTurn();
-  await service.steer({ worker: 'worker-dirty', prompt: 'Also add y.', delivery: 'queue' });
-  // No conversation handle: the continuation starts fresh with a full brief.
+  await service.followUp({ worker: 'worker-dirty', prompt: 'Also add y.' });
   turn1.finish({});
   const turn2 = await turn2Ready;
   assert.doesNotMatch(turn2.spec.prompt, /Already modified/);

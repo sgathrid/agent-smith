@@ -2,7 +2,7 @@
   "hooks": {
     "PostToolUse": [
       {
-        "matcher": "mcp__plugin_agent-smith_agent-smith__spawn_job|mcp__plugin_agent-smith_agent-smith__run_pipeline|mcp__plugin_agent-smith_agent-smith__resume_job|mcp__plugin_agent-smith_agent-smith__steer_job",
+        "matcher": "mcp__plugin_agent-smith_agent-smith__spawn_job|mcp__plugin_agent-smith_agent-smith__run_pipeline|mcp__plugin_agent-smith_agent-smith__follow_up|mcp__plugin_agent-smith_agent-smith__steer",
         "hooks": [
           {
             "type": "command",

@@ -1,4 +1,3 @@
-/** Forge sidebar views: the worker list and one worker's live view. No filesystem or timers here. */
 import type { UiComponents } from 'claude-code';
 import type { RadarJob } from '../types/index.d.ts';
 import type { ForgeDetail } from './canonical.ts';
@@ -8,14 +7,12 @@ import { classify, progressLines } from './progress.ts';
 
 export interface ViewActions {
   pick(job: RadarJob): Promise<void>;
-  /** Pin a prior turn by jobId, or pass null to return to the worker's live head. */
   pickTurn(jobId: string | null): Promise<void>;
   page(value: number): Promise<void>;
   back(): Promise<void>;
   task(): Promise<void>;
   tool(key: string): Promise<void>;
   close(): Promise<void>;
-  /** Switch the list between this session and the repository; absent when there is no session view. */
   scope?(next: 'session' | 'all'): Promise<void>;
 }
 export interface ViewOptions {
@@ -24,7 +21,6 @@ export interface ViewOptions {
   pinnedTurnId: string | null;
 }
 
-/** Rows per page: one per digit hotkey. */
 const PAGE_SIZE = 9;
 
 export function renderList(W: UiComponents, jobs: readonly RadarJob[], o: ViewOptions, a: ViewActions): JSX.Element {
@@ -59,7 +55,6 @@ export function renderList(W: UiComponents, jobs: readonly RadarJob[], o: ViewOp
   </Box>;
 }
 
-/** One scrolling view: header, prior turns inline, task, live timeline, then the result and failing checks. */
 export function renderWorker(W: UiComponents, d: ForgeDetail, o: ViewOptions, a: ViewActions, turns: readonly RadarJob[] = []): JSX.Element {
   const {Box,Text,Button,Markdown} = W;
   const job=d.job;
@@ -71,17 +66,11 @@ export function renderWorker(W: UiComponents, d: ForgeDetail, o: ViewOptions, a:
   const turnNum=job.turn??1;
   const meta=oneLine([[job.provider,job.model].filter(Boolean).join('·'),(turnNum>1||turns.length>1)?`turn ${turnNum}`:'',span===null?'':elapsed(span),checksLabel(job.acceptance)].filter(Boolean).join(' · '));
   const failing=job.acceptance?.checks.filter(check => !check.ok) ?? [];
-  // A live worker's own words, one line, when it wrote any and the timeline
-  // below does not already show them in full.
   const timelineProse=d.timeline.some(event => event.kind==='assistant');
   const note=(job.status==='running'||job.status==='attention')&&!timelineProse
     ? (job.reasoning?oneLine(job.reasoning,Math.max(1,o.width-6)):'') : '';
-  // A running worker's progress block opens with the same phase and test verdict
-  // `workerStatus` would print, so the status row only stands alone without it.
   const statusRow=!(job.status==='running'&&job.progress);
   const queuedSteers=!statusRow?pendingSteersLabel(job.pendingSteers):'';
-  // A shell-edited worker (codex) has no edit tool calls to count, so its
-  // changedFiles manifest is the only evidence of what it touched.
   const changedFiles=isTerminal(job.status)&&job.changedFileCount!=null&&job.changedFileCount>0&&(job.progress?.editedCount??0)===0
     ? job.changedFileCount : 0;
   const livenessLine=workerLivenessLine(job);
@@ -111,9 +100,9 @@ export function renderWorker(W: UiComponents, d: ForgeDetail, o: ViewOptions, a:
         ? timelineGroup(W,item,o,a)
         : item.event.kind==='assistant'
           ? <Markdown key={`event-${item.event.sequence}`} text={proseText(item.event.text)} />
+          : item.event.kind==='message'
+          ? <Text key={`event-${item.event.sequence}`} color={o.colour?'cyan':undefined} wrap="truncate-end">{messageLine(item.event.sender,item.event.text,o.width)}</Text>
           : toolRow(W,`event-${item.event.sequence}`,item.event.tool,item.event.input,item.event.output,item.event.state,o,a);
-      // A blank row where the worker turns from talking to working or back;
-      // a run of tool rows stays one tight block.
       return i>0&&isProse(items[i-1]!)!==isProse(item)
         ? [<Box key={`gap-${timelineKey(item)}`}><Text> </Text></Box>,row] : [row];
     })}
@@ -145,38 +134,28 @@ function toolRow(W: UiComponents,key:string,tool:string,input:string,output:stri
   </Box>;
 }
 
-/**
- * A condensed run of completed read/search calls: one summary row, expanded into
- * the individual rows on press. Nothing is dropped — the same keys the rows
- * would have had are used inside the group.
- */
 function timelineGroup(W: UiComponents, item: Extract<TimelineItem,{kind:'group'}>, o: ViewOptions, a: ViewActions): JSX.Element {
   const {Box,Button,Markdown}=W;
   return <Box key={`row-${item.key}`} flexDirection="column">
     <Button key={item.key} plain dimColor label={`✓ ${timelineGroupLabel(item.reads,item.searches,item.commands)}`} onPress={() => a.tool(item.key)} />
     {o.tools.includes(item.key) && item.events.map(event => event.kind==='tool'
       ? toolRow(W,`event-${event.sequence}`,event.tool,event.input,event.output,event.state,o,a)
+      : event.kind==='message'
+      ? <W.Text key={`event-${event.sequence}`} wrap="truncate-end">{messageLine(event.sender,event.text,o.width)}</W.Text>
       : <Markdown key={`event-${event.sequence}`} text={proseText(event.text)} />)}
   </Box>;
 }
 
-/**
- * The in-progress call's marker: a dim `●` that is on one second and off the
- * next, like Claude Code's own running tool. The pane already redraws every
- * second while open, so the blink needs no timer of its own; the blank keeps
- * the label from shifting.
- */
+export function messageLine(sender: 'follow_up' | 'steer', text: string, width: number): string {
+  const first=sanitizeText(text).split('\n').map(l => l.trim()).find(l => l!=='')??'';
+  return oneLine(`↳ ${sender==='steer'?'steer':'follow-up'} read: ${first}`,Math.max(1,width));
+}
+
 export const activeGlyph=(now: number): string => Math.floor(now/1000)%2===0?'●':' ';
 
 const isProse=(item: TimelineItem): boolean => item.kind==='event'&&item.event.kind==='assistant';
 const timelineKey=(item: TimelineItem): string => item.kind==='group'?item.key:`event-${item.event.sequence}`;
 
-/**
- * The worker's words, marked `●` like Claude Code's own transcript so they stand
- * apart from the dimmed tool rows. A text that opens with a heading, list, quote,
- * fence, table, rule, HTML block or indented code block is left unmarked and
- * keeps its indentation: a prefix would break its markdown.
- */
 export function proseText(text: string): string {
   const clean=sanitizeText(text).replace(/^(?:[ \t]*\n)+/,'');
   if (/^(?: {4}|\t)/.test(clean)) return clean;

@@ -50,8 +50,8 @@ test('settled failures stop needing attention after 24 h; live, pending and stal
   const pending=job('pending',{status:'failed',startedAt:old-10,endedAt:old,acceptance:{state:'unchecked',pending:true,checks:[]}});
   assert.deepEqual([oldFailed,freshFailed,oldRejected,undated,stalled,pending].filter(j=>needsAttention(j,now)).map(j=>j.id),
     ['fresh','undated','stalled','pending']);
-  assert.equal(needsAttention(oldFailed),true); // no clock, no expiry
-  assert.equal(needsAttention(oldFailed,old+ATTENTION_TTL_MS),true); // boundary is exclusive
+  assert.equal(needsAttention(oldFailed),true);
+  assert.equal(needsAttention(oldFailed,old+ATTENTION_TTL_MS),true);
   assert.equal(workerStatus(oldFailed),'failed · server stopped');
 });
 test('session launches are recorded once and select their jobs and pipeline stage jobs',()=>{
@@ -71,7 +71,6 @@ test('the /forge counts name this session, or label the repository, never padded
   assert.equal(scopeLine([],'session'),'No workers in this session');
   assert.equal(scopeLine(rows,'all'),'repository: 2 running · 1 failed · 1 done');
   assert.equal(scopeLine([],'all'),'repository: no workers yet');
-  // One count per listed worker: a resumed worker is one row.
   assert.equal(countLine([job('r1',{workerId:'ada',status:'succeeded',endedAt:1}),job('r2',{workerId:'ada',startedAt:200})]),'1 running');
 });
 
@@ -87,16 +86,11 @@ test('a denial, and an old job with only the long error, read as the same short 
 });
 
 test('measurePaneTerminalColumns reconstructs terminal width from docked pane geometry and leaves fullscreen/non-docked viewports intact', () => {
-  // Docked pane on a 180-column terminal: viewport.columns is conversationColumns (119), bodyColumns is 60, divider is 1.
   assert.equal(measurePaneTerminalColumns({ columns: 119 }, { bodyColumns: 60, placement: 'dock' }), 180);
   assert.equal( paneWidthRequest(measurePaneTerminalColumns({ columns: 119 }, { bodyColumns: 60, placement: 'dock' }) ?? null), 60);
-  // User-resized dock (e.g. dragged to 75 columns on a 180-column terminal -> conversationColumns is 104):
-  // terminal width is still 180, so paneWidthRequest(180) stays 60 and matches lastPaneRequest without fighting user sizing.
   assert.equal(measurePaneTerminalColumns({ columns: 104 }, { bodyColumns: 75, placement: 'dock' }), 180);
-  // Fullscreen or non-docked placement uses viewport.columns directly.
   assert.equal(measurePaneTerminalColumns({ columns: 180 }, { bodyColumns: 180, placement: 'fullscreen' }), 180);
   assert.equal(measurePaneTerminalColumns({ columns: 150 }, { bodyColumns: 50 }), 150);
-  // Missing or invalid geometry returns undefined so lastViewportColumns is not clobbered.
   assert.equal(measurePaneTerminalColumns(undefined, { bodyColumns: 60, placement: 'dock' }), undefined);
   assert.equal(measurePaneTerminalColumns({ columns: 119 }, { bodyColumns: 0, placement: 'dock' }), undefined);
   assert.equal(paneWidthRequest(null), PANE_FALLBACK_COLUMNS);
@@ -104,8 +98,6 @@ test('measurePaneTerminalColumns reconstructs terminal width from docked pane ge
 });
 
 test('commandTerminalColumns reads the terminal width the host stamps on a command event', () => {
-  // command.run's presentation.columns is the whole terminal, so a fresh /forge
-  // can size the dock before any band render has measured it.
   assert.equal(commandTerminalColumns({ isFullscreen: true, columns: 180 }), 180);
   assert.equal(commandTerminalColumns({ columns: 144.7 }), 144);
   assert.equal(commandTerminalColumns({ columns: 0 }), undefined);
@@ -115,13 +107,10 @@ test('commandTerminalColumns reads the terminal width the host stamps on a comma
 });
 
 test('sanitizeText strips ANSI sequences and forbidden controls while preserving newlines and valid astral characters', () => {
-  // Complete CSI, OSC (BEL and ST), DCS, and C1 sequences are removed cleanly without leaving parameter tails.
   const ansi = '\x1b[38;5;196mred\x1b[0m \x1b]8;;https://example.com\x07link\x1b]8;;\x1b\\ \x1bP1$r0m\x1b\\ \x9b32mgreen\x9b0m';
   assert.equal(sanitizeText(ansi), 'red link  green');
-  // Progress carriage returns become newlines; tabs become spaces; NUL, BEL, BS, VT, FF, DEL, C1, noncharacters, and lone surrogates are stripped.
   const controls = 'step 1\rstep 2\r\nstep 3\tindented\x00\x07\x08\x0b\x0c\x1f\x7f\x85\ufdd0\ud800 🚀';
   assert.equal(sanitizeText(controls), 'step 1\nstep 2\nstep 3  indented 🚀');
-  // Dashboard helpers sanitize heading, status, and check labels.
   const dirtyJob = job('dirty', {
     name: '\x1b[31mRenyi\x1b[0m\x07',
     role: 'review\x1b[2K\x08',
@@ -142,7 +131,6 @@ test('a job with no recorded start shows no clock cell, never a fabricated 0s',(
   const undated=job('undated',{startedAt:null,endedAt:null});
   assert.equal(statusLine(undated,1_000_000,60),oneLine(workerStatus(undated),60));
   assert.doesNotMatch(statusLine(undated,1_000_000,60),/0s/);
-  // A dated job keeps its fixed-width clock cell at the end.
   assert.match(statusLine(job('timed',{startedAt:1000}),11_000,60),/Running · Read file\.ts +10s$/);
 });
 
@@ -153,20 +141,16 @@ test('a finished row carries the evidence the writer recorded, and never a fabri
     'done · 3 files changed · checks ✓ 2/2');
   assert.equal(workerStatus(job('rejected',{status:'succeeded',endedAt:200,changedFileCount:2,
     acceptance:{state:'rejected',checks:[{name:'lint',ok:false,outputTail:''}]}})),'checks failed: lint · 2 files changed');
-  // An absent count is not zero: the row says nothing about files.
   assert.equal(workerStatus(job('quiet',{status:'succeeded',endedAt:200})),'done');
-  // A job that edits through the shell still has its digest's file count.
   const digest={phase:'editing' as const,filesRead:2,searches:0,commands:1,testRuns:0,
     edited:['a.ts'],editedCount:1,lastTestFailed:false,repeat:null};
   assert.equal(workerStatus(job('edited',{status:'succeeded',endedAt:200,progress:digest})),'done · 1 file edited');
-  // Steered and resumed continuations are labeled honestly.
-  assert.equal(workerStatus(job('steer',{status:'succeeded',endedAt:200,turn:2,continuedFrom:'job-0',continuationKind:'steer-queue',changedFileCount:1})),
-    'done · 1 file changed · after steer');
-  assert.equal(workerStatus(job('resumed',{status:'succeeded',endedAt:200,turn:2,continuedFrom:'job-0',continuationKind:'resume',changedFileCount:1})),
-    'done · 1 file changed · resumed');
+  assert.equal(workerStatus(job('steer',{status:'succeeded',endedAt:200,turn:2,continuedFrom:'job-0',continuationKind:'steer',changedFileCount:1})),
+    'done · 1 file changed · steered');
+  assert.equal(workerStatus(job('resumed',{status:'succeeded',endedAt:200,turn:2,continuedFrom:'job-0',continuationKind:'follow-up',changedFileCount:1})),
+    'done · 1 file changed · follow-up');
   assert.equal(workerStatus(job('superseded',{status:'canceled',endedAt:200,supersededBy:'job-2'})),'steered');
-  assert.equal(workerStatus(job('queued',{status:'running',pendingSteers:1,activity:'editing a.ts'})),'Running · steer queued · editing a.ts');
-  // A failure keeps its reason and adds the same evidence.
+  assert.equal(workerStatus(job('queued',{status:'running',pendingSteers:1,activity:'editing a.ts'})),'Running · 1 queued · editing a.ts');
   assert.equal(workerStatus(job('broke',{status:'failed',endedAt:200,failureReason:'timeout',changedFileCount:2})),
     'failed · timed out · 2 files changed');
 });
@@ -201,7 +185,7 @@ test('the /forge recap board is a multi-line factual summary of the fleet',()=>{
 
   const many=Array.from({length:13},(_,i)=>job(`w${i}`,{workerId:`w${i}`,status:'succeeded',startedAt:1000,endedAt:2000+i}));
   const capped=sessionBoard(many,'session',10_000).split('\n');
-  assert.equal(capped.length,14); // header + 12 rows + the fold note
+  assert.equal(capped.length,14);
   assert.equal(capped.at(-1),'…and 1 more');
 });
 
@@ -221,17 +205,13 @@ test('consecutive completed read and search calls condense; active, errored and 
   const group=items[0]!;
   assert.equal(group.kind==='group'&&timelineGroupLabel(group.reads,group.searches),'read 2 files · 1 search');
 
-  // Two is not a run, and the timeline's last event never joins one.
   assert.deepEqual(shape(condenseTimeline([tool(0,'Read','a.ts'),tool(1,'Read','b.ts')])),['event-0','event-1']);
   assert.deepEqual(shape(condenseTimeline([tool(0,'Read','a.ts'),tool(1,'Read','b.ts'),tool(2,'Read','c.ts')])),
     ['event-0','event-1','event-2']);
-  // Active and errored calls break a run instead of hiding inside it.
   assert.deepEqual(shape(condenseTimeline([tool(0,'Read','a.ts'),tool(1,'Read','b.ts'),
     tool(2,'Read','c.ts','active'),tool(3,'Read','d.ts')])),['event-0','event-1','event-2','event-3']);
-  // Assistant prose breaks a run too.
   assert.deepEqual(shape(condenseTimeline([tool(0,'Read','a.ts'),prose(1),tool(2,'Read','b.ts'),
     tool(3,'Read','c.ts'),tool(4,'Read','d.ts')])),['event-0','event-1','event-2','event-3','event-4']);
-  // Plain shell commands fold with reads; test runs and edits stay their own rows.
   const shell=condenseTimeline([tool(0,"/bin/zsh -lc 'git status'",''),tool(1,"/bin/zsh -lc 'node --version'",''),
     tool(2,"/bin/zsh -lc 'cat a.ts'",''),tool(3,'Bash','{"command":"npm test"}'),tool(4,'Read','e.ts')]);
   assert.deepEqual(shape(shell),['group-0','event-3','event-4']);
@@ -249,24 +229,17 @@ test('a settled row says when it started; a live row does not',()=>{
 
 test('workerLivenessLine drives the pane callout strictly from job.liveness with no legacy fallback', () => {
   const now = 1_000_000;
-  // active under 2 min -> no line
   assert.equal(workerLivenessLine(job('a1', { liveness: { state: 'active', silentForMs: PANE_QUIET_MS - 1, since: now - PANE_QUIET_MS + 1, forMs: PANE_QUIET_MS - 1 } })), null);
-  // active at 2 min or more -> dim process-alive line
   assert.deepEqual(workerLivenessLine(job('a2', { liveness: { state: 'active', silentForMs: PANE_QUIET_MS, since: now - PANE_QUIET_MS, forMs: PANE_QUIET_MS } })),
     { text: 'No output 2m00s · process alive', tone: 'dim' });
   assert.deepEqual(workerLivenessLine(job('a3', { liveness: { state: 'active', silentForMs: 130_000, since: now - 130_000, forMs: 130_000 } })),
     { text: 'No output 2m10s · process alive', tone: 'dim' });
-  // in-tool -> no line, even when silent for a long time
   assert.equal(workerLivenessLine(job('t1', { liveness: { state: 'in-tool', silentForMs: 16 * 60_000, since: now - 16 * 60_000, forMs: 16 * 60_000, tool: 'cargo test' } })), null);
-  // silent -> yellow No output <elapsed> (never "Stalled")
   assert.deepEqual(workerLivenessLine(job('s1', { status: 'attention', liveness: { state: 'silent', silentForMs: 16 * 60_000, since: now - 16 * 60_000, forMs: 16 * 60_000 } })),
     { text: 'No output 16m00s', tone: 'yellow' });
-  // dead -> red Worker process gone <elapsed of forMs>
   assert.deepEqual(workerLivenessLine(job('d1', { status: 'attention', liveness: { state: 'dead', silentForMs: 18 * 60_000, since: now - 3 * 60_000, forMs: 3 * 60_000 } })),
     { text: 'Worker process gone 3m00s', tone: 'red' });
-  // No liveness: returns null (legacy lastEventAt fallback purged)
   assert.equal(workerLivenessLine(job('o2', { lastEventAt: now - PANE_QUIET_MS - 1_000 })), null);
-  // Terminal job: no line
   assert.equal(workerLivenessLine(job('done', { status: 'succeeded', endedAt: now - 1_000, lastEventAt: now - 10 * 60_000 })), null);
 });
 
@@ -281,7 +254,6 @@ test('priorTurnSummary formats inline clickable prior turns honestly without lab
     workerId: 'ada', turn: 1, status: 'succeeded',
     startedAt: 10_000, endedAt: 55_000, chainStartedAt: 0, toolCount: 1,
   });
-  // Uses turn's own endedAt - startedAt (45s), NOT chainStartedAt (55s).
   assert.equal(priorTurnSummary(resumedParent, 1, 100_000), '▸ Turn 1 · done · 1 tool · 45s');
 
   const failedParent = job('t1-fail', {
@@ -293,13 +265,11 @@ test('priorTurnSummary formats inline clickable prior turns honestly without lab
 
 test('workerTurns, workerHead, statusLine and sessionJobs unify steered and resumed turns', () => {
   const t1 = job('t1', { workerId: 'ada', turn: 1, status: 'canceled', supersededBy: 't2', startedAt: 0, endedAt: 60_000, chainStartedAt: 0 });
-  const t2 = job('t2', { workerId: 'ada', turn: 2, status: 'running', continuedFrom: 't1', continuationKind: 'steer-interrupt', startedAt: 60_000, chainStartedAt: 0 });
+  const t2 = job('t2', { workerId: 'ada', turn: 2, status: 'running', continuedFrom: 't1', continuationKind: 'steer', startedAt: 60_000, chainStartedAt: 0 });
   assert.deepEqual(workerTurns([t2, t1], 'ada').map((j) => j.id), ['t1', 't2']);
   assert.equal(workerHead([t1, t2], 'ada')?.id, 't2');
-  // statusLine uses continuous chainStartedAt for steered turn 2 (72s = 1m12s, not 12s).
   assert.match(statusLine(t2, 72_000, 60), /1m12s$/);
-  // sessionJobs follows continuedFrom & workerId across steers and resumes.
-  const t3 = job('t3', { workerId: 'ada', turn: 3, status: 'running', continuedFrom: 't2', continuationKind: 'resume', startedAt: 200_000, chainStartedAt: 200_000 });
+  const t3 = job('t3', { workerId: 'ada', turn: 3, status: 'running', continuedFrom: 't2', continuationKind: 'follow-up', startedAt: 200_000, chainStartedAt: 200_000 });
   const mine = sessionJobs([t1, t2, t3, job('other')], { jobs: ['t1'], runs: [] });
   assert.deepEqual(mine.map((j) => j.id), ['t1', 't2', 't3']);
 });

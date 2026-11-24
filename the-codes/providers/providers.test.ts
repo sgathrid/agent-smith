@@ -4,12 +4,13 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'no
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { buildArgv as buildClaudeArgv, buildResult as buildClaudeResult, createClaudeTranslator } from './claude.ts';
+import { buildArgv as buildClaudeArgv, buildResult as buildClaudeResult, ClaudeLiveInput, claudeProvider, createClaudeTranslator } from './claude.ts';
 import { buildArgv as buildCodexArgv, codexStderrLevel, createCodexTranslator } from './codex.ts';
 import { buildArgv as buildAgyArgv } from './agy.ts';
 import { buildArgv as buildOpencodeArgv, buildResult as buildOpencodeResult, createOpencodeTranslator } from './opencode.ts';
 import { buildArgv as buildKimiArgv, buildResult as buildKimiResult, createKimiTranslator } from './kimi.ts';
 import { recoveredErrorNotice, spawnWorker } from './ndjson.ts';
+import { getProvider } from './registry.ts';
 import type { ProviderEvent, SpawnSpec } from './types.ts';
 import { scaled, waitFor } from '../forge/testing/time.ts';
 import { trackedTempDirs } from '../forge/testing/tmp.ts';
@@ -157,6 +158,44 @@ test('Claude argv applies effort and uses --resume for continuation', () => {
   assert.ok(!argv.includes('--session-id'));
 });
 
+test('Claude argv takes the prompt on stdin: stream-json input, replayed user messages, no prompt positional', () => {
+  const argv = buildClaudeArgv(spec({ prompt: 'secret-ish prompt text' }));
+  assert.ok(!argv.includes('secret-ish prompt text'));
+  assert.equal(argv[argv.indexOf('--input-format') + 1], 'stream-json');
+  assert.equal(argv[argv.indexOf('--output-format') + 1], 'stream-json');
+  assert.ok(argv.includes('--replay-user-messages') && argv.includes('--verbose'));
+  assert.equal(claudeProvider.liveInput, true);
+});
+
+test('Claude translator reports only replays of sent messages, never the prompt, subagent text or a tool result', () => {
+  const written: string[] = [];
+  let ended = false;
+  const stdin = { destroyed: false, writableEnded: false, on() { return this; }, write(s: string) { written.push(s); return true; }, end() { ended = true; this.writableEnded = true; } };
+  const input = new ClaudeLiveInput('the prompt');
+  input.attach(stdin as unknown as import('node:stream').Writable);
+  assert.deepEqual(JSON.parse(written[0]!), { type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'the prompt' }] } });
+  assert.equal(input.send('  '), false, 'an empty message is refused');
+  assert.equal(input.send('also do B'), true);
+  const tx = createClaudeTranslator(200, input);
+  const replay = (text: string, extra: Record<string, unknown> = {}) =>
+    tx.onEvent({ type: 'user', message: { role: 'user', content: [{ type: 'text', text }] }, ...extra }).filter((e) => e.kind === 'user-message');
+  assert.deepEqual(replay('the prompt', { parent_tool_use_id: null }), [], 'the initial prompt is not a follow-up');
+  assert.deepEqual(replay('also do B', { parent_tool_use_id: 'toolu_sub' }), [], 'forwarded subagent text is not a replay');
+  assert.deepEqual(replay('something claude injected'), []);
+  const read = replay('also do B', { parent_tool_use_id: null, isReplay: true });
+  assert.equal(read.length, 1);
+  assert.ok(read[0]!.kind === 'user-message' && read[0]!.text === 'also do B');
+  assert.deepEqual(replay('also do B'), [], 'a message is reported read once');
+  assert.equal(input.send('then C'), true);
+  assert.deepEqual(input.unread(), ['then C']);
+  tx.onEvent({ type: 'result', subtype: 'success', result: 'ok' });
+  assert.ok(ended, 'the result ends stdin');
+  assert.equal(input.send('too late'), false);
+  assert.deepEqual(input.unread(), ['then C'], 'unread after the result: undelivered');
+  assert.equal(tx.onEvent({ type: 'user', message: { role: 'user', content: 'then C' } }).filter((e) => e.kind === 'user-message').length, 1);
+  assert.deepEqual(input.unread(), []);
+});
+
 test('Claude rejects an effort the CLI does not support', () => {
   assert.throws(
     () => buildClaudeArgv(spec({ effort: 'ultra' })),
@@ -196,8 +235,6 @@ test('cancellation kills a worker process group including a surviving descendant
     onStderr() {},
   });
 
-  // Wait until the grandchild is live before asking the worker to stop.
-  // The pid file can exist before its contents land; only a positive pid identifies the descendant.
   const descendantPid = await waitFor(() => {
     const pid = existsSync(childPidFile) ? Number(readFileSync(childPidFile, 'utf8')) : 0;
     return Number.isInteger(pid) && pid > 0 ? pid : 0;
@@ -208,9 +245,6 @@ test('cancellation kills a worker process group including a surviving descendant
   assert.equal(worker.killReason, 'cancelled');
   assert.ok(exit.signal === 'SIGTERM' || exit.signal === 'SIGKILL');
 
-  // The descendant ignores SIGTERM and has no inherited pipes to keep close
-  // pending, so it can only die if the delayed SIGKILL reaches the whole group.
-  // Once it is provably dead it can never write its marker (a far-off cap).
   await waitFor(() => !pidAlive(descendantPid), { message: `descendant ${descendantPid} to die with its group` });
   assert.equal(existsSync(delayedMarker), false, `descendant ${descendantPid} survived cancellation`);
 });
@@ -248,9 +282,7 @@ test('a cancelled supervisor does not abandon detached-stdio descendants', async
   const workerScript = path.join(dir, 'worker.cjs');
   const supervisor = path.join(dir, 'supervisor.mjs');
   const pidFile = path.join(dir, 'descendant.pid');
-  // The descendant records its pid once its SIGTERM handler is installed; the marker delay is only a cap.
   const descendant = `process.on('SIGTERM',()=>{});require('node:fs').writeFileSync(${JSON.stringify(pidFile)},String(process.pid));setTimeout(()=>require('node:fs').writeFileSync(${JSON.stringify(marker)},'alive'),600000);setInterval(()=>{},1000)`;
-  // The worker reports 'ready' only after the descendant is up, so the cancel below always meets a live SIGTERM-ignoring descendant.
   writeFileSync(workerScript, `const fs=require('node:fs'),{spawn}=require('node:child_process');spawn(process.execPath,['-e',${JSON.stringify(descendant)}],{stdio:'ignore'});const t=setInterval(()=>{if(fs.existsSync(${JSON.stringify(pidFile)})){clearInterval(t);console.log('ready');}},10);setInterval(()=>{},1000)`);
   const moduleUrl = new URL('./ndjson.ts', import.meta.url).href;
   writeFileSync(supervisor, `import {spawnWorker} from ${JSON.stringify(moduleUrl)};
@@ -260,7 +292,6 @@ const proc=await spawnWorker({provider:'fixture',binary:process.execPath,argv:[$
     const pid = existsSync(pidFile) ? Number(readFileSync(pidFile, 'utf8')) : 0;
     return Number.isInteger(pid) && pid > 0 ? pid : 0;
   }, { message: 'the descendant to record its pid' });
-  // A dead descendant can never write its marker; a survivor means the supervisor abandoned it.
   await waitFor(() => !pidAlive(descendantPid), { message: `descendant ${descendantPid} to die with the cancelled supervisor` });
   assert.equal(existsSync(marker), false, 'the supervisor exited while its tool continued running');
 });
@@ -521,7 +552,6 @@ test('opencode translator emits a started event with conversationId on first ses
     assert.equal(first[0].conversationId, 'ses_opencode_123');
   }
 
-  // Subsequent events with the same sessionID do not emit duplicate started events.
   const second = tx.onEvent({
     type: 'text',
     sessionID: 'ses_opencode_123',
@@ -558,8 +588,6 @@ test('opencode: a tool_use part reports its state input and output on one step',
 });
 
 test('opencode: a failed tool call is a warning; a delivered report still succeeds', () => {
-  // Shape of review-smith-a4b33fdc's step 41: a `read` of a missing path,
-  // followed by the worker's complete report. That job was marked failed.
   const tx = createOpencodeTranslator(10_000);
   const events = [
     ...tx.onEvent({
@@ -688,9 +716,7 @@ for (const name of ['agy', 'codex', 'claude', 'opencode'] as const) {
     const saved = process.env[key];
     process.env[key] = missing;
     try {
-      // Binary names are captured at module scope, so load a fresh copy of the adapter.
-      const mod = (await import(`./${name}.ts?missing=${name}`)) as Record<string, import('./types.ts').Provider>;
-      const handle = await mod[`${name}Provider`]!.spawn({
+      const handle = await getProvider(name).spawn({
         mode: 'test',
         prompt: 'x',
         cwd: dir,
@@ -712,7 +738,6 @@ for (const name of ['agy', 'codex', 'claude', 'opencode'] as const) {
 test('spawnWorker heartbeats while the child runs (pid included), stops at exit, and writes nothing to events.jsonl', async () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'agent-smith-heartbeat-'));
   const beats: { at: string; pid: number | undefined }[] = [];
-  // The child lives until the test releases it, so beat count depends on events, not on how long the child lasts.
   const release = path.join(dir, 'release');
   const child = `setInterval(()=>{if(require('node:fs').existsSync(${JSON.stringify(release)})){process.exit(0)}},20);setTimeout(()=>process.exit(0),120000)`;
   const worker = await spawnWorker({
@@ -728,7 +753,6 @@ test('spawnWorker heartbeats while the child runs (pid included), stops at exit,
   const atExit = beats.length;
   assert.ok(atExit >= 3, `expected several beats while the child ran, got ${atExit}`);
   assert.ok(beats.every((b) => b.pid === worker.child.pid && Number.isFinite(Date.parse(b.at))));
-  // No positive observable exists for "a timer that was cleared never fires"; slowness can only hide a late beat (false pass), never fail a correct run.
   await new Promise((resolve) => setTimeout(resolve, 150));
   assert.equal(beats.length, atExit, 'no beats after exit');
   assert.equal(existsSync(path.join(dir, 'events.jsonl')), false, 'heartbeats are liveness, not events');
@@ -738,16 +762,12 @@ test('spawnWorker heartbeats while the child runs (pid included), stops at exit,
 test('spawnWorker stops heartbeats when the worker exits, even while a descendant holds stdout open', async () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'agent-smith-heartbeat-orphan-'));
   const beats: number[] = [];
-  // The worker leaves a detached, unreferenced grandchild that inherits its
-  // stdout, then exits: `close` waits for the grandchild, `exit` does not.
-  // The grandchild lives until the test releases it, so load cannot end it early.
   const release = path.join(dir, 'release');
   const workerRelease = path.join(dir, 'worker-release');
   const grandchild = `setInterval(()=>{ if (require('node:fs').existsSync(${JSON.stringify(release)})) process.exit(0); }, 20); setTimeout(()=>process.exit(0), 120000)`;
   const script = [
     "const { spawn } = require('node:child_process');",
     `spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}], { detached: true, stdio: ['ignore', 'inherit', 'ignore'] }).unref();`,
-    // The worker exits only when the test says so, after it has seen heartbeats.
     `const t = setInterval(() => { if (require('node:fs').existsSync(${JSON.stringify(workerRelease)})) process.exit(0); }, 20);`,
   ].join('\n');
   const worker = await spawnWorker({
@@ -763,7 +783,6 @@ test('spawnWorker stops heartbeats when the worker exits, even while a descendan
   await once(worker.child, 'exit');
   const atExit = beats.length;
   assert.ok(atExit >= 1, 'beats while the worker ran');
-  // The heartbeat timer is cleared on exit and no positive observable exists for "never fires again"; slowness can only hide a late beat (false pass), never fail a correct run.
   await new Promise((resolve) => setTimeout(resolve, 300));
   assert.equal(closed, false, 'stdout is still held open by the grandchild');
   assert.equal(beats.length, atExit, 'no heartbeat after the worker exited');
@@ -781,8 +800,6 @@ test('runNdjsonWorker routes heartbeats to the bus, never to the event log', () 
     assert.match(adapter, /runNdjsonWorker\(/, name);
   }
 });
-
-// ---- recovered provider errors (synthetic streams) -------------------------
 
 const TRANSPORT_ERROR = {
   type: 'error',
@@ -807,7 +824,6 @@ test('opencode: a transport error is a retrying warning, not an environment fail
   assert.match(notice.message, /^provider connection error \(retrying\): Connection lost.*ECONNRESET/);
   assert.doesNotMatch(notice.message, /environment failure/);
 
-  // Genuine environment failures keep their level and wording.
   const quota = createOpencodeTranslator(10_000)
     .onEvent({ type: 'error', error: { type: 'provider.quota', message: 'out of credit' } })
     .find((e) => e.kind === 'notice');
@@ -864,7 +880,6 @@ test('opencode: tool activity after the error without a report is not a recovery
   assert.equal(r.status, 'error');
   assert.match(r.error ?? '', /out of credit/);
 
-  // Killed by a signal: no exit code to corroborate completion.
   const killed = createOpencodeTranslator(10_000);
   killed.onEvent(TRANSPORT_ERROR);
   killed.onEvent(textPart('A report.'));
@@ -898,7 +913,6 @@ test('kimi: an error as the last meaningful event still fails', () => {
   assert.match(r.error ?? '', /stream dropped/);
   assert.equal(recoveredErrorNotice(tx.recovery.recovered(tx.finalText, r.exitCode), r), undefined);
 });
-
 
 test('opencode: retry prose and unfinished tools do not recover a crashed worker', () => {
   const tx = createOpencodeTranslator(10_000);
@@ -951,7 +965,6 @@ test('kimi: assistant text cannot recover a nonzero exit without a verified comp
   assert.equal(r.status, 'error');
   assert.equal(r.ok, false);
 });
-
 
 test('opencode: completion before post-error text cannot corroborate a failed exit', () => {
   const tx = createOpencodeTranslator(10_000);

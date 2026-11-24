@@ -182,6 +182,8 @@ export interface RunCheckOptions {
   killGraceMs?: number | undefined;
   /** Abort signal that triggers the same group kill as a timeout. */
   signal?: AbortSignal | undefined;
+  /** Keep `check.blocking` on `not-configured` skips instead of downgrading them to non-blocking. */
+  blockOnUnconfigured?: boolean | undefined;
 }
 
 /**
@@ -212,7 +214,7 @@ export function runCheck(check: Check, options: RunCheckOptions = {}): Promise<V
     // 'not-configured' is ABSENT, not broken: it must be visible in the report
     // but must not manufacture a failure no rerun could ever fix. The other two
     // reasons are real problems and do block.
-    blocking: blocking && reason !== 'not-configured',
+    blocking: blocking && (options.blockOnUnconfigured === true || reason !== 'not-configured'),
   });
 
   // Pre-flight: a missing working directory is the single most common config
@@ -402,6 +404,6 @@ export async function runChecks(
     verdicts: present,
     failing,
     durationMs: (options.now ?? Date.now)() - started,
-    incomplete: present.some((v) => v.skipped !== undefined),
+    incomplete: present.some((v) => v.skipped !== undefined && (options.blockOnUnconfigured === true ? v.blocking : true)),
   };
 }

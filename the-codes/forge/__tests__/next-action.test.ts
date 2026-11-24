@@ -1,4 +1,3 @@
-/** nextAction taxonomy + git changed-files reference. */
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, unlinkSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -37,10 +36,10 @@ test('provider setup and account failures do not suggest blind retries or broade
     '14 UNAVAILABLE: Service unavailable',
     'overloaded',
   ]) {
-    assert.equal(nextActionFor({ ...F, error }), 'Provider busy (temporary); resume_job to continue.');
+    assert.equal(nextActionFor({ ...F, error }), 'Provider busy (temporary); follow_up to continue.');
   }
   for (const error of ['429 Too Many Requests', 'rate_limit exceeded']) {
-    assert.equal(nextActionFor({ ...F, error }), 'Rate limited; resume_job after a short wait.');
+    assert.equal(nextActionFor({ ...F, error }), 'Rate limited; follow_up after a short wait.');
   }
   assert.match(nextActionFor({ ...F, error: '429 insufficient_quota' })!, /^Out of credits/);
   assert.match(nextActionFor({ ...F, error: 'quota exhausted' })!, /^Out of credits/);
@@ -49,11 +48,10 @@ test('provider setup and account failures do not suggest blind retries or broade
   }
   assert.match(nextActionFor({ ...F, error: 'spawn codex ENOENT' })!, /^Couldn.t start/);
   assert.match(nextActionFor({ ...F, jobStatus: 'denied' })!, /^Ask the user/);
-  // Successful prose is not an execution diagnostic.
   assert.equal(nextActionFor({ status: 'succeeded', error: 'unauthorized rate limit' }), null);
   const steer = nextActionFor({ ...F, jobStatus: 'timeout', steerNotApplied: true })!;
   assert.match(steer, /timeoutMs/);
-  assert.match(steer, /queued steer was not applied.*resume_job prompt/);
+  assert.match(steer, /queued message was discarded: send it again with follow_up/);
   assert.doesNotMatch(nextActionFor({ ...F, jobStatus: 'timeout' })!, /steer/);
   assert.equal(nextActionFor({ status: 'canceled', steerNotApplied: true }), null);
 });
@@ -95,10 +93,10 @@ const read = (r: string): ForgeManifest => JSON.parse(readFileSync(jobFile(r, 'i
 
 test('git baseline + changedFiles in a temp repo', async () => {
   const r = gitRepo();
-  writeFileSync(path.join(r, 'a.txt'), 'dirty before'); // dirty at start, untouched later
-  writeFileSync(path.join(r, 'b.txt'), 'dirty before'); // dirty at start, edited later
+  writeFileSync(path.join(r, 'a.txt'), 'dirty before');
+  writeFileSync(path.join(r, 'b.txt'), 'dirty before');
   const w = begin(r, r);
-  await w.prepareFinish(); // also awaits the baseline
+  await w.prepareFinish();
   writeFileSync(path.join(r, 'b.txt'), 'edited by the worker!');
   unlinkSync(path.join(r, 'c.txt'));
   writeFileSync(path.join(r, 'new.txt'), 'n');
@@ -131,7 +129,6 @@ test('read-only job yields []; a non-git cwd records nothing', async () => {
 test('start() does not wait on git', async () => {
   const r = gitRepo();
   begin(r, r);
-  // Structural, not timed: the baseline needs a git child process, so it cannot be in the manifest when start() returns.
   assert.equal(read(r).gitBaseline, undefined, 'start() returned before git was consulted');
   const landed = await waitFor(() => read(r).gitBaseline, { message: 'async git baseline to be merged into the manifest' });
   assert.ok(landed.head, 'baseline lands once git settles');
@@ -141,7 +138,6 @@ test('a route that failed before any work names the route, after specific diagno
   const location = 'Selected model is not supported in the selected location';
   assert.match(nextActionFor({ ...F, error: location, failedEarly: true }) ?? '', /^Route failed before any work.*list_capabilities/);
   assert.match(nextActionFor({ ...F, error: location }) ?? '', /^Read status.error/, 'without the flag nothing changes');
-  // A specific diagnosis still wins: 402 is out of credits.
   assert.match(nextActionFor({ ...F, error: 'HTTP 402: Insufficient account funds', failedEarly: true }) ?? '', /^Out of credits/);
   assert.match(nextActionFor({ ...F, error: 'Upstream request failed: Insufficient account funds', failedEarly: true }) ?? '', /^Route failed/);
   assert.match(nextActionFor({ ...F, error: 'no output', failedEarly: true }) ?? '', /^Route failed/);

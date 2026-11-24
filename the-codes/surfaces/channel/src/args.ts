@@ -1,4 +1,3 @@
-/** Argument parsing for tool calls: each helper validates one field and throws the message Claude sees. */
 import path from 'node:path';
 import { statSync } from 'node:fs';
 import { inheritContinuedProviders } from '../../../pipeline/pipeline.ts';
@@ -10,7 +9,7 @@ export function record(value: unknown, label: string): Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${label} must be an object.`);
   return value as Record<string, unknown>;
 }
-const REQUIRED_HINTS: Readonly<Record<string, string>> = { jobId: 'get one from spawn_job or list_jobs', runId: 'use the runId returned by run_pipeline', worker: 'a worker name or job ID from list_jobs', delivery: 'choose "queue" (after current turn) or "interrupt" (stop current turn now)' };
+const REQUIRED_HINTS: Readonly<Record<string, string>> = { id: 'a worker name or job ID from spawn_job or list_jobs', runId: 'use the runId returned by run_pipeline', worker: 'a worker name or job ID from list_jobs' };
 export function text(args: Record<string, unknown>, key: string, required = false): string | undefined {
   const v = args[key];
   if (v === undefined && !required) return undefined;
@@ -35,7 +34,7 @@ export function workingDirectory(args: Record<string, unknown>): string | undefi
   if (!path.isAbsolute(cwd)) throw new Error(`cwd must be an absolute path (got "${cwd}").`);
   try {
     if (statSync(cwd).isDirectory()) return cwd;
-  } catch { /* report the same validation error for absent/inaccessible paths */ }
+  } catch {}
   throw new Error(`cwd "${cwd}" is not a directory.`);
 }
 export function number(args: Record<string, unknown>, key: string, max = Number.MAX_SAFE_INTEGER): number | undefined {

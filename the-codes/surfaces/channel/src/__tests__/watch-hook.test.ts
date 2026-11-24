@@ -8,7 +8,7 @@ import { runJobWatch } from '../monitor.ts';
 import { toNotice, type WatchableJob } from '../policy.ts';
 import { parseHookInput, runHook } from '../watch-hook.ts';
 import { claimMarkerPath, headline } from '../../../mod/hooks/notice.ts';
-import { clearReadCache, readAll, readJob as readJobFile } from '../watch-source.ts';
+import { readJob as readJobFile } from '../watch-source.ts';
 
 const T0 = Date.parse('2026-10-07T12:00:00.000Z');
 const job = (id: string, status: WatchableJob['status'], extra: Partial<WatchableJob> = {}): WatchableJob => ({
@@ -88,7 +88,8 @@ test('hook input parsing handles each response shape', () => {
     const t = parseHookInput(wrap('mcp__plugin_agent-smith_agent-smith__spawn_job', s));
     assert.deepEqual({ kind: t?.kind, id: t?.id, cwd: t?.cwd }, { kind: 'job', id: 'j1', cwd: '/some/repo' });
   }
-  assert.equal(parseHookInput(wrap('resume_job', ack))?.kind, 'job');
+  assert.equal(parseHookInput(wrap('follow_up', { ...ack, action: 'started' }))?.kind, 'job');
+  assert.equal(parseHookInput(wrap('resume_job', ack)), null, 'removed verbs are not watched');
   const run = parseHookInput(wrap('mcp__x__run_pipeline', { runId: 'r1', recordPath: '/p/.agent-smith/pipelines/r1.json' }));
   assert.deepEqual({ kind: run?.kind, id: run?.id, cwd: run?.cwd }, { kind: 'run', id: 'r1', cwd: '/p' });
 });
@@ -147,33 +148,31 @@ test('runHook finds the claim through a symlinked repo path', async () => {
   fs.rmSync(link); fs.rmSync(real, { recursive: true, force: true });
 });
 
-test('the watch-hook notice carries after-steer and dropped-steer markers', async () => {
-  clearReadCache();
+test('the watch-hook notice carries follow-up and dropped-message markers', async () => {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'steer-notice-'));
   const dir = path.join(repo, '.agent-smith', 'jobs', 'turn-2');
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({
     schema: 1, jobId: 'turn-2', workerId: 'turn-1', turn: 2, status: 'failed', provider: 'codex', name: 'Ada',
-    continuedFrom: 'turn-1', continuationKind: 'steer-queue', error: 'timed out after 4s',
+    continuedFrom: 'turn-1', continuationKind: 'follow-up', error: 'timed out after 4s',
     startedAt: new Date(T0).toISOString(), finishedAt: new Date(T0 + 4000).toISOString(),
   }));
   fs.writeFileSync(path.join(dir, 'progress.json'), JSON.stringify({
-    warnings: ['1 queued steer not applied: the turn ended failed. Use resume_job or steer_job again.'],
+    warnings: ['1 queued follow-up not sent: the turn ended failed. "add the edge-case test"'],
   }));
-  const found = (await readAll(repo)).find((j) => j.id === 'turn-2');
+  const found = await readJobFile(repo, 'turn-2');
   assert.ok(found, 'job is read');
   assert.equal(found.continuedFrom, 'turn-1');
-  assert.equal(found.continuationKind, 'steer-queue');
+  assert.equal(found.continuationKind, 'follow-up');
   assert.equal(found.steerNotApplied, true);
   const text = toNotice(found, 'failed', T0 + 5000);
-  assert.equal((text as { continuationKind?: unknown }).continuationKind, 'steer-queue');
+  assert.equal((text as { continuationKind?: unknown }).continuationKind, 'follow-up');
   assert.equal(text.steerNotApplied, true);
-  assert.match(headline(text), /· after steer · queued steer not applied/);
+  assert.match(headline(text), /· follow-up · queued follow-up not sent: "add the edge-case test"$/);
   fs.rmSync(repo, { recursive: true, force: true });
 });
 
 test('runJobWatch wakes promptly on disk writes via waitForChange without 2s polling', async () => {
-  clearReadCache();
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'watch-fs-wake-'));
   const dir = path.join(repo, '.agent-smith', 'jobs', 'j-wake');
   fs.mkdirSync(dir, { recursive: true });
@@ -204,22 +203,6 @@ test('runJobWatch wakes promptly on disk writes via waitForChange without 2s pol
   fs.rmSync(repo, { recursive: true, force: true });
 });
 
-test('full scan caches terminal jobs instead of re-reading them', async () => {
-  clearReadCache();
-  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-cache-'));
-  const runs = path.join(repo, '.agent-smith', 'pipelines');
-  fs.mkdirSync(runs, { recursive: true });
-  const file = path.join(runs, 'r1.json');
-  const rec = (status: string) => JSON.stringify({ runId: 'r1', pipeline: 'p', status, startedAt: T0, finishedAt: T0 + 5, stageResults: {} });
-  fs.writeFileSync(file, rec('passed'));
-  assert.equal((await readAll(repo))[0]!.status, 'succeeded');
-  fs.writeFileSync(file, rec('failed'));
-  assert.equal((await readAll(repo))[0]!.status, 'succeeded', 'terminal record served from cache');
-  clearReadCache();
-  assert.equal((await readAll(repo))[0]!.status, 'failed');
-  fs.rmSync(repo, { recursive: true, force: true });
-});
-
 test('hook watch budget follows the ack timeout, with a 6h cap fallback for pipelines', async () => {
   const { parseHookInput } = await import('../watch-hook.ts');
   const job = parseHookInput({ tool_name: 'mcp__x__spawn_job', tool_response: { jobId: 'j1', repo: '/tmp/r', timeoutMs: 120_000 } });
@@ -240,7 +223,6 @@ test('runJobWatch follows supersededBy without emitting an intermediate parent n
 });
 
 test('a watcher holds a job whose checks are inside their budget, then says exited with checks running, then the verdict', async () => {
-  clearReadCache();
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'pending-notice-'));
   const dir = path.join(repo, '.agent-smith', 'jobs', 'j-1');
   fs.mkdirSync(dir, { recursive: true });
@@ -251,19 +233,20 @@ test('a watcher holds a job whose checks are inside their budget, then says exit
   }));
   const acceptance = (extra: object) => fs.writeFileSync(path.join(dir, 'acceptance.json'), JSON.stringify(extra));
   const { readJob } = await import('../watch-source.ts');
-  // 10 minutes after exit: past the flat 5-minute default, inside a 20-minute budget.
+  const { dedupeKey, shouldPush } = await import('../policy.ts');
   acceptance({ state: 'unchecked', checks: [], pending: true, budgetMs: 20 * 60_000, running: 'ui-suite' });
   const held = await readJob(repo, 'j-1', Date.now());
-  assert.equal(held?.status, 'running');
-  // No budget on the placeholder: the 5-minute default has passed.
+  assert.equal(held?.status, 'succeeded');
+  assert.equal(held?.acceptancePending, true);
+  assert.equal(shouldPush({ job: held!, seen: new Set(), observedInPriorPoll: true }), false);
   acceptance({ state: 'unchecked', checks: [], pending: true, running: 'ui-suite' });
   const late = await readJob(repo, 'j-1', Date.now());
   assert.equal(late?.status, 'succeeded');
+  assert.equal(late?.acceptancePending, undefined);
   assert.equal(late?.checksRunning, 'ui-suite');
   const text = headline(toNotice(late!, 'finished', Date.now()));
   assert.match(text, /exited · checks running: ui-suite/);
   assert.doesNotMatch(text, /done|✓/);
-  const { dedupeKey } = await import('../policy.ts');
   acceptance({ state: 'accepted', checks: [{ name: 'ui-suite', ok: true }] });
   const verdict = await readJob(repo, 'j-1', Date.now());
   assert.notEqual(dedupeKey(late!), dedupeKey(verdict!), 'the verdict is announced again');
@@ -335,7 +318,6 @@ test('hook deadline = job timeout + acceptance budget + grace, capped below the 
     const c = parseHookInput(JSON.parse(launchInput(huge.repo, 6 * 60 * 60_000)));
     assert.equal(c?.timeoutMs, 21_900_000 - 60_000, 'never outlives the hook');
     fs.rmSync(huge.repo, { recursive: true, force: true });
-    // No checks, no placeholder budget: unchanged.
     const bare = hookRepo(undefined, {}, 0);
     assert.equal(parseHookInput(JSON.parse(launchInput(bare.repo)))?.timeoutMs, 120_000);
     fs.rmSync(bare.repo, { recursive: true, force: true });
@@ -343,12 +325,9 @@ test('hook deadline = job timeout + acceptance budget + grace, capped below the 
 });
 
 test('hook with checks: one write at the verdict, never "checks running" and the verdict together', async () => {
-  clearReadCache();
   const { repo, dir } = hookRepo(20 * 60_000, { running: 'slow' }, 5_000);
   try {
     let out = '';
-    // The verdict lands while the hook is still holding the job: it is written when the hook
-    // starts its SECOND read, i.e. after the first read (checks pending) was fully handled.
     let reads = 0;
     const readJob: NonNullable<Parameters<typeof runHook>[2]>['readJob'] = (cwd, id, now) => {
       if (++reads === 2) fs.writeFileSync(path.join(dir, 'acceptance.json'), JSON.stringify({ state: 'accepted', checks: [{ name: 'slow', ok: true, blocking: true }] }));
@@ -363,8 +342,6 @@ test('hook with checks: one write at the verdict, never "checks running" and the
 });
 
 test('hook with checks that outlive their budget: one "exited · checks running" notice, then it ends', async () => {
-  clearReadCache();
-  // Exited 10 min ago, 1-min budget: expired.
   const { repo } = hookRepo(60_000, { running: 'slow' }, 10 * 60_000);
   try {
     let out = '';
@@ -406,11 +383,38 @@ test('runHook for a variants ack drops lines for claimed variants and is silent 
   } finally { fs.rmSync(repo, { recursive: true, force: true }); }
 });
 
-test('parseHookInput handles steer_job: ignores queued/interrupting steers and watches action:resumed', () => {
-  assert.equal(parseHookInput(wrap('steer_job', { jobId: 'j1', status: 'running', action: 'queued', repo: '/tmp/r' })), null);
-  assert.equal(parseHookInput(wrap('steer_job', { jobId: 'j1', status: 'running', action: 'interrupting', repo: '/tmp/r' })), null);
-  const resumed = parseHookInput(wrap('steer_job', { jobId: 'j2', status: 'running', action: 'resumed', repo: '/tmp/r', timeoutMs: 120_000 }));
-  assert.deepEqual({ kind: resumed?.kind, id: resumed?.id, cwd: resumed?.cwd }, { kind: 'job', id: 'j2', cwd: '/tmp/r' });
+test('parseHookInput watches a follow_up or steer ack only when it started a turn', () => {
+  for (const tool of ['follow_up', 'mcp__plugin_agent-smith_agent-smith__follow_up', 'steer']) {
+    assert.equal(parseHookInput(wrap(tool, { jobId: 'j1', workerId: 'w', status: 'running', action: 'queued', repo: '/tmp/r' })), null, `${tool} queued`);
+    assert.equal(parseHookInput(wrap(tool, { jobId: 'j1', workerId: 'w', status: 'running', action: 'interrupting', repo: '/tmp/r' })), null, `${tool} interrupting`);
+    assert.equal(parseHookInput(wrap(tool, { jobId: 'j1', status: 'running', repo: '/tmp/r' })), null, `${tool} without action`);
+    const started = parseHookInput(wrap(tool, { jobId: 'j2', workerId: 'w', status: 'running', action: 'started', repo: '/tmp/r', timeoutMs: 120_000 }));
+    assert.deepEqual({ kind: started?.kind, id: started?.id, cwd: started?.cwd }, { kind: 'job', id: 'j2', cwd: '/tmp/r' }, `${tool} started`);
+  }
+});
+
+test('runJobWatch follows the worker through its index to idle: two queued follow-ups make one notice', async () => {
+  const w = { workerId: 'ada', name: 'Ada' };
+  const lines: string[] = [];
+  const script: Record<string, WatchableJob[]> = {
+    t1: [job('t1', 'running', { ...w, turn: 1, pendingMessages: 2 }), job('t1', 'succeeded', { ...w, turn: 1, followedBy: 't2' })],
+    t2: [job('t2', 'running', { ...w, turn: 2, pendingMessages: 1 }), job('t2', 'succeeded', { ...w, turn: 2, pendingMessages: 1 }), job('t2', 'succeeded', { ...w, turn: 2, followedBy: 't3' })],
+    t3: [job('t3', 'running', { ...w, turn: 3 }), job('t3', 'succeeded', { ...w, turn: 3, continuationKind: 'follow-up' })],
+  };
+  let poll = 0;
+  const p = runJobWatch({
+    cwd: '/repo', jobIds: ['t1'], intervalMs: 50, now: () => T0 + ++poll,
+    readIndex: async () => ({ schema: 1, workerId: 'ada', name: 'Ada', turns: poll < 3 ? ['t1'] : poll < 6 ? ['t1', 't2'] : ['t1', 't2', 't3'], updatedAt: '' }),
+    readJob: async (_c, id) => {
+      const seq = script[id]!;
+      const at = id === 't1' ? (poll < 2 ? 0 : 1) : id === 't2' ? (poll < 4 ? 0 : poll < 5 ? 1 : 2) : (poll < 7 ? 0 : 1);
+      return seq[Math.min(at, seq.length - 1)]!;
+    },
+    emit: (l) => { lines.push(l); },
+  });
+  assert.equal(await p, 'done');
+  assert.equal(lines.length, 1, lines.join('\n'));
+  assert.match(lines[0]!, /^Agent Smith · ✓ Ada \(implementer\) · done · follow-up · also ran turns 1–2 status t3$/);
 });
 
 test('runHook suppresses output when the post-steer head jobId has a claim marker', async () => {

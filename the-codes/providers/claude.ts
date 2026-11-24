@@ -1,91 +1,3 @@
-/**
- * providers/claude.ts — Claude Code headless adapter.
- *
- * This is agent-smith's PROBER / MODERATOR provider. ARCHITECTURE.md is
- * emphatic about why: "Claude proposes, another model probes." Generative
- * agreement between same-family models is correlated (60% agreement when both
- * err, ICML 2025, 350+ models), so self-consistency is not verification — a
- * different model family is. This adapter exists to be that different family,
- * which means it must be as trustworthy about its own failure modes as agy is.
- *
- * ============================================================================
- * VERIFICATION LEVEL: HIGH. Verified by running `claude --help` (2.1.292) and
- * by executing the exact invocation below against a live model.
- * ============================================================================
- *
- * VERIFIED FLAGS (`claude --help`, 2.1.292):
- *
- *   -p, --print                       "Print response and exit (useful for pipes)".
- *                                     Note the help text itself says the workspace
- *                                     trust dialog is skipped when stdout is not
- *                                     a TTY — which is exactly our spawn shape.
- *   --output-format <text|json|stream-json>   "(only works with --print)"
- *   --input-format <text|stream-json>
- *   --verbose                         required for the full stream in print mode
- *   --forward-subagent-text           "Forward subagent text and thinking blocks as
- *                                     assistant/user messages with
- *                                     parent_tool_use_id set (only works with
- *                                     --print and --output-format=stream-json)"
- *                                     ^^^ THIS IS THE FLAG THAT MAKES A MODERATOR
- *                                     USABLE. Without it, a subagent's reasoning
- *                                     is invisible to us, and a moderator that
- *                                     cannot see what the prober did is just
- *                                     another proposer.
- *   --include-partial-messages        partial chunks as they arrive (stream-json)
- *   --model <model>                   alias ('fable', 'opus', 'sonnet') or full name
- *   --permission-mode <acceptEdits|auto|bypassPermissions|manual|dontAsk|plan>
- *   --permission-prompts <host|none>  who answers permission prompts in print mode
- *   --dangerously-skip-permissions    bypass all permission checks
- *   --allow-dangerously-skip-permissions  make it an *option*, not the default
- *   --add-dir <directories...>        additional directories for tool access
- *   --session-id <uuid>               use a specific session id
- *   --allowedTools, --allowed-tools   allowlist tools
- *   --append-system-prompt <prompt>   append to the default system prompt
- *   --bare                            minimal mode: skip hooks, LSP, plugin sync,
- *                                     auto-memory, CLAUDE.md auto-discovery.
- *                                     STRICTLY auth via ANTHROPIC_API_KEY.
- *   --setting-sources <user,project,local>   which settings files to load
- *   --max-turns <n>                   (listed as -n/--name separately; turn cap
- *                                     is accepted in print mode — see UNVERIFIED)
- *
- * VERIFIED EVENT SHAPES (live run of
- *   claude -p --output-format stream-json --verbose --model haiku "Reply with exactly: OK" < /dev/null):
- *
- *   {"type":"system","subtype":"init","cwd":"...","session_id":"fd8a7751-...",
- *    "tools":["Task","Bash","CronCreate",...],"model":"claude-haiku-4-5-20251001", ...}
- *   {"type":"system","subtype":"thinking_tokens","estimated_tokens":157,
- *    "estimated_tokens_delta":107,"session_id":"...","uuid":"..."}
- *   {"type":"system","subtype":"hook_started","hook_id":"...","hook_name":"SessionStart:startup", ...}
- *   {"type":"system","subtype":"hook_response","hook_id":"...","output":"{...}", ...}
- *   {"type":"assistant","message":{"id":"msg_...","role":"assistant",
- *       "content":[{"type":"thinking","thinking":"...","signature":"..."} |
-                   {"type":"text","text":"OK"} | {"type":"tool_use","id":"toolu_...",
-                   "name":"Bash","input":{...}}],
- *       "model":"claude-haiku-4-5-20251001","usage":{...}},"session_id":"..."}
- *   {"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_...",
- *       "content":"...","is_error":false}]},"session_id":"..."}     (documented; not in my run)
- *   {"type":"result","subtype":"success","duration_ms":...,"duration_api_ms":1609,
- *    "is_error":false,"result":"...","session_id":"...","total_cost_usd":0.03089125,
- *    "num_turns":1,"stop_reason":"end_turn",
- *    "usage":{"input_tokens":10,"cache_creation_input_tokens":24425,
- *             "cache_read_input_tokens":0,"output_tokens":70,
- *             "output_tokens_details":{"thinking_tokens":63}}}
- *   Exit code 0.
- *
- * NOTABLE AND IMPORTANT: hooks fire in headless mode. In my run a
- * SessionStart hook from this machine's Claude config ran and injected company
- * knowledge into the run. That means a headless moderator can be steered by
- * whatever hooks happen to be configured. For the prober/moderator role we
- * default to --setting-sources user (so personal hooks still apply) but keep the
- * knob, and `--bare` is available via SpawnSpec.env for callers who need a
- * hermetic run. Documented in the README — this is a real reproducibility trap.
- *
- * TIMEOUT: claude has NO `--print-timeout` equivalent (agy has one, codex does
- * not). We therefore enforce the budget entirely ourselves, via
- * spawnWorker's SIGTERM->SIGKILL escalation. If you kill mid-run, there is no
- * result event and we correctly report 'cancelled'/'timeout', never 'success'.
- */
-
 import {
   binaryAvailable,
   earlyVerdict,
@@ -97,7 +9,8 @@ import {
   runNdjsonWorker,
   str,
 } from './ndjson.ts';
-import type { ExitInfo } from './ndjson.ts';
+import type { ExitInfo, LiveInput } from './ndjson.ts';
+import type { Writable } from 'node:stream';
 import type {
   ActivityRef,
   ActivityStatus,
@@ -115,35 +28,15 @@ import type { RunFn } from './discovery.ts';
 import path from 'node:path';
 import { deniedText, noResultText, stderrClause } from './failure-text.ts';
 
-export const CLAUDE_BINARY = process.env['AGENT_SMITH_CLAUDE_BIN'] ?? 'claude';
+export function claudeBinary(): string {
+  return process.env['AGENT_SMITH_CLAUDE_BIN'] ?? 'claude';
+}
 
-/**
- * Build the exact argv for one claude worker.
- *
- * argv layout: `claude -p <flags> <prompt>`.
- *
- * The prompt is a TRAILING POSITIONAL (help shows `claude [options] [command] [prompt]`),
- * so a prompt beginning with "-" is safe. Combined with `-p`, this is the
- * documented headless invocation.
- */
-/**
- * Sandbox/permission flags for claude. Shared by buildArgv and describeSandbox.
- *
- * unrestricted -> --dangerously-skip-permissions ("trusted in this directory").
- * restricted   -> --permission-mode dontAsk + --permission-prompts none. Claude
- *   cannot prompt in print mode, so anything not already allowed (by the user's
- *   settings allow rules or built-in read-only tools) is DENIED, not stalled.
- *   Denials are surfaced as status 'denied' in the JobResult (detected from
- *   tool_result text), so a restricted worker does not silently pass; but
- *   read-only is NOT enforced: user allow rules may still permit writes.
- */
-/** Tools a read-only worker may use. Shell is limited to inspection commands. */
 const READ_ONLY_ALLOWED: readonly string[] = [
   'Read', 'Grep', 'Glob',
   ...['cat', 'head', 'tail', 'wc', 'xxd', 'od', 'ls', 'file', 'stat', 'rg', 'grep', 'diff',
     'git diff', 'git show', 'git log', 'git status', 'git blame'].map((c) => `Bash(${c}:*)`),
 ];
-/** Tools a read-only worker may never use, even if user settings would allow them. */
 const READ_ONLY_DENIED: readonly string[] = ['Edit', 'Write', 'NotebookEdit'];
 
 /**
@@ -168,12 +61,6 @@ export function sandboxPlan(spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly' | 
   }
   const flags = ['--permission-mode', 'dontAsk', '--permission-prompts', 'none'];
   if (spec.readOnly) {
-    // Read-only modes get an explicit allowlist (so a reviewer can inspect bytes
-    // and history instead of being denied) and an explicit write-tool denylist,
-    // which is what makes read-only enforced rather than merely requested.
-    // A stage's output artifact is its one permitted write: Write comes off the
-    // denylist and only that file goes on the allowlist, so dontAsk still denies
-    // every other write. Edit and NotebookEdit stay denied.
     const artifact = spec.artifactPath;
     const allowed = artifact === undefined ? READ_ONLY_ALLOWED : [...READ_ONLY_ALLOWED, artifactWriteRule(artifact)];
     const denied = artifact === undefined ? READ_ONLY_DENIED : READ_ONLY_DENIED.filter((t) => t !== 'Write');
@@ -196,7 +83,16 @@ export function sandboxPlan(spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly' | 
 export function buildArgv(spec: SpawnSpec): string[] {
   const argv: string[] = ['-p'];
 
-  // NDJSON on stdout. `stream-json` is what lets a moderator show its work.
+  // Live input (Provider.liveInput). Verified live on 2.1.331 through this
+  // adapter (haiku, dontAsk, one send during a 6 s Bash call): a stdin user
+  // message written while a tool runs does not interrupt it; it joins the SAME
+  // turn at the next tool round (one result event), and --replay-user-messages
+  // re-emits it on stdout at that moment, which is our proof it was read. In
+  // this mode claude waits for more stdin after each result, so the adapter
+  // ends stdin when the result arrives (ClaudeLiveInput.end); claude then
+  // exited 0 within a second. The initial prompt's replay is swallowed.
+  argv.push('--input-format', 'stream-json', '--replay-user-messages');
+
   argv.push('--output-format', 'stream-json');
 
   // WHY --verbose IS NOT OPTIONAL HERE: with --print, the full event stream is
@@ -205,13 +101,9 @@ export function buildArgv(spec: SpawnSpec): string[] {
   // passed --verbose to.
   argv.push('--verbose');
 
-  // Without this, a subagent's text and thinking are dropped from our stream.
-  // For a prober/moderator that is disqualifying: we would be judging a
-  // subagent's work we cannot see. Documented and verified to exist.
   argv.push('--forward-subagent-text');
 
   if (spec.model !== undefined && spec.model !== '') {
-    // Aliases ('sonnet', 'opus', 'fable') or full model names both work.
     argv.push('--model', spec.model);
   }
 
@@ -230,7 +122,6 @@ export function buildArgv(spec: SpawnSpec): string[] {
     argv.push('--add-dir', ...addDirs);
   }
 
-  // See sandboxPlan for the unrestricted / restricted (dontAsk) rationale.
   argv.push(...sandboxPlan(spec).flags);
 
   if (spec.conversation !== undefined && spec.conversation !== '') {
@@ -239,11 +130,6 @@ export function buildArgv(spec: SpawnSpec): string[] {
     argv.push('--resume', spec.conversation);
   }
 
-  // Reproducibility knob. --setting-sources controls which settings files load.
-  // Default here is 'user' so personal skills/hooks work; set
-  // AGENT_SMITH_CLAUDE_SETTING_SOURCES='' to disable the flag entirely, or
-  // AGENT_SMITH_CLAUDE_BARE=1 for --bare (no hooks, no CLAUDE.md, keychain
-  // auth disabled). See the header for why this matters for a moderator.
   const bare = process.env['AGENT_SMITH_CLAUDE_BARE'] === '1';
   if (bare) {
     argv.push('--bare');
@@ -252,29 +138,82 @@ export function buildArgv(spec: SpawnSpec): string[] {
     if (sources !== '') argv.push('--setting-sources', sources);
   }
 
-  // Trailing positional prompt, last.
-  argv.push(spec.prompt);
   return argv;
 }
 
-// ---------------------------------------------------------------------------
-// Event translation
-// ---------------------------------------------------------------------------
+export function streamJsonUserMessage(text: string): string {
+  return `${JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text }] } })}\n`;
+}
 
-/**
- * Anthropic usage field names, verified from the live `result` event:
- *   input_tokens, cache_creation_input_tokens, cache_read_input_tokens,
- *   output_tokens, output_tokens_details.thinking_tokens
- *
- * `cache_creation_input_tokens` maps to our `cacheWriteTokens` so the store can
- * sum cache writes across agy (which does not report them) and claude (which
- * does) without either provider needing to know about the other.
- */
+export class ClaudeLiveInput implements LiveInput {
+  private stdin: Writable | null = null;
+  private open = true;
+  private readonly pending: { text: string; initial: boolean }[] = [];
+  private readonly prompt: string;
+
+  constructor(prompt: string) {
+    this.prompt = prompt;
+  }
+
+  attach(stdin: Writable | null): void {
+    this.stdin = stdin;
+    if (stdin === null) {
+      this.open = false;
+      return;
+    }
+    // EPIPE when claude exits (or never started) must not crash the owner.
+    stdin.on('error', () => { this.open = false; });
+    this.write(this.prompt, true);
+  }
+
+  send(text: string): boolean {
+    if (text.trim() === '') return false;
+    return this.write(text, false);
+  }
+
+  end(): void {
+    this.open = false;
+    const s = this.stdin;
+    if (s !== null && !s.destroyed && !s.writableEnded) s.end();
+  }
+
+  replayed(text: string): string | undefined {
+    let i = this.pending.findIndex((p) => p.text === text);
+    if (i < 0) i = this.pending.findIndex((p) => p.text.trim() === text.trim());
+    if (i < 0) return undefined;
+    const [hit] = this.pending.splice(i, 1);
+    return hit === undefined || hit.initial ? undefined : hit.text;
+  }
+
+  unread(): string[] {
+    return this.pending.filter((p) => !p.initial).map((p) => p.text);
+  }
+
+  private write(text: string, initial: boolean): boolean {
+    const s = this.stdin;
+    if (!this.open || s === null || s.destroyed || s.writableEnded) return false;
+    this.pending.push({ text, initial });
+    s.write(streamJsonUserMessage(text));
+    return true;
+  }
+}
+
+function userText(content: unknown): string | undefined {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content) || content.length === 0) return undefined;
+  const parts: string[] = [];
+  for (const block of content) {
+    if (block === null || typeof block !== 'object') return undefined;
+    const b = block as Record<string, unknown>;
+    if (str(b, 'type') !== 'text') return undefined;
+    parts.push(str(b, 'text') ?? '');
+  }
+  return parts.join('\n');
+}
+
 function toTokenUsage(usage: Record<string, unknown> | undefined): TokenUsage | undefined {
   if (usage === undefined) return undefined;
   const out: TokenUsage = {};
-  // Anthropic emits these as JSON NUMBERS, so num() is correct here — str()
-  // would silently return undefined for every single field.
   const input = num(usage, 'input_tokens');
   const output = num(usage, 'output_tokens');
   if (input !== undefined) out.inputTokens = input;
@@ -286,12 +225,9 @@ function toTokenUsage(usage: Record<string, unknown> | undefined): TokenUsage | 
   if (read !== undefined) out.cacheReadTokens = read;
   const write = num(usage, 'cache_creation_input_tokens');
   if (write !== undefined) out.cacheWriteTokens = write;
-  // Anthropic does not send a total. Left undefined on purpose — consumers decide
-  // the accounting policy; providers do not invent numbers.
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
-/** Is this a tool_result block reporting a permission refusal? */
 function isPermissionDenial(text: string | undefined): boolean {
   if (text === undefined) return false;
   const hay = text.toLowerCase();
@@ -315,7 +251,10 @@ interface ClaudeTranslator {
   deniedTools: string[];
 }
 
-export function createClaudeTranslator(maxChars: number): ClaudeTranslator {
+export function createClaudeTranslator(
+  maxChars: number,
+  input?: Pick<ClaudeLiveInput, 'replayed' | 'end'>,
+): ClaudeTranslator {
   const tx: ClaudeTranslator = {
     finalText: '',
     sawResult: false,
@@ -323,7 +262,6 @@ export function createClaudeTranslator(maxChars: number): ClaudeTranslator {
     deniedTools: [],
     onEvent: () => [],
   };
-  /** tool_use_id -> stepIndex */
   const toolStep = new Map<string, number>();
   const deniedIds = new Set<string>();
   let step = 0;
@@ -351,7 +289,6 @@ export function createClaudeTranslator(maxChars: number): ClaudeTranslator {
     const sessionId = str(raw, 'session_id');
     if (sessionId !== undefined) tx.sessionId = sessionId;
 
-    // ---- system / init ------------------------------------------------------
     if (type === 'system') {
       const subtype = str(raw, 'subtype');
       if (subtype === 'permission_denied') {
@@ -374,9 +311,6 @@ export function createClaudeTranslator(maxChars: number): ClaudeTranslator {
         return out;
       }
       if (subtype === 'thinking_tokens') {
-        // Not text, but the only live signal that the model is thinking. Show
-        // it as thinking text so the moderator pane feels alive instead of
-        // frozen for 90 seconds.
         const est = raw['estimated_tokens'];
         out.push({
           kind: 'text',
@@ -387,8 +321,6 @@ export function createClaudeTranslator(maxChars: number): ClaudeTranslator {
         return out;
       }
       if (subtype === 'hook_started' || subtype === 'hook_response') {
-        // Hooks genuinely run headless (verified — a SessionStart hook fired in
-        // my run). An operator watching 16 workers should know they are there.
         out.push({
           kind: 'notice',
           at,
@@ -398,12 +330,10 @@ export function createClaudeTranslator(maxChars: number): ClaudeTranslator {
         });
         return out;
       }
-      // Other system subtypes (compact_boundary, etc.) are informational.
       out.push({ kind: 'notice', at, level: 'info', message: `claude system.${subtype ?? 'unknown'}`, raw });
       return out;
     }
 
-    // ---- assistant messages --------------------------------------------------
     if (type === 'assistant') {
       const message = obj(raw, 'message');
       const content = Array.isArray(message?.['content']) ? (message['content'] as unknown[]) : [];
@@ -466,9 +396,16 @@ export function createClaudeTranslator(maxChars: number): ClaudeTranslator {
       return out;
     }
 
-    // ---- user messages: tool_result blocks ----------------------------------
     if (type === 'user') {
       const message = obj(raw, 'message');
+      // A replayed stdin message (--replay-user-messages): top level only, as a
+      // forwarded subagent message carries parent_tool_use_id.
+      const parentId = raw['parent_tool_use_id'];
+      if (input !== undefined && (parentId === undefined || parentId === null)) {
+        const text = userText(message?.['content']);
+        const sent = text === undefined ? undefined : input.replayed(text);
+        if (sent !== undefined) out.push({ kind: 'user-message', at, text: sent });
+      }
       const content = Array.isArray(message?.['content']) ? (message['content'] as unknown[]) : [];
       for (const block of content) {
         if (block === null || typeof block !== 'object') continue;
@@ -504,9 +441,10 @@ export function createClaudeTranslator(maxChars: number): ClaudeTranslator {
       return out;
     }
 
-    // ---- result --------------------------------------------------------------
     if (type === 'result') {
       tx.sawResult = true;
+      // The turn is over: end stdin, or claude waits for another message forever.
+      input?.end();
       const permissionDenials = Array.isArray(raw['permission_denials']) ? raw['permission_denials'] : [];
       for (const denial of permissionDenials) {
         if (denial === null || typeof denial !== 'object') continue;
@@ -534,11 +472,6 @@ export function createClaudeTranslator(maxChars: number): ClaudeTranslator {
       const turns = raw['num_turns'];
       if (typeof turns === 'number') tx.numTurns = turns;
 
-      // The top-level `result` string is the authoritative final answer. Prefer
-      // it over our concatenation of text blocks: if the run used
-      // --forward-subagent-text, the concatenation includes subagent chatter we
-      // deliberately excluded, but if claude compressed or re-emitted text the
-      // `result` field is still correct.
       const finalAnswer = str(raw, 'result');
       if (finalAnswer !== undefined && finalAnswer !== '') tx.finalText = finalAnswer;
       return out;
@@ -562,10 +495,6 @@ export function createClaudeTranslator(maxChars: number): ClaudeTranslator {
   return tx;
 }
 
-// ---------------------------------------------------------------------------
-// Result
-// ---------------------------------------------------------------------------
-
 export function buildResult(args: {
   jobId: string;
   startedAtMs: number;
@@ -579,18 +508,13 @@ export function buildResult(args: {
   let status: JobStatus;
   let error: string | undefined;
 
-  // claude has no --print-timeout, so a timeout kill is entirely ours: never
-  // infer success from "it produced a lot of output".
   const early = earlyVerdict(exit, durationMs);
   if (early !== undefined) {
     ({ status, error } = early);
   } else if (tx.deniedTools.length > 0 && !(tx.sawResult && !tx.sawErrorResult && exit.code === 0 && tx.finalText.trim() !== '')) {
-    // Same discipline as agy. A moderator whose tools were denied has not
-    // moderated anything, and claude may still report subtype "success".
     status = 'denied';
     error = deniedText(tx.deniedTools, exit.stderr);
   } else if (!tx.sawResult) {
-    // No result event: killed early, crashed, or a CLI output change.
     status = exit.code === 0 ? 'malformed' : 'error';
     error = noResultText(exit);
   } else if (tx.sawErrorResult) {
@@ -604,9 +528,6 @@ export function buildResult(args: {
   }
 
   const out = jobResult({ provider: 'claude', jobId, status, error, exit, response: tx.finalText, startedAtMs, durationMs, stateDir });
-  // A report was delivered despite denied calls: the job succeeded, but the
-  // orchestrator must know some checks did not run (normalize.ts turns this
-  // into a warning).
   if (tx.deniedTools.length > 0) {
     out.deniedActions = tx.deniedTools.map((id) => ({ action: 'tool', displayName: id, nonfatal: true }));
   }
@@ -620,11 +541,6 @@ export function buildResult(args: {
   return out;
 }
 
-// ---------------------------------------------------------------------------
-// Provider
-// ---------------------------------------------------------------------------
-
-/** Aliases documented by `claude --help`. */
 const CLAUDE_ALIASES: ReadonlyArray<{ id: string; label: string }> = [
   { id: 'fable', label: 'Fable' },
   { id: 'opus', label: 'Opus' },
@@ -633,19 +549,16 @@ const CLAUDE_ALIASES: ReadonlyArray<{ id: string; label: string }> = [
 ];
 const CLAUDE_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
-/** Claude config dir: AGENT_SMITH_CLAUDE_HOME, CLAUDE_CONFIG_DIR, then ~/.claude. */
 export function claudeHome(): string {
   return configDir(['AGENT_SMITH_CLAUDE_HOME', 'CLAUDE_CONFIG_DIR'], '.claude');
 }
 
-/** Top-level `model` from <home>/settings.json. Throws on malformed JSON; callers decide how loud to be. */
 function readDefaultModel(home: string): string | undefined {
   const text = readTextSafe(path.join(home, 'settings.json'));
   const model = text === undefined ? undefined : (JSON.parse(text) as { model?: unknown } | null)?.model;
   return typeof model === 'string' && model !== '' ? model : undefined;
 }
 
-/** Static alias catalog; default model from <home>/settings.json top-level `model`. Never throws. */
 export async function listClaudeModels(_options?: ListModelsOptions, home: string = claudeHome()): Promise<ModelCatalog> {
   const cat: ModelCatalog = {
     provider: 'claude',
@@ -667,7 +580,6 @@ export async function listClaudeModels(_options?: ListModelsOptions, home: strin
   return cat;
 }
 
-/** Default model from <home>/settings.json. Sync file read only; never throws. */
 function claudeHarnessDefaults(home: string = claudeHome()): { model?: string; effort?: string } {
   try {
     const model = readDefaultModel(home);
@@ -681,18 +593,22 @@ export const claudeProvider: Provider = {
   harnessDefaults: () => claudeHarnessDefaults(),
   name: 'claude',
 
-  available: () => binaryAvailable(CLAUDE_BINARY),
+  available: () => binaryAvailable(claudeBinary()),
 
   describeSandbox: sandboxPlan,
 
   listModels: (options) => listClaudeModels(options),
 
+  liveInput: true,
+
   spawn(spec: SpawnSpec): Promise<WorkerHandle> {
-    const tx = createClaudeTranslator(spec.maxOutputChars ?? 2000);
+    const input = new ClaudeLiveInput(spec.prompt);
+    const tx = createClaudeTranslator(spec.maxOutputChars ?? 2000, input);
     return runNdjsonWorker({
       provider: 'claude',
-      binary: CLAUDE_BINARY,
+      binary: claudeBinary(),
       spec,
+      input,
       buildArgv,
       translate: tx.onEvent,
       buildResult: (ctx) => buildResult({ ...ctx, tx }),

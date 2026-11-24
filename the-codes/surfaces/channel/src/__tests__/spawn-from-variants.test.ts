@@ -1,4 +1,3 @@
-/** spawn_job from and variants, and cancel's settle wait. */
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -73,7 +72,6 @@ test('from with a different provider drops the inherited model, effort and unres
   assert.equal(r.isError, undefined, errText(r));
   const second = f.seen[1]!;
   assert.equal(second.provider, 'agy'); assert.notEqual(second.model, 'codex-n'); assert.equal(second.unrestricted, undefined);
-  // Same provider restated keeps them.
   await callTool(f.ctx, 'spawn_job', { from: 'job-1', provider: 'codex' });
   assert.equal(f.seen[2]!.model, 'codex-n');
 });
@@ -156,7 +154,7 @@ test('cancel returns the settled status within the window and marks the notice c
   const f = fixture({ status: () => (reads++ < 3 ? 'running' : 'canceled'), cancelSettleMs: 2_000 });
   await callTool(f.ctx, 'spawn_job', { mode: 'review', prompt: 'x', provider: 'codex' });
   reads = 0;
-  const c = body(await callTool(f.ctx, 'cancel', { jobId: 'job-1' }));
+  const c = body(await callTool(f.ctx, 'cancel', { id: 'job-1' }));
   assert.equal(c.status, 'canceled'); assert.equal(c.settled, true); assert.equal(c.requested, undefined);
   assert.ok(existsSync(claimMarkerPath(f.repo, 'job', 'job-1')));
 });
@@ -164,7 +162,7 @@ test('cancel returns the settled status within the window and marks the notice c
 test('cancel of a finished job returns its final status, settled', async () => {
   const f = fixture({ status: () => 'succeeded' });
   await callTool(f.ctx, 'spawn_job', { mode: 'review', prompt: 'x', provider: 'codex' });
-  const c = body(await callTool(f.ctx, 'cancel', { jobId: 'job-1' }));
+  const c = body(await callTool(f.ctx, 'cancel', { id: 'job-1' }));
   assert.equal(c.status, 'succeeded'); assert.equal(c.settled, true);
 });
 
@@ -172,7 +170,7 @@ test('cancel gives up after the window with settled:false and no claim marker', 
   const f = fixture({ status: () => 'running', cancelSettleMs: 60 });
   await callTool(f.ctx, 'spawn_job', { mode: 'review', prompt: 'x', provider: 'codex' });
   const t0 = Date.now();
-  const c = body(await callTool(f.ctx, 'cancel', { jobId: 'job-1' }));
+  const c = body(await callTool(f.ctx, 'cancel', { id: 'job-1' }));
   assert.equal(c.status, 'running'); assert.equal(c.settled, false);
   assert.ok(Date.now() - t0 < 2_000, 'waits only the window');
   assert.equal(existsSync(claimMarkerPath(f.repo, 'job', 'job-1')), false);
@@ -205,16 +203,15 @@ test('cancel writes the claim marker before signalling, removes it if unsettled,
     sawMarkerDuringCancel = existsSync(claimMarkerPath(f.repo, 'job', id));
     return origCancel(id);
   };
-  const unsettled = body(await callTool(f.ctx, 'cancel', { jobId: 'job-1' }));
+  const unsettled = body(await callTool(f.ctx, 'cancel', { id: 'job-1' }));
   assert.equal(sawMarkerDuringCancel, true);
   assert.equal(unsettled.settled, false);
   assert.equal(existsSync(claimMarkerPath(f.repo, 'job', 'job-1')), false);
 
-  // A pre-existing marker (e.g. claimed by the mod) is not removed when cancel times out.
   const preExisting = claimMarkerPath(f.repo, 'job', 'job-1');
   mkdirSync(path.dirname(preExisting), { recursive: true });
   writeFileSync(preExisting, 'mod\n');
-  const stillRunning = body(await callTool(f.ctx, 'cancel', { jobId: 'job-1' }));
+  const stillRunning = body(await callTool(f.ctx, 'cancel', { id: 'job-1' }));
   assert.equal(stillRunning.settled, false);
   assert.equal(existsSync(preExisting), true);
 });
@@ -228,27 +225,25 @@ test('cancel by an earlier turn marks both IDs and reads acceptance on the final
   let reads = 0;
   const svc = f.ctx.service as unknown as {
     cancel: (id: string) => unknown;
-    resolveHead: (id: string) => string;
+    resolveTurn: (id: string) => string;
     detail: (id: string) => Promise<unknown>;
   };
   svc.cancel = (id: string) => (id === 'turn-1' ? { jobId: 'turn-2', resolvedFrom: id, requested: true, signalled: true, note: 'x' } : { jobId: id, requested: true, signalled: true, note: 'x' });
-  svc.resolveHead = () => (reads === 0 ? 'turn-2' : 'turn-3');
+  svc.resolveTurn = (id: string) => (reads > 0 && (id === 'turn-1' || id === 'turn-2') ? 'turn-3' : id);
   svc.detail = async (id: string) => {
     reads++;
     return { jobId: id, name: 'w', workerId: 'turn-1', status: id === 'turn-3' ? 'canceled' : 'running', report: null, warnings: [] };
   };
-  const c = body(await callTool(f.ctx, 'cancel', { jobId: 'turn-1' }));
+  const c = body(await callTool(f.ctx, 'cancel', { id: 'turn-1' }));
   assert.equal(c.jobId, 'turn-3');
   assert.equal(c.resolvedFrom, 'turn-1');
   assert.equal(c.settled, false);
-  assert.equal(c.checksCanceled, false);
   assert.equal(existsSync(claimMarkerPath(f.repo, 'job', 'turn-1')), false);
   assert.equal(existsSync(claimMarkerPath(f.repo, 'job', 'turn-2')), false);
   assert.equal(existsSync(claimMarkerPath(f.repo, 'job', 'turn-3')), false);
 
-  // Once acceptance finishes, cancel settles and keeps markers for both IDs.
   writeFileSync(path.join(jobDir(f.repo, 'turn-3'), ACCEPTANCE_FILE), JSON.stringify({ state: 'accepted', pending: false }));
-  const settled = body(await callTool(f.ctx, 'cancel', { jobId: 'turn-1' }));
+  const settled = body(await callTool(f.ctx, 'cancel', { id: 'turn-1' }));
   assert.equal(settled.jobId, 'turn-3');
   assert.equal(settled.resolvedFrom, 'turn-1');
   assert.equal(settled.settled, true);
@@ -312,7 +307,7 @@ test('cancel waits for supersededBy to settle and cancels the new head that appe
   let turn2Status = 'running';
   const svc = f.ctx.service as unknown as {
     cancel: (id: string) => unknown;
-    resolveHead: (id: string) => string;
+    resolveTurn: (id: string) => string;
     detail: (id: string) => Promise<unknown>;
   };
   svc.cancel = (id: string) => {
@@ -320,13 +315,13 @@ test('cancel waits for supersededBy to settle and cancels the new head that appe
     if (id === 'turn-2') turn2Status = 'canceled';
     return { jobId: id, requested: true, signalled: true, note: 'x' };
   };
-  svc.resolveHead = () => 'turn-2';
+  svc.resolveTurn = (id: string) => (id === 'turn-1' ? 'turn-2' : id);
   svc.detail = async (id: string) => (
     id === 'turn-1'
       ? { jobId: 'turn-1', name: 'w', workerId: 'turn-1', status: 'canceled', supersededBy: 'turn-2', report: null, warnings: [] }
       : { jobId: 'turn-2', name: 'w', workerId: 'turn-1', status: turn2Status, report: null, warnings: [] }
   );
-  const c = body(await callTool(f.ctx, 'cancel', { jobId: 'turn-1' }));
+  const c = body(await callTool(f.ctx, 'cancel', { id: 'turn-1' }));
   assert.deepEqual(canceledCalls, ['turn-1', 'turn-2']);
   assert.equal(c.jobId, 'turn-2');
   assert.equal(c.settled, true);

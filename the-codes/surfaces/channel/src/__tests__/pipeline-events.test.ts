@@ -3,7 +3,7 @@ import test from 'node:test';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { readAll } from '../watch-source.ts';
+import { readPipelineRecord } from '../watch-source.ts';
 import { buildBatch } from '../policy.ts';
 
 test('acceptance failure is announced after successful worker execution with no worker summary', async () => {
@@ -15,15 +15,16 @@ test('acceptance failure is announced after successful worker execution with no 
     save();
     const seen = new Set<string>();
     const poll = async () => {
-      const batch = buildBatch((await readAll(repo)).map((job) => ({ job, seen, knownBefore: true })), Date.now());
+      const job = (await readPipelineRecord(repo, 'fixture-run'))!.job;
+      const batch = buildBatch([{ job, seen, observedInPriorPoll: true }], Date.now());
       for (const key of batch.keys) seen.add(key);
       return batch;
     };
     assert.equal((await poll()).content, null);
     run.status = 'failed'; run.finishedAt = Date.now();
     run.stageResults.implement = { stage: 'implement', status: 'failed', acceptance: 'failed' }; save();
-    const jobs = await readAll(repo);
-    assert.equal(jobs[0]?.status, 'failed'); assert.equal(jobs[0]?.summarySource, undefined);
+    const job = (await readPipelineRecord(repo, 'fixture-run'))!.job;
+    assert.equal(job.status, 'failed'); assert.equal(job.summarySource, undefined);
     const sent = [await poll(), await poll()].filter((b) => b.content !== null);
     assert.equal(sent.length, 1); assert.match(sent[0]!.content!, /Release review.*failed/);
     assert.match(sent[0]!.content!, /Release review .*1 stages passed|0\/1 stages passed · implement: checks failed/);

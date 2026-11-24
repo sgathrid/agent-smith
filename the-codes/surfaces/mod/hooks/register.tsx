@@ -1,4 +1,3 @@
-/** The band above the prompt and the /forge sidebar share canonical state and views. */
 import { atom, read, update } from 'claude-code';
 import type { EngineInterface, Register, UiRenderEvent } from 'claude-code';
 
@@ -7,9 +6,6 @@ import { jobLabel, oneLine, sanitizeText } from './format.ts';
 import { commandTerminalColumns, findWorker, groupWorkers, isLive, measurePaneTerminalColumns, paneWidthRequest, recordLaunch, scopeLine, sessionBoard, sessionJobs, workerHead, workerTurns, type Launched } from './dashboard.ts';
 import { renderList, renderWorker, type ViewActions, type ViewOptions } from './views.tsx';
 import type { ForgeDetail } from './canonical.ts';
-// ── BAND IMPORTS (band author) ────────────────────────────────────────────────
-// § PANE reads through this module too, and for the same reason the band does: it
-// reads through the same FsLike, handed `$.fs`.
 import {
   buildLine,
   isShown,
@@ -46,12 +42,9 @@ import {
 } from './native.ts';
 import { RELEASED_MANIFEST, manifestVersion, updateLine } from './update.ts';
 
-/** Pane id. Must match the `requestId` in the ui.render matcher below. */
 const PANE = 'agent-smith';
 
-/** Last measured whole-terminal width, supplied by the host render event. */
 let lastViewportColumns: number | null = null;
-/** Width last requested from ui.open, avoiding render-triggered reopen loops. */
 let lastPaneRequest: number | null = null;
 
 function noteViewport(columns: number | undefined): void {
@@ -63,7 +56,6 @@ function noteViewport(columns: number | undefined): void {
 async function requestPane($: EngineInterface, force = false): Promise<void> {
   const columns = paneWidthRequest(lastViewportColumns);
   if (!force && lastPaneRequest === columns) return;
-  // Set before awaiting: a Pane render can arrive while ui.open is still pending.
   lastPaneRequest = columns;
   await $.ui.open({
     id: PANE,
@@ -73,46 +65,22 @@ async function requestPane($: EngineInterface, force = false): Promise<void> {
   });
 }
 
-// ── state ───────────────────────────────────────────────────────────────────
-//
-// DECLARED AT MODULE SCOPE, NOT INSIDE register(). An atom created inside the
-// hook closure would be a brand-new store on every hot reload, so reloading this
-// file would silently drop the user's selection. The host owns these, keyed by
-// plugin name, and they survive reloads.
-//
-// The band owns `now`. Both halves need a clock and both must subscribe to the
-// SAME one, or the band would tick and the pane would not, and the two would show
-// elapsed times that disagree by up to a second.
-
 const selected = atom({ plugin: 'agent-smith', key: 'selected' } as const, null as string | null);
-/** Prior turn jobId explicitly pinned by user click; null auto-follows the worker's live head. */
 const pinnedTurnId = atom({ plugin: 'agent-smith', key: 'pinnedTurnId' } as const, null as string | null);
 const now = atom({ plugin: 'agent-smith', key: 'now' } as const, 0);
 
-/**
- * Whether the worker view keeps its end in view. A person scrolling up pauses
- * it; scrolling back to the bottom resumes it.
- */
 const follow = atom({ plugin: 'agent-smith', key: 'follow' } as const, true as boolean);
-/** The task line is expanded: the prompt as sent, preamble included. */
 const taskOpen = atom({ plugin: 'agent-smith', key: 'taskOpen' } as const, false as boolean);
 const listPage = atom({ plugin: 'agent-smith', key: 'listPage' } as const, 0);
 const paneOpen = atom({ plugin: 'agent-smith', key: 'paneOpen' } as const, false);
 const readError = atom({ plugin: 'agent-smith', key: 'readError' } as const, null as string | null);
 const expandedTools = atom({ plugin: 'agent-smith', key: 'expandedTools' } as const, [] as string[]);
-/** The worker the host was last asked to keep at its end; null re-anchors on the next draw. */
 let followingSite: string | null = null;
 const nativeTaskLinks = atom(
   { plugin: 'agent-smith', key: 'nativeTaskLinks' } as const,
   {} as NativeTaskLinks,
 );
 
-// ── BAND STATE (band author) ──────────────────────────────────────────────────
-// The band, pane list and native task projection share this polled snapshot.
-// Detail reads the selected job's bounded view on demand. Configuration is
-// resolved once at session start.
-
-/** No default repository: a hardcoded path would show another machine's jobs. */
 const DEFAULT_REPO = '';
 
 const bandJobs = atom({ plugin: 'agent-smith', key: 'bandJobs' } as const, [] as RadarJob[]);
@@ -122,74 +90,29 @@ const bandConfig = atom({ plugin: 'agent-smith', key: 'bandConfig' } as const, {
   source: 'cwd' as 'cwd' | 'launch',
 });
 
-/**
- * Launches this session claimed (see `takeLaunch`), until announced. Session
- * state, reset by /clear: a job claimed before a /clear is not announced after
- * it, and leaves this session's view (`/forge all` still lists it).
- */
 const notices = atom({ plugin: 'agent-smith', key: 'notices' } as const, [] as Owned[]);
 
-/**
- * Launches this session made in this repo, for the views. Unlike `notices`,
- * nothing prunes it: an announced or expired claim leaves `notices`, but its
- * finished job stays in this session's list. Session state, reset like `notices`.
- */
 const launched = atom({ plugin: 'agent-smith', key: 'launched' } as const, { jobs: [], runs: [] } as Launched);
-/** The /forge list shows this session's workers, or the repository's history. */
 const listScope = atom({ plugin: 'agent-smith', key: 'listScope' } as const, 'session' as 'session' | 'all');
 
-/**
- * The rows the band, the session list and native tasks show: this session's
- * launches.
- */
 async function sessionRows($: EngineInterface): Promise<RadarJob[]> {
   const jobs = await read($, bandJobs);
   const mine = await read($, launched);
   return sessionJobs(jobs, mine);
 }
 
-// =============================================================================
-// § BAND — band author.
-//
-// The band is the 1–4 line strip between the transcript and the prompt. It owns:
-//   - the `ui.render` matcher for component 'AbovePrompt'
-//   - the session.start wiring: config, the 1 s band clock, the 3 s data poll
-//
-// It is exported as a function rather than registered inline because `register`
-// below belongs to the pane and must not be edited to fix a band bug. The pane
-// calls `registerBand(on)` from its own `register`; that one call is the whole
-// coupling. If the band half is dropped, delete that call and nothing else.
-//
-// EVERY RULE HERE CITES agent-configs/shared/TERMINAL-UI.md. The three that
-// shape the code most:
-//   L22-35  nothing on screen moves unless the user caused it
-//   L170-176 yield to the host; render nothing when there is nothing to say
-//   L155-162 the tick is gated on visibility
-// =============================================================================
-
-/** Band clock: 1 s. TERMINAL-UI.md L147 — the seconds digit is all that moves. */
 const BAND_TICK_MS = 1000;
 
-/** Active data poll: 1 s when workers are live, notices are pending, or /forge is open; idle (0 disk reads) when quiet. */
 const POLL_MS = 1000;
 
-/** In-memory cache of immutable settled jobs (keyed by `repo\0id`) for O(active) polling. */
 const settledJobCache = new Map<string, RadarJob>();
 
-/** `$.fs` narrowed to what the readers ask of it. */
 const fsOf = ($: EngineInterface): FsLike => ({
   read: (p) => $.fs.read(p),
   list: (p) => $.fs.list(p),
   exists: (p) => $.fs.exists(p),
 });
 
-/**
- * One sweep of the jobs directory into the `bandJobs` atom.
- *
- * Immutable settled jobs are served from `settledJobCache` so steady-state polling
- * is O(active) instead of re-reading every historical job directory on disk.
- * Read failures retain the last snapshot and expose an error to the user.
- */
 async function pollBand($: EngineInterface): Promise<void> {
   const cfg = await read($, bandConfig);
   if (cfg.repo === '') return;
@@ -201,15 +124,11 @@ async function pollBand($: EngineInterface): Promise<void> {
   } catch (error) {
     const message = `Can't read job state: ${String(error).slice(0, 200)}`;
     if (await read($, readError) !== message) await update($, readError, () => message);
-    return; // Retain the last observed rows; a read failure is not an empty project.
+    return;
   }
 
-  // Canonical records are atomic and authoritative; all three surfaces receive
-  // exactly that projection.
   const previous = await read($, bandJobs);
 
-  // Only write when something actually changed so idle or unchanged polls do not
-  // invalidate UI surfaces unnecessarily.
   const before = JSON.stringify(previous);
   if (before !== JSON.stringify(next)) {
     detailCache = null;
@@ -231,52 +150,28 @@ async function pollBand($: EngineInterface): Promise<void> {
 // modules, so a classic handler here never runs and the host says so in the
 // transcript on every launch.
 
-/** Repo paths compare without trailing slashes. */
 const sameRepo = (a: string, b: string): boolean => a.replace(/\/+$/, '') === b.replace(/\/+$/, '');
 
-/**
- * Record a launch for this session's view and, where the mod can watch it,
- * claim its announcement. True when claimed.
- *
- * Ownership is per session by construction: `tool.call` fires for this
- * session's own tool calls, and `notices` is session state.
- */
 async function takeLaunch($: EngineInterface, launch: Launch, cwd: string): Promise<boolean> {
   const repo = launch.repo ?? cwd;
-  // The ack's repo is where the MCP server keeps its jobs, so it is the repo
-  // to watch. The session cwd was only a guess: it differs when the session
-  // started, or restarted, somewhere other than where the server did.
   const switched = repo !== '' && await adoptRepo($, repo);
   const cfg = await read($, bandConfig);
-  // Whether this session shows the job is a separate question from who
-  // announces it: any launch in this repo is shown, even one the hook keeps.
   const inWatchedRepo = cfg.repo !== '' && sameRepo(repo, cfg.repo);
   if (inWatchedRepo) await update($, launched, (l) => recordLaunch(l, launch));
-  // Wake immediately on launch (or repo switch) so the band, native tasks, and
-  // /forge pick up the new turn without waiting for the next timer tick.
   if (switched || inWatchedRepo) {
     detailCache = null;
     await pollBand($).catch(() => {});
     const atNow = await $.clock.now();
     await update($, now, () => atNow).catch(() => {});
   }
-  // A read error means no rows: the mod could not see this job finish, so the
-  // hook keeps it.
   if (cfg.repo === '' || await read($, readError) !== null) return false;
   if (!sameRepo(repo, cfg.repo)) return false;
   const at = await $.clock.now();
   await update($, notices, (owned) => claim(owned, launch, at));
-  // The command hook still starts for every launch; it finds this marker when
-  // the job ends and stays silent. The marker is the only thing that stops a
-  // second notice.
   await $.fs.write(claimMarkerPath(cfg.repo, launch.kind, launch.id), `${new Date(at).toISOString()}\n`).catch(() => {});
   return true;
 }
 
-/**
- * Watch `repo`, the repo a launch reported.
- * True when the watched repo changed, so the caller can re-read jobs now.
- */
 async function adoptRepo($: EngineInterface, repo: string): Promise<boolean> {
   const cfg = await read($, bandConfig);
   if (sameRepo(repo, cfg.repo)) {
@@ -285,8 +180,8 @@ async function adoptRepo($: EngineInterface, repo: string): Promise<boolean> {
   }
   settledJobCache.clear();
   detailCache = null;
+  idleEntries = null;
   await update($, bandConfig, (c) => ({ ...c, repo: trimSlashes(repo), source: 'launch' as const }));
-  // The old guess's rows and read error say nothing about the new repo.
   await update($, bandJobs, () => []);
   await update($, readError, () => null);
   return true;
@@ -294,10 +189,8 @@ async function adoptRepo($: EngineInterface, repo: string): Promise<boolean> {
 
 const trimSlashes = (p: string): string => p.replace(/\/+$/, '') || p;
 
-// A slow pass can overlap the next tick; one announcement pass at a time.
 let announcing = false;
 
-/** Announce every claimed launch that has news: one log block, one turn. */
 async function announce($: EngineInterface, repo: string, jobs: readonly RadarJob[], at: number): Promise<void> {
   if (announcing) return;
   announcing = true;
@@ -311,9 +204,7 @@ async function announce($: EngineInterface, repo: string, jobs: readonly RadarJo
       try {
         const run = await $.fs.exists(file) ? asRunRecord(JSON.parse(await $.fs.read(file))) : null;
         if (run) runs.set(o.id, run);
-      } catch {
-        // Mid-write or unreadable: try again next poll.
-      }
+      } catch {}
     }
     const result = due(owned, jobs, runs, at);
     const ownedChanged =
@@ -324,7 +215,9 @@ async function announce($: EngineInterface, repo: string, jobs: readonly RadarJo
         o.workerId !== owned[i]?.workerId ||
         o.saidAttention !== owned[i]?.saidAttention ||
         o.saidDead !== owned[i]?.saidDead ||
-        o.saidExited !== owned[i]?.saidExited);
+        o.saidExited !== owned[i]?.saidExited ||
+        o.fromTurn !== owned[i]?.fromTurn ||
+        o.readHead !== owned[i]?.readHead);
     const changed = result.notices.length > 0 || ownedChanged;
     if (!changed) return;
     for (const o of result.owned) {
@@ -332,28 +225,18 @@ async function announce($: EngineInterface, repo: string, jobs: readonly RadarJo
         await $.fs.write(claimMarkerPath(repo, o.kind, o.id), `${new Date(at).toISOString()}\n`).catch(() => {});
       }
     }
-    // Record before speaking, so a notice is said once even if the turn it
-    // asks for never starts. Claims made since the read above are kept.
     const seen = new Set([
       ...owned.map((o) => `${o.kind}:${o.id}`),
       ...result.owned.map((o) => `${o.kind}:${o.id}`),
     ]);
     await update($, notices, (current) => [...result.owned, ...current.filter((c) => !seen.has(`${c.kind}:${c.id}`))]);
     if (result.notices.length === 0) return;
-    // Resolves when the turn starts, which waits for the session to be idle.
-    // No `asUser`: the notice quotes worker-controlled text (reasons, errors),
-    // and the host's plugin wrapper is what tells Claude it is not the user's.
-    // The UserMessage render hook below keeps the transcript line short.
     void $.prompt.submit({ text: claudeText(result.notices) }).catch(() => {});
   } finally {
     announcing = false;
   }
 }
 
-/**
- * Toast once a session when main has released a newer version than the one
- * installed. Never throws: offline, rate-limited or refused, it says nothing.
- */
 async function checkForUpdate($: EngineInterface): Promise<void> {
   if (await $.env.get('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC').catch(() => undefined)) return;
   const current = manifestVersion(await $.fs.read(`${$.plugin.root}/.claude-plugin/plugin.json`));
@@ -362,44 +245,26 @@ async function checkForUpdate($: EngineInterface): Promise<void> {
   if (line !== null) await $.ui.toast(line);
 }
 
-/**
- * The band's half of session start. Await this INSIDE the pane's own
- * `session.start` handler, after its `await next(e)`.
- *
- * WHY A SEPARATE FUNCTION AND NOT A SECOND `on('session.start')`
- * ─────────────────────────────────────────────────────────────
- * Two constraints, both VERIFIED against the loader, and together they force
- * this shape:
- *
- *   1. Registering the same matcher-less event twice in one module is refused:
- *      `on("session.start") is registered twice without a matcher; the first is
- *       at …/register.tsx:57`. Two engineers owning two halves of one file
- *      therefore cannot both claim `session.start`.
- *   2. `$` may only be passed to a call to a function DECLARED at the top of the
- *      file (or a const bound to one): `$ is passed to "bandStart", which is not
- *      a function declared at the top of this file`. And a registration callback
- *      may not return a value the pane could hold: `the value of registerBand(on)
- *      is kept … it takes .catch(handler) where it is called and nothing else`.
- *
- * So the band exports a plain top-level function and the pane awaits it. That is
- * also why `registerBand` returns void.
- *
- * NEVER THROWS. A band that fails to configure itself must not take the
- * session's start — or the pane — down with it.
- */
 let polling = false;
 
+let idleEntries: string | null = null;
+
+async function jobsListing($: EngineInterface, repo: string): Promise<string> {
+  try {
+    const entries = await $.fs.list(`${repo.replace(/\/+$/, '')}/.agent-smith/jobs`);
+    return entries.filter((e) => e.kind === 'dir' && !e.name.startsWith('.')).map((e) => e.name).sort().join('\n');
+  } catch {
+    return '';
+  }
+}
+
 export async function startBand($: EngineInterface, cwd?: string): Promise<void> {
-  // Reset the module's own state, not the host's atoms. A reload fires
-  // session.start again but host-persisted state (paneOpen, selected, ...)
-  // survives it, and a pane the host still has mounted must stay open to this
-  // module: resetting paneOpen here would stop the clock gate and let the band
-  // record the dock's conversation width as the terminal's.
   lastViewportColumns = null;
   lastPaneRequest = null;
   followingSite = null;
   detailCache = null;
   polling = false;
+  idleEntries = null;
   settledJobCache.clear();
 
   // NO_COLOR first, because it decides every colour prop from here on.
@@ -413,51 +278,25 @@ export async function startBand($: EngineInterface, cwd?: string): Promise<void>
     $.env.get('TERM').catch(() => undefined),
   ]);
   await update($, bandConfig, (previous) => ({
-    // Precedence: the repo a launch already reported, else the session cwd,
-    // else DEFAULT_REPO (empty by design). A hardcoded developer path here
-    // would make the plugin show another machine's jobs.
-    //
-    // A launch's repo outranks the cwd because session.start fires again on a
-    // resume or compaction, and by then the cwd may have moved (a persisted
-    // `cd`, a worktree) while the MCP server still writes jobs under the
-    // directory it started in. See takeLaunch.
     ...(previous.source === 'launch' && previous.repo !== '' ? { repo: previous.repo, source: 'launch' as const }
       : { repo: cwd !== undefined && cwd !== '' ? cwd : DEFAULT_REPO, source: 'cwd' as const }),
     colour: !noColor({ NO_COLOR: nc, FORCE_COLOR: force, TERM: term }),
   }));
 
-  // First read is immediate and warm. TERMINAL-UI.md L140-146 INVERTS the web
-  // skill's 150–300 ms delay deliberately: there is no network here and no
-  // paint to hide behind, so a delay is pure loss.
   await pollBand($).catch(() => {});
 
-  // Seed the clock BEFORE the first render. `now` is an atom initialised to 0,
-  // and a running row's elapsed cell is `now - startedAt`. With `now === 0` that
-  // is a NEGATIVE span, which `elapsed()` clamps to `0s` — so without this seed a
-  // job that has been working for twelve minutes shows `0s` on its first paint
-  // and only becomes honest a second later, when the tick runs. That is a
-  // fabricated reading, which is the one thing a status line must not do, and it
-  // is exactly the "flash of wrong content" the one-rule (L22-35) is about.
   const seeded = await $.clock.now();
   await update($, now, () => seeded).catch(() => {});
 
-  // Tick while a row was visible at the previous time, so its expiry gets one
-  // final redraw. Keep ticking for an open pane; become idle only afterwards.
   $.clock.every(BAND_TICK_MS, () => {
     void (async () => {
       const at = await $.clock.now();
       const previousTime = await read($, now);
       const visible = groupWorkers(await sessionRows($)).some(j => isShown(j, previousTime));
-      // Draw once across the expiry boundary before becoming idle.
       if (visible || await read($, paneOpen)) await update($, now, () => at);
     })().catch(() => {});
   });
 
-  // Active data poll at 1 s cadence when workers are live, notices are pending,
-  // or /forge is open. Completely idle (0 disk reads/sec) when quiet; wakes
-  // immediately on tool.call launch or /forge open.
-  // Notices go out from here only: a timer runs outside any event, which is
-  // where `$.prompt.submit` belongs.
   $.clock.every(POLL_MS, () => {
     void (async () => {
       if (polling) return;
@@ -473,8 +312,13 @@ export async function startBand($: EngineInterface, cwd?: string): Promise<void>
           if (await read($, readError) !== null) return;
           await announce($, cfg.repo, await read($, bandJobs), await $.clock.now());
         } else {
-          // Completely idle on disk (0 disk reads/sec). Still close any lingering
-          // dismissible completed native task after CLOSE_DELAY_MS using the in-memory rows.
+          const listing = await jobsListing($, cfg.repo);
+          if (listing !== idleEntries) {
+            await pollBand($);
+            const rows = new Set((await read($, bandJobs)).map((job) => job.id));
+            idleEntries = listing.split('\n').every((name) => name === '' || rows.has(name)) ? listing : null;
+            return;
+          }
           const links = await read($, nativeTaskLinks);
           if (hasPendingNativeClose(currentJobs, links)) {
             await pollNativeTasks($, currentJobs);
@@ -487,9 +331,6 @@ export async function startBand($: EngineInterface, cwd?: string): Promise<void>
   });
 }
 
-// Clock ticks can arrive while the host's TaskCreate/TaskUpdate call is still
-// resolving. The durable map lives in plugin state; this is only an overlap
-// guard for the mod's current engine session.
 let nativeSyncing = false;
 
 async function pollNativeTasks($: EngineInterface, rows: readonly RadarJob[]): Promise<void> {
@@ -501,35 +342,17 @@ async function pollNativeTasks($: EngineInterface, rows: readonly RadarJob[]): P
       create: (input) => $.tool.call({ tool: 'TaskCreate', ...input }),
       update: (input) => $.tool.call({ tool: 'TaskUpdate', ...input }),
     };
-    // Only this session's launches get a new task; tasks already linked finish as before.
     const mine = new Set(sessionJobs(rows, await read($, launched)).map((job) => job.id));
     const next = await syncNativeTasks(nativeJobsFromRadar(rows), previous, client, await $.clock.now(), (id) => mine.has(id));
     if (JSON.stringify(previous) !== JSON.stringify(next)) {
       await update($, nativeTaskLinks, () => next);
     }
-  } catch {
-    // The native task list is an optional view. Its failure cannot interrupt
-    // worker execution, the pane, or the existing progress band.
-  } finally {
+  } catch {} finally {
     nativeSyncing = false;
   }
 }
 
-// ── the band's remaining registrations ─────────────────────────────────────
-//
-// Its session-start half is `startBand` above, because the engine refuses two
-// matcher-less registrations of the same event in one module. These need
-// nothing from the pane, so they are registered here.
-
-/**
- * Register the band. Called from the pane's `register`.
- *
- * The band registers NO `command.run` handler: `/forge` belongs to the pane
- * half. Its rows' digit hotkeys open the pane through `openForge`.
- */
 function registerBand(on: Parameters<Register>[0]): void {
-  // A launch this session made: wrap the launch tool, read its result, claim it
-  // for the mod's notices (see takeLaunch), and return the result untouched.
   on('tool.call', { tool: LAUNCH_TOOL }, async ($, e, next) => {
     const r = await next(e) as { result?: unknown; text?: unknown; deny?: string; isError?: boolean } | undefined;
     if (r && r.deny === undefined && r.isError !== true) {
@@ -540,11 +363,6 @@ function registerBand(on: Parameters<Register>[0]): void {
     return r;
   });
 
-  // When the main agent reads a job or pipeline that has already settled via
-  // status / pipeline_status, retire its pending notice so we don't wake Claude
-  // a second time. A subagent's read (agentId set) is not seen by the main
-  // agent, so it keeps the notice. A host that sends no agentId reads as the
-  // main agent; tool.call has carried it since Claude Code 2.1.304 at least.
   on('tool.call', { tool: STATUS_TOOL }, async ($, e, next) => {
     const r = await next(e) as { result?: unknown; text?: unknown; deny?: string; isError?: boolean } | undefined;
     if (r && r.deny === undefined && r.isError !== true && e.agentId === undefined) {
@@ -554,10 +372,6 @@ function registerBand(on: Parameters<Register>[0]): void {
     return r;
   });
 
-  // Render our completion notices in the transcript as a single clean status
-  // line, while leaving the stored prompt Claude reads intact. Expanded rows are
-  // cleaned too: Claude Code draws a short plugin prompt expanded under its
-  // "Prompt from the agent-smith plugin" label, and ctrl+o is indistinguishable.
   on('ui.render', { component: 'UserMessage' }, async (_$, e, next) => {
     // Claude Code 2.1.300 passes the prompt's origin as `stored`; older hosts as `origin`.
     const origin = e.props.origin ?? e.props.stored;
@@ -578,22 +392,13 @@ function registerBand(on: Parameters<Register>[0]): void {
     if (lastPaneRequest === null && !await read($, paneOpen)) {
       noteViewport(e.viewport?.columns);
     }
-    // Yield FIRST. Everything Claude Code and every other mod draw in this band
-    // comes back in `rest`, and we return it as our LAST child, untouched.
-    // TERMINAL-UI.md L170-173.
     const rest = await next(e);
 
-    // Subscribe. `await read($, now)` is what makes a clock tick repaint this
-    // element; reading bandJobs (in sessionRows) is what makes a poll repaint it.
     const at = await read($, now);
     const cfg = await read($, bandConfig);
     const all = await sessionRows($);
 
-    // A survey holds the band. Standing aside is not politeness: a survey is a
-    // question being asked, and the band would push it off screen.
     if (e.props.hasSurvey) return rest;
-    // Viewing a subagent's transcript: the band belongs to the main thread.
-    // Claude Code sets `view.agentId` only then; switching back re-renders.
     if (e.props.view?.agentId !== undefined) return rest;
 
     const error = await read($, readError);
@@ -602,49 +407,24 @@ function registerBand(on: Parameters<Register>[0]): void {
       return <Box flexDirection="column"><Text wrap="truncate-end">{oneLine(error)}</Text>{rest}</Box>;
     }
     const shown = sortForBand(groupWorkers(all)).filter((j) => isShown(j, at));
-    // No jobs → render NOTHING (TERMINAL-UI.md L168-171). Not "no jobs", not an
-    // empty box: the host's own output, exactly as it was. A band that "appears
-    // to say nothing" is noise.
     if (shown.length === 0) return rest;
 
-    // `maxRows` is the engine's own budget for this site — the fullscreen bottom
-    // slot's, or the terminal's height. Passing it in means the band cannot be
-    // the reason the prompt leaves the screen in a short terminal, which is rule
-    // #1 in a way the rule does not otherwise mention.
     const budget = rowBudget(shown, Math.max(1, (e.props.maxRows ?? 10) - 1));
     const { Box, Text, Button } = $.ui.resolve(e);
     // A plain Button draws `1: ` before its children, so the row is sized to the rest.
     const width = Math.max(1, e.props.bodyColumns - 3);
-    // Shrink the label column to the names on screen so the activity gets the room.
     const longestLabel = Math.max(0, ...budget.rows.map((job) => jobLabel(job).length));
 
     return (
       <Box flexDirection="column">
         {budget.rows.map((job, i) => {
           const line = buildLine(job, at, { colour: cfg.colour, width, longestLabel });
-          // A bare digit in an empty prompt presses a band Button without focusing
-          // the band, so one key opens the sidebar on this worker.
           return (
             <Button key={`band-${job.workerId}`} plain hotkey={String(i + 1)} label={line.plain.trim()} onPress={() => openForge($, job.workerId)}>
             <Text dimColor={line.recessive} wrap="truncate-end">
-              {/* Segment 1: the GLYPH ALONE, in the accent and bold while live.
-                  `accent` is undefined under NO_COLOR and for canceled/unknown,
-                  and `color={undefined}` draws in the terminal's default — the
-                  glyph still carries the state, which is the whole point.
-
-                  It is the glyph alone rather than "glyph + identity" because a
-                  44-column task title painted yellow is not an accent, it is a
-                  highlighted sentence. One accent per line, spent on the one
-                  character that means something. */}
               <Text color={line.accent} bold={line.bold} wrap="truncate-end">
                 {line.glyph}
               </Text>
-              {/* Segment 2: the task and the state, default foreground — this is
-                  level-1 identity and it must be as readable as anything else on
-                  the line. Segment 3 is the detail; segment 4 is the clock, LAST
-                  and dim. `wrap` on every one of them: TERMINAL-UI.md L124-126
-                  says EVERY Text, not just the outermost, and the engine tests
-                  the rule per element. */}
               <Text wrap="truncate-end">{` ${line.label}`}</Text>
               <Text dimColor={!line.recessive} wrap="truncate-end">
                 {` ${line.detail} ${line.clock}`.replace(/\s+$/, '')}
@@ -654,8 +434,6 @@ function registerBand(on: Parameters<Register>[0]): void {
           );
         })}
         {budget.hidden > 0 && (
-          // TERMINAL-UI.md L151: cap at 4, then `+N more`. Dim, and it names the
-          // command, so the overflow row is an invitation rather than a wall.
           <Text dimColor wrap="truncate-end">
             {overflowLine(budget.hidden)}
           </Text>
@@ -666,38 +444,12 @@ function registerBand(on: Parameters<Register>[0]): void {
   });
 }
 
-// =============================================================================
-// § PANE — everything below this line belongs to the /forge pane.
-// =============================================================================
-
-/** `register(on, options)` is the mod entry point. hooks.json names this file. */
 export const register: Register = (on) => {
-  // ── the band ───────────────────────────────────────────────────────────────
-  //
-  // TWO calls are the entire band↔pane coupling.
-  //
-  //   registerBand  registers the band's AbovePrompt render hook and its
-  //              launch and status hooks, and stores its session-start half.
-  //   startBand()   that stored half, awaited inside the handler below. It cannot
-  //              register its own `session.start`: VERIFIED, the engine refuses
-  //              two matcher-less registrations of one event in a module
-  //              ("on("session.start") is registered twice without a matcher").
-  //
-  // The pane below knows none of this and would work unchanged if both lines were
-  // deleted. See § BAND above.
   registerBand(on);
 
-  // ── the command ───────────────────────────────────────────────────────────
-  //
-  // `.catch(() => {})` because Claude Code refuses a command name it already owns,
-  // and refusing to start would take the band down with it. Losing `/forge` to
-  // a name collision is acceptable; losing the whole mod is not.
   on('session.start', async ($, e, next) => {
     const rest = await next(e);
-    // Band first, and it never throws: a slow or failing band config must not
-    // delay `/forge` appearing or take the session's start with it.
     await startBand($, typeof e.cwd === 'string' ? e.cwd : undefined);
-    // Not awaited: a slow network must not hold the session's start.
     void checkForUpdate($).catch(() => {});
 
     await $.command
@@ -710,34 +462,19 @@ export const register: Register = (on) => {
     return rest;
   });
 
-  // `next` is unused and deliberately so. A command handler's `next` would render
-  // some other handler's contribution to the command; there is nothing to chain
-  // here, and the reference mod's command handler also ignores it.
-  //
-  // The matcher must equal the name registered above — 'forge', not the plugin
-  // name. A matcher that matches nothing is a pane nobody can open, and it fails
-  // SILENTLY, so the two strings are deliberately the same string.
   on('command.run', { command: 'forge' }, async ($, e) => {
-    // A fresh session runs this before any band render has measured the
-    // terminal, and the event carries the terminal's own width. Seed it here so
-    // the first dock request is a third of the terminal, not the fallback.
     noteViewport(commandTerminalColumns(e.presentation));
     await pollBand($);
     const cfg = await read($, bandConfig);
     const jobs = await read($, bandJobs);
     const mine = await sessionRows($);
     const args = typeof e.args === 'string' ? e.args.trim() : '';
-    // `/forge recap` (and `/forge all recap` / `/forge recap all`) prints the board
-    // instead of opening one worker. `recap` is a verb here, never a worker name,
-    // so it must not fall through to findWorker and toast "No worker matches".
     const tokens = args.split(/\s+/).filter((token) => token !== '');
     const isRecap = tokens.includes('recap');
     const rest = isRecap ? tokens.filter((token) => token !== 'recap') : tokens;
     const word = rest[0] ?? '';
-    // `/forge pane` is the session list, kept because people have typed it.
     const scope = word === 'all' ? 'all' : 'session';
     const query = isRecap || word === 'pane' || word === 'all' ? '' : rest.join(' ');
-    // This session's worker first; then the repository's, so an older one still opens by name.
     const job = query === '' ? undefined : findWorker(mine, query) ?? findWorker(jobs, query);
     if (query !== '' && job === undefined) await $.ui.toast(`No worker matches "${query}"; showing the list`);
     await update($, listScope, () => scope);
@@ -749,7 +486,6 @@ export const register: Register = (on) => {
     return { text: scopeLine(scope === 'all' ? jobs : mine, scope) };
   });
 
-  // Scrolling up pauses following; scrolling back to the end resumes it.
   on('ui.scroll', async ($, e, next) => {
     if (e.component === 'Pane' && e.requestId === PANE && e.origin.kind === 'person' && await read($, selected) !== null) {
       const atEnd = e.offset >= e.contentRows - e.bodyRows;
@@ -771,15 +507,11 @@ export const register: Register = (on) => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     noteViewport(measurePaneTerminalColumns(e.viewport, e.props));
-    // requestPane is a no-op when the width it would ask for is the one already
-    // requested; the non-null check is the one thing it cannot know: a pane the
-    // host mounted without this module asking is left where it is.
     if (lastPaneRequest !== null) await requestPane($).catch(() => {});
     return renderForge($, e);
   });
 };
 
-/** Show one worker (by workerId, or the list for null) in the sidebar, auto-following its live head. */
 async function show($: EngineInterface, workerId: string | null): Promise<void> {
   await update($, selected, () => workerId);
   await update($, pinnedTurnId, () => null);
@@ -790,7 +522,6 @@ async function show($: EngineInterface, workerId: string | null): Promise<void> 
   await $.ui.scroll({ to: 'start', in: PANE }).catch(() => {});
 }
 
-/** Pin a specific prior turn jobId, or pass null to return to auto-following the worker's live head. */
 async function pinTurn($: EngineInterface, turnJobId: string | null): Promise<void> {
   await update($, pinnedTurnId, () => turnJobId);
   await update($, follow, () => turnJobId === null);
@@ -800,7 +531,6 @@ async function pinTurn($: EngineInterface, turnJobId: string | null): Promise<vo
   await $.ui.scroll({ to: 'start', in: PANE }).catch(() => {});
 }
 
-/** Open the sidebar focused, on one worker (by workerId) or on the list. */
 async function openForge($: EngineInterface, workerId: string | null): Promise<void> {
   detailCache = null;
   await show($, workerId);
@@ -817,8 +547,6 @@ async function scrollEnd($: EngineInterface): Promise<void> {
   if (result.deny) throw new Error(result.deny);
 }
 
-// Clock and control redraws reuse the bounded detail until the next data cadence;
-// immutable settled turn details stay cached until repo change / reload.
 let detailCache: { key: string; at: number; detail: ForgeDetail | null; settled: boolean } | null = null;
 async function loadDetail($: EngineInterface, repo: string, id: string, t: number): Promise<ForgeDetail | null> {
   const key = `${repo}\0${id}`;
@@ -869,7 +597,6 @@ async function renderForge($: EngineInterface, e: UiRenderEvent): Promise<JSX.El
       if (detail) {
         content = renderWorker(W, detail, o, a, turns);
         if (o.following && followingSite !== targetId) {
-          // Host end anchors keep following a growing tree until a person scrolls.
           try { await scrollEnd($); followingSite = targetId; }
           catch (failure) {
             // The testkit has no painted scroll surface. A live refusal is retried

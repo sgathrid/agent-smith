@@ -1,7 +1,3 @@
-/**
- * spawn-policy.test.ts — closed modes, preamble, read-only, model recording,
- * catalog validation and the agy preflight, all with injected fakes.
- */
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
@@ -103,14 +99,12 @@ test('protocol preparation persists after anchor and before worker launch; failu
 test('pipeline stages and resumes keep arbitrary modes, with no preset', async () => {
   const f = fakeProvider('fake');
   const { service } = svc(f);
-  // A custom stage role has no mode guidance, but still gets the rest of the brief.
   const a = await service.spawnJob({ mode: 'custom-stage', prompt: 'p', pipeline: 'pl', stage: 's' });
   assert.equal(a.preambleApplied, true);
   assert.ok(f.specs[0]!.prompt.endsWith('\n\np'));
   assert.match(f.specs[0]!.prompt, /orchestrating agent/);
   for (const preset of Object.values(MODE_PRESETS)) assert.equal(f.specs[0]!.prompt.includes(preset.guidance), false);
   assert.equal(f.specs[0]!.readOnly, undefined);
-  // A resume with nothing new to say sends the prompt untouched.
   const b = await service.spawnJob({ mode: 'task', prompt: 'p', conversation: 'c1', name: 'n2' });
   assert.equal(b.preambleApplied, false);
   assert.equal(f.specs[1]!.prompt, 'p');
@@ -127,7 +121,6 @@ test('the brief is prepended to the provider prompt, stored apart from it, and n
   const manifest = JSON.parse(readFileSync(path.join(ack.dir, 'job.json'), 'utf8'));
   assert.equal(manifest.preambleApplied, true);
   assert.equal(manifest.promptChars, 'look at it'.length);
-  // The pane's "Show preamble" renders `${preamble}\n\n${prompt}`, so it must be exactly the brief.
   const view = JSON.parse(readFileSync(path.join(ack.dir, 'view.json'), 'utf8'));
   assert.equal(view.preamble, brief);
   assert.equal(`${view.preamble}\n\n${view.prompt}`, f.specs[0]!.prompt);
@@ -256,7 +249,6 @@ test('already-dirty files line is capped at 20, omitted on resume/pipeline, and 
   const view = JSON.parse(readFileSync(path.join(ack.dir, 'view.json'), 'utf8')) as { preamble: string | null; prompt: string };
   assert.equal(`${view.preamble}\n\n${view.prompt}`, sent);
 
-  // Cancel landing during the baseline wait finishes the job as canceled and never spawns the provider.
   const f2 = fakeProvider('fake');
   const service2 = withDefaultProvider(new ForgeService({ repo, flushMs: 5, providerSource: () => f2.provider, catalogSource: async () => [] }));
   const { ack: cancelAck, done: cancelDone } = await service2.spawnTracked({ mode: 'implement', name: 'cancel-during-baseline', prompt: 'do not run' });
@@ -349,7 +341,6 @@ test('catalog validation: fresh catalog rejects unknown model and bad effort', a
   );
   const ok = await service.spawnJob({ mode: 'implement', prompt: 'x', model: 'm1', effort: 'low' });
   assert.equal(ok.warnings, undefined);
-  // a model with no efforts list accepts any effort
   await service.spawnJob({ mode: 'implement', name: 'b', prompt: 'x', model: 'm2', effort: 'whatever' });
 });
 
@@ -436,9 +427,12 @@ test('resolveWorker takes a job id or a name, newest turn first, and refuses an 
   const { ack: second, done: secondDone } = await service.spawnTracked({ mode: 'review', prompt: 'x', name: 'solo', workerId: 'another-identity' });
   await secondDone;
   assert.notEqual(second.jobId, first.jobId);
-  await assert.rejects(service.resolveWorker('solo'), (e: Error) => {
+  assert.equal((await service.resolveWorker('solo')).jobId, second.jobId);
+  const other = new ForgeService({ repo: service.repo });
+  await assert.rejects(other.resolveWorker('solo'), (e: Error) => {
     assert.equal(e.name, 'WorkerLookupError');
-    assert.match(e.message, /matches 2 workers/);
+    assert.match(e.message, /matches 2 workers: solo \(\S+, finished \S+\), solo \(\S+, finished \S+\)/);
+    assert.ok(e.message.includes(first.jobId) && e.message.includes(second.jobId));
     return true;
   });
   await assert.rejects(service.resolveWorker('nobody'), /No worker "nobody"/);
@@ -465,14 +459,11 @@ test('env reaches the provider spec; only the keys are written to disk and acked
 test('first spawn waits the cold catalog budget, later spawns the short one', async () => {
   const f = fakeProvider('fake');
   let calls = 0;
-  // Resolves on the next macrotask: the cold budget is huge, so only a real regression (not waiting) can fail it.
   const slow = async () => { calls++; await new Promise(r => setImmediate(r)); return [catalog()]; };
   const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-policy-'));
   const service = new ForgeService({ repo, flushMs: 1, providerSource: () => f.provider, catalogSource: slow, harnessDefaults: () => ({}), catalogWaitMs: { warm: 20, cold: scaled(30_000) } });
   const first = await service.spawnJob({ mode: 'implement', prompt: 'x', provider: 'fake', model: 'm1' });
   assert.equal(first.warnings, undefined, 'the cold wait outlasts the slow catalog');
-  // A catalog that stays pending until the test releases it, so the 20 ms budget always wins. The
-  // service's budget timer is unref'd; the keep-alive stops Node from exiting the file mid-test.
   let release: (v: ReturnType<typeof catalog>[]) => void = () => {};
   const keepAlive = setInterval(() => {}, 1_000);
   const slower = new ForgeService({ repo, flushMs: 1, providerSource: () => f.provider, catalogSource: () => new Promise((r) => { release = r; }), harnessDefaults: () => ({}), catalogWaitMs: { warm: 20, cold: 20 } });
@@ -493,6 +484,5 @@ test('warmCatalogs discovers once in the background and a spawn joins it instead
   assert.equal(calls, 1);
   const rejecting = new ForgeService({ repo, providerSource: () => f.provider, catalogSource: async () => { throw new Error('boom'); } });
   rejecting.warmCatalogs();
-  // A failing source settles within the microtask queue, so one macrotask turn is enough for it to have run (and been swallowed).
   await new Promise(r => setImmediate(r));
 });

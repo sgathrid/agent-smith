@@ -1,10 +1,5 @@
-/**
- * steer-log.ts — the durable record of steers (`steer.jsonl`) and the prompt a
- * continuation turn is built from. Pure over the job directory: the pump in
- * forge/service.ts decides WHEN to chain; this decides what is said.
- */
-
-import { appendFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { writeAtomic } from './atomic.ts';
 import { FILES, jobDir, jobFile, type SteerEntry } from './format.ts';
 
 export function appendSteerEntry(repo: string, jobId: string, entry: SteerEntry): void {
@@ -38,14 +33,73 @@ export function readSteerEntries(repo: string, jobId: string): SteerEntry[] {
         seenIds.add(parsed.id);
         out.push(parsed as SteerEntry);
       }
-    } catch { /* ignore truncated line */ }
+    } catch {}
   }
   return out;
+}
+
+function readCount(repo: string, jobId: string, name: string): number {
+  try {
+    const n = Number.parseInt(readFileSync(jobFile(repo, jobId, name), 'utf8').trim(), 10);
+    return Number.isInteger(n) && n >= 0 ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
+export function readConsumedCount(repo: string, jobId: string): number {
+  return readCount(repo, jobId, FILES.steerConsumed);
+}
+
+export function writeConsumedCount(repo: string, jobId: string, n: number): void {
+  writeAtomic(jobFile(repo, jobId, FILES.steerConsumed), `${n}\n`);
+}
+
+export function readDiscardCut(repo: string, jobId: string): number {
+  return readCount(repo, jobId, FILES.steerDiscard);
+}
+
+export function writeDiscardCut(repo: string, jobId: string, n: number): void {
+  writeAtomic(jobFile(repo, jobId, FILES.steerDiscard), `${n}\n`);
+}
+
+export function undeliveredEntries(repo: string, jobId: string): SteerEntry[] {
+  const discarded = existsSync(jobFile(repo, jobId, FILES.steerDiscard)) ? readDiscardCut(repo, jobId) : 0;
+  return readSteerEntries(repo, jobId).slice(Math.max(readConsumedCount(repo, jobId), discarded));
+}
+
+function quoted(entries: readonly SteerEntry[]): string {
+  return `"${entries[0]?.prompt.replace(/\s+/g, ' ').trim().slice(0, 80) ?? ''}"`;
+}
+
+function messages(n: number): string {
+  return `${n} queued message${n === 1 ? '' : 's'}`;
+}
+
+export function notSentWarning(entries: readonly SteerEntry[], reason: string): string {
+  return `${messages(entries.length)} not sent (${reason}): ${quoted(entries)}`;
+}
+
+export function discardedWarning(discarded: readonly SteerEntry[]): string {
+  return `${messages(discarded.length)} discarded: ${quoted(discarded)}`;
+}
+
+export function liveDeliverable(e: Pick<SteerEntry, 'delivery' | 'overrides' | 'files' | 'context'>): boolean {
+  return e.delivery === 'queue'
+    && (e.overrides === undefined || Object.keys(e.overrides).length === 0)
+    && (e.files === undefined || e.files.length === 0)
+    && e.context === undefined;
+}
+
+export function liveMessageText(e: Pick<SteerEntry, 'prompt'>): string {
+  return e.prompt;
 }
 
 export function buildSteeredPrompt(input: {
   parentJobId: string;
   wasInterrupted: boolean;
+  priorStatus?: string | undefined;
+  verdict?: string | undefined;
   freshContinuation?: boolean;
   toolCalls: number;
   responseTail: string;
@@ -64,7 +118,7 @@ export function buildSteeredPrompt(input: {
       : `[FOLLOW-UP STEER · ${input.entries.length} queued update${input.entries.length === 1 ? '' : 's'}]`;
   const statusLine = input.wasInterrupted
     ? `Your previous turn (${input.parentJobId}) was interrupted after ${input.toolCalls} tool call(s) with updated instructions from the orchestrator. Inspect your working tree before repeating any completed steps.`
-    : `Your previous turn (${input.parentJobId}) completed after ${input.toolCalls} tool call(s), and the orchestrator queued follow-up instructions for you.`;
+    : `Your previous turn (${input.parentJobId}) ${input.priorStatus === undefined || input.priorStatus === 'succeeded' ? 'completed' : `ended ${input.priorStatus}`} after ${input.toolCalls} tool call(s), and the orchestrator queued follow-up instructions for you.`;
   const syncedLine =
     input.syncedFiles !== undefined && input.syncedFiles.length > 0
       ? `\nSynced brief file(s) in your working tree: ${input.syncedFiles.join(', ')} (re-read before continuing).`
@@ -72,13 +126,13 @@ export function buildSteeredPrompt(input: {
   const tailBlock = input.responseTail
     ? `\nLast response excerpt from previous turn:\n${input.responseTail}\n`
     : '';
-  const header = `[STEERED TURN CONTINUITY] ${tag}\n${statusLine}${syncedLine}${tailBlock}\n[ORCHESTRATOR UPDATE]\n${steerBody}`;
+  const verdictBlock = input.verdict ? `\n${input.verdict}\n` : '';
+  const header = `[STEERED TURN CONTINUITY] ${tag}\n${statusLine}${syncedLine}${verdictBlock}${tailBlock}\n[ORCHESTRATOR UPDATE]\n${steerBody}`;
   const prependBrief = input.brief !== '' && !header.startsWith(input.brief);
   const sentPrompt = prependBrief ? `${input.brief}\n\n${header}` : header;
   return { rawPrompt: header, sentPrompt, prependBrief };
 }
 
-/** The child job id the pump published before stamping `supersededBy`, if any. */
 export function readSteerHead(repo: string, jobId: string): string | null {
   try {
     const line = readFileSync(jobFile(repo, jobId, FILES.steerHead), 'utf8')

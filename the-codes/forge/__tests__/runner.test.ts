@@ -12,10 +12,6 @@
  */
 
 import assert from 'node:assert/strict';
-// MUST BE FIRST in this file, and not as a matter of taste: providers/agy.ts
-// captures `AGENT_SMITH_AGY_BIN` into a module-level const the moment it loads, so
-// the shim has to be evaluated before anything below reaches the adapter. See
-// ../testing/shim.ts for what happens when it is not.
 import { MODE_PRESETS } from '../modes.ts';
 import { buildBrief } from '../brief.ts';
 import { assertFakeProviderActive } from '../testing/shim.ts';

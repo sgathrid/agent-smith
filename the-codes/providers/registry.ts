@@ -18,11 +18,11 @@
  *     cannot staff before burning a job slot on it.
  */
 
-import { agyProvider, AGY_BINARY } from './agy.ts';
-import { claudeProvider, CLAUDE_BINARY } from './claude.ts';
-import { codexProvider, CODEX_BINARY } from './codex.ts';
-import { kimiProvider, KIMI_BINARY } from './kimi.ts';
-import { opencodeProvider, OPENCODE_BINARY } from './opencode.ts';
+import { agyBinary, agyProvider } from './agy.ts';
+import { claudeBinary, claudeProvider } from './claude.ts';
+import { codexBinary, codexProvider } from './codex.ts';
+import { kimiBinary, kimiProvider } from './kimi.ts';
+import { opencodeBinary, opencodeProvider } from './opencode.ts';
 import type { Provider } from './types.ts';
 
 // ---------------------------------------------------------------------------
@@ -151,15 +151,15 @@ export function missingProviders(required: readonly string[]): string[] {
 function binaryFor(providerName: string): string {
   switch (providerName) {
     case 'agy':
-      return AGY_BINARY;
+      return agyBinary();
     case 'codex':
-      return CODEX_BINARY;
+      return codexBinary();
     case 'opencode':
-      return OPENCODE_BINARY;
+      return opencodeBinary();
     case 'claude':
-      return CLAUDE_BINARY;
+      return claudeBinary();
     case 'kimi':
-      return KIMI_BINARY;
+      return kimiBinary();
     default:
       return providerName;
   }

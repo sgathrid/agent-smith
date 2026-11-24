@@ -41,7 +41,6 @@ test('toSummary leaves digest and changedFileCount absent when the job has none'
   const bare = toSummary(observed({}));
   assert.equal(bare.digest, undefined);
   assert.equal(bare.changedFileCount, undefined);
-  // A digest without the shape the writer produces is not trusted.
   assert.equal(toSummary(observed({ digest: { phase: 'editing' } })).digest, undefined);
   assert.equal(toSummary(observed({ digest: 'editing' })).digest, undefined);
   assert.equal(toSummary(observed({ changed_files: 'not-a-list' })).changedFileCount, undefined);
@@ -72,9 +71,15 @@ test('toSummary projects unified turn-chain fields and defaults turn/chainStarte
   assert.equal(modern.workerId, 'w-1');
   assert.equal(modern.turn, 3);
   assert.equal(modern.continuedFrom, 'job-2');
-  assert.equal(modern.continuationKind, 'resume');
+  assert.equal(modern.continuationKind, 'follow-up', 'legacy resume reads as follow-up');
   assert.equal(modern.chainStartedAt, '2026-11-23T10:00:00.000Z');
   assert.equal('steeredFrom' in modern, false);
+  assert.equal(modern.followedBy, undefined);
+
+  assert.equal(toSummary(observed({ continuedFrom: 'a', continuationKind: 'steer-interrupt' })).continuationKind, 'steer');
+  assert.equal(toSummary(observed({ continuedFrom: 'a', continuationKind: 'steer-queue' })).continuationKind, 'follow-up');
+  assert.equal(toSummary(observed({ continuedFrom: 'a' })).continuationKind, 'follow-up');
+  assert.equal(toSummary(observed({ followedBy: 'job-9' })).followedBy, 'job-9');
 
   const bare = toSummary({
     ...observed({}),

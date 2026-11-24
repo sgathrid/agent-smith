@@ -1,47 +1,51 @@
-import { ForgeService, WorkerLookupError } from '../../../../forge/service.ts';
+import { WorkerLookupError, type ForgeService, type JobDetail } from '../../../../forge/service.ts';
 
-/** A hand-built service double with worker lookup matching ForgeService.resolveWorker for in-memory mocks. */
-export function withWorkerLookup<T extends object>(service: T): T {
-  return Object.assign(
-    {
-      resolveHead: (id: string) => id,
-      isSafeJobId: (ForgeService.prototype as unknown as { isSafeJobId: (id: string) => boolean }).isSafeJobId,
-      live: new Map(),
-      async resolveWorker(this: {
-        resolveHead: (id: string) => string;
-        detail?: (id: string) => Promise<unknown>;
-        list?: (opts?: Record<string, unknown>) => Promise<Array<Record<string, unknown>>>;
-      }, nameOrId: string) {
-        const trimmed = nameOrId.trim();
-        const headId = this.resolveHead(trimmed);
-        if (this.detail) {
-          try {
-            return await this.detail(headId);
-          } catch {
-            // Fall through to list-based lookup
-          }
-        }
-        if (this.list) {
-          const allTurns = await this.list({ limit: 500, groupByWorker: false });
-          const candidates = allTurns.filter((j) => j.name === trimmed || j.workerId === trimmed || j.jobId === trimmed);
-          const identities = new Set(candidates.map((j) => String(j.workerId ?? j.jobId)));
-          if (candidates.length === 0) throw new WorkerLookupError(`No worker "${nameOrId}"; see list_jobs.`, 'missing');
-          if (identities.size !== 1) {
-            const headIds = [...identities].map((wid) => this.resolveHead(wid));
-            throw new WorkerLookupError(
-              `"${nameOrId}" matches ${identities.size} workers; pass a job ID from list_jobs.`,
-              'ambiguous',
-              headIds,
-            );
-          }
-          const wid = [...identities][0]!;
-          const targetId = this.resolveHead(wid);
-          if (this.detail) return this.detail(targetId);
-          return candidates[candidates.length - 1];
-        }
-        throw new WorkerLookupError(`No worker "${nameOrId}"; see list_jobs.`, 'missing');
-      },
-    },
-    service,
-  );
+export type ServiceLookup = Pick<ForgeService,
+  'resolveTurn' | 'resolveWorkerHeadId' | 'resolveWorker' | 'resolveWorkerHead' | 'messageTarget' | 'earlierTurns' | 'followUp' | 'steer' | 'cancel' | 'spawnedIds'>;
+
+interface LooseSource {
+  readonly detail?: (id: string) => Promise<unknown>;
+  readonly list?: (filter?: Record<string, unknown>) => Promise<Array<Record<string, unknown>>>;
+}
+
+export function withWorkerLookup<T extends object>(service: T): T & ServiceLookup {
+  const merged = {} as T & ServiceLookup;
+  const src = merged as unknown as LooseSource;
+  async function lookup(nameOrId: string): Promise<JobDetail> {
+    const trimmed = nameOrId.trim();
+    const headId = merged.resolveTurn(trimmed);
+    if (src.detail) {
+      try {
+        return await src.detail(headId) as JobDetail;
+      } catch {
+      }
+    }
+    if (src.list) {
+      const allTurns = await src.list({ limit: 500, groupByWorker: false });
+      const candidates = allTurns.filter((j) => j.name === trimmed || j.workerId === trimmed || j.jobId === trimmed);
+      const identities = new Set(candidates.map((j) => String(j.workerId ?? j.jobId)));
+      if (candidates.length === 0) throw new WorkerLookupError(`No worker "${nameOrId}"; see list_jobs.`, 'missing');
+      if (identities.size !== 1) {
+        throw new WorkerLookupError(`"${nameOrId}" matches ${identities.size} workers; pass a jobId.`, 'ambiguous', [...identities]);
+      }
+      const targetId = merged.resolveTurn([...identities][0]!);
+      if (src.detail) return await src.detail(targetId) as JobDetail;
+      return candidates[candidates.length - 1] as unknown as JobDetail;
+    }
+    throw new WorkerLookupError(`No worker "${nameOrId}"; see list_jobs.`, 'missing');
+  }
+  const notMocked = (name: string) => () => { throw new Error(`${name} is not mocked`); };
+  const defaults: ServiceLookup = {
+    resolveTurn: (id) => id.trim(),
+    resolveWorkerHeadId: (ref) => ref.trim(),
+    resolveWorker: lookup,
+    resolveWorkerHead: lookup,
+    messageTarget: lookup,
+    earlierTurns: async () => [],
+    followUp: async () => notMocked('followUp')(),
+    steer: async () => notMocked('steer')(),
+    cancel: notMocked('cancel'),
+    spawnedIds: new Set<string>(),
+  };
+  return Object.assign(merged, defaults, service);
 }

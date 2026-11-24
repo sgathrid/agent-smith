@@ -125,7 +125,6 @@ test('background CLI returns a statusable run id, exposes the canonical job, and
   const oldScenario = process.env['FAKE_AGY_SCENARIO'];
   const oldDelay = process.env['FAKE_AGY_SLEEP_MS'];
   process.env['FAKE_AGY_SCENARIO'] = 'slow';
-  // Far longer than any loaded run needs to see the job and cancel it; cancel, not the sleep, ends the worker.
   process.env['FAKE_AGY_SLEEP_MS'] = '120000';
   try {
     const cliPath = new URL('../cli.ts', import.meta.url).pathname;
@@ -253,7 +252,6 @@ test('gc rejects an --older-than value that is not an age', async () => {
   assert.match(err, /--older-than: '2 weeks' is not an age/);
 });
 
-/** Setup ends with doctor, which needs one compatible worker CLI; CI runners have none. */
 function fakeWorkerOnPath(): () => void {
   const dir = mkdtempSync(path.join(tmpdir(), 'agent-smith-fake-worker-'));
   const bin = path.join(dir, 'opencode');
@@ -261,7 +259,6 @@ function fakeWorkerOnPath(): () => void {
   chmodSync(bin, 0o755);
   const previous = process.env['PATH'];
   process.env['PATH'] = `${dir}${path.delimiter}${previous ?? ''}`;
-  // Doctor probes the worker with a node cold start; the product's default probe budget is too tight under load.
   const previousProbe = process.env['AGENT_SMITH_PROBE_TIMEOUT_MS'];
   process.env['AGENT_SMITH_PROBE_TIMEOUT_MS'] = String(scaled(30_000));
   return () => {
@@ -301,7 +298,7 @@ test('setup installs via claude plugin install at user scope by default and reje
   const scratch = mkdtempSync(path.join(tmpdir(), 'agent-smith-setup-user-'));
   const fakeClaude = path.join(scratch, 'fake-claude');
   const argsFile = path.join(scratch, 'args.json');
-  writeFileSync(fakeClaude, `#!${process.execPath}\nconst fs = require('node:fs');\nfs.writeFileSync(${JSON.stringify(argsFile)}, JSON.stringify(process.argv.slice(2)));\nconsole.log('Successfully installed plugin: agent-smith@agent-smith (scope: user)');\n`);
+  writeFileSync(fakeClaude, `#!${process.execPath}\nconst fs = require('node:fs');\nif (process.argv[2] === 'plugin') fs.writeFileSync(${JSON.stringify(argsFile)}, JSON.stringify(process.argv.slice(2)));\nconsole.log('Successfully installed plugin: agent-smith@agent-smith (scope: user)');\n`);
   chmodSync(fakeClaude, 0o755);
   const prevClaude = process.env['AGENT_SMITH_CLAUDE_BIN'];
   process.env['AGENT_SMITH_CLAUDE_BIN'] = fakeClaude;
@@ -314,8 +311,6 @@ test('setup installs via claude plugin install at user scope by default and reje
     const recorded = JSON.parse(readFileSync(argsFile, 'utf8'));
     assert.deepEqual(recorded, ['plugin', 'install', 'agent-smith', '--marketplace', 'sgathrid/agent-smith', '--scope', 'user']);
 
-    // A clone has a committed build, but the default must stay the published
-    // marketplace: a project install would otherwise commit this absolute path.
     const project = await captureMain(['setup', '--scope', 'project']);
     assert.equal(project.code, 0, project.err);
     assert.deepEqual(JSON.parse(readFileSync(argsFile, 'utf8')), ['plugin', 'install', 'agent-smith', '--marketplace', 'sgathrid/agent-smith', '--scope', 'project']);

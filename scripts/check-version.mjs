@@ -1,7 +1,4 @@
 #!/usr/bin/env node
-// Fails when the shipped plugin changed since <base> but its version did not
-// rise, or when package.json and the plugin manifest disagree.
-// Usage: node scripts/check-version.mjs origin/main
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 

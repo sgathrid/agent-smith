@@ -1,16 +1,3 @@
-/**
- * Tests for the channel's push policy.
- *
- * This is the most important test file in the repo. Everything else renders a
- * screen the user can look away from; this file governs whether tokens are spent
- * in someone's context window. A policy that pushes a progress tick every 5
- * seconds would spend ~10k tokens an hour and would not be noticed until the bill
- * arrived, so the "must NOT push" cases are tested as hard as the "must push" ones.
- *
- * Fixtures use realistic ids, warning strings and ISO timestamps, so the tests
- * fail on realistic data rather than on tidy data.
- */
-
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
@@ -36,9 +23,6 @@ test('named completion notices lead with status and leave the worker summary out
   assert.match(batch.content!, /\nstatus [^\n]+$/);
 });
 
-// ── fixtures ────────────────────────────────────────────────────
-
-/** Realistic ids and statuses. */
 function job(over: Partial<WatchableJob> = {}): WatchableJob {
   return {
     id: 'implement-musm82da-f1dc1fe4',
@@ -50,14 +34,11 @@ function job(over: Partial<WatchableJob> = {}): WatchableJob {
   };
 }
 
-/** A candidate with nothing seen yet and the job already known from a prior poll. */
-function cand(j: WatchableJob, seen: string[] = [], known = true): Candidate {
-  return { job: j, seen: new Set(seen), knownBefore: known };
+function cand(j: WatchableJob, seen: string[] = [], observedInPriorPoll = true): Candidate {
+  return { job: j, seen: new Set(seen), observedInPriorPoll };
 }
 
 const NOW = Date.parse('2026-10-03T16:40:00.000Z');
-
-// ── the vocabulary ──────────────────────────────────────────────────────────
 
 test('exactly four things are speakable, and running is not one of them', () => {
   assert.equal(pushKindFor(job({ status: 'succeeded', finishedAt: 'x' })), 'finished');
@@ -65,94 +46,66 @@ test('exactly four things are speakable, and running is not one of them', () => 
   assert.equal(pushKindFor(job({ status: 'attention' })), 'attention');
   assert.equal(pushKindFor(job({ status: 'canceled', finishedAt: 'x' })), 'cancelled');
 
-  // THE HEADLINE RULE. `running` returning a push kind is the bug this whole file
-  // exists to prevent: progress pushed into context costs tokens on every
-  // subsequent turn and tells Claude nothing it cannot get from the mod band.
   assert.equal(pushKindFor(job({ status: 'running' })), null);
 
-  // `unknown` is silent too. "Something happened and I do not know what" costs
-  // tokens and buys nothing — and pushing it would train Claude to expect noise.
   assert.equal(pushKindFor(job({ status: 'unknown' })), null);
 });
 
 test('a running job is never pushed, no matter how long it has been up', () => {
   const running = job({ status: 'running', lastEventAt: new Date(NOW).toISOString() });
-  assert.equal(shouldPush(cand(running), NOW), false);
+  assert.equal(shouldPush(cand(running)), false);
 });
 
-// ── dedupe ──────────────────────────────────────────────────────────────────
-
 test('the same terminal state is never pushed twice', () => {
-  // THE DEDUPE RULE. This is the assertion the whole channel rests on: a 28-minute
-  // job is polled ~340 times, and without this the user is told it finished 340
-  // times.
   const finished = job({ status: 'succeeded', finishedAt: '2026-10-03T16:40:00Z' });
   const key = dedupeKey(finished);
 
-  assert.equal(shouldPush(cand(finished, []), NOW), true);
-  assert.equal(shouldPush(cand(finished, [key]), NOW), false, 'second sighting must be silent');
-  assert.equal(shouldPush(cand(finished, [key]), NOW), false, 'and every one after that');
+  assert.equal(shouldPush(cand(finished, [])), true);
+  assert.equal(shouldPush(cand(finished, [key])), false, 'second sighting must be silent');
+  assert.equal(shouldPush(cand(finished, [key])), false, 'and every one after that');
 });
 
 test('a job that fails then succeeds speaks twice — that is two facts', () => {
-  // Keying only on job id would swallow the recovery and leave Claude believing a
-  // job failed when it in fact succeeded on a re-run.
   const failed = job({ status: 'failed', finishedAt: '2026-10-03T16:30:00Z' });
   const succeeded = job({ status: 'succeeded', finishedAt: '2026-10-03T16:40:00Z' });
 
   assert.notEqual(dedupeKey(failed), dedupeKey(succeeded));
-  assert.equal(shouldPush(cand(failed, []), NOW), true);
-  assert.equal(shouldPush(cand(succeeded, [dedupeKey(failed)]), NOW), true);
+  assert.equal(shouldPush(cand(failed, [])), true);
+  assert.equal(shouldPush(cand(succeeded, [dedupeKey(failed)])), true);
 });
 
 test('the dedupe key is id + status, and never a timestamp', () => {
-  // finished_at is the natural instinct for a dedupe key and it is wrong: a
-  // timestamp is not stable across rewrites and would turn a re-read into a
-  // fake "new" event.
   const a = job({ status: 'failed', finishedAt: '2026-10-03T16:30:00Z' });
   const b = job({ status: 'failed', finishedAt: '2026-10-03T17:45:00Z' });
   assert.equal(dedupeKey(a), dedupeKey(b), 'a moved timestamp must not create a new event');
 
-  assert.equal(dedupeKey(a), `${a.id}#failed#0`);
-  assert.equal(dedupeKey(a).split('#').length, 3);
+  assert.equal(dedupeKey(a), `${a.id}#failed`);
+  assert.equal(dedupeKey(a).split('#').length, 2);
 });
 
 test('a terminal claim with no finished_at is not pushed', () => {
-  // The mid-flight flap: there is a window where the terminal file is
-  // mid-write. A reader sampling that
-  // window can see a finished job as `succeeded` with no finished_at yet. Pushing
-  // it, then pushing again once the timestamp lands, would produce a duplicate.
   const flapping = job({ status: 'succeeded', finishedAt: null });
-  assert.equal(shouldPush(cand(flapping), NOW), false);
+  assert.equal(shouldPush(cand(flapping)), false);
 
-  // Once the timestamp is real, it is pushable — exactly once.
   const settled = job({ status: 'succeeded', finishedAt: '2026-10-03T16:40:00Z' });
-  assert.equal(shouldPush(cand(settled), NOW), true);
+  assert.equal(shouldPush(cand(settled)), true);
 });
 
 test('attention is not news on first sighting — only after we watched it happen', () => {
-  // A channel starting against a directory with stalled jobs must not open with an
-  // avalanche. It did not observe them stall, so it has a backlog, not news.
   const stalled = job({ status: 'attention', lastEventAt: '2026-10-03T16:00:00Z' });
-  assert.equal(shouldPush(cand(stalled, [], false), NOW), false, 'first sighting is baseline');
-  assert.equal(shouldPush(cand(stalled, [], true), NOW), true, 'a transition into attention is news');
+  assert.equal(shouldPush(cand(stalled, [], false)), false, 'first sighting is baseline');
+  assert.equal(shouldPush(cand(stalled, [], true)), true, 'a transition into attention is news');
 });
 
 test('attention does not need a terminal timestamp but does need a last event', () => {
-  // The mirror of the gate above: attention is by definition NOT terminal, so
-  // requiring finishedAt would make it unpushable.
-  assert.equal(shouldPush(cand(job({ status: 'attention', lastEventAt: null }), [], true), NOW), false);
+  assert.equal(shouldPush(cand(job({ status: 'attention', lastEventAt: null }), [], true)), false);
   assert.equal(
-    shouldPush(cand(job({ status: 'attention', lastEventAt: '2026-10-03T16:39:00Z' }), [], true), NOW),
+    shouldPush(cand(job({ status: 'attention', lastEventAt: '2026-10-03T16:39:00Z' }), [], true)),
     true,
   );
 });
 
-// ── batching ────────────────────────────────────────────────────────────────
-
 test('five simultaneous failures become ONE notification', () => {
-  // THE ANTI-SPAM RULE. Not five lines. A firehose gets muted, and a muted channel
-  // costs the user the one thing they installed it for.
   const failed = (n: number): Candidate =>
     cand(
       job({
@@ -166,8 +119,6 @@ test('five simultaneous failures become ONE notification', () => {
 
   assert.ok(batch.content !== null);
   assert.match(batch.content, /^Agent Smith · 5 jobs: 5 failed\n/, 'one headline counts them');
-  // The ids are still named: "5 failed" alone does not tell Claude which five, and
-  // naming them is what lets Claude act without the user retyping a job id.
   for (const n of [1, 2, 3, 4, 5]) {
     assert.ok(batch.content.includes(`implement-musm82da-0000000${n}`), `missing job ${n}`);
   }
@@ -190,7 +141,6 @@ test('a mixed batch groups by kind, so "three finished, one failed" stays legibl
   const text = batch.content;
   assert.ok(text !== null);
   assert.match(text, /^Agent Smith · 4 jobs: 3 done, 1 failed\n/);
-  // Collapsing these into "4 finished" would throw away the only part that matters.
   assert.match(text, /✗ job d · failed/, 'the failed job must be named');
 });
 
@@ -203,8 +153,6 @@ test('a single event gets the specific message, not a one-item summary', () => {
 });
 
 test('nothing to say produces no notification at all', () => {
-  // The common case, and the one that must be cheap. On most ticks of a healthy
-  // session this is the entire output.
   const batch = buildBatch([cand(job({ status: 'running' }))], NOW);
   assert.equal(batch.content, null);
   assert.deepEqual(batch.keys, []);
@@ -215,8 +163,6 @@ test('a batch of already-seen events is silent', () => {
   const batch = buildBatch([cand(done, [dedupeKey(done)])], NOW);
   assert.equal(batch.content, null);
 });
-
-// ── message content ─────────────────────────────────────────────────────────
 
 test('the failure message is terse, specific, and ends with the next step', () => {
   const batch = buildBatch(
@@ -237,21 +183,16 @@ test('the failure message is terse, specific, and ends with the next step', () =
   const text = batch.content!;
   assert.ok(text.includes('job implement-musm82da-f1dc1fe4 · failed: exit 1'), text);
   assert.match(text, /\nstatus implement-musm82da-f1dc1fe4$/);
-  // The budget is ~50 tokens. A multi-sentence essay would blow it.
   assert.ok(text.length < 220, `message is ${text.length} chars: ${text}`);
 });
 
 test('a duration is claimed only from a real start, never from the last event', () => {
-  // last_event_at is the last EVENT, not the job start. For a fast job it is
-  // seconds before the end, so finished - lastEvent is ~4s for a 28-minute job.
-  // Without a start time the honest rendering is no duration at all.
   const quick = buildBatch(
     [cand(job({ status: 'failed', lastEventAt: '2026-10-03T16:39:56Z', finishedAt: '2026-10-03T16:40:00Z' }))],
     NOW,
   );
   assert.ok(!quick.content!.includes('after'), quick.content!);
 
-  // A genuine long run does get a duration.
   const long = buildBatch(
     [cand(job({ status: 'failed', startedAt: '2026-10-03T16:12:00Z', finishedAt: '2026-10-03T16:40:00Z' }))],
     NOW,
@@ -268,18 +209,11 @@ test('an unwarned success is not dressed up as suspicious', () => {
   assert.ok(!batch.content!.includes('claimed otherwise'), batch.content!);
 });
 
-// ── the shared stall threshold ──────────────────────────────────────────────
-
 test('the stall threshold is 15 minutes, shared with the mod', () => {
-  // One constant, two importers. If the pane and the channel disagreed about when
-  // a job counts as stalled, the user would see a band saying "fine" while Claude
-  // was told the job was stuck.
   assert.equal(STALL_GRACE_MS, 15 * 60 * 1000);
 });
 
 test('the status union the policy reasons over covers every reader outcome', () => {
-  // Guards against a reader gaining a status (codex, opencode) that the policy has
-  // no case for — which would silently default to null and never be pushed.
   const statuses: WatchStatus[] = ['running', 'succeeded', 'failed', 'canceled', 'attention', 'unknown'];
   const pushed = statuses.filter((s) => pushKindFor(job({ status: s, finishedAt: 'x' })) !== null);
   assert.deepEqual(pushed.sort(), ['attention', 'canceled', 'failed', 'succeeded']);
@@ -287,8 +221,6 @@ test('the status union the policy reasons over covers every reader outcome', () 
   const kinds: PushKind[] = ['finished', 'failed', 'attention', 'cancelled'];
   assert.equal(new Set(kinds).size, 4);
 });
-
-// ── liveness: silent vs dead ────────────────────────────────────────────────
 
 test('attention text is a fact: "no output for", and a dead process is "process gone"', () => {
   const silent = job({ status: 'attention', lastEventAt: new Date(NOW - 16 * 60_000).toISOString(),
@@ -305,20 +237,29 @@ test('a silent job that then dies is pushed again; a dead one is pushed once', (
   const silent = job({ status: 'attention', liveness: { state: 'silent', silentForMs: 16 * 60_000, since: NOW - 16 * 60_000 } });
   const dead = job({ status: 'attention', liveness: { state: 'dead', silentForMs: 18 * 60_000, since: NOW - 3 * 60_000 } });
   assert.notEqual(dedupeKey(silent), dedupeKey(dead));
-  assert.equal(shouldPush(cand(dead, [dedupeKey(silent)]), NOW), true, 'dead is news after silent');
-  assert.equal(shouldPush(cand(dead, [dedupeKey(silent), dedupeKey(dead)]), NOW), false, 'said once');
-  // Dead is a fact of its own: no event time does not silence it.
-  assert.equal(shouldPush(cand(job({ ...dead, lastEventAt: null })), NOW), true);
-  assert.equal(shouldPush(cand(job({ ...silent, lastEventAt: null })), NOW), false);
+  assert.equal(shouldPush(cand(dead, [dedupeKey(silent)])), true, 'dead is news after silent');
+  assert.equal(shouldPush(cand(dead, [dedupeKey(silent), dedupeKey(dead)])), false, 'said once');
+  assert.equal(shouldPush(cand(job({ ...dead, lastEventAt: null }))), true);
+  assert.equal(shouldPush(cand(job({ ...silent, lastEventAt: null }))), false);
 });
 
 test('toNotice passes continuationKind for steers and resumes without steeredFrom', async () => {
   const { toNotice } = await import('../policy.ts');
-  const steered = toNotice(job({ status: 'succeeded', finishedAt: '2026-10-03T16:40:00Z', continuedFrom: 'turn-1', continuationKind: 'steer-interrupt' }), 'finished', NOW);
-  assert.equal((steered as { continuationKind?: unknown }).continuationKind, 'steer-interrupt');
+  const steered = toNotice(job({ status: 'succeeded', finishedAt: '2026-10-03T16:40:00Z', continuedFrom: 'turn-1', continuationKind: 'steer' }), 'finished', NOW);
+  assert.equal((steered as { continuationKind?: unknown }).continuationKind, 'steer');
   assert.equal('steered' in steered, false);
-  const resumed = toNotice(job({ status: 'succeeded', finishedAt: '2026-10-03T16:40:00Z', continuedFrom: 'turn-2', continuationKind: 'resume' }), 'finished', NOW);
-  assert.equal((resumed as { continuationKind?: unknown }).continuationKind, 'resume');
+  const resumed = toNotice(job({ status: 'succeeded', finishedAt: '2026-10-03T16:40:00Z', continuedFrom: 'turn-2', continuationKind: 'follow-up' }), 'finished', NOW);
+  assert.equal((resumed as { continuationKind?: unknown }).continuationKind, 'follow-up');
+});
+
+test('a turn handed off to a follow-up is not pushed; the head carries the turns it also ran', async () => {
+  const { toNotice } = await import('../policy.ts');
+  const done = { status: 'succeeded' as const, finishedAt: '2026-10-03T16:40:00Z' };
+  assert.equal(shouldPush(cand(job({ ...done, followedBy: 'turn-2' }))), false);
+  assert.equal(shouldPush(cand(job({ ...done, supersededBy: 'turn-2' }))), false);
+  assert.equal(shouldPush(cand(job({ ...done, acceptancePending: true }))), false);
+  const head = toNotice(job({ ...done, continuationKind: 'follow-up', alsoRan: { from: 1, to: 2 }, droppedMessage: 'rerun' }), 'finished', NOW);
+  assert.deepEqual([head.alsoRan, head.droppedMessage], [{ from: 1, to: 2 }, 'rerun']);
 });
 
 test('toWatchStatus: a long open command is running; a stopped heartbeat is attention', async () => {
@@ -331,7 +272,6 @@ test('toWatchStatus: a long open command is running; a stopped heartbeat is atte
   const open = { stepIndex: 1, tool: 'Bash', input: '{"command":"cargo test"}', status: 'active' };
   assert.equal(toWatchStatus(obs({ last_activity: open, last_alive_at: new Date(NOW - 10_000).toISOString() }), NOW), 'running');
   assert.equal(toWatchStatus(obs({ last_activity: open, last_alive_at: new Date(NOW - 3 * 60_000).toISOString() }), NOW), 'attention');
-  // An older build's job (no heartbeat): the old 15-minute silence rule.
   assert.equal(toWatchStatus(obs({ last_activity: open }), NOW), 'attention');
   assert.equal(toWatchStatus({ ...obs({}), updatedAt: null }, NOW), 'attention');
 });
@@ -343,7 +283,7 @@ test('toNotice uses chainStartedAt for steered chains and per-turn startedAt on 
     chainStartedAt: '2026-10-03T16:38:00Z',
     startedAt: '2026-10-03T16:39:54Z',
     finishedAt: '2026-10-03T16:40:00Z',
-    continuationKind: 'steer-interrupt',
+    continuationKind: 'steer',
   }), 'finished', NOW);
   assert.equal(steered.durationMs, 120_000);
   const resumed = toNotice(job({
@@ -351,7 +291,7 @@ test('toNotice uses chainStartedAt for steered chains and per-turn startedAt on 
     chainStartedAt: '2026-10-03T16:39:54Z',
     startedAt: '2026-10-03T16:39:54Z',
     finishedAt: '2026-10-03T16:40:00Z',
-    continuationKind: 'resume',
+    continuationKind: 'follow-up',
   }), 'finished', NOW);
   assert.equal(resumed.durationMs, 6_000);
 });

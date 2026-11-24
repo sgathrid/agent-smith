@@ -6,20 +6,21 @@ import test from 'node:test';
 import type { ClientCapabilities, ElicitResult } from '@modelcontextprotocol/server';
 import { DECLINED_UNRESTRICTED, UNCONFIRMED_UNRESTRICTED, callTool, type HandlerContext } from '../tools.ts';
 import { withWorkerLookup } from './service-mock.ts';
+import { ForgeService } from '../../../../forge/service.ts';
+import { FILES, jobFile } from '../../../../forge/format.ts';
 
-// The prompt is the behaviour under test; an outer AGENT_SMITH_CONFIRM_UNRESTRICTED=0 would hide it (each test file runs in its own process).
 delete process.env.AGENT_SMITH_CONFIRM_UNRESTRICTED;
 const FORM: ClientCapabilities = { elicitation: { form: {} } };
 const body = (r: { content: unknown }) => JSON.parse(((r.content as { text: string }[])[0]!).text);
 const text = (r: { content: unknown }) => ((r.content as { text: string }[])[0]!).text;
 
-/** A fake forge service plus a fake MCP server that records what it was asked and answers with `action`. */
 function harness(opts: { caps?: ClientCapabilities; action?: ElicitResult['action'] | 'throw'; server?: boolean } = {}) {
   const repo = mkdtempSync(path.join(tmpdir(), 'smith-confirm-'));
   const spawned: Array<Record<string, unknown>> = []; const asked: string[] = [];
   const service = withWorkerLookup({
     repo,
     spawnJob: async (r: Record<string, unknown>) => { spawned.push(r); return { jobId: `job-${spawned.length}`, name: r.name ?? 'w', timeoutMs: 1_000, warnings: [] }; },
+    followUp: async (r: Record<string, unknown>) => { spawned.push(r); return { jobId: `job-${spawned.length}`, name: 'Ada', workerId: 'Ada', turn: 2, action: 'started', delivery: 'now', status: 'running', provider: 'codex', repo, timeoutMs: 1_000 }; },
     detail: async () => ({ jobId: 'fixture-job', status: 'succeeded', provider: 'codex', mode: 'review', name: 'Ada', workerId: 'Ada', conversation: 'thread', cwd: repo, unrestricted: false }),
   }) as never;
   const server: HandlerContext['server'] = {
@@ -42,7 +43,7 @@ test('accept: asks once with provider, worker and cwd, then spawns unrestricted'
   assert.deepEqual(h.asked, [`Allow codex worker "Ada" to run without approval prompts in ${h.repo}? It will be able to run any command.`]);
   assert.equal(h.spawned[0]!.unrestricted, true);
   assert.equal((body(r).warnings ?? []).includes(UNCONFIRMED_UNRESTRICTED), false);
-  const resumed = await callTool(h.ctx, 'resume_job', { worker: 'Ada', prompt: 'more', unrestricted: true });
+  const resumed = await callTool(h.ctx, 'follow_up', { worker: 'Ada', prompt: 'more', unrestricted: true });
   assert.equal(resumed.isError, undefined, text(resumed));
   assert.equal(h.asked.length, 2); assert.equal(h.spawned[1]!.unrestricted, true);
 });
@@ -50,7 +51,7 @@ test('accept: asks once with provider, worker and cwd, then spawns unrestricted'
 test('decline, cancel or no answer: isError with the next step, and nothing spawns', async () => {
   for (const action of ['decline', 'cancel', 'throw'] as const) {
     const h = harness({ caps: FORM, action });
-    for (const [tool, args] of [['spawn_job', spawnArgs], ['resume_job', { worker: 'Ada', prompt: 'more', unrestricted: true }]] as const) {
+    for (const [tool, args] of [['spawn_job', spawnArgs], ['follow_up', { worker: 'Ada', prompt: 'more', unrestricted: true }]] as const) {
       const r = await callTool(h.ctx, tool, args);
       assert.equal(r.isError, true, `${action} ${tool}`);
       if (action === 'throw') assert.match(text(r), /Could not confirm unrestricted access.*rerun without unrestricted, or ask the user\./);
@@ -66,7 +67,7 @@ test('no elicitation capability: proceeds as before, with a warning in the ack',
     assert.equal(r.isError, undefined, text(r));
     assert.ok(body(r).warnings.includes(UNCONFIRMED_UNRESTRICTED));
     assert.equal(h.spawned[0]!.unrestricted, true);
-    const resumed = await callTool(h.ctx, 'resume_job', { worker: 'Ada', prompt: 'more', unrestricted: true });
+    const resumed = await callTool(h.ctx, 'follow_up', { worker: 'Ada', prompt: 'more', unrestricted: true });
     assert.ok(body(resumed).warnings.includes(UNCONFIRMED_UNRESTRICTED));
     assert.equal(h.asked.length, 0);
   }
@@ -88,13 +89,13 @@ test('AGENT_SMITH_CONFIRM_UNRESTRICTED=0 disables the prompt and the warning', a
   }
 });
 
-test('no prompt for agy, for unrestricted false or absent, or for an inherited setting on resume', async () => {
+test('no prompt for agy, for unrestricted false or absent, or for an inherited setting on follow_up', async () => {
   const h = harness({ caps: FORM, action: 'decline' });
   for (const args of [{ ...spawnArgs, provider: 'agy' }, { ...spawnArgs, provider: 'kimi' }, { ...spawnArgs, unrestricted: false }, { mode: 'review', provider: 'claude', prompt: 'x' }]) {
     const r = await callTool(h.ctx, 'spawn_job', args);
     assert.equal(r.isError, undefined, text(r));
   }
-  assert.equal((await callTool(h.ctx, 'resume_job', { worker: 'Ada', prompt: 'more' })).isError, undefined);
+  assert.equal((await callTool(h.ctx, 'follow_up', { worker: 'Ada', prompt: 'more' })).isError, undefined);
   assert.equal(h.asked.length, 0);
   assert.equal(h.spawned.length, 5);
 });
@@ -158,4 +159,24 @@ test('variants: resolves providers from models.json aliases and defaultProvider 
   assert.equal(bad.isError, true);
   assert.equal(h.asked.length, 1, 'invalid shared arg must not prompt');
   assert.equal(h.spawned.length, 2);
+});
+
+test('follow_up checks its target before asking: a worker with no saved conversation, or a pipeline stage, never prompts', async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), 'smith-confirm-target-'));
+  const at = new Date().toISOString();
+  for (const [jobId, extra] of [['review-smith-noconv1', { name: 'NoConv', conversation: null, pipeline: null }], ['review-smith-stage01', { name: 'Stage', conversation: 'thread', pipeline: 'run-1', stage: 'build' }]] as const) {
+    const file = jobFile(repo, jobId, FILES.job);
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, JSON.stringify({ schema: 1, jobId, workerId: jobId, provider: 'codex', mode: 'review', cwd: repo, status: 'succeeded', createdAt: at, startedAt: at, updatedAt: at, finishedAt: at, ...extra }));
+  }
+  const asked: string[] = [];
+  const ctx: HandlerContext = {
+    service: new ForgeService({ repo }), catalogs: async () => [],
+    server: { getClientCapabilities: () => FORM, elicitInput: async (p) => { asked.push(p.message); return { action: 'accept' }; } },
+  };
+  const noConv = await callTool(ctx, 'follow_up', { worker: 'NoConv', prompt: 'more', unrestricted: true });
+  assert.match(text(noConv), /has no saved conversation/);
+  const stage = await callTool(ctx, 'follow_up', { worker: 'Stage', prompt: 'more', unrestricted: true });
+  assert.match(text(stage), /is a pipeline stage/);
+  assert.deepEqual(asked, []);
 });

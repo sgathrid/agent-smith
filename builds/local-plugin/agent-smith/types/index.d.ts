@@ -1,37 +1,3 @@
-/**
- * types/index.d.ts — the mod's own state shapes, plus the plugin-state
- * declaration the mod API needs.
- *
- * WHY THE MOD DEFINES ITS OWN JOB SHAPE INSTEAD OF USING ObservedJob:
- *
- * harness/ObservedJob is the right shape for a *store row* and the wrong shape
- * for a *list row*. It carries `raw: Record<string, unknown>` (the whole provider
- * payload — good for a debug dump, dead weight for rendering), it carries no tool
- * history and no activity, and its `startedAt` is honestly `null` when no start
- * time was recorded (normalize.ts refuses to invent one).
- *
- * The pane needs three things ObservedJob does not have:
- *   - toolCount, counted from events.jsonl (a real quantity, shown as-is)
- *   - activity, one terse phrase for the most recent tool
- *   - a start time
- *
- * So `readForgeJob` (hooks/canonical.ts) is the single place that turns one job on disk
- * into one drawable row. Keeping the mapping in one function is what makes the
- * band and the pane incapable of disagreeing about what a job looks like — and
- * it is the ONLY function that decides status, for either surface.
- */
-
-// ── the pane's row shape ────────────────────────────────────────────────────
-
-/**
- * The six states the pane can draw.
- *
- * Deliberately NOT the same union as harness's ObservedStatus: the pane adds
- * `attention` (a running job that has gone silent, surfaced from
- * the stall verdict) because "needs you" is a thing a human must
- * be able to tell apart from "still working", and the pane has no other way to
- * say it. The mapping is total and lives in projectRadarJob().
- */
 export type RadarStatus =
   | 'running'
   | 'succeeded'
@@ -40,154 +6,65 @@ export type RadarStatus =
   | 'attention'
   | 'unknown';
 
-export type ContinuationKind = 'steer-queue' | 'steer-interrupt' | 'resume';
+export type ContinuationKind = 'follow-up' | 'steer';
 
-/**
- * One job, as the pane draws it. Immutable; treat as a snapshot.
- *
- * `ObservedJob` in harness/types.ts is explicitly a snapshot too (point 5 of its
- * reconciliation note): readers must be re-callable at any cadence and two reads
- * are two independent observations that are allowed to disagree. Nothing in the
- * pane holds one of these across ticks expecting it to stay fresh.
- */
 export interface RadarJob {
-  /** The job id, e.g. `implement-smith-3f9a2c71`. */
   readonly id: string;
-
-  /** Optional human label for the worker; absent labels fall back to task text. */
   readonly name?: string | null;
-
-  /** Stable worker identity across all turns (or the job id for legacy 0.4.x files). */
   readonly workerId: string;
-
-  /** 1-based turn number within the worker's chain. */
   readonly turn: number;
-
-  /** Worker role/stage, when the source records one. */
   readonly role?: string | null;
   readonly provider?: string | null;
   readonly model?: string | null;
   readonly acceptance?: RadarAcceptance;
-  /** Files the job changed (job.json changedFiles), when recorded and not truncated. */
   readonly changedFileCount?: number | null;
-  /** Canonical failure detail from the manifest, when available. */
   readonly failureReason?: string | null;
   readonly failureDetail?: string | null;
   readonly lastEventAt?: number | null;
-  /**
-   * hooks/stale.ts livenessOf, for a live job: active, in-tool (a call still
-   * open), silent (no output past the grace period) or dead (heartbeat stopped).
-   * `attention` means silent or dead. Absent once terminal.
-   */
   readonly liveness?: { readonly state: 'active' | 'in-tool' | 'waiting' | 'silent' | 'dead'; readonly silentForMs: number; readonly since: number | null; readonly forMs: number; readonly tool?: string } | null;
   readonly pipeline?: string | null;
   readonly stage?: string | null;
   readonly attempt?: number | null;
-
-  /** Latest actual assistant output, kept separate from reasoning/tool activity. */
   readonly latestSummary?: string | null;
-
-  /** `worker` only when the latest summary came from worker output. */
   readonly summarySource?: 'worker' | null;
-
-  /** Lifecycle state as the pane draws it. See RadarStatus. */
   readonly status: RadarStatus;
-
-  /**
-   * Epoch ms, or null when no start could be established.
-   *
-   * NULL IS A REAL VALUE AND MUST BE RENDERED AS A BLANK CELL, NOT AS 0.
-   * A job with no known start has an unknown elapsed time; printing `0s` would
-   * be a fabrication and printing `Infinity` would be worse.
-   */
   readonly startedAt: number | null;
-
-  /**
-   * Epoch ms of the start of the continuous steered chain (reset on resume after
-   * an idle gap), or null when unknown.
-   */
   readonly chainStartedAt?: number | null;
-
-  /** Epoch ms once terminal, else null. */
   readonly endedAt: number | null;
-
-  /**
-   * Tool invocations counted from events.jsonl, or null when the file is gone.
-   *
-   * NULL IS CORRECT when no count was recorded. Inventing 0 there would draw a
-   * confident lie.
-   */
   readonly toolCount: number | null;
-
-  /** Terse "what it is doing" phrase, already truncated at the source. '' if idle. */
   readonly activity: string;
-
-  /** The task description, first line only. Never the whole prompt. */
   readonly task: string;
-
-  /** The full prompt sent to the worker. Detail view only; null elsewhere or on older jobs. */
   readonly prompt?: string | null;
-
-  /** The mode preamble Agent Smith prepended to the prompt. Detail view only. */
   readonly preamble?: string | null;
-
-  /** Non-fatal signals, provider codes preserved. Empty means "nothing flagged". */
   readonly warnings: readonly { code: string; message: string }[];
-
-  /**
-   * The de-polluted final report, or null.
-   *
-   * Run through `stripSystemNotifications()` (hazard C). Populated only when the
-   * reader is asked for it — the pane's detail view asks, the band does not,
-   * because the band would otherwise re-read 256 KB of markdown every 1 s to
-   * draw a six-character line. `null` therefore means "not requested" as well as
-   * "nothing there", and the band must never read it.
-   */
   readonly report: string | null;
-
-  /** Current reasoning text, or null when the job has not produced any yet. */
   readonly reasoning: string | null;
-
-  /** What the worker has done so far, from its tool calls (progress.json `digest`). Absent for older jobs. */
   readonly progress?: ProgressDigest | null;
-
-  /** Child job ID when this turn was superseded by a steered continuation turn. */
   readonly supersededBy?: string | null;
-
-  /** Parent job ID when this turn continued from an earlier turn (steer or resume). */
+  readonly followedBy?: string | null;
   readonly continuedFrom?: string | null;
-
-  /** How this turn continued from its parent: queued steer, interrupt steer, or resume. */
   readonly continuationKind?: ContinuationKind | null;
-
-  /** Unconsumed queued steer count while running. */
   readonly pendingSteers?: number | null;
-
-  /** Watched brief files that changed in the repository while the job ran. */
+  readonly pendingMessages?: number | null;
   readonly staleReads?: readonly string[] | null;
-
-  /** Raw provider payload, for the pane's debug view only. Never parsed by a surface. */
   readonly raw: Record<string, unknown>;
 }
 
 export type ActivityEvent =
   | { sequence: number; kind: 'assistant'; at: string; text: string }
-  | { sequence: number; kind: 'tool'; at: string; stepIndex: number; tool: string; input: string; output: string; state: string };
+  | { sequence: number; kind: 'tool'; at: string; stepIndex: number; tool: string; input: string; output: string; state: string }
+  | { sequence: number; kind: 'message'; at: string; text: string; delivery: 'next-step' | 'turn-start'; sender: 'follow_up' | 'steer' };
 
 export interface RadarAcceptance {
   readonly state: 'accepted' | 'rejected' | 'unchecked';
   readonly pending?: boolean;
-  /** Pending only: how long the checks may take, ms. */
   readonly budgetMs?: number;
-  /** Pending only: names of the checks running now. */
   readonly running?: string;
   readonly checks: readonly {
     name: string; ok: boolean; outputTail: string;
     reason?: string; timedOut?: boolean; signal?: string | null; skipped?: string;
   }[];
 }
-
-// ── mod plugin state ────────────────────────────────────────────────────────
 
 declare module 'claude-code' {
   /**
@@ -200,84 +77,39 @@ declare module 'claude-code' {
    */
   interface PluginState {
     'agent-smith': {
-      /** Worker id open in the sidebar's worker view, or null for the list. */
       selected: string | null;
-      /** Specific prior turn job id pinned by user click, or null to auto-follow live head. */
       pinnedTurnId: string | null;
-      /** Clock the pane subscribes to so elapsed cells tick. The BAND writes it. */
       now: number;
-      /** The worker view keeps its end in view; a person scrolling up pauses it. */
       follow: boolean;
-      /** The worker view's task line is expanded to the prompt as sent. */
       taskOpen: boolean;
       listPage: number;
       paneOpen: boolean;
       expandedTools: string[];
       readError: string | null;
-      /**
-       * The band's own snapshot of the jobs directory, from the 1 s active poll.
-       *
-       * SEPARATE FROM THE PANE'S READ ON PURPOSE. The pane re-reads on demand —
-       * a keypress is a deliberate act and deserves fresh data — while the band
-       * is driven by a poll and must never block a redraw on 20 file reads. Both
-       * are read-only projections of the same files, so they cannot disagree
-       * about the truth, only about when they looked.
-       */
       bandJobs: RadarJob[];
-      /** Host-created task IDs for live Agent Smith workers; keys are worker IDs. */
       nativeTaskLinks: Record<string, {
         taskId: string;
         status: 'in_progress' | 'completed' | 'deleted';
         fingerprint: string;
         doneAt?: number;
       }>;
-      /**
-       * Resolved once at session start: which repo to watch, and whether colour
-       * is allowed (NO_COLOR / FORCE_COLOR / TERM=dumb). Re-reading env per frame
-       * would be a pointless syscall per redraw.
-       *
-       * THE PANE READS `repo` FROM HERE TOO, and that is the point. `$.cwd` is
-       * refused by the mod loader, so the session cwd has to be captured once and
-       * folded in here; the pane reading the result means the band and the pane
-       * cannot end up pointed at different repos.
-       *
-       * `source` says where `repo` came from. `launch` is the MCP server's own repo, read from a
-       * launch ack: authoritative, so a later session.start does not replace it
-       * with a cwd that has drifted. `cwd` is the first guess until then.
-       */
       bandConfig: { repo: string; colour: boolean; source: 'cwd' | 'launch' };
-      /**
-       * Launches this session claimed at `tool.call`, until announced.
-       * Session state on purpose: another session's jobs are never in it.
-       * The shape is hooks/notice.ts `Owned`, spelled out for the validator.
-       */
-      notices: { kind: 'job' | 'run'; id: string; workerId?: string; at: number; until: number; saidAttention?: boolean; saidDead?: boolean; saidExited?: boolean; saidStageAttention?: string[] }[];
-      /**
-       * Job and pipeline run IDs this session launched in this repo, never pruned
-       * within the session: what the band, /forge and native tasks show.
-       * The shape is hooks/dashboard.ts `Launched`, spelled out for the validator.
-       */
+      notices: { kind: 'job' | 'run'; id: string; workerId?: string; fromTurn?: number; readHead?: string; at: number; until: number; saidAttention?: boolean; saidDead?: boolean; saidExited?: boolean; saidStageAttention?: string[] }[];
       launched: { jobs: string[]; runs: string[] };
-      /** The /forge list: this session's workers, or the repository's. */
       listScope: 'session' | 'all';
     };
   }
 }
 
-/** progress.json `digest`, written by the forge from every tool call (hooks/progress.ts). */
 export type ProgressPhase = 'starting' | 'exploring' | 'editing' | 'testing' | 'running';
 export interface ProgressDigest {
   readonly phase: ProgressPhase;
-  /** Distinct files read. */
   readonly filesRead: number;
   readonly searches: number;
-  /** Distinct files edited through a visible edit tool, most recent last (at most 8). */
   readonly edited: readonly string[];
   readonly editedCount: number;
   readonly commands: number;
   readonly testRuns: number;
-  /** True only when the provider ended the latest test run as an explicit error. */
   readonly lastTestFailed: boolean;
-  /** The same call made several times in a row: often a loop. */
   readonly repeat: { readonly label: string; readonly count: number } | null;
 }

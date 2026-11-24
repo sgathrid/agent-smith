@@ -160,10 +160,9 @@ test('syncNativeTasks keeps 1 worker-keyed native task across steer and reopens 
   const linked = await syncNativeTasks([parent], {}, client, 1000);
   assert.equal(linked['shell']?.taskId, 'native-1');
 
-  // Steer: parent superseded, child turn-2 running -> reuses native-1 without completing parent.
   const supersededParent = { ...parent, status: 'canceled' as const, supersededBy: 'turn-2' };
   const child = {
-    ...parent, id: 'turn-2', turn: 2, status: 'running' as const, continuedFrom: 'turn-1', continuationKind: 'steer-interrupt' as const,
+    ...parent, id: 'turn-2', turn: 2, status: 'running' as const, continuedFrom: 'turn-1', continuationKind: 'steer' as const,
     latestSummary: 'Pivoting to profile menu.', summarySource: 'worker' as const,
   };
   const steered = await syncNativeTasks([supersededParent, child], linked, client, 2000);
@@ -172,15 +171,13 @@ test('syncNativeTasks keeps 1 worker-keyed native task across steer and reopens 
   assert.equal(calls.filter((c) => c.method === 'create').length, 1, 'did not create a second native task on steer');
   assert.equal(calls.some((c) => c.input.status === 'completed'), false, 'did not mark parent completed');
 
-  // Finish turn-2 -> marks native-1 completed with doneAt.
   const finishedTurn2 = { ...child, status: 'succeeded' as const };
   const completed = await syncNativeTasks([supersededParent, finishedTurn2], steered, client, 5000);
   assert.equal(completed['shell']?.status, 'completed');
   assert.equal(completed['shell']?.doneAt, 5000);
 
-  // Resume before close delay -> reopens native-1 in_progress and clears doneAt, no second TaskCreate.
   const resumedTurn3 = {
-    ...parent, id: 'turn-3', turn: 3, status: 'running' as const, continuedFrom: 'turn-2', continuationKind: 'resume' as const,
+    ...parent, id: 'turn-3', turn: 3, status: 'running' as const, continuedFrom: 'turn-2', continuationKind: 'follow-up' as const,
   };
   const reopened = await syncNativeTasks([supersededParent, finishedTurn2, resumedTurn3], completed, client, 8000);
   assert.equal(reopened['shell']?.taskId, 'native-1');
@@ -188,14 +185,13 @@ test('syncNativeTasks keeps 1 worker-keyed native task across steer and reopens 
   assert.equal(reopened['shell']?.doneAt, undefined, 'doneAt cleared on reopen');
   assert.equal(calls.filter((c) => c.method === 'create').length, 1, 'reused native task on resume');
 
-  // Finish turn-3 and wait past close delay -> deleted; later resume re-creates a fresh native task.
   const doneTurn3 = { ...resumedTurn3, status: 'succeeded' as const };
   const settled3 = await syncNativeTasks([supersededParent, finishedTurn2, doneTurn3], reopened, client, 10_000);
   const deleted3 = await syncNativeTasks([supersededParent, finishedTurn2, doneTurn3], settled3, client, 20_000);
   assert.equal(deleted3['shell']?.status, 'deleted');
 
   const resumedTurn4 = {
-    ...parent, id: 'turn-4', turn: 4, status: 'running' as const, continuedFrom: 'turn-3', continuationKind: 'resume' as const,
+    ...parent, id: 'turn-4', turn: 4, status: 'running' as const, continuedFrom: 'turn-3', continuationKind: 'follow-up' as const,
   };
   const recreated = await syncNativeTasks([supersededParent, finishedTurn2, doneTurn3, resumedTurn4], deleted3, client, 30_000);
   assert.equal(recreated['shell']?.taskId, 'native-2', 're-creates task after earlier task was deleted');
@@ -209,7 +205,7 @@ test('hasPendingNativeClose selects the worker head regardless of fs.list hex or
     ...baseRadar,
     id: 'implement-smith-0000', workerId: 'w1', turn: 2, name: 'Ada', provider: 'codex', role: 'implement',
     status: 'succeeded' as const, activity: 'done', toolCount: 1, startedAt: 2000, endedAt: 3000,
-    continuedFrom: 'implement-smith-ffff', continuationKind: 'steer-interrupt' as const,
+    continuedFrom: 'implement-smith-ffff', continuationKind: 'steer' as const,
   };
   const turn1CanceledSuperseded = {
     ...baseRadar,

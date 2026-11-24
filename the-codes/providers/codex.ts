@@ -111,7 +111,9 @@ import type { RunFn } from './discovery.ts';
 import path from 'node:path';
 import { noResultText, stderrClause } from './failure-text.ts';
 
-export const CODEX_BINARY = process.env['AGENT_SMITH_CODEX_BIN'] ?? 'codex';
+export function codexBinary(): string {
+  return process.env['AGENT_SMITH_CODEX_BIN'] ?? 'codex';
+}
 
 /** Sandbox modes accepted by -s. Verified from `codex exec --help`. */
 export type CodexSandbox = 'read-only' | 'workspace-write' | 'danger-full-access';
@@ -657,7 +659,7 @@ export async function listCodexModels(
   try {
     let error: string | undefined;
     let models: ModelInfo[] | undefined;
-    const r = await run(CODEX_BINARY, ['debug', 'models'], options?.timeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS);
+    const r = await run(codexBinary(), ['debug', 'models'], options?.timeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS);
     if (r.error === undefined) models = parseCodexModels(r.stdout);
     if (models === undefined || models.length === 0) {
       error = r.error ?? '`codex debug models` returned no models';
@@ -709,7 +711,7 @@ export const codexProvider: Provider = {
   name: 'codex',
   harnessDefaults: () => codexHarnessDefaults(),
 
-  available: () => binaryAvailable(CODEX_BINARY),
+  available: () => binaryAvailable(codexBinary()),
 
   describeSandbox: sandboxPlan,
 
@@ -719,7 +721,7 @@ export const codexProvider: Provider = {
     const tx = createCodexTranslator(spec.maxOutputChars ?? 2000);
     return runNdjsonWorker({
       provider: 'codex',
-      binary: CODEX_BINARY,
+      binary: codexBinary(),
       spec,
       buildArgv,
       translate: tx.onEvent,

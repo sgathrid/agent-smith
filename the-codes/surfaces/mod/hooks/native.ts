@@ -1,16 +1,9 @@
-/**
- * Projection of live Agent Smith workers into Claude Code's native task list.
- *
- * The mod watches Agent Smith's durable job files; it does not create Claude
- * Agent IDs or enter Claude's Agent/subagent loop. A native task ID is kept only
- * after TaskCreate returns one from the host.
- */
-
 import type { FsLike } from './fs.ts';
 import type { ContinuationKind, RadarAcceptance, RadarJob } from '../types/index.d.ts';
 import { readForgeJobs, acceptanceLabel } from './canonical.ts';
 import { isLiveStatus } from './format.ts';
 import { firstTrimmed, record } from './guards.ts';
+import { compareTurnPriority, type TurnLike } from './turns.ts';
 
 export type NativeJobStatus = 'running' | 'attention' | 'succeeded' | 'failed' | 'canceled';
 
@@ -29,6 +22,7 @@ export interface NativeJob {
   readonly acceptance?: RadarAcceptance;
   readonly summarySource: 'worker' | null;
   readonly supersededBy?: string | null;
+  readonly followedBy?: string | null;
   readonly continuedFrom?: string | null;
   readonly continuationKind?: ContinuationKind | null;
   readonly pendingSteers?: number | null;
@@ -37,13 +31,10 @@ export interface NativeJob {
 export interface NativeTaskLink {
   readonly taskId: string;
   readonly status: 'in_progress' | 'completed' | 'deleted';
-  /** When this worker was first seen finished (epoch ms); starts the close delay. */
   readonly doneAt?: number;
-  /** Last description/status sent successfully; lets the poll avoid no-op writes. */
   readonly fingerprint: string;
 }
 
-/** Keyed by `workerId` — one native task per worker across spawn, steer, and resume. */
 export type NativeTaskLinks = Record<string, NativeTaskLink>;
 
 export interface NativeTaskClient {
@@ -62,7 +53,6 @@ export interface NativeTaskClient {
   }): Promise<unknown>;
 }
 
-/** Both native tasks and /forge use the same canonical projection and liveness. */
 export function nativeJobsFromRadar(jobs: readonly RadarJob[]): NativeJob[] {
   return jobs.filter(job => job.status !== 'unknown').map(job => ({
     id: job.id, status: job.status as NativeJobStatus, task: job.task,
@@ -71,6 +61,7 @@ export function nativeJobsFromRadar(jobs: readonly RadarJob[]): NativeJob[] {
     latestSummary: job.latestSummary ?? null, summarySource: job.summarySource ?? null,
     acceptance: job.acceptance,
     supersededBy: job.supersededBy ?? null,
+    followedBy: job.followedBy ?? null,
     continuedFrom: job.continuedFrom ?? null,
     continuationKind: job.continuationKind ?? null,
     pendingSteers: job.pendingSteers ?? null,
@@ -129,11 +120,10 @@ function updateSucceeded(result: unknown): boolean {
   return output?.success === true;
 }
 
-/** How long a finished worker's task stays in the host list before it is closed. */
 const CLOSE_DELAY_MS = 10_000;
 
 function isLiveNative(job: NativeJob): boolean {
-  if (job.supersededBy && !isLiveStatus(job.status)) return false;
+  if ((job.supersededBy || job.followedBy) && !isLiveStatus(job.status)) return false;
   return isLiveStatus(job.status) || job.acceptance?.pending === true;
 }
 
@@ -150,42 +140,23 @@ function fingerprint(job: NativeJob): string {
   });
 }
 
-function isBetterNativeHead(candidate: NativeJob, current: NativeJob): boolean {
-  const cSup = Boolean(candidate.supersededBy);
-  const oSup = Boolean(current.supersededBy);
-  if (cSup !== oSup) return !cSup;
-  const cLive = isLiveNative(candidate);
-  const oLive = isLiveNative(current);
-  if (cLive !== oLive) return cLive;
-  const cTurn = candidate.turn ?? 1;
-  const oTurn = current.turn ?? 1;
-  if (cTurn !== oTurn) return cTurn > oTurn;
-  const cAt = candidate.startedAt ?? 0;
-  const oAt = current.startedAt ?? 0;
-  if (cAt !== oAt) return cAt > oAt;
-  return candidate.id.localeCompare(current.id) > 0;
+function nativeTurn(job: NativeJob): TurnLike {
+  return {
+    jobId: job.id, status: job.status, turn: job.turn, supersededBy: job.supersededBy, followedBy: job.followedBy,
+    startedAt: job.startedAt, acceptancePending: job.acceptance?.pending === true, pendingMessages: job.pendingSteers,
+  };
 }
 
-/** Collapse turns to one head turn per worker. */
 function groupNativeWorkers(jobs: readonly NativeJob[]): NativeJob[] {
   const byWorker = new Map<string, NativeJob>();
   for (const job of jobs) {
     const key = job.workerId || job.id;
     const prev = byWorker.get(key);
-    if (!prev || isBetterNativeHead(job, prev)) byWorker.set(key, job);
+    if (!prev || compareTurnPriority(nativeTurn(job), nativeTurn(prev)) < 0) byWorker.set(key, job);
   }
   return [...byWorker.values()];
 }
 
-/**
- * Create tasks only for currently live workers this session owns, and update
- * existing worker links across spawn, steer, and resume.
- *
- * Keyed by `workerId`: a steered or resumed worker reuses its existing native
- * task (reopening `in_progress` and clearing `doneAt` on resume, or re-creating
- * a new task if the earlier one was already deleted after the close delay).
- */
-/** True when any completed native task belongs to a dismissible (succeeded, non-rejected) worker head waiting for CLOSE_DELAY_MS. */
 export function hasPendingNativeClose(rows: readonly RadarJob[], links: NativeTaskLinks): boolean {
   const byWorker = new Map<string, NativeJob>();
   for (const job of groupNativeWorkers(nativeJobsFromRadar(rows))) byWorker.set(job.workerId || job.id, job);
@@ -208,9 +179,7 @@ export async function syncNativeTasks(
   const workers = groupNativeWorkers(jobs);
 
   for (const job of workers) {
-    // Mid-handoff: only a superseded parent is visible before its child appears;
-    // keep the worker's task in_progress without marking it completed.
-    if (job.supersededBy && !isLiveStatus(job.status)) continue;
+    if ((job.supersededBy || job.followedBy) && !isLiveStatus(job.status)) continue;
 
     const key = job.workerId || job.id;
     const old = next[key];
@@ -240,7 +209,6 @@ export async function syncNativeTasks(
         });
         taskId = nativeId(created) ?? undefined;
       } catch {
-        // Host task APIs are an optional projection; workers keep running.
         continue;
       }
       if (taskId === undefined) continue;
@@ -248,14 +216,11 @@ export async function syncNativeTasks(
     }
 
     let link = next[key]!;
-    // Reopening a worker (e.g. resume_job before close delay) clears doneAt.
     if (live && link.doneAt !== undefined) {
       link = { taskId: link.taskId, status: link.status, fingerprint: link.fingerprint };
       next[key] = link;
     }
 
-    // A finished worker's task is closed (deleted from the host list) CLOSE_DELAY_MS
-    // after we first see it finished, so the list does not fill with done work.
     if (!live) {
       const doneAt = link.doneAt ?? now;
       const dismissible = job.status === 'succeeded' && job.acceptance?.state !== 'rejected';
@@ -263,9 +228,7 @@ export async function syncNativeTasks(
         try {
           const closed = await client.update({ taskId, subject, description, status: 'deleted' });
           if (updateSucceeded(closed)) next[key] = { taskId, status: 'deleted', fingerprint: '', doneAt };
-        } catch {
-          // Retried on the next poll.
-        }
+        } catch {}
         continue;
       }
       if (link.doneAt === undefined) {
@@ -291,9 +254,7 @@ export async function syncNativeTasks(
           ...(!live && prior?.doneAt !== undefined ? { doneAt: prior.doneAt } : {}),
         };
       }
-    } catch {
-      // Retain the old fingerprint so a later poll retries the update.
-    }
+    } catch {}
   }
   return next;
 }

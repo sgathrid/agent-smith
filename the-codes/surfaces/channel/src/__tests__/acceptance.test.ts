@@ -5,33 +5,32 @@ import path from 'node:path';
 import test from 'node:test';
 import { callTool, parseStages, TOOL_DEFS, type HandlerContext } from '../tools.ts';
 import { readAcceptance, writeAcceptance } from '../../../../forge/checks.ts';
-import { waitFor } from '../../../../forge/testing/time.ts';
+import { withWorkerLookup } from './service-mock.ts';
 
 const body = (r: { content: unknown }) => JSON.parse(((r.content as { text: string }[])[0]!).text);
 function fake(finalStatus: string, runningReads = 0) {
   const repo = mkdtempSync(path.join(tmpdir(), 'tools-'));
-  let reads = 0; let resolve!: (m: unknown) => void;
-  const done = new Promise(r => { resolve = r; });
-  const service = {
+  let reads = 0;
+  const seen: Record<string, unknown>[] = [];
+  const service = withWorkerLookup({
     repo,
-    spawnJob: async () => ({ jobId: 'job-1' }),
-    spawnTracked: async () => ({ ack: { jobId: 'job-1' }, done }),
+    spawnJob: async (req: Record<string, unknown>) => { seen.push(req); return { jobId: 'job-1' }; },
     detail: async () => ({ jobId: 'job-1', status: reads++ < runningReads ? 'running' : finalStatus, report: null, warnings: [] }),
-  };
-  return { repo, ctx: { service: service as never, pollMs: 5, catalogs: async () => [] } as HandlerContext, finish: () => resolve({ status: finalStatus, cwd: repo }) };
+  });
+  return { repo, seen, ctx: { service: service as never, pollMs: 5, catalogs: async () => [] } as HandlerContext };
 }
-// Checks run real shell commands: wait for the verdict, never for a fixed time.
-const settled = (repo: string) => waitFor(() => !(readAcceptance(repo, 'job-1') as { pending?: boolean }).pending, { message: 'acceptance no longer pending' });
 
-test('spawn_job with checks writes acceptance after terminal state', async () => {
+test('spawn_job with checks hands them to the worker\'s owner (ownerChecks) and the ack names them', async () => {
   const f = fake('succeeded');
   const r = await callTool(f.ctx, 'spawn_job', { mode: 'implement', prompt: 'x', provider: 'agy', checks: [{ name: 'ok', command: 'true' }] });
   assert.equal(r.isError, undefined); assert.equal(body(r).jobId, 'job-1'); assert.deepEqual(r.structuredContent, body(r));
-  assert.equal(readAcceptance(f.repo, 'job-1').state, 'unchecked');
-  assert.equal(body(await callTool(f.ctx, 'status', { jobId: 'job-1' })).acceptance.pending, true);
-  f.finish(); await settled(f.repo);
-  const s = body(await callTool(f.ctx, 'status', { jobId: 'job-1' }));
-  assert.equal(s.status, 'succeeded'); assert.equal(s.acceptance.state, 'accepted'); assert.deepEqual(s.acceptance.passed, ['ok']);
+  assert.deepEqual(body(r).checks, ['ok']);
+  assert.equal(f.seen[0]!.ownerChecks, true, 'the owner runs the checks, also across follow-ups');
+  assert.deepEqual((f.seen[0]!.checks as { name: string }[]).map(c => c.name), ['ok']);
+  assert.equal('pending' in readAcceptance(f.repo, 'job-1'), false);
+  await callTool(f.ctx, 'spawn_job', { mode: 'implement', prompt: 'x', provider: 'agy' });
+  assert.equal(f.seen[1]!.ownerChecks, true);
+  assert.equal(f.seen[1]!.checks, undefined);
 });
 
 test('spawn_job passes context and the checks to the service so the worker brief can show them', async () => {
@@ -66,20 +65,9 @@ test('run_pipeline stages accept a context string and reject a non-string one', 
   assert.throws(() => parseStages([{ name: 'implement', provider: 'agy', context: 7 }]), /context must be/);
 });
 
-test('failing blocking check rejects; failed job rejects', async () => {
-  const f = fake('succeeded');
-  await callTool(f.ctx, 'spawn_job', { mode: 'implement', prompt: 'x', provider: 'agy', checks: [{ name: 'bad', command: 'exit 1' }] });
-  f.finish(); await settled(f.repo);
-  assert.equal(readAcceptance(f.repo, 'job-1').state, 'rejected');
-  const g = fake('failed');
-  await callTool(g.ctx, 'spawn_job', { mode: 'implement', prompt: 'x', provider: 'agy', checks: [{ name: 'ok', command: 'true' }] });
-  g.finish(); await settled(g.repo);
-  assert.equal(readAcceptance(g.repo, 'job-1').state, 'rejected');
-});
-
 test('no checks: unchecked acceptance on status', async () => {
   const f = fake('succeeded');
-  const s = body(await callTool(f.ctx, 'status', { jobId: 'job-1' }));
+  const s = body(await callTool(f.ctx, 'status', { id: 'job-1' }));
   assert.deepEqual(s.acceptance, { state: 'unchecked' }); assert.equal(s.waited, undefined);
 });
 
@@ -89,12 +77,11 @@ test('status wait_ms keeps waiting while acceptance checks run, and returns once
   const started = Date.now();
   const timer = setTimeout(() => writeAcceptance(f.repo, 'job-1', { state: 'accepted', checks: [] }), 150);
   try {
-    const s = body(await callTool(f.ctx, 'status', { jobId: 'job-1', wait_ms: 5_000 }));
+    const s = body(await callTool(f.ctx, 'status', { id: 'job-1', wait_ms: 5_000 }));
     assert.ok(Date.now() - started >= 140, 'did not return while the checks were still running');
     assert.equal(s.stillRunning, false); assert.equal(s.acceptance.state, 'accepted');
-    // Still pending when the wait ends: reported as still running, not settled.
     writeAcceptance(f.repo, 'job-1', { state: 'unchecked', checks: [], pending: true, budgetMs: 60_000, running: 'suite' });
-    assert.equal(body(await callTool(f.ctx, 'status', { jobId: 'job-1', wait_ms: 60 })).stillRunning, true);
+    assert.equal(body(await callTool(f.ctx, 'status', { id: 'job-1', wait_ms: 60 })).stillRunning, true);
   } finally {
     clearTimeout(timer);
   }
@@ -102,58 +89,37 @@ test('status wait_ms keeps waiting while acceptance checks run, and returns once
 
 test('status wait_ms long-polls and is capped', async () => {
   const f = fake('succeeded', 3);
-  const s = body(await callTool(f.ctx, 'status', { jobId: 'job-1', wait_ms: 2000 }));
+  const s = body(await callTool(f.ctx, 'status', { id: 'job-1', wait_ms: 2000 }));
   assert.equal(s.waited, true); assert.equal(s.stillRunning, false); assert.equal(s.status, 'succeeded');
   const g = fake('succeeded', 1000);
-  const still = body(await callTool(g.ctx, 'status', { jobId: 'job-1', wait_ms: 60 }));
-  assert.equal(still.stillRunning, true); // a still-running job returns after wait_ms rather than hanging
-  assert.equal((await callTool(f.ctx, 'status', { jobId: 'job-1', wait_ms: 60_001 })).isError, true);
+  const still = body(await callTool(g.ctx, 'status', { id: 'job-1', wait_ms: 60 }));
+  assert.equal(still.stillRunning, true);
+  assert.equal((await callTool(f.ctx, 'status', { id: 'job-1', wait_ms: 60_001 })).isError, true);
 });
 
 test('structuredContent wraps arrays; outputSchema is permissive', async () => {
-  const ctx = { service: { list: async () => [{ jobId: 'a', warnings: [] }] } as never } as HandlerContext;
+  const ctx = { service: { list: async () => [{ jobId: 'a', status: 'succeeded', warnings: [] }] } as never } as HandlerContext;
   const r = await callTool(ctx, 'list_jobs', {});
-  assert.deepEqual(r.structuredContent, { items: [{ jobId: 'a', turn: 1 }] });
+  assert.deepEqual(r.structuredContent, { items: [{ jobId: 'a', status: 'succeeded' }] });
   for (const n of ['status', 'list_jobs', 'list_capabilities', 'spawn_job']) assert.equal(TOOL_DEFS.find(t => t.name === n)!.outputSchema!.additionalProperties, true);
 });
 
-test('spawn_job writes the checks budget into the pending placeholder', async () => {
-  const f = fake('succeeded');
-  await callTool(f.ctx, 'spawn_job', { mode: 'implement', prompt: 'x', provider: 'agy', checks: [{ name: 'a', command: 'true', timeoutMs: 600_000 }, { name: 'b', command: 'true', timeoutMs: 600_000 }] });
-  const pending = readAcceptance(f.repo, 'job-1') as { pending?: boolean; budgetMs?: number };
-  assert.equal(pending.pending, true); assert.equal(pending.budgetMs, 1_230_000);
-});
-
-test('status shows which check is running, and cancel aborts checks of an exited worker', async () => {
+test('cancel while checks run: checksCanceled once their owner stops them, else a note that it will', async () => {
   const f = fake('succeeded');
   (f.ctx.service as unknown as { cancel: (id: string) => unknown }).cancel = (id: string) => ({ jobId: id, requested: true, signalled: false, note: 'x' });
-  await callTool(f.ctx, 'spawn_job', { mode: 'implement', prompt: 'x', provider: 'agy', checks: [{ name: 'hang', command: 'sleep 30', timeoutMs: 60_000 }] });
-  f.finish();
-  const mid = await waitFor(async () => {
-    const m = body(await callTool(f.ctx, 'status', { jobId: 'job-1' }));
-    return m.acceptance.running === 'hang' ? m : null;
-  }, { message: 'check "hang" to start running' });
-  assert.equal(mid.acceptance.pending, true);
-  const c = body(await callTool(f.ctx, 'cancel', { jobId: 'job-1' }));
-  assert.equal(c.checksCanceled, true);
-  await settled(f.repo);
-  const after = readAcceptance(f.repo, 'job-1');
-  assert.equal(after.state, 'unchecked'); assert.equal((after as { reason?: string }).reason, 'checks canceled');
-  assert.equal((after as { pending?: boolean }).pending, undefined);
-});
-
-test('cancel under a detached supervisor does not claim it aborted the checks', async () => {
-  const f = fake('succeeded');
-  (f.ctx.service as unknown as { cancel: (id: string) => unknown }).cancel = (id: string) => ({ jobId: id, requested: true, signalled: false, note: 'x' });
-  (f.ctx.service as unknown as { supervisorUrl: URL }).supervisorUrl = new URL('file:///unused');
   writeAcceptance(f.repo, 'job-1', { state: 'unchecked', checks: [], pending: true, budgetMs: 60_000, running: 'hang' });
-  const c = body(await callTool(f.ctx, 'cancel', { jobId: 'job-1' }));
-  assert.equal(typeof c.settled, 'boolean');
-  assert.equal(c.checksCanceled, false);
-  assert.match(c.checksNote, /supervisor .* will stop them/);
-  // Checks not running (job still executing): nothing to say about them.
+  assert.equal(body(await callTool(f.ctx, 'status', { id: 'job-1' })).acceptance.running, 'hang');
+  const timer = setTimeout(() => writeAcceptance(f.repo, 'job-1', { state: 'unchecked', checks: [], reason: 'checks canceled' }), 50);
+  try {
+    const c = body(await callTool({ ...f.ctx, cancelSettleMs: 5_000 }, 'cancel', { id: 'job-1' }));
+    assert.deepEqual([c.settled, c.checksCanceled], [true, true]);
+  } finally { clearTimeout(timer); }
+  writeAcceptance(f.repo, 'job-1', { state: 'unchecked', checks: [], pending: true, budgetMs: 60_000, running: 'hang' });
+  const late = body(await callTool({ ...f.ctx, cancelSettleMs: 60 }, 'cancel', { id: 'job-1' }));
+  assert.deepEqual([late.settled, late.checksCanceled], [false, false]);
+  assert.match(late.checksNote, /will stop them/);
   writeAcceptance(f.repo, 'job-1', { state: 'unchecked', checks: [], pending: true, budgetMs: 60_000 });
-  const d = body(await callTool(f.ctx, 'cancel', { jobId: 'job-1' }));
+  const d = body(await callTool({ ...f.ctx, cancelSettleMs: 60 }, 'cancel', { id: 'job-1' }));
   assert.equal('checksCanceled' in d, false);
 });
 

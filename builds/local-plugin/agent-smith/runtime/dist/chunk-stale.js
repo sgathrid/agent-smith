@@ -1,4 +1,4 @@
-import {watch}from'node:fs';import {r as reasonFromText,$ as checksReason,a0 as toolLabel}from'./chunk-normalize.js';/**
+import {watch}from'node:fs';import {r as reasonFromText,ab as checksReason,ac as toolLabel}from'./chunk-normalize.js';/**
  * forge/watch.ts — wake when a job's files change, instead of re-reading them on a timer.
  *
  * A worker runs in another process (the detached supervisor) and reports only through
@@ -65,85 +65,10 @@ function waitForChange(dir, timeoutMs, opts = {}) {
             fallBack();
         }
     });
-}/**
- * format.ts — PURE presentation logic for the /forge pane and the band.
- *
- * WHY THIS FILE IS NOT `register.tsx`:
- * `node --test --experimental-strip-types` CANNOT load a .tsx file — TypeScript's
- * type stripping has no JSX transform (verified: any JSX element in an imported
- * .tsx is a hard parse error). So if the formatters lived next to the render
- * code they would be untestable under the repo's own test runner, which defeats
- * the point of making them pure in the first place. Everything testable lives
- * here, in a module with zero imports and zero I/O. `register.tsx` imports this
- * file and does nothing but lay out what these functions return.
- *
- * NOTHING in here reads the clock, the filesystem, or any atom. "Now" is always
- * a parameter, for the same reason the stall check does it: a formatter that
- * called Date.now() itself could not be tested at a boundary.
- *
- * THE RULES ENCODED BELOW come from agent-configs/shared/TERMINAL-UI.md. Where a
- * rule needed interpretation the reasoning is inline.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * THE ROW, IN ONE PLACE
- * ─────────────────────────────────────────────────────────────────────────────
- * Every job row in either surface is these four segments, in this order:
- *
- *     {glyph} {label} {detail} {elapsed}
- *       1        2       3        4
- *
- *   1 glyph     EAW=Neutral, one column, always drawn. Never colour alone.
- *   2 label     THE TASK, from `prompt_source.task`. Fixed-width cell.
- *   3 detail    what it is doing (live) or how it ended (terminal). Fixed cell.
- *   4 elapsed   fixed 6 columns, RIGHT-aligned, and LAST — see ELAPSED_WIDTH.
- *
- * WHY THE JOB ID IS NOT ON THE ROW ANY MORE. Measured against 20 real jobs:
- * every id looked like `implement-musm82da-f1dc1fe4`. That is
- * 30 columns of which the mode is constant (`implement`, 100% of the corpus, so
- * it is not information) and `-f1dc1fe4` is a UUID fragment that distinguishes
- * nothing a reader can act on. The request the job was actually given sits in
- * `prompt_source.task` and reads "open an agent-built dashboard with real names,
- * decoded inside Renyi". That is the identity. The id survives in the DETAIL
- * view, where it is what you would paste into `agy` to talk about the job.
- *
- * WHY ELAPSED IS LAST AND FIXED-WIDTH. TERMINAL-UI.md §Width: "put the volatile
- * field last — elapsed time ticks every second; if it sits mid-line, everything
- * after it shifts horizontally each tick." The pane used to put the clock second
- * and rely on right-alignment; that is safe (see ELAPSED_WIDTH) but it is a
- * weaker version of the same guarantee than simply putting the field last, and
- * the band already did the latter. Both surfaces now agree, so there is no
- * band/pane ordering deviation left to document.
- */
-/** True for the states that have stopped and will never move again.
- * Takes any string so wire payloads (notice.ts) can ask without a cast; only
- * the three settled names count, so 'unknown' and unrecognised words are not. */
-function isTerminal(status) {
+}function isTerminal(status) {
     return status === 'succeeded' || status === 'failed' || status === 'canceled';
-}/**
- * notice.ts: the words Agent Smith uses to say a job finished, and which jobs
- * this session may announce. Pure; no host API, no `node:` imports.
- *
- * One owner, two speakers. The mod announces through `$.ui.log` (the user's
- * line) and `$.prompt.submit` (Claude's turn, credited to the plugin). Without
- * the mod, the PostToolUse command hook (channel/src/watch-hook.ts) wakes Claude
- * with exit 2. Both render here, so the two paths cannot drift apart.
- *
- * Who announces is decided once per launch, when the mod sees the launch
- * (`tool.call`): the mod claims the job and writes a claim marker; the command
- * hook, which still starts, finds the marker when the job ends and stays silent. Nothing else
- * announces a claimed job (see register.tsx, `takeLaunch`).
- */
-/**
- * Acceptance checks run after a job ends, so a finished job briefly carries a
- * pending placeholder. Hold its notice until the verdict lands, never longer
- * than this: a crashed checker must not silence a finished job. A placeholder
- * that carries its own `budgetMs` (the checks' timeouts summed) holds that long.
- */
-const ACCEPTANCE_HOLD_MS = 5 * 60_000;
+}const ACCEPTANCE_HOLD_MS = 5 * 60_000;
 const GLYPH = { finished: '✓', failed: '✗', cancelled: '■', attention: '!' };
-// ── text ────────────────────────────────────────────────────────────────────
-/** Bound prose at a sentence or word boundary, never mid-word. The channel's
- * views.ts `trimWords` is its near-twin. */
 function compactExcerpt(value, max) {
     const text = value.replace(/\s+/g, ' ').trim();
     if (text.length <= max)
@@ -153,7 +78,6 @@ function compactExcerpt(value, max) {
     const end = sentence !== undefined && sentence >= max / 2 ? sentence + 1 : prefix.lastIndexOf(' ');
     return `${end > 0 ? prefix.slice(0, end).trimEnd() : ''}…`;
 }
-/** `43s`, `12m`, `1h05m`; '' for an unknown or negative span. */
 function durationWords(ms) {
     if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0)
         return '';
@@ -165,16 +89,11 @@ function durationWords(ms) {
         return `${m}m`;
     return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}m`;
 }
-/**
- * The service names an unnamed worker `<mode>-<last 8 of the job id>`. Beside
- * the job id that reads as a typo, so it counts as no name.
- */
 function chosenName(job) {
     if (!job.name)
         return null;
     return !job.run && job.id.length >= 8 && job.name.endsWith(`-${job.id.slice(-8)}`) ? null : job.name;
 }
-/** `Ada (codex review)`, `review-smith-1a2b3c4d (agy review)`, or `job <id>`. */
 function who(job) {
     const identity = [job.provider, job.role].filter(Boolean).join(' ');
     const name = chosenName(job);
@@ -184,22 +103,9 @@ function who(job) {
         return identity ? `${name} (${identity})` : name;
     return identity ? `${job.id} (${identity})` : `job ${job.id}`;
 }
-/** Execution succeeded but a check failed: the work is not done. */
 function rejected(job) {
     return job.kind === 'finished' && !job.run && job.checks != null && job.checks.passed < job.checks.total;
 }
-/**
- * One line, the outcome last:
- *   ✓ Ada (codex review) 43s · done · checks 2/2
- *   ✗ Bo (agy implement) 45m · failed: timed out
- *   ✗ Cy (codex implement) 3m · checks failed: lint
- *   ✓ Ed (codex review) 6s · done · after steer
- *   ✗ Flo (codex review) 4s · failed: timed out · queued steer not applied
- *   ! Di (opencode research) · no output for 16m
- *   ! Di (opencode research) · no output for 16m (in `npm test`)
- *   ! Di (opencode research) · process gone 3m
- * A quiet job is stated as a fact, never as a prompt to interrupt it.
- */
 function headline(job) {
     const d = durationWords(job.durationMs);
     const reason = job.reason ? compactExcerpt(job.reason, 160) : '';
@@ -235,12 +141,14 @@ function headline(job) {
                 parts.push(`no output${d ? ` for ${d}` : ''}${job.liveness?.tool ? ` (in \`${job.liveness.tool}\`)` : ''}`);
             break;
     }
-    if (job.continuationKind === 'steer-queue' || job.continuationKind === 'steer-interrupt')
-        parts.push('after steer');
-    else if (job.continuationKind === 'resume')
-        parts.push('resumed');
+    if (job.continuationKind === 'follow-up')
+        parts.push('follow-up');
+    else if (job.continuationKind === 'steer')
+        parts.push('steered');
+    if (job.alsoRan)
+        parts.push(job.alsoRan.from === job.alsoRan.to ? `also ran turn ${job.alsoRan.from}` : `also ran turns ${job.alsoRan.from}–${job.alsoRan.to}`);
     if (job.steerNotApplied)
-        parts.push('queued steer not applied');
+        parts.push(`queued follow-up not sent${job.droppedMessage ? `: "${compactExcerpt(job.droppedMessage, 80)}"` : ''}`);
     if (job.staleReads && job.staleReads.length > 0) {
         const first = job.staleReads[0];
         const extra = job.staleReads.length > 1 ? ` +${job.staleReads.length - 1}` : '';
@@ -249,12 +157,6 @@ function headline(job) {
     return parts.join(' · ');
 }
 const CLAUDE_JOBS = 8;
-/**
- * What Claude reads. One line per job, then how to read it:
- *   Agent Smith · ✗ pp-engine (agy implement) 21m · failed: denied view_file
- *   status implement-smith-6b456b3d
- * The worker's own summary is left out: Claude reads the result with status.
- */
 function claudeText(jobs) {
     if (jobs.length === 0)
         return '';
@@ -281,16 +183,13 @@ function claudeText(jobs) {
         lines.push(`pipeline_status ${ids(true).join(', ')}`);
     return lines.join('\n');
 }
-/** Counts in the order a reader scans them: done first, then what needs a look. */
 function shown(counts) {
     return ['done', 'exited', 'failed', 'canceled', 'no output', 'process gone'].flatMap((k) => (counts.has(k) ? [[k, counts.get(k)]] : []));
 }
 const STATE = {
     finished: 'done', failed: 'failed', cancelled: 'canceled', attention: 'no output',
 };
-// ── launch acks ─────────────────────────────────────────────────────────────
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
-/** Normalise any MCP result shape to the tool's payload object, or null on error/unparseable. */
 function unwrapResponse(response, depth = 0) {
     if (depth > 4)
         return null;
@@ -316,7 +215,6 @@ function unwrapResponse(response, depth = 0) {
         return null;
     if (response['isError'] === true)
         return null;
-    // Tasks clients deliver this result themselves; neither notice path owns it.
     if (isObj(response['_meta']) && response['_meta']['io.agent-smith/task-result'] === true)
         return null;
     if (isObj(response['structuredContent']))
@@ -325,8 +223,7 @@ function unwrapResponse(response, depth = 0) {
         return unwrapResponse(response['content'], depth + 1);
     return response;
 }
-/** The launch tools, by bare name. */
-const LAUNCH = { spawn_job: 'job', resume_job: 'job', steer_job: 'job', run_pipeline: 'run' };
+const LAUNCH = { spawn_job: 'job', follow_up: 'job', steer: 'job', run_pipeline: 'run' };
 function launchKind(toolName) {
     if (typeof toolName !== 'string')
         return null;
@@ -334,23 +231,13 @@ function launchKind(toolName) {
     return LAUNCH[bare] ?? null;
 }
 const trimSlash = (p) => p.replace(/\/+$/, '');
-/** `/repo/.agent-smith/<dir>/<leaf>` → `/repo`, else null. */
 function repoAbove(file, dir) {
     const parts = trimSlash(file).split('/');
     return parts.length >= 3 && parts.at(-2) === dir && parts.at(-3) === '.agent-smith' ? parts.slice(0, -3).join('/') || '/' : null;
 }
-/**
- * The file the mod writes when it claims a launch. The command hook checks it
- * before waking Claude, so a launch the mod claimed is announced once.
- */
 function claimMarkerPath(repo, kind, id) {
     return `${repo.replace(/\/+$/, '')}/.agent-smith/claims/${kind}-${encodeURIComponent(id)}`;
 }
-/**
- * Every launch an ack started. A `variants` spawn answers `{ jobs: [ack | {name, error}, ...] }`:
- * one launch per item that started a job, none for an item that failed. Any other ack is
- * the single launch parseLaunch reads.
- */
 function parseLaunches(toolName, response) {
     const kind = launchKind(toolName);
     if (kind === null)
@@ -392,14 +279,18 @@ function launchFromPayload(kind, payload) {
         kind,
         id,
         ...(workerId !== undefined ? { workerId } : {}),
+        ...(payload['action'] === 'started' ? { startsTurn: true } : {}),
         repo,
         timeoutMs: typeof t === 'number' && Number.isFinite(t) && t > 0 ? t : null,
     };
 }
-/**
- * Pipeline outcome: `2/3 stages passed · test: checks failed: lint`. The first
- * stage that did not pass says why, in the shared short words.
- */
+function droppedMessageQuote(message) {
+    if (typeof message !== 'string')
+        return null;
+    const m = /"([^"\n]+)|“([^”\n]+)/.exec(message);
+    const text = (m?.[1] ?? m?.[2] ?? '').trim();
+    return text === '' ? null : text;
+}
 function pipelineOutcome(run) {
     const stages = Object.values(run.stageResults)
         .filter((s) => s !== null && typeof s === 'object' && typeof s.stage === 'string');
@@ -418,27 +309,7 @@ function stageReason(s) {
     }
     const f = isObj(s.failure) ? s.failure : null;
     return reasonFromText(typeof f?.['message'] === 'string' ? f['message'] : typeof f?.['code'] === 'string' ? f['code'] : null);
-}/**
- * The one place the stall threshold is defined.
- *
- * WHY THIS FILE EXISTS: two surfaces (the mod pane and the channel) each need to
- * answer "is this running job actually working?", and if they disagree the user
- * gets a band that says a job is fine while the channel tells Claude it is stuck.
- * That contradiction is the exact failure this project exists to eliminate, so the
- * number is stated once.
- *
- * WHY ONE CONSTANT HERE: the mod cannot resolve a bare specifier for a sibling
- * package, and duplicating the literal in two files is how they drift. So: one
- * constant, here, imported by both surfaces.
- *
- * Value: 15 minutes.
- * Reasoning that number is defensible: against a 60m job budget, 15m of silence
- * is a quarter of the budget gone with nothing to show, while still leaving ample
- * room for a genuinely long single command like `cargo test --workspace` on a
- * cold target directory.
- */
-const STALL_GRACE_MS = 15 * 60 * 1000;
-/** A heartbeat older than this, on a job still marked running, means nobody is running it. */
+}const STALL_GRACE_MS = 15 * 60 * 1000;
 const ALIVE_GRACE_MS = 2 * 60_000;
 const LIVENESS_STATES = ['active', 'in-tool', 'waiting', 'silent', 'dead'];
 function epoch(v) {
@@ -449,11 +320,6 @@ function epoch(v) {
     const t = Date.parse(v);
     return Number.isFinite(t) ? t : null;
 }
-/**
- * The one liveness rule. Both surfaces call it (the channel for `status` and
- * `list_jobs` and its attention push, the mod for the band, pane and notices),
- * so they cannot disagree. Null for a job that is not running.
- */
 function livenessOf(i) {
     if (i.status !== 'running' && i.status !== 'attention')
         return null;
@@ -467,10 +333,8 @@ function livenessOf(i) {
     const withTool = tool === undefined ? {} : { tool };
     if (alive !== null && i.now - alive > ALIVE_GRACE_MS)
         return { state: 'dead', silentForMs, since: alive, forMs: i.now - alive, ...withTool };
-    // No event time at all: unknown is never drawn as healthy.
     if (lastSeen === null)
         return { state: 'silent', silentForMs, since: null, forMs: silentForMs, ...withTool };
-    // An older build wrote no heartbeat: only the old silence rule is provable.
     if (alive === null && silentForMs > STALL_GRACE_MS)
         return { state: 'silent', silentForMs, since: lastSeen, forMs: silentForMs, ...withTool };
     if (open)
@@ -478,4 +342,4 @@ function livenessOf(i) {
     if (silentForMs > STALL_GRACE_MS)
         return { state: 'silent', silentForMs, since: lastSeen, forMs: silentForMs };
     return { state: 'active', silentForMs, since: lastSeen, forMs: silentForMs };
-}export{ACCEPTANCE_HOLD_MS as A,LIVENESS_STATES as L,claudeText as a,pipelineOutcome as b,claimMarkerPath as c,livenessOf as l,parseLaunches as p,unwrapResponse as u,waitForChange as w};
+}export{ACCEPTANCE_HOLD_MS as A,LIVENESS_STATES as L,claudeText as a,pipelineOutcome as b,claimMarkerPath as c,droppedMessageQuote as d,livenessOf as l,parseLaunches as p,unwrapResponse as u,waitForChange as w};

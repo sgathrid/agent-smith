@@ -11,15 +11,12 @@ import { checkCompatibility, probeCommand, type ProbeCommand } from './compatibi
 const help = {
   agy: '--print --output-format --model --effort --print-timeout --add-dir --dangerously-skip-permissions --conversation',
   codex: '--json --skip-git-repo-check -C --model -c -s --add-dir --dangerously-bypass-approvals-and-sandbox',
-  claude: '--print --output-format --verbose --forward-subagent-text --model --effort --add-dir --permission-mode --permission-prompts --dangerously-skip-permissions --allowedTools --disallowedTools --resume --bare --setting-sources',
+  claude: '--print --output-format --verbose --forward-subagent-text --model --effort --add-dir --permission-mode --permission-prompts --dangerously-skip-permissions --allowedTools --disallowedTools --resume --bare --setting-sources --input-format --replay-user-messages',
   opencode: '--standalone --format --model --auto --session',
   kimi: '--prompt --output-format --model --session --add-dir',
 };
 const fakeProbe = (provider: keyof typeof help): ProbeCommand => async (_binary, args) => {
   if (args[0] === '--version') return { output: `${provider} 9.0.0` };
-  // Kimi's two probes are different surfaces: the root prompt flags and the
-  // provider subcommand's --json. Returning the same text for both would make
-  // the --json requirement untestable.
   if (provider === 'kimi' && args[0] === 'provider') return { output: '--json' };
   return { output: help[provider] };
 };
@@ -51,6 +48,13 @@ test('Claude missing permission-prompts names the flag and known minimum version
   assert.match(result.reason, /missing --permission-prompts/);
   assert.match(result.reason, /2\.1\.259 or newer/);
   assert.equal(result.version, '2.1.200');
+});
+
+test('Claude without live input flags is incompatible and names them', async () => {
+  const result = await checkCompatibility('claude', 'old-claude', { probe: async (_binary, args) =>
+    ({ output: args[0] === '--version' ? '2.1.300' : help.claude.replace(' --input-format --replay-user-messages', '') }) });
+  assert.equal(result.state, 'incompatible');
+  assert.match(result.reason, /missing --input-format, --replay-user-messages/);
 });
 
 test('Codex resume help is checked separately from exec help', async () => {
@@ -117,7 +121,6 @@ test('CLI doctor reports adapter compatibility using the configured binaries', (
   const binary = path.join(dir, 'fake-provider');
   writeFileSync(binary, `#!${process.execPath}\nconst args = process.argv.slice(2);\nif (args.join(' ') === '--version') console.log('fake 9.0.0');\nelse if (args.at(-1) === '--help') console.log(${JSON.stringify(Object.values(help).join(' '))});\nelse process.exit(9);\n`);
   chmodSync(binary, 0o755);
-  // Probes run in parallel node cold starts; the 2 s product default is too tight under load.
   const env: Record<string, string | undefined> = { ...process.env, AGENT_SMITH_PROBE_TIMEOUT_MS: String(scaled(30_000)) };
   for (const name of ['AGY', 'CODEX', 'CLAUDE', 'OPENCODE', 'KIMI']) env[`AGENT_SMITH_${name}_BIN`] = binary;
   const result = spawnSync(process.execPath, [fileURLToPath(new URL('../../scripts/agent-smith.mjs', import.meta.url)), 'doctor'],

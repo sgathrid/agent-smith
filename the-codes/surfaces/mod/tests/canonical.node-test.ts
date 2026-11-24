@@ -30,6 +30,36 @@ test('canonical list never reads report, view or event logs', async () => {
   assert.equal(jobs[0]?.status, 'running');
   assert.deepEqual(reads, [`${base}/job.json`, `${base}/progress.json`]);
 });
+test('canonical reads followedBy, normalizes legacy continuation kinds, and keeps the raw queued count for the idle rule', async () => {
+  const done = { ...manifest, status: 'succeeded', finishedAt: new Date(now).toISOString() };
+  const read = async (m: Record<string, unknown>, progress?: Record<string, unknown>) => (await readForgeJobs(memoryFs({
+    [`${base}/job.json`]: JSON.stringify(m),
+    ...(progress ? { [`${base}/progress.json`]: JSON.stringify(progress) } : {}),
+  }), '/repo', now))[0]!;
+  const followed = await read({ ...done, followedBy: 'job-b', continuedFrom: 'job-0', continuationKind: 'resume' });
+  assert.deepEqual([followed.followedBy, followed.continuationKind], ['job-b', 'follow-up']);
+  assert.equal((await read({ ...done, continuedFrom: 'job-0', continuationKind: 'steer-interrupt' })).continuationKind, 'steer');
+  assert.equal((await read({ ...done, continuedFrom: 'job-0', continuationKind: 'steer-queue' })).continuationKind, 'follow-up');
+  assert.equal((await read({ ...done, steeredFrom: 'job-0' })).continuationKind, 'follow-up', '0.4.x steeredFrom');
+  assert.equal((await read({ ...done, continuedFrom: 'job-0', continuationKind: 'steer' })).continuationKind, 'steer');
+  const queued = await read({ ...done }, { pendingSteers: 2 });
+  assert.deepEqual([queued.pendingSteers, queued.pendingMessages], [null, 2]);
+});
+
+test('canonical detail parses a read message event and tolerates its absence', async () => {
+  const timeline = [
+    { kind: 'assistant', sequence: 0, at: '2026-10-08T10:00:00Z', text: 'Working.' },
+    { kind: 'message', sequence: 1, at: '2026-10-08T10:00:01Z', text: 'Stop and fix lint first.', delivery: 'next-step', sender: 'steer' },
+    { kind: 'message', sequence: 2, at: '2026-10-08T10:00:02Z' },
+  ];
+  const detail = await readForgeDetail(memoryFs({
+    [`${base}/job.json`]: JSON.stringify(manifest),
+    [`${base}/view.json`]: JSON.stringify({ schema: 1, timeline }),
+  }), '/repo', 'job-a', now);
+  assert.deepEqual(detail?.timeline.map((e) => e.kind), ['assistant', 'message']);
+  assert.deepEqual(detail?.timeline[1], { kind: 'message', sequence: 1, at: '2026-10-08T10:00:01Z', text: 'Stop and fix lint first.', delivery: 'next-step', sender: 'steer' });
+});
+
 test('canonical silence is attention, not failure', async () => {
   const files = { [`${base}/job.json`]: JSON.stringify(manifest) };
   assert.equal((await readForgeJobs(memoryFs(files), '/repo', now + 1_000_000))[0]?.status, 'attention');
@@ -107,7 +137,6 @@ test('canonical detail reports whether the writer bounded its snapshot', async (
   }), '/repo', 'job-a', now);
   assert.equal((await detail({ truncated: true }))?.truncated, true);
   assert.equal((await detail({ truncated: false }))?.truncated, false);
-  // An older snapshot that never recorded the flag is not reported as truncated.
   assert.equal((await detail({}))?.truncated, false);
 });
 
@@ -117,7 +146,7 @@ test('canonical: unified turn-chain fields and defensive 0.4.x fallback', async 
   const jobs = await readForgeJobs(memoryFs({
     [`/repo/.agent-smith/jobs/turn-2/job.json`]: JSON.stringify({
       ...manifest, jobId: 'turn-2', workerId: 'ada', turn: 2,
-      continuedFrom: 'turn-1', continuationKind: 'steer-interrupt',
+      continuedFrom: 'turn-1', continuationKind: 'steer',
       startedAt: t2, chainStartedAt: t1, pendingSteers: 1,
     }),
     [`/repo/.agent-smith/jobs/legacy-steer/job.json`]: JSON.stringify({
@@ -128,14 +157,14 @@ test('canonical: unified turn-chain fields and defensive 0.4.x fallback', async 
   const v5 = jobs.find((j) => j.id === 'turn-2')!;
   assert.equal(v5.turn, 2);
   assert.equal(v5.continuedFrom, 'turn-1');
-  assert.equal(v5.continuationKind, 'steer-interrupt');
+  assert.equal(v5.continuationKind, 'steer');
   assert.equal(v5.chainStartedAt, Date.parse(t1));
   assert.equal(v5.pendingSteers, 1);
 
   const legacy = jobs.find((j) => j.id === 'legacy-steer')!;
   assert.equal(legacy.turn, 1);
   assert.equal(legacy.continuedFrom, 'legacy-1');
-  assert.equal(legacy.continuationKind, 'steer-queue');
+  assert.equal(legacy.continuationKind, 'follow-up');
   assert.equal(legacy.chainStartedAt, Date.parse(t2));
 });
 
@@ -152,32 +181,28 @@ test('canonical settled-job cache: O(active) disk reads, pruning, and steer-hand
   const fs = memoryFs(files, reads);
   const cache = new Map();
 
-  // First poll reads both jobs.
   const first = await readForgeJobs(fs, '/repo', now, cache);
   assert.equal(first.length, 2);
   assert.ok(reads.includes('/repo/.agent-smith/jobs/done-1/job.json'));
   assert.ok(reads.includes('/repo/.agent-smith/jobs/live-1/job.json'));
 
-  // Second poll skips cached settled job done-1 and re-reads only live-1.
   reads.length = 0;
   const second = await readForgeJobs(fs, '/repo', now + 1000, cache);
   assert.equal(second.length, 2);
   assert.equal(reads.includes('/repo/.agent-smith/jobs/done-1/job.json'), false, 'settled job served from cache');
   assert.equal(reads.includes('/repo/.agent-smith/jobs/live-1/job.json'), true, 'live job re-read');
 
-  // If done-1 gets superseded mid-flight and its steered child appears, cache self-heals done-1.
   files['/repo/.agent-smith/jobs/done-1/job.json'] = JSON.stringify({
     ...manifest, jobId: 'done-1', workerId: 'w1', status: 'succeeded', finishedAt: new Date(now).toISOString(), supersededBy: 'done-2',
   });
   files['/repo/.agent-smith/jobs/done-2/job.json'] = JSON.stringify({
-    ...manifest, jobId: 'done-2', workerId: 'w1', turn: 2, status: 'running', continuedFrom: 'done-1', continuationKind: 'steer-queue',
+    ...manifest, jobId: 'done-2', workerId: 'w1', turn: 2, status: 'running', continuedFrom: 'done-1', continuationKind: 'follow-up',
   });
   reads.length = 0;
   const third = await readForgeJobs(fs, '/repo', now + 2000, cache);
   assert.equal(third.find((j) => j.id === 'done-1')?.supersededBy, 'done-2');
   assert.equal(reads.includes('/repo/.agent-smith/jobs/done-1/job.json'), true, 'parent re-read once to pick up supersededBy');
 
-  // Removing a job directory prunes it from the cache.
   delete files['/repo/.agent-smith/jobs/done-1/job.json'];
   await readForgeJobs(fs, '/repo', now + 3000, cache);
   assert.equal(cache.has('/repo\0done-1'), false);

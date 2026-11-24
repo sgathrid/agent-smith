@@ -1,11 +1,3 @@
-/**
- * Job-scoped monitor entrypoint (the `notify.fallback` monitorCommand).
- *
- * This process is deliberately separate from the MCP server: Claude Code can
- * launch it with `--job`/`--run` and consume one human-readable line per
- * milestone from stdout. Routine running/progress polls produce no stdout.
- */
-
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -14,6 +6,8 @@ import { pipelineRecordPath } from '../../../forge/execute.ts';
 import { waitForChange } from '../../../forge/watch.ts';
 import { type Batch, type WatchableJob, buildBatch, dedupeKey } from './policy.ts';
 import { readJob, readPipelineRecord } from './watch-source.ts';
+import { readJsonSafe } from '../../../harness/safe-fs.ts';
+import { WORKERS_DIR, isWorkerIdle, parseWorkerIndex, pickHead, workerIndexPath, type TurnLike, type WorkerIndex } from '../../mod/hooks/turns.ts';
 
 function safeJobDir(cwd: string, id: string): string {
   try { return jobDir(cwd, id); } catch { return jobsDir(cwd); }
@@ -61,7 +55,6 @@ async function emitStdout(line: string): Promise<void> {
 }
 
 const DEFAULT_WATCH_TIMEOUT_MS = 45 * 60_000 + 60_000;
-/** Upper bound on one fs.watch slice so a dead supervisor (no file write) is still reconciled promptly. */
 const WATCH_RECHECK_MS = 5_000;
 const WATCH_FALLBACK_MS = 500;
 
@@ -75,24 +68,62 @@ export interface JobWatchOptions {
   readonly now?: () => number;
   readonly readJob?: (cwd: string, id: string, now: number) => Promise<WatchableJob | null>;
   readonly readRun?: (cwd: string, id: string) => Promise<{ job: WatchableJob; stageJobIds: string[] } | null>;
+  readonly readIndex?: (cwd: string, workerId: string) => Promise<WorkerIndex | null>;
   readonly emit?: (line: string, batch: Batch | null) => Promise<void> | void;
   readonly onError?: (error: unknown) => void;
-  /**
-   * Announce each job once. A job that exited with checks still running (its acceptance budget
-   * ran out) is announced as "exited · checks running" and the watch ends, instead of waiting for
-   * the verdict as a second notice. For callers that can wake Claude only once (the fallback hook).
-   */
   readonly announceOnce?: boolean;
 }
 
 export type JobWatchEnd = 'done' | 'timeout' | 'aborted';
 
+interface WorkerWatch {
+  readonly root: string;
+  rootTurn: number | null;
+  head: string | null;
+}
 
-/**
- * Watch specific jobs/runs until each is terminal. There is NO silent
- * baseline: a job that already finished before the watcher
- * started is reported on the first observation.
- */
+function watchTurn(job: WatchableJob): TurnLike {
+  return {
+    jobId: job.id, status: job.status, turn: job.turn, supersededBy: job.supersededBy, followedBy: job.followedBy,
+    startedAt: job.startedAt, acceptancePending: job.acceptancePending, pendingMessages: job.pendingMessages,
+  };
+}
+
+export async function readWorkerIndex(cwd: string, workerId: string): Promise<WorkerIndex | null> {
+  let file: string;
+  try { file = workerIndexPath(cwd, workerId); } catch { return null; }
+  return parseWorkerIndex(await readJsonSafe<unknown>(file));
+}
+
+const MAX_TURNS_READ = 64;
+
+async function followWorkerHead(
+  cwd: string,
+  rootId: string,
+  root: WatchableJob,
+  now: number,
+  readJobFn: (cwd: string, id: string, now: number) => Promise<WatchableJob | null>,
+  readIndexFn: (cwd: string, workerId: string) => Promise<WorkerIndex | null>,
+): Promise<{ head: WatchableJob; missingNextId: string | null }> {
+  const rows = new Map<string, WatchableJob>([[root.id, root]]);
+  const index = root.workerId ? await readIndexFn(cwd, root.workerId) : null;
+  const at = index ? index.turns.indexOf(rootId) : -1;
+  for (const id of at >= 0 ? index!.turns.slice(at + 1) : []) {
+    if (rows.size >= MAX_TURNS_READ) break;
+    const row = await readJobFn(cwd, id, now);
+    if (row) rows.set(row.id, row);
+  }
+  let head = pickHead([...rows.values()].map((r) => ({ ...watchTurn(r), row: r })))!.row;
+  let missingNextId: string | null = null;
+  for (let next = head.supersededBy ?? head.followedBy; next && !rows.has(next) && rows.size < MAX_TURNS_READ; next = head.supersededBy ?? head.followedBy) {
+    const row = await readJobFn(cwd, next, now);
+    if (!row) { missingNextId = next; break; }
+    rows.set(row.id, row);
+    head = pickHead([...rows.values()].map((r) => ({ ...watchTurn(r), row: r })))!.row;
+  }
+  return { head, missingNextId };
+}
+
 export async function runJobWatch(options: JobWatchOptions): Promise<JobWatchEnd> {
   const recheckMs = Math.max(50, options.intervalMs ?? WATCH_RECHECK_MS);
   const fallbackMs = Math.max(50, options.intervalMs ?? WATCH_FALLBACK_MS);
@@ -100,9 +131,10 @@ export async function runJobWatch(options: JobWatchOptions): Promise<JobWatchEnd
   const now = options.now ?? Date.now;
   const rj = options.readJob ?? readJob;
   const rr = options.readRun ?? readPipelineRecord;
+  const ri = options.readIndex ?? readWorkerIndex;
   const emit = options.emit ?? emitStdout;
   const onError = options.onError ?? ((error) => { process.stderr.write(`agent-smith monitor: ${String(error)}\n`); });
-  const jobIds = [...new Set(options.jobIds ?? [])];
+  const workers: WorkerWatch[] = [...new Set(options.jobIds ?? [])].map((root) => ({ root, rootTurn: null, head: null }));
   const runIds = [...new Set(options.runIds ?? [])];
   const seen = new Map<string, Set<string>>();
   const done = new Set<string>();
@@ -112,52 +144,41 @@ export async function runJobWatch(options: JobWatchOptions): Promise<JobWatchEnd
     const watchDirs: string[] = [];
     try {
       const t = now();
-      const jobs = new Map<string, WatchableJob>();
-      const want = new Set(jobIds);
-      for (let i = 0; i < jobIds.length; i++) {
-        const id = jobIds[i]!;
-        const job = await rj(options.cwd, id, t);
-        if (!job) {
-          if (!done.has(id)) watchDirs.push(safeJobDir(options.cwd, id));
-          continue;
-        }
-        jobs.set(job.id, job);
-        if (job.supersededBy && job.supersededBy !== job.id) {
-          if (jobIds.includes(job.supersededBy)) {
-            done.add(job.id);
-          } else {
-            const childJob = await rj(options.cwd, job.supersededBy, t);
-            if (childJob) {
-              done.add(job.id);
-              jobIds.push(job.supersededBy);
-              want.add(job.supersededBy);
-              startedAt = t;
-            }
-          }
+      const candidates: WatchableJob[] = [];
+      const finals = new Map<string, WatchableJob>();
+      for (const w of workers) {
+        if (done.has(w.root)) continue;
+        const root = await rj(options.cwd, w.root, t);
+        if (!root) { watchDirs.push(safeJobDir(options.cwd, w.root)); continue; }
+        w.rootTurn ??= root.turn ?? 1;
+        const { head, missingNextId } = await followWorkerHead(options.cwd, w.root, root, t, rj, ri);
+        if (missingNextId !== null) watchDirs.push(safeJobDir(options.cwd, missingNextId));
+        if (w.head !== null && w.head !== head.id) startedAt = t;
+        w.head = head.id;
+        if (root.workerId) watchDirs.push(path.join(options.cwd, WORKERS_DIR));
+        watchDirs.push(safeJobDir(options.cwd, head.id));
+        const turn = head.turn ?? 1;
+        const announced = w.rootTurn !== null && turn > w.rootTurn ? { ...head, alsoRan: { from: w.rootTurn, to: turn - 1 } } : head;
+        if (head.status === 'attention' || isWorkerIdle(watchTurn(head))) {
+          candidates.push(announced);
+          if (isWorkerIdle(watchTurn(head))) finals.set(w.root, announced);
         }
       }
       for (const id of runIds) {
+        if (done.has(id)) continue;
         const rec = await rr(options.cwd, id);
-        if (!rec) {
-          if (!done.has(id)) watchDirs.push(path.dirname(pipelineRecordPath(options.cwd, id)));
-          continue;
-        }
-        jobs.set(rec.job.id, rec.job);
-        want.add(rec.job.id);
-        if (!done.has(rec.job.id)) watchDirs.push(path.dirname(pipelineRecordPath(options.cwd, id)));
+        if (!rec) { watchDirs.push(path.dirname(pipelineRecordPath(options.cwd, id))); continue; }
+        candidates.push(rec.job);
+        finals.set(id, rec.job);
+        watchDirs.push(path.dirname(pipelineRecordPath(options.cwd, id)));
         for (const sid of rec.stageJobIds) {
-          if (!done.has(sid)) watchDirs.push(safeJobDir(options.cwd, sid));
-          if (jobs.has(sid)) continue;
+          watchDirs.push(safeJobDir(options.cwd, sid));
           const sj = await rj(options.cwd, sid, t);
-          if (sj) jobs.set(sj.id, sj);
+          if (sj && !(options.announceOnce === true && sj.checksRunning !== undefined)) candidates.push(sj);
         }
       }
-      // Announcing once: a stage that exited with its checks still running waits for its verdict
-      // rather than contributing a "checks running" line that the one write would carry twice.
-      const announce = options.announceOnce === true
-        ? [...jobs.values()].filter((job) => job.checksRunning === undefined || want.has(job.id))
-        : [...jobs.values()];
-      const batch = buildBatch(announce.map((job) => ({ job, seen: seen.get(job.id) ?? new Set<string>(), knownBefore: true })), t);
+      const unique = [...new Map(candidates.map((job) => [job.id, job])).values()];
+      const batch = buildBatch(unique.map((job) => ({ job, seen: seen.get(job.id) ?? new Set<string>(), observedInPriorPoll: true })), t);
       if (batch.content !== null) {
         await emit(batch.content.replace(/\s+/g, ' ').trim(), batch);
         for (const key of batch.keys) {
@@ -166,24 +187,18 @@ export async function runJobWatch(options: JobWatchOptions): Promise<JobWatchEnd
           if (set) set.add(key); else seen.set(id, new Set([key]));
         }
       }
-      for (const id of want) {
-        const job = jobs.get(id);
-        if (job?.supersededBy) {
-          if (want.has(job.supersededBy)) done.add(id);
-          else watchDirs.push(safeJobDir(options.cwd, id));
-          continue;
-        }
-        // Exited with checks still running: the verdict is a second notice, so keep watching (unless announcing once).
-        if (job && isTerminalForgeStatus(job.status) && (options.announceOnce === true || job.checksRunning === undefined) && (seen.get(id)?.has(dedupeKey(job)) ?? false)) done.add(id);
-        else if (!done.has(id) && !runIds.includes(id)) watchDirs.push(safeJobDir(options.cwd, id));
+      for (const [id, job] of finals) {
+        if (isTerminalForgeStatus(job.status) && !job.acceptancePending && (options.announceOnce === true || job.checksRunning === undefined) &&
+          (seen.get(job.id)?.has(dedupeKey(job)) ?? false)) done.add(id);
       }
-      if (want.size > 0 && [...want].every((id) => done.has(id))) return 'done';
+      const all = [...workers.map((w) => w.root), ...runIds];
+      if (all.length > 0 && all.every((id) => done.has(id))) return 'done';
     } catch (error) {
       onError(error);
     }
     const elapsed = now() - startedAt;
     if (elapsed >= timeoutMs) {
-      const ids = [...jobIds, ...runIds].filter((id) => !done.has(id));
+      const ids = [...workers.filter((w) => !done.has(w.root)).map((w) => w.head ?? w.root), ...runIds.filter((id) => !done.has(id))];
       try { await emit(`Agent Smith · still running: ${ids.join(', ')}`, null); } catch (error) { onError(error); }
       return 'timeout';
     }

@@ -1,56 +1,11 @@
-/**
- * policy.ts — when the channel is allowed to speak into Claude's context.
- *
- * This file is the whole point of Surface 2, and it is pure so it can be tested
- * exhaustively. If this logic is wrong the channel is not merely noisy, it is
- * actively harmful: every pushed event is tokens the user pays for on every
- * subsequent turn, and a channel that pushes progress ticks would push more
- * context than the conversation it is meant to inform.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * THE DESIGN RULE
- * ─────────────────────────────────────────────────────────────────────────────
- *
- *   PUSH STATE CHANGES ONLY. NEVER PROGRESS TICKS.
- *
- * The mod already shows progress, for free, every second, to the human. A channel
- * cannot draw and a human cannot read Claude's context. So the channel's only
- * job is the one thing the mod cannot do: wake Claude when something CHANGED that
- * Claude would otherwise not notice.
- *
- * Four pushable events. That is the entire vocabulary:
- *
- *   finished  the job reached a terminal success
- *   failed    it reached a terminal failure, or a suspicious success
- *   attention it went silent past the grace period (no event, process alive or
- *             unknown), or its process stopped while it is still marked running
- *   cancelled a human stopped it
- *
- * Not pushable, and the reasoning matters:
- *   running     — this is a progress tick. The definition of the thing we forbid.
- *   unknown     — we do not know what happened. Telling Claude "something
- *                 happened and I don't know what" costs tokens and buys nothing.
- *   succeeded→? — a re-read of an unchanged terminal job is not a change.
- *
- * Budget: one short line per job plus a closing next step (the text is
- * mod/hooks/notice.ts claudeText). Worker prose is excerpted, never pasted whole.
- */
-
-// The words live in the mod (hooks/notice.ts), which announces the same jobs
-// when it is loaded: one renderer, so the hook and the mod cannot drift apart.
-import type { ContinuationKind } from '../../../forge/format.ts';
+import type { ContinuationKind } from '../../mod/hooks/turns.ts';
 import { type NoticeJob, claudeText } from '../../mod/hooks/notice.ts';
 import { reasonFromText } from '../../mod/hooks/reasons.ts';
 
-// ── what we are allowed to say ──────────────────────────────────────────────
-
-/** The event kinds this channel may ever emit. */
 export type PushKind = 'finished' | 'failed' | 'attention' | 'cancelled';
 
-/** A job state, as far as the channel is concerned. Mirrors RadarStatus. */
 export type WatchStatus = 'running' | 'succeeded' | 'failed' | 'canceled' | 'attention' | 'unknown';
 
-/** Everything the policy needs to know about one job. No I/O, no types from core. */
 export interface WatchableJob {
   readonly id: string;
   readonly workerId?: string;
@@ -63,46 +18,28 @@ export interface WatchableJob {
   readonly changedFileCount?: number;
   readonly latestSummary?: string | null;
   readonly summarySource?: 'worker' | null;
-  /** Runtime-owned outcome, separate from worker-authored prose. */
   readonly outcome?: string;
-  /** Runtime-owned failure reason (job.json error), when recorded. */
   readonly failureReason?: string | null;
   readonly failureDetail?: string | null;
-  /** Acceptance check tally, when checks ran. */
   readonly checks?: { readonly passed: number; readonly total: number; readonly failed?: readonly string[] } | null;
-  /** The job exited but its acceptance checks have no verdict yet: names running, or true. */
   readonly checksRunning?: string | true;
+  readonly acceptancePending?: boolean;
   readonly status: WatchStatus;
-  /** ISO-8601 of the last evidence of real work. Null ⇒ we have no evidence. */
   readonly lastEventAt: string | null;
-  /** ISO-8601 the job reached a terminal state. Null while it has not. */
   readonly finishedAt: string | null;
-  /** Whether the provider flagged warnings. Meaningful only once terminal; not rendered. */
   readonly warned: boolean;
-  /** Child job ID when this turn was superseded by a steered continuation turn. */
   readonly supersededBy?: string | null;
-  /** Parent job ID when this turn continued from an earlier turn (steer or resume). */
+  readonly followedBy?: string | null;
+  readonly pendingMessages?: number | null;
   readonly continuedFrom?: string | null;
-  /** How this turn continued from continuedFrom. */
   readonly continuationKind?: ContinuationKind | null;
-  /** A queued steer was dropped because this turn did not succeed. */
   readonly steerNotApplied?: boolean;
-  /** Watched brief files that changed in the repository while the job ran. */
+  readonly droppedMessage?: string;
+  readonly alsoRan?: { readonly from: number; readonly to: number };
   readonly staleReads?: readonly string[] | null;
-  /**
-   * Why an `attention` job needs eyes (mod/hooks/stale.ts): `silent` (no event
-   * for the grace period, process alive or unknown) or `dead` (no heartbeat).
-   * `since` is epoch ms of the last heartbeat for dead; `tool` an open tool call.
-   */
   readonly liveness?: { readonly state: 'silent' | 'dead'; readonly silentForMs: number; readonly since: number | null; readonly tool?: string };
 }
 
-/**
- * Which pushable event, if any, this job's current state represents.
- *
- * Returns null for every state we refuse to speak about. Keeping the refusal in
- * one function means "did we push a tick?" is answerable by reading one map.
- */
 export function pushKindFor(job: WatchableJob): PushKind | null {
   switch (job.status) {
     case 'succeeded':
@@ -113,147 +50,51 @@ export function pushKindFor(job: WatchableJob): PushKind | null {
       return 'cancelled';
     case 'attention':
       return 'attention';
-    // 'running' and 'unknown' deliberately fall through to null.
     default:
       return null;
   }
 }
 
-// ── dedupe ──────────────────────────────────────────────────────────────────
-
-/**
- * The dedupe key: identity + the specific state we announced.
- *
- * WHY THE STATE IS PART OF THE KEY AND NOT JUST THE JOB ID:
- * a job that fails and is then re-run to success is two distinct facts. If the
- * key were just the job id, the success would be swallowed as a duplicate of the
- * failure, and Claude would sit on a stale "this failed" belief. Including the
- * state lets a job speak twice, but only if it genuinely changed its mind.
- *
- * WHY `finishedAt` IS NOT IN THE KEY:
- * it is the natural instinct and it is wrong. Keying on a timestamp that the worker does not promise to be stable converts a
- * re-read into a fake "new" event. The state is the fact; the timestamp is not.
- *
- * WHY `attention` IS NOT IN THE KEY:
- * a stall can be detected, resolve, and be detected again. That IS one story
- * ("this job stalls"), and the user needs to hear it once. The `epoch` argument
- * exists only so a caller can deliberately re-announce a job that recovered and
- * stalled again, and the default epoch never changes.
- */
-export function dedupeKey(job: WatchableJob, epoch: number = 0): string {
-  // A job that exited with checks still running speaks again when the verdict lands.
-  // A silent job whose process then dies is a second fact: dead is keyed apart.
+export function dedupeKey(job: WatchableJob): string {
   const dead = job.status === 'attention' && job.liveness?.state === 'dead' ? '#dead' : '';
-  return `${job.id}#${job.status}${dead}${job.checksRunning === undefined ? '' : '#checks'}#${epoch}`;
+  return `${job.id}#${job.status}${dead}${job.checksRunning === undefined ? '' : '#checks'}`;
 }
 
-// ── the decision ────────────────────────────────────────────────────────────
-
-/** One job's contribution to a poll. Constructed by the caller. */
 export interface Candidate {
   readonly job: WatchableJob;
-  /** Keys already pushed, for this job. The caller owns the memory. */
   readonly seen: ReadonlySet<string>;
-  /**
-   * Did a PREVIOUS poll see this job at all?
-   *
-   * This is what makes "first sighting is baseline, not news" expressible. The
-   * `seen` key-set alone cannot answer it: a job pushed once and then re-pushed is
-   * a different question from a job the channel has never encountered.
-   *
-   * The first poll sets this false for everything on disk. That is deliberate:
-   * starting the channel against a directory of 16 already-finished jobs must not
-   * greet the user with 16 notifications about work that completed before the
-   * channel existed. From poll two onward it is true for anything still present.
-   */
-  readonly knownBefore: boolean;
+  readonly observedInPriorPoll: boolean;
 }
 
-/**
- * True if this job should be pushed right now.
- *
- * FOUR GATES, in order. Each one alone is insufficient, which is why they stack:
- *
- *  1. the state must be pushable        — kills progress ticks and `unknown`
- *  2. the key must be new                — kills a re-read of the same terminal state
- *  3. a terminal state must be *settled* — kills the mid-flight flap where a
- *     finished job is briefly unreadable and normalizes to `unknown` and back
- *  4. attention must be a transition     — a job that has been stalled since the
- *     channel started is a known quantity, not news
- *
- * GATE 3 EXISTS BECAUSE OF A REAL HAZARD. There is a window in which the
- * terminal status file is being written while we read. A reader that samples that window
- * sees a finished job as `running`, then `succeeded` again. Without gate 3 that
- * flaps as push, silence, push. With it, a push requires the job to have actually
- * finished — a finished_at that exists — so a flap cannot produce a second event.
- */
-export function shouldPush(candidate: Candidate, now: number): boolean {
+export function shouldPush(candidate: Candidate): boolean {
   const { job, seen } = candidate;
 
-  // A superseded turn is an intermediate step in a steered worker chain; its
-  // continuation owns the terminal announcement.
-  if (job.supersededBy) return false;
+  if (job.supersededBy || job.followedBy || job.acceptancePending) return false;
 
-  // Gate 1 — is this state speakable at all?
   const kind = pushKindFor(job);
   if (kind === null) return false;
 
-  // Gate 2 — have we already said this exact thing?
   if (seen.has(dedupeKey(job))) return false;
 
-  // Gate 3 — terminal claims must be backed by a terminal timestamp.
   if (kind === 'finished' || kind === 'failed' || kind === 'cancelled') {
     if (job.finishedAt === null) return false;
   }
 
-  // Gate 4 — `attention` is only news if it is NEW. A channel that connects to a
-  // directory which already contains stalled jobs says nothing about them: it did
-  // not observe them stall, so it has no news, only a backlog. Announcing the
-  // backlog would be the channel's first impression being 16 lines of alarm.
   if (kind === 'attention') {
-    if (!candidate.knownBefore) return false;
-    // A stall with no last_event_at is not a stall we can describe. We know the job
-    // exists and that it is not reporting; we do not know that it went quiet, and
-    // a reader that just started will produce exactly this state for every job.
-    // Saying "has stopped making progress" about a job whose progress we have
-    // never observed would be a confident sentence about nothing.
-    // A dead process is a fact of its own (its heartbeat stopped), event times or not.
+    if (!candidate.observedInPriorPoll) return false;
     if (job.lastEventAt === null && job.liveness?.state !== 'dead') return false;
   }
 
   return true;
 }
 
-// ── batching ────────────────────────────────────────────────────────────────
-
-/**
- * What the channel will actually send for one poll.
- *
- * THE ANTI-SPAM RULE: N simultaneous events become at most ONE notification.
- * If five jobs fail in the same tick, Claude gets one block: a counted headline
- * and a line per job. Not five wakes. This is not a formatting preference — it is the difference
- * between an event feed and a firehose, and a firehome gets muted, and a muted
- * channel costs the user the one thing they installed it for.
- */
 export interface Batch {
-  /** The notification to send, or null if there is nothing to say. */
   readonly content: string | null;
-  /** Keys to add to `seen` AFTER a successful send. */
   readonly keys: readonly string[];
 }
 
-/**
- * Collapse a poll's candidates into at most one notification.
- *
- * PURE. Given the same candidates and the same `seen`, always the same batch.
- *
- * The headline counts by KIND. "three succeeded, one failed" is a different
- * piece of news from "four failed", and Claude's useful next action differs:
- * several successes is usually "carry on", several failures is usually "stop
- * and look". Each job still gets its own line so Claude can act on its id.
- */
 export function buildBatch(candidates: readonly Candidate[], now: number): Batch {
-  const pushable = candidates.filter((c) => shouldPush(c, now));
+  const pushable = candidates.filter(shouldPush);
 
   if (pushable.length === 0) {
     return { content: null, keys: [] };
@@ -265,10 +106,6 @@ export function buildBatch(candidates: readonly Candidate[], now: number): Batch
   return { content, keys };
 }
 
-/**
- * A watched job as the shared notice shape. A pipeline run (role `pipeline`)
- * carries its stage verdicts as `outcome`; a job carries its failure reason.
- */
 export function toNotice(job: WatchableJob, kind: PushKind, now: number): NoticeJob {
   const run = job.role === 'pipeline' && job.outcome !== undefined;
   const dead = kind === 'attention' && job.liveness?.state === 'dead';
@@ -289,6 +126,8 @@ export function toNotice(job: WatchableJob, kind: PushKind, now: number): Notice
     ...(job.staleReads && job.staleReads.length > 0 ? { staleReads: job.staleReads } : {}),
     ...(job.continuationKind ? { continuationKind: job.continuationKind } : {}),
     ...(job.steerNotApplied ? { steerNotApplied: true } : {}),
+    ...(job.droppedMessage ? { droppedMessage: job.droppedMessage } : {}),
+    ...(job.alsoRan ? { alsoRan: job.alsoRan } : {}),
     ...(kind === 'finished' && job.checksRunning !== undefined ? { checksRunning: job.checksRunning } : {}),
     ...(kind === 'attention' && job.liveness ? { liveness: { state: job.liveness.state, ...(job.liveness.tool ? { tool: job.liveness.tool } : {}) } } : {}),
   };

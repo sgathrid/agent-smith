@@ -33,7 +33,6 @@ function writeJson(file, value) {
   writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
 }
 
-/** Bundle the channel entrypoints and MCP SDK into self-contained ESM files with no node_modules. */
 async function bundleRuntime({ channelRoot, serverSource, monitorSource, watchHookSource, outDir }) {
   const bundle = await rollup({
     input: {
@@ -68,7 +67,6 @@ async function bundleRuntime({ channelRoot, serverSource, monitorSource, watchHo
   }
 }
 
-/** Build the self-contained local Claude plugin into outputRoot/agent-smith. */
 export async function buildPlugin({ repoRoot = DEFAULT_ROOT, outputRoot = path.join(repoRoot, 'builds', 'local-plugin'), modRoot = path.join(repoRoot, 'the-codes', 'surfaces', 'mod'), channelRoot = path.join(repoRoot, 'the-codes', 'surfaces', 'channel') } = {}) {
   const sourceManifest = path.join(modRoot, '.claude-plugin', 'plugin.json');
   const hooksSource = path.join(modRoot, 'hooks');
@@ -80,7 +78,6 @@ export async function buildPlugin({ repoRoot = DEFAULT_ROOT, outputRoot = path.j
   const modulesSource = path.join(channelRoot, 'node_modules');
   const channelPackagePath = path.join(channelRoot, 'package.json');
 
-  // Validate every required input before creating or replacing the output.
   required(sourceManifest, 'plugin manifest');
   required(hooksSource, 'plugin hooks');
   required(typesSource, 'plugin types');
@@ -105,7 +102,6 @@ export async function buildPlugin({ repoRoot = DEFAULT_ROOT, outputRoot = path.j
   try {
     mkdirSync(staging, { recursive: true });
     copyTree(path.dirname(sourceManifest), path.join(staging, '.claude-plugin'), { excludeTests: true });
-    // Keep the canonical plugin manifest, while dropping source-only type build files.
     for (const name of ['types', 'tsconfig.json']) {
       rmSync(path.join(staging, '.claude-plugin', name), { recursive: true, force: true });
     }
@@ -123,16 +119,23 @@ export async function buildPlugin({ repoRoot = DEFAULT_ROOT, outputRoot = path.j
       type: 'module',
     });
 
+    const watchHookModule = path.join(path.dirname(watchHookSource), 'surfaces', 'channel', 'src', 'watch-hook.js');
+    required(watchHookModule, 'built watch hook module');
+    const { HOOK_TIMEOUT_MS } = await import(pathToFileURL(watchHookModule).href);
+    if (typeof HOOK_TIMEOUT_MS !== 'number' || !Number.isFinite(HOOK_TIMEOUT_MS) || HOOK_TIMEOUT_MS <= 0) {
+      throw new Error(`Invalid HOOK_TIMEOUT_MS in ${watchHookModule}`);
+    }
+
     const toolPrefix = 'mcp__plugin_agent-smith_agent-smith__';
     writeJson(path.join(staging, 'hooks', 'watch-hooks.json'), {
       hooks: {
         PostToolUse: [{
-          matcher: ['spawn_job', 'run_pipeline', 'resume_job', 'steer_job'].map((n) => `${toolPrefix}${n}`).join('|'),
+          matcher: ['spawn_job', 'run_pipeline', 'follow_up', 'steer'].map((n) => `${toolPrefix}${n}`).join('|'),
           hooks: [{
             type: 'command',
             command: 'node "${CLAUDE_PLUGIN_ROOT}/runtime/dist/watch-hook.js"',
             asyncRewake: true,
-            timeout: 21_900,
+            timeout: Math.ceil(HOOK_TIMEOUT_MS / 1000),
           }],
         }],
       },
@@ -147,13 +150,10 @@ export async function buildPlugin({ repoRoot = DEFAULT_ROOT, outputRoot = path.j
           args: ['${CLAUDE_PLUGIN_ROOT}/runtime/dist/server.js'],
         },
       },
-      // The always-on monitor is gone: a running monitor shows in Claude's exit
-      // dialog and polls forever. A job-scoped asyncRewake hook replaces it.
       hooks: './hooks/watch-hooks.json',
     };
     writeJson(path.join(staging, '.claude-plugin', 'plugin.json'), pluginManifest);
 
-    // Ensure the staging output is complete before replacing the last good build.
     required(path.join(staging, 'runtime', 'dist', 'server.js'), 'staged MCP server');
     required(path.join(staging, 'runtime', 'dist', 'monitor.js'), 'staged monitor entrypoint');
     required(path.join(staging, 'runtime', 'dist', 'watch-hook.js'), 'staged watch hook entrypoint');

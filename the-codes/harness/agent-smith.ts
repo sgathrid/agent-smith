@@ -1,18 +1,3 @@
-/**
- * agent-smith.ts — reads OUR OWN job state from `<repo>/.agent-smith/jobs/`.
- *
- * The source of truth for every job this repo spawned. It is not much code
- * because forge/format.ts made it not much code: owning the state format means
- * three questions, three answers:
- *
- *   - Does this job exist?        → the directory exists and holds a job.json.
- *   - What is its terminal state? → job.json.status. Written atomically, always.
- *   - Is it alive?                → job.json.updatedAt, refreshed on every event.
- *
- * The one hazard to respect is the cancel marker: `cancel` can exist before
- * job.json reaches a terminal state, so it outranks it.
- */
-
 import { existsSafe, readJsonSafe, readTextSafe, readdirSafe } from './safe-fs.ts';
 import {
   FILES,
@@ -20,7 +5,8 @@ import {
   CANCEL_ORPHAN_REASON,
   ORPHAN_REASON,
   deriveOrphan,
-  isContinuationKind,
+  normalizeContinuationKind,
+  normalizeDenials,
   ownerAlive,
   jobFile,
   jobsDir,
@@ -28,10 +14,6 @@ import {
 } from '../forge/format.ts';
 import type { JobStateReader, RawJobState } from './types.ts';
 
-/**
- * payload keys the normalizer relies on. Cross-referenced by name from
- * harness/normalize.ts's `smithNormalizer`.
- */
 export const SMITH_PAYLOAD = {
   provider: 'provider',
   mode: 'mode',
@@ -68,48 +50,19 @@ export const SMITH_PAYLOAD = {
 
 const CANCELED_ORPHAN = { status: 'canceled', suspicious: false, reason: CANCEL_ORPHAN_REASON } as const;
 
-/**
- * Reads `.agent-smith/jobs`.
- *
- * Every method is fault-tolerant: a reader reads files a live process is
- * rewriting, and one
- * unreadable job is that job's absence rather than a dead band. `discover`
- * NEVER throws; an absent jobs directory is the ordinary case for a repo that
- * has never spawned anything, not an error.
- */
 export class AgentSmithReader implements JobStateReader {
   readonly provider = 'agent-smith';
 
-  /**
-   * Enumerate job ids from the jobs directory.
-   *
-   * Keyed on the DIRECTORY: there is no suffix to parse, no "which file proves this job
-   * exists", and no entry that can half-qualify. A job's identity is its
-   * directory, so identity cannot be lost.
-   */
   async discover(cwd: string): Promise<string[]> {
     const entries = await readdirSafe(jobsDir(cwd));
     const ids = new Set<string>();
     for (const entry of entries) {
-      // `readdirSafe` returns names only; a name that is not a directory will
-      // simply fail the job.json read below and contribute nothing. We do not
-      // stat here because a stat per entry is a syscall per entry on a path the
-      // band hits every three seconds.
       if (!entry.startsWith('.')) ids.add(entry);
     }
     return [...ids].sort();
   }
 
-  /**
-   * Assemble one snapshot.
-   *
-   * Returns null when the job does not exist to this reader — i.e. no directory
-   * and no job.json. A FINISHED job returns a full snapshot: job.json is never
-   * deleted, which is the whole reason the format has a single anchor.
-   */
   async read(cwd: string, jobId: string): Promise<RawJobState | null> {
-    // The cancel marker outranks job.json: it can exist before the worker has
-    // been reaped.
     const cancelPath = jobFile(cwd, jobId, FILES.cancel);
     const cancelRequested = await existsSafe(cancelPath);
     let cancelAt: string | null = null;
@@ -120,13 +73,8 @@ export class AgentSmithReader implements JobStateReader {
     }
 
     const manifest = await readJsonSafe<ForgeManifest>(jobFile(cwd, jobId, FILES.job));
-    // A marker is a request. The owner may still be working or may finish
-    // successfully before it can stop; only terminal canceled state is proof.
     const canceled = manifest === null ? cancelRequested : manifest.status === 'canceled';
 
-    // A manifest from a NEWER writer is refused rather than half-understood.
-    // Reading a v2 file with v1 rules produces exactly the confident wrong
-    // answers this project exists to prevent, and `unknown` is the honest state.
     if (manifest !== null && typeof manifest.schema === 'number' && manifest.schema > SCHEMA_VERSION) {
       return {
         provider: this.provider,
@@ -159,21 +107,9 @@ export class AgentSmithReader implements JobStateReader {
       digest?: unknown;
     }>(jobFile(cwd, jobId, FILES.progress));
 
-    // "Does this job exist?" is asked LAST, and includes the marker: a job
-    // whose only surviving artefact is its cancel request is still a job.
-    //
-    // Note what is NOT consulted: the bare existence of the directory. A
-    // half-created directory (crash between mkdir and the first write) and a
-    // stray directory a human dropped in here are both indistinguishable from a
-    // job by `stat`, and a band that draws "unknown" for a stray folder is
-    // indistinguishable from one that lies. We require evidence of a job.
     const anyEvidence = manifest !== null || canceled || report !== null;
     if (!anyEvidence) return null;
 
-    // Orphan derivation (forge/format.ts deriveOrphan): a `running` anchor with
-    // no terminal result whose supervisor is gone. Derived, never written into
-    // job.json. Only the service reconciler persists the verdict; this reader
-    // is read-only, including when used by notifications and validation.
     let orphan: ReturnType<typeof deriveOrphan> = null;
     if (manifest !== null && manifest.status === 'running' && !canceled
         && !(await existsSafe(jobFile(cwd, jobId, FILES.result)))) {
@@ -181,14 +117,11 @@ export class AgentSmithReader implements JobStateReader {
         Date.parse(manifest.updatedAt), Date.parse(progress?.lastEventAt ?? ''),
       );
       orphan = deriveOrphan(manifest, Number.isFinite(lastSeen) ? lastSeen : null, Date.now(), undefined, cancelRequested);
-      // A live supervisor honours a cancel request within seconds. A request that
-      // is a minute old and still has no terminal state means nobody is listening.
       const cancelAgeMs = cancelAt === null ? NaN : Date.now() - Date.parse(cancelAt);
       const ownerIsAlive = ownerAlive(manifest);
       if (orphan === null && cancelRequested && cancelAgeMs > 60_000 && !ownerIsAlive) orphan = CANCELED_ORPHAN;
     }
 
-    // Defensive 0.4.x disk-read fallback: older manifests wrote `steeredFrom` and omitted `turn`/`chainStartedAt`.
     const legacySteeredFrom = (manifest as (ForgeManifest & { steeredFrom?: unknown }) | null)?.steeredFrom;
     const turn = typeof manifest?.turn === 'number' && Number.isInteger(manifest.turn) && manifest.turn >= 1 ? manifest.turn : 1;
     const continuedFrom =
@@ -197,7 +130,7 @@ export class AgentSmithReader implements JobStateReader {
         : typeof legacySteeredFrom === 'string' && legacySteeredFrom !== ''
           ? legacySteeredFrom
           : undefined;
-    const continuationKind = isContinuationKind(manifest?.continuationKind) ? manifest.continuationKind : undefined;
+    const continuationKind = normalizeContinuationKind(manifest?.continuationKind) ?? (continuedFrom !== undefined ? 'follow-up' : undefined);
     const chainStartedAt =
       typeof manifest?.chainStartedAt === 'string' && manifest.chainStartedAt !== ''
         ? manifest.chainStartedAt
@@ -226,12 +159,10 @@ export class AgentSmithReader implements JobStateReader {
       [SMITH_PAYLOAD.exitCode]: manifest?.exitCode ?? null,
       [SMITH_PAYLOAD.jobStatus]: manifest?.jobStatus ?? null,
       [SMITH_PAYLOAD.error]: orphan?.reason ?? manifest?.error ?? null,
-      [SMITH_PAYLOAD.deniedActions]: manifest?.deniedActions ?? [],
+      [SMITH_PAYLOAD.deniedActions]: normalizeDenials(manifest?.deniedActions),
       [SMITH_PAYLOAD.usage]: manifest?.usage ?? null,
       ...(Array.isArray(manifest?.changedFiles) && manifest.changedFilesTruncated !== true
         ? { changed_files: manifest.changedFiles } : {}),
-      // No progress.json and no manifest count is unknown, not zero: a job that
-      // wrote nothing must not claim it made no tool calls.
       [SMITH_PAYLOAD.toolCalls]: progress?.toolCalls ?? manifest?.toolCalls ?? null,
       [SMITH_PAYLOAD.pipeline]: manifest?.pipeline ?? null,
       [SMITH_PAYLOAD.stage]: manifest?.stage ?? null,
@@ -240,8 +171,6 @@ export class AgentSmithReader implements JobStateReader {
       [SMITH_PAYLOAD.canceled]: canceled,
       [SMITH_PAYLOAD.cancelAt]: cancelAt,
       [SMITH_PAYLOAD.lastEventAt]: progress?.lastEventAt ?? manifest?.updatedAt ?? null,
-      // The process owner's heartbeat (providers/ndjson.ts). Absent for jobs
-      // written by older builds: liveness then falls back to event silence.
       [SMITH_PAYLOAD.lastAliveAt]: progress?.lastAliveAt ?? null,
       ...(typeof progress?.workerPid === 'number' ? { workerPid: progress.workerPid } : {}),
       ...(typeof (manifest?.toolErrors ?? progress?.toolErrors) === 'number'
@@ -255,6 +184,7 @@ export class AgentSmithReader implements JobStateReader {
       [SMITH_PAYLOAD.progressWarnings]: progress?.warnings ?? [],
       ...(progress?.digest !== undefined ? { digest: progress.digest } : {}),
       ...(manifest?.supersededBy !== undefined ? { supersededBy: manifest.supersededBy } : {}),
+      ...(typeof manifest?.followedBy === 'string' && manifest.followedBy !== '' ? { followedBy: manifest.followedBy } : {}),
       ...(continuedFrom !== undefined ? { continuedFrom } : {}),
       ...(continuationKind !== undefined ? { continuationKind } : {}),
       ...(chainStartedAt !== undefined ? { chainStartedAt } : {}),
@@ -266,10 +196,6 @@ export class AgentSmithReader implements JobStateReader {
         : {}),
     };
 
-    // partial=true when the anchor is missing: something is on disk for this
-    // job but we could not read the file that says what state it is in. The
-    // normalizer biases toward `unknown` over a guess, and `unknown` must never
-    // be collapsed into `running`.
     return {
       provider: this.provider,
       jobId,

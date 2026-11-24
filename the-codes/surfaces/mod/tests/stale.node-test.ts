@@ -1,4 +1,3 @@
-/** stale.ts livenessOf: the one rule the band, the pane, notices and the channel share. */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { ALIVE_GRACE_MS, STALL_GRACE_MS, livenessOf } from '../hooks/stale.ts';
