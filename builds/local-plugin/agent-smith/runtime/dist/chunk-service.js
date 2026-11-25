@@ -1,4 +1,4 @@
-import {l as readManifest,d as jobFile,F as FILES,o as ownerAlive,c as readPipeline,h as cancelPipeline,n as findProvider,p as providerNames,q as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,P as PROVIDERS,t as errMessage,w as writeJsonAtomic,A as AgentSmithReader,u as normalize,x as writeAtomic,j as jobDir,y as SCHEMA_VERSION,z as validOwnerPid,k as isTerminalForgeStatus,B as reportFor,C as cwdFacts,E as normalizeDenials,G as deriveOrphan,H as deriveStatus,I as summaryTail,J as failureFields,R as REASONS,e as readAcceptance,K as writeAcceptance,L as createMarker,W as WORKERS_DIR,N as jobsDir,O as parseWorkerIndex,Q as normalizeContinuationKind,T as nextActionFor,U as fileSig,V as JobWriter,i as isTerminalStatus,g as isMode,X as newJobId,Y as markAcceptancePending,Z as humanDuration,_ as pipeEvents,$ as checksAbortRequested,a0 as verdictBlock,a1 as runAcceptance,a2 as senderOf,a3 as buildSteeredPrompt,a4 as taskTitle,a5 as markAcceptanceSuperseded,a6 as pickHead,f as isWorkerIdle,a7 as compareTurnPriority,a8 as computeStaleReads,a9 as SMITH_PAYLOAD,aa as isForgeStatus}from'./chunk-normalize.js';import {existsSync,readFileSync,mkdirSync,appendFileSync,openSync,writeSync,closeSync,unlinkSync,statSync,renameSync,linkSync,readdirSync,realpathSync,lstatSync,copyFileSync}from'node:fs';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import path from'node:path';import {createHash}from'node:crypto';const LAUNCH_ACK_MS = 15_000;
+import {l as readManifest,d as jobFile,F as FILES,o as ownerAlive,c as readPipeline,h as cancelPipeline,n as findProvider,p as providerNames,q as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,P as PROVIDERS,t as errMessage,w as writeJsonAtomic,A as AgentSmithReader,u as normalize,x as writeAtomic,j as jobDir,y as SCHEMA_VERSION,z as validOwnerPid,k as isTerminalForgeStatus,B as reportFor,C as cwdFacts,E as normalizeDenials,G as deriveOrphan,H as deriveStatus,I as summaryTail,J as failureFields,R as REASONS,e as readAcceptance,K as writeAcceptance,L as createMarker,W as WORKERS_DIR,N as jobsDir,O as parseWorkerIndex,Q as normalizeContinuationKind,T as nextActionFor,U as fileSig,V as JobWriter,i as isTerminalStatus,g as isMode,X as newJobId,Y as markAcceptancePending,Z as humanDuration,_ as pipeEvents,$ as checksAbortRequested,a0 as verdictBlock,a1 as runAcceptance,a2 as senderOf,a3 as taskTitle,a4 as markAcceptanceSuperseded,a5 as pickHead,f as isWorkerIdle,a6 as compareTurnPriority,a7 as computeStaleReads,a8 as SMITH_PAYLOAD,a9 as isForgeStatus}from'./chunk-normalize.js';import {existsSync,readFileSync,mkdirSync,appendFileSync,openSync,writeSync,closeSync,unlinkSync,statSync,renameSync,linkSync,readdirSync,realpathSync,lstatSync,copyFileSync}from'node:fs';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import path from'node:path';import {createHash}from'node:crypto';const LAUNCH_ACK_MS = 15_000;
 async function launch(url, payload, onPrepared) {
     const child = fork(fileURLToPath(url), [], {
         detached: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
@@ -292,6 +292,7 @@ function turnStartInput(provider, spec, turn) {
         ...(turn.continuationKind === undefined ? {} : { continuationKind: turn.continuationKind }),
         ...(turn.chainStartedAt === undefined ? {} : { chainStartedAt: turn.chainStartedAt }),
         ...(turn.watchedFiles === undefined ? {} : { watchedFiles: turn.watchedFiles }),
+        ...(turn.messages !== undefined && turn.messages.length > 0 ? { messages: turn.messages } : {}),
     };
 }/**
  * providers/catalog.ts — cached model discovery across providers.
@@ -637,6 +638,28 @@ function liveDeliverable(e) {
 }
 function liveMessageText(e) {
     return e.prompt;
+}
+function buildSteeredPrompt(input) {
+    const steerBody = input.entries.length === 1
+        ? input.entries[0].prompt
+        : input.entries.map((e, idx) => `${idx + 1}. ${e.prompt}`).join('\n\n');
+    const baseStatus = input.wasInterrupted
+        ? 'Your previous turn was interrupted with updated instructions. Inspect your working tree before repeating any completed steps.'
+        : `Your previous turn ${input.priorStatus === undefined || input.priorStatus === 'succeeded' ? 'completed' : `ended ${input.priorStatus}`}.`;
+    const statusLine = input.freshContinuation ? `${baseStatus} This starts a fresh conversation.` : baseStatus;
+    const parts = [statusLine];
+    if (input.syncedFiles !== undefined && input.syncedFiles.length > 0) {
+        parts.push(`Synced brief file(s) in your working tree: ${input.syncedFiles.join(', ')} (re-read before continuing).`);
+    }
+    if (input.verdict)
+        parts.push(input.verdict);
+    if (input.freshContinuation && input.responseTail) {
+        parts.push(`Last response excerpt from previous turn:\n${input.responseTail}`);
+    }
+    const header = `${parts.join('\n')}\n\n${steerBody}`;
+    const prependBrief = input.brief !== '' && !header.startsWith(input.brief);
+    const sentPrompt = prependBrief ? `${input.brief}\n\n${header}` : header;
+    return { rawPrompt: header, sentPrompt, prependBrief };
 }
 function readSteerHead(repo, jobId) {
     try {
@@ -1767,6 +1790,7 @@ class ForgeService {
             continuedFrom: request.continuedFrom,
             continuationKind,
             chainStartedAt: continuationKind === 'follow-up' ? undefined : request.chainStartedAt,
+            messages: request.messages,
         }));
         try {
             this.recordTurnStart({
@@ -2348,6 +2372,7 @@ class ForgeService {
             continuedFrom: parent.jobId,
             continuationKind,
             chainStartedAt,
+            messages: unconsumed.map((e) => ({ text: e.prompt, sender: senderOf(e) })),
         }));
         if (spec.checks !== undefined)
             writeJsonAtomic(jobFile(this.repo, nextJobId, FILES.checksSpec), spec.checks);

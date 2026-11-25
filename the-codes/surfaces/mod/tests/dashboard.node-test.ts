@@ -260,14 +260,16 @@ test('priorTurnSummary formats inline clickable turns with message, verdict or s
   const failedCheckParent = job('t2-chk', {
     workerId: 'ada', turn: 2, status: 'succeeded',
     startedAt: 0, endedAt: 283_000, toolCount: 41,
-    prompt: '[FOLLOW-UP STEER · 1 queued update]\nYour previous turn completed.\n\n[ORCHESTRATOR UPDATE]\nFix the review findings',
+    prompt: 'Your previous turn completed.\n\nFix the review findings',
+    messages: [{ sender: 'follow_up', text: 'Fix the review findings' }],
     acceptance: { state: 'rejected', checks: [{ name: 'lint', ok: false, outputTail: '' }] },
   });
   assert.equal(priorTurnSummary(failedCheckParent, 2, 300_000), '▸ 2  Fix the review findings · ✗ lint · 4m43s');
 
   const openTurn = job('t3', {
     workerId: 'ada', turn: 3, status: 'running',
-    prompt: '[FOLLOW-UP STEER · 1 queued update]\nYour previous turn completed.\n\n[ORCHESTRATOR UPDATE]\nAfter you finish the 19 test failures, do the decided fix list',
+    prompt: 'Your previous turn completed.\n\nAfter you finish the 19 test failures, do the decided fix list',
+    messages: [{ sender: 'follow_up', text: 'After you finish the 19 test failures, do the decided fix list' }],
   });
   assert.equal(priorTurnSummary(openTurn, 3, 100_000, { open: true }), '▾ 3  After you finish the 19 test failures, do the decided fix list');
 

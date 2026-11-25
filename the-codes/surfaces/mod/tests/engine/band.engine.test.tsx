@@ -755,6 +755,7 @@ test('ANSI escapes and control bytes in failed tool output, warnings, check outp
   expect(await pane.find({ type: 'Text', text: /Denied rm\nsecond line/ })).toBeDefined();
   expect(await pane.find({ type: 'Text', text: /Warn retry/ })).toBeDefined();
   expect(await pane.find({ type: 'Markdown', text: 'Heading bold\nline 2' })).toBeDefined();
+  await pane.press({ key: 'event-1' });
   expect(await pane.find({ type: 'Text', text: /error\[E0425\]: cannot find value\n10%\n100%/ })).toBeDefined();
   expect(await pane.find({ type: 'Markdown', text: 'Final report\nclean' })).toBeDefined();
   expect(await pane.find({ type: 'Text', text: '✗ clippy! · exit 1' })).toBeDefined();
@@ -1243,11 +1244,11 @@ describe('worker-first UI, inline prior turns, auto-follow, and O(active) idle p
     expect(btns.map((b) => `${b.props?.hotkey}:${b.props?.label}`)).toEqual(['t:Task', 'b:Back', 'x:Close']);
   });
 
-  test('three-turn worker unwraps steered prompt, suppresses duplicate follow-up read, and formats turn rows without tool counts', async ($, on) => {
+  test('three-turn worker reads task from stored messages, suppresses duplicate turn-start message, and formats turn rows without tool counts', async ($, on) => {
     const t1Start = RUNNING_NOW - 5_448_000;
     const t2Start = RUNNING_NOW - 288_000;
     const t3Start = RUNNING_NOW - 5_000;
-    const steeredPrompt = '[FOLLOW-UP STEER · 1 queued update]\nYour previous turn completed.\n\n[ORCHESTRATOR UPDATE]\nAfter you finish the 19 test failures, do the decided fix list';
+    const steeredPrompt = 'Your previous turn completed.\n\nAfter you finish the 19 test failures, do the decided fix list';
     const files: Record<string, string> = {
       ...canonicalJob('job-l-1', {
         status: 'succeeded', name: 'links2-neon', workerId: 'links2', turn: 1, role: 'implement',
@@ -1283,6 +1284,7 @@ describe('worker-first UI, inline prior turns, auto-follow, and O(active) idle p
         }),
         'view.json': JSON.stringify({
           schema: 1, prompt: steeredPrompt, preamble: '', truncated: false, tools: [], transcript: [],
+          messages: [{ sender: 'follow_up', text: 'After you finish the 19 test failures, do the decided fix list' }],
           timeline: [
             { kind: 'message', sequence: 0, at: iso(RUNNING_NOW), text: 'After you finish the 19 test failures, do the decided fix list', delivery: 'turn-start', sender: 'follow_up' },
             { kind: 'message', sequence: 1, at: iso(RUNNING_NOW + 100), text: 'Also check the empty-input edge case.', delivery: 'next-step', sender: 'follow_up' },
@@ -1335,7 +1337,8 @@ describe('worker-first UI, inline prior turns, auto-follow, and O(active) idle p
       }, {
         'view.json': JSON.stringify({
           schema: 1,
-          prompt: '[FOLLOW-UP STEER · 1 queued update]\nYour previous turn completed.\n\n[ORCHESTRATOR UPDATE]\nVerify edge cases',
+          prompt: 'Your previous turn completed.\n\nVerify edge cases',
+          messages: [{ sender: 'follow_up', text: 'Verify edge cases' }],
           preamble: '', truncated: false, tools: [], transcript: [], timeline: [],
         }),
       }),
@@ -1376,12 +1379,24 @@ describe('worker-first UI, inline prior turns, auto-follow, and O(active) idle p
     expect(collapsedEdit?.props?.dimColor).toBe(true);
     expect(await pane.find({ key: 'body-event-3' })).toBeUndefined();
 
-    const errorCmd = (await pane.find({ key: 'event-4' })) as { props?: Record<string, unknown> } | undefined;
+    const errorCmd = (await pane.find({ key: 'event-4' })) as { props?: Record<string, unknown>; children?: { props?: Record<string, unknown> }[] } | undefined;
     expect(String(errorCmd?.props?.label)).toBe('✗ running tests');
     expect(errorCmd?.props?.dimColor).toBe(false);
+    expect(errorCmd?.children?.[0]?.props?.color).toBe('red');
+    expect(await pane.find({ key: 'body-event-4' })).toBeUndefined();
+    expect(await pane.find({ type: 'Text', text: 'Bash {"command":"npm test"}\nexit 1' })).toBeUndefined();
+
+    await pane.press({ key: 'event-4' });
+    const errorExpanded = (await pane.find({ key: 'event-4' })) as { props?: Record<string, unknown> } | undefined;
+    expect(String(errorExpanded?.props?.label)).toBe('✗ running tests');
     const errorBody = (await pane.find({ key: 'body-event-4' })) as { props?: Record<string, unknown>; children?: unknown[] } | undefined;
     expect(errorBody?.props?.flexDirection).toBe('row');
     expect(await pane.find({ type: 'Text', text: 'Bash {"command":"npm test"}\nexit 1' })).toBeDefined();
+    expect(await pane.find({ key: 'end-event-4' })).toBeDefined();
+
+    await pane.press({ key: 'event-4' });
+    expect(await pane.find({ key: 'body-event-4' })).toBeUndefined();
+    expect(await pane.find({ key: 'end-event-4' })).toBeUndefined();
 
     await pane.press({ key: 'event-3' });
     const expandedEdit = (await pane.find({ key: 'event-3' })) as { props?: Record<string, unknown> } | undefined;
@@ -1405,5 +1420,34 @@ describe('worker-first UI, inline prior turns, auto-follow, and O(active) idle p
     const nestedBody = (await pane.find({ key: 'body-event-0' })) as { props?: Record<string, unknown> } | undefined;
     expect(nestedBody?.props?.flexDirection).toBe('row');
     expect(await pane.find({ type: 'Text', text: 'Read src/a.ts\nline 1\nline 2' })).toBeDefined();
+  });
+
+  test('error tool row is plain when NO_COLOR is set and expanded blocks get one trailing blank line without doubling prose gaps', async ($, on) => {
+    const view = JSON.stringify({
+      schema: 1, prompt: 'Inspect', preamble: '', truncated: false, tools: [], transcript: [],
+      timeline: [
+        { kind: 'tool', sequence: 0, at: iso(RUNNING_NOW), stepIndex: 0, tool: 'Bash', input: '{"command":"npm test"}', output: 'exit 1', state: 'error' },
+        { kind: 'tool', sequence: 1, at: iso(RUNNING_NOW), stepIndex: 1, tool: 'Edit', input: '{"file_path":"src/c.ts"}', output: 'saved', state: 'done' },
+        { kind: 'assistant', sequence: 2, at: iso(RUNNING_NOW), text: 'Checking output.' },
+      ],
+    });
+    const files = canonicalJob('job-col', { status: 'running', name: 'Col', workerId: 'col', role: 'implement' }, { 'view.json': view });
+    forgeHost(on, files, ['job-col'], { NO_COLOR: '1' });
+    await start($);
+    await launch($, 'job-col');
+    await $.command.run({ command: 'forge', args: 'col' });
+    const pane = await $.ui.mount(PANE_TARGET);
+
+    const errorBtn = (await pane.find({ key: 'event-0' })) as { children?: { props?: Record<string, unknown> }[] } | undefined;
+    expect(errorBtn?.children?.[0]?.props?.color).toBeUndefined();
+    expect(await pane.find({ key: 'end-event-0' })).toBeUndefined();
+    expect(await pane.find({ key: 'end-event-1' })).toBeUndefined();
+
+    await pane.press({ key: 'event-0' });
+    expect(await pane.find({ key: 'end-event-0' })).toBeDefined();
+
+    await pane.press({ key: 'event-1' });
+    expect(await pane.find({ key: 'end-event-1' })).toBeUndefined();
+    expect(await pane.find({ key: 'gap-event-2' })).toBeDefined();
   });
 });

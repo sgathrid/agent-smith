@@ -4,7 +4,7 @@ import { MODE_PRESETS, MODES } from './modes.ts';
 import type { BriefCheck } from './brief.ts';
 import type { ModePreset } from './modes.ts';
 import type { StartInput } from './writer.ts';
-import { DEFAULT_TIMEOUT_MS, type ContinuationKind, type LegacyContinuationKind, type ForgeManifest, type ForgeStatus, type MessageSender, type WatchedFileSigs } from './format.ts';
+import { DEFAULT_TIMEOUT_MS, type ContinuationKind, type LegacyContinuationKind, type ForgeManifest, type ForgeStatus, type TurnMessage, type WatchedFileSigs } from './format.ts';
 
 export const MIN_TIMEOUT_MS = 1_000;
 export const MAX_TIMEOUT_MS = 6 * 60 * 60_000;
@@ -40,7 +40,7 @@ export interface SpawnRequest {
   readonly attempt?: number | undefined;
   readonly onPrepared?: ((jobId: string) => void | Promise<void>) | undefined;
   readonly ownerChecks?: boolean | undefined;
-  readonly messages?: readonly { readonly text: string; readonly sender: MessageSender }[] | undefined;
+  readonly messages?: readonly TurnMessage[] | undefined;
 }
 
 export interface SpawnAck {
@@ -267,6 +267,7 @@ export function turnStartInput(
     readonly continuedFrom?: string | undefined;
     readonly continuationKind?: ContinuationKind | undefined;
     readonly chainStartedAt?: string | undefined;
+    readonly messages?: readonly TurnMessage[] | undefined;
   },
 ): StartInput {
   return {
@@ -299,5 +300,6 @@ export function turnStartInput(
     ...(turn.continuationKind === undefined ? {} : { continuationKind: turn.continuationKind }),
     ...(turn.chainStartedAt === undefined ? {} : { chainStartedAt: turn.chainStartedAt }),
     ...(turn.watchedFiles === undefined ? {} : { watchedFiles: turn.watchedFiles }),
+    ...(turn.messages !== undefined && turn.messages.length > 0 ? { messages: turn.messages } : {}),
   };
 }

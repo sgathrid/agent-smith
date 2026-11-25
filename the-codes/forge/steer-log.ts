@@ -95,7 +95,37 @@ export function liveMessageText(e: Pick<SteerEntry, 'prompt'>): string {
   return e.prompt;
 }
 
-export { buildSteeredPrompt, extractSteerMessage } from '../surfaces/mod/hooks/turns.ts';
+export function buildSteeredPrompt(input: {
+  wasInterrupted: boolean;
+  priorStatus?: string | undefined;
+  verdict?: string | undefined;
+  freshContinuation?: boolean;
+  responseTail: string;
+  entries: readonly { readonly prompt: string }[];
+  syncedFiles?: readonly string[];
+  brief: string;
+}): { rawPrompt: string; sentPrompt: string; prependBrief: boolean } {
+  const steerBody =
+    input.entries.length === 1
+      ? input.entries[0]!.prompt
+      : input.entries.map((e, idx) => `${idx + 1}. ${e.prompt}`).join('\n\n');
+  const baseStatus = input.wasInterrupted
+    ? 'Your previous turn was interrupted with updated instructions. Inspect your working tree before repeating any completed steps.'
+    : `Your previous turn ${input.priorStatus === undefined || input.priorStatus === 'succeeded' ? 'completed' : `ended ${input.priorStatus}`}.`;
+  const statusLine = input.freshContinuation ? `${baseStatus} This starts a fresh conversation.` : baseStatus;
+  const parts = [statusLine];
+  if (input.syncedFiles !== undefined && input.syncedFiles.length > 0) {
+    parts.push(`Synced brief file(s) in your working tree: ${input.syncedFiles.join(', ')} (re-read before continuing).`);
+  }
+  if (input.verdict) parts.push(input.verdict);
+  if (input.freshContinuation && input.responseTail) {
+    parts.push(`Last response excerpt from previous turn:\n${input.responseTail}`);
+  }
+  const header = `${parts.join('\n')}\n\n${steerBody}`;
+  const prependBrief = input.brief !== '' && !header.startsWith(input.brief);
+  const sentPrompt = prependBrief ? `${input.brief}\n\n${header}` : header;
+  return { rawPrompt: header, sentPrompt, prependBrief };
+}
 
 export function readSteerHead(repo: string, jobId: string): string | null {
   try {

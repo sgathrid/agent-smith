@@ -1,7 +1,7 @@
 import type { ActivityEvent, RadarAcceptance, RadarJob } from '../types/index.d.ts';
 import { continuationLabel, countSummary, effectiveStart, elapsed, elapsedCell, failedChecks, failureWords, fitCell, isTerminal, jobLabel, livenessWords, oneLine, pendingSteersLabel, pickGlyph } from './format.ts';
 import { classify } from './progress.ts';
-import { compareTurnPriority, extractSteerMessage, type TurnLike } from './turns.ts';
+import { compareTurnPriority, type TurnLike } from './turns.ts';
 
 export const ATTENTION_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -177,12 +177,13 @@ export function priorTurnSummary(
   job: RadarJob,
   fallbackTurn: number,
   now: number,
-  options: { readonly width?: number; readonly open?: boolean; readonly prompt?: string | null } = {},
+  options: { readonly width?: number; readonly open?: boolean; readonly prompt?: string | null; readonly messages?: RadarJob['messages'] } = {},
 ): string {
   const turn = job.turn ?? fallbackTurn;
   const open = options.open === true;
   const prefix = `${open ? '▾' : '▸'} ${turn}  `;
-  const msg = oneLine(extractSteerMessage(options.prompt ?? job.prompt ?? job.task));
+  const messages = options.messages ?? job.messages;
+  const msg = oneLine(messages && messages.length > 0 ? messages[0]!.text : (options.prompt ?? job.prompt ?? job.task));
   if (open) {
     const shown = options.width !== undefined ? oneLine(msg, Math.max(1, options.width - prefix.length)) : msg;
     return `${prefix}${shown}`.trimEnd();

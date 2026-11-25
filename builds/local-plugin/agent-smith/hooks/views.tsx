@@ -4,7 +4,6 @@ import type { ForgeDetail } from './canonical.ts';
 import { checksLabel, condenseTimeline, forgeList, isLive, needsAttention, priorTurnSummary, scopeLine, statusLine, timelineGroupLabel, workerHead, workerHeading, workerLivenessLine, workerStatus, type TimelineItem } from './dashboard.ts';
 import { effectiveStart, elapsed, isTerminal, oneLine, pendingSteersLabel, pickColor, pickGlyph, sanitizeText } from './format.ts';
 import { classify, progressLines } from './progress.ts';
-import { extractSteerMessage } from './turns.ts';
 
 export interface ViewActions {
   pick(job: RadarJob): Promise<void>;
@@ -60,7 +59,7 @@ export function renderWorker(W: UiComponents, d: ForgeDetail, o: ViewOptions, a:
   const {Box,Text,Button,Markdown} = W;
   const job=d.job;
   const prompt=job.prompt??job.task;
-  const taskMessage=extractSteerMessage(prompt);
+  const taskMessage=job.messages&&job.messages.length>0?job.messages[0]!.text:prompt;
   const head=workerHead(turns,job.workerId);
   const isPinned=o.pinnedTurnId!==null&&head!==undefined&&head.id!==job.id;
   const headerStart=isPinned?job.startedAt:effectiveStart(job);
@@ -79,12 +78,18 @@ export function renderWorker(W: UiComponents, d: ForgeDetail, o: ViewOptions, a:
     ? job.changedFileCount : 0;
   const livenessLine=workerLivenessLine(job);
   const showProgress=Boolean(job.progress)&&!(job.progress!.phase==='starting'&&(job.toolCount??0)===0&&job.progress!.filesRead===0&&job.progress!.searches===0&&job.progress!.commands===0&&job.progress!.editedCount===0&&job.progress!.testRuns===0&&job.progress!.repeat===null);
+  const storedTexts=new Set((job.messages??[]).map(m => oneLine(m.text)).filter(Boolean));
   const taskOneLine=oneLine(taskMessage);
   let suppressedFirstTaskMsg=false;
   const visibleTimeline=d.timeline.filter(event => {
-    if (!suppressedFirstTaskMsg&&event.kind==='message'&&taskOneLine!==''&&oneLine(event.text)===taskOneLine) {
-      suppressedFirstTaskMsg=true;
-      return false;
+    if (event.kind==='message') {
+      const eventLine=oneLine(event.text);
+      if (storedTexts.size>0) {
+        if (event.delivery==='turn-start'&&storedTexts.has(eventLine)) return false;
+      } else if (!suppressedFirstTaskMsg&&taskOneLine!==''&&eventLine===taskOneLine) {
+        suppressedFirstTaskMsg=true;
+        return false;
+      }
     }
     return true;
   });
@@ -103,20 +108,21 @@ export function renderWorker(W: UiComponents, d: ForgeDetail, o: ViewOptions, a:
     {turns.length>1
       ? <Box flexDirection="column">
         {turns.map((turn,i) => turn.id===job.id
-          ? <Text key={`turn-${turn.id}`} bold wrap="truncate-end">{priorTurnSummary(turn,i+1,o.now,{width:Math.max(1,o.width-2),open:true,prompt})}</Text>
+          ? <Text key={`turn-${turn.id}`} bold wrap="truncate-end">{priorTurnSummary(turn,i+1,o.now,{width:Math.max(1,o.width-2),open:true,prompt,messages:job.messages})}</Text>
           : <Button key={`turn-${turn.id}`} plain dimColor label={priorTurnSummary(turn,i+1,o.now,{width:Math.max(1,o.width-2)})} onPress={() => a.pickTurn(turn.id)} />)}
       </Box>
       : <Text dimColor wrap="truncate-end">{`Task: ${oneLine(taskMessage,Math.max(1,o.width-8))}`}</Text>}
     {o.taskOpen && <Markdown text={sanitizeText(job.preamble?`${job.preamble}\n\n${prompt}`:prompt)} />}
     {o.taskOpen && <Text dimColor wrap="wrap">{sanitizeText(`${oneLine(job.id)}\nWorker: ${oneLine(job.workerId)}${job.pipeline?`\nPipeline: ${oneLine(job.pipeline)} · ${oneLine(job.stage??'stage unknown')}`:''}${job.attempt!=null?`\nAttempt: ${job.attempt}`:''}`)}</Text>}
     {condenseTimeline(visibleTimeline).flatMap((item,i,items) => {
+      const followedByProse=i+1<items.length&&isProse(items[i+1]!)!==isProse(item);
       const row=item.kind==='group'
-        ? timelineGroup(W,item,o,a)
+        ? timelineGroup(W,item,o,a,!followedByProse)
         : item.event.kind==='assistant'
           ? <Markdown key={`event-${item.event.sequence}`} text={proseText(item.event.text)} />
           : item.event.kind==='message'
           ? <Text key={`event-${item.event.sequence}`} color={o.colour?'cyan':undefined} wrap="truncate-end">{messageLine(item.event.sender,item.event.text,o.width)}</Text>
-          : toolRow(W,`event-${item.event.sequence}`,item.event.tool,item.event.input,item.event.output,item.event.state,o,a);
+          : toolRow(W,`event-${item.event.sequence}`,item.event.tool,item.event.input,item.event.output,item.event.state,o,a,!followedByProse);
       return i>0&&isProse(items[i-1]!)!==isProse(item)
         ? [<Box key={`gap-${timelineKey(item)}`}><Text> </Text></Box>,row] : [row];
     })}
@@ -140,22 +146,28 @@ export function renderWorker(W: UiComponents, d: ForgeDetail, o: ViewOptions, a:
   </Box>;
 }
 
-function toolRow(W: UiComponents,key:string,tool:string,input:string,output:string,state:string,o:ViewOptions,a:ViewActions): JSX.Element {
+function toolRow(W: UiComponents,key:string,tool:string,input:string,output:string,state:string,o:ViewOptions,a:ViewActions,trailingGap=true): JSX.Element {
   const {Box,Text,Button}=W;
-  const expanded=o.tools.includes(key)||state==='error';
+  const expanded=o.tools.includes(key);
   const glyph=state==='active'?activeGlyph(o.now):state==='error'?'✗':expanded?'▾':'✓';
+  const label=`${glyph} ${oneLine(classify(tool,input).label,Math.max(1,o.width-3))}`;
   return <Box key={`row-${key}`} flexDirection="column">
-    <Button key={key} plain dimColor={state!=='error'&&!expanded} label={`${glyph} ${oneLine(classify(tool,input).label,Math.max(1,o.width-3))}`} onPress={() => a.tool(key)} />
+    {state==='error'
+      ? <Button key={key} plain dimColor={false} label={label} onPress={() => a.tool(key)}>
+        <Text color={o.colour?'red':undefined} wrap="truncate-end">{label}</Text>
+      </Button>
+      : <Button key={key} plain dimColor={!expanded} label={label} onPress={() => a.tool(key)} />}
     {expanded&&<Box key={`body-${key}`} flexDirection="row">
       <Text>{'  '}</Text>
       <Box flexDirection="column">
         <Text dimColor wrap="wrap">{sanitizeText(`${oneLine(tool)} ${input}${output?`\n${output}`:''}`)}</Text>
       </Box>
     </Box>}
+    {expanded&&trailingGap&&<Box key={`end-${key}`}><Text> </Text></Box>}
   </Box>;
 }
 
-function timelineGroup(W: UiComponents, item: Extract<TimelineItem,{kind:'group'}>, o: ViewOptions, a: ViewActions): JSX.Element {
+function timelineGroup(W: UiComponents, item: Extract<TimelineItem,{kind:'group'}>, o: ViewOptions, a: ViewActions, trailingGap=true): JSX.Element {
   const {Box,Text,Button,Markdown}=W;
   const expanded=o.tools.includes(item.key);
   const childOpts={...o,width:Math.max(1,o.width-2)};
@@ -164,13 +176,14 @@ function timelineGroup(W: UiComponents, item: Extract<TimelineItem,{kind:'group'
     {expanded && <Box key={`body-${item.key}`} flexDirection="row">
       <Text>{'  '}</Text>
       <Box flexDirection="column">
-        {item.events.map(event => event.kind==='tool'
-          ? toolRow(W,`event-${event.sequence}`,event.tool,event.input,event.output,event.state,childOpts,a)
+        {item.events.map((event,i) => event.kind==='tool'
+          ? toolRow(W,`event-${event.sequence}`,event.tool,event.input,event.output,event.state,childOpts,a,i<item.events.length-1)
           : event.kind==='message'
           ? <Text key={`event-${event.sequence}`} wrap="truncate-end">{messageLine(event.sender,event.text,childOpts.width)}</Text>
           : <Markdown key={`event-${event.sequence}`} text={proseText(event.text)} />)}
       </Box>
     </Box>}
+    {expanded&&trailingGap&&<Box key={`end-${item.key}`}><Text> </Text></Box>}
   </Box>;
 }
 
