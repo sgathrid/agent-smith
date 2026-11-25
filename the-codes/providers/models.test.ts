@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -424,5 +424,33 @@ test('catalog and probeAvailability: a throwing availability probe is reported w
     );
   } finally {
     resetCatalogCacheForTest();
+  }
+});
+
+test('probeAvailability: non-ENOENT filesystem error (ENAMETOOLONG) reports failed and caches failure, while non-executable file reports not-installed', async () => {
+  const savedBin = process.env['AGENT_SMITH_CODEX_BIN'];
+  const savedPath = process.env['PATH'];
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'smith-probe-err-'));
+  try {
+    process.env['AGENT_SMITH_CODEX_BIN'] = `/${'a'.repeat(2048)}`;
+    const first = await probeAvailability([codexProvider]);
+    assert.equal(first[0]!.status, 'failed');
+    assert.match(first[0]!.reason ?? '', /ENAMETOOLONG/);
+    const second = await probeAvailability([codexProvider]);
+    assert.equal(second[0]!.status, 'failed');
+    assert.match(second[0]!.reason ?? '', /ENAMETOOLONG/);
+
+    const nonExec = path.join(dir, 'fake-codex');
+    writeFileSync(nonExec, '#!/bin/sh\n');
+    chmodSync(nonExec, 0o644);
+    process.env['AGENT_SMITH_CODEX_BIN'] = nonExec;
+    const notExec = await probeAvailability([codexProvider]);
+    assert.equal(notExec[0]!.status, 'not-installed');
+  } finally {
+    if (savedBin === undefined) delete process.env['AGENT_SMITH_CODEX_BIN'];
+    else process.env['AGENT_SMITH_CODEX_BIN'] = savedBin;
+    if (savedPath === undefined) delete process.env['PATH'];
+    else process.env['PATH'] = savedPath;
+    rmSync(dir, { recursive: true, force: true });
   }
 });

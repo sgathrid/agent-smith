@@ -226,9 +226,13 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
 
     if (role === 'assistant') {
       const content = str(raw, 'content');
-      if (content !== undefined && content !== '') {
-        tx.finalText = content;
-        out.push({ kind: 'text', at, text: content, stream: 'assistant' });
+      if (content !== undefined) {
+        if (content === '') {
+          tx.finalText = '';
+        } else {
+          tx.finalText = content;
+          out.push({ kind: 'text', at, text: content, stream: 'assistant' });
+        }
       }
 
       const calls = raw['tool_calls'];
@@ -243,6 +247,7 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
             raw,
           });
         } else {
+          if (calls.length > 0) tx.finalText = '';
           for (const rawCall of calls) {
             if (rawCall === null || typeof rawCall !== 'object' || Array.isArray(rawCall)) continue;
             const call = rawCall as Record<string, unknown>;
@@ -275,6 +280,7 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
     }
 
     if (role === 'tool') {
+      tx.finalText = '';
       const id = str(raw, 'tool_call_id') ?? str(raw, 'id') ?? `tool-${step}`;
       if (ended.has(id)) {
         out.push({

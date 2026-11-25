@@ -265,6 +265,7 @@ describe('agy stale and recovered error handling', () => {
         denials: tx.denials,
         sawAnyToolCall: tx.stepsWereTools(),
         errorIsStale: tx.errorIsStale(),
+        finalText: tx.finalText(),
       });
 
       assert.equal(res.status, 'success');
@@ -469,5 +470,69 @@ describe('agy final message extraction', () => {
 
     assert.equal(res.status, 'success');
     assert.equal(res.response, 'Fallback report.');
+  });
+
+  it('denies when tool is denied after prose and result.response is empty', () => {
+    const tx = createAgyTranslator(2000);
+    tx.onEvent({ event: 'step_update', step_update: { step_index: 1, step_type: 'agent_response', state: 'DONE', text_delta: 'Let me run the command.' } });
+    tx.onEvent({ event: 'step_update', step_update: { step_index: 2, step_type: 'tool', state: 'ACTIVE', tool_name: 'run_command', tool_info: {} } });
+    tx.onEvent({ event: 'step_update', step_update: { step_index: 2, step_type: 'tool', state: 'ERROR', tool_name: 'run_command', tool_info: { error: { type: 'TOOL_ERROR', message: 'permission check failed' } } } });
+
+    const res = buildResult({
+      jobId: 'agy-denied-after-prose',
+      resultEvent: { status: 'SUCCESS', response: '', denied_actions: [{ action: 'command', display_name: 'RunCommand' }] },
+      exit: { code: 0, signal: null, killReason: undefined, stderr: '' },
+      startedAtMs: Date.now() - 10,
+      stateDir: '/tmp',
+      denials: tx.denials,
+      sawAnyToolCall: tx.stepsWereTools(),
+      errorIsStale: tx.errorIsStale(),
+      finalText: tx.finalText(),
+    });
+
+    assert.equal(res.status, 'denied');
+    assert.equal(res.response, '');
+  });
+
+  it('does not succeed when tool follows prose and result.response is empty', () => {
+    const tx = createAgyTranslator(2000);
+    tx.onEvent({ event: 'step_update', step_update: { step_index: 1, step_type: 'agent_response', state: 'DONE', text_delta: 'Checking...' } });
+    tx.onEvent({ event: 'step_update', step_update: { step_index: 2, step_type: 'tool', state: 'ACTIVE', tool_name: 'run_command', tool_info: {} } });
+    tx.onEvent({ event: 'step_update', step_update: { step_index: 2, step_type: 'tool', state: 'DONE', tool_name: 'run_command', tool_info: { output: 'ok' } } });
+
+    const res = buildResult({
+      jobId: 'agy-empty-after-tool',
+      resultEvent: { status: 'SUCCESS', response: '' },
+      exit: { code: 0, signal: null, killReason: undefined, stderr: '' },
+      startedAtMs: Date.now() - 10,
+      stateDir: '/tmp',
+      denials: tx.denials,
+      sawAnyToolCall: tx.stepsWereTools(),
+      errorIsStale: tx.errorIsStale(),
+      finalText: tx.finalText(),
+    });
+
+    assert.notEqual(res.status, 'success');
+    assert.equal(res.response, '');
+  });
+
+  it('errors when result is ERROR with empty response after prose and no error_message step', () => {
+    const tx = createAgyTranslator(2000);
+    tx.onEvent({ event: 'step_update', step_update: { step_index: 1, step_type: 'agent_response', state: 'DONE', text_delta: 'Working...' } });
+
+    const res = buildResult({
+      jobId: 'agy-error-empty-response',
+      resultEvent: { status: 'ERROR', response: '', error: 'upstream failed' },
+      exit: { code: 0, signal: null, killReason: undefined, stderr: '' },
+      startedAtMs: Date.now() - 10,
+      stateDir: '/tmp',
+      denials: tx.denials,
+      sawAnyToolCall: tx.stepsWereTools(),
+      errorIsStale: tx.errorIsStale(),
+      finalText: tx.finalText(),
+    });
+
+    assert.equal(res.status, 'error');
+    assert.equal(res.response, '');
   });
 });

@@ -489,3 +489,19 @@ test('warmCatalogs discovers once in the background and a spawn joins it instead
   rejecting.warmCatalogs();
   await new Promise(r => setImmediate(r));
 });
+
+test('AGENT_SMITH_CODEX_SANDBOX=danger-full-access reports effective unrestricted: true in ack and manifest', async () => {
+  const prior = process.env['AGENT_SMITH_CODEX_SANDBOX'];
+  process.env['AGENT_SMITH_CODEX_SANDBOX'] = 'danger-full-access';
+  try {
+    const f = fakeProvider('codex');
+    const { service, repo } = svc(f);
+    const ack = await service.spawnJob({ mode: 'implement', prompt: 'x', provider: 'codex', unrestricted: false });
+    assert.equal(ack.unrestricted, true);
+    const manifest = JSON.parse(readFileSync(path.join(repo, '.agent-smith/jobs', ack.jobId, 'job.json'), 'utf8')) as { unrestricted: boolean };
+    assert.equal(manifest.unrestricted, true);
+  } finally {
+    if (prior === undefined) delete process.env['AGENT_SMITH_CODEX_SANDBOX'];
+    else process.env['AGENT_SMITH_CODEX_SANDBOX'] = prior;
+  }
+});

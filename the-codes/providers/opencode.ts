@@ -350,7 +350,6 @@ export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
     onEvent: () => [],
   };
   let step = 0;
-  let resetOnNextText = false;
   const partStep = new Map<string, number>();
 
   const translate = (raw: Record<string, unknown>): ProviderEvent[] => {
@@ -448,7 +447,7 @@ export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
       `anon-${step}`;
 
     if (toolName !== undefined && (stateWord !== '' || isToolType)) {
-      resetOnNextText = true;
+      tx.finalText = '';
       const isDone = DONE_WORDS.has(stateWord) || type.endsWith('.completed') || type.endsWith('.done');
       const isErr = ERROR_WORDS.has(stateWord) || type.endsWith('.error');
       const errorTexts = [
@@ -532,10 +531,6 @@ export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
     const isThinking = type.includes('thinking') || type.includes('reasoning');
     if (text !== undefined && text !== '') {
       if (!isThinking) {
-        if (resetOnNextText) {
-          tx.finalText = '';
-          resetOnNextText = false;
-        }
         if (tx.finalText !== '') tx.finalText += '\n';
         tx.finalText += text;
       }
@@ -544,10 +539,14 @@ export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
       // it doubles as a terminal marker candidate below.
       return out;
     }
+    if (text === '' && !isThinking && (type === 'text' || partType === 'text')) {
+      tx.finalText = '';
+      return out;
+    }
 
     // ---- step boundaries ----------------------------------------------------
     if (isStepStart || isStepFinish) {
-      if (isStepStart) resetOnNextText = true;
+      if (isStepStart) tx.finalText = '';
       // Verified in the installed OpenCode CLI: session.step.ended emits
       // step_finish with part.reason = data.finish. Tool-call/length finishes
       // end only a step; "stop" confirms the assistant finished normally.

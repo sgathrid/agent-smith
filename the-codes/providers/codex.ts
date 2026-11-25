@@ -438,9 +438,13 @@ export function createCodexTranslator(maxChars: number): CodexTranslator {
       // Assistant prose.
       if (itemType === 'agent_message') {
         const text = str(item, 'text');
-        if (text !== undefined && text !== '') {
-          state.finalText = text;
-          out.push({ kind: 'text', at, text, stream: 'assistant' });
+        if (text !== undefined) {
+          if (text === '') {
+            state.finalText = '';
+          } else {
+            state.finalText = text;
+            out.push({ kind: 'text', at, text, stream: 'assistant' });
+          }
         }
         return out;
       }
@@ -458,6 +462,7 @@ export function createCodexTranslator(maxChars: number): CodexTranslator {
 
       if (NON_TOOL_ITEM_TYPES.has(itemType)) return out;
 
+      state.finalText = '';
       // ---- tool-ish items ----------------------------------------------------
       const tool = itemTool.get(itemId) ?? toolLabelFor(itemType, item);
       if (!itemTool.has(itemId)) itemTool.set(itemId, tool);
@@ -602,6 +607,9 @@ export function buildResult(args: {
     // turn.completed arrived but the process still failed. Corroboration wins.
     status = 'error';
     error = tx.error ?? `exited ${exit.code}${stderrClause(exit.stderr)}`;
+  } else if (tx.finalText.trim() === '') {
+    status = 'malformed';
+    error = `no output${stderrClause(exit.stderr)}`;
   } else {
     status = 'success';
   }

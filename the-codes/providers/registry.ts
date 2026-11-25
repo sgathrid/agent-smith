@@ -99,6 +99,21 @@ export interface AvailabilityProbe {
   reason?: string;
 }
 
+export function effectiveDefaultUnrestricted(provider: Pick<Provider, 'defaultUnrestricted'> | undefined): boolean | 'always' {
+  if (provider?.defaultUnrestricted === 'always') return 'always';
+  return provider?.defaultUnrestricted === true && process.env['AGENT_SMITH_AGY_RESTRICTED'] !== '1';
+}
+
+export function effectiveUnrestricted(
+  provider: Pick<Provider, 'name' | 'defaultUnrestricted'>,
+  requested: boolean | undefined,
+): boolean {
+  const def = effectiveDefaultUnrestricted(provider);
+  if (def === 'always') return true;
+  if (provider.name === 'codex' && process.env['AGENT_SMITH_CODEX_SANDBOX'] === 'danger-full-access') return true;
+  return requested ?? def;
+}
+
 export async function probeAvailability(providers: readonly Provider[] = PROVIDERS): Promise<AvailabilityProbe[]> {
   return Promise.all(
     providers.map(async (p): Promise<AvailabilityProbe> => {

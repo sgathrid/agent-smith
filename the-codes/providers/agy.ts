@@ -336,6 +336,7 @@ export function createAgyTranslator(maxChars: number) {
 
       // --- tool calls ---------------------------------------------------------
       if (stepType === 'tool') {
+        lastProseStep = undefined;
         const info = su.tool_info;
         const toolName = su.tool_name ?? info?.name ?? 'unknown';
         const mem = steps.get(stepIndex) ?? {};
@@ -385,6 +386,7 @@ export function createAgyTranslator(maxChars: number) {
 
       // --- error_message: agy's own API/transport errors ----------------------
       if (stepType === 'error_message') {
+        lastProseStep = undefined;
         sawErrorStep = true;
         progressedAfterError = false;
         // agy's stream carries no error text here; the final result does.
@@ -446,7 +448,10 @@ export function buildResult(args: {
   const { errorIsStale } = args;
   const durationMs = Date.now() - startedAtMs;
 
-  const response = args.finalText ?? resultEvent?.response ?? '';
+  const explicitEmptyResult = resultEvent?.response !== undefined && resultEvent.response.trim() === '';
+  const finalText = args.finalText !== undefined && args.finalText.trim() !== '' ? args.finalText : undefined;
+  const resultResponse = resultEvent?.response !== undefined && resultEvent.response.trim() !== '' ? resultEvent.response : undefined;
+  const response = explicitEmptyResult ? '' : (finalText ?? resultResponse ?? '');
   const reportedStatus = resultEvent?.status;
   const usage = toTokenUsage(resultEvent?.usage);
 

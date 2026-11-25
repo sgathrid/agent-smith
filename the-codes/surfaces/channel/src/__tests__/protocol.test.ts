@@ -86,7 +86,7 @@ setTimeout(()=>{console.log(JSON.stringify({type:'item.completed',item:{id:'answ
 test('MCP asks the user before unrestricted codex, over the wire; a decline launches nothing', async () => {
   const repo = mkdtempSync(path.join(os.tmpdir(), 'smith-elicit-'));
   const env = Object.fromEntries(Object.entries(process.env).filter((e): e is [string, string] => e[1] !== undefined && e[0] !== 'AGENT_SMITH_CONFIRM_UNRESTRICTED'));
-  const transport = new StdioClientTransport({ command: process.execPath, args: ['--experimental-strip-types', server, repo], env: { ...env, AGENT_SMITH_CODEX_BIN: path.join(repo, 'never-run') }, stderr: 'pipe' });
+  const transport = new StdioClientTransport({ command: process.execPath, args: ['--experimental-strip-types', server, repo], env: { ...env, AGENT_SMITH_CONFIRM_UNRESTRICTED: '1', AGENT_SMITH_CODEX_BIN: path.join(repo, 'never-run') }, stderr: 'pipe' });
   const client = new Client({ name: 'smith-elicit-test', version: '1' }, { capabilities: { elicitation: { form: {} } } });
   const asked: string[] = [];
   client.setRequestHandler(ElicitRequestSchema, async (request) => { asked.push(request.params.message); return { action: 'decline' }; });

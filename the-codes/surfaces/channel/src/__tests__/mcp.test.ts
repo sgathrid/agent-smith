@@ -7,6 +7,13 @@ import { waitFor } from '../../../../forge/testing/time.ts';
 import { createSmithServer } from '../mcp.ts';
 import { withWorkerLookup } from './service-mock.ts';
 
+const priorConfirm = process.env.AGENT_SMITH_CONFIRM_UNRESTRICTED;
+process.env.AGENT_SMITH_CONFIRM_UNRESTRICTED = '1';
+test.after(() => {
+  if (priorConfirm === undefined) delete process.env.AGENT_SMITH_CONFIRM_UNRESTRICTED;
+  else process.env.AGENT_SMITH_CONFIRM_UNRESTRICTED = priorConfirm;
+});
+
 function fixture() {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   let launches = 0;

@@ -40,7 +40,7 @@ Agy and kimi run unrestricted by default; other providers run restricted. Headle
 ask for permission, so restricted agy denies its own tools, reports success and does
 nothing. Kimi's print mode always runs unrestricted and has no per-run effort flag; the
 ack's warnings say so. If a restricted worker fails because a tool was
-denied, ask the user before retrying with `unrestricted: true`.
+denied, ask the user before retrying with `unrestricted: true` (it is honoured without a server prompt by default).
 
 ## While it runs
 
