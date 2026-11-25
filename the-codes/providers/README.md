@@ -139,14 +139,26 @@ explicit deny.
 ### codex — `codex.ts`
 
 ```
-codex exec --json --skip-git-repo-check -C <cwd>
-    [--model <id>] [--add-dir <dir>]...
-    (-s workspace-write | --dangerously-bypass-approvals-and-sandbox)
+codex exec --json --skip-git-repo-check -c approval_policy="never" -C <cwd>
+    [--model <id>] [-c model_reasoning_effort=<effort>] [--add-dir <dir>]...
+    (-s <read-only|workspace-write> | -c default_permissions=... | --dangerously-bypass-approvals-and-sandbox)
+    <prompt>
+
+codex exec resume <thread_id> --json --skip-git-repo-check -c approval_policy="never"
+    [--model <id>] [-c model_reasoning_effort=<effort>]
+    (-c sandbox_mode=<mode> | -c default_permissions=... | --dangerously-bypass-approvals-and-sandbox)
     <prompt>
 ```
 
-Verified by running `--help` on 0.161.0 (flags re-checked after an upgrade from
-0.160.1) and by executing the exact command end to end.
+Flags re-checked against `codex exec --help` and `codex exec resume --help` on
+0.172.0; JSONL event and item shapes checked against `codex-rs/exec/src/exec_events.rs`
+at `rust-v0.172.0`. The last live end-to-end run was on 0.160.1.
+
+`-c approval_policy="never"` is always passed on both `exec` and `exec resume`
+so headless workers never inherit an interactive/reviewer policy that rejects
+actions. Cancellation and timeout send `SIGINT` first (escalating to `SIGKILL`
+after 5 s) because `codex exec` only traps `SIGINT` to send `turn/interrupt` and
+record the abort in thread history; other providers use `SIGTERM`→`SIGKILL`.
 
 Events observed live: `thread.started` (`thread_id`), `turn.started`,
 `item.completed` (`item:{id,type:'agent_message',text}`),
@@ -318,11 +330,13 @@ empty model response. **Nothing is ever silently dropped.** The first run agains
 a funded account should be treated as a discovery run — read the
 "unrecognised event type" notices and extend the parser.
 
-**codex.** `item.started` / `item.updated` are handled if they exist and ignored
-if not (`--help` does not enumerate event names, and my run made no tool calls).
-The tool `item.type` vocabulary (`command_execution`, `file_change`,
-`mcp_tool_call`, `reasoning`, `todo_list`) comes from Codex's docs, not local
-observation. Denial detection from message text is unverified.
+**codex.** Event and item shapes (`item.started`/`updated`/`completed`,
+`agent_message`, `reasoning`, `command_execution`, `file_change`,
+`mcp_tool_call`, `collab_tool_call`, `web_search`, `todo_list`, `error`, and
+status enums including `declined`) are verified against `exec_events.rs` at
+`rust-v0.172.0`. No live run has been performed since 0.160.1, so tool-call
+items, resume, and `SIGINT`-interrupt behaviour are source-verified rather than
+live-observed; message-text fallback denial detection remains unverified.
 
 **claude.** `user` messages carrying `tool_result` are documented but absent
 from my run (no tool calls). `--max-turns` accepted in print mode is untested.
@@ -333,9 +347,10 @@ deliberately not passed; `--project` has no `SpawnSpec` field and is a harness
 concern.
 
 **Not tested at all:** concurrent spawn of many workers per provider (the
-concurrency cap lives outside this layer), and behaviour when a worker ignores
-SIGTERM mid-tool-call (escalation to SIGKILL after 5 s is implemented but only
-exercised by the orphan-descendant test).
+concurrency cap lives outside this layer), and behaviour when a live worker
+ignores its first signal (`SIGTERM`, or `SIGINT` for codex) mid-tool-call
+(escalation to `SIGKILL` after 5 s is implemented and exercised with fake
+workers).
 
 ## Environment overrides
 

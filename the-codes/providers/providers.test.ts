@@ -12,6 +12,7 @@ import { buildArgv as buildKimiArgv, buildResult as buildKimiResult, createKimiT
 import { recoveredErrorNotice, spawnWorker } from './ndjson.ts';
 import { getProvider } from './registry.ts';
 import type { ProviderEvent, SpawnSpec } from './types.ts';
+import { classify } from '../surfaces/mod/hooks/progress.ts';
 import { scaled, waitFor } from '../forge/testing/time.ts';
 import { trackedTempDirs } from '../forge/testing/tmp.ts';
 
@@ -53,11 +54,243 @@ test('Codex argv applies effort and resumes the supplied thread', () => {
   assert.equal(argv.at(-1), 'continue the work');
 });
 
+test('Codex argv pins approval_policy="never" for exec and exec resume across every sandbox branch', () => {
+  const saved = process.env['AGENT_SMITH_CODEX_SANDBOX'];
+  delete process.env['AGENT_SMITH_CODEX_SANDBOX'];
+  const hasApprovalNever = (argv: string[]): boolean =>
+    argv.some((a, i) => a === '-c' && argv[i + 1] === 'approval_policy="never"');
+  try {
+    const branches: Partial<SpawnSpec>[] = [
+      { unrestricted: false },
+      { unrestricted: false, readOnly: true },
+      { unrestricted: false, readOnly: true, artifactPath: '/tmp/out.md' },
+      { unrestricted: true },
+    ];
+    for (const conversation of [undefined, 'thread-123']) {
+      for (const branch of branches) {
+        const argv = buildCodexArgv(spec({ ...branch, ...(conversation === undefined ? {} : { conversation }) }));
+        assert.ok(hasApprovalNever(argv), `missing -c approval_policy="never" in ${JSON.stringify(argv)}`);
+      }
+    }
+    process.env['AGENT_SMITH_CODEX_SANDBOX'] = 'read-only';
+    for (const conversation of [undefined, 'thread-123']) {
+      const argv = buildCodexArgv(spec(conversation === undefined ? {} : { conversation }));
+      assert.ok(hasApprovalNever(argv), `missing -c approval_policy="never" with env sandbox in ${JSON.stringify(argv)}`);
+    }
+  } finally {
+    if (saved === undefined) delete process.env['AGENT_SMITH_CODEX_SANDBOX'];
+    else process.env['AGENT_SMITH_CODEX_SANDBOX'] = saved;
+  }
+});
+
 test('Codex rejects an effort the CLI adapter does not support', () => {
   assert.throws(
     () => buildCodexArgv(spec({ effort: 'maximum-ish' })),
     /codex does not support effort 'maximum-ish'/,
   );
+});
+
+test('Codex translator maps exec_events.rs item schemas: reasoning, collab, file_change, mcp, web_search, statuses, unknown', () => {
+  const tx = createCodexTranslator(200);
+
+  const reasoning = tx.onEvent({
+    type: 'item.completed',
+    item: { id: 'r1', type: 'reasoning', text: 'Checking auth middleware first.' },
+  });
+  assert.equal(reasoning.length, 1);
+  assert.ok(reasoning[0]?.kind === 'text');
+  assert.equal(reasoning[0].stream, 'thinking');
+  assert.equal(reasoning[0].text, 'Checking auth middleware first.');
+  assert.deepEqual(
+    tx.onEvent({ type: 'item.completed', item: { id: 'r2', type: 'reasoning', text: '' } }),
+    [],
+  );
+
+  const collabStart = tx.onEvent({
+    type: 'item.started',
+    item: {
+      id: 'c1',
+      type: 'collab_tool_call',
+      tool: 'spawn_agent',
+      sender_thread_id: 'thr_parent',
+      receiver_thread_ids: ['thr_child'],
+      prompt: 'Audit the parser',
+      agents_states: {},
+      status: 'in_progress',
+    },
+  });
+  assert.equal(collabStart.length, 1);
+  assert.ok(collabStart[0]?.kind === 'activity-start');
+  assert.equal(collabStart[0].activity.tool, 'collab/spawn_agent');
+  assert.equal(collabStart[0].activity.input, 'thr_child: Audit the parser');
+
+  const collabEnd = tx.onEvent({
+    type: 'item.completed',
+    item: {
+      id: 'c1',
+      type: 'collab_tool_call',
+      tool: 'spawn_agent',
+      sender_thread_id: 'thr_parent',
+      receiver_thread_ids: ['thr_child'],
+      prompt: 'Audit the parser',
+      agents_states: { thr_child: { status: 'completed', message: 'clean' } },
+      status: 'completed',
+    },
+  });
+  assert.equal(collabEnd.length, 1);
+  assert.ok(collabEnd[0]?.kind === 'activity-end');
+  assert.equal(collabEnd[0].activity.stepIndex, collabStart[0].activity.stepIndex);
+  assert.equal(collabEnd[0].activity.tool, 'collab/spawn_agent');
+  assert.equal(collabEnd[0].activity.output, 'thr_child: completed (clean)');
+  assert.equal(collabEnd[0].status, 'done');
+
+  const collabFail = tx.onEvent({
+    type: 'item.completed',
+    item: {
+      id: 'c2',
+      type: 'collab_tool_call',
+      tool: 'wait',
+      sender_thread_id: 'thr_parent',
+      receiver_thread_ids: ['thr_child'],
+      prompt: null,
+      agents_states: {},
+      status: 'failed',
+    },
+  });
+  assert.ok(collabFail[0]?.kind === 'activity-end');
+  assert.equal(collabFail[0].activity.tool, 'collab/wait');
+  assert.equal(collabFail[0].activity.input, 'thr_child');
+  assert.equal(collabFail[0].status, 'error');
+
+  const fileOk = tx.onEvent({
+    type: 'item.completed',
+    item: {
+      id: 'f1',
+      type: 'file_change',
+      changes: [
+        { path: 'src/a.ts', kind: 'update' },
+        { path: 'src/b.ts', kind: 'add' },
+      ],
+      status: 'completed',
+    },
+  });
+  assert.ok(fileOk[0]?.kind === 'activity-end');
+  assert.equal(fileOk[0].activity.tool, 'file_change');
+  assert.deepEqual(JSON.parse(fileOk[0].activity.input ?? ''), {
+    changes: [
+      { path: 'src/a.ts', kind: 'update' },
+      { path: 'src/b.ts', kind: 'add' },
+    ],
+  });
+  assert.deepEqual(classify(fileOk[0].activity.tool, fileOk[0].activity.input), {
+    kind: 'edit',
+    label: 'editing a.ts',
+    path: 'src/a.ts',
+  });
+  assert.equal(fileOk[0].status, 'done');
+
+  const fileFail = tx.onEvent({
+    type: 'item.completed',
+    item: {
+      id: 'f2',
+      type: 'file_change',
+      changes: [{ path: 'src/c.ts', kind: 'delete' }],
+      status: 'failed',
+    },
+  });
+  assert.ok(fileFail[0]?.kind === 'activity-end');
+  assert.deepEqual(JSON.parse(fileFail[0].activity.input ?? ''), {
+    changes: [{ path: 'src/c.ts', kind: 'delete' }],
+  });
+  assert.equal(fileFail[0].status, 'error');
+
+  const mcpStart = tx.onEvent({
+    type: 'item.started',
+    item: {
+      id: 'm1',
+      type: 'mcp_tool_call',
+      server: 'github',
+      tool: 'get_pr',
+      arguments: { number: 42 },
+      result: null,
+      error: null,
+      status: 'in_progress',
+    },
+  });
+  assert.ok(mcpStart[0]?.kind === 'activity-start');
+  assert.equal(mcpStart[0].activity.tool, 'github/get_pr');
+  assert.equal(mcpStart[0].activity.input, '{"number":42}');
+
+  const mcpEnd = tx.onEvent({
+    type: 'item.completed',
+    item: {
+      id: 'm1',
+      type: 'mcp_tool_call',
+      server: 'github',
+      tool: 'get_pr',
+      arguments: { number: 42 },
+      result: { content: [{ type: 'text', text: 'PR #42' }], structured_content: null },
+      error: null,
+      status: 'completed',
+    },
+  });
+  assert.ok(mcpEnd[0]?.kind === 'activity-end');
+  assert.equal(mcpEnd[0].activity.stepIndex, mcpStart[0].activity.stepIndex);
+  assert.equal(mcpEnd[0].activity.tool, 'github/get_pr');
+  assert.match(mcpEnd[0].activity.output ?? '', /PR #42/);
+  assert.equal(mcpEnd[0].status, 'done');
+
+  const searchStart = tx.onEvent({
+    type: 'item.started',
+    item: { id: 'w1', type: 'web_search', query: 'codex exec jsonl schema', action: { type: 'search' } },
+  });
+  assert.ok(searchStart[0]?.kind === 'activity-start');
+  assert.equal(searchStart[0].activity.tool, 'web_search');
+  assert.deepEqual(JSON.parse(searchStart[0].activity.input ?? ''), { query: 'codex exec jsonl schema' });
+  assert.deepEqual(classify(searchStart[0].activity.tool, searchStart[0].activity.input), {
+    kind: 'search',
+    label: 'searching codex exec jsonl schema',
+  });
+
+  const searchEnd = tx.onEvent({
+    type: 'item.completed',
+    item: {
+      id: 'w1',
+      type: 'web_search',
+      query: 'codex exec jsonl schema',
+      action: { type: 'search' },
+      results: [{ title: 'exec_events.rs' }],
+    },
+  });
+  assert.ok(searchEnd[0]?.kind === 'activity-end');
+  assert.deepEqual(JSON.parse(searchEnd[0].activity.input ?? ''), { query: 'codex exec jsonl schema' });
+  assert.match(searchEnd[0].activity.output ?? '', /exec_events\.rs/);
+  assert.equal(searchEnd[0].status, 'done');
+
+  const cmdFail = tx.onEvent({
+    type: 'item.completed',
+    item: { id: 'cmd-fail', type: 'command_execution', command: 'false', aggregated_output: 'boom', exit_code: 1, status: 'failed' },
+  });
+  assert.ok(cmdFail[0]?.kind === 'activity-end');
+  assert.equal(cmdFail[0].status, 'error');
+  assert.equal(cmdFail[0].activity.output, 'boom');
+
+  const cmdDeclined = tx.onEvent({
+    type: 'item.completed',
+    item: { id: 'cmd-dec', type: 'command_execution', command: 'rm -rf /', aggregated_output: '', exit_code: null, status: 'declined' },
+  });
+  assert.ok(cmdDeclined[0]?.kind === 'activity-end');
+  assert.equal(cmdDeclined[0].status, 'denied');
+  assert.equal(cmdDeclined[0].activity.denied, true);
+
+  const unknown = tx.onEvent({
+    type: 'item.completed',
+    item: { id: 'u1', type: 'future_tool_kind', payload: 1 },
+  });
+  assert.equal(unknown.length, 1);
+  assert.ok(unknown[0]?.kind === 'notice');
+  assert.equal(unknown[0].level, 'info');
+  assert.match(unknown[0].message, /unrecognised item type "future_tool_kind"/);
 });
 
 test('Codex completed file and MCP items without exit codes are successful activities', () => {

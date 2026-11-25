@@ -1,56 +1,62 @@
 /**
  * providers/codex.ts — OpenAI Codex CLI adapter (`codex exec`).
  *
- * VERIFICATION LEVEL: HIGH. Every flag below was read out of `codex exec --help`
- * on codex-cli 0.160.1 on this machine, and the whole invocation was then run
- * live end to end. See the transcript at the bottom of this file header.
- *
  * ----------------------------------------------------------------------------
- * VERIFIED FLAGS (`codex exec --help`, v0.160.1)
+ * VERIFIED FLAGS (`codex exec --help` / `codex exec resume --help`, v0.172.0)
  * ----------------------------------------------------------------------------
- *   codex exec [PROMPT]            non-interactive; "Use Codex non-interactively"
- *   --json                         "Print events to stdout as JSONL"
- *   -m, --model <MODEL>
- *   -C, --cd <DIR>                 working root, independent of our spawn cwd
- *   -s, --sandbox <read-only|workspace-write|danger-full-access>
- *   --add-dir <DIR>                widen the writable sandbox
+ *   codex exec [PROMPT]            non-interactive; "Run Codex non-interactively"
+ *   --json                         "Print events to stdout as JSONL" (exec & resume)
+ *   -m, --model <MODEL>            (exec & resume)
+ *   -C, --cd <DIR>                 working root, independent of spawn cwd (exec only)
+ *   -s, --sandbox <read-only|workspace-write|danger-full-access> (exec only;
+ *                                  resume uses `-c sandbox_mode="..."`)
+ *   --add-dir <DIR>                widen the writable sandbox (exec only)
  *   --skip-git-repo-check          "Allow running Codex outside a Git repository"
  *   --dangerously-bypass-approvals-and-sandbox
  *                                  "Skip all confirmation prompts and execute
  *                                   commands without sandboxing."
  *   --ephemeral                    do not persist session files
- *   --ignore-user-config           skip ~/.codex/config.toml (auth still used)
- *   -c key=value                   dotted-path config override, TOML-parsed
+ *   --ignore-user-config           skip $CODEX_HOME/config.toml (auth still used)
+ *   -c, --config <key=value>       dotted-path config override, TOML-parsed (exec & resume)
  *   -o, --output-last-message <FILE>  write final message to a file
  *   --output-schema <FILE>         JSON Schema for the final response
  *
- * VERIFIED EVENT SHAPES (live, codex exec --json):
+ * VERIFIED EVENT SHAPES (`codex-rs/exec/src/exec_events.rs`, rust-v0.172.0):
  *
- *   {"type":"thread.started","thread_id":"01a113ee-..."}
- *   {"type":"turn.started"}
- *   {"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"OK"}}
- *   {"type":"turn.completed","usage":{"input_tokens":22319,
- *       "cached_input_tokens":12288,"cache_write_input_tokens":0,
- *       "output_tokens":5,"reasoning_output_tokens":0}}
+ *   Top-level `ThreadEvent` (`type`):
+ *     thread.started  { thread_id }
+ *     turn.started    {}
+ *     turn.completed  { usage: { input_tokens, cached_input_tokens,
+ *                       cache_write_input_tokens, output_tokens,
+ *                       reasoning_output_tokens } }
+ *     turn.failed     { error: { message } }
+ *     item.started | item.updated | item.completed  { item: { id, type, ... } }
+ *     error           { message }
+ *
+ *   Flattened `ThreadItemDetails` (`item.type`):
+ *     agent_message      { text }
+ *     reasoning          { text }
+ *     command_execution  { command, aggregated_output, exit_code?,
+ *                          status: in_progress|completed|failed|declined }
+ *     file_change        { changes: [{ path, kind: add|delete|update }],
+ *                          status: in_progress|completed|failed }
+ *     mcp_tool_call      { server, tool, arguments, result?, error?,
+ *                          status: in_progress|completed|failed }
+ *     collab_tool_call   { tool: spawn_agent|send_input|wait|close_agent,
+ *                          sender_thread_id, receiver_thread_ids, prompt?,
+ *                          agents_states, status: in_progress|completed|failed }
+ *     web_search         { id, query, action, results? }
+ *     todo_list          { items: [{ text, completed }] }
+ *     error              { message }
  *
  * NOTE ON THE USAGE SHAPE: codex reports `cached_input_tokens` and
  * `cache_write_input_tokens`, NOT `cache_read_tokens` as agy does. We map
  * cached -> cacheReadTokens and cache_write -> cacheWriteTokens. There is no
  * `total_tokens`; we leave it undefined rather than inventing one. (Note also
- * that codex's input_tokens already appears to INCLUDE cached tokens in this
- * run — 22319 in, 12288 cached. We report what the CLI says and let consumers
- * decide the accounting policy; silently double-subtracting would be worse.)
- *
- * UNVERIFIED (documented in --help or upstream docs but NOT observed locally):
- *   - `item.started` and `item.updated`. `--help` does not enumerate event
- *     names and my live run produced no tool calls, so I never saw an in-flight
- *     tool event. The parser below HANDLES them if they exist and ignores them
- *     if they do not. See README "UNVERIFIED".
- *   - The exact `item.type` vocabulary for tools. I observed `agent_message`
- *     only. `command_execution`, `file_change`, `mcp_tool_call`, `reasoning`
- *     and `todo_list` appear in Codex's own docs and are handled defensively.
- *   - Whether `codex exec` ever exits 0 on a failed turn. Assumed it does not,
- *     but exit code is treated as corroboration, not proof — see buildResult.
+ * that codex's input_tokens already appears to INCLUDE cached tokens in the
+ * 0.160.1 run — 22319 in, 12288 cached. We report what the CLI says and let
+ * consumers decide the accounting policy; silently double-subtracting would be
+ * worse.)
  *
  * ----------------------------------------------------------------------------
  * TWO BEHAVIOURS THAT WILL BITE ANYONE WHO SPAWNS THIS NAIVELY
@@ -92,6 +98,7 @@ import {
   preview,
   runNdjsonWorker,
   str,
+  truncate,
 } from './ndjson.ts';
 import type { ExitInfo } from './ndjson.ts';
 import type {
@@ -238,6 +245,10 @@ export function buildArgv(spec: SpawnSpec): string[] {
   // Verified necessary outside a git repo; see header note 2.
   argv.push('--skip-git-repo-check');
 
+  // Pin approval_policy="never" unconditionally so headless workers never
+  // inherit a saved interactive/reviewer policy that rejects actions.
+  argv.push('-c', 'approval_policy="never"');
+
   // `exec resume --help` does not expose -C; resumed sessions retain their
   // original working directory. New sessions get an explicit root.
   if (!resuming) argv.push('-C', spec.cwd);
@@ -299,20 +310,13 @@ function toTokenUsage(u: CodexUsage | undefined): TokenUsage | undefined {
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
-/**
- * Codex item types that represent a tool call, and the label we show for each.
- *
- * ONLY `agent_message` is VERIFIED (observed live). The rest come from Codex's
- * public docs and are mapped defensively: an unknown item type falls through to
- * a generic tool activity rather than being dropped, so progress never silently
- * disappears because the CLI added a type.
- */
 const KNOWN_ITEM_TYPES = new Set([
   'agent_message',
   'reasoning',
   'command_execution',
   'file_change',
   'mcp_tool_call',
+  'collab_tool_call',
   'web_search',
   'todo_list',
   'error',
@@ -320,6 +324,44 @@ const KNOWN_ITEM_TYPES = new Set([
 
 /** Item types that are NOT tool calls and must not become activities. */
 const NON_TOOL_ITEM_TYPES = new Set(['agent_message', 'reasoning', 'todo_list']);
+
+function formatCollabInput(item: Record<string, unknown>): string | undefined {
+  const receivers = Array.isArray(item['receiver_thread_ids']) ? item['receiver_thread_ids'].join(', ') : '';
+  return [receivers, str(item, 'prompt') ?? ''].filter((s) => s !== '').join(': ') || undefined;
+}
+
+function formatCollabOutput(states: Record<string, unknown> | undefined): string | undefined {
+  const parts = Object.keys(states ?? {}).map((id) => {
+    const status = str(obj(states, id), 'status');
+    const message = str(obj(states, id), 'message');
+    return message ? `${id}: ${status} (${message})` : `${id}: ${status}`;
+  });
+  return parts.length > 0 ? parts.join('; ') : undefined;
+}
+
+function toolLabelFor(itemType: string, item: Record<string, unknown>): string {
+  if (itemType === 'command_execution') return str(item, 'command') ?? itemType;
+  if (itemType === 'mcp_tool_call') return `${str(item, 'server')}/${str(item, 'tool')}`;
+  if (itemType === 'collab_tool_call') return `collab/${str(item, 'tool')}`;
+  return itemType;
+}
+
+function inputPreviewFor(itemType: string, item: Record<string, unknown>, maxChars: number) {
+  if (itemType === 'command_execution') return preview(item['command'], maxChars);
+  if (itemType === 'file_change') return preview({ changes: item['changes'] }, maxChars);
+  if (itemType === 'mcp_tool_call') return preview(item['arguments'], maxChars);
+  if (itemType === 'collab_tool_call') return preview(formatCollabInput(item), maxChars);
+  if (itemType === 'web_search') return preview({ query: item['query'] }, maxChars);
+  return preview(item['input'], maxChars);
+}
+
+function outputPreviewFor(itemType: string, item: Record<string, unknown>, maxChars: number) {
+  if (itemType === 'mcp_tool_call') return preview(item['result'] ?? str(obj(item, 'error'), 'message'), maxChars);
+  if (itemType === 'collab_tool_call') return preview(formatCollabOutput(obj(item, 'agents_states')), maxChars);
+  if (itemType === 'web_search') return preview(item['results'], maxChars);
+  if (itemType === 'error') return preview(item['message'], maxChars);
+  return preview(item['aggregated_output'] ?? item['output'], maxChars);
+}
 
 interface CodexTranslator {
   onEvent(raw: Record<string, unknown>): ProviderEvent[];
@@ -404,14 +446,9 @@ export function createCodexTranslator(maxChars: number): CodexTranslator {
         return out;
       }
 
-      // Reasoning. codex does not stream reasoning text in the JSONL we verified,
-      // only a token count in usage, so there is nothing to emit here beyond a
-      // notice. Kept so the branch is explicit rather than accidental.
       if (itemType === 'reasoning') {
-        const summary = preview(item['summary'], maxChars);
-        if (summary !== undefined) {
-          out.push({ kind: 'text', at, text: summary.text, stream: 'thinking' });
-        }
+        const text = str(item, 'text');
+        if (text) out.push({ kind: 'text', at, text: truncate(text, maxChars).text, stream: 'thinking' });
         return out;
       }
 
@@ -423,16 +460,11 @@ export function createCodexTranslator(maxChars: number): CodexTranslator {
       if (NON_TOOL_ITEM_TYPES.has(itemType)) return out;
 
       // ---- tool-ish items ----------------------------------------------------
-      const tool = itemTool.get(itemId) ?? str(item, 'command') ?? itemType;
+      const tool = itemTool.get(itemId) ?? toolLabelFor(itemType, item);
       if (!itemTool.has(itemId)) itemTool.set(itemId, tool);
 
-      // Command output arrives as `aggregated_output` / `output` on the item.
-      // The parameter shape differs per item type, so preview the whole item
-      // minus the id and hand it to the truncation helper. Better a slightly
-      // noisy preview than no visibility into what the worker ran.
-      const inputPreview =
-        itemType === 'command_execution' ? preview(item['command'], maxChars) : preview(item['input'], maxChars);
-      const outputPreview = preview(item['aggregated_output'] ?? item['output'], maxChars);
+      const inputPreview = inputPreviewFor(itemType, item, maxChars);
+      const outputPreview = outputPreviewFor(itemType, item, maxChars);
 
       if (type === 'item.started') {
         const idx = step++;
@@ -462,9 +494,8 @@ export function createCodexTranslator(maxChars: number): CodexTranslator {
       const idx = itemStep.get(itemId) ?? step++;
       itemStep.set(itemId, idx);
 
-      // codex item status field: UNVERIFIED name/shape. We read a few plausible
-      // spellings and fall back to "done", because a completed item that
-      // carries an explicit failure must not render as green.
+      // Status enums in exec_events.rs: in_progress | completed | failed
+      // (command_execution also has declined).
       const itemStatus = str(item, 'status') ?? str(item, 'state');
       const exitCode = itemType === 'command_execution' ? num(item, 'exit_code') : undefined;
       const itemResult = obj(item, 'result');
@@ -475,11 +506,6 @@ export function createCodexTranslator(maxChars: number): CodexTranslator {
         (exitCode !== undefined && exitCode !== 0);
       let status: ActivityStatus = explicitError ? 'error' : 'done';
 
-      // A codex tool call that needs approval it cannot get is the same failure
-      // shape as agy's soft denial: the work silently did not happen. We do not
-      // have a verified codex denial field, but the message text is stable
-      // enough to detect, and mis-rendering this as success is the expensive
-      // error. UNVERIFIED — see README.
       const error = obj(item, 'error');
       const denialReason = str(item, 'decision') ?? str(item, 'approval_status') ?? str(error, 'type');
       const messages = [str(error, 'message'), str(item, 'message')].filter((m) => m !== undefined).map((m) => m.toLowerCase());
@@ -516,9 +542,6 @@ export function createCodexTranslator(maxChars: number): CodexTranslator {
     }
 
     if (type === 'turn.failed') {
-      // UNVERIFIED: not observed locally, but it is the shape codex's docs
-      // describe for a failed turn. Handled so a failure is not mistaken for
-      // "the stream just ended".
       state.error = str(obj(raw, 'error'), 'message') ?? 'codex turn failed';
       out.push({
         kind: 'notice',
@@ -725,6 +748,9 @@ export const codexProvider: Provider = {
       spec,
       buildArgv,
       translate: tx.onEvent,
+      // codex exec only traps SIGINT (sending turn/interrupt so the abort is
+      // recorded in thread history); SIGTERM stops it without recording abort.
+      terminateSignal: 'SIGINT',
       // "Not inside a trusted directory..." is the single most useful line
       // codex emits and it is INFO-level, not an error — but it means the job
       // is dead. Level is about presentation, not job status.

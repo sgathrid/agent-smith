@@ -189,6 +189,7 @@ export interface SpawnWorkerOptions extends WorkerPumps {
   cwd: string;
   timeoutMs: number;
   killGraceMs?: number;
+  terminateSignal?: NodeJS.Signals;
   env?: NodeJS.ProcessEnv;
   stateDir: string;
   jobId: string;
@@ -254,9 +255,7 @@ export function spawnWorker(opts: SpawnWorkerOptions): Promise<WorkerProcess> {
     }
   }
 
-  // RULE 4: polite first, then escalate. SIGTERM gives the CLI a chance to flush
-  // its result file.
-  // Some CLIs ignore SIGTERM while a tool call is in flight, hence the SIGKILL.
+  const firstSignal: NodeJS.Signals = opts.terminateSignal ?? 'SIGTERM';
   function terminate(reason: 'cancelled' | 'timeout'): void {
     if (killReason !== undefined) return;
     killReason = reason;
@@ -265,7 +264,7 @@ export function spawnWorker(opts: SpawnWorkerOptions): Promise<WorkerProcess> {
       clearTimeout(timeoutTimer);
       timeoutTimer = undefined;
     }
-    signalTree('SIGTERM');
+    signalTree(firstSignal);
     killTimer = setTimeout(() => {
       killTimer = undefined;
       signalTree('SIGKILL');
@@ -501,6 +500,7 @@ export interface NdjsonWorkerConfig {
   preamble?: ProviderEvent[];
   intercept?(raw: Record<string, unknown>): boolean;
   stderrLevel?(text: string): 'info' | 'warn' | 'error';
+  terminateSignal?: NodeJS.Signals;
   buildResult(ctx: { jobId: string; startedAtMs: number; stateDir: string; exit: ExitInfo }): JobResult;
   afterResult?(result: JobResult): ProviderEvent[];
   input?: LiveInput;
@@ -543,6 +543,7 @@ export async function runNdjsonWorker(cfg: NdjsonWorkerConfig): Promise<WorkerHa
     jobId,
     mode: spec.mode,
     onHeartbeat: (at, pid) => bus.emit({ kind: 'heartbeat', at, ...(pid === undefined ? {} : { pid }) }),
+    ...(cfg.terminateSignal !== undefined ? { terminateSignal: cfg.terminateSignal } : {}),
     ...(spec.env !== undefined ? { env: spec.env } : {}),
     ...(cfg.input !== undefined ? { stdin: 'pipe' as const } : {}),
     onStdoutLine(line) {

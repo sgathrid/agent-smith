@@ -894,16 +894,16 @@ export class ForgeService {
     const conversation = typeof head.conversation === 'string' && head.conversation !== '' ? head.conversation : undefined;
     const steered = entries.some((e) => senderOf(e) === 'steer');
     let responseTail = '';
-    try { responseTail = readFileSync(jobFile(this.repo, head.jobId, FILES.report), 'utf8').trim().slice(-600); } catch {}
+    if (conversation === undefined) {
+      try { responseTail = readFileSync(jobFile(this.repo, head.jobId, FILES.report), 'utf8').trim().slice(-600); } catch {}
+    }
     const cwd = spec?.cwd ?? head.cwd ?? this.repo;
     const { watchedFiles, syncedFiles, notes } = this.syncContinuationFiles(cwd, head.watchedFiles, entries.flatMap((e) => e.files ?? []));
     const { rawPrompt } = buildSteeredPrompt({
-      parentJobId: head.jobId,
       wasInterrupted: false,
       priorStatus: head.status,
       verdict: input.verdict,
       freshContinuation: conversation === undefined,
-      toolCalls: head.toolCalls ?? 0,
       responseTail,
       entries,
       syncedFiles,
@@ -1029,11 +1029,9 @@ export class ForgeService {
       resuming,
     });
     const { rawPrompt, sentPrompt, prependBrief } = buildSteeredPrompt({
-      parentJobId: parent.jobId,
       wasInterrupted,
       priorStatus: verdictStatus,
       freshContinuation: !resuming,
-      toolCalls: parent.writer.snapshot()?.toolCalls ?? 0,
       responseTail: result.response.trim().slice(-600),
       entries: unconsumed,
       syncedFiles,
