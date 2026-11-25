@@ -1,4 +1,4 @@
-import {n as readManifest,d as jobFile,F as FILES,o as ownerAlive,c as readPipeline,k as cancelPipeline,f as findProvider,p as providerNames,q as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,t as errMessage,P as PROVIDERS,u as probeAvailability,w as writeJsonAtomic,A as AgentSmithReader,x as normalize,y as writeAtomic,j as jobDir,z as SCHEMA_VERSION,B as validOwnerPid,l as isTerminalForgeStatus,C as reportFor,E as cwdFacts,G as normalizeDenials,H as deriveOrphan,I as deriveStatus,J as summaryTail,K as failureFields,R as REASONS,e as readAcceptance,L as writeAcceptance,N as createMarker,W as WORKERS_DIR,O as jobsDir,Q as parseWorkerIndex,T as normalizeContinuationKind,U as nextActionFor,V as fileSig,X as JobWriter,i as isTerminalStatus,h as isMode,Y as newJobId,Z as markAcceptancePending,_ as humanDuration,$ as pipeEvents,a0 as checksAbortRequested,a1 as verdictBlock,a2 as runAcceptance,a3 as senderOf,a4 as taskTitle,a5 as markAcceptanceSuperseded,a6 as pickHead,g as isWorkerIdle,a7 as compareTurnPriority,a8 as computeStaleReads,a9 as SMITH_PAYLOAD,aa as isForgeStatus}from'./chunk-normalize.js';import {existsSync,readFileSync,mkdirSync,appendFileSync,openSync,writeSync,closeSync,unlinkSync,statSync,renameSync,linkSync,readdirSync,realpathSync,lstatSync,copyFileSync}from'node:fs';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import path from'node:path';import {createHash}from'node:crypto';const LAUNCH_ACK_MS = 15_000;
+import {n as readManifest,d as jobFile,F as FILES,o as ownerAlive,c as readPipeline,k as cancelPipeline,f as findProvider,p as providerNames,q as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,t as errMessage,P as PROVIDERS,u as probeAvailability,w as writeJsonAtomic,A as AgentSmithReader,x as normalize,y as writeAtomic,j as jobDir,z as SCHEMA_VERSION,B as validOwnerPid,l as isTerminalForgeStatus,C as reportFor,E as cwdFacts,G as normalizeDenials,H as deriveOrphan,I as deriveStatus,J as summaryHead,K as failureFields,R as REASONS,e as readAcceptance,L as writeAcceptance,N as createMarker,W as WORKERS_DIR,O as jobsDir,Q as parseWorkerIndex,T as normalizeContinuationKind,U as nextActionFor,V as fileSig,X as JobWriter,i as isTerminalStatus,h as isMode,Y as newJobId,Z as newWorkerId,_ as markAcceptancePending,$ as humanDuration,a0 as pipeEvents,a1 as checksAbortRequested,a2 as verdictBlock,a3 as runAcceptance,a4 as senderOf,a5 as taskTitle,a6 as markAcceptanceSuperseded,a7 as pickHead,g as isWorkerIdle,a8 as compareTurnPriority,a9 as computeStaleReads,aa as SMITH_PAYLOAD,ab as isForgeStatus}from'./chunk-normalize.js';import {existsSync,readFileSync,mkdirSync,appendFileSync,openSync,writeSync,closeSync,unlinkSync,statSync,renameSync,linkSync,readdirSync,realpathSync,lstatSync,copyFileSync}from'node:fs';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import path from'node:path';import {createHash}from'node:crypto';const LAUNCH_ACK_MS = 15_000;
 async function launch(url, payload, onPrepared) {
     const child = fork(fileURLToPath(url), [], {
         detached: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
@@ -742,8 +742,7 @@ function reconcileOrphan(repo, jobId, now = Date.now()) {
                     ...(nonfatal === true ? { nonfatal: true } : {}),
                 })),
                 usage: result.usage === undefined ? null : Object.fromEntries(Object.entries(result.usage).filter((entry) => typeof entry[1] === 'number')),
-                // The conclusion is at the end of the response (same rule as writer.finish).
-                latestSummary: summaryTail(result.response, 1_000) || manifest.latestSummary || null,
+                latestSummary: summaryHead(result.response, 1_000) || manifest.latestSummary || null,
                 summarySource: result.response.trim() || manifest.latestSummary ? 'worker' : null,
                 // Recovery never runs the finish-time git diff.
                 changedFilesUnknown: true,
@@ -1730,7 +1729,7 @@ class ForgeService {
         const name = request.name?.trim() || `${mode}-${jobId.slice(-8)}`;
         if (name.length > 80)
             throw new Error('worker name must be at most 80 characters');
-        const workerId = request.workerId ?? jobId;
+        const workerId = request.workerId ?? newWorkerId();
         this.assertNameFree(name, workerId);
         const writer = this.newWriter(jobId);
         warnings.push(...request.notes ?? []);

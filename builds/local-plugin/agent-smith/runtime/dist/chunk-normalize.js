@@ -275,6 +275,9 @@ function newJobId$1(mode) {
     const prefix = safeMode === '' ? 'job' : safeMode;
     return `${prefix}-${ID_MARKER}-${randomBytes(4).toString('hex')}`;
 }
+function newWorkerId() {
+    return `w-${randomBytes(6).toString('hex')}`;
+}
 function taskTitle(prompt) {
     const first = prompt.split('\n').find((l) => l.trim().length > 0) ?? '';
     return first.replace(/^#\s*/, '').trim().slice(0, 200);
@@ -6295,7 +6298,7 @@ class JobWriter {
         this.latestText = appendBounded(this.latestText ?? '', event.text, LATEST_TEXT_CHARS);
         this.currentMessage = appendBounded(this.currentMessage, event.text, LATEST_TEXT_CHARS);
         this.noteFirstEvent(false);
-        this.manifest = { ...this.manifest, latestSummary: summaryTail(this.currentMessage, SUMMARY_CHARS) || this.manifest.latestSummary || null, summarySource: 'worker' };
+        this.manifest = { ...this.manifest, latestSummary: summaryHead(this.currentMessage, SUMMARY_CHARS) || this.manifest.latestSummary || null, summarySource: 'worker' };
         this.touch(at);
     }
     verdictFacts() {
@@ -6348,7 +6351,7 @@ class JobWriter {
             ...(this.toolErrorSteps.size === 0 ? {} : { toolErrors: this.toolErrorSteps.size }),
             ...(failedEarly ? { failedEarly: true } : {}),
             conversation: this.conversation,
-            latestSummary: summaryTail(response, SUMMARY_CHARS) || this.manifest.latestSummary || null,
+            latestSummary: summaryHead(response, SUMMARY_CHARS) || this.manifest.latestSummary || null,
             summarySource: response || this.manifest.latestSummary ? 'worker' : null,
             ...(this.changed === null
                 ? { changedFilesUnknown: true }
@@ -6624,17 +6627,19 @@ function appendBounded(base, add, max) {
         return joined;
     return joined.slice(joined.length - max);
 }
-function summaryTail(text, max) {
+function summaryHead(text, max) {
     const t = text.trim().replace(/^Status:[^\n]*(?:\n|$)/, '').trim();
     if (t.length <= max)
         return t;
-    const tail = t.slice(t.length - max);
+    const head = t.slice(0, max);
+    if (t[max] === '\n')
+        return head.trim();
     for (const sep of ['\n\n', '\n']) {
-        const i = tail.indexOf(sep);
-        if (i >= 0 && tail.slice(i).trim() !== '')
-            return tail.slice(i).trim();
+        const i = head.lastIndexOf(sep);
+        if (i >= 0 && head.slice(0, i).trim() !== '')
+            return head.slice(0, i).trim();
     }
-    return tail.trim();
+    return head.trim();
 }
 function emptyManifest(jobId) {
     const now = new Date().toISOString();
@@ -8399,4 +8404,4 @@ function asUsage(v) {
 /** Normalize a raw agent-smith job snapshot. */
 function normalize(raw) {
     return smithNormalizer(raw);
-}export{pipeEvents as $,AgentSmithReader as A,validOwnerPid as B,reportFor as C,DEFAULT_TIMEOUT_MS as D,cwdFacts as E,FILES as F,normalizeDenials as G,deriveOrphan as H,deriveStatus as I,summaryTail as J,failureFields as K,writeAcceptance as L,MODES as M,createMarker as N,jobsDir as O,PROVIDERS as P,parseWorkerIndex as Q,REASONS as R,STAGE_PROMPTS as S,normalizeContinuationKind as T,nextActionFor as U,fileSig as V,WORKERS_DIR as W,JobWriter as X,newJobId$1 as Y,markAcceptancePending as Z,humanDuration as _,MODE_PRESETS as a,checksAbortRequested as a0,verdictBlock as a1,runAcceptance as a2,senderOf as a3,taskTitle as a4,markAcceptanceSuperseded as a5,pickHead as a6,compareTurnPriority as a7,computeStaleReads as a8,SMITH_PAYLOAD as a9,isForgeStatus as aa,readJsonSafe as ab,pipelineRecordPath as ac,workerIndexPath as ad,checksReason as ae,toolLabel as af,inheritContinuedProviders as b,readPipeline as c,jobFile as d,readAcceptance as e,findProvider as f,isWorkerIdle as g,isMode as h,isTerminalStatus as i,jobDir as j,cancelPipeline as k,isTerminalForgeStatus as l,missingPipelineError as m,readManifest as n,ownerAlive as o,providerNames as p,getProvider as q,reasonFromText as r,startPipeline as s,errMessage as t,probeAvailability as u,validateSpec as v,writeJsonAtomic as w,normalize as x,writeAtomic as y,SCHEMA_VERSION as z};
+}export{humanDuration as $,AgentSmithReader as A,validOwnerPid as B,reportFor as C,DEFAULT_TIMEOUT_MS as D,cwdFacts as E,FILES as F,normalizeDenials as G,deriveOrphan as H,deriveStatus as I,summaryHead as J,failureFields as K,writeAcceptance as L,MODES as M,createMarker as N,jobsDir as O,PROVIDERS as P,parseWorkerIndex as Q,REASONS as R,STAGE_PROMPTS as S,normalizeContinuationKind as T,nextActionFor as U,fileSig as V,WORKERS_DIR as W,JobWriter as X,newJobId$1 as Y,newWorkerId as Z,markAcceptancePending as _,MODE_PRESETS as a,pipeEvents as a0,checksAbortRequested as a1,verdictBlock as a2,runAcceptance as a3,senderOf as a4,taskTitle as a5,markAcceptanceSuperseded as a6,pickHead as a7,compareTurnPriority as a8,computeStaleReads as a9,SMITH_PAYLOAD as aa,isForgeStatus as ab,readJsonSafe as ac,pipelineRecordPath as ad,workerIndexPath as ae,checksReason as af,toolLabel as ag,inheritContinuedProviders as b,readPipeline as c,jobFile as d,readAcceptance as e,findProvider as f,isWorkerIdle as g,isMode as h,isTerminalStatus as i,jobDir as j,cancelPipeline as k,isTerminalForgeStatus as l,missingPipelineError as m,readManifest as n,ownerAlive as o,providerNames as p,getProvider as q,reasonFromText as r,startPipeline as s,errMessage as t,probeAvailability as u,validateSpec as v,writeJsonAtomic as w,normalize as x,writeAtomic as y,SCHEMA_VERSION as z};

@@ -1,4 +1,4 @@
-import {watch}from'node:fs';import {r as reasonFromText,ae as checksReason,af as toolLabel}from'./chunk-normalize.js';/**
+import {watch}from'node:fs';import {r as reasonFromText,af as checksReason,ag as toolLabel}from'./chunk-normalize.js';/**
  * forge/watch.ts — wake when a job's files change, instead of re-reading them on a timer.
  *
  * A worker runs in another process (the detached supervisor) and reports only through
@@ -176,7 +176,7 @@ function claudeText(jobs) {
         lines.push(`${one ? 'Agent Smith · ' : ''}${headline(job)}`);
     if (jobs.length > CLAUDE_JOBS)
         lines.push(`…and ${jobs.length - CLAUDE_JOBS} more; list_jobs shows them.`);
-    const ids = (run) => listed.filter((j) => !!j.run === run).map((j) => j.id);
+    const ids = (run) => listed.filter((j) => !!j.run === run).map((j) => (run ? j.id : j.workerId ?? j.id));
     if (ids(false).length > 0)
         lines.push(`status ${ids(false).join(', ')}`);
     if (ids(true).length > 0)

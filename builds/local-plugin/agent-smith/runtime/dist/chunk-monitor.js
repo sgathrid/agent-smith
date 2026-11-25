@@ -1,4 +1,4 @@
-import path from'node:path';import {fileURLToPath}from'node:url';import {r as reasonFromText,ab as readJsonSafe,ac as pipelineRecordPath,A as AgentSmithReader,x as normalize,e as readAcceptance,T as normalizeContinuationKind,l as isTerminalForgeStatus,W as WORKERS_DIR,g as isWorkerIdle,O as jobsDir,j as jobDir,a6 as pickHead,ad as workerIndexPath,Q as parseWorkerIndex}from'./chunk-normalize.js';import {a as claudeText,d as droppedMessageQuote,b as pipelineOutcome,A as ACCEPTANCE_HOLD_MS,l as livenessOf,w as waitForChange}from'./chunk-stale.js';function pushKindFor(job) {
+import path from'node:path';import {fileURLToPath}from'node:url';import {r as reasonFromText,ac as readJsonSafe,ad as pipelineRecordPath,A as AgentSmithReader,x as normalize,e as readAcceptance,T as normalizeContinuationKind,l as isTerminalForgeStatus,W as WORKERS_DIR,g as isWorkerIdle,O as jobsDir,j as jobDir,a7 as pickHead,ae as workerIndexPath,Q as parseWorkerIndex}from'./chunk-normalize.js';import {a as claudeText,d as droppedMessageQuote,b as pipelineOutcome,A as ACCEPTANCE_HOLD_MS,l as livenessOf,w as waitForChange}from'./chunk-stale.js';function pushKindFor(job) {
     switch (job.status) {
         case 'succeeded':
             return 'finished';
@@ -56,7 +56,7 @@ function toNotice(job, kind, now) {
             ? (job.lastEventAt === null ? NaN : now - Date.parse(job.lastEventAt))
             : (start && job.finishedAt ? Date.parse(job.finishedAt) - Date.parse(start) : NaN);
     return {
-        id: job.id, kind, name: job.name ?? null, provider: job.provider ?? null, role: job.role ?? null,
+        id: job.id, ...(job.workerId ? { workerId: job.workerId } : {}), kind, name: job.name ?? null, provider: job.provider ?? null, role: job.role ?? null,
         run,
         durationMs: Number.isFinite(span) ? span : null,
         changedFiles: job.changedFileCount ?? null,
