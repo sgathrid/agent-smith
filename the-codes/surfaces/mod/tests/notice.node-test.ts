@@ -27,25 +27,52 @@ function notice(over: Partial<NoticeJob>): NoticeJob {
   return { id: 'job-1', kind: 'finished', ...over };
 }
 
-test('done names worker, provider, role and duration; checks only when they ran', () => {
+test('done names worker, provider, role and duration; checks replace done when they ran', () => {
   assert.equal(
     headline(notice({ name: 'Ada', provider: 'codex', role: 'review', durationMs: 43_000, changedFiles: 2, checks: { passed: 2, total: 2 } })),
-    '✓ Ada (codex review) 43s · done · checks 2/2',
+    '✓ Ada (codex review) · checks 2/2 · 43s',
   );
   assert.equal(headline(notice({ name: 'Ada', provider: 'codex', role: 'review' })), '✓ Ada (codex review) · done');
 });
 
-test('a steered or follow-up continuation says so honestly, and a dropped queued follow-up is named', () => {
-  assert.equal(headline(notice({ name: 'Ada', provider: 'codex', role: 'review', durationMs: 6000, continuationKind: 'steer' })), '✓ Ada (codex review) 6s · done · steered');
-  assert.equal(headline(notice({ name: 'Ada', provider: 'codex', role: 'review', durationMs: 6000, continuationKind: 'follow-up' })), '✓ Ada (codex review) 6s · done · follow-up');
+test('target headline renderings match the approved format', () => {
+  assert.equal(
+    headline(notice({ name: 'arch-doc', provider: 'agy', role: 'implement', checks: { passed: 2, total: 2 }, durationMs: 24_000 })),
+    '✓ arch-doc (agy implement) · checks 2/2 · 24s',
+  );
+  assert.equal(
+    headline(notice({ name: 'text-audit', provider: 'agy', role: 'review', durationMs: 3 * 60_000 })),
+    '✓ text-audit (agy review) · done · 3m',
+  );
+  assert.equal(
+    headline(notice({ name: 'comments-and-docs', provider: 'agy', role: 'implement', checks: { passed: 2, total: 2 }, durationMs: 9 * 60_000, turns: { from: 1, to: 2 } })),
+    '✓ comments-and-docs (agy implement) · checks 2/2 · 9m · turns 1–2',
+  );
+  assert.equal(
+    headline(notice({ name: 'links2', provider: 'codex', role: 'implement', checks: { passed: 2, total: 2 }, durationMs: 2 * 60_000, turns: { from: 3, to: 3 } })),
+    '✓ links2 (codex implement) · checks 2/2 · 2m · turn 3',
+  );
+  assert.equal(
+    headline(notice({ name: 'links2', provider: 'codex', role: 'implement', checks: { passed: 1, total: 2, failed: ['lint'] }, durationMs: 4 * 60_000, turns: { from: 3, to: 3 } })),
+    '✗ links2 (codex implement) · checks failed: lint · 4m · turn 3',
+  );
+  assert.equal(
+    headline(notice({ kind: 'attention', name: 'solfix', provider: 'codex', role: 'implement', durationMs: 16 * 60_000 })),
+    '! solfix (codex implement) · no output for 16m',
+  );
+});
+
+test('continuation tags are omitted while dropped queued follow-up is named', () => {
+  assert.equal(headline(notice({ name: 'Ada', provider: 'codex', role: 'review', durationMs: 6000, continuationKind: 'steer' })), '✓ Ada (codex review) · done · 6s');
+  assert.equal(headline(notice({ name: 'Ada', provider: 'codex', role: 'review', durationMs: 6000, continuationKind: 'follow-up' })), '✓ Ada (codex review) · done · 6s');
   assert.equal(
     headline(notice({ name: 'Ada', provider: 'codex', role: 'review', durationMs: 4000, kind: 'failed', reason: 'timed out', steerNotApplied: true })),
-    '✗ Ada (codex review) 4s · failed: timed out · queued follow-up not sent',
+    '✗ Ada (codex review) · failed: timed out · 4s · queued follow-up not sent',
   );
   const steered = noticeFromRadar(row({ id: 'j2', name: 'Ada', status: 'succeeded', endedAt: NOW, continuedFrom: 'j1', continuationKind: 'steer' }), 'finished', NOW);
-  assert.match(headline(steered), /· done · steered$/);
+  assert.match(headline(steered), /· done · 60s$/);
   const followed = noticeFromRadar(row({ id: 'j2r', name: 'Ada', status: 'succeeded', endedAt: NOW, continuedFrom: 'j1', continuationKind: 'follow-up' }), 'finished', NOW);
-  assert.match(headline(followed), /· done · follow-up$/);
+  assert.match(headline(followed), /· done · 60s$/);
   const dropped = noticeFromRadar(row({ id: 'j3', name: 'Ada', status: 'failed', endedAt: NOW, failureReason: 'timed out', warnings: [{ code: 'steer_not_applied' }] }), 'failed', NOW);
   assert.match(headline(dropped), /· queued follow-up not sent$/);
   const quoted = noticeFromRadar(row({ id: 'j5', name: 'Ada', status: 'failed', endedAt: NOW, failureReason: 'timed out',
@@ -54,19 +81,19 @@ test('a steered or follow-up continuation says so honestly, and a dropped queued
   assert.doesNotMatch(headline(noticeFromRadar(row({ id: 'j4', status: 'succeeded', endedAt: NOW }), 'finished', NOW)), /steer|follow-up/);
   const discarded = noticeFromRadar(row({ id: 'j6', name: 'Ada', status: 'canceled', endedAt: NOW,
     warnings: [{ code: 'tool_error', message: '2 queued messages discarded by cancel: "add the edge-case test"' }] }), 'cancelled', NOW);
-  assert.match(headline(discarded), /· canceled · queued follow-up not sent: "add the edge-case test"$/);
+  assert.match(headline(discarded), /· canceled · 60s · queued follow-up not sent: "add the edge-case test"$/);
 });
 
 test('failure says failed and the short reason', () => {
   assert.equal(
     headline(notice({ kind: 'failed', name: 'Bo', provider: 'agy', role: 'implement', durationMs: 45 * 60_000, reason: 'timed out' })),
-    '✗ Bo (agy implement) 45m · failed: timed out',
+    '✗ Bo (agy implement) · failed: timed out · 45m',
   );
 });
 
 test('canceled and quiet read as what they are: facts, never "stalled"', () => {
   assert.equal(headline(notice({ kind: 'cancelled', name: 'Cy', provider: 'claude', role: 'implement', durationMs: 125_000 })),
-    '■ Cy (claude implement) 2m · canceled');
+    '■ Cy (claude implement) · canceled · 2m');
   assert.equal(headline(notice({ kind: 'attention', name: 'Di', provider: 'opencode', role: 'research', durationMs: 16 * 60_000 })),
     '! Di (opencode research) · no output for 16m');
   assert.equal(headline(notice({ kind: 'attention', name: 'Di', provider: 'opencode', role: 'research', durationMs: 16 * 60_000,
@@ -89,7 +116,7 @@ test('noticeFromRadar: silent counts from the last event, dead from the last hea
 
 test('rejected checks are a failure, not done: glyph x and the failed check names', () => {
   assert.equal(headline(notice({ name: 'E', provider: 'codex', checks: { passed: 1, total: 2, failed: ['lint'] }, durationMs: 65 * 60_000 })),
-    '✗ E (codex) 1h05m · checks failed: lint');
+    '✗ E (codex) · checks failed: lint · 1h05m');
   assert.equal(headline(notice({ name: 'E', provider: 'codex', checks: { passed: 0, total: 2, failed: ['lint', 'tests'] } })),
     '✗ E (codex) · checks failed: lint +1');
 });
@@ -110,10 +137,10 @@ test("Claude's text: the user's failed job is one short line, then how to read i
   }), 'failed', NOW);
   const text = claudeText([job]);
   assert.equal(text, [
-    'Agent Smith · ✗ pp-engine (agy implement) 21m · failed: denied view_file',
+    'Agent Smith · ✗ pp-engine (agy implement) · failed: denied view_file · 21m',
     'status implement-smith-6b456b3d',
   ].join('\n'));
-  assert.equal(displayNoticeText(text), 'Agent Smith · ✗ pp-engine (agy implement) 21m · failed: denied view_file');
+  assert.equal(displayNoticeText(text), 'Agent Smith · ✗ pp-engine (agy implement) · failed: denied view_file · 21m');
 });
 
 test('an old job with only the long error text gets the same short reason', () => {
@@ -129,7 +156,7 @@ test('checks rejected after a clean execution: failed glyph, failed check names'
     id: 'job-9', name: 'Ada', provider: 'codex', role: 'implement', status: 'succeeded', endedAt: NOW, startedAt: NOW - 120_000,
     acceptance: { checks: [{ ok: true, name: 'tests' }, { ok: false, name: 'lint' }] },
   }), 'finished', NOW);
-  assert.equal(claudeText([job]), 'Agent Smith · ✗ Ada (codex implement) 2m · checks failed: lint\nstatus job-9');
+  assert.equal(claudeText([job]), 'Agent Smith · ✗ Ada (codex implement) · checks failed: lint · 2m\nstatus job-9');
 });
 
 test("Claude's text: a batch is one block, counted by outcome, one line per job", () => {
@@ -158,7 +185,7 @@ test('a generated name is shown as the job id', () => {
 test('a pipeline run points at pipeline_status and states its stages', () => {
   const text = claudeText([notice({ id: 'run-1', name: 'ship', role: 'pipeline', run: true, kind: 'failed', durationMs: 120_000, reason: '1/2 stages passed · test: checks failed: lint' })]);
   assert.equal(text, [
-    'Agent Smith · ✗ ship 2m · 1/2 stages passed · test: checks failed: lint',
+    'Agent Smith · ✗ ship · 1/2 stages passed · test: checks failed: lint · 2m',
     'pipeline_status run-1',
   ].join('\n'));
 });
@@ -169,7 +196,7 @@ test('noticeFromRadar forwards workerId and claudeText prints status <workerId>'
     status: 'succeeded', startedAt: NOW - 30_000, endedAt: NOW,
   }), 'finished', NOW);
   assert.equal(claudeText([job]), [
-    'Agent Smith · ✓ Ada (codex implement) 30s · done',
+    'Agent Smith · ✓ Ada (codex implement) · done · 30s',
     'status w-abcdef123456',
   ].join('\n'));
 });
@@ -289,7 +316,7 @@ test('the hold follows the checks budget; past it the notice says exited, checks
   assert.deepEqual(due(late.owned, [pending], new Map(), NOW + budget + 60_000).notices, []);
   const verdict = row({ id: 'j', name: 'Ada', status: 'succeeded', startedAt: NOW - 60_000, endedAt: NOW, acceptance: { checks: [{ ok: true, name: 'ui-suite' }] } });
   const final = due(late.owned, [verdict], new Map(), NOW + budget + 120_000);
-  assert.match(claudeText(final.notices), /✓ .*done · checks 1\/1/);
+  assert.match(claudeText(final.notices), /✓ .*checks 1\/1/);
   assert.deepEqual(final.owned, []);
 });
 
@@ -303,7 +330,7 @@ test('a claimed run is announced with its stage jobs when it ends, not before', 
   assert.deepEqual(due(owned, [stage], new Map([['run-1', record('running', null)]]), NOW).notices, [], 'a finished stage waits for its run');
   const r = due(owned, [stage], new Map([['run-1', record('passed', NOW)]]), NOW);
   assert.deepEqual(r.notices.map((n) => n.id), ['run-1', 'stage-1']);
-  assert.match(claudeText(r.notices), /✓ ship 2m · 1\/1 stages passed/);
+  assert.match(claudeText(r.notices), /✓ ship · 1\/1 stages passed · 2m/);
 });
 
 test('a claim that never shows up expires silently', () => {
@@ -326,12 +353,15 @@ test('the hook (policy) and the mod render the same job in the same words', () =
     acceptance: { checks: [{ ok: true }, { ok: true }] }, summarySource: 'worker', latestSummary: 'Two findings.',
   }), 'finished', NOW)]);
   assert.equal(hook, mod);
-  assert.match(mod, /^Agent Smith · ✓ Ada \(codex review\) 43s · done · checks 2\/2 · stale brief: ARCHITECTURE\.md \+1\nstatus job-ada$/);
+  assert.match(mod, /^Agent Smith · ✓ Ada \(codex review\) · checks 2\/2 · 43s · stale brief: ARCHITECTURE\.md \+1\nstatus job-ada$/);
 });
 
 test('displayNoticeText keeps the notice lines and drops the line for Claude', () => {
   const single = claudeText([notice({ id: 'implement-smith-6729d530', name: 'smoke-agy', provider: 'agy', role: 'implement', durationMs: 7000, checks: { passed: 1, total: 1 } })]);
-  assert.equal(displayNoticeText(single), 'Agent Smith · ✓ smoke-agy (agy implement) 7s · done · checks 1/1');
+  assert.equal(displayNoticeText(single), 'Agent Smith · ✓ smoke-agy (agy implement) · checks 1/1 · 7s');
+
+  const pipe = claudeText([notice({ id: 'run-1', name: 'ship', role: 'pipeline', run: true, kind: 'failed', durationMs: 120_000, reason: '1/2 stages passed' })]);
+  assert.equal(displayNoticeText(pipe), 'Agent Smith · ✗ ship · 1/2 stages passed · 2m');
 
   const batch = claudeText([
     notice({ id: 'a', name: 'Ada', provider: 'codex' }),
@@ -353,7 +383,7 @@ test('displayNoticeText drops the host frame Claude Code wraps around a plugin p
     const framed = `${header}\n${body.split('\n').map((l) => `  ${l}`).join('\n')}\n\n  ${footer}`;
     assert.equal(displayNoticeText(framed), displayNoticeText(body));
   }
-  assert.equal(displayNoticeText(body), 'Agent Smith · ✓ pp-docs (agy implement) 5m · done');
+  assert.equal(displayNoticeText(body), 'Agent Smith · ✓ pp-docs (agy implement) · done · 5m');
 });
 
 test('parseSettledRead and unclaim retire a notice once status reads a settled job or run', () => {
@@ -458,7 +488,7 @@ describe('one notice per idle transition', () => {
       owned = r.owned;
     });
     assert.deepEqual(said.map((n) => n.id), ['t3']);
-    assert.equal(headline(said[0]!), '✓ Ada (codex review) 1s · done · follow-up · also ran turns 1–2');
+    assert.equal(headline(said[0]!), '✓ Ada (codex review) · done · 2s · turns 1–3');
     assert.deepEqual(owned, []);
   });
 
@@ -466,7 +496,7 @@ describe('one notice per idle transition', () => {
     let owned = claim([], spawn, NOW);
     const first = due(owned, [done('t1', 1)], new Map(), NOW + 5000);
     assert.deepEqual(first.notices.map((n) => n.id), ['t1']);
-    assert.doesNotMatch(headline(first.notices[0]!), /also ran/);
+    assert.doesNotMatch(headline(first.notices[0]!), /turn /);
     owned = first.owned;
     assert.deepEqual(owned, []);
     owned = claim(owned, parseLaunch(`${PLUGIN}follow_up`, { jobId: 't2', workerId: 'ada', status: 'running', action: 'started', turn: 2, repo: '/repo' })!, NOW + 6000);
@@ -478,7 +508,7 @@ describe('one notice per idle transition', () => {
     assert.deepEqual(running.notices, []);
     const second = due(running.owned, [done('t1', 1, { followedBy: 't2' }), done('t2', 2, { continuationKind: 'follow-up' })], new Map(), NOW + 9000);
     assert.deepEqual(second.notices.map((n) => n.id), ['t2']);
-    assert.match(headline(second.notices[0]!), /· done · follow-up$/);
+    assert.match(headline(second.notices[0]!), /· done · 1s · turn 2$/);
   });
 
   test("a settled read of an earlier turn while a follow-up runs does not swallow the worker's notice", () => {
@@ -491,14 +521,22 @@ describe('one notice per idle transition', () => {
     assert.deepEqual(due(again, [done('t1', 1)], new Map(), NOW + 5000).notices, []);
   });
 
-  test('a new turn started after a settled read moves the claim to it: no "also ran" for the turn already read', () => {
+  test('a new turn started after a settled read moves the claim to it: no range for the turn already read', () => {
     let owned = claim([], spawn, NOW);
     owned = due(owned, [ada('t1', 1)], new Map(), NOW + 500).owned;
     owned = unclaim(owned, parseSettledRead(`${PLUGIN}status`, { jobId: 't1', workerId: 'ada', status: 'succeeded' })!);
     owned = claim(owned, parseLaunch(`${PLUGIN}follow_up`, { jobId: 't2', workerId: 'ada', status: 'running', action: 'started', turn: 2, repo: '/repo' })!, NOW + 2000);
     assert.deepEqual(owned.map((o) => [o.id, o.fromTurn, o.readHead]), [['t2', undefined, undefined]]);
     const r = due(owned, [done('t1', 1, { followedBy: 't2' }), done('t2', 2, { continuationKind: 'follow-up' })], new Map(), NOW + 5000);
-    assert.equal(headline(r.notices[0]!), '✓ Ada (codex review) 1s · done · follow-up');
+    assert.equal(headline(r.notices[0]!), '✓ Ada (codex review) · done · 1s · turn 2');
+  });
+
+  test('due sums duration across covered turns when turns 1–2 settle together', () => {
+    const t1 = row({ id: 'c1', workerId: 'comments', turn: 1, name: 'comments-and-docs', provider: 'agy', role: 'implement', status: 'succeeded', startedAt: NOW, endedAt: NOW + 4 * 60_000, followedBy: 'c2' });
+    const t2 = row({ id: 'c2', workerId: 'comments', turn: 2, name: 'comments-and-docs', provider: 'agy', role: 'implement', status: 'succeeded', startedAt: NOW + 5 * 60_000, endedAt: NOW + 10 * 60_000, acceptance: { checks: [{ ok: true }, { ok: true }] } });
+    const owned = claim([], parseLaunch(`${PLUGIN}spawn_job`, { jobId: 'c1', workerId: 'comments', status: 'running', repo: '/repo' })!, NOW);
+    const r = due(owned, [t1, t2], new Map(), NOW + 10 * 60_000);
+    assert.equal(headline(r.notices[0]!), '✓ comments-and-docs (agy implement) · checks 2/2 · 9m · turns 1–2');
   });
 
   test('a failed turn whose checks placeholder never settled is announced once and released', () => {
@@ -512,7 +550,7 @@ describe('one notice per idle transition', () => {
     const r = due(claim([], spawn, NOW), [ada('t1', 1, { status: 'failed', endedAt: NOW + 1500, failureReason: 'timed out',
       warnings: [{ code: 'steer_not_applied', message: '1 queued follow-up not sent: the turn ended failed. "rerun the tests"' }] })], new Map(), NOW + 3000);
     assert.equal(r.notices.length, 1);
-    assert.match(headline(r.notices[0]!), /failed: timed out · queued follow-up not sent: "rerun the tests"$/);
+    assert.match(headline(r.notices[0]!), /failed: timed out · 1s · queued follow-up not sent: "rerun the tests"$/);
   });
 });
 

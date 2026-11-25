@@ -846,7 +846,7 @@ describe('completion notices', () => {
     expect(said.logs).toEqual([]);
     expect(said.prompts).toHaveLength(1);
     expect(said.origins[0]?.asUser).not.toBe(true);
-    expect(said.prompts[0]).toMatch(/^Agent Smith · ✓ Ada \(codex review\) 44s · done · checks 2\/2\nstatus w-ada$/);
+    expect(said.prompts[0]).toMatch(/^Agent Smith · ✓ Ada \(codex review\) · checks 2\/2 · 44s\nstatus w-ada$/);
   });
 
   const settledRead = ($: any, id: string, more: Record<string, unknown> = {}) =>
@@ -967,16 +967,24 @@ describe('completion notices', () => {
     expect(said.hookRuns).toBe(1);
   });
 
-  test('a notice row drops the host frame, even drawn expanded under its speaker label', async ($, on) => {
+  test('a notice row drops the host frame and status line, even via stored or marketplace origin', async ($, on) => {
     on('ui.render', { component: 'UserMessage' }, ($: any, e: any) => $.ui.resolve(e).Text({ children: e.props.text }));
-    const text = 'The agent-smith plugin sent a message:\n  Agent Smith · ✓ hig-codex (codex review) 7m · done\n  status review-smith-7cdfd099\n\n' +
+    const text = 'The agent-smith plugin sent a message:\n  Agent Smith · ✓ hig-codex (codex review) · done · 7m\n  status review-smith-7cdfd099\n\n' +
       "  This is how Claude Code surfaces a prompt a plugin submits between turns — it starts this turn in the user's place. Address the message above.";
     for (const isExpanded of [false, true]) {
       const row = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', component: 'UserMessage', requestId: `row-${isExpanded}`,
         props: { text, origin: { kind: 'plugin', name: 'agent-smith' }, isExpanded } } as never);
-      expect(await row.find({ type: 'Text', text: /^Agent Smith · ✓ hig-codex \(codex review\) 7m · done$/ })).toBeDefined();
+      expect(await row.find({ type: 'Text', text: /^Agent Smith · ✓ hig-codex \(codex review\) · done · 7m$/ })).toBeDefined();
       expect(await row.find({ type: 'Text', text: /This is how Claude Code|sent a message|^status / })).toBeUndefined();
     }
+    const storedRow = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', component: 'UserMessage', requestId: 'row-stored',
+      props: {
+        text: 'Agent Smith · ✗ ship · 1/2 stages passed · 2m\npipeline_status run-1',
+        origin: { kind: 'person' },
+        stored: { kind: 'plugin', name: 'agent-smith@local' },
+      } } as never);
+    expect(await storedRow.find({ type: 'Text', text: /^Agent Smith · ✗ ship · 1\/2 stages passed · 2m$/ })).toBeDefined();
+    expect(await storedRow.find({ type: 'Text', text: /pipeline_status/ })).toBeUndefined();
   });
 
   test("another session's job finishing in the same repo is not announced here", async ($, on) => {

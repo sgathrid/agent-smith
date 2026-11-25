@@ -464,7 +464,7 @@ Claude                MCP server (dist/server.js)      Claude Code hooks        
   `status` with `wait_ms` for a worker it will still announce (live, notice not yet
   retired, no read error); subagents, headless runs and other workers still wait. Notices fire **once per worker idle transition**
   (`isWorkerIdle` on the head in `mod/hooks/turns.ts`), covering all turns completed since
-  the last notice (e.g. `also ran turns 2–3`); two queued follow-ups produce one notice.
+  the last notice (e.g. `turns 1–2`); two queued follow-ups produce one notice.
   On each 1 s active poll (when nothing is live and `/forge` is closed, an idle tick does one
   `readdir` of `.agent-smith/jobs` with no parsing, and a new entry wakes active polling), it
   announces claimed workers that reached idle, or

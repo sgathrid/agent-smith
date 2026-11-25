@@ -168,7 +168,7 @@ test('the watch-hook notice carries follow-up and dropped-message markers', asyn
   const text = toNotice(found, 'failed', T0 + 5000);
   assert.equal((text as { continuationKind?: unknown }).continuationKind, 'follow-up');
   assert.equal(text.steerNotApplied, true);
-  assert.match(headline(text), /· follow-up · queued follow-up not sent: "add the edge-case test"$/);
+  assert.match(headline(text), /· failed: timed out after 4s · 4s · queued follow-up not sent: "add the edge-case test"$/);
   fs.rmSync(repo, { recursive: true, force: true });
 });
 
@@ -250,7 +250,7 @@ test('a watcher holds a job whose checks are inside their budget, then says exit
   acceptance({ state: 'accepted', checks: [{ name: 'ui-suite', ok: true }] });
   const verdict = await readJob(repo, 'j-1', Date.now());
   assert.notEqual(dedupeKey(late!), dedupeKey(verdict!), 'the verdict is announced again');
-  assert.match(headline(toNotice(verdict!, 'finished', Date.now())), /✓ .*done · checks 1\/1/);
+  assert.match(headline(toNotice(verdict!, 'finished', Date.now())), /✓ .*checks 1\/1/);
   fs.rmSync(repo, { recursive: true, force: true });
 });
 
@@ -335,7 +335,7 @@ test('hook with checks: one write at the verdict, never "checks running" and the
     };
     const code = await runHook(launchInput(repo), (s) => { out += s; }, { intervalMs: 50, readJob });
     assert.equal(code, 2);
-    assert.match(out, /done · checks 1\/1/);
+    assert.match(out, /checks 1\/1 · 60s/);
     assert.doesNotMatch(out, /checks running/);
     assert.equal(out.split('Agent Smith').length - 1, 1, 'a single notice');
   } finally { fs.rmSync(repo, { recursive: true, force: true }); }
@@ -414,7 +414,22 @@ test('runJobWatch follows the worker through its index to idle: two queued follo
   });
   assert.equal(await p, 'done');
   assert.equal(lines.length, 1, lines.join('\n'));
-  assert.match(lines[0]!, /^Agent Smith · ✓ Ada \(implementer\) · done · follow-up · also ran turns 1–2 status ada$/);
+  assert.match(lines[0]!, /^Agent Smith · ✓ Ada \(implementer\) · done · turns 1–3 status ada$/);
+});
+
+test('runJobWatch sums elapsed duration across covered turns', async () => {
+  const w = { workerId: 'comments', name: 'comments-and-docs', provider: 'agy', role: 'implement' };
+  const lines: string[] = [];
+  const t1 = job('c1', 'succeeded', { ...w, turn: 1, followedBy: 'c2', startedAt: new Date(T0).toISOString(), finishedAt: new Date(T0 + 4 * 60_000).toISOString() });
+  const t2 = job('c2', 'succeeded', { ...w, turn: 2, checks: { passed: 2, total: 2 }, startedAt: new Date(T0 + 5 * 60_000).toISOString(), finishedAt: new Date(T0 + 10 * 60_000).toISOString() });
+  const p = runJobWatch({
+    cwd: '/repo', jobIds: ['c1'], intervalMs: 50, now: () => T0 + 10 * 60_000,
+    readIndex: async () => ({ schema: 1, workerId: 'comments', name: 'comments-and-docs', turns: ['c1', 'c2'], updatedAt: '' }),
+    readJob: async (_c, id) => (id === 'c1' ? t1 : id === 'c2' ? t2 : null),
+    emit: (l) => { lines.push(l); },
+  });
+  assert.equal(await p, 'done');
+  assert.equal(lines[0], 'Agent Smith · ✓ comments-and-docs (agy implement) · checks 2/2 · 9m · turns 1–2 status comments');
 });
 
 test('runHook suppresses output when the post-steer head jobId has a claim marker', async () => {

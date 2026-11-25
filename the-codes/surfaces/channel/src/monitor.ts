@@ -104,7 +104,7 @@ async function followWorkerHead(
   now: number,
   readJobFn: (cwd: string, id: string, now: number) => Promise<WatchableJob | null>,
   readIndexFn: (cwd: string, workerId: string) => Promise<WorkerIndex | null>,
-): Promise<{ head: WatchableJob; missingNextId: string | null }> {
+): Promise<{ head: WatchableJob; rows: Map<string, WatchableJob>; missingNextId: string | null }> {
   const rows = new Map<string, WatchableJob>([[root.id, root]]);
   const index = root.workerId ? await readIndexFn(cwd, root.workerId) : null;
   const at = index ? index.turns.indexOf(rootId) : -1;
@@ -121,7 +121,38 @@ async function followWorkerHead(
     rows.set(row.id, row);
     head = pickHead([...rows.values()].map((r) => ({ ...watchTurn(r), row: r })))!.row;
   }
-  return { head, missingNextId };
+  return { head, rows, missingNextId };
+}
+
+function watchTurnDurationMs(job: WatchableJob): number | null {
+  if (!job.startedAt || !job.finishedAt) return null;
+  const start = Date.parse(job.startedAt);
+  const end = Date.parse(job.finishedAt);
+  return Number.isFinite(start) && Number.isFinite(end) && end >= start ? end - start : null;
+}
+
+function coveredWatchTurns(
+  fromTurn: number | null,
+  head: WatchableJob,
+  rows: ReadonlyMap<string, WatchableJob>,
+): { turns?: { readonly from: number; readonly to: number }; durationMs?: number } {
+  const to = head.turn ?? 1;
+  const from = fromTurn ?? to;
+  const range = from < to ? { from, to } : to > 1 ? { from: to, to } : null;
+  if (!range) return {};
+  if (range.from >= range.to) return { turns: range };
+  let sum = 0;
+  let count = 0;
+  for (const r of rows.values()) {
+    const tNum = r.turn ?? 1;
+    if (tNum < range.from || tNum > range.to) continue;
+    const span = watchTurnDurationMs(r);
+    if (span !== null) {
+      sum += span;
+      count += 1;
+    }
+  }
+  return count > 1 ? { turns: range, durationMs: sum } : { turns: range };
 }
 
 export async function runJobWatch(options: JobWatchOptions): Promise<JobWatchEnd> {
@@ -151,14 +182,13 @@ export async function runJobWatch(options: JobWatchOptions): Promise<JobWatchEnd
         const root = await rj(options.cwd, w.root, t);
         if (!root) { watchDirs.push(safeJobDir(options.cwd, w.root)); continue; }
         w.rootTurn ??= root.turn ?? 1;
-        const { head, missingNextId } = await followWorkerHead(options.cwd, w.root, root, t, rj, ri);
+        const { head, rows, missingNextId } = await followWorkerHead(options.cwd, w.root, root, t, rj, ri);
         if (missingNextId !== null) watchDirs.push(safeJobDir(options.cwd, missingNextId));
         if (w.head !== null && w.head !== head.id) startedAt = t;
         w.head = head.id;
         if (root.workerId) watchDirs.push(path.join(options.cwd, WORKERS_DIR));
         watchDirs.push(safeJobDir(options.cwd, head.id));
-        const turn = head.turn ?? 1;
-        const announced = w.rootTurn !== null && turn > w.rootTurn ? { ...head, alsoRan: { from: w.rootTurn, to: turn - 1 } } : head;
+        const announced = head.status === 'attention' ? head : { ...head, ...coveredWatchTurns(w.rootTurn, head, rows) };
         if (head.status === 'attention' || isWorkerIdle(watchTurn(head))) {
           candidates.push(announced);
           if (isWorkerIdle(watchTurn(head))) finals.set(w.root, announced);
