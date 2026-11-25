@@ -40,6 +40,7 @@ import {
   type SteerEntry,
   type WatchedFileSigs,
   senderOf,
+  taskTitle,
 } from './format.ts';
 import { reconcileOrphan } from './reconcile.ts';
 import { computeStaleReads, JobWriter, pipeEvents, reportFor } from './writer.ts';
@@ -918,7 +919,7 @@ export class ForgeService {
       provider: input.provider,
       name: head.name,
       workerId: head.workerId ?? head.jobId,
-      task: head.task ?? undefined,
+      task: taskTitle(entries[0]!.prompt) || head.task || undefined,
       cwd,
       model: o.model ?? spec?.model ?? head.model ?? undefined,
       effort: o.effort ?? spec?.effort ?? head.effort ?? undefined,
@@ -1050,7 +1051,7 @@ export class ForgeService {
       preamble: prependBrief ? nextBrief : undefined,
       preambleApplied: nextBrief !== '',
       conversation,
-      task: parentSnap?.task ?? spec.task,
+      task: taskTitle(unconsumed[0]!.prompt) || parentSnap?.task || spec.task,
       watchedFiles: nextWatchedFiles,
       turn: nextTurn,
       continuedFrom: parent.jobId,

@@ -117,3 +117,53 @@ export function parseWorkerIndex(raw: unknown): WorkerIndex | null {
   const turns = r['turns'].filter((t): t is string => typeof t === 'string' && SAFE_ID.test(t));
   return { schema: 1, workerId: r['workerId'], name: r['name'], turns, updatedAt: typeof r['updatedAt'] === 'string' ? r['updatedAt'] : '' };
 }
+
+const STEER_TAG_RE = /^\[(?:FRESH CONTINUATION|TURN INTERRUPTED|FOLLOW-UP STEER · (\d+) queued updates?)\]\n/;
+const STEER_UPDATE_MARKER = '\n[ORCHESTRATOR UPDATE]\n';
+
+export function buildSteeredPrompt(input: {
+  wasInterrupted: boolean;
+  priorStatus?: string | undefined;
+  verdict?: string | undefined;
+  freshContinuation?: boolean;
+  responseTail: string;
+  entries: readonly { readonly createdAt: string; readonly prompt: string }[];
+  syncedFiles?: readonly string[];
+  brief: string;
+}): { rawPrompt: string; sentPrompt: string; prependBrief: boolean } {
+  const steerBody =
+    input.entries.length === 1
+      ? input.entries[0]!.prompt
+      : input.entries.map((e, idx) => `[Steer ${idx + 1} (${e.createdAt})]\n${e.prompt}`).join('\n\n');
+  const tag = input.freshContinuation
+    ? '[FRESH CONTINUATION]'
+    : input.wasInterrupted
+      ? '[TURN INTERRUPTED]'
+      : `[FOLLOW-UP STEER · ${input.entries.length} queued update${input.entries.length === 1 ? '' : 's'}]`;
+  const statusLine = input.wasInterrupted
+    ? 'Your previous turn was interrupted with updated instructions. Inspect your working tree before repeating any completed steps.'
+    : `Your previous turn ${input.priorStatus === undefined || input.priorStatus === 'succeeded' ? 'completed' : `ended ${input.priorStatus}`}.`;
+  const syncedLine =
+    input.syncedFiles !== undefined && input.syncedFiles.length > 0
+      ? `\nSynced brief file(s) in your working tree: ${input.syncedFiles.join(', ')} (re-read before continuing).`
+      : '';
+  const tailBlock = input.freshContinuation && input.responseTail
+    ? `\nLast response excerpt from previous turn:\n${input.responseTail}\n`
+    : '';
+  const verdictBlock = input.verdict ? `\n${input.verdict}\n` : '';
+  const header = `${tag}\n${statusLine}${syncedLine}${verdictBlock}${tailBlock}\n[ORCHESTRATOR UPDATE]\n${steerBody}`;
+  const prependBrief = input.brief !== '' && !header.startsWith(input.brief);
+  const sentPrompt = prependBrief ? `${input.brief}\n\n${header}` : header;
+  return { rawPrompt: header, sentPrompt, prependBrief };
+}
+
+export function extractSteerMessage(prompt: string): string {
+  const m = STEER_TAG_RE.exec(prompt);
+  if (m === null) return prompt;
+  const idx = prompt.indexOf(STEER_UPDATE_MARKER);
+  if (idx === -1) return prompt;
+  const body = prompt.slice(idx + STEER_UPDATE_MARKER.length);
+  return body.startsWith('[Steer 1 (')
+    ? body.replace(/(?:^|\n\n)\[Steer \d+ \([^)]+\)\]\n/g, (_, offset: number) => (offset === 0 ? '' : '\n\n'))
+    : body;
+}

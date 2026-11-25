@@ -243,24 +243,39 @@ test('workerLivenessLine drives the pane callout strictly from job.liveness with
   assert.equal(workerLivenessLine(job('done', { status: 'succeeded', endedAt: now - 1_000, lastEventAt: now - 10 * 60_000 })), null);
 });
 
-test('priorTurnSummary formats inline clickable prior turns honestly without labeling steered parents canceled', () => {
+test('priorTurnSummary formats inline clickable turns with message, verdict or status, and duration without tool count', () => {
   const steeredParent = job('t1', {
     workerId: 'ada', turn: 1, status: 'canceled', supersededBy: 't2',
-    startedAt: 0, endedAt: 72_000, toolCount: 14,
+    startedAt: 0, endedAt: 72_000, toolCount: 14, task: 'Refactor the links engine',
   });
-  assert.equal(priorTurnSummary(steeredParent, 1, 100_000), '▸ Turn 1 · steered · 14 tools · 1m12s');
+  assert.equal(priorTurnSummary(steeredParent, 1, 100_000), '▸ 1  Refactor the links engine · steered · 1m12s');
 
-  const resumedParent = job('t1-res', {
+  const checkedParent = job('t1-chk', {
     workerId: 'ada', turn: 1, status: 'succeeded',
-    startedAt: 10_000, endedAt: 55_000, chainStartedAt: 0, toolCount: 1,
+    startedAt: 0, endedAt: 5_160_000, toolCount: 614, task: 'Refactor the links engine',
+    acceptance: { state: 'accepted', checks: [{ name: 'a', ok: true, outputTail: '' }, { name: 'b', ok: true, outputTail: '' }] },
   });
-  assert.equal(priorTurnSummary(resumedParent, 1, 100_000), '▸ Turn 1 · done · 1 tool · 45s');
+  assert.equal(priorTurnSummary(checkedParent, 1, 6_000_000), '▸ 1  Refactor the links engine · checks ✓ 2/2 · 1h26m');
+
+  const failedCheckParent = job('t2-chk', {
+    workerId: 'ada', turn: 2, status: 'succeeded',
+    startedAt: 0, endedAt: 283_000, toolCount: 41,
+    prompt: '[FOLLOW-UP STEER · 1 queued update]\nYour previous turn completed.\n\n[ORCHESTRATOR UPDATE]\nFix the review findings',
+    acceptance: { state: 'rejected', checks: [{ name: 'lint', ok: false, outputTail: '' }] },
+  });
+  assert.equal(priorTurnSummary(failedCheckParent, 2, 300_000), '▸ 2  Fix the review findings · ✗ lint · 4m43s');
+
+  const openTurn = job('t3', {
+    workerId: 'ada', turn: 3, status: 'running',
+    prompt: '[FOLLOW-UP STEER · 1 queued update]\nYour previous turn completed.\n\n[ORCHESTRATOR UPDATE]\nAfter you finish the 19 test failures, do the decided fix list',
+  });
+  assert.equal(priorTurnSummary(openTurn, 3, 100_000, { open: true }), '▾ 3  After you finish the 19 test failures, do the decided fix list');
 
   const failedParent = job('t1-fail', {
     workerId: 'ada', turn: 1, status: 'failed', failureReason: 'timeout',
-    startedAt: 0, endedAt: 30_000, toolCount: null,
+    startedAt: 0, endedAt: 30_000, toolCount: null, task: 'Run tests',
   });
-  assert.equal(priorTurnSummary(failedParent, 1, 100_000), '▸ Turn 1 · failed · timed out · 30s');
+  assert.equal(priorTurnSummary(failedParent, 1, 100_000), '▸ 1  Run tests · failed · timed out · 30s');
 });
 
 test('workerTurns, workerHead, statusLine and sessionJobs unify steered and resumed turns', () => {

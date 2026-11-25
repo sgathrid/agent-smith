@@ -7,7 +7,7 @@ import { test } from 'node:test';
 import type { SpawnSpec } from '../../providers/types.ts';
 import { readAcceptance } from '../checks.ts';
 import { FILES, jobFile } from '../format.ts';
-import { buildSteeredPrompt } from '../steer-log.ts';
+import { buildSteeredPrompt, extractSteerMessage } from '../steer-log.ts';
 import { ForgeTasks } from '../../surfaces/channel/src/tasks.ts';
 import { callTool } from '../../surfaces/channel/src/tools.ts';
 import { isLive } from '../../surfaces/mod/hooks/dashboard.ts';
@@ -578,4 +578,89 @@ test('buildSteeredPrompt trims bloat on resumed continuations and keeps excerpt 
   assert.doesNotMatch(fresh.rawPrompt, /\[STEERED TURN CONTINUITY\]/);
   assert.match(fresh.rawPrompt, /Last response excerpt from previous turn:\nTail from the previous turn\./);
   assert.match(fresh.rawPrompt, /\[ORCHESTRATOR UPDATE\]\nRetry the fix\./);
+});
+
+test('extractSteerMessage round-trips buildSteeredPrompt across all continuation variants and leaves plain prompts intact', () => {
+  const entry = (id: string, createdAt: string, prompt: string) => ({
+    id, createdAt, prompt, delivery: 'queue' as const,
+  });
+  const cases = [
+    {
+      wasInterrupted: false,
+      priorStatus: 'succeeded',
+      freshContinuation: false,
+      responseTail: '',
+      entries: [entry('s1', '2026-11-24T10:00:00.000Z', 'After you finish the 19 test failures, do the decided fix list')],
+      brief: '',
+    },
+    {
+      wasInterrupted: true,
+      freshContinuation: false,
+      responseTail: 'Ignored tail',
+      entries: [entry('s1', '2026-11-24T10:00:00.000Z', 'Switch to approach B.')],
+      syncedFiles: ['docs/spec.md'],
+      verdict: 'Checks failed: lint',
+      brief: 'Brief',
+    },
+    {
+      wasInterrupted: false,
+      priorStatus: 'failed',
+      freshContinuation: true,
+      responseTail: 'Tail from previous turn.',
+      entries: [entry('s1', '2026-11-24T10:00:00.000Z', 'Retry the fix.\nKeep tests green.')],
+      brief: '',
+    },
+  ];
+  for (const input of cases) {
+    const { rawPrompt } = buildSteeredPrompt(input);
+    assert.equal(extractSteerMessage(rawPrompt), input.entries[0]!.prompt);
+  }
+  const multi = buildSteeredPrompt({
+    wasInterrupted: false,
+    priorStatus: 'succeeded',
+    freshContinuation: false,
+    responseTail: '',
+    entries: [
+      entry('s1', '2026-11-24T10:00:00.000Z', 'First update.'),
+      entry('s2', '2026-11-24T10:01:00.000Z', 'Second update.'),
+    ],
+    brief: '',
+  });
+  assert.equal(extractSteerMessage(multi.rawPrompt), 'First update.\n\nSecond update.');
+  assert.equal(extractSteerMessage('Refactor the links engine'), 'Refactor the links engine');
+});
+
+test('a continuation turn manifest task is the label of its own message, not turn 1', async () => {
+  const ctrl = controlledProvider();
+  const { service, repo } = makeService(ctrl.provider);
+  const readTask = (id: string) => (JSON.parse(readFileSync(jobFile(repo, id, FILES.job), 'utf8')) as { task?: string }).task;
+
+  const t1Ready = ctrl.nextTurn();
+  const { ack, done: done1 } = await service.spawnTracked({ mode: 'implement', name: 'Ada', prompt: '# Refactor the links engine\n\nFull details.' });
+  const t1 = await t1Ready;
+  t1.emit({ kind: 'started', at: new Date().toISOString(), conversationId: 'conv-1' });
+  t1.finish({ status: 'success', response: 'Done.' });
+  await done1;
+  assert.equal(readTask(ack.jobId), 'Refactor the links engine');
+
+  const t2Ready = ctrl.nextTurn();
+  const f1 = await service.followUp({ worker: ack.jobId, prompt: '\n\n# Fix the review findings\n\nMore details.' });
+  assert.equal(f1.action, 'started');
+  const t2 = await t2Ready;
+  t2.emit({ kind: 'started', at: new Date().toISOString(), conversationId: 'conv-1' });
+  const q1 = await service.followUp({ worker: f1.jobId!, prompt: 'Interrupt with new plan\nDetails', context: 'c' });
+  assert.equal(q1.action, 'queued');
+
+  const t3Ready = ctrl.nextTurn();
+  t2.finish({ status: 'success', response: 'Fixed.' });
+  const t3 = await t3Ready;
+  t3.finish({ status: 'success', response: 'Done 3.' });
+  const t3JobId = await waitFor(async () => {
+    const m = JSON.parse(readFileSync(jobFile(repo, f1.jobId!, FILES.job), 'utf8')) as { followedBy?: string };
+    return m.followedBy ?? null;
+  });
+  await waitFor(async () => (await service.detail(t3JobId)).status === 'succeeded');
+
+  assert.equal(readTask(f1.jobId!), 'Fix the review findings');
+  assert.equal(readTask(t3JobId), 'Interrupt with new plan');
 });

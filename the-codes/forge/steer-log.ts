@@ -95,41 +95,7 @@ export function liveMessageText(e: Pick<SteerEntry, 'prompt'>): string {
   return e.prompt;
 }
 
-export function buildSteeredPrompt(input: {
-  wasInterrupted: boolean;
-  priorStatus?: string | undefined;
-  verdict?: string | undefined;
-  freshContinuation?: boolean;
-  responseTail: string;
-  entries: readonly SteerEntry[];
-  syncedFiles?: readonly string[];
-  brief: string;
-}): { rawPrompt: string; sentPrompt: string; prependBrief: boolean } {
-  const steerBody =
-    input.entries.length === 1
-      ? input.entries[0]!.prompt
-      : input.entries.map((e, idx) => `[Steer ${idx + 1} (${e.createdAt})]\n${e.prompt}`).join('\n\n');
-  const tag = input.freshContinuation
-    ? '[FRESH CONTINUATION]'
-    : input.wasInterrupted
-      ? '[TURN INTERRUPTED]'
-      : `[FOLLOW-UP STEER · ${input.entries.length} queued update${input.entries.length === 1 ? '' : 's'}]`;
-  const statusLine = input.wasInterrupted
-    ? 'Your previous turn was interrupted with updated instructions. Inspect your working tree before repeating any completed steps.'
-    : `Your previous turn ${input.priorStatus === undefined || input.priorStatus === 'succeeded' ? 'completed' : `ended ${input.priorStatus}`}.`;
-  const syncedLine =
-    input.syncedFiles !== undefined && input.syncedFiles.length > 0
-      ? `\nSynced brief file(s) in your working tree: ${input.syncedFiles.join(', ')} (re-read before continuing).`
-      : '';
-  const tailBlock = input.freshContinuation && input.responseTail
-    ? `\nLast response excerpt from previous turn:\n${input.responseTail}\n`
-    : '';
-  const verdictBlock = input.verdict ? `\n${input.verdict}\n` : '';
-  const header = `${tag}\n${statusLine}${syncedLine}${verdictBlock}${tailBlock}\n[ORCHESTRATOR UPDATE]\n${steerBody}`;
-  const prependBrief = input.brief !== '' && !header.startsWith(input.brief);
-  const sentPrompt = prependBrief ? `${input.brief}\n\n${header}` : header;
-  return { rawPrompt: header, sentPrompt, prependBrief };
-}
+export { buildSteeredPrompt, extractSteerMessage } from '../surfaces/mod/hooks/turns.ts';
 
 export function readSteerHead(repo: string, jobId: string): string | null {
   try {
