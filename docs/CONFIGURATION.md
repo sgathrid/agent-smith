@@ -292,8 +292,8 @@ finish evidence fields (`toolErrors, failedEarly, changedFilesUnknown, cwdMissin
 `earlierTurns` (`[{turn, jobId, status, summary (<= 120 chars)}]`), `report`
 (first 2 000 chars; a trailing note says it was cut and `reportTruncated` is true), `reportPath`,
 `summary` only when the report does not already contain it, and with `wait_ms`: `waited`, `stillRunning`. Null fields are omitted.
-`include_diff` (either format) adds `diff`: a unified diff of `changedFiles` against the job's spawn-time
-`gitBaseline.head`, run in the job's `cwd`, capped at 40 000 chars on a line boundary. `diffNote` says how
+`include_diff` (either format) adds `diff`: a unified diff of `changedFiles` against the turn's spawn-time
+`gitBaseline.head` (for a worker name, the union across its turns against the earliest turn's), run in the job's `cwd`, capped at 40 000 chars on a line boundary. `diffNote` says how
 to see the rest (`git diff <head> -- <file>`), lists new untracked files (which a diff cannot show), or
 explains why there is no diff (no git baseline, job still running, no changes; `diff` is then null or empty).
 
