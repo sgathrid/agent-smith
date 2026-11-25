@@ -261,12 +261,12 @@ or relative `30m`/`2h`/`1d`; jobs last active at or after it), `session` (only j
 process; empty after a restart), `response_format` `concise|detailed` (default `concise`). Groups by `workerId` by default (one row per worker, selecting the head turn). Running first,
 then newest.
 Concise rows (compact JSON):
-- Settled: `name, jobId, turn` (only if `> 1`), `status, provider, model, mode, summary` (<= 160 chars), `durationMs, finishedAt, acceptance` (verdict), `changedFileCount` (only if `> 0`), `warningCount?`, and finish evidence fields when they apply (`toolErrors, failedEarly, changedFilesUnknown, cwdMissingAtFinish`).
+- Settled: `name, jobId, turn` (only if `> 1`), `status, provider, model, mode, summary` (<= 160 chars), `durationMs, finishedAt, acceptance` (verdict), `changedFileCount` (only if `> 0`), `warningCount?`, `resumable` (on `failed` rows), and finish evidence fields when they apply (`toolErrors, failedEarly, changedFilesUnknown, cwdMissingAtFinish`).
 - Running: `name, jobId, turn` (only if `> 1`), `status, provider, model, mode, liveness, lastActivity, digest, elapsedMs, toolCalls, pendingMessages?`.
 Concise rows omit `workerId`, `taskStatus`, `chainStartedAt`, `startedAt` (settled), `continuedFrom`, `continuationKind`, `supersededBy`, and `followedBy`.
 Detailed rows (`JobSummary`): `jobId, name, workerId, turn, role, latestSummary, summarySource,
 source, status, taskStatus, provider, mode, model, task, toolCalls, currentActivity, lastActivity, startedAt,
-updatedAt, finishedAt, chainStartedAt?, continuedFrom?, continuationKind?, supersededBy?, followedBy?, pendingMessages?, warnings[], nextAction, unrestricted?`, the same evidence fields,
+updatedAt, finishedAt, chainStartedAt?, continuedFrom?, continuationKind?, supersededBy?, followedBy?, pendingMessages?, warnings[], resumable?, unrestricted?`, the same evidence fields,
 `lastEventAt`, `lastAliveAt`, and for running jobs `liveness`. `latestSummary` is
 untrusted: the worker's current message while it runs, the head of its final response (after any leading `Status:` line) once done.
 
@@ -278,7 +278,7 @@ Concise result: `jobId, workerId, name, turn` (only if `> 1`), `status, provider
 `supersededBy?` (only if set), `resolvedFrom?` (only if set), `liveness` and `lastActivity` (running jobs),
 `durationMs, pendingMessages?`, `changedFileCount`, `changedFiles` (first 20), `changedFilesNote?`,
 finish evidence fields (`toolErrors, failedEarly, changedFilesUnknown, cwdMissingAtFinish`), `staleReads?`,
-`nextAction`, `reason`, `error` (<= 500 chars), `warnings` (deduped strings),
+`resumable` (when not running and not succeeded), `reason`, `error` (<= 500 chars), `warnings` (deduped strings),
 `earlierTurns` (`[{turn, jobId, status, summary (<= 120 chars)}]`), `report`
 (first 2 000 chars; a trailing note says it was cut and `reportTruncated` is true), `reportPath`,
 `summary` only when the report does not already contain it, and with `wait_ms`: `waited`, `stillRunning`. Null fields are omitted.
@@ -297,7 +297,7 @@ event.
 
 Finish evidence, present only when true or nonzero: `toolErrors` (tool calls that ended in an
 error; a warning, not a verdict), `failedEarly` (failed before any tool call: model, region or
-account; `error` keeps the provider text and `nextAction` suggests another route),
+account; `error` keeps the provider text),
 `changedFilesUnknown` (changed files could not be computed, so a missing `changedFiles` means
 unknown, not none), `cwdMissingAtFinish` (the cwd was gone at finish; a writing job then fails
 with reason `working directory gone`).

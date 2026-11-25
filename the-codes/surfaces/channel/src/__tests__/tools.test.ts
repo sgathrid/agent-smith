@@ -284,7 +284,7 @@ const summary = (i: number, extra: Record<string, unknown> = {}) => ({
   jobId: `implement-smith-${i}`, name: `w${i}`, workerId: `w${i}`, role: 'implement', latestSummary: LONG, summarySource: 'worker',
   status: 'succeeded', provider: 'agy', mode: 'implement', model: 'm', task: 't', toolCalls: 7, currentActivity: null,
   lastActivity: { stepIndex: 12, tool: 'Bash', input: 'npm test '.repeat(100), status: 'done' },
-  startedAt: iso(60_000), updatedAt: iso(30_000), finishedAt: iso(30_000), warnings: [], nextAction: null, ...extra,
+  startedAt: iso(60_000), updatedAt: iso(30_000), finishedAt: iso(30_000), warnings: [], ...extra,
 });
 const detail = (extra: Record<string, unknown> = {}) => ({ ...summary(1), report: 'All done.', error: null, exitCode: 0, unrestricted: true, pipeline: null, stage: null,
   usage: { input: 1 }, conversation: 'c', effort: 'high', cwd: '/x', cancellable: false, ...extra });
@@ -310,7 +310,7 @@ test('list_jobs: a concise list cut by its limit says so; an uncut one stays a p
   const ctx = withService({ list: async (f: { limit: number }) => Array.from({ length: Math.min(f.limit, 3) }, (_, i) => summary(i)) });
   const cut = await callTool(ctx, 'list_jobs', { limit: 2 });
   assert.equal(body(cut).items.length, 2);
-  assert.match(body(cut).more, /More than 2 jobs match; narrow with since, status or session/);
+  assert.equal(body(cut).more, 'More than 2 jobs match; 2 shown.');
   assert.deepEqual(cut.structuredContent, body(cut));
   const whole = await callTool(ctx, 'list_jobs', { limit: 3 });
   assert.equal(body(whole).length, 3);
@@ -340,6 +340,32 @@ test('status names the id it resolved from when it answers with another turn', a
   assert.equal(body(await callTool(ctx, 'status', { id: 'w1' })).resolvedFrom, 'w1');
   assert.equal(body(await callTool(ctx, 'status', { id: 'w1', response_format: 'detailed' })).resolvedFrom, 'w1');
   assert.equal('resolvedFrom' in body(await callTool(ctx, 'status', { id: 'implement-smith-1' })), false);
+});
+
+test('concise status and list_jobs include resumable when failed/stopped without succeeding, and omit it for running/succeeded', async () => {
+  const ctx = withService({
+    list: async () => [
+      summary(1, { status: 'succeeded', resumable: true }),
+      summary(2, { status: 'running', finishedAt: null, resumable: true }),
+      summary(3, { status: 'failed', resumable: true }),
+      summary(4, { status: 'failed', resumable: false }),
+    ],
+    detail: async (id: string) => {
+      if (id === 's') return detail({ status: 'succeeded', conversation: 'c' });
+      if (id === 'r') return detail({ status: 'running', finishedAt: null, conversation: 'c' });
+      if (id === 'f') return detail({ status: 'failed', conversation: 'c', error: 'timed out' });
+      return detail({ status: 'canceled', conversation: null });
+    },
+  });
+  const rows = body(await callTool(ctx, 'list_jobs', {}));
+  assert.equal('resumable' in rows[0], false);
+  assert.equal('resumable' in rows[1], false);
+  assert.equal(rows[2].resumable, true);
+  assert.equal(rows[3].resumable, false);
+  assert.equal('resumable' in body(await callTool(ctx, 'status', { id: 's' })), false);
+  assert.equal('resumable' in body(await callTool(ctx, 'status', { id: 'r' })), false);
+  assert.equal(body(await callTool(ctx, 'status', { id: 'f' })).resumable, true);
+  assert.equal(body(await callTool(ctx, 'status', { id: 'c' })).resumable, false);
 });
 
 test('a running job with no progress time reports liveness silent in list_jobs and status (no stalled alias)', async () => {
@@ -456,11 +482,13 @@ test('status: concise merges identity, verdicts, timing and one report; detailed
   assert.equal(full.usage.input, 1); assert.equal(full.latestSummary, 'All done.'); assert.equal(full.reportTruncated, false); assert.equal(full.cwd, '/x');
 });
 
-test('status: concise report is bounded with an explicit truncation note; a distinct summary is kept', async () => {
-  const ctx = withService({ detail: async () => detail({ report: 'x'.repeat(5_000), latestSummary: 'Different summary.' }) });
+test('status: concise report and changedFiles are bounded with factual truncation notes; a distinct summary is kept', async () => {
+  const many = Array.from({ length: 25 }, (_, i) => `f${i}.ts`);
+  const ctx = withService({ detail: async () => detail({ report: 'x'.repeat(5_000), latestSummary: 'Different summary.', changedFiles: many }) });
   const b = body(await callTool(ctx, 'status', { id: 'j' }));
   assert.equal(b.reportTruncated, true);
-  assert.match(b.report, /\[truncated: 2000 of 5000 chars; use response_format: "detailed" for more\]$/);
+  assert.match(b.report, /\[truncated: 2000 of 5000 chars shown\]$/);
+  assert.equal(b.changedFilesNote, 'First 20 of 25 shown.');
   assert.ok(b.report.length < 2_150); assert.equal(b.summary, 'Different summary.');
   assert.equal(body(await callTool(ctx, 'status', { id: 'j', response_format: 'detailed' })).report.length, 5_000);
 });
@@ -701,7 +729,9 @@ test('concise list_capabilities drops non-coding models and repeated defaults, p
 
   const oc = caps.providers.find((p: any) => p.name === 'opencode');
   assert.equal(oc.models, undefined, 'over the cap: a count, not a list');
-  assert.equal(oc.modelCount, 124); assert.match(oc.more, /provider: "opencode"/); assert.equal(typeof oc.unverified, 'string');
+  assert.equal(oc.modelCount, 124); assert.equal(oc.more, '0 of 124 models shown'); assert.equal(oc.unverified, 'model list unconfirmed');
+  const followUpDef = TOOL_DEFS.find((t) => t.name === 'follow_up');
+  assert.equal(followUpDef?.description.includes('pass env again'), false);
   assert.equal(oc.defaultModel, undefined);
   assert.equal(caps.providers.find((p: any) => p.name === 'agy').models, undefined, 'uninstalled providers carry no models');
   assert.ok(text.length < 1_500, `concise output stays small (${text.length} chars)`);

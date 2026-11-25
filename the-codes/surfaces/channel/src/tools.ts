@@ -310,7 +310,7 @@ const listJobs: Handler = async (ctx, args) => {
   if (fmt !== 'concise') return structured(workers.map(j => { const live = jobLiveness(j); return { ...j, taskStatus: taskStatus(j.status), ...(live === null ? {} : { liveness: livenessView(live) }) }; }));
   const rows = workers.slice(0, limit).map(j => conciseRow(j));
   return structured(workers.length > rows.length
-    ? { items: rows, more: `More than ${rows.length} jobs match; narrow with since, status or session, or raise limit.` }
+    ? { items: rows, more: `More than ${rows.length} jobs match; ${rows.length} shown.` }
     : rows, { compact: true });
 };
 

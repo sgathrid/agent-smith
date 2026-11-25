@@ -407,7 +407,7 @@ test('a provider without per-run effort control records no effort and warns', as
   (fake.provider as Provider & { supportsEffort?: boolean }).supportsEffort = false;
   const { service } = svc(fake);
   const ack = await service.spawnJob({ mode: 'implement', prompt: 'x', effort: 'high' });
-  assert.ok(ack.warnings?.some((w) => /has no per-run effort flag/.test(w)));
+  assert.equal(ack.warnings?.find((w) => /has no per-run effort flag/.test(w)), 'kimi has no per-run effort flag; effort "high" was ignored.');
   const job = JSON.parse(readFileSync(path.join(ack.dir, 'job.json'), 'utf8'));
   assert.equal(job.effort, null, 'an effort that was not applied must not be recorded as if it was');
   assert.equal(fake.specs[0]?.effort, undefined, 'the adapter is not asked to honor an impossible knob');

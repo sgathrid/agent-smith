@@ -1,8 +1,7 @@
 import type { ProgressDigest } from '../surfaces/mod/types/index.d.ts';
 import type { ContinuationKind } from '../surfaces/mod/hooks/turns.ts';
 import {
-  AUTH_RE, BUSY_RE, COMPATIBILITY_RE, DENIED_RE, NETWORK_RE, NO_OUTPUT_RE, ORPHAN_RE, QUOTA_RE, RATE_LIMIT_RE,
-  REASONS, START_RE, TIMEOUT_RE, deniedReason, reasonFromText,
+  DENIED_RE, REASONS, deniedReason, reasonFromText,
 } from '../surfaces/mod/hooks/reasons.ts';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -483,52 +482,4 @@ export function deriveOrphan(
   if (times.length === 0) return null;
   const ref = Math.max(...times);
   return nowMs - ref > LEGACY_ORPHAN_AFTER_MS ? verdict : null;
-}
-
-export interface NextActionInput {
-  readonly status: string | null | undefined;
-  readonly jobStatus?: string | null | undefined;
-  readonly error?: string | null | undefined;
-  readonly report?: string | null | undefined;
-  readonly exitCode?: number | null | undefined;
-  readonly deniedCount?: number | undefined;
-  readonly unrestricted?: boolean | undefined;
-  readonly steerNotApplied?: boolean | undefined;
-  readonly failedEarly?: boolean | undefined;
-}
-
-export function nextActionFor(i: NextActionInput): string | null {
-  const base = baseNextAction(i);
-  return base !== null && i.steerNotApplied === true
-    ? `${base} A queued message was discarded: send it again with follow_up.`
-    : base;
-}
-
-function baseNextAction(i: NextActionInput): string | null {
-  const status = i.status ?? null;
-  if (status !== 'failed') return null;
-  const err = i.error ?? '';
-  if (ORPHAN_RE.test(err)) return 'Server stopped: follow_up if it has a conversation, else rerun.';
-  if (i.jobStatus === 'denied' || (i.deniedCount ?? 0) > 0 || DENIED_RE.test(err)) {
-    return i.unrestricted === true
-      ? 'Denied even with unrestricted:true: narrow the task or give an approved path.'
-      : 'Ask the user before retrying with unrestricted:true.';
-  }
-  if (AUTH_RE.test(err)) return 'Not logged in: fix the provider login, then retry.';
-  if (BUSY_RE.test(err)) return 'Provider busy (temporary); follow_up to continue.';
-  if (QUOTA_RE.test(err)) return 'Out of credits on the provider account.';
-  if (RATE_LIMIT_RE.test(err)) return 'Rate limited; follow_up after a short wait.';
-  if (COMPATIBILITY_RE.test(err)) return 'Bad flag or model.';
-  if (START_RE.test(err)) return "Couldn't start.";
-  if (i.failedEarly === true && i.jobStatus !== 'timeout') {
-    return 'Route failed before any work (model/account): pick another model from list_capabilities or fix the account.';
-  }
-  if (i.jobStatus === 'timeout' || TIMEOUT_RE.test(err)) {
-    return 'Raise timeoutMs or split the task; follow_up keeps context.';
-  }
-  if (NETWORK_RE.test(err)) return 'Network error: retry once with follow_up or a new spawn.';
-  if (NO_OUTPUT_RE.test(err) || (i.exitCode === 0 && looksEmpty(i.report))) {
-    return 'No output: ask for a final answer via follow_up, or rerun.';
-  }
-  return 'Read status.error and warnings before retrying.';
 }

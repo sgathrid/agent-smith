@@ -212,7 +212,7 @@ export async function validateModelAndEffort(
   const effectiveEffort = provider.supportsEffort === false ? undefined : effort;
   if (effort !== undefined && provider.supportsEffort === false) {
     warnings.push(
-      `${provider.name} has no per-run effort flag; effort "${effort}" was ignored. Set [thinking].effort or a model alias default_effort in config.toml.`,
+      `${provider.name} has no per-run effort flag; effort "${effort}" was ignored.`,
     );
   }
   if ((model !== undefined || effectiveEffort !== undefined) && getCatalog !== undefined) {

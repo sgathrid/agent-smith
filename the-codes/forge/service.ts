@@ -1432,7 +1432,7 @@ export class ForgeService {
     const known = { ...(vault ?? {}), ...(env ?? {}) };
     const runEnv = Object.keys(known).length > 0 ? known : undefined;
     const missing = this.envKeysOf(headId).filter((k) => !(k in known));
-    if (missing.length > 0) warnings.push(`env ${missing.join(', ')} not set: values live only in memory and were lost; pass env again.`);
+    if (missing.length > 0) warnings.push(`env ${missing.join(', ')} not set: values live only in memory and were lost.`);
     const ack: Pick<MessageAck, 'env' | 'envKeys'> = missing.length > 0 ? { env: 'dropped', envKeys: missing }
       : passed ? { env: 'set' } : runEnv !== undefined ? { env: 'kept' } : {};
     return { ack, ...(runEnv === undefined ? {} : { runEnv }) };
@@ -1571,10 +1571,8 @@ export class ForgeService {
       const workerId = m?.workerId ?? trimmed;
       return this.workerHeadId(workerId) ?? this.resolveTurn(trimmed);
     }
-    if (this.isSafeJobId(trimmed)) {
-      const byWorkerId = this.workerHeadId(trimmed);
-      if (byWorkerId !== null) return byWorkerId;
-    }
+    const byWorkerId = this.workerHeadId(trimmed);
+    if (byWorkerId !== null) return byWorkerId;
     return this.resolveName(trimmed);
   }
 

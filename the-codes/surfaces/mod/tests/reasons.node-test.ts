@@ -53,3 +53,15 @@ test('an unavailable file or model is not a busy provider', () => {
   assert.notEqual(reasonFromText('file unavailable: /w/x.py'), 'provider busy');
   assert.equal(reasonFromText('503 Service Unavailable'), 'provider busy');
 });
+
+test('provider API access errors are not tool denials, while tool permission denials are', () => {
+  assert.equal(reasonFromText('Access denied'), 'Access denied');
+  assert.equal(reasonFromText('403 Permission denied'), '403 Permission denied');
+  assert.equal(reasonFromText('HTTP 403 Permission denied for /v1/messages'), 'worker error');
+  assert.match(reasonFromText('permission check failed for command rm: user denied permission to run command'), /^denied\b/);
+  assert.match(reasonFromText('auto-denied by permission policy'), /^denied\b/);
+});
+
+test('quota outranks timeout consistently', () => {
+  assert.equal(reasonFromText('quota exhausted; request timed out'), 'out of credits');
+});

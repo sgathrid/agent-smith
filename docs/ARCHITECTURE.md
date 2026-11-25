@@ -207,16 +207,7 @@ call, `tool` (the first command of a shell call, else the tool name). `attention
 `liveness {state, silentForMs, tool?}` as the sole liveness truth. kimi reports a tool call
 only when it ends, so a kimi job in a long command reads `silent`, not `in-tool`.
 
-`nextActionFor` derives (never stores) an imperative for the orchestrator on
-`failed`/`canceled` jobs: canceled -> nothing to do; orphaned -> `follow_up` if it has a
-conversation handle else rerun; denied -> use an approved path or ask authorization before
-retrying unrestricted; authentication/quota -> resolve the account problem; rate limit ->
-wait or reduce concurrency; incompatible arguments -> run `doctor` and check capabilities;
-`failedEarly` -> pick another model from `list_capabilities` or fix the account (after the
-specific diagnoses, before the generic ones; never for a timeout);
-timeout -> raise `timeoutMs`/split; network-ish error -> retry once;
-empty output -> ask via `follow_up`; otherwise read `error` and `warnings`. `null` for
-running/succeeded. Surfaced in `list_jobs` and `status`.
+`classifyFailure` and `reasonFromText` (`surfaces/mod/hooks/reasons.ts`) classify failure text into a short `reason` on failed jobs (`server stopped`, `denied`, `not logged in`, `provider busy`, `out of credits`, `rate limited`, `bad flag or model`, `couldn't start`, `timed out`, `network error`, `no output`, `crashed`, `setup failed`, `checks failed`, or `exit N`). `resumable` reports whether a saved conversation handle exists. Both are surfaced in `status` and `list_jobs`.
 
 ## MCP Tasks (`io.modelcontextprotocol/tasks`)
 

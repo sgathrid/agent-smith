@@ -297,7 +297,7 @@ const plural = (n: number, one: string, many = `${one}s`): string => `${n} ${n =
  */
 export function progressPhrase(digest: ProgressDigest, activity: string): string {
   const parts: string[] = [];
-  if (digest.repeat !== null) parts.push(`repeating ${oneLine(digest.repeat.label)} ×${digest.repeat.count}`);
+  if (digest.repeat !== null) parts.push(`${digest.repeat.count}× in a row: ${oneLine(digest.repeat.label)}`);
   else {
     // A verb phrase ("reading config.py", "running tests") says what is happening.
     // A raw command fallback ("ls tests/", "printf %s") does not; the phase does.
@@ -308,6 +308,19 @@ export function progressPhrase(digest: ProgressDigest, activity: string): string
   if (digest.testRuns > 0) parts.push(digest.lastTestFailed ? 'last test run failed' : `ran tests ×${digest.testRuns}`);
   if (digest.editedCount === 0 && digest.filesRead > 0) parts.push(`${plural(digest.filesRead, 'file')} read`);
   return parts.filter((p) => p !== '').join(' · ');
+}
+
+export function progressSummaryLine(digest: ProgressDigest): string {
+  const phase = oneLine(digest.phase) || 'running';
+  const parts = [
+    `${phase[0]!.toUpperCase()}${phase.slice(1)}`,
+    digest.filesRead > 0 ? `${plural(digest.filesRead, 'file')} read` : '',
+    digest.searches > 0 ? plural(digest.searches, 'search', 'searches') : '',
+    digest.commands > 0 ? plural(digest.commands, 'command') : '',
+    digest.testRuns > 0 ? `tests ran ${digest.testRuns}×${digest.lastTestFailed ? ' · last run failed' : ''}` : '',
+    digest.repeat !== null ? `${digest.repeat.count}× in a row: ${oneLine(digest.repeat.label)}` : '',
+  ].filter((p) => p !== '');
+  return parts.join(' · ');
 }
 
 /** The pane's progress block: a few full lines, nothing truncated mid-thought. */
@@ -331,7 +344,7 @@ export function progressLines(digest: ProgressDigest, toolCount: number | null):
   if (digest.testRuns > 0) {
     lines.push(`Tests: ran ${plural(digest.testRuns, 'time')}${digest.lastTestFailed ? ' · last run failed' : ''}`);
   }
-  if (digest.repeat !== null) lines.push(`Repeating: ${oneLine(digest.repeat.label)} ×${digest.repeat.count}`);
+  if (digest.repeat !== null) lines.push(`${digest.repeat.count}× in a row: ${oneLine(digest.repeat.label)}`);
   return lines;
 }
 

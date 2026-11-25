@@ -256,15 +256,19 @@ export async function cmdStatus(jobId: string, repo = process.cwd()): Promise<nu
     return EXIT.ok;
   } catch { /* maybe this is a worker job id */ }
   try {
-    const detail = await service.detail(jobId);
+    const detail = await service.resolveWorker(jobId);
     process.stdout.write(`id        ${detail.jobId}\nstatus    ${detail.status}\nname      ${detail.name || '-'}\nrole      ${detail.role ?? detail.mode ?? '-'}\ntask      ${detail.task ?? '-'}\nprovider  ${detail.provider ?? '-'}\nmode      ${detail.mode ?? '-'}\nrepo      ${root}\n`);
     if (detail.currentActivity !== null) process.stdout.write(`activity  ${detail.currentActivity.tool} (${detail.currentActivity.status})\n`);
     if (detail.latestSummary !== null && detail.summarySource === 'worker') process.stdout.write(`summary   [worker] ${detail.latestSummary}\n`);
     if (detail.report !== null) process.stdout.write(`\n${detail.report}\n`);
     if (detail.error !== null) process.stdout.write(`error     ${detail.error}\n`);
     return EXIT.ok;
-  } catch {
-    process.stderr.write(`agent-smith: no run or job '${jobId}' in ${root}/.agent-smith\n`);
+  } catch (error) {
+    if (error instanceof WorkerLookupError && error.kind === 'ambiguous') {
+      process.stderr.write(`agent-smith: worker name '${jobId}' is ambiguous; use a job id: ${error.jobIds.join(', ')}\n`);
+      return EXIT.usage;
+    }
+    process.stderr.write(`agent-smith: no run or worker '${jobId}' in ${root}/.agent-smith\n`);
     return EXIT.notFound;
   }
 }
@@ -288,7 +292,7 @@ export async function cmdCancel(id: string, repo = process.cwd()): Promise<numbe
   }
 }
 
-export const USAGE = `agent-smith — run coding agents from Claude\n\n  agent-smith setup [--scope user|project|local] [--local] [--repo path] [--marketplace source]\n  agent-smith uninstall [--local] [--repo path] [--keep-jobs]\n  agent-smith run implement --prompt "…" [--name worker] [--repo path] [--cwd path]\n                            [--provider agy] [--model …] [--effort low] [--check "npm test"]\n  agent-smith run ./pipeline.yaml [--foreground]\n  agent-smith resume <jobId|worker-name> --prompt "…" [--repo path] [--cwd path]\n  agent-smith ls [--status running]\n  agent-smith status <runId|jobId>\n  agent-smith cancel <runId|jobId>\n  agent-smith gc [--older-than 14d] [--delete] [--dry-run] [--repo path]\n  agent-smith doctor\n\nWorkers run on this machine. They are restricted by default; --unrestricted bypasses provider approval prompts.\n`;
+export const USAGE = `agent-smith — run coding agents from Claude\n\n  agent-smith setup [--scope user|project|local] [--local] [--repo path] [--marketplace source]\n  agent-smith uninstall [--local] [--repo path] [--keep-jobs]\n  agent-smith run implement --prompt "…" [--name worker] [--repo path] [--cwd path]\n                            [--provider agy] [--model …] [--effort low] [--check "npm test"]\n  agent-smith run ./pipeline.yaml [--foreground]\n  agent-smith resume <jobId|worker-name> --prompt "…" [--repo path] [--cwd path]\n  agent-smith ls [--status running]\n  agent-smith status <runId|jobId|workerId|name>\n  agent-smith cancel <runId|jobId>\n  agent-smith gc [--older-than 14d] [--delete] [--dry-run] [--repo path]\n  agent-smith doctor\n\nWorkers run on this machine. They are restricted by default; --unrestricted bypasses provider approval prompts.\n`;
 
 export async function main(argv: readonly string[]): Promise<number> {
   let parsed;

@@ -62,7 +62,6 @@ function rawTransport(tasks = true) {
       updatedAt: '2026-10-14T12:00:05.000Z',
       finishedAt: status === 'running' ? null : '2026-10-14T12:00:05.000Z',
       warnings: [],
-      nextAction: status === 'failed' ? 'inspect error' : null,
       report: status === 'running' ? null : 'Completed worker report: all findings documented.',
       error: status === 'failed' ? 'worker exited 1' : null,
       exitCode: status === 'succeeded' ? 0 : status === 'failed' ? 1 : null,

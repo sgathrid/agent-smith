@@ -35,7 +35,7 @@ const summary: JobSummary = {
   status: 'succeeded', provider: 'codex', mode: 'review', model: 'gpt-x', task: 'Review parser', toolCalls: 4,
   currentActivity: null, lastActivity: { stepIndex: 3, tool: 'shell', input: 'npm test', status: 'done' },
   startedAt: '2026-10-11T09:00:00.000Z', updatedAt: '2026-10-11T09:05:00.000Z', finishedAt: '2026-10-11T09:05:00.000Z',
-  warnings: [{ code: 'slow', message: 'took a while' }], nextAction: null, unrestricted: false,
+  warnings: [{ code: 'slow', message: 'took a while' }], unrestricted: false,
 };
 const detail: JobDetail = {
   ...summary, report: 'Report body. '.repeat(400), error: null, exitCode: 0, unrestricted: false, pipeline: null, stage: null,
@@ -46,7 +46,7 @@ const detail: JobDetail = {
 };
 const running: JobDetail = { ...detail, jobId: 'job-2', name: 'Bo', workerId: 'Bo', status: 'running', finishedAt: null, report: null, exitCode: null, latestSummary: null, summarySource: null, lastActivity: null, toolCalls: null, changedFiles: undefined, gitBaseline: undefined, warnings: [] };
 const unknown: JobDetail = { ...running, jobId: 'job-3', name: 'Cy', workerId: 'Cy', status: 'unknown' };
-const failed: JobDetail = { ...running, jobId: 'job-4', name: 'Di', workerId: 'Di', status: 'failed', finishedAt: '2026-10-11T09:06:00.000Z', exitCode: 1, error: 'exit 1', nextAction: 'rerun' };
+const failed: JobDetail = { ...running, jobId: 'job-4', name: 'Di', workerId: 'Di', status: 'failed', finishedAt: '2026-10-11T09:06:00.000Z', exitCode: 1, error: 'exit 1' };
 const details = [detail, running, unknown, failed];
 const messageAck: MessageAck = {
   jobId: 'job-2', name: 'Bo', workerId: 'Bo', turn: 1, action: 'queued', delivery: 'turn-end', status: 'running',
@@ -57,7 +57,7 @@ const service = withWorkerLookup({
   spawnJob: async () => ack,
   followUp: async (req: { worker: string; env?: unknown }): Promise<MessageAck> => (req.worker === 'Bo'
     ? { ...messageAck, action: 'queued', delivery: 'next-step', pendingMessages: 2, note: 'Sent into the running turn; read at its next step.' }
-    : { ...messageAck, jobId: 'job-1-t2', name: 'Ada', workerId: 'Ada', turn: 2, action: 'started', delivery: 'now', env: 'dropped', envKeys: ['CARGO_TARGET_DIR'], checks: ['tests'], warnings: ['env CARGO_TARGET_DIR not set: values live only in memory and were lost; pass env again.'], note: 'Started turn 2.' }),
+    : { ...messageAck, jobId: 'job-1-t2', name: 'Ada', workerId: 'Ada', turn: 2, action: 'started', delivery: 'now', env: 'dropped', envKeys: ['CARGO_TARGET_DIR'], checks: ['tests'], warnings: ['env CARGO_TARGET_DIR not set: values live only in memory and were lost.'], note: 'Started turn 2.' }),
   steer: async (): Promise<MessageAck> => ({ ...messageAck, action: 'interrupting', delivery: 'now', note: 'Interrupting; the steered turn starts next.' }),
   detail: async (id: string) => { const d = details.find(x => x.jobId === id); if (!d) throw new Error('no job'); return d; },
   list: async ({ limit }: { limit?: number }) => (details as JobSummary[]).slice(0, limit),
@@ -94,7 +94,11 @@ test('status validates concise and detailed, for every lifecycle, with wait_ms a
       const label = `status ${d.jobId} ${response_format}`;
       const out = assertValid('status', await callTool(ctx, 'status', { id: d.jobId, response_format }), label);
       assert.equal(out.taskStatus, response_format === 'concise' ? undefined : { running: 'working', unknown: 'working', succeeded: 'completed', failed: 'failed' }[d.status as string], label);
-      if (response_format === 'concise') for (const k of ['resumable', 'chainStartedAt', 'continuedFrom', 'continuationKind', 'followedBy']) assert.equal(k in out, false, `${label} ${k}`);
+      if (response_format === 'concise') {
+        for (const k of ['chainStartedAt', 'continuedFrom', 'continuationKind', 'followedBy']) assert.equal(k in out, false, `${label} ${k}`);
+        if (d.status === 'running' || d.status === 'succeeded') assert.equal('resumable' in out, false, `${label} resumable`);
+        else assert.equal(typeof out.resumable, 'boolean', `${label} resumable`);
+      }
       assertValid('status', await callTool(ctx, 'status', { id: d.jobId, response_format, include_diff: true }), `${label} include_diff`);
     }
   }

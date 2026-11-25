@@ -509,7 +509,7 @@ test('env: set (passed), kept (vault, same service), dropped (fresh service = re
   const t4 = await ready;
   assert.equal(dropped.env, 'dropped');
   assert.deepEqual(dropped.envKeys, ['TOKEN', 'OTHER']);
-  assert.match(dropped.warnings?.join('\n') ?? '', /env TOKEN, OTHER not set/);
+  assert.equal(dropped.warnings?.find((w) => /env TOKEN, OTHER not set/.test(w)), 'env TOKEN, OTHER not set: values live only in memory and were lost.');
   assert.equal(t4.spec.env, undefined);
   assert.equal(JSON.stringify(readManifest(repo, t4.spec.jobId!)).includes('v1'), false, 'no env value on disk');
   t4.finish({ status: 'success', response: 'ok' });

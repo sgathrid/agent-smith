@@ -152,8 +152,7 @@ with alike names can be told apart. A worker that exited while its checks run re
 `exited · checking: <check>`, never `done`. A failure from the last 24 hours is drawn red
 with its failure label; after that it is drawn dim like other finished work.
 
-The worker view is one scroll: one header line (status, name, provider·model, turn when multi-turn, elapsed
-or duration, checks), turns labelled by their message (`▾` on the active turn, `▸` on collapsed turns), the task as one line when single-turn, the live transcript of assistant
+The worker view is one scroll: a structured header (line 1: status, name, role, turn when multi-turn, elapsed; line 2: harness and model, checks, failure reason, queued count, changed files; line 3 while running: phase, counts and test runs), turns labelled by their message (`▾` on the active turn, `▸` on collapsed turns), the task as one line when single-turn, the live transcript of assistant
 text and tool rows (expanded tool and group rows marked `▾` and indented; failed tool rows drawn red and collapsed until pressed), the result and the output of failing checks once the
 worker has finished, and one footer row (`Task`, `Back`, `Close`). It keeps its end in view as output arrives. Scrolling up
 pauses that; scrolling back to the bottom resumes it.
