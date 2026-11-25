@@ -112,7 +112,7 @@ function headline(job) {
     const bad = rejected(job);
     const awaiting = job.kind === 'finished' && !job.run && !bad && job.checksRunning !== undefined;
     const glyph = bad ? GLYPH.failed : awaiting ? '…' : GLYPH[job.kind];
-    const parts = [`${glyph} ${who(job)}${d && job.kind !== 'attention' ? ` ${d}` : ''}`];
+    const parts = [`${glyph} ${who(job)}`];
     switch (job.kind) {
         case 'finished':
             if (job.run)
@@ -122,10 +122,11 @@ function headline(job) {
             else if (awaiting) {
                 parts.push('exited', typeof job.checksRunning === 'string' ? `checks running: ${job.checksRunning}` : 'checks pending');
             }
+            else if (job.checks && job.checks.total > 0) {
+                parts.push(`checks ${job.checks.passed}/${job.checks.total}`);
+            }
             else {
                 parts.push('done');
-                if (job.checks && job.checks.total > 0)
-                    parts.push(`checks ${job.checks.passed}/${job.checks.total}`);
             }
             break;
         case 'failed':
@@ -141,12 +142,14 @@ function headline(job) {
                 parts.push(`no output${d ? ` for ${d}` : ''}${job.liveness?.tool ? ` (in \`${job.liveness.tool}\`)` : ''}`);
             break;
     }
-    if (job.continuationKind === 'follow-up')
-        parts.push('follow-up');
-    else if (job.continuationKind === 'steer')
-        parts.push('steered');
-    if (job.alsoRan)
-        parts.push(job.alsoRan.from === job.alsoRan.to ? `also ran turn ${job.alsoRan.from}` : `also ran turns ${job.alsoRan.from}–${job.alsoRan.to}`);
+    if (d && job.kind !== 'attention')
+        parts.push(d);
+    if (job.turns) {
+        if (job.turns.from < job.turns.to)
+            parts.push(`turns ${job.turns.from}–${job.turns.to}`);
+        else if (job.turns.to > 1)
+            parts.push(`turn ${job.turns.to}`);
+    }
     if (job.steerNotApplied)
         parts.push(`queued follow-up not sent${job.droppedMessage ? `: "${compactExcerpt(job.droppedMessage, 80)}"` : ''}`);
     if (job.staleReads && job.staleReads.length > 0) {
