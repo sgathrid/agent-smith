@@ -266,6 +266,20 @@ export function unclaim(
   return owned.map((o) => (matches(o) ? { ...o, readHead: settled.id } : o));
 }
 
+export function refusesStatusWait(owned: readonly Owned[], jobs: readonly NoticeRow[], id: string): boolean {
+  const named = (match: (row: NoticeRow) => boolean) => new Set(jobs.filter(match).map((row) => row.workerId ?? row.id));
+  const byId = named((row) => row.id === id);
+  const byWorker = named((row) => row.workerId === id);
+  const workers = byId.size > 0 ? byId : byWorker.size > 0 ? byWorker : named((row) => row.name === id);
+  if (workers.size !== 1) return false;
+  const [workerId] = workers;
+  const turns = jobs.filter((row) => (row.workerId ?? row.id) === workerId);
+  const head = pickHead(turns.map(noticeTurn));
+  if (head === null || head.status === 'attention' || isWorkerIdle(head)) return false;
+  return owned.some((o) => o.kind === 'job' && o.readHead === undefined && o.saidAttention !== true &&
+    (o.workerId === workerId || turns.some((row) => row.id === o.id)));
+}
+
 function launchKind(toolName: unknown): 'job' | 'run' | null {
   if (typeof toolName !== 'string') return null;
   const bare = toolName.includes('__') ? toolName.slice(toolName.lastIndexOf('__') + 2) : toolName;
