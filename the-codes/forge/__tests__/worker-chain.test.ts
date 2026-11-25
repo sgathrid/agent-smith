@@ -324,3 +324,41 @@ test('compareTurnPriority (turns.ts): not handed off, running, higher turn, then
   items.sort(compareTurnPriority);
   assert.deepEqual(items.map((x) => x.jobId), ['e', 'd', 'c', 'b', 'f', 'a']);
 });
+
+test('a new worker gets a distinct w- workerId; status, followUp, steer and cancel resolve it to the head', async () => {
+  const ctrl = controlledProvider();
+  const { service, repo } = makeService(ctrl.provider);
+
+  const t1Ready = ctrl.nextTurn();
+  const { ack: t1Ack, done: t1ChainDone } = await service.spawnTracked({ mode: 'implement', name: 'w-ops', prompt: 'Turn 1.' });
+  assert.match(t1Ack.workerId, /^w-[0-9a-f]{12}$/);
+  assert.notEqual(t1Ack.workerId, t1Ack.jobId);
+  assert.equal(existsSync(path.join(repo, '.agent-smith/jobs', t1Ack.workerId)), false);
+  const t1 = await t1Ready;
+  t1.emit({ kind: 'started', at: new Date().toISOString(), conversationId: 'conv-w-ops' });
+
+  await tick();
+  const t2Ready = ctrl.nextTurn();
+  const fu = await service.followUp({ worker: t1Ack.workerId, prompt: 'Turn 2.' });
+  assert.equal(fu.workerId, t1Ack.workerId);
+  t1.finish({ status: 'success', response: 'Done 1.' });
+  const t2 = await t2Ready;
+  t2.emit({ kind: 'started', at: new Date().toISOString(), conversationId: 'conv-w-ops' });
+
+  const t3Ready = ctrl.nextTurn();
+  const st = await service.steer({ worker: t1Ack.workerId, prompt: 'Turn 3.' });
+  assert.equal(st.workerId, t1Ack.workerId);
+  const t3 = await t3Ready;
+  t3.emit({ kind: 'started', at: new Date().toISOString(), conversationId: 'conv-w-ops' });
+
+  const head = await service.resolveWorker(t1Ack.workerId);
+  assert.equal(head.jobId, t3.spec.jobId);
+  assert.equal(head.workerId, t1Ack.workerId);
+  assert.deepEqual((await service.earlierTurns(t1Ack.workerId)).map((t) => t.jobId), [t1Ack.jobId, t2.spec.jobId]);
+
+  const c = service.cancel(t1Ack.workerId);
+  assert.equal(c.jobId, t3.spec.jobId);
+  assert.equal(c.resolvedFrom, t1Ack.workerId);
+  assert.equal(c.signalled, true);
+  assert.equal((await t1ChainDone).status, 'canceled');
+});

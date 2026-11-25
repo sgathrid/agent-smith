@@ -826,7 +826,7 @@ describe('completion notices', () => {
     return { ...r, said };
   }
   const ada = (status: string, more: Record<string, unknown> = {}) => canonicalJob('job-ada',
-    {status,name:'Ada',provider:'codex',role:'review',...more},
+    {status,name:'Ada',workerId:'w-ada',provider:'codex',role:'review',...more},
     status === 'running' ? {} : {'acceptance.json':JSON.stringify({state:'accepted',checks:[{name:'tests',ok:true},{name:'lint',ok:true}]})});
 
   test('a finished owned job: the hook stands down, no ui.log, one prompt.submit', async ($, on) => {
@@ -846,7 +846,7 @@ describe('completion notices', () => {
     expect(said.logs).toEqual([]);
     expect(said.prompts).toHaveLength(1);
     expect(said.origins[0]?.asUser).not.toBe(true);
-    expect(said.prompts[0]).toMatch(/^Agent Smith · ✓ Ada \(codex review\) 44s · done · checks 2\/2\nstatus job-ada$/);
+    expect(said.prompts[0]).toMatch(/^Agent Smith · ✓ Ada \(codex review\) 44s · done · checks 2\/2\nstatus w-ada$/);
   });
 
   const settledRead = ($: any, id: string, more: Record<string, unknown> = {}) =>
@@ -926,18 +926,18 @@ describe('completion notices', () => {
   });
 
   test('a variants ack with two jobs announces both jobs when both finish', async ($, on) => {
-    const files = { ...ada('running'), ...canonicalJob('job-bo', { status: 'running', name: 'Bo', provider: 'codex', role: 'review' }) };
+    const files = { ...ada('running'), ...canonicalJob('job-bo', { status: 'running', name: 'Bo', workerId: 'w-bo', provider: 'codex', role: 'review' }) };
     const { clock, said } = noticeHost(on, files, ['job-ada', 'job-bo']);
     await start($);
     await $.tool.call({ tool: 'mcp__plugin_agent-smith_agent-smith__spawn_job', variantJobs: ['job-ada', 'job-bo'], repo: '/work' });
     Object.assign(files, ada('succeeded', { finishedAt: iso(RUNNING_NOW + 1000) }),
-      canonicalJob('job-bo', { status: 'succeeded', name: 'Bo', provider: 'codex', role: 'review', finishedAt: iso(RUNNING_NOW + 1000) },
+      canonicalJob('job-bo', { status: 'succeeded', name: 'Bo', workerId: 'w-bo', provider: 'codex', role: 'review', finishedAt: iso(RUNNING_NOW + 1000) },
         { 'acceptance.json': JSON.stringify({ state: 'accepted', checks: [] }) }));
     await clock.advance(3000);
     await clock.advance(3000);
     await clock.advance(3000);
     expect(said.prompts).toHaveLength(1);
-    expect(said.prompts[0]).toMatch(/status job-ada, job-bo/);
+    expect(said.prompts[0]).toMatch(/status w-ada, w-bo/);
     const all = said.prompts.join('\n');
     expect(all).toMatch(/Ada/);
     expect(all).toMatch(/Bo/);

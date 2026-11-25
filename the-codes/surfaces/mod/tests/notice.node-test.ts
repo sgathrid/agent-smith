@@ -163,6 +163,17 @@ test('a pipeline run points at pipeline_status and states its stages', () => {
   ].join('\n'));
 });
 
+test('noticeFromRadar forwards workerId and claudeText prints status <workerId>', () => {
+  const job = noticeFromRadar(row({
+    id: 'implement-smith-12345678', workerId: 'w-abcdef123456', name: 'Ada', provider: 'codex', role: 'implement',
+    status: 'succeeded', startedAt: NOW - 30_000, endedAt: NOW,
+  }), 'finished', NOW);
+  assert.equal(claudeText([job]), [
+    'Agent Smith · ✓ Ada (codex implement) 30s · done',
+    'status w-abcdef123456',
+  ].join('\n'));
+});
+
 test('pipelineOutcome names the first stage that did not pass, in the short words', () => {
   const record = (stageResults: RunRecord['stageResults']): RunRecord => ({
     runId: 'r', pipeline: 'ship', status: 'partial', startedAt: 0, finishedAt: 1, stageResults,

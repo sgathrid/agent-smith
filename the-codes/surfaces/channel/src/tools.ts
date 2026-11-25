@@ -167,7 +167,7 @@ function overlay(base: Args, over: Args, baseProvider?: string): Args {
 async function inheritFrom(ctx: HandlerContext, args: Args): Promise<Args> {
   const from = text(args, 'from', true)!;
   const detail = await ctx.service.resolveWorkerHead(from);
-  const root = detail.workerId || detail.jobId;
+  const root = (await ctx.service.earlierTurns(detail, Number.MAX_SAFE_INTEGER))[0]?.jobId ?? detail.jobId;
   let saved: Args;
   try { saved = JSON.parse(readFileSync(jobFile(ctx.service.repo, root, FILES.request), 'utf8')) as Args; } catch {
     throw new Error(`"${detail.name}" has no saved request to reuse (a pipeline stage, or spawned before from existed); pass mode and prompt.`);

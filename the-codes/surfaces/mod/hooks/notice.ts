@@ -38,6 +38,7 @@ export const ACCEPTANCE_HOLD_MS = 5 * 60_000;
 
 export interface NoticeJob {
   readonly id: string;
+  readonly workerId?: string;
   readonly kind: NoticeKind;
   readonly name?: string | null;
   readonly provider?: string | null;
@@ -149,7 +150,7 @@ export function claudeText(jobs: readonly NoticeJob[]): string {
   const listed = jobs.slice(0, CLAUDE_JOBS);
   for (const job of listed) lines.push(`${one ? 'Agent Smith · ' : ''}${headline(job)}`);
   if (jobs.length > CLAUDE_JOBS) lines.push(`…and ${jobs.length - CLAUDE_JOBS} more; list_jobs shows them.`);
-  const ids = (run: boolean) => listed.filter((j) => !!j.run === run).map((j) => j.id);
+  const ids = (run: boolean) => listed.filter((j) => !!j.run === run).map((j) => (run ? j.id : j.workerId ?? j.id));
   if (ids(false).length > 0) lines.push(`status ${ids(false).join(', ')}`);
   if (ids(true).length > 0) lines.push(`pipeline_status ${ids(true).join(', ')}`);
   return lines.join('\n');
@@ -374,7 +375,7 @@ export function noticeFromRadar(job: NoticeRow, kind: NoticeKind, now: number): 
       ? (job.liveness ? job.liveness.silentForMs : job.lastEventAt != null ? now - job.lastEventAt : null)
       : (job.endedAt != null && start != null ? job.endedAt - start : null);
   return {
-    id: job.id, kind, name: job.name, provider: job.provider, role: job.role,
+    id: job.id, ...(job.workerId ? { workerId: job.workerId } : {}), kind, name: job.name, provider: job.provider, role: job.role,
     durationMs: span,
     changedFiles: job.changedFileCount ?? null,
     checks: checks.length > 0

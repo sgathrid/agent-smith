@@ -29,6 +29,7 @@ import {
   jobFile,
   jobsDir,
   newJobId,
+  newWorkerId,
   ownerAlive,
   readManifest,
   type ContinuationKind,
@@ -390,7 +391,7 @@ export class ForgeService {
     const jobId = newJobId(mode);
     const name = request.name?.trim() || `${mode}-${jobId.slice(-8)}`;
     if (name.length > 80) throw new Error('worker name must be at most 80 characters');
-    const workerId = request.workerId ?? jobId;
+    const workerId = request.workerId ?? newWorkerId();
     this.assertNameFree(name, workerId);
 
     const writer = this.newWriter(jobId);

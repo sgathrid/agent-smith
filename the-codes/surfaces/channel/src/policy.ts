@@ -116,7 +116,7 @@ export function toNotice(job: WatchableJob, kind: PushKind, now: number): Notice
       ? (job.lastEventAt === null ? NaN : now - Date.parse(job.lastEventAt))
       : (start && job.finishedAt ? Date.parse(job.finishedAt) - Date.parse(start) : NaN);
   return {
-    id: job.id, kind, name: job.name ?? null, provider: job.provider ?? null, role: job.role ?? null,
+    id: job.id, ...(job.workerId ? { workerId: job.workerId } : {}), kind, name: job.name ?? null, provider: job.provider ?? null, role: job.role ?? null,
     run,
     durationMs: Number.isFinite(span) ? span : null,
     changedFiles: job.changedFileCount ?? null,

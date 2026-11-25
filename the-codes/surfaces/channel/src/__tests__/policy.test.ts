@@ -170,6 +170,7 @@ test('the failure message is terse, specific, and ends with the next step', () =
       cand(
         job({
           id: 'implement-musm82da-f1dc1fe4',
+          workerId: 'w-f1dc1fe40001',
           status: 'failed',
           warned: true,
           failureReason: 'agy exited 1',
@@ -182,7 +183,7 @@ test('the failure message is terse, specific, and ends with the next step', () =
   );
   const text = batch.content!;
   assert.ok(text.includes('job implement-musm82da-f1dc1fe4 · failed: exit 1'), text);
-  assert.match(text, /\nstatus implement-musm82da-f1dc1fe4$/);
+  assert.match(text, /\nstatus w-f1dc1fe40001$/);
   assert.ok(text.length < 220, `message is ${text.length} chars: ${text}`);
 });
 

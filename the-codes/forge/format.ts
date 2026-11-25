@@ -294,6 +294,10 @@ export function newJobId(mode: string): string {
   return `${prefix}-${ID_MARKER}-${randomBytes(4).toString('hex')}`;
 }
 
+export function newWorkerId(): string {
+  return `w-${randomBytes(6).toString('hex')}`;
+}
+
 export function taskTitle(prompt: string): string {
   const first = prompt.split('\n').find((l) => l.trim().length > 0) ?? '';
   return first.replace(/^#\s*/, '').trim().slice(0, 200);

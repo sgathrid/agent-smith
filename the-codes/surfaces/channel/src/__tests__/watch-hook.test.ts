@@ -414,7 +414,7 @@ test('runJobWatch follows the worker through its index to idle: two queued follo
   });
   assert.equal(await p, 'done');
   assert.equal(lines.length, 1, lines.join('\n'));
-  assert.match(lines[0]!, /^Agent Smith · ✓ Ada \(implementer\) · done · follow-up · also ran turns 1–2 status t3$/);
+  assert.match(lines[0]!, /^Agent Smith · ✓ Ada \(implementer\) · done · follow-up · also ran turns 1–2 status ada$/);
 });
 
 test('runHook suppresses output when the post-steer head jobId has a claim marker', async () => {

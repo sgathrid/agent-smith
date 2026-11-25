@@ -24,6 +24,7 @@ import {
   jobsDir,
   looksEmpty,
   newJobId,
+  newWorkerId,
   shouldFlush,
   taskTitle,
   warningsFor,
@@ -81,6 +82,15 @@ test('multiword modes keep the id shape and job paths reject traversal', () => {
   const id = newJobId('code review');
   assert.match(id, /^code-review-smith-[0-9a-f]{8}$/);
   assert.throws(() => jobDir('/repo', '../outside'), /invalid job id/);
+});
+
+test('a worker id carries the w- prefix, passes safe-id checks, and never collides', () => {
+  const ids = new Set(Array.from({ length: 500 }, () => newWorkerId()));
+  assert.equal(ids.size, 500);
+  for (const id of ids) {
+    assert.match(id, /^w-[0-9a-f]{12}$/);
+    assert.equal(jobDir('/repo', id), `/repo/.agent-smith/jobs/${id}`);
+  }
 });
 
 test('the task is the first non-empty prompt line, hash-stripped and capped', () => {
