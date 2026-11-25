@@ -24,6 +24,12 @@ export async function discoverCatalogs(ctx: { catalogs?: CatalogSource }, refres
 export async function installedCatalogs(ctx: { catalogs?: CatalogSource }, refresh = false): Promise<ModelCatalog[]> {
   return (await discoverCatalogs(ctx, refresh)).catalogs;
 }
+export function catalogFailureText(catalogs: readonly ModelCatalog[]): string | undefined {
+  const failures = catalogs
+    .filter(c => c.probeFailed === true)
+    .map(c => `${c.provider}: ${c.error ?? 'availability probe failed'}`);
+  return failures.length > 0 ? failures.join('; ') : undefined;
+}
 /** The provider to use when none is configured: the only installed one. Never a guess between several. */
 export function defaultProvider(installed: readonly string[], onMany?: (list: string) => string, discoveryError?: string): string {
   if (installed.length === 0) {
@@ -49,13 +55,15 @@ export async function defaultMixedPipeline(input: MixedSpecInput, catalogs?: Cat
     return { name: input.name, stages, workDir: input.workDir, concurrency: input.concurrency };
   }
   const { catalogs: cats, error: discoveryError } = await discoverCatalogs({ catalogs });
-  const installed = cats.map(c => c.provider);
+  const usable = cats.filter(c => c.probeFailed !== true);
+  const installed = usable.map(c => c.provider);
+  const effectiveError = discoveryError ?? (usable.length === 0 ? catalogFailureText(cats) : undefined);
   const stage = (name: string, extra: Partial<Stage>): Stage => {
     const rd = input.modelConfig ? resolveRequest({ mode: name }, input.modelConfig) : undefined;
     if (rd?.source === 'roleDefault' && rd.provider) {
       return { name, provider: rd.provider, model: input.models?.[name] ?? rd.model, effort: input.efforts?.[name] ?? rd.effort as Effort | undefined, role: name, routingPinned: true, ...extra } as Stage;
     }
-    const provider = defaultProvider(installed, list => `pass stages with a provider each: installed are ${list}.`, discoveryError); const cat = cats.find(c => c.provider === provider);
+    const provider = defaultProvider(installed, list => `pass stages with a provider each: installed are ${list}.`, effectiveError); const cat = usable.find(c => c.provider === provider);
     const cfg = cat?.defaultSource === 'harness-config';
     return { name, provider, model: input.models?.[provider] ?? input.models?.[name] ?? (cfg ? cat?.defaultModel : undefined),
       effort: input.efforts?.[name] ?? (cfg ? cat?.defaultEffort as Effort | undefined : undefined), role: name, routingPinned: true, ...extra } as Stage;

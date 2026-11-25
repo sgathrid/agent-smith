@@ -423,3 +423,51 @@ describe('agy stale and recovered error handling', () => {
     }
   });
 });
+
+describe('agy final message extraction', () => {
+  it('reports only the last agent_response step prose across prose, tool, prose, final prose', () => {
+    const tx = createAgyTranslator(2000);
+    tx.onEvent({ event: 'step_update', step_update: { step_index: 1, step_type: 'agent_response', state: 'DONE', text_delta: 'Working on it.' } });
+    tx.onEvent({ event: 'step_update', step_update: { step_index: 2, step_type: 'tool', state: 'ACTIVE', tool_name: 'run_command', tool_info: { parameters: { CommandLine: 'npm test' } } } });
+    tx.onEvent({ event: 'step_update', step_update: { step_index: 2, step_type: 'tool', state: 'DONE', tool_name: 'run_command', tool_info: { output: 'ok' } } });
+    tx.onEvent({ event: 'step_update', step_update: { step_index: 3, step_type: 'agent_response', state: 'DONE', text_delta: 'Re-running checks.' } });
+    tx.onEvent({ event: 'step_update', step_update: { step_index: 4, step_type: 'agent_response', state: 'ACTIVE', text_delta: 'Status: DONE\n' } });
+    tx.onEvent({ event: 'step_update', step_update: { step_index: 4, step_type: 'agent_response', state: 'DONE', text_delta: 'Final answer.' } });
+
+    const res = buildResult({
+      jobId: 'agy-final-only',
+      resultEvent: { status: 'SUCCESS', response: 'Working on it.\nRe-running checks.\nStatus: DONE\nFinal answer.' },
+      exit: { code: 0, signal: null, killReason: undefined, stderr: '' },
+      startedAtMs: Date.now() - 10,
+      stateDir: '/tmp',
+      denials: tx.denials,
+      sawAnyToolCall: tx.stepsWereTools(),
+      errorIsStale: tx.errorIsStale(),
+      finalText: tx.finalText(),
+    });
+
+    assert.equal(res.status, 'success');
+    assert.equal(res.response, 'Status: DONE\nFinal answer.');
+  });
+
+  it('falls back to resultEvent.response when no agent_response step prose was seen', () => {
+    const tx = createAgyTranslator(2000);
+    tx.onEvent({ event: 'step_update', step_update: { step_index: 1, step_type: 'tool', state: 'ACTIVE', tool_name: 'run_command', tool_info: {} } });
+    tx.onEvent({ event: 'step_update', step_update: { step_index: 1, step_type: 'tool', state: 'DONE', tool_name: 'run_command', tool_info: { output: 'ok' } } });
+
+    const res = buildResult({
+      jobId: 'agy-fallback',
+      resultEvent: { status: 'SUCCESS', response: 'Fallback report.' },
+      exit: { code: 0, signal: null, killReason: undefined, stderr: '' },
+      startedAtMs: Date.now() - 10,
+      stateDir: '/tmp',
+      denials: tx.denials,
+      sawAnyToolCall: tx.stepsWereTools(),
+      errorIsStale: tx.errorIsStale(),
+      finalText: tx.finalText(),
+    });
+
+    assert.equal(res.status, 'success');
+    assert.equal(res.response, 'Fallback report.');
+  });
+});

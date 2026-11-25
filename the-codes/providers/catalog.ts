@@ -8,7 +8,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { writeJsonAtomic } from '../forge/atomic.ts';
 import { errMessage } from './discovery.ts';
-import { PROVIDERS, findProvider } from './registry.ts';
+import { PROVIDERS, findProvider, probeAvailability, type AvailabilityProbe } from './registry.ts';
 import type { ModelCatalog, Provider } from './types.ts';
 
 export interface CatalogOptions {
@@ -77,8 +77,17 @@ function lookup(name: string): Provider | undefined {
   return providerSource().find((p) => p.name === name) ?? (providerSource() === PROVIDERS ? findProvider(name) : undefined);
 }
 
-function failed(name: string, error: string): ModelCatalog {
-  return { provider: name, models: [], defaultSource: 'unknown', source: 'live', stale: false, verified: false, error };
+function failed(name: string, error: string, probeFailed = false): ModelCatalog {
+  return {
+    provider: name,
+    models: [],
+    defaultSource: 'unknown',
+    source: 'live',
+    stale: false,
+    verified: false,
+    error,
+    ...(probeFailed ? { probeFailed: true } : {}),
+  };
 }
 
 async function discover(provider: Provider, timeoutMs: number, refresh: boolean, repo?: string): Promise<ModelCatalog> {
@@ -121,11 +130,14 @@ async function discover(provider: Provider, timeoutMs: number, refresh: boolean,
   return fresh;
 }
 
+export async function probeProviders(): Promise<AvailabilityProbe[]> {
+  return probeAvailability(providerSource());
+}
+
 /** Names of installed providers. PATH probes only: cheap, no model discovery. */
 export async function getInstalledProviders(): Promise<string[]> {
-  const all = providerSource();
-  const flags = await Promise.all(all.map(async (p) => { try { return await p.available(); } catch { return false; } }));
-  return all.filter((_, i) => flags[i]).map((p) => p.name);
+  const probes = await probeProviders();
+  return probes.filter((p) => p.status === 'installed').map((p) => p.name);
 }
 
 /** A provider's configured default model/effort from its own config file. Sync, no CLI. */
@@ -148,17 +160,13 @@ export async function getCatalogs(options: CatalogOptions = {}): Promise<ModelCa
         else missing.push(failed(n, `unknown provider '${n}'`));
       }
     } else {
-      const all = providerSource();
-      const flags = await Promise.all(
-        all.map(async (p) => {
-          try {
-            return await p.available();
-          } catch {
-            return false;
-          }
-        }),
-      );
-      targets = all.filter((_, i) => flags[i]);
+      const probes = await probeProviders();
+      targets = probes.filter((p) => p.status === 'installed').map((p) => p.provider);
+      for (const p of probes) {
+        if (p.status === 'failed') {
+          missing.push(failed(p.name, p.reason ?? 'availability probe failed', true));
+        }
+      }
     }
     const results = await Promise.all(
       targets.map((p) => discover(p, timeoutMs, refresh, options.repo).catch((e) => failed(p.name, errMessage(e)))),

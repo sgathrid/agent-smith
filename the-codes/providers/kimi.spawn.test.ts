@@ -80,7 +80,7 @@ test('kimi spawn maps stream-json to text and one tool step, and captures the se
   const result = await handle.waitForResult();
 
   assert.equal(result.status, 'success');
-  assert.equal(result.response, 'Checking.\nDONE');
+  assert.equal(result.response, 'DONE');
   assert.deepEqual(result.raw, { sessionId: 'session_fixture_123' });
 
   const text = events.filter((e) => e.kind === 'text').map((e) => e.text);

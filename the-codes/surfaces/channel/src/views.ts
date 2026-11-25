@@ -277,7 +277,7 @@ export interface CapabilityProvider {
 
 export function conciseCapabilities(providers: readonly CapabilityProvider[], only: string | undefined) {
   return providers.map((p) => {
-    if (!p.available) return { name: p.name, available: false };
+    if (!p.available) return { name: p.name, available: false, ...(p.error ? { error: p.error } : {}) };
     const coding = p.models.filter((m) => !NON_CODING_MODEL.test(m.id));
     const efforts = commonEfforts(coding.map(model => model.efforts ?? []));
     const rows = coding.map(model => ({

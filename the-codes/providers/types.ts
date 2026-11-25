@@ -175,6 +175,7 @@ export interface ModelCatalog {
   stale: boolean;
   verified: boolean;
   error?: string;
+  probeFailed?: boolean;
 }
 
 export interface ListModelsOptions {

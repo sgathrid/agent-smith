@@ -439,8 +439,7 @@ export function createCodexTranslator(maxChars: number): CodexTranslator {
       if (itemType === 'agent_message') {
         const text = str(item, 'text');
         if (text !== undefined && text !== '') {
-          if (state.finalText !== '') state.finalText += '\n';
-          state.finalText += text;
+          state.finalText = text;
           out.push({ kind: 'text', at, text, stream: 'assistant' });
         }
         return out;
@@ -580,7 +579,7 @@ export function createCodexTranslator(maxChars: number): CodexTranslator {
 // Result
 // ---------------------------------------------------------------------------
 
-function buildResult(args: {
+export function buildResult(args: {
   jobId: string;
   startedAtMs: number;
   stateDir: string;

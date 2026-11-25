@@ -350,6 +350,7 @@ export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
     onEvent: () => [],
   };
   let step = 0;
+  let resetOnNextText = false;
   /** partID -> stepIndex */
   const partStep = new Map<string, number>();
 
@@ -448,6 +449,7 @@ export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
       `anon-${step}`;
 
     if (toolName !== undefined && (stateWord !== '' || isToolType)) {
+      resetOnNextText = true;
       const isDone = DONE_WORDS.has(stateWord) || type.endsWith('.completed') || type.endsWith('.done');
       const isErr = ERROR_WORDS.has(stateWord) || type.endsWith('.error');
       const errorTexts = [
@@ -531,6 +533,10 @@ export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
     const isThinking = type.includes('thinking') || type.includes('reasoning');
     if (text !== undefined && text !== '') {
       if (!isThinking) {
+        if (resetOnNextText) {
+          tx.finalText = '';
+          resetOnNextText = false;
+        }
         if (tx.finalText !== '') tx.finalText += '\n';
         tx.finalText += text;
       }
@@ -545,6 +551,7 @@ export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
     // nothing else a reader needs per step, so they are silent: one info notice
     // per step would bury real warnings under hundreds of lines of noise.
     if (isStepStart || isStepFinish) {
+      if (isStepStart) resetOnNextText = true;
       // Verified in the installed OpenCode CLI: session.step.ended emits
       // step_finish with part.reason = data.finish. Tool-call/length finishes
       // end only a step; "stop" confirms the assistant finished normally.

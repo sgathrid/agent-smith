@@ -8,7 +8,8 @@ import { buildArgv as codexArgv, listCodexModels, parseCodexModels, codexProvide
 import { buildArgv as claudeArgv, listClaudeModels, claudeProvider } from './claude.ts';
 import { buildArgv as opencodeArgv, listOpencodeModels, opencodeProvider } from './opencode.ts';
 import { buildArgv as kimiArgv, listKimiModels, parseKimiModels, kimiProvider } from './kimi.ts';
-import { getCatalogs, resetCatalogCacheForTest } from './catalog.ts';
+import { getCatalogs, getInstalledProviders, resetCatalogCacheForTest } from './catalog.ts';
+import { probeAvailability } from './registry.ts';
 import { parseTomlTopLevel, type RunFn } from './discovery.ts';
 import type { ModelCatalog, Provider, SpawnSpec } from './types.ts';
 import { trackedTempDirs } from '../forge/testing/tmp.ts';
@@ -392,4 +393,36 @@ test('catalog: disk cache is shared across processes, honors TTL, refresh rewrit
       assert.equal(a5.calls, 1, `rediscovered for ${JSON.stringify(model)}`);
     }
   } finally { rmSync(repo, { recursive: true, force: true }); resetCatalogCacheForTest(); }
+});
+
+test('catalog and probeAvailability: a throwing availability probe is reported with its reason, not as not-installed', async () => {
+  const broken = {
+    name: 'agy',
+    available: async () => { throw new Error('EACCES: permission denied'); },
+    spawn: async () => { throw new Error('unused'); },
+  } as unknown as Provider;
+  const absent = fakeProvider('codex', async () => good('codex'), false);
+  const okProv = fakeProvider('claude', async () => good('claude'), true);
+  try {
+    const probes = await probeAvailability([broken, absent, okProv]);
+    assert.deepEqual(probes.map((p) => [p.name, p.status, p.reason]), [
+      ['agy', 'failed', 'EACCES: permission denied'],
+      ['codex', 'not-installed', undefined],
+      ['claude', 'installed', undefined],
+    ]);
+
+    resetCatalogCacheForTest({ providers: () => [broken, absent, okProv] });
+    assert.deepEqual(await getInstalledProviders(), ['claude']);
+
+    const catalogs = await getCatalogs();
+    assert.deepEqual(
+      catalogs.map((c) => [c.provider, c.models.length, c.error, c.probeFailed]),
+      [
+        ['claude', 1, undefined, undefined],
+        ['agy', 0, 'EACCES: permission denied', true],
+      ],
+    );
+  } finally {
+    resetCatalogCacheForTest();
+  }
 });
