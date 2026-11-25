@@ -54,7 +54,7 @@ import { compareTurnPriority, isTerminalStatus, isWorkerIdle, pickHead, type Tur
 import { WorkerIndexStore } from './worker-index.ts';
 import { LOCK_WAIT_MS, withWorkerLock } from './worker-lock.ts';
 import {
-  checkAgainstCatalog, resolveTimeoutMs, ENV_KEYS_FILE, modeError, requireProvider, turnStartInput,
+  checkAgainstCatalog, validateModelAndEffort, resolveTimeoutMs, ENV_KEYS_FILE, modeError, requireProvider, turnStartInput,
   type FollowUpRequest, type MessageAck, type SpawnAck, type SpawnRequest, type SteerRequest, type TrackedSpawn, type TurnSpec,
 } from './spawn-request.ts';
 import { toSummary, type JobDetail, type JobSummary, type ListFilter } from './summary.ts';
@@ -279,7 +279,7 @@ export class ForgeService {
       .finally(() => { this.catalogWarm = undefined; });
   }
 
-  private async catalogFor(provider: string): Promise<ModelCatalog | undefined> {
+  async catalogFor(provider: string): Promise<ModelCatalog | undefined> {
     let timer: NodeJS.Timeout | undefined;
     try {
       const waitMs = this.catalogSeen ? this.catalogWaitMs.warm : this.catalogWaitMs.cold;
@@ -346,17 +346,14 @@ export class ForgeService {
         'kimi print mode force-sets the auto permission policy; unrestricted:false cannot restrict it. The ack and job.json record the effective posture.',
       );
     }
-    const effort = provider.supportsEffort === false ? undefined : request.effort;
-    if (request.effort !== undefined && provider.supportsEffort === false) {
-      warnings.push(
-        `kimi has no per-run effort flag; effort "${request.effort}" was ignored. Set [thinking].effort or a model alias default_effort in config.toml.`,
-      );
-    }
-    if ((request.model !== undefined || effort !== undefined) && request.lockHeldByCaller !== true) {
-      warnings.push(
-        ...checkAgainstCatalog(provider.name, request.model, effort, await this.catalogFor(provider.name)),
-      );
-    }
+    const checked = await validateModelAndEffort(
+      provider,
+      request.model,
+      request.effort,
+      request.lockHeldByCaller === true ? undefined : () => this.catalogFor(provider.name),
+    );
+    const effort = checked.effort;
+    warnings.push(...checked.warnings);
     let modelResolved: string | null = request.model ?? null;
     let modelSource: SpawnAck['modelSource'] = request.model === undefined ? 'unknown' : 'requested';
     if (request.model === undefined) {
