@@ -24,7 +24,7 @@ export function withWorkerLookup<T extends object>(service: T): T & ServiceLooku
       const allTurns = await src.list({ limit: 500, groupByWorker: false });
       const candidates = allTurns.filter((j) => j.name === trimmed || j.workerId === trimmed || j.jobId === trimmed);
       const identities = new Set(candidates.map((j) => String(j.workerId ?? j.jobId)));
-      if (candidates.length === 0) throw new WorkerLookupError(`No worker "${nameOrId}"; see list_jobs.`, 'missing');
+      if (candidates.length === 0) throw new WorkerLookupError(`No worker "${nameOrId}".`, 'missing');
       if (identities.size !== 1) {
         throw new WorkerLookupError(`"${nameOrId}" matches ${identities.size} workers; pass a jobId.`, 'ambiguous', [...identities]);
       }
@@ -32,7 +32,7 @@ export function withWorkerLookup<T extends object>(service: T): T & ServiceLooku
       if (src.detail) return await src.detail(targetId) as JobDetail;
       return candidates[candidates.length - 1] as unknown as JobDetail;
     }
-    throw new WorkerLookupError(`No worker "${nameOrId}"; see list_jobs.`, 'missing');
+    throw new WorkerLookupError(`No worker "${nameOrId}".`, 'missing');
   }
   const notMocked = (name: string) => () => { throw new Error(`${name} is not mocked`); };
   const defaults: ServiceLookup = {

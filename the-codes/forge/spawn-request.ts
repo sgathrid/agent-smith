@@ -196,6 +196,25 @@ export function checkAgainstCatalog(
   return warnings;
 }
 
+export async function validateModelAndEffort(
+  provider: Provider,
+  model: string | undefined,
+  effort: string | undefined,
+  getCatalog?: () => Promise<ModelCatalog | undefined>,
+): Promise<{ effort: string | undefined; warnings: string[] }> {
+  const warnings: string[] = [];
+  const effectiveEffort = provider.supportsEffort === false ? undefined : effort;
+  if (effort !== undefined && provider.supportsEffort === false) {
+    warnings.push(
+      `${provider.name} has no per-run effort flag; effort "${effort}" was ignored. Set [thinking].effort or a model alias default_effort in config.toml.`,
+    );
+  }
+  if ((model !== undefined || effectiveEffort !== undefined) && getCatalog !== undefined) {
+    warnings.push(...checkAgainstCatalog(provider.name, model, effectiveEffort, await getCatalog()));
+  }
+  return { effort: effectiveEffort, warnings };
+}
+
 export interface TurnSpec {
   jobId: string;
   name: string;

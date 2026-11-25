@@ -44,9 +44,9 @@ test('provider setup and account failures do not suggest blind retries or broade
   assert.match(nextActionFor({ ...F, error: '429 insufficient_quota' })!, /^Out of credits/);
   assert.match(nextActionFor({ ...F, error: 'quota exhausted' })!, /^Out of credits/);
   for (const error of ["unknown option '--permission-prompts'", "unexpected argument '--standalone'", 'unknown model "old-model"']) {
-    assert.match(nextActionFor({ ...F, error })!, /^Bad flag or model/);
+    assert.equal(nextActionFor({ ...F, error }), 'Bad flag or model.');
   }
-  assert.match(nextActionFor({ ...F, error: 'spawn codex ENOENT' })!, /^Couldn.t start/);
+  assert.equal(nextActionFor({ ...F, error: 'spawn codex ENOENT' }), "Couldn't start.");
   assert.match(nextActionFor({ ...F, jobStatus: 'denied' })!, /^Ask the user/);
   assert.equal(nextActionFor({ status: 'succeeded', error: 'unauthorized rate limit' }), null);
   const steer = nextActionFor({ ...F, jobStatus: 'timeout', steerNotApplied: true })!;

@@ -443,9 +443,9 @@ function baseNextAction(i) {
     if (RATE_LIMIT_RE.test(err))
         return 'Rate limited; follow_up after a short wait.';
     if (COMPATIBILITY_RE.test(err))
-        return 'Bad flag or model: run agent-smith doctor, then fix the request.';
+        return 'Bad flag or model.';
     if (START_RE.test(err))
-        return "Couldn't start: run agent-smith doctor.";
+        return "Couldn't start.";
     if (i.failedEarly === true && i.jobStatus !== 'timeout') {
         return 'Route failed before any work (model/account): pick another model from list_capabilities or fix the account.';
     }
@@ -998,8 +998,11 @@ function validateSpec(spec) {
     }
     const seen = new Set();
     for (const stage of spec.stages) {
-        if (!stage.name.trim() || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(stage.name)) {
+        if (!stage.name.trim()) {
             throw new PipelineSpecError('every stage needs a name');
+        }
+        if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(stage.name)) {
+            throw new PipelineSpecError(`stage '${stage.name}' has an invalid name; must match ^[A-Za-z0-9][A-Za-z0-9._-]*$`);
         }
         if (!stage.provider.trim())
             throw new PipelineSpecError(`stage '${stage.name}' needs a provider`);
@@ -7744,10 +7747,13 @@ function readPipeline(repo, runId) {
     }
     return null;
 }
+function missingPipelineError(runId) {
+    return new Error(`No pipeline run "${runId}".`);
+}
 function cancelPipeline(repo, runId) {
     const record = readPipeline(repo, runId);
     if (record === null)
-        throw new Error(`no pipeline run "${runId}"`);
+        throw missingPipelineError(runId);
     if (record.status !== 'running') {
         return { requested: false, runId, note: `pipeline already ${record.status}` };
     }
@@ -8327,4 +8333,4 @@ function asUsage(v) {
 /** Normalize a raw agent-smith job snapshot. */
 function normalize(raw) {
     return smithNormalizer(raw);
-}export{verdictBlock as $,AgentSmithReader as A,normalizeDenials as B,deriveOrphan as C,DEFAULT_TIMEOUT_MS as D,deriveStatus as E,FILES as F,summaryTail as G,failureFields as H,writeAcceptance as I,createMarker as J,jobsDir as K,parseWorkerIndex as L,MODES as M,getProvider as N,normalizeContinuationKind as O,PROVIDERS as P,nextActionFor as Q,REASONS as R,STAGE_PROMPTS as S,fileSig as T,JobWriter as U,newJobId$1 as V,WORKERS_DIR as W,markAcceptancePending as X,humanDuration as Y,pipeEvents as Z,checksAbortRequested as _,MODE_PRESETS as a,runAcceptance as a0,senderOf as a1,markAcceptanceSuperseded as a2,pipelineRecordPath as a3,pickHead as a4,compareTurnPriority as a5,computeStaleReads as a6,SMITH_PAYLOAD as a7,isForgeStatus as a8,readJsonSafe as a9,workerIndexPath as aa,checksReason as ab,toolLabel as ac,inheritContinuedProviders as b,readPipeline as c,jobFile as d,readAcceptance as e,isWorkerIdle as f,isMode as g,cancelPipeline as h,isTerminalStatus as i,jobDir as j,isTerminalForgeStatus as k,readManifest as l,errMessage as m,findProvider as n,ownerAlive as o,providerNames as p,normalize as q,reasonFromText as r,startPipeline as s,writeAtomic as t,SCHEMA_VERSION as u,validateSpec as v,writeJsonAtomic as w,validOwnerPid as x,reportFor as y,cwdFacts as z};
+}export{checksAbortRequested as $,AgentSmithReader as A,reportFor as B,cwdFacts as C,DEFAULT_TIMEOUT_MS as D,normalizeDenials as E,FILES as F,deriveOrphan as G,deriveStatus as H,summaryTail as I,failureFields as J,writeAcceptance as K,createMarker as L,MODES as M,jobsDir as N,parseWorkerIndex as O,PROVIDERS as P,normalizeContinuationKind as Q,REASONS as R,STAGE_PROMPTS as S,nextActionFor as T,fileSig as U,JobWriter as V,WORKERS_DIR as W,newJobId$1 as X,markAcceptancePending as Y,humanDuration as Z,pipeEvents as _,MODE_PRESETS as a,verdictBlock as a0,runAcceptance as a1,senderOf as a2,markAcceptanceSuperseded as a3,pickHead as a4,compareTurnPriority as a5,computeStaleReads as a6,SMITH_PAYLOAD as a7,isForgeStatus as a8,readJsonSafe as a9,pipelineRecordPath as aa,workerIndexPath as ab,checksReason as ac,toolLabel as ad,inheritContinuedProviders as b,readPipeline as c,jobFile as d,readAcceptance as e,isWorkerIdle as f,isMode as g,cancelPipeline as h,isTerminalStatus as i,jobDir as j,isTerminalForgeStatus as k,readManifest as l,missingPipelineError as m,findProvider as n,ownerAlive as o,providerNames as p,getProvider as q,reasonFromText as r,startPipeline as s,errMessage as t,normalize as u,validateSpec as v,writeJsonAtomic as w,writeAtomic as x,SCHEMA_VERSION as y,validOwnerPid as z};

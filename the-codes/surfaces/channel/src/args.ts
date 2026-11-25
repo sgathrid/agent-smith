@@ -48,7 +48,12 @@ export function boolean(args: Record<string, unknown>, key: string): boolean | u
   return v;
 }
 export function allowed(args: Record<string, unknown>, key: string, values: readonly string[]): string | undefined {
-  const v = text(args, key); if (v !== undefined && !values.includes(v)) throw new Error(`${key} must be one of ${values.join(', ')}.`); return v;
+  const v = args[key];
+  if (v === undefined) return undefined;
+  if (typeof v !== 'string' || !values.includes(v)) {
+    throw new Error(`${key} must be one of ${values.join(', ')} (got ${JSON.stringify(v) ?? String(v)}).`);
+  }
+  return v;
 }
 export function format(args: Record<string, unknown>): ResponseFormat { return (allowed(args, 'response_format', FORMATS) ?? 'concise') as ResponseFormat; }
 export function keys(args: Record<string, unknown>, known: readonly string[]): void {

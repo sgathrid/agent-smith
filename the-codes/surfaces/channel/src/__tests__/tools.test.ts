@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
@@ -7,6 +7,7 @@ import test from 'node:test';
 import { TOOL_DEFS, callTool, defaultMixedPipeline, type HandlerContext } from '../tools.ts';
 import { readAcceptance, writeAcceptance } from '../../../../forge/checks.ts';
 import { writePipelineRecord } from '../../../../forge/execute.ts';
+import { ForgeService } from '../../../../forge/service.ts';
 import type { ModelCatalog } from '../../../../providers/types.ts';
 import { withWorkerLookup } from './service-mock.ts';
 
@@ -45,6 +46,9 @@ test('spawn_job with no configured default: the only installed provider, else a 
   assert.equal(many.isError, true); assert.match((many.content as { text: string }[])[0]!.text, /provider is required: installed are agy, codex\./);
   const none = await callTool({ service, catalogs: async () => [] } as unknown as HandlerContext, 'spawn_job', { mode: 'review', prompt: 'x' });
   assert.equal(none.isError, true); assert.match((none.content as { text: string }[])[0]!.text, /No coding agent installed/);
+  const broken = await callTool({ service, catalogs: async () => { throw new Error('cli crashed'); } } as unknown as HandlerContext, 'spawn_job', { mode: 'review', prompt: 'x' });
+  assert.equal(broken.isError, true);
+  assert.equal(text(broken), 'Provider discovery failed (cli crashed).');
   assert.equal(seen.length, 1);
 });
 
@@ -60,10 +64,16 @@ test('list_capabilities reports catalogs, errors and modes without throwing', as
   assert.equal(codex.available, true); assert.equal(codex.models[0].id, 'codex-m'); assert.equal(codex.defaultSource, 'harness-config');
   assert.equal(claude.error, 'boom');
   assert.equal(r.providers.find((p: any) => p.name === 'agy').available, false);
+  assert.equal(r.warning, undefined);
   assert.deepEqual(r.modes.map((m: any) => m.name), ['implement', 'review', 'moderate', 'verify']);
   assert.equal(typeof r.efforts, 'string');
   const failing = { service: { repo: mkdtempSync(path.join(tmpdir(), 'agent-smith-tools-')) } as never, catalogs: async () => { throw new Error('x'); } } as HandlerContext;
-  assert.equal((await callTool(failing, 'list_capabilities', {})).isError, undefined);
+  const failedConcise = await callTool(failing, 'list_capabilities', {});
+  assert.equal(failedConcise.isError, undefined);
+  assert.equal(body(failedConcise).warning, 'Provider discovery failed (x).');
+  const failedDetailed = await callTool(failing, 'list_capabilities', { response_format: 'detailed' });
+  assert.equal(failedDetailed.isError, undefined);
+  assert.equal(body(failedDetailed).warning, 'Provider discovery failed (x).');
 });
 
 test('annotations are present', () => {
@@ -88,6 +98,7 @@ test('default pipeline derives providers from installed catalogs', async () => {
   assert.deepEqual(one.stages.map(s => s.provider), ['codex', 'codex', 'codex']);
   assert.equal(one.stages[0]!.model, 'codex-m'); assert.equal(one.stages[0]!.effort, 'high');
   await assert.rejects(defaultMixedPipeline({ name: 'p', task: 't' }, async () => []), /No coding agent installed: install one of agy, codex, opencode, claude, kimi\./);
+  await assert.rejects(defaultMixedPipeline({ name: 'p', task: 't' }, async () => { throw new Error('cli crashed'); }), /discovery failed.*cli crashed/i);
 });
 
 test('run_pipeline stages accept continues, inherit its provider, and reject a bad spec before starting anything', async () => {
@@ -110,6 +121,58 @@ test('run_pipeline stages accept continues, inherit its provider, and reject a b
     const r = await run(fix);
     assert.equal(r.isError, true); assert.match(text(r), message);
   }
+});
+
+test('run_pipeline validates stage models and efforts against catalogs before launching, including continues and warnings', async () => {
+  const fresh = (provider: string, models: ModelCatalog['models'], extra: Partial<ModelCatalog> = {}): ModelCatalog => ({
+    provider, models, defaultModel: models[0]?.id, defaultSource: 'harness-config', source: 'live', stale: false, verified: true, ...extra,
+  });
+  let spawned = 0;
+  const service = withWorkerLookup({ repo: mkdtempSync(path.join(tmpdir(), 'agent-smith-pipe-val-')), spawnTracked: async () => { spawned += 1; throw new Error('should not launch'); } }) as never;
+  const ctx = { service, catalogs: async () => [
+    fresh('agy', [{ id: 'agy-m', label: 'Agy', efforts: ['low', 'high'], defaultEffort: 'low' }]),
+    fresh('codex', [{ id: 'mini', label: 'Mini', efforts: ['low'], defaultEffort: 'low' }]),
+    fresh('kimi', [{ id: 'kimi-m', label: 'Kimi', efforts: [], defaultEffort: undefined }]),
+    fresh('opencode', [{ id: 'oc-m', label: 'OC', efforts: [] }], { verified: false }),
+  ] } as HandlerContext;
+
+  const badModel = await callTool(ctx, 'run_pipeline', { spec: { name: 'p', stages: [
+    { name: 'build', provider: 'agy', prompt: 'b' },
+    { name: 'review', provider: 'agy', model: 'x', prompt: 'r', dependsOn: ['build'] },
+  ] } });
+  assert.equal(badModel.isError, true);
+  assert.match(text(badModel), /^stage 'review': unknown model "x" for agy\. Valid model ids: agy-m\.$/);
+
+  const badEffort = await callTool(ctx, 'run_pipeline', { spec: { name: 'p', stages: [
+    { name: 'review', provider: 'codex', model: 'mini', effort: 'high', prompt: 'r' },
+  ] } });
+  assert.equal(badEffort.isError, true);
+  assert.match(text(badEffort), /^stage 'review': effort "high" is not valid for codex model "mini"\. Valid efforts: low\.$/);
+
+  const badContinued = await callTool(ctx, 'run_pipeline', { spec: { name: 'p', stages: [
+    { name: 'build', provider: 'agy', prompt: 'b' },
+    { name: 'fix', continues: 'build', model: 'nope', prompt: 'f', dependsOn: ['build'] },
+  ] } });
+  assert.equal(badContinued.isError, true);
+  assert.match(text(badContinued), /^stage 'fix': unknown model "nope" for agy\. Valid model ids: agy-m\.$/);
+  assert.equal(spawned, 0);
+
+  const okService = { repo: mkdtempSync(path.join(tmpdir(), 'agent-smith-pipe-ok-')) } as never;
+  const okCtx = { ...ctx, service: okService } as HandlerContext;
+  const warned = await callTool(okCtx, 'run_pipeline', { spec: { name: 'p', stages: [
+    { name: 'a', provider: 'opencode', model: 'oc-x', prompt: 'a' },
+    { name: 'b', provider: 'kimi', effort: 'high', prompt: 'b' },
+  ] } });
+  assert.equal(warned.isError, undefined, text(warned));
+  assert.equal(body(warned).warnings.length, 2);
+  assert.match(body(warned).warnings[0], /could not verify model "oc-x" for opencode/);
+  assert.match(body(warned).warnings[1], /kimi has no per-run effort flag/);
+
+  const clean = await callTool(okCtx, 'run_pipeline', { spec: { name: 'p', stages: [
+    { name: 'a', provider: 'agy', model: 'agy-m', effort: 'high', prompt: 'a' },
+  ] } });
+  assert.equal(clean.isError, undefined, text(clean));
+  assert.equal('warnings' in body(clean), false);
 });
 
 test('explicit stages are unchanged', async () => {
@@ -475,6 +538,91 @@ test('status include_diff: says so without a baseline, while running, or with no
   assert.equal(empty.diff, ''); assert.match(empty.diffNote, /No files changed/);
 });
 
+test('status include_diff: a removed cwd is named instead of blaming git', async () => {
+  const { cwd, head } = gitRepo();
+  rmSync(cwd, { recursive: true, force: true });
+  const ctx = withService({ resolveWorker: async () => detail({ cwd, gitBaseline: { head, dirty: [] }, changedFiles: ['a.txt'] }) });
+  const gone = body(await callTool(ctx, 'status', { id: 'implement-smith-1', include_diff: true }));
+  assert.equal(gone.diff, null);
+  assert.equal(gone.diffNote, `No diff: ${cwd} no longer exists.`);
+});
+
+test('status by worker: unions changedFiles across turns in stable order and diffs against earliest baseline, while job ID stays scoped', async () => {
+  const { cwd, head: baseHead } = gitRepo();
+  writeFileSync(path.join(cwd, 'a.txt'), 'one\ntwo\n');
+  writeFileSync(path.join(cwd, 'b.txt'), 'bee\n');
+  execFileSync('git', ['add', 'a.txt'], { cwd });
+  execFileSync('git', ['commit', '-qm', 'mid'], { cwd });
+  const midHead = execFileSync('git', ['rev-parse', 'HEAD'], { cwd, encoding: 'utf8' }).trim();
+  const turns: Record<string, Record<string, unknown>> = {
+    'w-1': detail({ jobId: 'w-1', workerId: 'w-ada', turn: 1, cwd, gitBaseline: { head: baseHead, dirty: [] }, changedFiles: ['b.txt', 'a.txt'] }),
+    'w-2': detail({ jobId: 'w-2', workerId: 'w-ada', turn: 2, cwd, gitBaseline: { head: midHead, dirty: ['b.txt'] }, changedFiles: ['a.txt', 'c.txt'] }),
+    'w-3': detail({ jobId: 'w-3', workerId: 'w-ada', turn: 3, cwd, gitBaseline: { head: midHead, dirty: [] }, changedFiles: [] }),
+  };
+  const ctx = withService({
+    resolveWorker: async (id: string) => (id === 'w-ada' ? turns['w-3']! : turns[id]!),
+    earlierTurns: async (head: { jobId: string }) => (head.jobId === 'w-3' ? [turns['w-1']!, turns['w-2']!] : []),
+  });
+
+  const workerConcise = body(await callTool(ctx, 'status', { id: 'w-ada', include_diff: true }));
+  assert.equal(workerConcise.changedFileCount, 3);
+  assert.deepEqual(workerConcise.changedFiles, ['b.txt', 'a.txt', 'c.txt']);
+  assert.match(workerConcise.diff, /^diff --git a\/a\.txt b\/a\.txt[\s\S]*\+two/);
+  assert.match(workerConcise.diffNote, /Untracked, not in diff.*b\.txt/);
+
+  const workerDetailed = body(await callTool(ctx, 'status', { id: 'w-ada', include_diff: true, response_format: 'detailed' }));
+  assert.equal(workerDetailed.changedFileCount, 3);
+  assert.deepEqual(workerDetailed.changedFiles, ['b.txt', 'a.txt', 'c.txt']);
+  assert.equal(workerDetailed.diff, workerConcise.diff);
+
+  const turnOnly = body(await callTool(ctx, 'status', { id: 'w-3', include_diff: true }));
+  assert.equal('changedFileCount' in turnOnly, false);
+  assert.equal('changedFiles' in turnOnly, false);
+  assert.equal(turnOnly.diff, '');
+  assert.match(turnOnly.diffNote, /No files changed/);
+});
+
+test('status by worker: uses earliest turn with a git baseline, preserves changedFilesUnknown, and handles a still-running head turn', async () => {
+  const { cwd, head: baseHead } = gitRepo();
+  writeFileSync(path.join(cwd, 'a.txt'), 'one\ntwo\n');
+
+  const noBaseTurns: Record<string, Record<string, unknown>> = {
+    't-1': detail({ jobId: 't-1', workerId: 'w-b', turn: 1, cwd, gitBaseline: undefined, changedFiles: ['a.txt'] }),
+    't-2': detail({ jobId: 't-2', workerId: 'w-b', turn: 2, cwd, gitBaseline: { head: baseHead, dirty: [] }, changedFiles: [] }),
+  };
+  const bCtx = withService({
+    resolveWorker: async () => noBaseTurns['t-2']!,
+    earlierTurns: async () => [noBaseTurns['t-1']!],
+  });
+  const bStatus = body(await callTool(bCtx, 'status', { id: 'w-b', include_diff: true }));
+  assert.match(bStatus.diff, /\+two/);
+
+  const unknownTurns: Record<string, Record<string, unknown>> = {
+    'u-1': detail({ jobId: 'u-1', workerId: 'w-u', turn: 1, changedFiles: undefined, changedFilesUnknown: true }),
+    'u-2': detail({ jobId: 'u-2', workerId: 'w-u', turn: 2, changedFiles: [] }),
+  };
+  const uCtx = withService({
+    resolveWorker: async () => unknownTurns['u-2']!,
+    earlierTurns: async () => [unknownTurns['u-1']!],
+  });
+  assert.equal(body(await callTool(uCtx, 'status', { id: 'w-u' })).changedFilesUnknown, true);
+  assert.equal(body(await callTool(uCtx, 'status', { id: 'w-u', response_format: 'detailed' })).changedFilesUnknown, true);
+
+  const runningTurns: Record<string, Record<string, unknown>> = {
+    'r-1': detail({ jobId: 'r-1', workerId: 'w-r', turn: 1, cwd, gitBaseline: { head: baseHead, dirty: [] }, changedFiles: ['a.txt'] }),
+    'r-2': detail({ jobId: 'r-2', workerId: 'w-r', turn: 2, cwd, status: 'running', finishedAt: null, changedFiles: undefined }),
+  };
+  const rCtx = withService({
+    resolveWorker: async () => runningTurns['r-2']!,
+    earlierTurns: async () => [runningTurns['r-1']!],
+  });
+  const rStatus = body(await callTool(rCtx, 'status', { id: 'w-r', include_diff: true }));
+  assert.equal(rStatus.changedFileCount, 1);
+  assert.deepEqual(rStatus.changedFiles, ['a.txt']);
+  assert.match(rStatus.diff, /\+two/);
+  assert.match(rStatus.diffNote, /running turn/i);
+});
+
 test('tool failures are isError results that say what to do next', async () => {
   const cwd = mkdtempSync(path.join(tmpdir(), 'smith-err-'));
   let current: Record<string, unknown> = {};
@@ -486,7 +634,7 @@ test('tool failures are isError results that say what to do next', async () => {
   };
   await fail('spawn_job', { mode: 'review', prompt: 'x', cwd: 'rel' }, /absolute path/);
   await fail('spawn_job', { mode: 'review', prompt: 'x', cwd: path.join(cwd, 'nope') }, /is not a directory/);
-  await fail('follow_up', { worker: 'ghost', prompt: 'x', model: 'm' }, /No worker "ghost"; see list_jobs/);
+  await fail('follow_up', { worker: 'ghost', prompt: 'x', model: 'm' }, /No worker "ghost"/);
   await fail('follow_up', { worker: 'Ada', prompt: 'x', model: 'm' }, /matches 2 workers; pass a jobId/);
   for (const tool of ['follow_up', 'steer']) {
     await fail(tool, { prompt: 'x' }, /worker is required/);
@@ -496,10 +644,19 @@ test('tool failures are isError results that say what to do next', async () => {
   await fail('follow_up', { worker: 'Ada', prompt: 'x', checks: 'npm test' }, /checks must be an array/);
   await fail('status', {}, /id is required: a worker name or job ID/);
   await fail('cancel', {}, /id is required/);
-  await fail('pipeline_status', { runId: 'nope' }, /No pipeline run "nope"/);
+  await fail('pipeline_status', { runId: 'nope' }, /No pipeline run "nope"\./);
   await fail('pipeline_status', {}, /runId is required/);
+  await fail('spawn_job', { mode: '', prompt: 'x' }, /mode must be one of implement, review, moderate, verify \(got ""\)\./);
+  await fail('spawn_job', { mode: 'review', effort: 123, prompt: 'x' }, /effort must be one of .* \(got 123\)\./);
+  await fail('list_jobs', { response_format: 'xml' }, /response_format must be one of concise, detailed \(got "xml"\)\./);
   await fail('status', { id: 'j', bogus: 1 }, /Unknown field bogus; valid fields: id, wait_ms, include_diff, response_format/);
   await fail('nope', {}, /Unknown tool nope; available: list_capabilities/);
+
+  writePipelineRecord(cwd, 'run-123', { runId: 'run-123', pipeline: 'p', status: 'running', startedAt: 1, stageResults: {} });
+  const realCtx = { service: new ForgeService({ repo: cwd }), catalogs: async () => [cat('codex')] } as HandlerContext;
+  const runStatus = await callTool(realCtx, 'status', { id: 'run-123' });
+  assert.equal(runStatus.isError, true);
+  assert.match(text(runStatus), /"run-123" is a pipeline run, not a worker\./);
 });
 
 test('a failed job preparation never leaves checks pending', async () => {
