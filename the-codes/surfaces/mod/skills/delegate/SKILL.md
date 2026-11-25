@@ -44,9 +44,10 @@ denied, ask the user before retrying with `unrestricted: true`.
 
 ## While it runs
 
-`spawn_job` returns at once and the worker runs in the background. The main conversation gets
-a message when it ends. A subagent or headless session gets none and calls `status` with
-`wait_ms` until the job settles.
+`spawn_job` returns at once and the worker runs in the background. You get a message when it
+ends, so don't poll or start your own monitor. A subagent doesn't get that message (it goes
+to the main conversation), and neither does a headless session; either one calls `status`
+with `wait_ms` until the job settles.
 
 ## Talking to a worker
 

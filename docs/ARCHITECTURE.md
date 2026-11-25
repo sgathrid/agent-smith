@@ -455,10 +455,11 @@ Claude                MCP server (dist/server.js)      Claude Code hooks        
   `classic.*` event: Claude Code's built-in guard (`cc-plugin-sec-default`) sends
   `classic.PostToolUse` past user-tier modules, so `tool.call` is the only path. A
   `status`/`pipeline_status` read of a settled worker on the main loop (`tool.call` with no
-  `agentId`) retires its notice, as does a `cancel` that returns `settled: true`. The mod refuses a main-loop `status` with
-  `wait_ms` for a live worker it will announce; subagents and headless sessions still wait.
-  It declines (calls `next`) in legacy mode, after a read error, or when the ack's
-  repo is not the one it polls. Notices fire **once per worker idle transition**
+  `agentId`) retires its notice, as does a `cancel` that returns `settled: true`.
+  The mod declines a launch (calls `next`) in legacy mode, after a read error, or when the ack's
+  repo is not the one it polls. In an interactive session it also refuses a main-loop
+  `status` with `wait_ms` for a worker it will still announce (live, notice not yet
+  retired, no read error); subagents, headless runs and other workers still wait. Notices fire **once per worker idle transition**
   (`isWorkerIdle` on the head in `mod/hooks/turns.ts`), covering all turns completed since
   the last notice (e.g. `also ran turns 2–3`); two queued follow-ups produce one notice.
   On each 1 s active poll (when nothing is live and `/forge` is closed, an idle tick does one

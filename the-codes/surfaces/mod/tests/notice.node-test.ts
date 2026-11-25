@@ -566,17 +566,39 @@ test('noticeFromRadar uses chainStartedAt for steered chains and per-turn starte
 });
 
 describe('refusesStatusWait', () => {
-  const job = (status: string) => ({ id: 'job-1', workerId: 'w-1', name: 'links1-neon', status, startedAt: NOW, endedAt: null }) as any;
-  const owned: Owned[] = [{ kind: 'job', id: 'job-1', workerId: 'w-1', at: NOW, until: NOW + 1000 }];
+  const row = (id: string, status: string, more: Record<string, unknown> = {}): NoticeRow =>
+    ({ id, workerId: 'w-1', name: 'links1-neon', status, startedAt: NOW, endedAt: null, ...more }) as NoticeRow;
+  const own = (more: Partial<Owned> = {}): Owned[] => [{ kind: 'job', id: 'job-1', workerId: 'w-1', at: NOW, until: NOW + 1000, ...more }];
   for (const id of ['links1-neon', 'job-1', 'w-1']) {
     test(`refuses an owned live worker addressed as ${id}`, () => {
-      assert.equal(refusesStatusWait(owned, [job('running')], id), true);
+      assert.equal(refusesStatusWait(own(), [row('job-1', 'running')], id), true);
     });
   }
-  test('passes a worker this session holds no notice for', () => {
-    assert.equal(refusesStatusWait([], [job('running')], 'job-1'), false);
+  test('refuses a steered worker addressed by its first turn', () => {
+    const turns = [
+      row('job-1', 'canceled', { workerId: 'job-1', supersededBy: 'job-2' }),
+      row('job-2', 'running', { workerId: 'job-1', turn: 2, startedAt: NOW + 1 }),
+    ];
+    assert.equal(refusesStatusWait(own({ id: 'job-2', workerId: 'job-1' }), turns, 'job-1'), true);
+  });
+  test('refuses while a queued follow-up is waiting to start', () => {
+    assert.equal(refusesStatusWait(own(), [row('job-1', 'succeeded', { pendingMessages: 1 })], 'job-1'), true);
+  });
+  test('passes a worker this session holds no notice for, though it holds others', () => {
+    const rows = [row('job-1', 'running'), row('job-9', 'running', { workerId: 'w-9', name: 'other' })];
+    assert.equal(refusesStatusWait(own(), rows, 'other'), false);
   });
   test('passes an owned worker that has settled', () => {
-    assert.equal(refusesStatusWait(owned, [job('succeeded')], 'job-1'), false);
+    assert.equal(refusesStatusWait(own(), [row('job-1', 'succeeded')], 'job-1'), false);
+  });
+  test('passes when no further notice will come', () => {
+    assert.equal(refusesStatusWait(own({ readHead: 'job-1' }), [row('job-1', 'running')], 'job-1'), false);
+    assert.equal(refusesStatusWait(own({ saidAttention: true }), [row('job-1', 'running')], 'job-1'), false);
+    assert.equal(refusesStatusWait(own(), [row('job-1', 'attention')], 'job-1'), false);
+  });
+  test('passes a name the server would resolve differently', () => {
+    assert.equal(refusesStatusWait(own(), [row('job-1', 'running')], 'Links1-Neon'), false);
+    const twins = [row('job-1', 'running'), row('job-2', 'running', { workerId: 'w-2' })];
+    assert.equal(refusesStatusWait(own(), twins, 'links1-neon'), false);
   });
 });

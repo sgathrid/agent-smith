@@ -353,6 +353,8 @@ async function pollNativeTasks($: EngineInterface, rows: readonly RadarJob[]): P
   }
 }
 
+let interactive = false;
+
 function registerBand(on: Parameters<Register>[0]): void {
   on('tool.call', { tool: LAUNCH_TOOL }, async ($, e, next) => {
     const r = await next(e) as { result?: unknown; text?: unknown; deny?: string; isError?: boolean } | undefined;
@@ -366,8 +368,8 @@ function registerBand(on: Parameters<Register>[0]): void {
 
   on('tool.call', { tool: STATUS_TOOL }, async ($, e, next) => {
     if (
-      e.agentId === undefined && typeof e.tool === 'string' && e.tool.endsWith('__status') && e.wait_ms !== undefined && typeof e.id === 'string' &&
-      refusesStatusWait(await read($, notices), await read($, bandJobs), e.id)
+      interactive && e.agentId === undefined && typeof e.tool === 'string' && e.tool.endsWith('__status') && e.wait_ms !== undefined && typeof e.id === 'string' &&
+      await read($, readError) === null && refusesStatusWait(await read($, notices), await read($, bandJobs), e.id)
     ) {
       return { deny: `${e.id} will be announced when it finishes. Call status without wait_ms to check it now.` };
     }
@@ -456,6 +458,7 @@ export const register: Register = (on) => {
 
   on('session.start', async ($, e, next) => {
     const rest = await next(e);
+    interactive = e.isInteractive === true;
     await startBand($, typeof e.cwd === 'string' ? e.cwd : undefined);
     void checkForUpdate($).catch(() => {});
 

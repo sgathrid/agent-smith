@@ -228,7 +228,7 @@ const ADA_VIEW = JSON.stringify({schema:1,prompt:'Long task instructions',preamb
 const ada = () => canonicalJob('job-ada', {status:'running',name:'Ada',workerId:'ada',role:'reviewer',provider:'codex',model:'gpt-6-sol'}, {'view.json':ADA_VIEW});
 
 function forgeHost(on: (...args: any[]) => void, files: Record<string,string>, ids: string[], env: Record<string,string> = {}) {
-  const host = { opens: [] as Record<string,unknown>[], closes: [] as Record<string,unknown>[], toasts: [] as string[], scrolls: [] as Record<string,unknown>[], io: { list: 0, reads: [] as string[] } };
+  const host = { opens: [] as Record<string,unknown>[], closes: [] as Record<string,unknown>[], toasts: [] as string[], scrolls: [] as Record<string,unknown>[], io: { list: 0, reads: [] as string[] }, statusCalls: 0 };
   on('session.start', (_$: unknown, e: any) => ({sessionId:'s',cwd:e.cwd}));
   on('command.register', () => ({value:undefined}));
   on('env.get', (_$: unknown, e: any) => ({value:env[e.name]}));
@@ -240,7 +240,7 @@ function forgeHost(on: (...args: any[]) => void, files: Record<string,string>, i
   on('tool.call', (_$: unknown, e: any) => e.tool==='TaskCreate'?{result:{task:{id:'native-task-1'}}}
     :LAUNCH_TOOL.test(e.tool)?launchAck(e)
     :/__cancel$/.test(e.tool)?{result:{structuredContent:{jobId:e.jobId,status:'canceled',settled:e.settled??true},content:[]}}
-    :/__status$/.test(e.tool)?{result:{structuredContent:{jobId:e.jobId,status:e.status??'succeeded',acceptance:{state:'accepted',pending:false}},content:[]}}
+    :/__status$/.test(e.tool)&&++host.statusCalls?{result:{structuredContent:{jobId:e.jobId,status:e.status??'succeeded',acceptance:{state:'accepted',pending:false}},content:[]}}
     :{result:{success:true}});
   const clock = mock.clock(on as never,{now:RUNNING_NOW});
   on('fs.list', () => { host.io.list += 1; return {value:ids.map(name=>({name,kind:'dir',size:0}))}; });
@@ -873,17 +873,25 @@ describe('completion notices', () => {
   describe('status wait_ms on an announced worker', () => {
     const statusWait = ($: any, more: Record<string, unknown> = {}, tool = 'status') =>
       $.tool.call({ tool: `mcp__plugin_agent-smith_agent-smith__${tool}`, id: 'job-ada', wait_ms: 60_000, ...more });
-    const owning = async ($: any, on: any) => {
-      noticeHost(on, ada('running'), ['job-ada']);
-      await start($);
+    const owning = async ($: any, on: any, isInteractive = true) => {
+      const { host } = noticeHost(on, ada('running'), ['job-ada']);
+      await $.session.start({ surface: isInteractive ? 'terminal' : null, isInteractive, cwd: '/work' } as never);
       await launched($, 'job-ada');
+      return host;
     };
 
     test('the main loop is denied and the tool is not called', async ($, on) => {
-      await owning($, on);
+      const host = await owning($, on);
       const r = await statusWait($) as any;
       expect(r.deny).toBe('job-ada will be announced when it finishes. Call status without wait_ms to check it now.');
-      expect(r.result).toBeUndefined();
+      expect(host.statusCalls).toBe(0);
+    });
+
+    test('a headless session passes through', async ($, on) => {
+      const host = await owning($, on, false);
+      const r = await statusWait($) as any;
+      expect(r.deny).toBeUndefined();
+      expect(host.statusCalls).toBe(1);
     });
 
     for (const [label, more, tool] of [
