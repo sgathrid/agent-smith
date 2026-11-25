@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
@@ -474,6 +474,15 @@ test('status include_diff: says so without a baseline, while running, or with no
   const { cwd, head } = gitRepo();
   const empty = body(await callTool(withService({ detail: async () => detail({ cwd, gitBaseline: { head, dirty: [] }, changedFiles: [] }) }), 'status', { id: 'j', include_diff: true }));
   assert.equal(empty.diff, ''); assert.match(empty.diffNote, /No files changed/);
+});
+
+test('status include_diff: a removed cwd is named instead of blaming git', async () => {
+  const { cwd, head } = gitRepo();
+  rmSync(cwd, { recursive: true, force: true });
+  const ctx = withService({ resolveWorker: async () => detail({ cwd, gitBaseline: { head, dirty: [] }, changedFiles: ['a.txt'] }) });
+  const gone = body(await callTool(ctx, 'status', { id: 'implement-smith-1', include_diff: true }));
+  assert.equal(gone.diff, null);
+  assert.equal(gone.diffNote, `No diff: ${cwd} no longer exists.`);
 });
 
 test('status by worker: unions changedFiles across turns in stable order and diffs against earliest baseline, while job ID stays scoped', async () => {

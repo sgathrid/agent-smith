@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import type { JobDetail, JobSummary } from '../../../forge/service.ts';
 import type { ContinuationKind } from '../../../forge/format.ts';
 import type { Acceptance } from '../../../forge/checks.ts';
@@ -241,6 +242,7 @@ export async function jobDiff(d: JobDetail, { runningTurnPending = false }: { ru
   if (d.changedFiles.length === 0) {
     return { diff: '', diffNote: runningTurnPending ? "No files changed yet; the running turn's files are added when it finishes." : 'No files changed.' };
   }
+  if (!existsSync(d.cwd)) return { diff: null, diffNote: `No diff: ${d.cwd} no longer exists.` };
   try {
     const [tracked, untracked] = await Promise.all([
       git(d.cwd, ['diff', '--no-color', head, '--', ...d.changedFiles]),
