@@ -252,14 +252,15 @@ opt-in 2026-07-28 Tasks receiver (`AGENT_SMITH_TASKS=1`) over `ForgeService` for
    records `cancellationRequestedAt`, and requests `ForgeService.cancel(jobId)`, keeping
    task status `working` until the Forge job reaches `canceled`. Protocol-level `failed`
    (`-32603`) is reserved for tasks whose linked Forge job is missing or unreadable.
-5. **Claude Code orchestrator status**: Claude Code 2.1.300 negotiates `2026-07-28` via
-   `server/discover` over stdio and ships a built-in 2026-07-28 Tasks client driver
-   (`CreateTaskResultSchema`, `driveMcpTask` polling `tasks/get`, `tasks/update`,
-   `tasks/cancel`), but gates advertising `extensions['io.modelcontextprotocol/tasks']`
-   behind its remote feature flag `tengu_glowing_lark` (default `false` in 2.1.300).
-   While that host flag is off, Claude Code strips `io.modelcontextprotocol/tasks` from
-   per-request `_meta['io.modelcontextprotocol/clientCapabilities']`, and Agent Smith
-   cleanly serves the immediate `SpawnAck` fallback.
+5. **Claude Code orchestrator status**: From 2.1.319, Claude Code supports MCP tasks in the
+   terminal without feature-flag fetching (the `tengu_glowing_lark` gate from 2.1.300 no
+   longer applies). When a server runs a tool call as a task, Claude Code moves it to the
+   background at once and tells Claude the result when it finishes.
+   `CLAUDE_CODE_DISABLE_MCP_TASKS=1` turns MCP tasks off, and
+   `CLAUDE_CODE_DISABLE_MCP_TASK_BACKGROUND` makes Claude Code wait for a task inside its
+   tool call instead of backgrounding it. Agent Smith's receiver remains opt-in
+   (`AGENT_SMITH_TASKS=1`); it is not yet verified whether a subagent or a headless
+   (`claude -p`) caller receives a task result before it exits.
 
 Track the [Tasks specification](https://tasks.extensions.modelcontextprotocol.io/specification/2026-07-28/tasks)
 and [official extension implementation](https://github.com/modelcontextprotocol/ext-tasks).
