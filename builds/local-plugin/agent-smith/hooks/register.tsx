@@ -27,6 +27,7 @@ import {
   due,
   parseLaunches,
   parseSettledRead,
+  refusesStatusWait,
   runFileName,
   unclaim,
   type Launch,
@@ -364,6 +365,12 @@ function registerBand(on: Parameters<Register>[0]): void {
   });
 
   on('tool.call', { tool: STATUS_TOOL }, async ($, e, next) => {
+    if (
+      e.agentId === undefined && typeof e.tool === 'string' && e.tool.endsWith('__status') && e.wait_ms !== undefined && typeof e.id === 'string' &&
+      refusesStatusWait(await read($, notices), await read($, bandJobs), e.id)
+    ) {
+      return { deny: `${e.id} will be announced when it finishes. Call status without wait_ms to check it now.` };
+    }
     const r = await next(e) as { result?: unknown; text?: unknown; deny?: string; isError?: boolean } | undefined;
     if (r && r.deny === undefined && r.isError !== true && e.agentId === undefined) {
       const settled = parseSettledRead(e.tool, r.result) ?? parseSettledRead(e.tool, r.text);

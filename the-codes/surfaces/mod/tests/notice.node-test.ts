@@ -3,7 +3,7 @@ import { describe, test } from 'node:test';
 
 import {
   ACCEPTANCE_HOLD_MS, LAUNCH_TOOL, STATUS_TOOL, type NoticeJob, type NoticeRow, type Owned, type RunRecord,
-  claim, claudeText, displayNoticeText, due, headline, noticeFromRadar, parseLaunch, parseLaunches, pipelineOutcome, parseSettledRead, unclaim,
+  claim, claudeText, displayNoticeText, due, headline, noticeFromRadar, parseLaunch, parseLaunches, pipelineOutcome, parseSettledRead, refusesStatusWait, unclaim,
 } from '../hooks/notice.ts';
 import { buildBatch } from '../../channel/src/policy.ts';
 
@@ -563,4 +563,20 @@ test('noticeFromRadar uses chainStartedAt for steered chains and per-turn starte
     chainStartedAt: NOW - 6_000, continuationKind: 'follow-up',
   }), 'finished', NOW);
   assert.equal(resumed.durationMs, 6_000);
+});
+
+describe('refusesStatusWait', () => {
+  const job = (status: string) => ({ id: 'job-1', workerId: 'w-1', name: 'links1-neon', status, startedAt: NOW, endedAt: null }) as any;
+  const owned: Owned[] = [{ kind: 'job', id: 'job-1', workerId: 'w-1', at: NOW, until: NOW + 1000 }];
+  for (const id of ['links1-neon', 'job-1', 'w-1']) {
+    test(`refuses an owned live worker addressed as ${id}`, () => {
+      assert.equal(refusesStatusWait(owned, [job('running')], id), true);
+    });
+  }
+  test('passes a worker this session holds no notice for', () => {
+    assert.equal(refusesStatusWait([], [job('running')], 'job-1'), false);
+  });
+  test('passes an owned worker that has settled', () => {
+    assert.equal(refusesStatusWait(owned, [job('succeeded')], 'job-1'), false);
+  });
 });

@@ -870,6 +870,36 @@ describe('completion notices', () => {
     expect(said.prompts).toHaveLength(1);
   });
 
+  describe('status wait_ms on an announced worker', () => {
+    const statusWait = ($: any, more: Record<string, unknown> = {}, tool = 'status') =>
+      $.tool.call({ tool: `mcp__plugin_agent-smith_agent-smith__${tool}`, id: 'job-ada', wait_ms: 60_000, ...more });
+    const owning = async ($: any, on: any) => {
+      noticeHost(on, ada('running'), ['job-ada']);
+      await start($);
+      await launched($, 'job-ada');
+    };
+
+    test('the main loop is denied and the tool is not called', async ($, on) => {
+      await owning($, on);
+      const r = await statusWait($) as any;
+      expect(r.deny).toBe('job-ada will be announced when it finishes. Call status without wait_ms to check it now.');
+      expect(r.result).toBeUndefined();
+    });
+
+    for (const [label, more, tool] of [
+      ['a subagent', { agentId: 'sub-1' }, 'status'],
+      ['a status without wait_ms', { wait_ms: undefined }, 'status'],
+      ['pipeline_status', {}, 'pipeline_status'],
+    ] as const) {
+      test(`${label} passes through`, async ($, on) => {
+        await owning($, on);
+        const r = await statusWait($, more, tool) as any;
+        expect(r.deny).toBeUndefined();
+        expect(r.result).toBeDefined();
+      });
+    }
+  });
+
   test('a variants ack claims every job it started, and skips a variant that failed', async ($, on) => {
     const files = { ...ada('running'), ...canonicalJob('job-bo', { status: 'running', name: 'Bo', provider: 'codex', role: 'review' }) };
     noticeHost(on, files, ['job-ada', 'job-bo']);

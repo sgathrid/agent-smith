@@ -1,5 +1,7 @@
 import { STEER_NOT_APPLIED_RE, checksReason, reasonFromText } from './reasons.ts';
+import { findWorker, isLive } from './dashboard.ts';
 import { isTerminal } from './format.ts';
+import type { RadarJob } from '../types/index.d.ts';
 import { isWorkerIdle, pickHead, type ContinuationKind, type TurnLike } from './turns.ts';
 
 export type NoticeContinuationKind = ContinuationKind;
@@ -264,6 +266,12 @@ export function unclaim(
     (settled.workerId !== undefined && o.workerId === settled.workerId));
   if (settled.kind === 'run') return owned.filter((o) => !matches(o));
   return owned.map((o) => (matches(o) ? { ...o, readHead: settled.id } : o));
+}
+
+export function refusesStatusWait(owned: readonly Owned[], jobs: readonly RadarJob[], id: string): boolean {
+  const worker = findWorker(jobs, id);
+  if (worker === undefined || !isLive(worker)) return false;
+  return owned.some((o) => o.kind === 'job' && (o.id === worker.id || (o.workerId !== undefined && o.workerId === worker.workerId)));
 }
 
 function launchKind(toolName: unknown): 'job' | 'run' | null {
