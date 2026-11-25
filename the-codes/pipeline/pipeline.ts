@@ -113,8 +113,13 @@ export function validateSpec(spec: PipelineSpec): void {
   }
   const seen = new Set<string>();
   for (const stage of spec.stages) {
-    if (!stage.name.trim() || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(stage.name)) {
+    if (!stage.name.trim()) {
       throw new PipelineSpecError('every stage needs a name');
+    }
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(stage.name)) {
+      throw new PipelineSpecError(
+        `stage '${stage.name}' has an invalid name; must match ^[A-Za-z0-9][A-Za-z0-9._-]*$`,
+      );
     }
     if (!stage.provider.trim()) throw new PipelineSpecError(`stage '${stage.name}' needs a provider`);
     if (stage.timeoutMs !== undefined && (!Number.isSafeInteger(stage.timeoutMs) || stage.timeoutMs <= 0)) {

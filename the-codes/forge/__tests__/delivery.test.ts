@@ -172,7 +172,7 @@ test('a worker running checks with a queued message keeps its name busy', async 
   t1.finish({ status: 'success', response: 'ok' });
   await waitFor(() => (readAcceptance(repo, ack.jobId) as { running?: string }).running === 'gate', { message: 'checks running' });
   await s.followUp({ worker: 'w', prompt: 'QUEUED' });
-  await assert.rejects(serviceOn(repo, ctrl.provider).spawnJob({ mode: 'implement', name: 'w', prompt: 'Another w.' }), /"w" is busy/);
+  await assert.rejects(serviceOn(repo, ctrl.provider).spawnJob({ mode: 'implement', name: 'w', prompt: 'Another w.' }), /"w" is busy.*follow_up/);
   const t2Ready = ctrl.nextTurn();
   writeFileSync(path.join(repo, 'GO'), '');
   const t2 = await t2Ready;

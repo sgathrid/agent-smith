@@ -102,6 +102,14 @@ test('validateSpec rejects duplicate stage names', () => {
   assert.throws(() => validateSpec(spec('s', [stage('a'), stage('a')])), PipelineSpecError);
 });
 
+test('validateSpec distinguishes missing stage names from invalid name patterns', () => {
+  assert.throws(() => validateSpec(spec('s', [stage('   ')])), /^PipelineSpecError: every stage needs a name$|^every stage needs a name$/);
+  assert.throws(
+    () => validateSpec(spec('s', [stage('step 1')])),
+    /stage 'step 1' has an invalid name; must match \^\[A-Za-z0-9\]\[A-Za-z0-9\._-\]\*\$/,
+  );
+});
+
 test('validateSpec rejects an unknown dependency', () => {
   assert.throws(
     () => validateSpec(spec('s', [stage('a', { dependsOn: ['ghost'] })])),

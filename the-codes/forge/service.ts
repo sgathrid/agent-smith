@@ -228,7 +228,7 @@ export class ForgeService {
 
   private assertNameFree(name: string, workerId: string): void {
     const busy = (jobId: string): Error =>
-      new Error(`"${name}" is busy (${jobId}); wait, cancel, or use another name.`);
+      new Error(`"${name}" is busy (${jobId}); use follow_up to message it, wait, cancel, or use another name.`);
     const canonicalConflict = this.findActiveIdentity(name, workerId);
     if (canonicalConflict !== null) throw busy(canonicalConflict.jobId);
     for (const { writer } of this.live.values()) {
@@ -1120,13 +1120,13 @@ export class ForgeService {
       headId = isJob ? this.resolveTurn(trimmed) : this.resolveWorkerHeadId(trimmed);
     } catch (err) {
       if (err instanceof WorkerLookupError && err.kind === 'missing') {
-        throw new Error(`no job "${id}" in ${jobsDir(this.repo)}; call list_jobs for valid job IDs.`);
+        throw this.notFound(id);
       }
       throw err;
     }
     const known = this.live.has(headId) || (this.isSafeJobId(headId) && existsSync(jobDir(this.repo, headId)));
     if (!known) {
-      throw new Error(`no job "${id}" in ${jobsDir(this.repo)}; call list_jobs for valid job IDs.`);
+      throw this.notFound(id);
     }
     const resolvedFrom = headId !== trimmed ? trimmed : null;
     const discarded = this.cutQueue(headId);
@@ -1218,10 +1218,18 @@ export class ForgeService {
     return this.numberedDetail(headId);
   }
 
-  private messageHead(ref: string): { headId: string; head: ForgeManifest } {
-    if (existsSync(pipelineRecordPath(this.repo, ref))) {
-      throw new Error(`"${ref}" is a pipeline run; follow_up and steer apply to workers, not runs.`);
+  private notFound(id: string): Error {
+    return new Error(`No worker "${id}"; see list_jobs.`);
+  }
+
+  private rejectPipelineRun(ref: string, guidance: string): void {
+    if (readPipeline(this.repo, ref) !== null) {
+      throw new Error(`"${ref}" is a pipeline run; ${guidance}`);
     }
+  }
+
+  private messageHead(ref: string): { headId: string; head: ForgeManifest } {
+    this.rejectPipelineRun(ref, 'follow_up and steer apply to workers, not runs.');
     let headId: string;
     try {
       headId = this.resolveWorkerHeadId(ref);
@@ -1229,7 +1237,7 @@ export class ForgeService {
       throw err instanceof WorkerLookupError ? new Error(err.message) : err;
     }
     const head = this.readManifestSync(headId);
-    if (head === null) throw new Error(`No worker "${ref}"; see list_jobs.`);
+    if (head === null) throw this.notFound(ref);
     if (head.pipeline !== null && head.pipeline !== undefined) {
       throw new Error(`"${head.name ?? headId}" is a pipeline stage (${headId}); run_pipeline manages its turns.`);
     }
@@ -1285,7 +1293,7 @@ export class ForgeService {
     return withWorkerLock(this.repo, workerId, async () => {
       const headId = this.workerHeadId(workerId) ?? firstHeadId;
       const head = this.readManifestSync(headId);
-      if (head === null) throw new Error(`No worker "${ref}"; see list_jobs.`);
+      if (head === null) throw this.notFound(ref);
       if (this.ownerLive(headId, head)) return this.enqueue(sender, headId, head, entry, env, warnings);
       return this.coldStart(sender, head, entry, env, warnings);
     }, { waitMs: LAUNCH_ACK_MS + LOCK_WAIT_MS });
@@ -1534,6 +1542,7 @@ export class ForgeService {
   resolveWorkerHeadId(ref: string): string {
     const trimmed = ref.trim();
     if (trimmed === '') throw new WorkerLookupError('worker is empty; pass a worker name, workerId or jobId.', 'missing');
+    this.rejectPipelineRun(trimmed, 'call pipeline_status.');
     this.workers.refresh();
     if (this.isJobId(trimmed)) {
       const m = this.readManifestRaw(trimmed);
@@ -1558,7 +1567,7 @@ export class ForgeService {
       const manifest = this.readManifestSync(headId) ?? turns.find((t) => t.jobId === head.jobId)!.manifest;
       heads.push({ jobId: headId, manifest, session: turns.some((t) => this.spawnedIds.has(t.jobId)), idle: isWorkerIdle(head) });
     }
-    if (heads.length === 0) throw new WorkerLookupError(`No worker "${name}"; see list_jobs.`, 'missing');
+    if (heads.length === 0) throw new WorkerLookupError(this.notFound(name).message, 'missing');
     const startOf = (h: { manifest: ForgeManifest }): number => Date.parse(h.manifest.startedAt ?? h.manifest.createdAt ?? '') || 0;
     const latest = <T extends { manifest: ForgeManifest; jobId: string }>(xs: readonly T[]): T =>
       [...xs].sort((a, b) => startOf(b) - startOf(a) || b.jobId.localeCompare(a.jobId))[0]!;
@@ -1712,7 +1721,7 @@ export class ForgeService {
     reconcileOrphan(this.repo, jobId);
     const observed = await readObservedJob(this.repo, jobId);
     if (observed === null) {
-      throw new Error(`no job "${jobId}" in ${jobsDir(this.repo)}; call list_jobs for valid job IDs.`);
+      throw this.notFound(jobId);
     }
 
     const reportPath = jobFile(this.repo, jobId, FILES.report);
