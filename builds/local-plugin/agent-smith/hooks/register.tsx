@@ -191,9 +191,10 @@ async function adoptRepo($: EngineInterface, repo: string): Promise<boolean> {
 const trimSlashes = (p: string): string => p.replace(/\/+$/, '') || p;
 
 let announcing = false;
+let inMainTurn = false;
 
 async function announce($: EngineInterface, repo: string, jobs: readonly RadarJob[], at: number): Promise<void> {
-  if (announcing) return;
+  if (inMainTurn || announcing) return;
   announcing = true;
   try {
     const owned = await read($, notices);
@@ -265,6 +266,7 @@ export async function startBand($: EngineInterface, cwd?: string): Promise<void>
   followingSite = null;
   detailCache = null;
   polling = false;
+  inMainTurn = false;
   idleEntries = null;
   settledJobCache.clear();
 
@@ -355,7 +357,33 @@ async function pollNativeTasks($: EngineInterface, rows: readonly RadarJob[]): P
 
 let interactive = false;
 
+async function flushTurnNotices($: EngineInterface): Promise<void> {
+  const cfg = await read($, bandConfig);
+  if (cfg.repo === '' || await read($, readError) !== null) return;
+  if ((await read($, notices)).length === 0) return;
+  await pollBand($);
+  if (await read($, readError) !== null) return;
+  await announce($, cfg.repo, await read($, bandJobs), await $.clock.now());
+}
+
 function registerBand(on: Parameters<Register>[0]): void {
+  try {
+    on('turn.start', async (_$, e, next) => {
+      if (e.agentId === undefined) inMainTurn = true;
+      return next(e);
+    });
+
+    on('turn.complete', async ($, e, next) => {
+      try {
+        return await next(e);
+      } finally {
+        if (e.agentId === undefined) {
+          inMainTurn = false;
+          await flushTurnNotices($).catch(() => {});
+        }
+      }
+    });
+  } catch {}
   on('tool.call', { tool: LAUNCH_TOOL }, async ($, e, next) => {
     const r = await next(e) as { result?: unknown; text?: unknown; deny?: string; isError?: boolean } | undefined;
     if (r && r.deny === undefined && r.isError !== true) {

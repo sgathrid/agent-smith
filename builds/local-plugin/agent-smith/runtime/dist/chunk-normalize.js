@@ -7,9 +7,32 @@ const QUOTA_RE = /insufficient[_ ](?:quota|credits|balance)|quota (?:exceeded|ex
 const COMPATIBILITY_RE = /unknown (?:option|argument|flag)|unrecognized (?:option|argument|flag|subcommand)|unexpected argument|unsupported (?:option|flag)|invalid value.{0,80}(?:--model|--effort|reasoning_effort)|unknown model|does not support effort|bad flag or model/i;
 const START_RE = /\bENOENT\b|spawn.{0,100}(?:not found|no such file)|couldn't start|could not start/i;
 const ORPHAN_RE = /orphaned|supervisor process exited|server stopped/i;
-const DENIED_RE = /\bdenied\b|soft-denied/i;
+const DENIED_RE = /^(?:denied\b)|(?:soft|auto)-denied|permission check failed|user denied permission|denied permission to/i;
 const STEER_NOT_APPLIED_RE = /^\d+ queued (?:steers?|follow-ups?|messages?) (?:not (?:applied|sent)|discarded)\b/i;
 const NO_OUTPUT_RE = /no usable output|empty response|\bno output\b/i;
+const FAILURE_PATTERNS = [
+    ['serverStopped', ORPHAN_RE],
+    ['denied', DENIED_RE],
+    ['notLoggedIn', AUTH_RE],
+    ['providerBusy', BUSY_RE],
+    ['outOfCredits', QUOTA_RE],
+    ['rateLimited', RATE_LIMIT_RE],
+    ['badFlagOrModel', COMPATIBILITY_RE],
+    ['couldntStart', START_RE],
+    ['timedOut', TIMEOUT_RE],
+    ['networkError', NETWORK_RE],
+    ['noOutput', NO_OUTPUT_RE],
+];
+function classifyFailure(text) {
+    const t = (text ?? '').trim();
+    if (t === '')
+        return null;
+    for (const [kind, re] of FAILURE_PATTERNS) {
+        if (re.test(t))
+            return kind;
+    }
+    return null;
+}
 const REASONS = {
     serverStopped: 'server stopped',
     noOutput: 'no output',
@@ -46,32 +69,15 @@ function reasonFromText(text) {
     const t = (text ?? '').trim();
     if (t === '')
         return REASONS.workerError;
-    if (ORPHAN_RE.test(t))
-        return REASONS.serverStopped;
     if (/^denied(?: [^\n·]+)?$/.test(t) && t.length <= 64)
         return t;
-    if (DENIED_RE.test(t)) {
+    const kind = classifyFailure(t);
+    if (kind === 'denied') {
         const named = /\(([^()]{2,})\)/.exec(t)?.[1] ?? /\bdenied:? ([A-Za-z_][^·\n]*)/i.exec(t)?.[1] ?? '';
         return deniedReason(named.split(',').map((n) => n.replace(/\s*\+\d+$/, '')));
     }
-    if (NO_OUTPUT_RE.test(t))
-        return REASONS.noOutput;
-    if (TIMEOUT_RE.test(t))
-        return REASONS.timedOut;
-    if (AUTH_RE.test(t))
-        return REASONS.notLoggedIn;
-    if (BUSY_RE.test(t))
-        return REASONS.providerBusy;
-    if (QUOTA_RE.test(t))
-        return REASONS.outOfCredits;
-    if (RATE_LIMIT_RE.test(t))
-        return REASONS.rateLimited;
-    if (COMPATIBILITY_RE.test(t))
-        return REASONS.badFlagOrModel;
-    if (START_RE.test(t))
-        return REASONS.couldntStart;
-    if (NETWORK_RE.test(t))
-        return REASONS.networkError;
+    if (kind !== null)
+        return REASONS[kind];
     if (/without (?:emitting )?a result|no result event|\bcrashed\b/i.test(t))
         return REASONS.crashed;
     if (/preparation failed|setup failed/i.test(t))
@@ -430,49 +436,6 @@ function deriveOrphan(m, lastSeenMs, nowMs, alive = isPidAlive, cancelRequested 
         return null;
     const ref = Math.max(...times);
     return nowMs - ref > LEGACY_ORPHAN_AFTER_MS ? verdict : null;
-}
-function nextActionFor(i) {
-    const base = baseNextAction(i);
-    return base !== null && i.steerNotApplied === true
-        ? `${base} A queued message was discarded: send it again with follow_up.`
-        : base;
-}
-function baseNextAction(i) {
-    const status = i.status ?? null;
-    if (status !== 'failed')
-        return null;
-    const err = i.error ?? '';
-    if (ORPHAN_RE.test(err))
-        return 'Server stopped: follow_up if it has a conversation, else rerun.';
-    if (i.jobStatus === 'denied' || (i.deniedCount ?? 0) > 0 || DENIED_RE.test(err)) {
-        return i.unrestricted === true
-            ? 'Denied even with unrestricted:true: narrow the task or give an approved path.'
-            : 'Ask the user before retrying with unrestricted:true.';
-    }
-    if (AUTH_RE.test(err))
-        return 'Not logged in: fix the provider login, then retry.';
-    if (BUSY_RE.test(err))
-        return 'Provider busy (temporary); follow_up to continue.';
-    if (QUOTA_RE.test(err))
-        return 'Out of credits on the provider account.';
-    if (RATE_LIMIT_RE.test(err))
-        return 'Rate limited; follow_up after a short wait.';
-    if (COMPATIBILITY_RE.test(err))
-        return 'Bad flag or model.';
-    if (START_RE.test(err))
-        return "Couldn't start.";
-    if (i.failedEarly === true && i.jobStatus !== 'timeout') {
-        return 'Route failed before any work (model/account): pick another model from list_capabilities or fix the account.';
-    }
-    if (i.jobStatus === 'timeout' || TIMEOUT_RE.test(err)) {
-        return 'Raise timeoutMs or split the task; follow_up keeps context.';
-    }
-    if (NETWORK_RE.test(err))
-        return 'Network error: retry once with follow_up or a new spawn.';
-    if (NO_OUTPUT_RE.test(err) || (i.exitCode === 0 && looksEmpty(i.report))) {
-        return 'No output: ask for a final answer via follow_up, or rerun.';
-    }
-    return 'Read status.error and warnings before retrying.';
 }/**
  * pipeline/routing.ts — dynamic model/stage selection.
  *
@@ -1676,7 +1639,7 @@ function buildEscalationContext(shape, outputTail) {
  *
  * One spelling per case, so every provider fails in the same words. Detail that
  * only a developer needs (event-shape gaps, flag advice) belongs in code
- * comments; advice for the orchestrator is nextActionFor's job (forge/format.ts).
+ * comments; failure classification is reasonFromText's job (surfaces/mod/hooks/reasons.ts).
  */
 const STDERR_TAIL_CHARS = 300;
 /** `45m`, `1h05m`, `30s`, `2m10s`. Whole units, never raw milliseconds. */
@@ -1722,35 +1685,69 @@ function recoveredErrorText(label, message, at) {
     const clock = /^\d{4}-\d\d-\d\dT(\d\d:\d\d)/.exec(at)?.[1];
     return `recovered from ${label}${clock === undefined ? '' : ` at ${clock} UTC`}${detail === '' ? '' : `: ${detail}`}`;
 }const pathProbeCache = new Map();
+async function probeExecutable(target) {
+    try {
+        await access(target, constants.X_OK);
+        return true;
+    }
+    catch (err) {
+        const code = err.code;
+        if (code === 'ENOENT' || code === 'ENOTDIR')
+            return false;
+        if (code === 'EACCES') {
+            try {
+                await access(target, constants.F_OK);
+                return false;
+            }
+            catch (fErr) {
+                const fCode = fErr.code;
+                if (fCode === 'ENOENT' || fCode === 'ENOTDIR')
+                    return false;
+                throw fErr;
+            }
+        }
+        throw err;
+    }
+}
 async function binaryOnPath(bin) {
     const pathEnv = process.env['PATH'] ?? '';
     const cacheKey = `${bin}|${pathEnv}`;
     const cached = pathProbeCache.get(cacheKey);
-    if (cached !== undefined)
-        return cached;
-    if (bin.includes('/') || bin.includes(path.sep)) {
-        let direct = false;
-        try {
-            await access(bin, constants.X_OK);
-            direct = true;
-        }
-        catch { }
-        pathProbeCache.set(cacheKey, direct);
-        return direct;
+    if (cached !== undefined) {
+        if (!cached.ok)
+            throw cached.error;
+        return cached.found;
     }
-    const dirs = pathEnv.split(path.delimiter).filter((d) => d !== '');
-    let found = false;
-    for (const dir of dirs) {
-        const full = path.join(dir, bin);
-        try {
-            await access(full, constants.X_OK);
-            found = true;
-            break;
+    try {
+        if (bin.includes('/') || bin.includes(path.sep)) {
+            const direct = await probeExecutable(bin);
+            pathProbeCache.set(cacheKey, { ok: true, found: direct });
+            return direct;
         }
-        catch { }
+        const dirs = pathEnv.split(path.delimiter).filter((d) => d !== '');
+        let found = false;
+        let probeError;
+        for (const dir of dirs) {
+            const full = path.join(dir, bin);
+            try {
+                if (await probeExecutable(full)) {
+                    found = true;
+                    break;
+                }
+            }
+            catch (err) {
+                probeError ??= err;
+            }
+        }
+        if (!found && probeError !== undefined)
+            throw probeError;
+        pathProbeCache.set(cacheKey, { ok: true, found });
+        return found;
     }
-    pathProbeCache.set(cacheKey, found);
-    return found;
+    catch (err) {
+        pathProbeCache.set(cacheKey, { ok: false, error: err });
+        throw err;
+    }
 }
 function stateRoot() {
     return process.env['AGENT_SMITH_STATE_DIR'] ?? path.join(os.homedir(), '.agent-smith', 'state');
@@ -2072,12 +2069,7 @@ function writeResultFile(stateDir, result) {
     catch { }
 }
 async function binaryAvailable(binary) {
-    try {
-        return await binaryOnPath(binary);
-    }
-    catch {
-        return false;
-    }
+    return binaryOnPath(binary);
 }
 function earlyVerdict(exit, durationMs) {
     if (exit.killReason === 'cancelled')
@@ -2511,6 +2503,7 @@ function createAgyTranslator(maxChars) {
             }
             // --- tool calls ---------------------------------------------------------
             if (stepType === 'tool') {
+                lastProseStep = undefined;
                 const info = su.tool_info;
                 const toolName = su.tool_name ?? info?.name ?? 'unknown';
                 const mem = steps.get(stepIndex) ?? {};
@@ -2565,6 +2558,7 @@ function createAgyTranslator(maxChars) {
             }
             // --- error_message: agy's own API/transport errors ----------------------
             if (stepType === 'error_message') {
+                lastProseStep = undefined;
                 sawErrorStep = true;
                 progressedAfterError = false;
                 // agy's stream carries no error text here; the final result does.
@@ -2608,7 +2602,10 @@ function buildResult$4(args) {
     const { jobId, resultEvent, exit, startedAtMs, stateDir, denials, sawAnyToolCall } = args;
     const { errorIsStale } = args;
     const durationMs = Date.now() - startedAtMs;
-    const response = args.finalText ?? resultEvent?.response ?? '';
+    const explicitEmptyResult = resultEvent?.response !== undefined && resultEvent.response.trim() === '';
+    const finalText = args.finalText !== undefined && args.finalText.trim() !== '' ? args.finalText : undefined;
+    const resultResponse = resultEvent?.response !== undefined && resultEvent.response.trim() !== '' ? resultEvent.response : undefined;
+    const response = explicitEmptyResult ? '' : (finalText ?? resultResponse ?? '');
     const reportedStatus = resultEvent?.status;
     const usage = toTokenUsage$4(resultEvent?.usage);
     // Normalize agy's denied_actions into our shape. Present-but-empty is the
@@ -3075,6 +3072,7 @@ function createClaudeTranslator(maxChars, input) {
                 tx.usage = usage;
                 out.push({ kind: 'usage', at, usage });
             }
+            let resetInMessage = false;
             for (const block of content) {
                 if (block === null || typeof block !== 'object')
                     continue;
@@ -3082,13 +3080,9 @@ function createClaudeTranslator(maxChars, input) {
                 const bType = str(b, 'type');
                 if (bType === 'text') {
                     const text = str(b, 'text');
-                    if (text !== undefined && text !== '') {
-                        // parent_tool_use_id present => this text came from a SUBAGENT
-                        // (forwarded by --forward-subagent-text). We must not fold it into
-                        // finalText: the top-level result is the moderator's own answer, and
-                        // a subagent's chatter in there would corrupt the moderated output.
-                        const parent = str(b, 'parent_tool_use_id');
-                        if (parent !== undefined) {
+                    const parent = str(b, 'parent_tool_use_id');
+                    if (parent !== undefined) {
+                        if (text !== undefined && text !== '') {
                             out.push({
                                 kind: 'text',
                                 at,
@@ -3096,7 +3090,13 @@ function createClaudeTranslator(maxChars, input) {
                                 stream: 'assistant',
                             });
                         }
-                        else {
+                    }
+                    else {
+                        if (!resetInMessage) {
+                            tx.finalText = '';
+                            resetInMessage = true;
+                        }
+                        if (text !== undefined && text !== '') {
                             tx.finalText += text;
                             out.push({ kind: 'text', at, text, stream: 'assistant' });
                         }
@@ -3111,6 +3111,10 @@ function createClaudeTranslator(maxChars, input) {
                     continue;
                 }
                 if (bType === 'tool_use') {
+                    if (str(b, 'parent_tool_use_id') === undefined && raw['parent_tool_use_id'] == null) {
+                        tx.finalText = '';
+                        resetInMessage = true;
+                    }
                     const toolUseId = str(b, 'id') ?? `toolu-${step}`;
                     const toolName = str(b, 'name') ?? 'unknown';
                     const idx = step++;
@@ -3145,6 +3149,8 @@ function createClaudeTranslator(maxChars, input) {
                 const b = block;
                 if (str(b, 'type') !== 'tool_result')
                     continue;
+                if (parentId === undefined || parentId === null)
+                    tx.finalText = '';
                 const toolUseId = str(b, 'tool_use_id') ?? '';
                 const idx = toolStep.get(toolUseId) ?? step++;
                 if (toolUseId !== '')
@@ -3211,8 +3217,9 @@ function createClaudeTranslator(maxChars, input) {
             if (typeof turns === 'number')
                 tx.numTurns = turns;
             const finalAnswer = str(raw, 'result');
-            if (finalAnswer !== undefined && finalAnswer !== '')
-                tx.finalText = finalAnswer;
+            if (finalAnswer !== undefined) {
+                tx.finalText = finalAnswer.trim() === '' ? '' : finalAnswer;
+            }
             return out;
         }
         if (type === 'error') {
@@ -3254,6 +3261,10 @@ function buildResult$3(args) {
     else if (exit.code !== 0) {
         status = 'error';
         error = `exited ${exit.code}${stderrClause(exit.stderr)}`;
+    }
+    else if (tx.finalText.trim() === '') {
+        status = 'malformed';
+        error = `no output${stderrClause(exit.stderr)}`;
     }
     else {
         status = 'success';
@@ -3719,9 +3730,14 @@ function createCodexTranslator(maxChars) {
             // Assistant prose.
             if (itemType === 'agent_message') {
                 const text = str(item, 'text');
-                if (text !== undefined && text !== '') {
-                    state.finalText = text;
-                    out.push({ kind: 'text', at, text, stream: 'assistant' });
+                if (text !== undefined) {
+                    if (text === '') {
+                        state.finalText = '';
+                    }
+                    else {
+                        state.finalText = text;
+                        out.push({ kind: 'text', at, text, stream: 'assistant' });
+                    }
                 }
                 return out;
             }
@@ -3737,6 +3753,7 @@ function createCodexTranslator(maxChars) {
             }
             if (NON_TOOL_ITEM_TYPES.has(itemType))
                 return out;
+            state.finalText = '';
             // ---- tool-ish items ----------------------------------------------------
             const tool = itemTool.get(itemId) ?? toolLabelFor(itemType, item);
             if (!itemTool.has(itemId))
@@ -3871,6 +3888,10 @@ function buildResult$2(args) {
         // turn.completed arrived but the process still failed. Corroboration wins.
         status = 'error';
         error = tx.error ?? `exited ${exit.code}${stderrClause(exit.stderr)}`;
+    }
+    else if (tx.finalText.trim() === '') {
+        status = 'malformed';
+        error = `no output${stderrClause(exit.stderr)}`;
     }
     else {
         status = 'success';
@@ -4204,9 +4225,14 @@ function createKimiTranslator(maxChars) {
         }
         if (role === 'assistant') {
             const content = str(raw, 'content');
-            if (content !== undefined && content !== '') {
-                tx.finalText = content;
-                out.push({ kind: 'text', at, text: content, stream: 'assistant' });
+            if (content !== undefined) {
+                if (content === '') {
+                    tx.finalText = '';
+                }
+                else {
+                    tx.finalText = content;
+                    out.push({ kind: 'text', at, text: content, stream: 'assistant' });
+                }
             }
             const calls = raw['tool_calls'];
             if (calls !== undefined) {
@@ -4221,6 +4247,8 @@ function createKimiTranslator(maxChars) {
                     });
                 }
                 else {
+                    if (calls.length > 0)
+                        tx.finalText = '';
                     for (const rawCall of calls) {
                         if (rawCall === null || typeof rawCall !== 'object' || Array.isArray(rawCall))
                             continue;
@@ -4254,6 +4282,7 @@ function createKimiTranslator(maxChars) {
             return out;
         }
         if (role === 'tool') {
+            tx.finalText = '';
             const id = str(raw, 'tool_call_id') ?? str(raw, 'id') ?? `tool-${step}`;
             if (ended.has(id)) {
                 out.push({
@@ -4751,7 +4780,6 @@ function createOpencodeTranslator(maxChars) {
         onEvent: () => [],
     };
     let step = 0;
-    let resetOnNextText = false;
     const partStep = new Map();
     const translate = (raw) => {
         const out = [];
@@ -4840,7 +4868,7 @@ function createOpencodeTranslator(maxChars) {
             deepString(raw, ['callID', 'callId', 'id', 'partID', 'partId']) ??
             `anon-${step}`;
         if (toolName !== undefined && (stateWord !== '' || isToolType)) {
-            resetOnNextText = true;
+            tx.finalText = '';
             const isDone = DONE_WORDS.has(stateWord) || type.endsWith('.completed') || type.endsWith('.done');
             const isErr = ERROR_WORDS.has(stateWord) || type.endsWith('.error');
             const errorTexts = [
@@ -4926,10 +4954,6 @@ function createOpencodeTranslator(maxChars) {
         const isThinking = type.includes('thinking') || type.includes('reasoning');
         if (text !== undefined && text !== '') {
             if (!isThinking) {
-                if (resetOnNextText) {
-                    tx.finalText = '';
-                    resetOnNextText = false;
-                }
                 if (tx.finalText !== '')
                     tx.finalText += '\n';
                 tx.finalText += text;
@@ -4939,10 +4963,14 @@ function createOpencodeTranslator(maxChars) {
             // it doubles as a terminal marker candidate below.
             return out;
         }
+        if (text === '' && !isThinking && (type === 'text' || partType === 'text')) {
+            tx.finalText = '';
+            return out;
+        }
         // ---- step boundaries ----------------------------------------------------
         if (isStepStart || isStepFinish) {
             if (isStepStart)
-                resetOnNextText = true;
+                tx.finalText = '';
             // Verified in the installed OpenCode CLI: session.step.ended emits
             // step_finish with part.reason = data.finish. Tool-call/length finishes
             // end only a step; "stop" confirms the assistant finished normally.
@@ -5198,6 +5226,19 @@ function getProvider(name) {
 /** Non-throwing lookup, for config validation that wants to report rather than raise. */
 function findProvider(name) {
     return BY_NAME.get(name);
+}
+function effectiveDefaultUnrestricted(provider) {
+    if (provider?.defaultUnrestricted === 'always')
+        return 'always';
+    return provider?.defaultUnrestricted === true && process.env['AGENT_SMITH_AGY_RESTRICTED'] !== '1';
+}
+function effectiveUnrestricted(provider, requested) {
+    const def = effectiveDefaultUnrestricted(provider);
+    if (def === 'always')
+        return true;
+    if (provider.name === 'codex' && process.env['AGENT_SMITH_CODEX_SANDBOX'] === 'danger-full-access')
+        return true;
+    return requested ?? def;
 }
 async function probeAvailability(providers = PROVIDERS) {
     return Promise.all(providers.map(async (p) => {
@@ -8311,4 +8352,4 @@ function asUsage(v) {
 /** Normalize a raw agent-smith job snapshot. */
 function normalize(raw) {
     return smithNormalizer(raw);
-}export{humanDuration as $,AgentSmithReader as A,validOwnerPid as B,reportFor as C,DEFAULT_TIMEOUT_MS as D,cwdFacts as E,FILES as F,normalizeDenials as G,deriveOrphan as H,deriveStatus as I,summaryHead as J,failureFields as K,writeAcceptance as L,MODES as M,createMarker as N,jobsDir as O,PROVIDERS as P,parseWorkerIndex as Q,REASONS as R,STAGE_PROMPTS as S,normalizeContinuationKind as T,nextActionFor as U,fileSig as V,WORKERS_DIR as W,JobWriter as X,newJobId$1 as Y,newWorkerId as Z,markAcceptancePending as _,MODE_PRESETS as a,pipeEvents as a0,checksAbortRequested as a1,verdictBlock as a2,runAcceptance as a3,senderOf as a4,taskTitle as a5,markAcceptanceSuperseded as a6,pickHead as a7,compareTurnPriority as a8,computeStaleReads as a9,SMITH_PAYLOAD as aa,isForgeStatus as ab,noticeReason as ac,readJsonSafe as ad,pipelineRecordPath as ae,workerIndexPath as af,checksReason as ag,toolLabel as ah,inheritContinuedProviders as b,readPipeline as c,jobFile as d,readAcceptance as e,findProvider as f,isWorkerIdle as g,isMode as h,isTerminalStatus as i,jobDir as j,cancelPipeline as k,isTerminalForgeStatus as l,missingPipelineError as m,readManifest as n,ownerAlive as o,providerNames as p,getProvider as q,reasonFromText as r,startPipeline as s,errMessage as t,probeAvailability as u,validateSpec as v,writeJsonAtomic as w,normalize as x,writeAtomic as y,SCHEMA_VERSION as z};
+}export{markAcceptancePending as $,AgentSmithReader as A,SCHEMA_VERSION as B,validOwnerPid as C,DEFAULT_TIMEOUT_MS as D,reportFor as E,FILES as F,cwdFacts as G,normalizeDenials as H,deriveOrphan as I,deriveStatus as J,summaryHead as K,failureFields as L,MODES as M,writeAcceptance as N,createMarker as O,PROVIDERS as P,jobsDir as Q,REASONS as R,STAGE_PROMPTS as S,parseWorkerIndex as T,normalizeContinuationKind as U,fileSig as V,WORKERS_DIR as W,JobWriter as X,effectiveUnrestricted as Y,newJobId$1 as Z,newWorkerId as _,MODE_PRESETS as a,humanDuration as a0,pipeEvents as a1,checksAbortRequested as a2,verdictBlock as a3,runAcceptance as a4,senderOf as a5,taskTitle as a6,markAcceptanceSuperseded as a7,pickHead as a8,compareTurnPriority as a9,computeStaleReads as aa,SMITH_PAYLOAD as ab,isForgeStatus as ac,noticeReason as ad,readJsonSafe as ae,pipelineRecordPath as af,workerIndexPath as ag,checksReason as ah,toolLabel as ai,inheritContinuedProviders as b,readPipeline as c,jobFile as d,readAcceptance as e,effectiveDefaultUnrestricted as f,findProvider as g,isWorkerIdle as h,isTerminalStatus as i,jobDir as j,isMode as k,cancelPipeline as l,missingPipelineError as m,isTerminalForgeStatus as n,readManifest as o,providerNames as p,ownerAlive as q,reasonFromText as r,startPipeline as s,getProvider as t,errMessage as u,validateSpec as v,probeAvailability as w,writeJsonAtomic as x,normalize as y,writeAtomic as z};

@@ -141,15 +141,24 @@ export function workerLivenessLine(job: RadarJob): WorkerLivenessLine | null {
   }
 }
 
-function changedFilesPhrase(job: RadarJob): string {
+export function changedFilesPhrase(job: RadarJob): string {
   const count = typeof job.changedFileCount === 'number' && job.changedFileCount > 0 ? job.changedFileCount
     : (job.progress && job.progress.editedCount > 0 ? job.progress.editedCount : 0);
   if (count <= 0) return '';
   return `${count} ${count === 1 ? 'file' : 'files'} ${job.changedFileCount === count ? 'changed' : 'edited'}`;
 }
+export function paneChecksLabel(acceptance?: RadarAcceptance): string {
+  if (!acceptance) return '';
+  if (acceptance.pending) return acceptance.running !== undefined && acceptance.running !== '' ? 'checks running' : '';
+  const failed = acceptance.checks.filter((check) => !check.ok);
+  if (failed.length > 0) return `✗ ${failed.map((check) => oneLine(check.name)).join(', ')}`;
+  if (acceptance.checks.length > 0) return `checks ${acceptance.checks.length}/${acceptance.checks.length}`;
+  return acceptance.state === 'rejected' ? 'checks failed' : '';
+}
+
 export function checksLabel(acceptance?: RadarAcceptance): string {
   if (!acceptance) return '';
-  if (acceptance.pending) return 'checking';
+  if (acceptance.pending) return acceptance.running !== undefined && acceptance.running !== '' ? 'checking' : '';
   const failed = acceptance.checks.filter((check) => !check.ok);
   if (failed.length > 0) return `✗ ${failed.map((check) => oneLine(check.name)).join(', ')}`;
   if (acceptance.checks.length > 0) return `checks ✓ ${acceptance.checks.length}/${acceptance.checks.length}`;

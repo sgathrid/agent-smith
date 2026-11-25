@@ -7,9 +7,45 @@ export const QUOTA_RE = /insufficient[_ ](?:quota|credits|balance)|quota (?:exce
 export const COMPATIBILITY_RE = /unknown (?:option|argument|flag)|unrecognized (?:option|argument|flag|subcommand)|unexpected argument|unsupported (?:option|flag)|invalid value.{0,80}(?:--model|--effort|reasoning_effort)|unknown model|does not support effort|bad flag or model/i;
 export const START_RE = /\bENOENT\b|spawn.{0,100}(?:not found|no such file)|couldn't start|could not start/i;
 export const ORPHAN_RE = /orphaned|supervisor process exited|server stopped/i;
-export const DENIED_RE = /\bdenied\b|soft-denied/i;
+export const DENIED_RE = /^(?:denied\b)|(?:soft|auto)-denied|permission check failed|user denied permission|denied permission to/i;
 export const STEER_NOT_APPLIED_RE = /^\d+ queued (?:steers?|follow-ups?|messages?) (?:not (?:applied|sent)|discarded)\b/i;
 export const NO_OUTPUT_RE = /no usable output|empty response|\bno output\b/i;
+
+export type FailureKind =
+  | 'serverStopped'
+  | 'denied'
+  | 'notLoggedIn'
+  | 'providerBusy'
+  | 'outOfCredits'
+  | 'rateLimited'
+  | 'badFlagOrModel'
+  | 'couldntStart'
+  | 'timedOut'
+  | 'networkError'
+  | 'noOutput';
+
+const FAILURE_PATTERNS: ReadonlyArray<readonly [FailureKind, RegExp]> = [
+  ['serverStopped', ORPHAN_RE],
+  ['denied', DENIED_RE],
+  ['notLoggedIn', AUTH_RE],
+  ['providerBusy', BUSY_RE],
+  ['outOfCredits', QUOTA_RE],
+  ['rateLimited', RATE_LIMIT_RE],
+  ['badFlagOrModel', COMPATIBILITY_RE],
+  ['couldntStart', START_RE],
+  ['timedOut', TIMEOUT_RE],
+  ['networkError', NETWORK_RE],
+  ['noOutput', NO_OUTPUT_RE],
+];
+
+export function classifyFailure(text: string | null | undefined): FailureKind | null {
+  const t = (text ?? '').trim();
+  if (t === '') return null;
+  for (const [kind, re] of FAILURE_PATTERNS) {
+    if (re.test(t)) return kind;
+  }
+  return null;
+}
 
 export const REASONS = {
   serverStopped: 'server stopped',
@@ -50,21 +86,13 @@ export function exitReason(code: number): string {
 export function reasonFromText(text: string | null | undefined): string {
   const t = (text ?? '').trim();
   if (t === '') return REASONS.workerError;
-  if (ORPHAN_RE.test(t)) return REASONS.serverStopped;
   if (/^denied(?: [^\n·]+)?$/.test(t) && t.length <= 64) return t;
-  if (DENIED_RE.test(t)) {
+  const kind = classifyFailure(t);
+  if (kind === 'denied') {
     const named = /\(([^()]{2,})\)/.exec(t)?.[1] ?? /\bdenied:? ([A-Za-z_][^·\n]*)/i.exec(t)?.[1] ?? '';
     return deniedReason(named.split(',').map((n) => n.replace(/\s*\+\d+$/, '')));
   }
-  if (NO_OUTPUT_RE.test(t)) return REASONS.noOutput;
-  if (TIMEOUT_RE.test(t)) return REASONS.timedOut;
-  if (AUTH_RE.test(t)) return REASONS.notLoggedIn;
-  if (BUSY_RE.test(t)) return REASONS.providerBusy;
-  if (QUOTA_RE.test(t)) return REASONS.outOfCredits;
-  if (RATE_LIMIT_RE.test(t)) return REASONS.rateLimited;
-  if (COMPATIBILITY_RE.test(t)) return REASONS.badFlagOrModel;
-  if (START_RE.test(t)) return REASONS.couldntStart;
-  if (NETWORK_RE.test(t)) return REASONS.networkError;
+  if (kind !== null) return REASONS[kind];
   if (/without (?:emitting )?a result|no result event|\bcrashed\b/i.test(t)) return REASONS.crashed;
   if (/preparation failed|setup failed/i.test(t)) return REASONS.setupFailed;
   if (/checks failed/i.test(t)) return t.split('\n')[0]!.slice(0, 48);

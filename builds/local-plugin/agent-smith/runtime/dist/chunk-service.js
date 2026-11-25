@@ -1,4 +1,4 @@
-import {n as readManifest,d as jobFile,F as FILES,o as ownerAlive,c as readPipeline,k as cancelPipeline,f as findProvider,p as providerNames,q as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,t as errMessage,P as PROVIDERS,u as probeAvailability,w as writeJsonAtomic,A as AgentSmithReader,x as normalize,y as writeAtomic,j as jobDir,z as SCHEMA_VERSION,B as validOwnerPid,l as isTerminalForgeStatus,C as reportFor,E as cwdFacts,G as normalizeDenials,H as deriveOrphan,I as deriveStatus,J as summaryHead,K as failureFields,R as REASONS,e as readAcceptance,L as writeAcceptance,N as createMarker,W as WORKERS_DIR,O as jobsDir,Q as parseWorkerIndex,T as normalizeContinuationKind,U as nextActionFor,V as fileSig,X as JobWriter,i as isTerminalStatus,h as isMode,Y as newJobId,Z as newWorkerId,_ as markAcceptancePending,$ as humanDuration,a0 as pipeEvents,a1 as checksAbortRequested,a2 as verdictBlock,a3 as runAcceptance,a4 as senderOf,a5 as taskTitle,a6 as markAcceptanceSuperseded,a7 as pickHead,g as isWorkerIdle,a8 as compareTurnPriority,a9 as computeStaleReads,aa as SMITH_PAYLOAD,ab as isForgeStatus}from'./chunk-normalize.js';import {existsSync,readFileSync,mkdirSync,appendFileSync,openSync,writeSync,closeSync,unlinkSync,statSync,renameSync,linkSync,readdirSync,realpathSync,lstatSync,copyFileSync}from'node:fs';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import path from'node:path';import {createHash}from'node:crypto';const LAUNCH_ACK_MS = 15_000;
+import {o as readManifest,d as jobFile,F as FILES,q as ownerAlive,c as readPipeline,l as cancelPipeline,g as findProvider,p as providerNames,t as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,u as errMessage,P as PROVIDERS,w as probeAvailability,x as writeJsonAtomic,A as AgentSmithReader,y as normalize,z as writeAtomic,j as jobDir,B as SCHEMA_VERSION,C as validOwnerPid,n as isTerminalForgeStatus,E as reportFor,G as cwdFacts,H as normalizeDenials,I as deriveOrphan,J as deriveStatus,K as summaryHead,L as failureFields,R as REASONS,e as readAcceptance,N as writeAcceptance,O as createMarker,W as WORKERS_DIR,Q as jobsDir,T as parseWorkerIndex,U as normalizeContinuationKind,V as fileSig,X as JobWriter,i as isTerminalStatus,k as isMode,Y as effectiveUnrestricted,Z as newJobId,_ as newWorkerId,$ as markAcceptancePending,a0 as humanDuration,a1 as pipeEvents,a2 as checksAbortRequested,a3 as verdictBlock,a4 as runAcceptance,a5 as senderOf,a6 as taskTitle,a7 as markAcceptanceSuperseded,a8 as pickHead,h as isWorkerIdle,a9 as compareTurnPriority,aa as computeStaleReads,ab as SMITH_PAYLOAD,ac as isForgeStatus}from'./chunk-normalize.js';import {existsSync,readFileSync,mkdirSync,appendFileSync,openSync,writeSync,closeSync,unlinkSync,statSync,renameSync,linkSync,readdirSync,realpathSync,lstatSync,copyFileSync}from'node:fs';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import path from'node:path';import {createHash}from'node:crypto';const LAUNCH_ACK_MS = 15_000;
 async function launch(url, payload, onPrepared) {
     const child = fork(fileURLToPath(url), [], {
         detached: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
@@ -257,7 +257,7 @@ async function validateModelAndEffort(provider, model, effort, getCatalog, unres
     }
     const effectiveEffort = provider.supportsEffort === false ? undefined : effort;
     if (effort !== undefined && provider.supportsEffort === false) {
-        warnings.push(`${provider.name} has no per-run effort flag; effort "${effort}" was ignored. Set [thinking].effort or a model alias default_effort in config.toml.`);
+        warnings.push(`${provider.name} has no per-run effort flag; effort "${effort}" was ignored.`);
     }
     if ((model !== undefined || effectiveEffort !== undefined) && getCatalog !== undefined) {
         warnings.push(...checkAgainstCatalog(provider.name, model, effectiveEffort, await getCatalog()));
@@ -1281,17 +1281,7 @@ class WorkerIndexStore {
         status: observed.status,
         provider: typeof raw['provider'] === 'string' ? raw['provider'] : observed.label,
         unrestricted: raw['unrestricted'] === true,
-        nextAction: nextActionFor({
-            status: observed.status,
-            jobStatus: typeof raw['job_status'] === 'string' ? raw['job_status'] : null,
-            error: [typeof raw['error'] === 'string' ? raw['error'] : '', ...observed.warnings.map((w) => w.message)].join(' — '),
-            report: observed.output,
-            exitCode: typeof raw['exit_code'] === 'number' ? raw['exit_code'] : null,
-            deniedCount: Array.isArray(raw['denied_actions']) ? raw['denied_actions'].length : 0,
-            unrestricted: raw['unrestricted'] === true,
-            steerNotApplied: observed.warnings.some((w) => w.code === 'steer_not_applied'),
-            failedEarly: raw['failedEarly'] === true,
-        }),
+        resumable: typeof raw['conversation'] === 'string' && raw['conversation'] !== '',
         mode: observed.mode,
         model: observed.model,
         task,
@@ -1506,7 +1496,7 @@ function mergeOverrides(entries) {
 function applyOverrides(spec, o, provider) {
     if (Object.keys(o).length === 0)
         return spec;
-    const unrestricted = o.unrestricted === undefined ? spec.unrestricted : provider.defaultUnrestricted === 'always' ? true : o.unrestricted;
+    const unrestricted = effectiveUnrestricted(provider, o.unrestricted === undefined ? spec.unrestricted : o.unrestricted);
     return {
         ...spec,
         ...(o.model === undefined ? {} : { model: o.model, modelRequested: o.model, modelResolved: o.model, modelSource: 'requested' }),
@@ -1683,9 +1673,7 @@ class ForgeService {
         const envKeys = env === undefined ? [] : Object.keys(env);
         const cwd = request.cwd ?? this.repo;
         const unrestrictedRequested = request.unrestricted;
-        const unrestricted = provider.defaultUnrestricted === 'always'
-            ? true
-            : unrestrictedRequested ?? (provider.defaultUnrestricted === true && process.env['AGENT_SMITH_AGY_RESTRICTED'] !== '1');
+        const unrestricted = effectiveUnrestricted(provider, unrestrictedRequested);
         const warnings = [];
         const checked = await validateModelAndEffort(provider, request.model, request.effort, request.lockHeldByCaller === true ? undefined : () => this.catalogFor(provider.name), unrestrictedRequested);
         const effort = checked.effort;
@@ -2631,6 +2619,11 @@ class ForgeService {
                 throw new Error(`Cannot interrupt "${name}" (${headId}): no resumable conversation handle exists yet, so interrupting now would discard in-flight context and start fresh. Wait for a conversation ID, use follow_up, or pass allowFresh: true.`);
             }
         }
+        const provider = this.providerSafe(head.provider);
+        if (provider !== null) {
+            const checked = await validateModelAndEffort(provider, entry.overrides?.model, entry.overrides?.effort, checkCatalog ? async () => catalog : undefined, entry.overrides?.unrestricted);
+            warnings.push(...checked.warnings);
+        }
         const checksRunning = !running && this.checksPending(headId);
         appendSteerEntry(this.repo, headId, entry);
         const at = entry.createdAt;
@@ -2658,11 +2651,6 @@ class ForgeService {
             this.setSettledPending(headId, pending);
         const workerId = head.workerId ?? headId;
         const { ack: envAck } = this.resolveFollowUpEnv(workerId, headId, env, true, warnings);
-        const provider = this.providerSafe(head.provider);
-        if (provider !== null) {
-            const checked = await validateModelAndEffort(provider, entry.overrides?.model, entry.overrides?.effort, checkCatalog ? async () => catalog : undefined, entry.overrides?.unrestricted);
-            warnings.push(...checked.warnings);
-        }
         const canDeliverLive = running
             && provider?.liveInput === true
             && !live?.interruptRequested
@@ -2739,7 +2727,7 @@ class ForgeService {
         const runEnv = Object.keys(known).length > 0 ? known : undefined;
         const missing = this.envKeysOf(headId).filter((k) => !(k in known));
         if (missing.length > 0)
-            warnings.push(`env ${missing.join(', ')} not set: values live only in memory and were lost; pass env again.`);
+            warnings.push(`env ${missing.join(', ')} not set: values live only in memory and were lost.`);
         const ack = missing.length > 0 ? { env: 'dropped', envKeys: missing }
             : passed ? { env: 'set' } : runEnv !== undefined ? { env: 'kept' } : {};
         return { ack, ...(runEnv === undefined ? {} : { runEnv }) };
@@ -2884,11 +2872,9 @@ class ForgeService {
             const workerId = m?.workerId ?? trimmed;
             return this.workerHeadId(workerId) ?? this.resolveTurn(trimmed);
         }
-        if (this.isSafeJobId(trimmed)) {
-            const byWorkerId = this.workerHeadId(trimmed);
-            if (byWorkerId !== null)
-                return byWorkerId;
-        }
+        const byWorkerId = this.workerHeadId(trimmed);
+        if (byWorkerId !== null)
+            return byWorkerId;
         return this.resolveName(trimmed);
     }
     resolveName(name) {
