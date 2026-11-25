@@ -1,4 +1,4 @@
-import {l as readManifest,d as jobFile,F as FILES,o as ownerAlive,c as readPipeline,h as cancelPipeline,P as PROVIDERS,n as errMessage,q as findProvider,w as writeJsonAtomic,A as AgentSmithReader,t as normalize,u as writeAtomic,j as jobDir,x as SCHEMA_VERSION,y as validOwnerPid,k as isTerminalForgeStatus,z as reportFor,B as cwdFacts,C as normalizeDenials,E as deriveOrphan,G as deriveStatus,H as summaryTail,I as failureFields,R as REASONS,e as readAcceptance,J as writeAcceptance,K as createMarker,W as WORKERS_DIR,L as jobsDir,N as parseWorkerIndex,p as providerNames,O as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,Q as normalizeContinuationKind,T as nextActionFor,U as fileSig,V as JobWriter,i as isTerminalStatus,g as isMode,X as newJobId,Y as markAcceptancePending,Z as humanDuration,_ as pipeEvents,$ as checksAbortRequested,a0 as verdictBlock,a1 as runAcceptance,a2 as senderOf,a3 as markAcceptanceSuperseded,a4 as pickHead,f as isWorkerIdle,a5 as compareTurnPriority,a6 as computeStaleReads,a7 as SMITH_PAYLOAD,a8 as isForgeStatus}from'./chunk-normalize.js';import {existsSync,readFileSync,mkdirSync,appendFileSync,openSync,writeSync,closeSync,unlinkSync,statSync,renameSync,linkSync,readdirSync,realpathSync,lstatSync,copyFileSync}from'node:fs';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import path from'node:path';import {createHash}from'node:crypto';const LAUNCH_ACK_MS = 15_000;
+import {l as readManifest,d as jobFile,F as FILES,o as ownerAlive,c as readPipeline,h as cancelPipeline,n as findProvider,p as providerNames,q as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,P as PROVIDERS,t as errMessage,w as writeJsonAtomic,A as AgentSmithReader,u as normalize,x as writeAtomic,j as jobDir,y as SCHEMA_VERSION,z as validOwnerPid,k as isTerminalForgeStatus,B as reportFor,C as cwdFacts,E as normalizeDenials,G as deriveOrphan,H as deriveStatus,I as summaryTail,J as failureFields,R as REASONS,e as readAcceptance,K as writeAcceptance,L as createMarker,W as WORKERS_DIR,N as jobsDir,O as parseWorkerIndex,Q as normalizeContinuationKind,T as nextActionFor,U as fileSig,V as JobWriter,i as isTerminalStatus,g as isMode,X as newJobId,Y as markAcceptancePending,Z as humanDuration,_ as pipeEvents,$ as checksAbortRequested,a0 as verdictBlock,a1 as runAcceptance,a2 as senderOf,a3 as markAcceptanceSuperseded,a4 as pickHead,f as isWorkerIdle,a5 as compareTurnPriority,a6 as computeStaleReads,a7 as SMITH_PAYLOAD,a8 as isForgeStatus}from'./chunk-normalize.js';import {existsSync,readFileSync,mkdirSync,appendFileSync,openSync,writeSync,closeSync,unlinkSync,statSync,renameSync,linkSync,readdirSync,realpathSync,lstatSync,copyFileSync}from'node:fs';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import path from'node:path';import {createHash}from'node:crypto';const LAUNCH_ACK_MS = 15_000;
 async function launch(url, payload, onPrepared) {
     const child = fork(fileURLToPath(url), [], {
         detached: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
@@ -184,6 +184,115 @@ function validateEnv(raw, label = 'env') {
         out[key] = value;
     }
     return out;
+}const MIN_TIMEOUT_MS = 1_000;
+const MAX_TIMEOUT_MS = 6 * 60 * 60_000;
+function resolveTimeoutMs(ms) {
+    if (ms === undefined)
+        return DEFAULT_TIMEOUT_MS$1;
+    if (!Number.isFinite(ms) || ms <= 0) {
+        throw new RangeError(`timeoutMs must be a positive finite number, got ${ms}`);
+    }
+    return Math.min(MAX_TIMEOUT_MS, Math.max(MIN_TIMEOUT_MS, Math.floor(ms)));
+}
+function requireProvider(name) {
+    if (findProvider(name) === undefined) {
+        throw new Error(`unknown provider "${name}". Known providers: ${providerNames().join(', ')}.`);
+    }
+    return getProvider(name);
+}
+function modeError(mode) {
+    const lines = MODES.map((m) => `  ${m}: ${MODE_PRESETS[m].description}`).join('\n');
+    return new Error(`${mode === '' ? 'mode is required' : `unknown mode "${mode}"`}. Valid modes:\n${lines}`);
+}
+const ENV_KEYS_FILE = 'env-keys.json';
+const AGY_EFFORT_SUFFIX = /-(low|medium|high)$/;
+function checkAgainstCatalog(provider, model, effort, catalog) {
+    const warnings = [];
+    if (model === undefined && effort === undefined)
+        return warnings;
+    const fresh = catalog !== undefined &&
+        !catalog.stale &&
+        catalog.error === undefined &&
+        catalog.verified !== false &&
+        catalog.source !== 'static' &&
+        catalog.models.length > 0;
+    if (!fresh) {
+        const why = catalog === undefined
+            ? 'no catalog available'
+            : catalog.error !== undefined
+                ? `catalog error: ${catalog.error}`
+                : catalog.stale
+                    ? 'catalog is stale'
+                    : catalog.models.length === 0
+                        ? 'catalog is empty'
+                        : catalog.source === 'static'
+                            ? 'catalog is a static alias list; full model names are also valid'
+                            : 'catalog is unverified';
+        warnings.push(`could not verify ${[model === undefined ? '' : `model "${model}"`, effort === undefined ? '' : `effort "${effort}"`].filter(Boolean).join(' / ')} for ${provider} (${why}); passing it through unchecked.`);
+        return warnings;
+    }
+    const ids = catalog.models.map((m) => m.id);
+    let match = model === undefined ? undefined : catalog.models.find((m) => m.id === model);
+    if (model !== undefined && match === undefined && provider === 'agy') {
+        const base = model.replace(AGY_EFFORT_SUFFIX, '');
+        if (base !== model)
+            match = catalog.models.find((m) => m.id === base);
+    }
+    if (model !== undefined && match === undefined) {
+        throw new Error(`unknown model "${model}" for ${provider}. Valid model ids: ${ids.join(', ')}.`);
+    }
+    if (effort !== undefined) {
+        const target = match ?? (catalog.defaultModel === undefined ? undefined : catalog.models.find((m) => m.id === catalog.defaultModel));
+        const efforts = Array.isArray(target?.efforts) ? target.efforts : [];
+        if (target !== undefined && efforts.length > 0 && !efforts.includes(effort)) {
+            throw new Error(`effort "${effort}" is not valid for ${provider} model "${target.id}". Valid efforts: ${efforts.join(', ')}.`);
+        }
+    }
+    return warnings;
+}
+async function validateModelAndEffort(provider, model, effort, getCatalog) {
+    const warnings = [];
+    const effectiveEffort = provider.supportsEffort === false ? undefined : effort;
+    if (effort !== undefined && provider.supportsEffort === false) {
+        warnings.push(`${provider.name} has no per-run effort flag; effort "${effort}" was ignored. Set [thinking].effort or a model alias default_effort in config.toml.`);
+    }
+    if ((model !== undefined || effectiveEffort !== undefined) && getCatalog !== undefined) {
+        warnings.push(...checkAgainstCatalog(provider.name, model, effectiveEffort, await getCatalog()));
+    }
+    return { effort: effectiveEffort, warnings };
+}
+function turnStartInput(provider, spec, turn) {
+    return {
+        name: spec.name,
+        workerId: spec.workerId,
+        task: turn.task,
+        provider,
+        mode: spec.mode,
+        model: spec.model ?? null,
+        effort: spec.effort ?? null,
+        cwd: spec.cwd,
+        prompt: turn.prompt,
+        ...(turn.preamble === undefined ? {} : { preamble: turn.preamble }),
+        unrestricted: spec.unrestricted,
+        conversation: turn.conversation,
+        timeoutMs: spec.timeoutMs,
+        pipeline: spec.pipeline,
+        stage: spec.stage,
+        attempt: spec.attempt,
+        modelRequested: spec.modelRequested,
+        modelResolved: spec.modelResolved,
+        modelSource: spec.modelSource,
+        preambleApplied: turn.preambleApplied,
+        sandbox: spec.sandbox,
+        sandboxFlags: [...spec.sandboxFlags],
+        readOnlyRequested: spec.readOnlyRequested,
+        readOnlyEnforced: spec.readOnlyEnforced,
+        ...(turn.turn === undefined ? {} : { turn: turn.turn }),
+        ...(turn.continuedFrom === undefined ? {} : { continuedFrom: turn.continuedFrom }),
+        ...(turn.continuationKind === undefined ? {} : { continuationKind: turn.continuationKind }),
+        ...(turn.chainStartedAt === undefined ? {} : { chainStartedAt: turn.chainStartedAt }),
+        ...(turn.watchedFiles === undefined ? {} : { watchedFiles: turn.watchedFiles }),
+    };
 }/**
  * providers/catalog.ts — cached model discovery across providers.
  *
@@ -1147,104 +1256,6 @@ class WorkerIndexStore {
     workerOf(jobId) {
         return this.jobWorker.get(jobId);
     }
-}const MIN_TIMEOUT_MS = 1_000;
-const MAX_TIMEOUT_MS = 6 * 60 * 60_000;
-function resolveTimeoutMs(ms) {
-    if (ms === undefined)
-        return DEFAULT_TIMEOUT_MS$1;
-    if (!Number.isFinite(ms) || ms <= 0) {
-        throw new RangeError(`timeoutMs must be a positive finite number, got ${ms}`);
-    }
-    return Math.min(MAX_TIMEOUT_MS, Math.max(MIN_TIMEOUT_MS, Math.floor(ms)));
-}
-function requireProvider(name) {
-    if (findProvider(name) === undefined) {
-        throw new Error(`unknown provider "${name}". Known providers: ${providerNames().join(', ')}.`);
-    }
-    return getProvider(name);
-}
-function modeError(mode) {
-    const lines = MODES.map((m) => `  ${m}: ${MODE_PRESETS[m].description}`).join('\n');
-    return new Error(`${mode === '' ? 'mode is required' : `unknown mode "${mode}"`}. Valid modes:\n${lines}`);
-}
-const ENV_KEYS_FILE = 'env-keys.json';
-const AGY_EFFORT_SUFFIX = /-(low|medium|high)$/;
-function checkAgainstCatalog(provider, model, effort, catalog) {
-    const warnings = [];
-    if (model === undefined && effort === undefined)
-        return warnings;
-    const fresh = catalog !== undefined &&
-        !catalog.stale &&
-        catalog.error === undefined &&
-        catalog.verified !== false &&
-        catalog.source !== 'static' &&
-        catalog.models.length > 0;
-    if (!fresh) {
-        const why = catalog === undefined
-            ? 'no catalog available'
-            : catalog.error !== undefined
-                ? `catalog error: ${catalog.error}`
-                : catalog.stale
-                    ? 'catalog is stale'
-                    : catalog.models.length === 0
-                        ? 'catalog is empty'
-                        : catalog.source === 'static'
-                            ? 'catalog is a static alias list; full model names are also valid'
-                            : 'catalog is unverified';
-        warnings.push(`could not verify ${[model === undefined ? '' : `model "${model}"`, effort === undefined ? '' : `effort "${effort}"`].filter(Boolean).join(' / ')} for ${provider} (${why}); passing it through unchecked.`);
-        return warnings;
-    }
-    const ids = catalog.models.map((m) => m.id);
-    let match = model === undefined ? undefined : catalog.models.find((m) => m.id === model);
-    if (model !== undefined && match === undefined && provider === 'agy') {
-        const base = model.replace(AGY_EFFORT_SUFFIX, '');
-        if (base !== model)
-            match = catalog.models.find((m) => m.id === base);
-    }
-    if (model !== undefined && match === undefined) {
-        throw new Error(`unknown model "${model}" for ${provider}. Valid model ids: ${ids.join(', ')}.`);
-    }
-    if (effort !== undefined) {
-        const target = match ?? (catalog.defaultModel === undefined ? undefined : catalog.models.find((m) => m.id === catalog.defaultModel));
-        const efforts = Array.isArray(target?.efforts) ? target.efforts : [];
-        if (target !== undefined && efforts.length > 0 && !efforts.includes(effort)) {
-            throw new Error(`effort "${effort}" is not valid for ${provider} model "${target.id}". Valid efforts: ${efforts.join(', ')}.`);
-        }
-    }
-    return warnings;
-}
-function turnStartInput(provider, spec, turn) {
-    return {
-        name: spec.name,
-        workerId: spec.workerId,
-        task: turn.task,
-        provider,
-        mode: spec.mode,
-        model: spec.model ?? null,
-        effort: spec.effort ?? null,
-        cwd: spec.cwd,
-        prompt: turn.prompt,
-        ...(turn.preamble === undefined ? {} : { preamble: turn.preamble }),
-        unrestricted: spec.unrestricted,
-        conversation: turn.conversation,
-        timeoutMs: spec.timeoutMs,
-        pipeline: spec.pipeline,
-        stage: spec.stage,
-        attempt: spec.attempt,
-        modelRequested: spec.modelRequested,
-        modelResolved: spec.modelResolved,
-        modelSource: spec.modelSource,
-        preambleApplied: turn.preambleApplied,
-        sandbox: spec.sandbox,
-        sandboxFlags: [...spec.sandboxFlags],
-        readOnlyRequested: spec.readOnlyRequested,
-        readOnlyEnforced: spec.readOnlyEnforced,
-        ...(turn.turn === undefined ? {} : { turn: turn.turn }),
-        ...(turn.continuedFrom === undefined ? {} : { continuedFrom: turn.continuedFrom }),
-        ...(turn.continuationKind === undefined ? {} : { continuationKind: turn.continuationKind }),
-        ...(turn.chainStartedAt === undefined ? {} : { chainStartedAt: turn.chainStartedAt }),
-        ...(turn.watchedFiles === undefined ? {} : { watchedFiles: turn.watchedFiles }),
-    };
 }function toSummary(observed) {
     const raw = observed.raw;
     const toolCalls = typeof raw['tool_calls'] === 'number' ? raw['tool_calls'] : null;
@@ -1564,7 +1575,7 @@ class ForgeService {
         });
     }
     assertNameFree(name, workerId) {
-        const busy = (jobId) => new Error(`"${name}" is busy (${jobId}); use follow_up to message it, wait, cancel, or use another name.`);
+        const busy = (jobId) => new Error(`"${name}" is busy: turn ${jobId} is running.`);
         const canonicalConflict = this.findActiveIdentity(name, workerId);
         if (canonicalConflict !== null)
             throw busy(canonicalConflict.jobId);
@@ -1681,13 +1692,9 @@ class ForgeService {
         if (unrestrictedRequested === false && provider.name === 'kimi') {
             warnings.push('kimi print mode force-sets the auto permission policy; unrestricted:false cannot restrict it. The ack and job.json record the effective posture.');
         }
-        const effort = provider.supportsEffort === false ? undefined : request.effort;
-        if (request.effort !== undefined && provider.supportsEffort === false) {
-            warnings.push(`kimi has no per-run effort flag; effort "${request.effort}" was ignored. Set [thinking].effort or a model alias default_effort in config.toml.`);
-        }
-        if ((request.model !== undefined || effort !== undefined) && request.lockHeldByCaller !== true) {
-            warnings.push(...checkAgainstCatalog(provider.name, request.model, effort, await this.catalogFor(provider.name)));
-        }
+        const checked = await validateModelAndEffort(provider, request.model, request.effort, request.lockHeldByCaller === true ? undefined : () => this.catalogFor(provider.name));
+        const effort = checked.effort;
+        warnings.push(...checked.warnings);
         let modelResolved = request.model ?? null;
         let modelSource = request.model === undefined ? 'unknown' : 'requested';
         if (request.model === undefined) {
@@ -2536,15 +2543,15 @@ class ForgeService {
         return this.numberedDetail(headId);
     }
     notFound(id) {
-        return new Error(`No worker "${id}"; see list_jobs.`);
+        return new Error(`No worker "${id}".`);
     }
-    rejectPipelineRun(ref, guidance) {
+    rejectPipelineRun(ref) {
         if (readPipeline(this.repo, ref) !== null) {
-            throw new Error(`"${ref}" is a pipeline run; ${guidance}`);
+            throw new Error(`"${ref}" is a pipeline run, not a worker.`);
         }
     }
     messageHead(ref) {
-        this.rejectPipelineRun(ref, 'follow_up and steer apply to workers, not runs.');
+        this.rejectPipelineRun(ref);
         let headId;
         try {
             headId = this.resolveWorkerHeadId(ref);
@@ -2860,7 +2867,7 @@ class ForgeService {
         const trimmed = ref.trim();
         if (trimmed === '')
             throw new WorkerLookupError('worker is empty; pass a worker name, workerId or jobId.', 'missing');
-        this.rejectPipelineRun(trimmed, 'call pipeline_status.');
+        this.rejectPipelineRun(trimmed);
         this.workers.refresh();
         if (this.isJobId(trimmed)) {
             const m = this.readManifestRaw(trimmed);
@@ -3138,4 +3145,4 @@ function describe(err) {
     if (err instanceof Error)
         return err.message;
     return String(err);
-}export{EFFORTS as E,ForgeService as F,MAX_WATCHED_FILES as M,getInstalledProviders as a,getCatalogs as g,launchPipeline as l,validateEnv as v};
+}export{EFFORTS as E,ForgeService as F,MAX_WATCHED_FILES as M,validateModelAndEffort as a,getInstalledProviders as b,getCatalogs as g,launchPipeline as l,requireProvider as r,validateEnv as v};
