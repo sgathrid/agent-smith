@@ -2513,6 +2513,8 @@ function recoveredNotice(final, resultEvent) {
 }
 function createAgyTranslator(maxChars) {
     const steps = new Map();
+    const stepProse = new Map();
+    let lastProseStep;
     /** Set by any denial signal; carried into JobResult. */
     const denials = [];
     // agy's final status repeats the conversation's last error, even one it
@@ -2564,6 +2566,8 @@ function createAgyTranslator(maxChars) {
             if (stepType === 'agent_response') {
                 const delta = su.text_delta;
                 if (delta !== undefined && delta !== '') {
+                    stepProse.set(stepIndex, (stepProse.get(stepIndex) ?? '') + delta);
+                    lastProseStep = stepIndex;
                     // agy streams prose as many small text_delta slices. We forward each
                     // one rather than buffering: the mod surface renders incrementally and
                     // a long answer would otherwise be invisible for minutes.
@@ -2660,6 +2664,7 @@ function createAgyTranslator(maxChars) {
         denials,
         stepsWereTools: () => [...steps.values()].some((m) => m.tool !== undefined),
         errorIsStale,
+        finalText: () => (lastProseStep === undefined ? undefined : stepProse.get(lastProseStep)),
     };
 }
 // ---------------------------------------------------------------------------
@@ -2669,7 +2674,7 @@ function buildResult$4(args) {
     const { jobId, resultEvent, exit, startedAtMs, stateDir, denials, sawAnyToolCall } = args;
     const { errorIsStale } = args;
     const durationMs = Date.now() - startedAtMs;
-    const response = resultEvent?.response ?? '';
+    const response = args.finalText ?? resultEvent?.response ?? '';
     const reportedStatus = resultEvent?.status;
     const usage = toTokenUsage$4(resultEvent?.usage);
     // Normalize agy's denied_actions into our shape. Present-but-empty is the
@@ -2820,6 +2825,7 @@ async function listAgyModels(run, options) {
 }
 const agyProvider = {
     name: 'agy',
+    defaultUnrestricted: true,
     /**
      * PATH probe only. We deliberately do NOT run `agy models` here: available()
      * is called for every provider on every startup and a network-touching probe
@@ -2858,6 +2864,7 @@ const agyProvider = {
                 denials: translator.denials,
                 sawAnyToolCall: translator.stepsWereTools(),
                 errorIsStale: translator.errorIsStale(),
+                finalText: translator.finalText(),
             }),
             afterResult(final) {
                 const recovered = recoveredNotice(final, resultEvent);
@@ -3399,6 +3406,7 @@ function claudeHarnessDefaults(home = claudeHome()) {
 const claudeProvider = {
     harnessDefaults: () => claudeHarnessDefaults(),
     name: 'claude',
+    defaultUnrestricted: false,
     available: () => binaryAvailable(claudeBinary()),
     describeSandbox: sandboxPlan$3,
     listModels: (options) => listClaudeModels(),
@@ -3793,9 +3801,7 @@ function createCodexTranslator(maxChars) {
             if (itemType === 'agent_message') {
                 const text = str(item, 'text');
                 if (text !== undefined && text !== '') {
-                    if (state.finalText !== '')
-                        state.finalText += '\n';
-                    state.finalText += text;
+                    state.finalText = text;
                     out.push({ kind: 'text', at, text, stream: 'assistant' });
                 }
                 return out;
@@ -4081,6 +4087,7 @@ function codexStderrLevel(text) {
 }
 const codexProvider = {
     name: 'codex',
+    defaultUnrestricted: false,
     harnessDefaults: () => codexHarnessDefaults(),
     available: () => binaryAvailable(codexBinary()),
     describeSandbox: sandboxPlan$2,
@@ -4284,9 +4291,7 @@ function createKimiTranslator(maxChars) {
         if (role === 'assistant') {
             const content = str(raw, 'content');
             if (content !== undefined && content !== '') {
-                if (tx.finalText !== '')
-                    tx.finalText += '\n';
-                tx.finalText += content;
+                tx.finalText = content;
                 out.push({ kind: 'text', at, text: content, stream: 'assistant' });
             }
             const calls = raw['tool_calls'];
@@ -4500,6 +4505,7 @@ function kimiHarnessDefaults(home = kimiHome()) {
 const kimiProvider = {
     name: 'kimi',
     supportsEffort: false,
+    defaultUnrestricted: 'always',
     harnessDefaults: () => kimiHarnessDefaults(),
     available: () => binaryAvailable(kimiBinary()),
     describeSandbox: sandboxPlan$1,
@@ -4831,6 +4837,7 @@ function createOpencodeTranslator(maxChars) {
         onEvent: () => [],
     };
     let step = 0;
+    let resetOnNextText = false;
     /** partID -> stepIndex */
     const partStep = new Map();
     const translate = (raw) => {
@@ -4920,6 +4927,7 @@ function createOpencodeTranslator(maxChars) {
             deepString(raw, ['callID', 'callId', 'id', 'partID', 'partId']) ??
             `anon-${step}`;
         if (toolName !== undefined && (stateWord !== '' || isToolType)) {
+            resetOnNextText = true;
             const isDone = DONE_WORDS.has(stateWord) || type.endsWith('.completed') || type.endsWith('.done');
             const isErr = ERROR_WORDS.has(stateWord) || type.endsWith('.error');
             const errorTexts = [
@@ -5005,6 +5013,10 @@ function createOpencodeTranslator(maxChars) {
         const isThinking = type.includes('thinking') || type.includes('reasoning');
         if (text !== undefined && text !== '') {
             if (!isThinking) {
+                if (resetOnNextText) {
+                    tx.finalText = '';
+                    resetOnNextText = false;
+                }
                 if (tx.finalText !== '')
                     tx.finalText += '\n';
                 tx.finalText += text;
@@ -5019,6 +5031,8 @@ function createOpencodeTranslator(maxChars) {
         // nothing else a reader needs per step, so they are silent: one info notice
         // per step would bury real warnings under hundreds of lines of noise.
         if (isStepStart || isStepFinish) {
+            if (isStepStart)
+                resetOnNextText = true;
             // Verified in the installed OpenCode CLI: session.step.ended emits
             // step_finish with part.reason = data.finish. Tool-call/length finishes
             // end only a step; "stop" confirms the assistant finished normally.
@@ -5193,6 +5207,7 @@ async function listOpencodeModels(run, options) {
 }
 const opencodeProvider = {
     name: 'opencode',
+    defaultUnrestricted: false,
     available: () => binaryAvailable(opencodeBinary()),
     describeSandbox: sandboxPlan,
     listModels: (options) => listOpencodeModels(runCapture, options),
@@ -5273,6 +5288,50 @@ function getProvider(name) {
 /** Non-throwing lookup, for config validation that wants to report rather than raise. */
 function findProvider(name) {
     return BY_NAME.get(name);
+}
+async function probeAvailability(providers = PROVIDERS) {
+    return Promise.all(providers.map(async (p) => {
+        const binary = binaryFor(p.name);
+        try {
+            const ok = await p.available();
+            return { provider: p, name: p.name, status: ok ? 'installed' : 'not-installed', binary };
+        }
+        catch (err) {
+            return {
+                provider: p,
+                name: p.name,
+                status: 'failed',
+                binary,
+                reason: errMessage(err),
+            };
+        }
+    }));
+}
+// ---------------------------------------------------------------------------
+// Binary resolution (for display and for the mod's "not installed" hint)
+// ---------------------------------------------------------------------------
+/**
+ * The binary name/path a provider will actually exec.
+ *
+ * Each adapter honours an AGENT_SMITH_<NAME>_BIN override so an operator can
+ * point at a non-PATH install without editing code. Surfaced here so the
+ * "provider not found" message tells you which command was looked for.
+ */
+function binaryFor(providerName) {
+    switch (providerName) {
+        case 'agy':
+            return agyBinary();
+        case 'codex':
+            return codexBinary();
+        case 'opencode':
+            return opencodeBinary();
+        case 'claude':
+            return claudeBinary();
+        case 'kimi':
+            return kimiBinary();
+        default:
+            return providerName;
+    }
 }/**
  * atomic.ts — the write primitives the state format depends on.
  *
@@ -8340,4 +8399,4 @@ function asUsage(v) {
 /** Normalize a raw agent-smith job snapshot. */
 function normalize(raw) {
     return smithNormalizer(raw);
-}export{checksAbortRequested as $,AgentSmithReader as A,reportFor as B,cwdFacts as C,DEFAULT_TIMEOUT_MS as D,normalizeDenials as E,FILES as F,deriveOrphan as G,deriveStatus as H,summaryTail as I,failureFields as J,writeAcceptance as K,createMarker as L,MODES as M,jobsDir as N,parseWorkerIndex as O,PROVIDERS as P,normalizeContinuationKind as Q,REASONS as R,STAGE_PROMPTS as S,nextActionFor as T,fileSig as U,JobWriter as V,WORKERS_DIR as W,newJobId$1 as X,markAcceptancePending as Y,humanDuration as Z,pipeEvents as _,MODE_PRESETS as a,verdictBlock as a0,runAcceptance as a1,senderOf as a2,taskTitle as a3,markAcceptanceSuperseded as a4,pickHead as a5,compareTurnPriority as a6,computeStaleReads as a7,SMITH_PAYLOAD as a8,isForgeStatus as a9,readJsonSafe as aa,pipelineRecordPath as ab,workerIndexPath as ac,checksReason as ad,toolLabel as ae,inheritContinuedProviders as b,readPipeline as c,jobFile as d,readAcceptance as e,isWorkerIdle as f,isMode as g,cancelPipeline as h,isTerminalStatus as i,jobDir as j,isTerminalForgeStatus as k,readManifest as l,missingPipelineError as m,findProvider as n,ownerAlive as o,providerNames as p,getProvider as q,reasonFromText as r,startPipeline as s,errMessage as t,normalize as u,validateSpec as v,writeJsonAtomic as w,writeAtomic as x,SCHEMA_VERSION as y,validOwnerPid as z};
+}export{pipeEvents as $,AgentSmithReader as A,validOwnerPid as B,reportFor as C,DEFAULT_TIMEOUT_MS as D,cwdFacts as E,FILES as F,normalizeDenials as G,deriveOrphan as H,deriveStatus as I,summaryTail as J,failureFields as K,writeAcceptance as L,MODES as M,createMarker as N,jobsDir as O,PROVIDERS as P,parseWorkerIndex as Q,REASONS as R,STAGE_PROMPTS as S,normalizeContinuationKind as T,nextActionFor as U,fileSig as V,WORKERS_DIR as W,JobWriter as X,newJobId$1 as Y,markAcceptancePending as Z,humanDuration as _,MODE_PRESETS as a,checksAbortRequested as a0,verdictBlock as a1,runAcceptance as a2,senderOf as a3,taskTitle as a4,markAcceptanceSuperseded as a5,pickHead as a6,compareTurnPriority as a7,computeStaleReads as a8,SMITH_PAYLOAD as a9,isForgeStatus as aa,readJsonSafe as ab,pipelineRecordPath as ac,workerIndexPath as ad,checksReason as ae,toolLabel as af,inheritContinuedProviders as b,readPipeline as c,jobFile as d,readAcceptance as e,findProvider as f,isWorkerIdle as g,isMode as h,isTerminalStatus as i,jobDir as j,cancelPipeline as k,isTerminalForgeStatus as l,missingPipelineError as m,readManifest as n,ownerAlive as o,providerNames as p,getProvider as q,reasonFromText as r,startPipeline as s,errMessage as t,probeAvailability as u,validateSpec as v,writeJsonAtomic as w,normalize as x,writeAtomic as y,SCHEMA_VERSION as z};

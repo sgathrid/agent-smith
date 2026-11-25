@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import process$1 from'node:process';import {randomUUID,randomBytes}from'node:crypto';import {readFileSync,existsSync,statSync,rmSync,writeFileSync,mkdirSync,linkSync,unlinkSync,renameSync,readdirSync}from'node:fs';import path from'node:path';import {l as livenessOf,L as LIVENESS_STATES,w as waitForChange,c as claimMarkerPath}from'./chunk-stale.js';import {E as EFFORTS$1,M as MAX_WATCHED_FILES,v as validateEnv,g as getCatalogs,l as launchPipeline,r as requireProvider,a as validateModelAndEffort,b as getInstalledProviders,F as ForgeService}from'./chunk-service.js';import {i as isTerminalStatus,r as reasonFromText,M as MODES$1,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS,b as inheritContinuedProviders,S as STAGE_PROMPTS,v as validateSpec,s as startPipeline,c as readPipeline,m as missingPipelineError,j as jobDir,d as jobFile,F as FILES,e as readAcceptance,f as isWorkerIdle,p as providerNames,g as isMode,h as cancelPipeline,k as isTerminalForgeStatus}from'./chunk-normalize.js';import os from'node:os';import {execFile}from'node:child_process';import'node:url';import'node:timers/promises';import'node:fs/promises';import'node:readline';//#region rolldown:runtime
+import process$1 from'node:process';import {randomUUID,randomBytes}from'node:crypto';import {readFileSync,existsSync,statSync,rmSync,writeFileSync,mkdirSync,linkSync,unlinkSync,renameSync,readdirSync}from'node:fs';import path from'node:path';import {l as livenessOf,L as LIVENESS_STATES,w as waitForChange,c as claimMarkerPath}from'./chunk-stale.js';import {E as EFFORTS$1,M as MAX_WATCHED_FILES,v as validateEnv,g as getCatalogs,l as launchPipeline,r as requireProvider,a as validateModelAndEffort,p as probeProviders,F as ForgeService}from'./chunk-service.js';import {i as isTerminalStatus,r as reasonFromText,M as MODES$1,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS,b as inheritContinuedProviders,S as STAGE_PROMPTS,v as validateSpec,s as startPipeline,c as readPipeline,m as missingPipelineError,j as jobDir,d as jobFile,F as FILES,e as readAcceptance,f as findProvider,g as isWorkerIdle,p as providerNames,h as isMode,k as cancelPipeline,l as isTerminalForgeStatus}from'./chunk-normalize.js';import os from'node:os';import {execFile}from'node:child_process';import'node:url';import'node:timers/promises';import'node:fs/promises';import'node:readline';//#region rolldown:runtime
 var __create = Object.create;
 var __defProp = Object.defineProperty;
 var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
@@ -25483,7 +25483,7 @@ const NON_CODING_MODEL = /embedding|(?:^|[-/])tts(?:$|-)|-tts\b|image|(?:^|\/)ve
 function conciseCapabilities(providers, only) {
     return providers.map((p) => {
         if (!p.available)
-            return { name: p.name, available: false };
+            return { name: p.name, available: false, ...(p.error ? { error: p.error } : {}) };
         const coding = p.models.filter((m) => !NON_CODING_MODEL.test(m.id));
         const efforts = commonEfforts(coding.map(model => model.efforts ?? []));
         const rows = coding.map(model => ({
@@ -25680,7 +25680,7 @@ const MESSAGE_OUTPUT = open({
     repo: typed('string'),
     timeoutMs: typed('integer'),
     pendingMessages: typed('integer', 'Messages accepted but not yet read, this one included.'),
-    env: { type: 'string', enum: ['set', 'kept', 'dropped'], description: 'dropped: the worker had env whose values were lost; envKeys names them.' },
+    env: { type: 'string', enum: ['set', 'kept', 'dropped', 'deferred'], description: 'dropped: the worker had env whose values were lost; envKeys names them. deferred: held until the running worker goes idle.' },
     envKeys: strings(),
     checks: strings('Acceptance checks the next turn runs.'),
     warnings: strings(),
@@ -25837,6 +25837,12 @@ async function discoverCatalogs(ctx, refresh = false) {
         return { catalogs: [], error: err instanceof Error ? err.message : String(err) };
     }
 }
+function catalogFailureText(catalogs) {
+    const failures = catalogs
+        .filter(c => c.probeFailed === true)
+        .map(c => `${c.provider}: ${c.error ?? 'availability probe failed'}`);
+    return failures.length > 0 ? failures.join('; ') : undefined;
+}
 /** The provider to use when none is configured: the only installed one. Never a guess between several. */
 function defaultProvider(installed, onMany, discoveryError) {
     if (installed.length === 0) {
@@ -25860,14 +25866,16 @@ async function defaultMixedPipeline(input, catalogs) {
         return { name: input.name, stages, workDir: input.workDir, concurrency: input.concurrency };
     }
     const { catalogs: cats, error: discoveryError } = await discoverCatalogs({ catalogs });
-    const installed = cats.map(c => c.provider);
+    const usable = cats.filter(c => c.probeFailed !== true);
+    const installed = usable.map(c => c.provider);
+    const effectiveError = discoveryError ?? (usable.length === 0 ? catalogFailureText(cats) : undefined);
     const stage = (name, extra) => {
         const rd = input.modelConfig ? resolveRequest({ mode: name }, input.modelConfig) : undefined;
         if (rd?.source === 'roleDefault' && rd.provider) {
             return { name, provider: rd.provider, model: input.models?.[name] ?? rd.model, effort: input.efforts?.[name] ?? rd.effort, role: name, routingPinned: true, ...extra };
         }
-        const provider = defaultProvider(installed, list => `pass stages with a provider each: installed are ${list}.`, discoveryError);
-        const cat = cats.find(c => c.provider === provider);
+        const provider = defaultProvider(installed, list => `pass stages with a provider each: installed are ${list}.`, effectiveError);
+        const cat = usable.find(c => c.provider === provider);
         const cfg = cat?.defaultSource === 'harness-config';
         return { name, provider, model: input.models?.[provider] ?? input.models?.[name] ?? (cfg ? cat?.defaultModel : undefined),
             effort: input.efforts?.[name] ?? (cfg ? cat?.defaultEffort : undefined), role: name, routingPinned: true, ...extra };
@@ -25881,22 +25889,24 @@ async function defaultMixedPipeline(input, catalogs) {
 }const REPORT_HEAD_CHARS = 8_000;
 const WAIT_POLL_MS = 500;
 const WATCH_RECHECK_MS = 5_000;
-/** Providers that run restricted unless asked. agy and kimi are unrestricted by design: headless they cannot prompt (kimi's print mode forces auto). */
-const RESTRICTED_BY_DEFAULT = new Set(['codex', 'claude', 'opencode']);
 /** Long enough for a person to read the prompt and answer; the SDK default (60 s) is not. */
 const CONFIRM_TIMEOUT_MS = 10 * 60_000;
 const DECLINED_UNRESTRICTED = 'The user declined unrestricted access; rerun without unrestricted, or ask the user.';
 const UNCONFIRMED_UNRESTRICTED = 'unrestricted: true was not confirmed with the user: this client cannot show a confirmation prompt (no MCP elicitation support).';
-async function confirmUnrestricted(ctx, req) {
-    if (req.unrestricted !== true || !RESTRICTED_BY_DEFAULT.has(req.provider) || process.env['AGENT_SMITH_CONFIRM_UNRESTRICTED'] === '0')
+async function confirmUnrestricted(ctx, launches, kind = 'worker') {
+    const escalating = launches.filter(l => l.unrestricted === true && !findProvider(l.provider)?.defaultUnrestricted);
+    if (escalating.length === 0 || process.env['AGENT_SMITH_CONFIRM_UNRESTRICTED'] === '0')
         return {};
     if (ctx.unrestrictedGate)
         return ctx.unrestrictedGate;
     if (!ctx.server?.getClientCapabilities()?.elicitation?.form)
         return { warning: UNCONFIRMED_UNRESTRICTED };
-    const who = req.who ?? (req.worker ? `${req.provider} worker "${req.worker}"` : `a new ${req.provider} worker`);
+    const target = escalating.length === 1
+        ? escalating[0].who
+        : `${escalating.length} ${kind}s (${escalating.map(e => e.label ?? e.who).join(', ')})`;
+    const cwds = [...new Set(escalating.map(e => e.cwd))].join(', ');
     try {
-        const answer = await ctx.server.elicitInput({ mode: 'form', message: `Allow ${who} to run without approval prompts in ${req.cwd}? It will be able to run any command.`, requestedSchema: { type: 'object', properties: {} } }, { timeout: CONFIRM_TIMEOUT_MS });
+        const answer = await ctx.server.elicitInput({ mode: 'form', message: `Allow ${target} to run without approval prompts in ${cwds}? It will be able to run any command.`, requestedSchema: { type: 'object', properties: {} } }, { timeout: CONFIRM_TIMEOUT_MS });
         return answer.action === 'accept' ? {} : { refused: failure(DECLINED_UNRESTRICTED) };
     }
     catch (err) {
@@ -25934,9 +25944,17 @@ function slimAck(ack) {
 async function resolveDefaultProvider(ctx) {
     if (ctx.catalogs) {
         const { catalogs, error } = await discoverCatalogs(ctx);
-        return defaultProvider(catalogs.map(c => c.provider), undefined, error);
+        const usable = catalogs.filter(c => c.probeFailed !== true);
+        const detail = error ?? (usable.length === 0 ? catalogFailureText(catalogs) : undefined);
+        return defaultProvider(usable.map(c => c.provider), undefined, detail);
     }
-    return defaultProvider(await getInstalledProviders());
+    const probes = await probeProviders();
+    const installed = probes.filter(p => p.status === 'installed').map(p => p.name);
+    const failed = probes.filter(p => p.status === 'failed');
+    const detail = installed.length === 0 && failed.length > 0
+        ? failed.map(p => `${p.name}: ${p.reason ?? 'availability probe failed'}`).join('; ')
+        : undefined;
+    return defaultProvider(installed, undefined, detail);
 }
 async function spawnOne(ctx, args) {
     const mode = allowed(args, 'mode', MODES$1);
@@ -25951,7 +25969,12 @@ async function spawnOne(ctx, args) {
     const checks = parseChecks(args.checks);
     const request = { mode, prompt: text(args, 'prompt', true), context: contextText(args), files: filesList(args), checks, cwd: workingDirectory(args), name: text(args, 'name'), task: text(args, 'task'), provider, model: resolved.model, effort: resolved.effort, timeoutMs: number(args, 'timeoutMs'), conversation: text(args, 'conversation'), unrestricted: boolean(args, 'unrestricted'), env: validateEnv(args.env),
         ownerChecks: true, onPrepared: ctx.onJobPrepared };
-    const gate = await confirmUnrestricted(ctx, { unrestricted: request.unrestricted, provider, worker: request.name, cwd: request.cwd ?? ctx.service.repo });
+    const gate = await confirmUnrestricted(ctx, [{
+            unrestricted: request.unrestricted,
+            provider,
+            who: request.name ? `${provider} worker "${request.name}"` : `a new ${provider} worker`,
+            cwd: request.cwd ?? ctx.service.repo,
+        }]);
     if (gate.refused)
         throw new Error(refusedText(gate.refused));
     if (gate.warning)
@@ -26055,19 +26078,16 @@ const spawnJob = async (ctx, args) => {
         const resolved = resolveRequest({ provider: allowed(r, 'provider', PROVIDERS), model: text(r, 'model'), effort: allowed(r, 'effort', EFFORTS$1), mode }, cfg);
         resolvedProviders.push(resolved.provider ?? await getFallbackProvider());
     }
-    const escalating = requests
-        .map((r, i) => ({ r, provider: resolvedProviders[i] }))
-        .filter(({ r, provider }) => r.unrestricted === true && RESTRICTED_BY_DEFAULT.has(provider));
-    let batchCtx = ctx;
-    if (escalating.length > 0) {
-        const who = escalating.length === 1
-            ? `${escalating[0].provider} worker "${String(escalating[0].r.name)}"`
-            : `${escalating.length} workers (${escalating.map(e => `${String(e.r.name)}: ${e.provider}`).join(', ')})`;
-        const gate = await confirmUnrestricted(ctx, { unrestricted: true, provider: escalating[0].provider, cwd: cwd ?? ctx.service.repo, who });
-        if (gate.refused)
-            return gate.refused;
-        batchCtx = { ...ctx, unrestrictedGate: gate.warning ? { warning: gate.warning } : {} };
-    }
+    const gate = await confirmUnrestricted(ctx, requests.map((r, i) => ({
+        unrestricted: boolean(r, 'unrestricted'),
+        provider: resolvedProviders[i],
+        who: `${resolvedProviders[i]} worker "${String(r.name)}"`,
+        label: `${String(r.name)}: ${resolvedProviders[i]}`,
+        cwd: cwd ?? ctx.service.repo,
+    })));
+    if (gate.refused)
+        return gate.refused;
+    const batchCtx = { ...ctx, unrestrictedGate: gate.warning ? { warning: gate.warning } : {} };
     const jobs = [];
     for (const [i, r] of requests.entries()) {
         try {
@@ -26100,7 +26120,12 @@ const followUp = async (ctx, args) => {
             Object.assign(request, { model: resolved.model, effort: resolved.effort });
             notes.push(...resolved.warnings, ...cfg.errors.map(e => `models.json: ${e}`));
         }
-        const gate = await confirmUnrestricted(ctx, { unrestricted: request.unrestricted, provider, worker: head.name, cwd: head.cwd ?? ctx.service.repo });
+        const gate = await confirmUnrestricted(ctx, [{
+                unrestricted: request.unrestricted,
+                provider,
+                who: head.name ? `${provider} worker "${head.name}"` : `a new ${provider} worker`,
+                cwd: head.cwd ?? ctx.service.repo,
+            }]);
         if (gate.refused)
             return gate.refused;
         if (gate.warning)
@@ -26316,9 +26341,21 @@ const runPipeline = async (ctx, args) => {
     const spec = await defaultMixedPipeline({ name: text(raw, 'name', true), task: task ?? '', stages, workDir: text(raw, 'workDir') ?? ctx.service.repo, concurrency: number(raw, 'concurrency', 32), modelConfig: loadModelConfig({ repo: ctx.service.repo }) }, ctx.catalogs);
     validateSpec(spec);
     const warnings = await validatePipelineStages(ctx, spec.stages);
+    const unrestricted = boolean(raw, 'unrestricted');
+    const gate = await confirmUnrestricted(ctx, spec.stages.map(s => ({
+        unrestricted,
+        provider: s.provider,
+        who: `pipeline stage "${s.name}" (${s.provider})`,
+        label: `${s.name}: ${s.provider}`,
+        cwd: spec.workDir ?? ctx.service.repo,
+    })), 'pipeline stage');
+    if (gate.refused)
+        return gate.refused;
+    if (gate.warning)
+        warnings.push(gate.warning);
     const run = ctx.service.supervisorUrl
-        ? await launchPipeline(ctx.service, spec, { unrestricted: boolean(raw, 'unrestricted') })
-        : startPipeline(ctx.service, spec, { unrestricted: boolean(raw, 'unrestricted') });
+        ? await launchPipeline(ctx.service, spec, { unrestricted })
+        : startPipeline(ctx.service, spec, { unrestricted });
     void run.done.catch(err => process.stderr.write(`agent-smith pipeline ${run.runId}: ${String(err)}\n`));
     return json({ runId: run.runId, repo: ctx.service.repo, stages: spec.stages.map(s => ({ name: s.name, provider: s.provider, ...(s.dependsOn?.length ? { dependsOn: s.dependsOn } : {}) })), ...(warnings.length ? { warnings } : {}) });
 };
@@ -26349,7 +26386,7 @@ async function listCapabilities(ctx, refresh, fmt, only) {
     const warning = discoveryError ? `Provider discovery failed (${discoveryError}).` : undefined;
     const installed = new Set(cats.map(c => c.provider));
     const all = [
-        ...cats.map(c => ({ name: c.provider, available: true, defaultModel: c.defaultModel, defaultEffort: c.defaultEffort, defaultSource: c.defaultSource,
+        ...cats.map(c => ({ name: c.provider, available: c.probeFailed !== true, defaultModel: c.defaultModel, defaultEffort: c.defaultEffort, defaultSource: c.defaultSource,
             models: c.models.map(m => ({ id: m.id, label: m.label, efforts: m.efforts, defaultEffort: m.defaultEffort })), source: c.source, stale: c.stale, verified: c.verified, ...(c.error ? { error: c.error } : {}) })),
         ...providerNames().filter(n => !installed.has(n)).map(name => ({ name, available: false, models: [], defaultSource: 'unknown' })),
     ];
