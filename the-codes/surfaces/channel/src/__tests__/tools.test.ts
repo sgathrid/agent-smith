@@ -475,6 +475,82 @@ test('status include_diff: says so without a baseline, while running, or with no
   assert.equal(empty.diff, ''); assert.match(empty.diffNote, /No files changed/);
 });
 
+test('status by worker: unions changedFiles across turns in stable order and diffs against earliest baseline, while job ID stays scoped', async () => {
+  const { cwd, head: baseHead } = gitRepo();
+  writeFileSync(path.join(cwd, 'a.txt'), 'one\ntwo\n');
+  writeFileSync(path.join(cwd, 'b.txt'), 'bee\n');
+  execFileSync('git', ['add', 'a.txt'], { cwd });
+  execFileSync('git', ['commit', '-qm', 'mid'], { cwd });
+  const midHead = execFileSync('git', ['rev-parse', 'HEAD'], { cwd, encoding: 'utf8' }).trim();
+  const turns: Record<string, Record<string, unknown>> = {
+    'w-1': detail({ jobId: 'w-1', workerId: 'w-ada', turn: 1, cwd, gitBaseline: { head: baseHead, dirty: [] }, changedFiles: ['b.txt', 'a.txt'] }),
+    'w-2': detail({ jobId: 'w-2', workerId: 'w-ada', turn: 2, cwd, gitBaseline: { head: midHead, dirty: ['b.txt'] }, changedFiles: ['a.txt', 'c.txt'] }),
+    'w-3': detail({ jobId: 'w-3', workerId: 'w-ada', turn: 3, cwd, gitBaseline: { head: midHead, dirty: [] }, changedFiles: [] }),
+  };
+  const ctx = withService({
+    resolveWorker: async (id: string) => (id === 'w-ada' ? turns['w-3']! : turns[id]!),
+    earlierTurns: async (head: { jobId: string }) => (head.jobId === 'w-3' ? [turns['w-1']!, turns['w-2']!] : []),
+  });
+
+  const workerConcise = body(await callTool(ctx, 'status', { id: 'w-ada', include_diff: true }));
+  assert.equal(workerConcise.changedFileCount, 3);
+  assert.deepEqual(workerConcise.changedFiles, ['b.txt', 'a.txt', 'c.txt']);
+  assert.match(workerConcise.diff, /^diff --git a\/a\.txt b\/a\.txt[\s\S]*\+two/);
+  assert.match(workerConcise.diffNote, /Untracked, not in diff.*b\.txt/);
+
+  const workerDetailed = body(await callTool(ctx, 'status', { id: 'w-ada', include_diff: true, response_format: 'detailed' }));
+  assert.equal(workerDetailed.changedFileCount, 3);
+  assert.deepEqual(workerDetailed.changedFiles, ['b.txt', 'a.txt', 'c.txt']);
+  assert.equal(workerDetailed.diff, workerConcise.diff);
+
+  const turnOnly = body(await callTool(ctx, 'status', { id: 'w-3', include_diff: true }));
+  assert.equal('changedFileCount' in turnOnly, false);
+  assert.equal('changedFiles' in turnOnly, false);
+  assert.equal(turnOnly.diff, '');
+  assert.match(turnOnly.diffNote, /No files changed/);
+});
+
+test('status by worker: uses earliest turn with a git baseline, preserves changedFilesUnknown, and handles a still-running head turn', async () => {
+  const { cwd, head: baseHead } = gitRepo();
+  writeFileSync(path.join(cwd, 'a.txt'), 'one\ntwo\n');
+
+  const noBaseTurns: Record<string, Record<string, unknown>> = {
+    't-1': detail({ jobId: 't-1', workerId: 'w-b', turn: 1, cwd, gitBaseline: undefined, changedFiles: ['a.txt'] }),
+    't-2': detail({ jobId: 't-2', workerId: 'w-b', turn: 2, cwd, gitBaseline: { head: baseHead, dirty: [] }, changedFiles: [] }),
+  };
+  const bCtx = withService({
+    resolveWorker: async () => noBaseTurns['t-2']!,
+    earlierTurns: async () => [noBaseTurns['t-1']!],
+  });
+  const bStatus = body(await callTool(bCtx, 'status', { id: 'w-b', include_diff: true }));
+  assert.match(bStatus.diff, /\+two/);
+
+  const unknownTurns: Record<string, Record<string, unknown>> = {
+    'u-1': detail({ jobId: 'u-1', workerId: 'w-u', turn: 1, changedFiles: undefined, changedFilesUnknown: true }),
+    'u-2': detail({ jobId: 'u-2', workerId: 'w-u', turn: 2, changedFiles: [] }),
+  };
+  const uCtx = withService({
+    resolveWorker: async () => unknownTurns['u-2']!,
+    earlierTurns: async () => [unknownTurns['u-1']!],
+  });
+  assert.equal(body(await callTool(uCtx, 'status', { id: 'w-u' })).changedFilesUnknown, true);
+  assert.equal(body(await callTool(uCtx, 'status', { id: 'w-u', response_format: 'detailed' })).changedFilesUnknown, true);
+
+  const runningTurns: Record<string, Record<string, unknown>> = {
+    'r-1': detail({ jobId: 'r-1', workerId: 'w-r', turn: 1, cwd, gitBaseline: { head: baseHead, dirty: [] }, changedFiles: ['a.txt'] }),
+    'r-2': detail({ jobId: 'r-2', workerId: 'w-r', turn: 2, cwd, status: 'running', finishedAt: null, changedFiles: undefined }),
+  };
+  const rCtx = withService({
+    resolveWorker: async () => runningTurns['r-2']!,
+    earlierTurns: async () => [runningTurns['r-1']!],
+  });
+  const rStatus = body(await callTool(rCtx, 'status', { id: 'w-r', include_diff: true }));
+  assert.equal(rStatus.changedFileCount, 1);
+  assert.deepEqual(rStatus.changedFiles, ['a.txt']);
+  assert.match(rStatus.diff, /\+two/);
+  assert.match(rStatus.diffNote, /running turn/i);
+});
+
 test('tool failures are isError results that say what to do next', async () => {
   const cwd = mkdtempSync(path.join(tmpdir(), 'smith-err-'));
   let current: Record<string, unknown> = {};

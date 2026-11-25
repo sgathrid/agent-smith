@@ -17,7 +17,7 @@ import { MODES, MODE_PRESETS, isMode as isModeName } from '../../../forge/modes.
 import { getCatalogs, getInstalledProviders } from '../../../providers/catalog.ts';
 import { providerNames } from '../../../providers/registry.ts';
 import { loadModelConfig, resolveRequest, describeAliases } from '../../../providers/aliases.ts';
-import { CONCISE_LIST_LIMIT, EARLIER_TURNS_CAP, conciseCapabilities, conciseRow, conciseStatus, concisePipeline, earlierTurn, jobDiff, jobLiveness, livenessView, parseSince, taskStatus, type ResponseFormat } from './views.ts';
+import { CONCISE_LIST_LIMIT, EARLIER_TURNS_CAP, conciseCapabilities, conciseRow, conciseStatus, concisePipeline, earlierTurn, jobDiff, jobLiveness, livenessView, parseSince, taskStatus, withWorkerBaseline, withWorkerFiles, type ResponseFormat } from './views.ts';
 import { PROVIDERS, TOOL_DEFS, MAX_WAIT_MS } from './tool-defs.ts';
 import { allowed, boolean, contextText, filesList, format, keys, number, parseChecks, parseStages, record, text, workingDirectory } from './args.ts';
 import { defaultMixedPipeline, defaultProvider, installedCatalogs, type CatalogSource } from './stage-defaults.ts';
@@ -295,11 +295,14 @@ const jobStatus: Handler = async (ctx, args) => {
   const reportPath = jobFile(ctx.service.repo, detail.jobId, FILES.report);
   if (boolean(args, 'report_only')) return structured({ jobId: detail.jobId, status: detail.status, report: detail.report, reportPath });
   const acceptance = readAcceptance(ctx.service.repo, detail.jobId); const wait = waited ? { waited: true, stillRunning: unsettled(ctx, detail, worker) } : {};
-  const diff = wantDiff ? await jobDiff(detail) : {};
-  const earlier = await ctx.service.earlierTurns(detail, EARLIER_TURNS_CAP);
+  const allEarlier = await ctx.service.earlierTurns(detail, worker ? Number.MAX_SAFE_INTEGER : EARLIER_TURNS_CAP);
+  const earlier = allEarlier.slice(-EARLIER_TURNS_CAP);
+  const viewDetail = worker ? withWorkerFiles(detail, allEarlier) : detail;
+  const diffDetail = worker ? withWorkerBaseline(viewDetail, allEarlier) : viewDetail;
+  const diff = wantDiff ? await jobDiff(diffDetail, { runningTurnPending: worker && allEarlier.length > 0 && detail.status === 'running' }) : {};
   const turns = earlier.length > 0 ? { earlierTurns: earlier.map(t => earlierTurn(t, jobFile(ctx.service.repo, t.jobId, FILES.report), fmt)) } : {};
-  if (fmt === 'concise') return structured({ ...conciseStatus(detail, acceptance, wait), reportPath, ...turns, ...diff }, { compact: true });
-  return structured({ ...fullStatus(detail, acceptance), reportPath, ...turns, ...wait, ...diff });
+  if (fmt === 'concise') return structured({ ...conciseStatus(viewDetail, acceptance, wait), reportPath, ...turns, ...diff }, { compact: true });
+  return structured({ ...fullStatus(viewDetail, acceptance), reportPath, ...turns, ...wait, ...diff });
 };
 
 const pipelineStatus: Handler = async (ctx, args) => {
