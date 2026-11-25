@@ -82,3 +82,8 @@ test('a record written under the old 80-character name is still found by its 90-
   writeFileSync(legacy, JSON.stringify({ runId, pipeline: 'p', status: 'passed', startedAt: 1, finishedAt: 2, stageResults: {} }));
   assert.equal(readPipeline(repo, runId)?.status, 'passed');
 });
+
+test('cancelPipeline names run_pipeline when runId is unknown', () => {
+  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-execute-'));
+  assert.throws(() => cancelPipeline(repo, 'missing-run'), /No pipeline run "missing-run"; use a runId from run_pipeline\./);
+});

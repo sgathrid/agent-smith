@@ -8,7 +8,7 @@ import type { FollowUpRequest, ForgeService, JobDetail, MessageAck, SpawnAck, St
 import { launchPipeline } from '../../../forge/supervisor.ts';
 import { FILES, jobDir, jobFile } from '../../../forge/format.ts';
 import { waitForChange } from '../../../forge/watch.ts';
-import { startPipeline, readPipeline, cancelPipeline } from '../../../forge/execute.ts';
+import { startPipeline, readPipeline, cancelPipeline, missingPipelineError } from '../../../forge/execute.ts';
 import { readAcceptance } from '../../../forge/checks.ts';
 import { isWorkerIdle } from '../../mod/hooks/turns.ts';
 import { validateSpec } from '../../../pipeline/pipeline.ts';
@@ -304,7 +304,7 @@ const jobStatus: Handler = async (ctx, args) => {
 
 const pipelineStatus: Handler = async (ctx, args) => {
   const runId = text(args, 'runId', true)!; const r = readPipeline(ctx.service.repo, runId);
-  if (!r) throw new Error(`No pipeline run "${runId}".`);
+  if (!r) throw missingPipelineError(runId);
   return json(format(args) === 'concise' ? concisePipeline(r) : r);
 };
 

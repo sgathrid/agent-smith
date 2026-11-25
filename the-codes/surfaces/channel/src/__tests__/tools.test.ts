@@ -7,6 +7,7 @@ import test from 'node:test';
 import { TOOL_DEFS, callTool, defaultMixedPipeline, type HandlerContext } from '../tools.ts';
 import { readAcceptance, writeAcceptance } from '../../../../forge/checks.ts';
 import { writePipelineRecord } from '../../../../forge/execute.ts';
+import { ForgeService } from '../../../../forge/service.ts';
 import type { ModelCatalog } from '../../../../providers/types.ts';
 import { withWorkerLookup } from './service-mock.ts';
 
@@ -496,10 +497,19 @@ test('tool failures are isError results that say what to do next', async () => {
   await fail('follow_up', { worker: 'Ada', prompt: 'x', checks: 'npm test' }, /checks must be an array/);
   await fail('status', {}, /id is required: a worker name or job ID/);
   await fail('cancel', {}, /id is required/);
-  await fail('pipeline_status', { runId: 'nope' }, /No pipeline run "nope"/);
+  await fail('pipeline_status', { runId: 'nope' }, /No pipeline run "nope"; use a runId from run_pipeline\./);
   await fail('pipeline_status', {}, /runId is required/);
+  await fail('spawn_job', { mode: '', prompt: 'x' }, /mode must be one of implement, review, moderate, verify \(got ""\)\./);
+  await fail('spawn_job', { mode: 'review', effort: 123, prompt: 'x' }, /effort must be one of .* \(got 123\)\./);
+  await fail('list_jobs', { response_format: 'xml' }, /response_format must be one of concise, detailed \(got "xml"\)\./);
   await fail('status', { id: 'j', bogus: 1 }, /Unknown field bogus; valid fields: id, wait_ms, include_diff, response_format/);
   await fail('nope', {}, /Unknown tool nope; available: list_capabilities/);
+
+  writePipelineRecord(cwd, 'run-123', { runId: 'run-123', pipeline: 'p', status: 'running', startedAt: 1, stageResults: {} });
+  const realCtx = { service: new ForgeService({ repo: cwd }), catalogs: async () => [cat('codex')] } as HandlerContext;
+  const runStatus = await callTool(realCtx, 'status', { id: 'run-123' });
+  assert.equal(runStatus.isError, true);
+  assert.match(text(runStatus), /"run-123" is a pipeline run; call pipeline_status\./);
 });
 
 test('a failed job preparation never leaves checks pending', async () => {
