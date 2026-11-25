@@ -350,6 +350,8 @@ export function recoveredNotice(final: JobResult, resultEvent: AgyResultEvent | 
 
 export function createAgyTranslator(maxChars: number) {
   const steps = new Map<number, StepMemory>();
+  const stepProse = new Map<number, string>();
+  let lastProseStep: number | undefined;
   /** Set by any denial signal; carried into JobResult. */
   const denials: DeniedAction[] = [];
   // agy's final status repeats the conversation's last error, even one it
@@ -404,6 +406,8 @@ export function createAgyTranslator(maxChars: number) {
       if (stepType === 'agent_response') {
         const delta = su.text_delta;
         if (delta !== undefined && delta !== '') {
+          stepProse.set(stepIndex, (stepProse.get(stepIndex) ?? '') + delta);
+          lastProseStep = stepIndex;
           // agy streams prose as many small text_delta slices. We forward each
           // one rather than buffering: the mod surface renders incrementally and
           // a long answer would otherwise be invisible for minutes.
@@ -500,6 +504,7 @@ export function createAgyTranslator(maxChars: number) {
     denials,
     stepsWereTools: (): boolean => [...steps.values()].some((m) => m.tool !== undefined),
     errorIsStale,
+    finalText: (): string | undefined => (lastProseStep === undefined ? undefined : stepProse.get(lastProseStep)),
   };
 }
 
@@ -517,12 +522,13 @@ export function buildResult(args: {
   sawAnyToolCall: boolean;
   /** From the translator: agy's reported error predates this run's last progress. */
   errorIsStale: boolean;
+  finalText?: string;
 }): JobResult {
   const { jobId, resultEvent, exit, startedAtMs, stateDir, denials, sawAnyToolCall } = args;
   const { errorIsStale } = args;
   const durationMs = Date.now() - startedAtMs;
 
-  const response = resultEvent?.response ?? '';
+  const response = args.finalText ?? resultEvent?.response ?? '';
   const reportedStatus = resultEvent?.status;
   const usage = toTokenUsage(resultEvent?.usage);
 
@@ -707,6 +713,7 @@ export const agyProvider: Provider = {
           denials: translator.denials,
           sawAnyToolCall: translator.stepsWereTools(),
           errorIsStale: translator.errorIsStale(),
+          finalText: translator.finalText(),
         }),
       afterResult(final) {
         const recovered = recoveredNotice(final, resultEvent);

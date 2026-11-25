@@ -15,14 +15,14 @@ import { validateSpec } from '../../../pipeline/pipeline.ts';
 import { EFFORTS, validateEnv, type Stage } from '../../../pipeline/types.ts';
 import { MODES, MODE_PRESETS, isMode as isModeName } from '../../../forge/modes.ts';
 import { requireProvider, validateModelAndEffort } from '../../../forge/spawn-request.ts';
-import { getCatalogs, getInstalledProviders } from '../../../providers/catalog.ts';
+import { getCatalogs, probeProviders } from '../../../providers/catalog.ts';
 import { findProvider, providerNames } from '../../../providers/registry.ts';
 import type { ModelCatalog } from '../../../providers/types.ts';
 import { loadModelConfig, resolveRequest, describeAliases } from '../../../providers/aliases.ts';
 import { CONCISE_LIST_LIMIT, EARLIER_TURNS_CAP, conciseCapabilities, conciseRow, conciseStatus, concisePipeline, earlierTurn, jobDiff, jobLiveness, livenessView, parseSince, taskStatus, withWorkerBaseline, withWorkerFiles, type ResponseFormat } from './views.ts';
 import { PROVIDERS, TOOL_DEFS, MAX_WAIT_MS } from './tool-defs.ts';
 import { allowed, boolean, contextText, filesList, format, keys, number, parseChecks, parseStages, record, text, workingDirectory } from './args.ts';
-import { defaultMixedPipeline, defaultProvider, discoverCatalogs, type CatalogSource } from './stage-defaults.ts';
+import { catalogFailureText, defaultMixedPipeline, defaultProvider, discoverCatalogs, type CatalogSource } from './stage-defaults.ts';
 
 export { MAX_CONTEXT_CHARS, TOOL_DEFS, type ToolAnnotations, type ToolDef } from './tool-defs.ts';
 export { parseStages } from './args.ts';
@@ -110,9 +110,17 @@ export function slimAck(ack: SpawnAck) {
 async function resolveDefaultProvider(ctx: HandlerContext): Promise<string> {
   if (ctx.catalogs) {
     const { catalogs, error } = await discoverCatalogs(ctx);
-    return defaultProvider(catalogs.map(c => c.provider), undefined, error);
+    const usable = catalogs.filter(c => c.probeFailed !== true);
+    const detail = error ?? (usable.length === 0 ? catalogFailureText(catalogs) : undefined);
+    return defaultProvider(usable.map(c => c.provider), undefined, detail);
   }
-  return defaultProvider(await getInstalledProviders());
+  const probes = await probeProviders();
+  const installed = probes.filter(p => p.status === 'installed').map(p => p.name);
+  const failed = probes.filter(p => p.status === 'failed');
+  const detail = installed.length === 0 && failed.length > 0
+    ? failed.map(p => `${p.name}: ${p.reason ?? 'availability probe failed'}`).join('; ')
+    : undefined;
+  return defaultProvider(installed, undefined, detail);
 }
 
 async function spawnOne(ctx: HandlerContext, args: Args): Promise<Record<string, unknown>> {
@@ -496,7 +504,7 @@ async function listCapabilities(ctx: HandlerContext, refresh: boolean, fmt: Resp
   const warning = discoveryError ? `Provider discovery failed (${discoveryError}).` : undefined;
   const installed = new Set(cats.map(c => c.provider));
   const all = [
-    ...cats.map(c => ({ name: c.provider, available: true, defaultModel: c.defaultModel, defaultEffort: c.defaultEffort, defaultSource: c.defaultSource,
+    ...cats.map(c => ({ name: c.provider, available: c.probeFailed !== true, defaultModel: c.defaultModel, defaultEffort: c.defaultEffort, defaultSource: c.defaultSource,
       models: c.models.map(m => ({ id: m.id, label: m.label, efforts: m.efforts, defaultEffort: m.defaultEffort })), source: c.source, stale: c.stale, verified: c.verified, ...(c.error ? { error: c.error } : {}) })),
     ...providerNames().filter(n => !installed.has(n)).map(name => ({ name, available: false, models: [], defaultSource: 'unknown' as const })),
   ];

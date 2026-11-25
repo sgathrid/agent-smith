@@ -5,8 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { buildArgv as buildClaudeArgv, buildResult as buildClaudeResult, ClaudeLiveInput, claudeProvider, createClaudeTranslator } from './claude.ts';
-import { buildArgv as buildCodexArgv, codexStderrLevel, createCodexTranslator } from './codex.ts';
-import { buildArgv as buildAgyArgv } from './agy.ts';
+import { buildArgv as buildCodexArgv, buildResult as buildCodexResult, codexStderrLevel, createCodexTranslator } from './codex.ts';
+import { buildArgv as buildAgyArgv, buildResult as buildAgyResult, createAgyTranslator } from './agy.ts';
 import { buildArgv as buildOpencodeArgv, buildResult as buildOpencodeResult, createOpencodeTranslator } from './opencode.ts';
 import { buildArgv as buildKimiArgv, buildResult as buildKimiResult, createKimiTranslator } from './kimi.ts';
 import { recoveredErrorNotice, spawnWorker } from './ndjson.ts';
@@ -1213,4 +1213,71 @@ test('opencode: explicit session completion corroborates a recovered report', ()
   tx.onEvent(textPart('Final report.'));
   tx.onEvent({ type: 'session.completed' });
   assert.equal(buildOc(tx, failedExit).status, 'success');
+});
+
+test('all provider adapters: prose, tool call, final prose returns only final prose', async (t) => {
+  const exit = { code: 0, signal: null, killReason: undefined, stderr: '' };
+
+  await t.test('agy', () => {
+    const tx = createAgyTranslator(2000);
+    tx.onEvent({ event: 'step_update', step_update: { step_index: 1, step_type: 'agent_response', state: 'DONE', text_delta: 'earlier prose' } });
+    tx.onEvent({ event: 'step_update', step_update: { step_index: 2, step_type: 'tool', state: 'ACTIVE', tool_name: 'run_command', tool_info: {} } });
+    tx.onEvent({ event: 'step_update', step_update: { step_index: 2, step_type: 'tool', state: 'DONE', tool_name: 'run_command', tool_info: { output: 'ok' } } });
+    tx.onEvent({ event: 'step_update', step_update: { step_index: 3, step_type: 'agent_response', state: 'DONE', text_delta: 'final prose' } });
+    const res = buildAgyResult({
+      jobId: 'j',
+      resultEvent: { status: 'SUCCESS', response: 'earlier prose\nfinal prose' },
+      exit,
+      startedAtMs: Date.now() - 10,
+      stateDir: '/tmp',
+      denials: tx.denials,
+      sawAnyToolCall: tx.stepsWereTools(),
+      errorIsStale: tx.errorIsStale(),
+      finalText: tx.finalText(),
+    });
+    assert.equal(res.response, 'final prose');
+  });
+
+  await t.test('claude', () => {
+    const tx = createClaudeTranslator(2000);
+    tx.onEvent({ type: 'assistant', message: { content: [{ type: 'text', text: 'earlier prose' }] } });
+    tx.onEvent({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ls' } }] } });
+    tx.onEvent({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] } });
+    tx.onEvent({ type: 'assistant', message: { content: [{ type: 'text', text: 'final prose' }] } });
+    tx.onEvent({ type: 'result', subtype: 'success', result: 'final prose' });
+    const res = buildClaudeResult({ jobId: 'j', startedAtMs: Date.now() - 10, stateDir: '/tmp', exit, tx });
+    assert.equal(res.response, 'final prose');
+  });
+
+  await t.test('codex', () => {
+    const tx = createCodexTranslator(2000);
+    tx.onEvent({ type: 'item.completed', item: { id: 'm1', type: 'agent_message', text: 'earlier prose' } });
+    tx.onEvent({ type: 'item.started', item: { id: 'c1', type: 'command_execution', command: 'ls' } });
+    tx.onEvent({ type: 'item.completed', item: { id: 'c1', type: 'command_execution', command: 'ls', exit_code: 0 } });
+    tx.onEvent({ type: 'item.completed', item: { id: 'm2', type: 'agent_message', text: 'final prose' } });
+    tx.onEvent({ type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } });
+    const res = buildCodexResult({ jobId: 'j', startedAtMs: Date.now() - 10, stateDir: '/tmp', exit, tx });
+    assert.equal(res.response, 'final prose');
+  });
+
+  await t.test('opencode', () => {
+    const tx = createOpencodeTranslator(2000);
+    tx.onEvent({ type: 'text', text: 'earlier prose' });
+    tx.onEvent({ type: 'tool.started', part: { id: 'p1', tool: 'bash', state: { status: 'running', input: {} } } });
+    tx.onEvent({ type: 'tool.completed', part: { id: 'p1', tool: 'bash', state: { status: 'completed', output: 'ok' } } });
+    tx.onEvent({ type: 'text', text: 'final prose' });
+    tx.onEvent({ type: 'session.completed' });
+    const res = buildOpencodeResult({ jobId: 'j', startedAtMs: Date.now() - 10, stateDir: '/tmp', exit, tx });
+    assert.equal(res.response, 'final prose');
+  });
+
+  await t.test('kimi', () => {
+    const tx = createKimiTranslator(2000);
+    tx.onEvent({ role: 'assistant', content: 'earlier prose' });
+    tx.onEvent({ role: 'assistant', tool_calls: [{ id: 'tc1', type: 'function', function: { name: 'Bash', arguments: '{}' } }] });
+    tx.onEvent({ role: 'tool', tool_call_id: 'tc1', content: 'ok' });
+    tx.onEvent({ role: 'assistant', content: 'final prose' });
+    const res = buildKimiResult({ jobId: 'j', startedAtMs: Date.now() - 10, stateDir: '/tmp', exit, tx });
+    assert.equal(res.response, 'final prose');
+  });
 });

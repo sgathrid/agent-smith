@@ -21,6 +21,7 @@
 import { agyBinary, agyProvider } from './agy.ts';
 import { claudeBinary, claudeProvider } from './claude.ts';
 import { codexBinary, codexProvider } from './codex.ts';
+import { errMessage } from './discovery.ts';
 import { kimiBinary, kimiProvider } from './kimi.ts';
 import { opencodeBinary, opencodeProvider } from './opencode.ts';
 import type { Provider } from './types.ts';
@@ -107,22 +108,44 @@ export interface ProviderAvailability {
  * All four probes run concurrently. Never rejects: a provider whose probe throws
  * is reported unavailable with the reason, because detectAvailable() feeds a UI.
  */
-export async function detectAvailable(): Promise<ProviderAvailability[]> {
+export type AvailabilityStatus = 'installed' | 'not-installed' | 'failed';
+
+export interface AvailabilityProbe {
+  provider: Provider;
+  name: string;
+  status: AvailabilityStatus;
+  binary: string;
+  reason?: string;
+}
+
+export async function probeAvailability(providers: readonly Provider[] = PROVIDERS): Promise<AvailabilityProbe[]> {
   return Promise.all(
-    PROVIDERS.map(async (p): Promise<ProviderAvailability> => {
+    providers.map(async (p): Promise<AvailabilityProbe> => {
+      const binary = binaryFor(p.name);
       try {
         const ok = await p.available();
-        return { name: p.name, available: ok, binary: binaryFor(p.name) };
+        return { provider: p, name: p.name, status: ok ? 'installed' : 'not-installed', binary };
       } catch (err) {
         return {
+          provider: p,
           name: p.name,
-          available: false,
-          binary: binaryFor(p.name),
-          reason: err instanceof Error ? err.message : String(err),
+          status: 'failed',
+          binary,
+          reason: errMessage(err),
         };
       }
     }),
   );
+}
+
+export async function detectAvailable(): Promise<ProviderAvailability[]> {
+  const probes = await probeAvailability(PROVIDERS);
+  return probes.map((p) => ({
+    name: p.name,
+    available: p.status === 'installed',
+    binary: p.binary,
+    ...(p.reason !== undefined ? { reason: p.reason } : {}),
+  }));
 }
 
 /**
