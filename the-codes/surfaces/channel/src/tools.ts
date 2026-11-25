@@ -12,15 +12,17 @@ import { startPipeline, readPipeline, cancelPipeline, missingPipelineError } fro
 import { readAcceptance } from '../../../forge/checks.ts';
 import { isWorkerIdle } from '../../mod/hooks/turns.ts';
 import { validateSpec } from '../../../pipeline/pipeline.ts';
-import { EFFORTS, validateEnv } from '../../../pipeline/types.ts';
+import { EFFORTS, validateEnv, type Stage } from '../../../pipeline/types.ts';
 import { MODES, MODE_PRESETS, isMode as isModeName } from '../../../forge/modes.ts';
+import { requireProvider, validateModelAndEffort } from '../../../forge/spawn-request.ts';
 import { getCatalogs, getInstalledProviders } from '../../../providers/catalog.ts';
 import { providerNames } from '../../../providers/registry.ts';
+import type { ModelCatalog } from '../../../providers/types.ts';
 import { loadModelConfig, resolveRequest, describeAliases } from '../../../providers/aliases.ts';
 import { CONCISE_LIST_LIMIT, EARLIER_TURNS_CAP, conciseCapabilities, conciseRow, conciseStatus, concisePipeline, earlierTurn, jobDiff, jobLiveness, livenessView, parseSince, taskStatus, withWorkerBaseline, withWorkerFiles, type ResponseFormat } from './views.ts';
 import { PROVIDERS, TOOL_DEFS, MAX_WAIT_MS } from './tool-defs.ts';
 import { allowed, boolean, contextText, filesList, format, keys, number, parseChecks, parseStages, record, text, workingDirectory } from './args.ts';
-import { defaultMixedPipeline, defaultProvider, installedCatalogs, type CatalogSource } from './stage-defaults.ts';
+import { defaultMixedPipeline, defaultProvider, discoverCatalogs, type CatalogSource } from './stage-defaults.ts';
 
 export { MAX_CONTEXT_CHARS, TOOL_DEFS, type ToolAnnotations, type ToolDef } from './tool-defs.ts';
 export { parseStages } from './args.ts';
@@ -92,12 +94,20 @@ export function slimAck(ack: SpawnAck) {
   return Object.fromEntries(Object.entries(out).filter(([, v]) => v !== undefined)) as Partial<typeof out>;
 }
 
+async function resolveDefaultProvider(ctx: HandlerContext): Promise<string> {
+  if (ctx.catalogs) {
+    const { catalogs, error } = await discoverCatalogs(ctx);
+    return defaultProvider(catalogs.map(c => c.provider), undefined, error);
+  }
+  return defaultProvider(await getInstalledProviders());
+}
+
 async function spawnOne(ctx: HandlerContext, args: Args): Promise<Record<string, unknown>> {
   const mode = allowed(args, 'mode', MODES); if (mode === undefined) throw new Error(`mode is required; one of ${MODES.join(', ')}.`);
   const cfg = loadModelConfig({ repo: ctx.service.repo });
   const rawProvider = allowed(args, 'provider', PROVIDERS);
   const resolved = resolveRequest({ provider: rawProvider, model: text(args, 'model'), effort: allowed(args, 'effort', EFFORTS), mode }, cfg);
-  const provider = resolved.provider ?? defaultProvider(ctx.catalogs ? (await installedCatalogs(ctx)).map(c => c.provider) : await getInstalledProviders());
+  const provider = resolved.provider ?? await resolveDefaultProvider(ctx);
   const notes = [...resolved.warnings, ...cfg.errors.map(e => `models.json: ${e}`)];
   const withNotes = (ack: SpawnAck) => ({ ...slimAck(ack), provider: ack.provider ?? provider, ...(resolved.appliedAlias ? { aliasApplied: resolved.appliedAlias, aliasSource: resolved.source } : {}), ...(notes.length ? { warnings: [...(ack.warnings ?? []), ...notes] } : {}) });
   const checks = parseChecks(args.checks);
@@ -190,7 +200,7 @@ const spawnJob: Handler = async (ctx, args) => {
   }, cfg).provider;
   const requests = variants.map((v, i) => overlay(shared, { ...v, name: names[i] }, baseProvider));
   let fallbackProvider: string | undefined;
-  const getFallbackProvider = async () => fallbackProvider ??= defaultProvider(ctx.catalogs ? (await installedCatalogs(ctx)).map(c => c.provider) : await getInstalledProviders());
+  const getFallbackProvider = async () => fallbackProvider ??= await resolveDefaultProvider(ctx);
   const resolvedProviders: string[] = [];
   for (const r of requests) {
     const resolved = resolveRequest({ provider: allowed(r, 'provider', PROVIDERS), model: text(r, 'model'), effort: allowed(r, 'effort', EFFORTS), mode }, cfg);
@@ -397,16 +407,35 @@ const cancelJob: Handler = async (ctx, args) => {
   return json(out);
 };
 
+async function validatePipelineStages(ctx: HandlerContext, stages: readonly Stage[]): Promise<string[]> {
+  let stubbed: Promise<ModelCatalog[]> | undefined;
+  const catalogOf = (provider: string) => ctx.catalogs
+    ? (stubbed ??= discoverCatalogs(ctx).then(r => r.catalogs)).then(all => all.find(c => c.provider === provider))
+    : ctx.service.catalogFor(provider);
+  const warnings: string[] = [];
+  for (const stage of stages) {
+    try {
+      const provider = requireProvider(stage.provider);
+      const checked = await validateModelAndEffort(provider, stage.model, stage.effort, () => catalogOf(provider.name));
+      warnings.push(...checked.warnings.map(w => `stage '${stage.name}': ${w}`));
+    } catch (err) {
+      throw new Error(`stage '${stage.name}': ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  return warnings;
+}
+
 const runPipeline: Handler = async (ctx, args) => {
   const raw = record(args.spec, 'spec'); keys(raw, ['name', 'task', 'workDir', 'concurrency', 'unrestricted', 'stages']);
   const stages = parseStages(raw.stages); const task = text(raw, 'task', stages === undefined);
   const spec = await defaultMixedPipeline({ name: text(raw, 'name', true)!, task: task ?? '', stages, workDir: text(raw, 'workDir') ?? ctx.service.repo, concurrency: number(raw, 'concurrency', 32), modelConfig: loadModelConfig({ repo: ctx.service.repo }) }, ctx.catalogs);
   validateSpec(spec);
+  const warnings = await validatePipelineStages(ctx, spec.stages);
   const run = ctx.service.supervisorUrl
     ? await launchPipeline(ctx.service, spec, { unrestricted: boolean(raw, 'unrestricted') })
     : startPipeline(ctx.service, spec, { unrestricted: boolean(raw, 'unrestricted') });
   void run.done.catch(err => process.stderr.write(`agent-smith pipeline ${run.runId}: ${String(err)}\n`));
-  return json({ runId: run.runId, repo: ctx.service.repo, stages: spec.stages.map(s => ({ name: s.name, provider: s.provider, ...(s.dependsOn?.length ? { dependsOn: s.dependsOn } : {}) })) });
+  return json({ runId: run.runId, repo: ctx.service.repo, stages: spec.stages.map(s => ({ name: s.name, provider: s.provider, ...(s.dependsOn?.length ? { dependsOn: s.dependsOn } : {}) })), ...(warnings.length ? { warnings } : {}) });
 };
 
 const HANDLERS: Readonly<Record<string, Handler>> = {
@@ -424,7 +453,10 @@ export async function callTool(ctx: HandlerContext, name: string, rawArgs: unkno
 }
 
 async function listCapabilities(ctx: HandlerContext, refresh: boolean, fmt: ResponseFormat, only: string | undefined) {
-  const cats = ctx.catalogs ? await installedCatalogs(ctx) : await installedCatalogs({ catalogs: () => getCatalogs({ refresh, repo: ctx.service.repo }) });
+  const { catalogs: cats, error: discoveryError } = ctx.catalogs
+    ? await discoverCatalogs(ctx)
+    : await discoverCatalogs({ catalogs: () => getCatalogs({ refresh, repo: ctx.service.repo }) });
+  const warning = discoveryError ? `Provider discovery failed (${discoveryError}).` : undefined;
   const installed = new Set(cats.map(c => c.provider));
   const all = [
     ...cats.map(c => ({ name: c.provider, available: true, defaultModel: c.defaultModel, defaultEffort: c.defaultEffort, defaultSource: c.defaultSource,
@@ -437,12 +469,14 @@ async function listCapabilities(ctx: HandlerContext, refresh: boolean, fmt: Resp
   if (fmt === 'concise') {
     return {
       providers: conciseCapabilities(providers, only),
+      ...(warning ? { warning } : {}),
       ...(aliases.aliases.length || Object.keys(aliases.roleDefaults).length ? { aliases } : {}),
       ...(modelConfig.errors.length ? { aliasConfigErrors: modelConfig.errors } : {}),
     };
   }
   return {
     providers,
+    ...(warning ? { warning } : {}),
     aliases,
     ...(modelConfig.errors.length ? { aliasConfigErrors: modelConfig.errors } : {}),
     modes: MODES.map(name => ({ name, description: MODE_PRESETS[name].description, readOnly: MODE_PRESETS[name].readOnly, runsCommands: MODE_PRESETS[name].runsCommands })),

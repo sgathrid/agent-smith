@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import process$1 from'node:process';import {randomUUID,randomBytes}from'node:crypto';import {readFileSync,statSync,rmSync,writeFileSync,mkdirSync,linkSync,unlinkSync,existsSync,renameSync,readdirSync}from'node:fs';import path from'node:path';import {l as livenessOf,L as LIVENESS_STATES,w as waitForChange,c as claimMarkerPath}from'./chunk-stale.js';import {E as EFFORTS$1,M as MAX_WATCHED_FILES,v as validateEnv,g as getCatalogs,l as launchPipeline,a as getInstalledProviders,F as ForgeService}from'./chunk-service.js';import {i as isTerminalStatus,r as reasonFromText,M as MODES$1,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS,b as inheritContinuedProviders,S as STAGE_PROMPTS,v as validateSpec,s as startPipeline,c as readPipeline,m as missingPipelineError,j as jobDir,d as jobFile,F as FILES,e as readAcceptance,f as isWorkerIdle,p as providerNames,g as isMode,h as cancelPipeline,k as isTerminalForgeStatus}from'./chunk-normalize.js';import os from'node:os';import {execFile}from'node:child_process';import'node:url';import'node:timers/promises';import'node:fs/promises';import'node:readline';//#region rolldown:runtime
+import process$1 from'node:process';import {randomUUID,randomBytes}from'node:crypto';import {readFileSync,existsSync,statSync,rmSync,writeFileSync,mkdirSync,linkSync,unlinkSync,renameSync,readdirSync}from'node:fs';import path from'node:path';import {l as livenessOf,L as LIVENESS_STATES,w as waitForChange,c as claimMarkerPath}from'./chunk-stale.js';import {E as EFFORTS$1,M as MAX_WATCHED_FILES,v as validateEnv,g as getCatalogs,l as launchPipeline,r as requireProvider,a as validateModelAndEffort,b as getInstalledProviders,F as ForgeService}from'./chunk-service.js';import {i as isTerminalStatus,r as reasonFromText,M as MODES$1,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS,b as inheritContinuedProviders,S as STAGE_PROMPTS,v as validateSpec,s as startPipeline,c as readPipeline,m as missingPipelineError,j as jobDir,d as jobFile,F as FILES,e as readAcceptance,f as isWorkerIdle,p as providerNames,g as isMode,h as cancelPipeline,k as isTerminalForgeStatus}from'./chunk-normalize.js';import os from'node:os';import {execFile}from'node:child_process';import'node:url';import'node:timers/promises';import'node:fs/promises';import'node:readline';//#region rolldown:runtime
 var __create = Object.create;
 var __defProp = Object.defineProperty;
 var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
@@ -25450,6 +25450,8 @@ async function jobDiff(d, { runningTurnPending = false } = {}) {
     if (d.changedFiles.length === 0) {
         return { diff: '', diffNote: runningTurnPending ? "No files changed yet; the running turn's files are added when it finishes." : 'No files changed.' };
     }
+    if (!existsSync(d.cwd))
+        return { diff: null, diffNote: `No diff: ${d.cwd} no longer exists.` };
     try {
         const [tracked, untracked] = await Promise.all([
             git(d.cwd, ['diff', '--no-color', head, '--', ...d.changedFiles]),
@@ -25662,6 +25664,7 @@ const CAPABILITIES_OUTPUT = open({
         }, ['name', 'available']) },
     aliases: open({}),
     aliasConfigErrors: strings(),
+    warning: typed('string', 'Why provider discovery failed.'),
     modes: { type: 'array', items: open({ name: typed('string'), description: typed('string'), readOnly: typed('boolean'), runsCommands: typed('boolean') }, ['name']) },
     efforts: typed('string'),
 }, ['providers']);
@@ -25693,7 +25696,7 @@ const LAUNCHES = { readOnlyHint: false, openWorldHint: true };
 const modeDescription = MODES$1.map(m => `${m}: ${MODE_PRESETS[m].description}`).join(' | ');
 const RAW_TOOL_DEFS = [
     { name: 'list_capabilities', annotations: { title: 'List capabilities', ...READ_ONLY }, description: `List installed providers with their coding models, efforts and defaults. Use it to choose provider, model or effort for spawn_job or run_pipeline; an invalid choice is rejected with the valid ones. A provider with no defaultModel uses its CLI's own default when model is omitted. Effort is one of ${EFFORTS.join(', ')}; a model lists the efforts it accepts when the provider reports them. Concise by default: a provider with many models gives a count, and provider lists them all. response_format detailed returns every discovered model, including non-coding ones, with labels and job modes.`, inputSchema: schema({ refresh: { type: 'boolean', default: false, description: 'Bypass the discovery cache.' }, provider: { type: 'string', enum: PROVIDERS, description: 'Only this provider, with its full model list.' }, response_format: responseFormat }) },
-    { name: 'spawn_job', annotations: { title: 'Spawn job', ...LAUNCHES }, description: 'Delegate one task to an external coding agent; returns a job ID at once while the worker runs in the background. Name the worker: follow_up and steer address it by name. provider defaults to a configured default, else the only installed provider; list_capabilities lists valid providers, models and efforts. checks define done: the worker sees them, they run when it succeeds, and status reports acceptance (accepted, rejected or unchecked) apart from execution; acceptance.pending means they are still running. The ack reports permissions (unrestricted, readOnlyEnforced) and any warnings. env sets worker environment variables; only the names are recorded. from reuses an earlier worker\'s request; arguments passed here override it, and a different provider drops its model, effort and unrestricted. variants starts one independent job per entry; the ack is {jobs: [one ack or {name, error} each]}.', inputSchema: schema({
+    { name: 'spawn_job', annotations: { title: 'Spawn job', ...LAUNCHES }, description: 'Delegate one task to an external coding agent; returns a job ID at once while the worker runs in the background. Name the worker: follow_up and steer address it by name. provider defaults to a configured default, else the only installed provider; list_capabilities lists valid providers, models and efforts. checks define done: the worker sees them, they run when it succeeds, and status reports acceptance (accepted, rejected or unchecked) apart from execution; acceptance.pending means the verdict is not in yet. The ack reports permissions (unrestricted, readOnlyEnforced) and any warnings. env sets worker environment variables; only the names are recorded. from reuses an earlier worker\'s request; arguments passed here override it, and a different provider drops its model, effort and unrestricted. variants starts one independent job per entry; the ack is {jobs: [one ack or {name, error} each]}.', inputSchema: schema({
             mode: { type: 'string', enum: [...MODES$1], description: `Required unless from is set. ${modeDescription}` }, prompt: { ...string, description: 'The task. Required unless from is set.' },
             from: { ...string, description: 'Worker name, workerId, or job ID whose request to reuse.' },
             variants: { type: 'array', minItems: 1, maxItems: 8, description: 'One job per entry, each overriding name, provider, model or effort.', items: { type: 'object', additionalProperties: false, properties: { name: { ...string, maxLength: 80 }, provider: { type: 'string', enum: PROVIDERS }, model: string, effort: { type: 'string', enum: EFFORTS } } } }, context: contextSchema, files: filesSchema, name: { ...string, description: 'Worker name, kept across turns.' }, task: { ...string, description: 'Short label; defaults to the first prompt line.' }, cwd: { type: 'string', description: 'Absolute existing working directory. Defaults to the server repository.' },
@@ -25822,18 +25825,26 @@ function parseStages(raw) {
         return { name: text(s, 'name', true), agentName: text(s, 'agentName'), workerId: text(s, 'workerId'), conversation: text(s, 'conversation'), continues: text(s, 'continues'), provider: allowed(s, 'provider', PROVIDERS), model: text(s, 'model'), effort: allowed(s, 'effort', EFFORTS$1), prompt: text(s, 'prompt'), context: contextText(s), title: text(s, 'title'), role: text(s, 'role'), dependsOn, consumes, workDir: text(s, 'workDir'), resultPath: text(s, 'resultPath'), timeoutMs: number(s, 'timeoutMs'), routingPinned: boolean(s, 'routingPinned'), checks: parseChecks(s.checks), env: validateEnv(s.env, 'env') };
     }));
 }/** Default providers and the default implement/review/moderate pipeline, chosen from what is installed. */
-async function installedCatalogs(ctx, refresh = false) {
+async function discoverCatalogs(ctx, refresh = false) {
     try {
-        return await (ctx.catalogs ?? (() => getCatalogs({ refresh })))();
+        const catalogs = await (ctx.catalogs ?? (() => getCatalogs({ refresh })))();
+        const failedAll = catalogs.length === 1 && catalogs[0]?.provider === '*' ? catalogs[0] : undefined;
+        if (failedAll)
+            return { catalogs: [], error: failedAll.error ?? 'provider discovery failed' };
+        return { catalogs };
     }
-    catch {
-        return [];
+    catch (err) {
+        return { catalogs: [], error: err instanceof Error ? err.message : String(err) };
     }
 }
 /** The provider to use when none is configured: the only installed one. Never a guess between several. */
-function defaultProvider(installed, onMany) {
-    if (installed.length === 0)
+function defaultProvider(installed, onMany, discoveryError) {
+    if (installed.length === 0) {
+        if (discoveryError !== undefined) {
+            throw new Error(`Provider discovery failed (${discoveryError}).`);
+        }
         throw new Error(`No coding agent installed: install one of ${PROVIDERS.join(', ')}.`);
+    }
     if (installed.length > 1) {
         const list = installed.join(', ');
         throw new Error(onMany ? onMany(list) : `provider is required: installed are ${list}.`);
@@ -25848,14 +25859,14 @@ async function defaultMixedPipeline(input, catalogs) {
             : input.stages;
         return { name: input.name, stages, workDir: input.workDir, concurrency: input.concurrency };
     }
-    const cats = await installedCatalogs({ catalogs });
+    const { catalogs: cats, error: discoveryError } = await discoverCatalogs({ catalogs });
     const installed = cats.map(c => c.provider);
     const stage = (name, extra) => {
         const rd = input.modelConfig ? resolveRequest({ mode: name }, input.modelConfig) : undefined;
         if (rd?.source === 'roleDefault' && rd.provider) {
             return { name, provider: rd.provider, model: input.models?.[name] ?? rd.model, effort: input.efforts?.[name] ?? rd.effort, role: name, routingPinned: true, ...extra };
         }
-        const provider = defaultProvider(installed, list => `pass stages with a provider each: installed are ${list}.`);
+        const provider = defaultProvider(installed, list => `pass stages with a provider each: installed are ${list}.`, discoveryError);
         const cat = cats.find(c => c.provider === provider);
         const cfg = cat?.defaultSource === 'harness-config';
         return { name, provider, model: input.models?.[provider] ?? input.models?.[name] ?? (cfg ? cat?.defaultModel : undefined),
@@ -25920,6 +25931,13 @@ function slimAck(ack) {
     };
     return Object.fromEntries(Object.entries(out).filter(([, v]) => v !== undefined));
 }
+async function resolveDefaultProvider(ctx) {
+    if (ctx.catalogs) {
+        const { catalogs, error } = await discoverCatalogs(ctx);
+        return defaultProvider(catalogs.map(c => c.provider), undefined, error);
+    }
+    return defaultProvider(await getInstalledProviders());
+}
 async function spawnOne(ctx, args) {
     const mode = allowed(args, 'mode', MODES$1);
     if (mode === undefined)
@@ -25927,7 +25945,7 @@ async function spawnOne(ctx, args) {
     const cfg = loadModelConfig({ repo: ctx.service.repo });
     const rawProvider = allowed(args, 'provider', PROVIDERS);
     const resolved = resolveRequest({ provider: rawProvider, model: text(args, 'model'), effort: allowed(args, 'effort', EFFORTS$1), mode }, cfg);
-    const provider = resolved.provider ?? defaultProvider(ctx.catalogs ? (await installedCatalogs(ctx)).map(c => c.provider) : await getInstalledProviders());
+    const provider = resolved.provider ?? await resolveDefaultProvider(ctx);
     const notes = [...resolved.warnings, ...cfg.errors.map(e => `models.json: ${e}`)];
     const withNotes = (ack) => ({ ...slimAck(ack), provider: ack.provider ?? provider, ...(resolved.appliedAlias ? { aliasApplied: resolved.appliedAlias, aliasSource: resolved.source } : {}), ...(notes.length ? { warnings: [...(ack.warnings ?? []), ...notes] } : {}) });
     const checks = parseChecks(args.checks);
@@ -26031,7 +26049,7 @@ const spawnJob = async (ctx, args) => {
     }, cfg).provider;
     const requests = variants.map((v, i) => overlay(shared, { ...v, name: names[i] }, baseProvider));
     let fallbackProvider;
-    const getFallbackProvider = async () => fallbackProvider ??= defaultProvider(ctx.catalogs ? (await installedCatalogs(ctx)).map(c => c.provider) : await getInstalledProviders());
+    const getFallbackProvider = async () => fallbackProvider ??= await resolveDefaultProvider(ctx);
     const resolvedProviders = [];
     for (const r of requests) {
         const resolved = resolveRequest({ provider: allowed(r, 'provider', PROVIDERS), model: text(r, 'model'), effort: allowed(r, 'effort', EFFORTS$1), mode }, cfg);
@@ -26272,6 +26290,24 @@ const cancelJob = async (ctx, args) => {
     });
     return json(out);
 };
+async function validatePipelineStages(ctx, stages) {
+    let stubbed;
+    const catalogOf = (provider) => ctx.catalogs
+        ? (stubbed ??= discoverCatalogs(ctx).then(r => r.catalogs)).then(all => all.find(c => c.provider === provider))
+        : ctx.service.catalogFor(provider);
+    const warnings = [];
+    for (const stage of stages) {
+        try {
+            const provider = requireProvider(stage.provider);
+            const checked = await validateModelAndEffort(provider, stage.model, stage.effort, () => catalogOf(provider.name));
+            warnings.push(...checked.warnings.map(w => `stage '${stage.name}': ${w}`));
+        }
+        catch (err) {
+            throw new Error(`stage '${stage.name}': ${err instanceof Error ? err.message : String(err)}`);
+        }
+    }
+    return warnings;
+}
 const runPipeline = async (ctx, args) => {
     const raw = record(args.spec, 'spec');
     keys(raw, ['name', 'task', 'workDir', 'concurrency', 'unrestricted', 'stages']);
@@ -26279,11 +26315,12 @@ const runPipeline = async (ctx, args) => {
     const task = text(raw, 'task', stages === undefined);
     const spec = await defaultMixedPipeline({ name: text(raw, 'name', true), task: task ?? '', stages, workDir: text(raw, 'workDir') ?? ctx.service.repo, concurrency: number(raw, 'concurrency', 32), modelConfig: loadModelConfig({ repo: ctx.service.repo }) }, ctx.catalogs);
     validateSpec(spec);
+    const warnings = await validatePipelineStages(ctx, spec.stages);
     const run = ctx.service.supervisorUrl
         ? await launchPipeline(ctx.service, spec, { unrestricted: boolean(raw, 'unrestricted') })
         : startPipeline(ctx.service, spec, { unrestricted: boolean(raw, 'unrestricted') });
     void run.done.catch(err => process.stderr.write(`agent-smith pipeline ${run.runId}: ${String(err)}\n`));
-    return json({ runId: run.runId, repo: ctx.service.repo, stages: spec.stages.map(s => ({ name: s.name, provider: s.provider, ...(s.dependsOn?.length ? { dependsOn: s.dependsOn } : {}) })) });
+    return json({ runId: run.runId, repo: ctx.service.repo, stages: spec.stages.map(s => ({ name: s.name, provider: s.provider, ...(s.dependsOn?.length ? { dependsOn: s.dependsOn } : {}) })), ...(warnings.length ? { warnings } : {}) });
 };
 const HANDLERS = {
     list_capabilities: listCapabilitiesTool, spawn_job: spawnJob, follow_up: followUp, steer,
@@ -26306,7 +26343,10 @@ async function callTool(ctx, name, rawArgs) {
     }
 }
 async function listCapabilities(ctx, refresh, fmt, only) {
-    const cats = ctx.catalogs ? await installedCatalogs(ctx) : await installedCatalogs({ catalogs: () => getCatalogs({ refresh, repo: ctx.service.repo }) });
+    const { catalogs: cats, error: discoveryError } = ctx.catalogs
+        ? await discoverCatalogs(ctx)
+        : await discoverCatalogs({ catalogs: () => getCatalogs({ refresh, repo: ctx.service.repo }) });
+    const warning = discoveryError ? `Provider discovery failed (${discoveryError}).` : undefined;
     const installed = new Set(cats.map(c => c.provider));
     const all = [
         ...cats.map(c => ({ name: c.provider, available: true, defaultModel: c.defaultModel, defaultEffort: c.defaultEffort, defaultSource: c.defaultSource,
@@ -26319,12 +26359,14 @@ async function listCapabilities(ctx, refresh, fmt, only) {
     if (fmt === 'concise') {
         return {
             providers: conciseCapabilities(providers, only),
+            ...(warning ? { warning } : {}),
             ...(aliases.aliases.length || Object.keys(aliases.roleDefaults).length ? { aliases } : {}),
             ...(modelConfig.errors.length ? { aliasConfigErrors: modelConfig.errors } : {}),
         };
     }
     return {
         providers,
+        ...(warning ? { warning } : {}),
         aliases,
         ...(modelConfig.errors.length ? { aliasConfigErrors: modelConfig.errors } : {}),
         modes: MODES$1.map(name => ({ name, description: MODE_PRESETS[name].description, readOnly: MODE_PRESETS[name].readOnly, runsCommands: MODE_PRESETS[name].runsCommands })),

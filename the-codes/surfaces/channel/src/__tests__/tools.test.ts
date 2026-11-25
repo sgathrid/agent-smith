@@ -46,6 +46,9 @@ test('spawn_job with no configured default: the only installed provider, else a 
   assert.equal(many.isError, true); assert.match((many.content as { text: string }[])[0]!.text, /provider is required: installed are agy, codex\./);
   const none = await callTool({ service, catalogs: async () => [] } as unknown as HandlerContext, 'spawn_job', { mode: 'review', prompt: 'x' });
   assert.equal(none.isError, true); assert.match((none.content as { text: string }[])[0]!.text, /No coding agent installed/);
+  const broken = await callTool({ service, catalogs: async () => { throw new Error('cli crashed'); } } as unknown as HandlerContext, 'spawn_job', { mode: 'review', prompt: 'x' });
+  assert.equal(broken.isError, true);
+  assert.equal(text(broken), 'Provider discovery failed (cli crashed).');
   assert.equal(seen.length, 1);
 });
 
@@ -61,10 +64,16 @@ test('list_capabilities reports catalogs, errors and modes without throwing', as
   assert.equal(codex.available, true); assert.equal(codex.models[0].id, 'codex-m'); assert.equal(codex.defaultSource, 'harness-config');
   assert.equal(claude.error, 'boom');
   assert.equal(r.providers.find((p: any) => p.name === 'agy').available, false);
+  assert.equal(r.warning, undefined);
   assert.deepEqual(r.modes.map((m: any) => m.name), ['implement', 'review', 'moderate', 'verify']);
   assert.equal(typeof r.efforts, 'string');
   const failing = { service: { repo: mkdtempSync(path.join(tmpdir(), 'agent-smith-tools-')) } as never, catalogs: async () => { throw new Error('x'); } } as HandlerContext;
-  assert.equal((await callTool(failing, 'list_capabilities', {})).isError, undefined);
+  const failedConcise = await callTool(failing, 'list_capabilities', {});
+  assert.equal(failedConcise.isError, undefined);
+  assert.equal(body(failedConcise).warning, 'Provider discovery failed (x).');
+  const failedDetailed = await callTool(failing, 'list_capabilities', { response_format: 'detailed' });
+  assert.equal(failedDetailed.isError, undefined);
+  assert.equal(body(failedDetailed).warning, 'Provider discovery failed (x).');
 });
 
 test('annotations are present', () => {
@@ -89,6 +98,7 @@ test('default pipeline derives providers from installed catalogs', async () => {
   assert.deepEqual(one.stages.map(s => s.provider), ['codex', 'codex', 'codex']);
   assert.equal(one.stages[0]!.model, 'codex-m'); assert.equal(one.stages[0]!.effort, 'high');
   await assert.rejects(defaultMixedPipeline({ name: 'p', task: 't' }, async () => []), /No coding agent installed: install one of agy, codex, opencode, claude, kimi\./);
+  await assert.rejects(defaultMixedPipeline({ name: 'p', task: 't' }, async () => { throw new Error('cli crashed'); }), /discovery failed.*cli crashed/i);
 });
 
 test('run_pipeline stages accept continues, inherit its provider, and reject a bad spec before starting anything', async () => {
@@ -111,6 +121,58 @@ test('run_pipeline stages accept continues, inherit its provider, and reject a b
     const r = await run(fix);
     assert.equal(r.isError, true); assert.match(text(r), message);
   }
+});
+
+test('run_pipeline validates stage models and efforts against catalogs before launching, including continues and warnings', async () => {
+  const fresh = (provider: string, models: ModelCatalog['models'], extra: Partial<ModelCatalog> = {}): ModelCatalog => ({
+    provider, models, defaultModel: models[0]?.id, defaultSource: 'harness-config', source: 'live', stale: false, verified: true, ...extra,
+  });
+  let spawned = 0;
+  const service = withWorkerLookup({ repo: mkdtempSync(path.join(tmpdir(), 'agent-smith-pipe-val-')), spawnTracked: async () => { spawned += 1; throw new Error('should not launch'); } }) as never;
+  const ctx = { service, catalogs: async () => [
+    fresh('agy', [{ id: 'agy-m', label: 'Agy', efforts: ['low', 'high'], defaultEffort: 'low' }]),
+    fresh('codex', [{ id: 'mini', label: 'Mini', efforts: ['low'], defaultEffort: 'low' }]),
+    fresh('kimi', [{ id: 'kimi-m', label: 'Kimi', efforts: [], defaultEffort: undefined }]),
+    fresh('opencode', [{ id: 'oc-m', label: 'OC', efforts: [] }], { verified: false }),
+  ] } as HandlerContext;
+
+  const badModel = await callTool(ctx, 'run_pipeline', { spec: { name: 'p', stages: [
+    { name: 'build', provider: 'agy', prompt: 'b' },
+    { name: 'review', provider: 'agy', model: 'x', prompt: 'r', dependsOn: ['build'] },
+  ] } });
+  assert.equal(badModel.isError, true);
+  assert.match(text(badModel), /^stage 'review': unknown model "x" for agy\. Valid model ids: agy-m\.$/);
+
+  const badEffort = await callTool(ctx, 'run_pipeline', { spec: { name: 'p', stages: [
+    { name: 'review', provider: 'codex', model: 'mini', effort: 'high', prompt: 'r' },
+  ] } });
+  assert.equal(badEffort.isError, true);
+  assert.match(text(badEffort), /^stage 'review': effort "high" is not valid for codex model "mini"\. Valid efforts: low\.$/);
+
+  const badContinued = await callTool(ctx, 'run_pipeline', { spec: { name: 'p', stages: [
+    { name: 'build', provider: 'agy', prompt: 'b' },
+    { name: 'fix', continues: 'build', model: 'nope', prompt: 'f', dependsOn: ['build'] },
+  ] } });
+  assert.equal(badContinued.isError, true);
+  assert.match(text(badContinued), /^stage 'fix': unknown model "nope" for agy\. Valid model ids: agy-m\.$/);
+  assert.equal(spawned, 0);
+
+  const okService = { repo: mkdtempSync(path.join(tmpdir(), 'agent-smith-pipe-ok-')) } as never;
+  const okCtx = { ...ctx, service: okService } as HandlerContext;
+  const warned = await callTool(okCtx, 'run_pipeline', { spec: { name: 'p', stages: [
+    { name: 'a', provider: 'opencode', model: 'oc-x', prompt: 'a' },
+    { name: 'b', provider: 'kimi', effort: 'high', prompt: 'b' },
+  ] } });
+  assert.equal(warned.isError, undefined, text(warned));
+  assert.equal(body(warned).warnings.length, 2);
+  assert.match(body(warned).warnings[0], /could not verify model "oc-x" for opencode/);
+  assert.match(body(warned).warnings[1], /kimi has no per-run effort flag/);
+
+  const clean = await callTool(okCtx, 'run_pipeline', { spec: { name: 'p', stages: [
+    { name: 'a', provider: 'agy', model: 'agy-m', effort: 'high', prompt: 'a' },
+  ] } });
+  assert.equal(clean.isError, undefined, text(clean));
+  assert.equal('warnings' in body(clean), false);
 });
 
 test('explicit stages are unchanged', async () => {

@@ -154,6 +154,7 @@ const CAPABILITIES_OUTPUT = open({
   }, ['name', 'available']) },
   aliases: open({}),
   aliasConfigErrors: strings(),
+  warning: typed('string', 'Why provider discovery failed.'),
   modes: { type: 'array', items: open({ name: typed('string'), description: typed('string'), readOnly: typed('boolean'), runsCommands: typed('boolean') }, ['name']) },
   efforts: typed('string'),
 }, ['providers']);
