@@ -17,7 +17,7 @@ test('named completion notices lead with status and leave the worker summary out
   const batch = buildBatch([cand(job({ name: 'smoke-codex', role: 'review', provider: 'codex',
     status: 'succeeded', startedAt: '2026-10-03T16:39:17Z', finishedAt: '2026-10-03T16:40:00Z',
     changedFileCount: 0, summarySource: 'worker', latestSummary: 'Complete sentence. ' + 'preserved '.repeat(80) }))], NOW);
-  assert.match(batch.content!, /^Agent Smith · ✓ smoke-codex \(codex review\) 43s · done\n/);
+  assert.match(batch.content!, /^Agent Smith · ✓ smoke-codex \(codex review\) · done · 43s\n/);
   assert.doesNotMatch(batch.content!, /0 files changed/, 'no change is not a fact worth a clause');
   assert.doesNotMatch(batch.content!, /Worker summary|Complete sentence|preserved/, 'the worker summary is not repeated in the notice');
   assert.match(batch.content!, /\nstatus [^\n]+$/);
@@ -170,6 +170,7 @@ test('the failure message is terse, specific, and ends with the next step', () =
       cand(
         job({
           id: 'implement-musm82da-f1dc1fe4',
+          workerId: 'w-f1dc1fe40001',
           status: 'failed',
           warned: true,
           failureReason: 'agy exited 1',
@@ -182,7 +183,7 @@ test('the failure message is terse, specific, and ends with the next step', () =
   );
   const text = batch.content!;
   assert.ok(text.includes('job implement-musm82da-f1dc1fe4 · failed: exit 1'), text);
-  assert.match(text, /\nstatus implement-musm82da-f1dc1fe4$/);
+  assert.match(text, /\nstatus w-f1dc1fe40001$/);
   assert.ok(text.length < 220, `message is ${text.length} chars: ${text}`);
 });
 
@@ -197,7 +198,7 @@ test('a duration is claimed only from a real start, never from the last event', 
     [cand(job({ status: 'failed', startedAt: '2026-10-03T16:12:00Z', finishedAt: '2026-10-03T16:40:00Z' }))],
     NOW,
   );
-  assert.ok(long.content!.includes('28m · failed'), long.content!);
+  assert.ok(long.content!.includes('failed: worker error · 28m'), long.content!);
 });
 
 test('an unwarned success is not dressed up as suspicious', () => {
@@ -252,14 +253,14 @@ test('toNotice passes continuationKind for steers and resumes without steeredFro
   assert.equal((resumed as { continuationKind?: unknown }).continuationKind, 'follow-up');
 });
 
-test('a turn handed off to a follow-up is not pushed; the head carries the turns it also ran', async () => {
+test('a turn handed off to a follow-up is not pushed; the head carries the turns it covered', async () => {
   const { toNotice } = await import('../policy.ts');
   const done = { status: 'succeeded' as const, finishedAt: '2026-10-03T16:40:00Z' };
   assert.equal(shouldPush(cand(job({ ...done, followedBy: 'turn-2' }))), false);
   assert.equal(shouldPush(cand(job({ ...done, supersededBy: 'turn-2' }))), false);
   assert.equal(shouldPush(cand(job({ ...done, acceptancePending: true }))), false);
-  const head = toNotice(job({ ...done, continuationKind: 'follow-up', alsoRan: { from: 1, to: 2 }, droppedMessage: 'rerun' }), 'finished', NOW);
-  assert.deepEqual([head.alsoRan, head.droppedMessage], [{ from: 1, to: 2 }, 'rerun']);
+  const head = toNotice(job({ ...done, continuationKind: 'follow-up', turns: { from: 1, to: 3 }, droppedMessage: 'rerun' }), 'finished', NOW);
+  assert.deepEqual([head.turns, head.droppedMessage], [{ from: 1, to: 3 }, 'rerun']);
 });
 
 test('toWatchStatus: a long open command is running; a stopped heartbeat is attention', async () => {

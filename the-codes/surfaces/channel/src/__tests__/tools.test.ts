@@ -8,7 +8,8 @@ import { TOOL_DEFS, callTool, defaultMixedPipeline, type HandlerContext } from '
 import { readAcceptance, writeAcceptance } from '../../../../forge/checks.ts';
 import { writePipelineRecord } from '../../../../forge/execute.ts';
 import { ForgeService } from '../../../../forge/service.ts';
-import type { ModelCatalog } from '../../../../providers/types.ts';
+import type { ModelCatalog, Provider } from '../../../../providers/types.ts';
+import { resetCatalogCacheForTest } from '../../../../providers/catalog.ts';
 import { withWorkerLookup } from './service-mock.ts';
 
 const cat = (provider: string, extra: Partial<ModelCatalog> = {}): ModelCatalog => ({
@@ -814,4 +815,90 @@ test('status wait_ms on a worker waits until it is idle; on a job ID only until 
   const byWorker = body(await callTool(ctx, 'status', { id: 'w-ada', wait_ms: 2_000 }));
   assert.ok(Date.now() - started >= 50, 'did not return while a follow-up was queued');
   assert.deepEqual([byWorker.jobId, byWorker.turn, byWorker.stillRunning], ['implement-smith-2', 2, false]);
+});
+
+test('failed availability probe is listed by list_capabilities and reported by default-provider spawn', async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-probe-'));
+  const broken = {
+    name: 'agy',
+    available: async () => { throw new Error('EACCES: agy'); },
+    spawn: async () => { throw new Error('unused'); },
+    listModels: async () => { throw new Error('should not be called'); },
+  } as unknown as Provider;
+  const absent = {
+    name: 'codex',
+    available: async () => false,
+    spawn: async () => { throw new Error('unused'); },
+  } as unknown as Provider;
+  try {
+    resetCatalogCacheForTest({ providers: () => [broken, absent] });
+    const service = withWorkerLookup({ repo, spawnJob: async () => ({ jobId: 'j' }) });
+    const ctx = { service } as unknown as HandlerContext;
+
+    const concise = body(await callTool(ctx, 'list_capabilities', {}));
+    const agyConcise = concise.providers.find((p: any) => p.name === 'agy');
+    assert.equal(agyConcise.error, 'EACCES: agy');
+    assert.equal(agyConcise.available, false);
+
+    const detailed = body(await callTool(ctx, 'list_capabilities', { response_format: 'detailed' }));
+    const agyDetailed = detailed.providers.find((p: any) => p.name === 'agy');
+    assert.equal(agyDetailed.error, 'EACCES: agy');
+    assert.equal(agyDetailed.available, false);
+
+    const spawned = await callTool(ctx, 'spawn_job', { mode: 'review', prompt: 'x' });
+    assert.equal(spawned.isError, true);
+    const errText = (spawned.content as { text: string }[])[0]!.text;
+    assert.match(errText, /agy/);
+    assert.match(errText, /EACCES: agy/);
+    assert.doesNotMatch(errText, /No coding agent installed/);
+
+    await assert.rejects(
+      defaultMixedPipeline({ name: 'p', task: 't' }),
+      (err: Error) => err.message.includes('agy') && err.message.includes('EACCES: agy') && !err.message.includes('No coding agent installed'),
+    );
+  } finally {
+    resetCatalogCacheForTest();
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('installed provider with failing model discovery stays available: true and is picked as default provider', async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-models-err-'));
+  const installedBrokenModels = {
+    name: 'agy',
+    available: async () => true,
+    spawn: async () => { throw new Error('unused'); },
+    listModels: async () => { throw new Error('models endpoint down'); },
+  } as unknown as Provider;
+  const absent = {
+    name: 'codex',
+    available: async () => false,
+    spawn: async () => { throw new Error('unused'); },
+  } as unknown as Provider;
+  const seen: Array<Record<string, unknown>> = [];
+  try {
+    resetCatalogCacheForTest({ providers: () => [installedBrokenModels, absent] });
+    const service = withWorkerLookup({ repo, spawnJob: async (req: Record<string, unknown>) => { seen.push(req); return { jobId: 'j' }; } });
+    const ctx = { service } as unknown as HandlerContext;
+
+    const concise = body(await callTool(ctx, 'list_capabilities', {}));
+    const agyConcise = concise.providers.find((p: any) => p.name === 'agy');
+    assert.equal(agyConcise.available, true);
+    assert.equal(agyConcise.error, 'models endpoint down');
+
+    const detailed = body(await callTool(ctx, 'list_capabilities', { response_format: 'detailed' }));
+    const agyDetailed = detailed.providers.find((p: any) => p.name === 'agy');
+    assert.equal(agyDetailed.available, true);
+    assert.equal(agyDetailed.error, 'models endpoint down');
+
+    const spawned = await callTool(ctx, 'spawn_job', { mode: 'review', prompt: 'x' });
+    assert.equal(spawned.isError, undefined);
+    assert.equal(seen[0]!.provider, 'agy');
+
+    const pipeline = await defaultMixedPipeline({ name: 'p', task: 't' });
+    assert.deepEqual(pipeline.stages.map(s => s.provider), ['agy', 'agy', 'agy']);
+  } finally {
+    resetCatalogCacheForTest();
+    rmSync(repo, { recursive: true, force: true });
+  }
 });

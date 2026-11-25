@@ -214,7 +214,14 @@ export async function readForgeDetail(fs: FsLike, repo: string, id: string, now:
       typeof item.input === 'string' && typeof item.output === 'string' && typeof item.state === 'string') return [item as ActivityEvent];
     return [];
   }) : [];
+  const messages = Array.isArray(view?.messages) ? view.messages.flatMap(value => {
+    const item = record(value);
+    if (!item || typeof item.text !== 'string') return [];
+    const sender: 'follow_up' | 'steer' | null = item.sender === 'steer' ? 'steer' : item.sender === 'follow_up' ? 'follow_up' : null;
+    return sender ? [{ sender, text: item.text }] : [];
+  }) : [];
   return { job: { ...job, report, prompt: firstText(view?.prompt), preamble: firstText(view?.preamble),
+    ...(messages.length > 0 ? { messages } : {}),
     warnings: [...job.warnings, ...(view === null ? [{code:'detail_unavailable',message:'This older job has no detail snapshot; summary and report are shown.'}] : [])] }, timeline,
     truncated: view?.truncated === true };
 }

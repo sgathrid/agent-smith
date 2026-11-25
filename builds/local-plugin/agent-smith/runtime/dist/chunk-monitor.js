@@ -1,4 +1,4 @@
-import path from'node:path';import {fileURLToPath}from'node:url';import {r as reasonFromText,a9 as readJsonSafe,aa as pipelineRecordPath,A as AgentSmithReader,u as normalize,e as readAcceptance,Q as normalizeContinuationKind,k as isTerminalForgeStatus,W as WORKERS_DIR,f as isWorkerIdle,N as jobsDir,j as jobDir,a4 as pickHead,ab as workerIndexPath,O as parseWorkerIndex}from'./chunk-normalize.js';import {a as claudeText,d as droppedMessageQuote,b as pipelineOutcome,A as ACCEPTANCE_HOLD_MS,l as livenessOf,w as waitForChange}from'./chunk-stale.js';function pushKindFor(job) {
+import path from'node:path';import {fileURLToPath}from'node:url';import {r as reasonFromText,ac as readJsonSafe,ad as pipelineRecordPath,A as AgentSmithReader,x as normalize,e as readAcceptance,T as normalizeContinuationKind,l as isTerminalForgeStatus,W as WORKERS_DIR,g as isWorkerIdle,O as jobsDir,j as jobDir,a7 as pickHead,ae as workerIndexPath,Q as parseWorkerIndex}from'./chunk-normalize.js';import {a as claudeText,d as droppedMessageQuote,b as pipelineOutcome,A as ACCEPTANCE_HOLD_MS,l as livenessOf,w as waitForChange}from'./chunk-stale.js';function pushKindFor(job) {
     switch (job.status) {
         case 'succeeded':
             return 'finished';
@@ -54,9 +54,11 @@ function toNotice(job, kind, now) {
         ? (job.liveness?.since == null ? NaN : now - job.liveness.since)
         : kind === 'attention'
             ? (job.lastEventAt === null ? NaN : now - Date.parse(job.lastEventAt))
-            : (start && job.finishedAt ? Date.parse(job.finishedAt) - Date.parse(start) : NaN);
+            : typeof job.durationMs === 'number' && Number.isFinite(job.durationMs)
+                ? job.durationMs
+                : (start && job.finishedAt ? Date.parse(job.finishedAt) - Date.parse(start) : NaN);
     return {
-        id: job.id, kind, name: job.name ?? null, provider: job.provider ?? null, role: job.role ?? null,
+        id: job.id, ...(job.workerId ? { workerId: job.workerId } : {}), kind, name: job.name ?? null, provider: job.provider ?? null, role: job.role ?? null,
         run,
         durationMs: Number.isFinite(span) ? span : null,
         changedFiles: job.changedFileCount ?? null,
@@ -67,7 +69,7 @@ function toNotice(job, kind, now) {
         ...(job.continuationKind ? { continuationKind: job.continuationKind } : {}),
         ...(job.steerNotApplied ? { steerNotApplied: true } : {}),
         ...(job.droppedMessage ? { droppedMessage: job.droppedMessage } : {}),
-        ...(job.alsoRan ? { alsoRan: job.alsoRan } : {}),
+        ...(job.turns ? { turns: job.turns } : {}),
         ...(kind === 'finished' && job.checksRunning !== undefined ? { checksRunning: job.checksRunning } : {}),
         ...(kind === 'attention' && job.liveness ? { liveness: { state: job.liveness.state, ...(job.liveness.tool ? { tool: job.liveness.tool } : {}) } } : {}),
     };
@@ -274,7 +276,36 @@ async function followWorkerHead(cwd, rootId, root, now, readJobFn, readIndexFn) 
         rows.set(row.id, row);
         head = pickHead([...rows.values()].map((r) => ({ ...watchTurn(r), row: r }))).row;
     }
-    return { head, missingNextId };
+    return { head, rows, missingNextId };
+}
+function watchTurnDurationMs(job) {
+    if (!job.startedAt || !job.finishedAt)
+        return null;
+    const start = Date.parse(job.startedAt);
+    const end = Date.parse(job.finishedAt);
+    return Number.isFinite(start) && Number.isFinite(end) && end >= start ? end - start : null;
+}
+function coveredWatchTurns(fromTurn, head, rows) {
+    const to = head.turn ?? 1;
+    const from = fromTurn ?? to;
+    const range = from < to ? { from, to } : to > 1 ? { from: to, to } : null;
+    if (!range)
+        return {};
+    if (range.from >= range.to)
+        return { turns: range };
+    let sum = 0;
+    let count = 0;
+    for (const r of rows.values()) {
+        const tNum = r.turn ?? 1;
+        if (tNum < range.from || tNum > range.to)
+            continue;
+        const span = watchTurnDurationMs(r);
+        if (span !== null) {
+            sum += span;
+            count += 1;
+        }
+    }
+    return count > 1 ? { turns: range, durationMs: sum } : { turns: range };
 }
 async function runJobWatch(options) {
     const recheckMs = Math.max(50, options.intervalMs ?? WATCH_RECHECK_MS);
@@ -306,7 +337,7 @@ async function runJobWatch(options) {
                     continue;
                 }
                 w.rootTurn ??= root.turn ?? 1;
-                const { head, missingNextId } = await followWorkerHead(options.cwd, w.root, root, t, rj, ri);
+                const { head, rows, missingNextId } = await followWorkerHead(options.cwd, w.root, root, t, rj, ri);
                 if (missingNextId !== null)
                     watchDirs.push(safeJobDir(options.cwd, missingNextId));
                 if (w.head !== null && w.head !== head.id)
@@ -315,8 +346,7 @@ async function runJobWatch(options) {
                 if (root.workerId)
                     watchDirs.push(path.join(options.cwd, WORKERS_DIR));
                 watchDirs.push(safeJobDir(options.cwd, head.id));
-                const turn = head.turn ?? 1;
-                const announced = w.rootTurn !== null && turn > w.rootTurn ? { ...head, alsoRan: { from: w.rootTurn, to: turn - 1 } } : head;
+                const announced = head.status === 'attention' ? head : { ...head, ...coveredWatchTurns(w.rootTurn, head, rows) };
                 if (head.status === 'attention' || isWorkerIdle(watchTurn(head))) {
                     candidates.push(announced);
                     if (isWorkerIdle(watchTurn(head)))

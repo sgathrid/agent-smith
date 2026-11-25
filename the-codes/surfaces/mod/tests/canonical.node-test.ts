@@ -54,10 +54,11 @@ test('canonical detail parses a read message event and tolerates its absence', a
   ];
   const detail = await readForgeDetail(memoryFs({
     [`${base}/job.json`]: JSON.stringify(manifest),
-    [`${base}/view.json`]: JSON.stringify({ schema: 1, timeline }),
+    [`${base}/view.json`]: JSON.stringify({ schema: 1, timeline, messages: [{ sender: 'follow_up', text: 'Fix lint first.' }] }),
   }), '/repo', 'job-a', now);
   assert.deepEqual(detail?.timeline.map((e) => e.kind), ['assistant', 'message']);
   assert.deepEqual(detail?.timeline[1], { kind: 'message', sequence: 1, at: '2026-10-08T10:00:01Z', text: 'Stop and fix lint first.', delivery: 'next-step', sender: 'steer' });
+  assert.deepEqual(detail?.job.messages, [{ sender: 'follow_up', text: 'Fix lint first.' }]);
 });
 
 test('canonical silence is attention, not failure', async () => {

@@ -38,6 +38,7 @@ export const ACCEPTANCE_HOLD_MS = 5 * 60_000;
 
 export interface NoticeJob {
   readonly id: string;
+  readonly workerId?: string;
   readonly kind: NoticeKind;
   readonly name?: string | null;
   readonly provider?: string | null;
@@ -51,7 +52,7 @@ export interface NoticeJob {
   readonly continuationKind?: NoticeContinuationKind | null;
   readonly steerNotApplied?: boolean;
   readonly droppedMessage?: string;
-  readonly alsoRan?: { readonly from: number; readonly to: number };
+  readonly turns?: { readonly from: number; readonly to: number };
   readonly run?: boolean;
   readonly checksRunning?: string | true;
   readonly liveness?: { readonly state: 'silent' | 'dead'; readonly tool?: string };
@@ -100,16 +101,17 @@ export function headline(job: NoticeJob): string {
   const bad = rejected(job);
   const awaiting = job.kind === 'finished' && !job.run && !bad && job.checksRunning !== undefined;
   const glyph = bad ? GLYPH.failed : awaiting ? '…' : GLYPH[job.kind];
-  const parts: string[] = [`${glyph} ${who(job)}${d && job.kind !== 'attention' ? ` ${d}` : ''}`];
+  const parts: string[] = [`${glyph} ${who(job)}`];
   switch (job.kind) {
     case 'finished':
       if (job.run) parts.push(reason || 'done');
       else if (bad) parts.push(checksReason(job.checks?.failed ?? []));
       else if (awaiting) {
         parts.push('exited', typeof job.checksRunning === 'string' ? `checks running: ${job.checksRunning}` : 'checks pending');
+      } else if (job.checks && job.checks.total > 0) {
+        parts.push(`checks ${job.checks.passed}/${job.checks.total}`);
       } else {
         parts.push('done');
-        if (job.checks && job.checks.total > 0) parts.push(`checks ${job.checks.passed}/${job.checks.total}`);
       }
       break;
     case 'failed': parts.push(job.run ? reason || 'failed' : `failed${reason ? `: ${reason}` : ''}`); break;
@@ -119,9 +121,11 @@ export function headline(job: NoticeJob): string {
       else parts.push(`no output${d ? ` for ${d}` : ''}${job.liveness?.tool ? ` (in \`${job.liveness.tool}\`)` : ''}`);
       break;
   }
-  if (job.continuationKind === 'follow-up') parts.push('follow-up');
-  else if (job.continuationKind === 'steer') parts.push('steered');
-  if (job.alsoRan) parts.push(job.alsoRan.from === job.alsoRan.to ? `also ran turn ${job.alsoRan.from}` : `also ran turns ${job.alsoRan.from}–${job.alsoRan.to}`);
+  if (d && job.kind !== 'attention') parts.push(d);
+  if (job.turns) {
+    if (job.turns.from < job.turns.to) parts.push(`turns ${job.turns.from}–${job.turns.to}`);
+    else if (job.turns.to > 1) parts.push(`turn ${job.turns.to}`);
+  }
   if (job.steerNotApplied) parts.push(`queued follow-up not sent${job.droppedMessage ? `: "${compactExcerpt(job.droppedMessage, 80)}"` : ''}`);
   if (job.staleReads && job.staleReads.length > 0) {
     const first = job.staleReads[0]!;
@@ -149,7 +153,7 @@ export function claudeText(jobs: readonly NoticeJob[]): string {
   const listed = jobs.slice(0, CLAUDE_JOBS);
   for (const job of listed) lines.push(`${one ? 'Agent Smith · ' : ''}${headline(job)}`);
   if (jobs.length > CLAUDE_JOBS) lines.push(`…and ${jobs.length - CLAUDE_JOBS} more; list_jobs shows them.`);
-  const ids = (run: boolean) => listed.filter((j) => !!j.run === run).map((j) => j.id);
+  const ids = (run: boolean) => listed.filter((j) => !!j.run === run).map((j) => (run ? j.id : j.workerId ?? j.id));
   if (ids(false).length > 0) lines.push(`status ${ids(false).join(', ')}`);
   if (ids(true).length > 0) lines.push(`pipeline_status ${ids(true).join(', ')}`);
   return lines.join('\n');
@@ -374,7 +378,7 @@ export function noticeFromRadar(job: NoticeRow, kind: NoticeKind, now: number): 
       ? (job.liveness ? job.liveness.silentForMs : job.lastEventAt != null ? now - job.lastEventAt : null)
       : (job.endedAt != null && start != null ? job.endedAt - start : null);
   return {
-    id: job.id, kind, name: job.name, provider: job.provider, role: job.role,
+    id: job.id, ...(job.workerId ? { workerId: job.workerId } : {}), kind, name: job.name, provider: job.provider, role: job.role,
     durationMs: span,
     changedFiles: job.changedFileCount ?? null,
     checks: checks.length > 0
@@ -505,9 +509,36 @@ export function noticeTurn(row: NoticeRow): TurnLike {
   };
 }
 
-function alsoRan(fromTurn: number | undefined, head: NoticeRow): { from: number; to: number } | null {
-  const turn = head.turn ?? 1;
-  return fromTurn !== undefined && fromTurn < turn ? { from: fromTurn, to: turn - 1 } : null;
+function coveredTurns(fromTurn: number | undefined, head: NoticeRow): { from: number; to: number } | null {
+  const to = head.turn ?? 1;
+  const from = fromTurn ?? to;
+  if (from < to) return { from, to };
+  return to > 1 ? { from: to, to } : null;
+}
+
+function rowDurationMs(row: NoticeRow): number | null {
+  return row.startedAt != null && row.endedAt != null && row.endedAt >= row.startedAt
+    ? row.endedAt - row.startedAt
+    : null;
+}
+
+function coveredDurationMs(
+  turns: readonly NoticeRow[],
+  range: { from: number; to: number } | null,
+): number | null {
+  if (!range || range.from >= range.to) return null;
+  let sum = 0;
+  let count = 0;
+  for (const t of turns) {
+    const turn = t.turn ?? 1;
+    if (turn < range.from || turn > range.to) continue;
+    const span = rowDurationMs(t);
+    if (span !== null) {
+      sum += span;
+      count += 1;
+    }
+  }
+  return count > 1 ? sum : null;
 }
 
 export function due(
@@ -617,12 +648,12 @@ export function due(
       continue;
     }
     if (head.acceptance?.pending === true && kind !== 'finished' && !held(head, now)) {
-      if (current.readHead !== head.id) pushNotice(withAlso(noticeFromRadar(head, kind, now), alsoRan(current.fromTurn, head)));
+      if (current.readHead !== head.id) pushNotice(withTurns(noticeFromRadar(head, kind, now), coveredTurns(current.fromTurn, head), turns));
       continue;
     }
     if (head.acceptance?.pending === true) {
       if (!held(head, now) && !current.saidExited && current.readHead !== head.id) {
-        pushNotice(withAlso(noticeFromRadar(head, kind, now), alsoRan(current.fromTurn, head)));
+        pushNotice(withTurns(noticeFromRadar(head, kind, now), coveredTurns(current.fromTurn, head), turns));
         current = { ...current, saidExited: true };
       }
       if (now <= current.until) pushKeep(current);
@@ -633,13 +664,22 @@ export function due(
       continue;
     }
     if (current.readHead === head.id) continue;
-    pushNotice(withAlso(noticeFromRadar(head, kind, now), current.saidExited ? null : alsoRan(current.fromTurn, head)));
+    pushNotice(withTurns(noticeFromRadar(head, kind, now), coveredTurns(current.fromTurn, head), turns));
   }
   return { notices, owned: keep };
 }
 
-function withAlso(notice: NoticeJob, also: { from: number; to: number } | null): NoticeJob {
-  return also === null ? notice : { ...notice, alsoRan: also };
+function withTurns(
+  notice: NoticeJob,
+  range: { from: number; to: number } | null,
+  turns: readonly NoticeRow[],
+): NoticeJob {
+  const durationMs = coveredDurationMs(turns, range);
+  return {
+    ...notice,
+    ...(range !== null ? { turns: range } : {}),
+    ...(durationMs !== null ? { durationMs } : {}),
+  };
 }
 
 function held(job: NoticeRow, now: number): boolean {

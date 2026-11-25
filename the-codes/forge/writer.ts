@@ -30,6 +30,7 @@ import {
   type ForgeView,
   type ForgeViewEvent,
   type MessageSender,
+  type TurnMessage,
   type WatchedFileSigs,
 } from './format.ts';
 import type { JobResult, ProviderEvent, WorkerHandle } from '../providers/types.ts';
@@ -57,6 +58,7 @@ export interface StartInput {
   readonly cwd: string;
   readonly prompt: string;
   readonly preamble?: string;
+  readonly messages?: readonly TurnMessage[] | undefined;
   readonly unrestricted: boolean;
   readonly conversation: string | null;
   readonly timeoutMs: number;
@@ -125,8 +127,15 @@ export class JobWriter {
     const now = new Date().toISOString();
     const turn = typeof input.turn === 'number' && Number.isInteger(input.turn) && input.turn >= 1 ? input.turn : 1;
     const chainStartedAt = input.chainStartedAt ?? now;
-    this.view = { ...this.view, prompt: input.prompt.slice(0, 64_000), preamble: input.preamble?.slice(0, 4_000) ?? null,
-      truncated: input.prompt.length > 64_000 || (input.preamble?.length ?? 0) > 4_000 };
+    this.view = {
+      ...this.view,
+      prompt: input.prompt.slice(0, 64_000),
+      preamble: input.preamble?.slice(0, 4_000) ?? null,
+      ...(input.messages !== undefined && input.messages.length > 0
+        ? { messages: input.messages.map((m) => ({ sender: m.sender, text: m.text.slice(0, 64_000) })) }
+        : {}),
+      truncated: input.prompt.length > 64_000 || (input.preamble?.length ?? 0) > 4_000,
+    };
     this.conversation = input.conversation;
     const manifest: ForgeManifest = {
       schema: SCHEMA_VERSION,
@@ -440,7 +449,7 @@ export class JobWriter {
     this.latestText = appendBounded(this.latestText ?? '', event.text, LATEST_TEXT_CHARS);
     this.currentMessage = appendBounded(this.currentMessage, event.text, LATEST_TEXT_CHARS);
     this.noteFirstEvent(false);
-    this.manifest = { ...this.manifest, latestSummary: summaryTail(this.currentMessage, SUMMARY_CHARS) || this.manifest.latestSummary || null, summarySource: 'worker' };
+    this.manifest = { ...this.manifest, latestSummary: summaryHead(this.currentMessage, SUMMARY_CHARS) || this.manifest.latestSummary || null, summarySource: 'worker' };
     this.touch(at);  }
 
   verdictFacts(): { cwdMissing: boolean; writing: boolean } {
@@ -503,7 +512,7 @@ export class JobWriter {
       ...(this.toolErrorSteps.size === 0 ? {} : { toolErrors: this.toolErrorSteps.size }),
       ...(failedEarly ? { failedEarly: true } : {}),
       conversation: this.conversation,
-      latestSummary: summaryTail(response, SUMMARY_CHARS) || this.manifest.latestSummary || null,
+      latestSummary: summaryHead(response, SUMMARY_CHARS) || this.manifest.latestSummary || null,
       summarySource: response || this.manifest.latestSummary ? 'worker' : null,
       ...(this.changed === null
         ? { changedFilesUnknown: true }
@@ -790,15 +799,16 @@ export function appendBounded(base: string, add: string, max: number): string {
   return joined.slice(joined.length - max);
 }
 
-export function summaryTail(text: string, max: number): string {
+export function summaryHead(text: string, max: number): string {
   const t = text.trim().replace(/^Status:[^\n]*(?:\n|$)/, '').trim();
   if (t.length <= max) return t;
-  const tail = t.slice(t.length - max);
+  const head = t.slice(0, max);
+  if (t[max] === '\n') return head.trim();
   for (const sep of ['\n\n', '\n']) {
-    const i = tail.indexOf(sep);
-    if (i >= 0 && tail.slice(i).trim() !== '') return tail.slice(i).trim();
+    const i = head.lastIndexOf(sep);
+    if (i >= 0 && head.slice(0, i).trim() !== '') return head.slice(0, i).trim();
   }
-  return tail.trim();
+  return head.trim();
 }
 
 function reportText(repo: string, jobId: string): string {

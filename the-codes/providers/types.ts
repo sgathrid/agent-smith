@@ -142,6 +142,8 @@ export interface Provider {
    */
   readonly supportsEffort?: boolean;
 
+  readonly defaultUnrestricted?: boolean | 'always';
+
   /**
    * True when a running worker accepts messages mid-turn (WorkerHandle.send and
    * the 'user-message' event). Absent means false. Only claude has it.
@@ -175,6 +177,7 @@ export interface ModelCatalog {
   stale: boolean;
   verified: boolean;
   error?: string;
+  probeFailed?: boolean;
 }
 
 export interface ListModelsOptions {

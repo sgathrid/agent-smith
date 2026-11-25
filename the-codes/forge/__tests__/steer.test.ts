@@ -52,9 +52,8 @@ test('steer(queue): coalesces multiple queued steers, opens child anchor before 
   const turn2 = await turn2Ready;
   assert.equal(turn2.spec.conversation, 'thread-shell');
   assert.match(turn2.spec.prompt, /^Context: Needed by consumers\./);
-  assert.match(turn2.spec.prompt, /\[FOLLOW-UP STEER · 2 queued updates\]/);
-  assert.match(turn2.spec.prompt, /\[Steer 1 \([^)]+\)\]\nAlso export NavItemProps\./);
-  assert.match(turn2.spec.prompt, /\[Steer 2 \([^)]+\)\]\nAnd add keyboard shortcuts\./);
+  assert.match(turn2.spec.prompt, /Your previous turn completed\./);
+  assert.match(turn2.spec.prompt, /1\. Also export NavItemProps\.\n\n2\. And add keyboard shortcuts\./);
 
   turn2.finish({ status: 'success', response: 'Exported NavItemProps interface and wired keyboard shortcuts into the component.' });
 
@@ -103,7 +102,7 @@ test('steer(interrupt): cancels active turn, records supersededBy on parent, and
 
   const turn2 = await turn2Ready;
   assert.equal(turn2.spec.conversation, 'thread-interrupt');
-  assert.match(turn2.spec.prompt, /\[TURN INTERRUPTED\]/);
+  assert.match(turn2.spec.prompt, /^Your previous turn was interrupted with updated instructions\. Inspect your working tree before repeating any completed steps\./);
   assert.match(turn2.spec.prompt, /Stop sidebar; move navigation to the profile menu\./);
 
   const parentManifest = JSON.parse(readFileSync(jobFile(repo, ack.jobId, FILES.job), 'utf8'));
@@ -154,7 +153,7 @@ test('steer(interrupt) before conversation ID arrives fails closed unless allowF
 
   const turn2 = await turn2Ready;
   assert.equal(turn2.spec.conversation, undefined);
-  assert.match(turn2.spec.prompt, /\[FRESH CONTINUATION\]/);
+  assert.match(turn2.spec.prompt, /This starts a fresh conversation\./);
   assert.match(turn2.spec.prompt, /orchestrating agent/);
   assert.match(turn2.spec.prompt, /Updated task instructions\./);
 
@@ -448,7 +447,7 @@ test('queue steer when provider reports no conversation ID chains a fresh contin
 
   const t2 = await t2Ready;
   assert.equal(t2.spec.conversation, undefined);
-  assert.match(t2.spec.prompt, /\[FRESH CONTINUATION\]/);
+  assert.match(t2.spec.prompt, /This starts a fresh conversation\./);
   assert.match(t2.spec.prompt, /Queued follow-up without conversation ID\./);
 
   t2.finish({ status: 'success', response: 'Finished fresh continuation turn 2.' });
@@ -527,28 +526,39 @@ test('a writing turn whose cwd vanished fails, and its queued follow-up is still
   assert.equal(ctrl.turns.length, 2);
 });
 
-test('buildSteeredPrompt trims bloat on resumed continuations and keeps excerpt only when fresh', () => {
-  const entry = (id: string, createdAt: string, prompt: string) => ({
-    id, createdAt, prompt, delivery: 'queue' as const,
+test('buildSteeredPrompt emits plain sentences without bracketed tags or uppercase labels', () => {
+  const singleCompleted = buildSteeredPrompt({
+    wasInterrupted: false,
+    priorStatus: 'succeeded',
+    freshContinuation: false,
+    responseTail: 'Ignored tail.',
+    entries: [{ prompt: 'Fix the review findings.' }],
+    brief: '',
   });
+  assert.equal(
+    singleCompleted.rawPrompt,
+    'Your previous turn completed.\n\nFix the review findings.',
+  );
 
   const resumedInterrupt = buildSteeredPrompt({
     wasInterrupted: true,
     freshContinuation: false,
     responseTail: 'Previous partial output that is already in thread history.',
-    entries: [entry('s1', '2026-11-24T10:00:00.000Z', 'Switch to approach B.')],
+    entries: [{ prompt: 'Switch to approach B.' }],
     syncedFiles: ['docs/spec.md'],
     verdict: 'Checks failed: test',
     brief: '',
   });
-  assert.match(resumedInterrupt.rawPrompt, /^\[TURN INTERRUPTED\]\n/);
-  assert.doesNotMatch(resumedInterrupt.rawPrompt, /\[STEERED TURN CONTINUITY\]/);
-  assert.doesNotMatch(resumedInterrupt.rawPrompt, /Last response excerpt/);
-  assert.doesNotMatch(resumedInterrupt.rawPrompt, /tool call\(s\)/);
-  assert.match(resumedInterrupt.rawPrompt, /Inspect your working tree before repeating any completed steps\./);
-  assert.match(resumedInterrupt.rawPrompt, /Synced brief file\(s\) in your working tree: docs\/spec\.md/);
-  assert.match(resumedInterrupt.rawPrompt, /Checks failed: test/);
-  assert.match(resumedInterrupt.rawPrompt, /\[ORCHESTRATOR UPDATE\]\nSwitch to approach B\./);
+  assert.equal(
+    resumedInterrupt.rawPrompt,
+    [
+      'Your previous turn was interrupted with updated instructions. Inspect your working tree before repeating any completed steps.',
+      'Synced brief file(s) in your working tree: docs/spec.md (re-read before continuing).',
+      'Checks failed: test',
+      '',
+      'Switch to approach B.',
+    ].join('\n'),
+  );
 
   const resumedMulti = buildSteeredPrompt({
     wasInterrupted: false,
@@ -556,26 +566,70 @@ test('buildSteeredPrompt trims bloat on resumed continuations and keeps excerpt 
     freshContinuation: false,
     responseTail: 'Already in thread history.',
     entries: [
-      entry('s1', '2026-11-24T10:00:00.000Z', 'First update.'),
-      entry('s2', '2026-11-24T10:01:00.000Z', 'Second update.'),
+      { prompt: 'First update.' },
+      { prompt: 'Second update.' },
     ],
     brief: '',
   });
-  assert.match(resumedMulti.rawPrompt, /^\[FOLLOW-UP STEER · 2 queued updates\]\nYour previous turn completed\./);
-  assert.doesNotMatch(resumedMulti.rawPrompt, /Last response excerpt/);
-  assert.match(resumedMulti.rawPrompt, /\[Steer 1 \(2026-11-24T10:00:00\.000Z\)\]\nFirst update\./);
-  assert.match(resumedMulti.rawPrompt, /\[Steer 2 \(2026-11-24T10:01:00\.000Z\)\]\nSecond update\./);
+  assert.equal(
+    resumedMulti.rawPrompt,
+    'Your previous turn completed.\n\n1. First update.\n\n2. Second update.',
+  );
 
   const fresh = buildSteeredPrompt({
     wasInterrupted: false,
     priorStatus: 'failed',
     freshContinuation: true,
     responseTail: 'Tail from the previous turn.',
-    entries: [entry('s1', '2026-11-24T10:00:00.000Z', 'Retry the fix.')],
+    entries: [{ prompt: 'Retry the fix.' }],
     brief: '',
   });
-  assert.match(fresh.rawPrompt, /^\[FRESH CONTINUATION\]\nYour previous turn ended failed\./);
-  assert.doesNotMatch(fresh.rawPrompt, /\[STEERED TURN CONTINUITY\]/);
-  assert.match(fresh.rawPrompt, /Last response excerpt from previous turn:\nTail from the previous turn\./);
-  assert.match(fresh.rawPrompt, /\[ORCHESTRATOR UPDATE\]\nRetry the fix\./);
+  assert.equal(
+    fresh.rawPrompt,
+    'Your previous turn ended failed. This starts a fresh conversation.\nLast response excerpt from previous turn:\nTail from the previous turn.\n\nRetry the fix.',
+  );
+});
+
+test('a continuation turn stores its starting messages in view.json and its first label in manifest task', async () => {
+  const ctrl = controlledProvider();
+  const { service, repo } = makeService(ctrl.provider);
+  const readTask = (id: string) => (JSON.parse(readFileSync(jobFile(repo, id, FILES.job), 'utf8')) as { task?: string }).task;
+  const readMessages = (id: string) => (JSON.parse(readFileSync(jobFile(repo, id, FILES.view), 'utf8')) as { messages?: unknown }).messages;
+
+  const t1Ready = ctrl.nextTurn();
+  const { ack, done: done1 } = await service.spawnTracked({ mode: 'implement', name: 'Ada', prompt: '# Refactor the links engine\n\nFull details.' });
+  const t1 = await t1Ready;
+  t1.emit({ kind: 'started', at: new Date().toISOString(), conversationId: 'conv-1' });
+  t1.finish({ status: 'success', response: 'Done.' });
+  await done1;
+  assert.equal(readTask(ack.jobId), 'Refactor the links engine');
+  assert.equal(readMessages(ack.jobId), undefined);
+
+  const t2Ready = ctrl.nextTurn();
+  const f1 = await service.followUp({ worker: ack.jobId, prompt: '\n\n# Fix the review findings\n\nMore details.' });
+  assert.equal(f1.action, 'started');
+  const t2 = await t2Ready;
+  t2.emit({ kind: 'started', at: new Date().toISOString(), conversationId: 'conv-1' });
+  const q1 = await service.followUp({ worker: f1.jobId!, prompt: 'Interrupt with new plan\nDetails', context: 'c' });
+  assert.equal(q1.action, 'queued');
+  const q2 = await service.steer({ worker: f1.jobId!, prompt: 'Also check edge cases' });
+  assert.equal(q2.action, 'interrupting');
+
+  const t3Ready = ctrl.nextTurn();
+  t2.finish({ status: 'cancelled', response: 'Stopped.' });
+  const t3 = await t3Ready;
+  t3.finish({ status: 'success', response: 'Done 3.' });
+  const t3JobId = await waitFor(async () => {
+    const m = JSON.parse(readFileSync(jobFile(repo, f1.jobId!, FILES.job), 'utf8')) as { supersededBy?: string };
+    return m.supersededBy ?? null;
+  });
+  await waitFor(async () => (await service.detail(t3JobId)).status === 'succeeded');
+
+  assert.equal(readTask(f1.jobId!), 'Fix the review findings');
+  assert.deepEqual(readMessages(f1.jobId!), [{ sender: 'follow_up', text: '\n\n# Fix the review findings\n\nMore details.' }]);
+  assert.equal(readTask(t3JobId), 'Interrupt with new plan');
+  assert.deepEqual(readMessages(t3JobId), [
+    { sender: 'follow_up', text: 'Interrupt with new plan\nDetails' },
+    { sender: 'steer', text: 'Also check edge cases' },
+  ]);
 });

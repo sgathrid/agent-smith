@@ -65,6 +65,11 @@ export interface SteerEntry {
 
 export type MessageSender = 'follow_up' | 'steer';
 
+export interface TurnMessage {
+  readonly sender: MessageSender;
+  readonly text: string;
+}
+
 export interface MessageOverrides {
   readonly checks?: readonly { readonly name: string; readonly command: string; readonly cwd?: string; readonly timeoutMs?: number; readonly blocking?: boolean }[] | undefined;
   readonly model?: string | undefined;
@@ -240,6 +245,7 @@ export interface ForgeView {
   readonly schema: 1;
   readonly prompt: string;
   readonly preamble: string | null;
+  readonly messages?: readonly TurnMessage[];
   readonly truncated: boolean;
   readonly transcript: readonly string[];
   readonly timeline?: readonly ForgeViewEvent[];
@@ -286,6 +292,10 @@ export function newJobId(mode: string): string {
   const safeMode = mode.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 120).replace(/-+$/g, '');
   const prefix = safeMode === '' ? 'job' : safeMode;
   return `${prefix}-${ID_MARKER}-${randomBytes(4).toString('hex')}`;
+}
+
+export function newWorkerId(): string {
+  return `w-${randomBytes(6).toString('hex')}`;
 }
 
 export function taskTitle(prompt: string): string {

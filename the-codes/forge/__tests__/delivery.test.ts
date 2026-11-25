@@ -540,13 +540,29 @@ test('env: keys a worker ever had stay tracked; kept only when every key has a v
   t4.finish({ status: 'success', response: 'ok' });
 });
 
-test('env passed with a queued follow_up is kept for the next owner, with a warning', async () => {
+test('env passed with a queued follow_up is deferred for the next owner, with a warning', async () => {
   const repo = newRepo(); const ctrl = controlledProvider(); const s = serviceOn(repo, ctrl.provider);
   const { t1 } = await startWorker(s, ctrl);
   const fu = await s.followUp({ worker: 'w', prompt: 'q', env: { K: 'v' } });
   assert.equal(fu.action, 'queued');
-  assert.equal(fu.env, 'kept');
+  assert.equal(fu.env, 'deferred');
   assert.match(fu.warnings?.join('\n') ?? '', /env applies from the next new turn/);
+  const t2Ready = ctrl.nextTurn();
+  t1.finish({ status: 'success', response: 'ok' });
+  (await t2Ready).finish({ status: 'success', response: 'ok' });
+});
+
+test('follow_up queued on a running worker warns about unsupported effort and unrestricted: false at enqueue', async () => {
+  const repo = newRepo();
+  const ctrl = controlledProvider();
+  const kimiLike: Provider = { ...ctrl.provider, name: 'kimi', supportsEffort: false, defaultUnrestricted: 'always' };
+  const s = serviceOn(repo, kimiLike);
+  const { t1 } = await startWorker(s, ctrl);
+  const fu = await s.followUp({ worker: 'w', prompt: 'q', effort: 'high', unrestricted: false });
+  assert.equal(fu.action, 'queued');
+  const joined = fu.warnings?.join('\n') ?? '';
+  assert.match(joined, /has no per-run effort flag/);
+  assert.match(joined, /cannot restrict it/);
   const t2Ready = ctrl.nextTurn();
   t1.finish({ status: 'success', response: 'ok' });
   (await t2Ready).finish({ status: 'success', response: 'ok' });

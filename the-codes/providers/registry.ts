@@ -21,6 +21,7 @@
 import { agyBinary, agyProvider } from './agy.ts';
 import { claudeBinary, claudeProvider } from './claude.ts';
 import { codexBinary, codexProvider } from './codex.ts';
+import { errMessage } from './discovery.ts';
 import { kimiBinary, kimiProvider } from './kimi.ts';
 import { opencodeBinary, opencodeProvider } from './opencode.ts';
 import type { Provider } from './types.ts';
@@ -88,41 +89,44 @@ export interface ProviderAvailability {
   reason?: string;
 }
 
-/**
- * Which providers exist on this machine.
- *
- * IMPLEMENTATION: each Provider.available() does a PATH walk + X_OK test (see
- * binaryOnPath in ndjson.ts). Deliberately NOT a `--version` subprocess probe:
- * - four spawns on every startup is slow for a check that runs on every render;
- * - `--version` on a broken install can hang waiting on a network auth check;
- * - agy/agy models and codex/codex --version have both been observed to be
- *   slow or interactive in the past.
- *
- * The trade-off is explicit: this answers "can I exec it", NOT "is it
- * authenticated". A provider can be available and still fail its first job on
- * a 402 or a missing key. That failure arrives as a JobResult with a real error
- * string, which is where it belongs — not as a false negative in detection that
- * hides the provider from the mod.
- *
- * All four probes run concurrently. Never rejects: a provider whose probe throws
- * is reported unavailable with the reason, because detectAvailable() feeds a UI.
- */
-export async function detectAvailable(): Promise<ProviderAvailability[]> {
+export type AvailabilityStatus = 'installed' | 'not-installed' | 'failed';
+
+export interface AvailabilityProbe {
+  provider: Provider;
+  name: string;
+  status: AvailabilityStatus;
+  binary: string;
+  reason?: string;
+}
+
+export async function probeAvailability(providers: readonly Provider[] = PROVIDERS): Promise<AvailabilityProbe[]> {
   return Promise.all(
-    PROVIDERS.map(async (p): Promise<ProviderAvailability> => {
+    providers.map(async (p): Promise<AvailabilityProbe> => {
+      const binary = binaryFor(p.name);
       try {
         const ok = await p.available();
-        return { name: p.name, available: ok, binary: binaryFor(p.name) };
+        return { provider: p, name: p.name, status: ok ? 'installed' : 'not-installed', binary };
       } catch (err) {
         return {
+          provider: p,
           name: p.name,
-          available: false,
-          binary: binaryFor(p.name),
-          reason: err instanceof Error ? err.message : String(err),
+          status: 'failed',
+          binary,
+          reason: errMessage(err),
         };
       }
     }),
   );
+}
+
+export async function detectAvailable(): Promise<ProviderAvailability[]> {
+  const probes = await probeAvailability(PROVIDERS);
+  return probes.map((p) => ({
+    name: p.name,
+    available: p.status === 'installed',
+    binary: p.binary,
+    ...(p.reason !== undefined ? { reason: p.reason } : {}),
+  }));
 }
 
 /**

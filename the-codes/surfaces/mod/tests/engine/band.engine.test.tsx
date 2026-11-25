@@ -398,6 +398,10 @@ test('a long run of completed read calls folds into one expandable row, leaving 
   expect(await pane.find({key:'event-6'})).toBeDefined();
 
   await pane.press({key:'group-0'});
+  const expandedGroup = await pane.find({key:'group-0'}) as {props?: Record<string,unknown>} | undefined;
+  expect(String(expandedGroup?.props?.label)).toBe('▾ read 3 files · 1 search');
+  expect(expandedGroup?.props?.dimColor).toBe(false);
+  expect(await pane.find({key:'body-group-0'})).toBeDefined();
   expect(await pane.find({key:'event-0'})).toBeDefined();
   expect(await pane.find({key:'event-3'})).toBeDefined();
 });
@@ -485,10 +489,10 @@ test('the worker view is one scroll: header, task, transcript, then result and f
   await start($);
   await $.command.run({command:'forge',args:'Ada'});
   const pane = await $.ui.mount(PANE_TARGET);
-  expect(await pane.find({type:'Text',text:/codex·gpt-6-sol · 5s/})).toBeDefined();
-  expect(await pane.find({key:'task',text:/Task: Long task instructions/})).toBeDefined();
+  expect(await pane.find({type:'Text',text:/Ada · reviewer · gpt-6-sol · 5s/})).toBeDefined();
+  expect(await pane.find({type:'Text',text:/Task: Long task instructions/})).toBeDefined();
   expect(await pane.find({type:'Markdown',text:/Mode preamble/})).toBeUndefined();
-  expect(await pane.find({type:'Text',text:'Following live output.'})).toBeDefined();
+  expect(await pane.find({type:'Text',text:'Following live output.'})).toBeUndefined();
   expect(await pane.find({key:'tab-activity'})).toBeUndefined();
   await pane.press({key:'task'});
   expect(await pane.find({type:'Markdown',text:'Mode preamble\n\nLong task instructions'})).toBeDefined();
@@ -532,7 +536,8 @@ test('scrolling up pauses following and scrolling back to the end resumes it', a
   await clock.advance(3000);
   expect(ends()).toBe(before);
   await $.ui.scroll({...person,offset:20,by:10} as never);
-  expect(await pane.find({type:'Text',text:'Following live output.'})).toBeDefined();
+  expect(await pane.find({type:'Text',text:/^Paused/})).toBeUndefined();
+  expect(await pane.find({type:'Text',text:'Following live output.'})).toBeUndefined();
 });
 
 test('canonical acceptance refreshes in an open worker view; a read failure keeps the rows', async ($, on) => {
@@ -750,6 +755,7 @@ test('ANSI escapes and control bytes in failed tool output, warnings, check outp
   expect(await pane.find({ type: 'Text', text: /Denied rm\nsecond line/ })).toBeDefined();
   expect(await pane.find({ type: 'Text', text: /Warn retry/ })).toBeDefined();
   expect(await pane.find({ type: 'Markdown', text: 'Heading bold\nline 2' })).toBeDefined();
+  await pane.press({ key: 'event-1' });
   expect(await pane.find({ type: 'Text', text: /error\[E0425\]: cannot find value\n10%\n100%/ })).toBeDefined();
   expect(await pane.find({ type: 'Markdown', text: 'Final report\nclean' })).toBeDefined();
   expect(await pane.find({ type: 'Text', text: '✗ clippy! · exit 1' })).toBeDefined();
@@ -820,7 +826,7 @@ describe('completion notices', () => {
     return { ...r, said };
   }
   const ada = (status: string, more: Record<string, unknown> = {}) => canonicalJob('job-ada',
-    {status,name:'Ada',provider:'codex',role:'review',...more},
+    {status,name:'Ada',workerId:'w-ada',provider:'codex',role:'review',...more},
     status === 'running' ? {} : {'acceptance.json':JSON.stringify({state:'accepted',checks:[{name:'tests',ok:true},{name:'lint',ok:true}]})});
 
   test('a finished owned job: the hook stands down, no ui.log, one prompt.submit', async ($, on) => {
@@ -840,7 +846,7 @@ describe('completion notices', () => {
     expect(said.logs).toEqual([]);
     expect(said.prompts).toHaveLength(1);
     expect(said.origins[0]?.asUser).not.toBe(true);
-    expect(said.prompts[0]).toMatch(/^Agent Smith · ✓ Ada \(codex review\) 44s · done · checks 2\/2\nstatus job-ada$/);
+    expect(said.prompts[0]).toMatch(/^Agent Smith · ✓ Ada \(codex review\) · checks 2\/2 · 44s\nstatus w-ada$/);
   });
 
   const settledRead = ($: any, id: string, more: Record<string, unknown> = {}) =>
@@ -920,18 +926,18 @@ describe('completion notices', () => {
   });
 
   test('a variants ack with two jobs announces both jobs when both finish', async ($, on) => {
-    const files = { ...ada('running'), ...canonicalJob('job-bo', { status: 'running', name: 'Bo', provider: 'codex', role: 'review' }) };
+    const files = { ...ada('running'), ...canonicalJob('job-bo', { status: 'running', name: 'Bo', workerId: 'w-bo', provider: 'codex', role: 'review' }) };
     const { clock, said } = noticeHost(on, files, ['job-ada', 'job-bo']);
     await start($);
     await $.tool.call({ tool: 'mcp__plugin_agent-smith_agent-smith__spawn_job', variantJobs: ['job-ada', 'job-bo'], repo: '/work' });
     Object.assign(files, ada('succeeded', { finishedAt: iso(RUNNING_NOW + 1000) }),
-      canonicalJob('job-bo', { status: 'succeeded', name: 'Bo', provider: 'codex', role: 'review', finishedAt: iso(RUNNING_NOW + 1000) },
+      canonicalJob('job-bo', { status: 'succeeded', name: 'Bo', workerId: 'w-bo', provider: 'codex', role: 'review', finishedAt: iso(RUNNING_NOW + 1000) },
         { 'acceptance.json': JSON.stringify({ state: 'accepted', checks: [] }) }));
     await clock.advance(3000);
     await clock.advance(3000);
     await clock.advance(3000);
     expect(said.prompts).toHaveLength(1);
-    expect(said.prompts[0]).toMatch(/status job-ada, job-bo/);
+    expect(said.prompts[0]).toMatch(/status w-ada, w-bo/);
     const all = said.prompts.join('\n');
     expect(all).toMatch(/Ada/);
     expect(all).toMatch(/Bo/);
@@ -961,16 +967,24 @@ describe('completion notices', () => {
     expect(said.hookRuns).toBe(1);
   });
 
-  test('a notice row drops the host frame, even drawn expanded under its speaker label', async ($, on) => {
+  test('a notice row drops the host frame and status line, even via stored or marketplace origin', async ($, on) => {
     on('ui.render', { component: 'UserMessage' }, ($: any, e: any) => $.ui.resolve(e).Text({ children: e.props.text }));
-    const text = 'The agent-smith plugin sent a message:\n  Agent Smith · ✓ hig-codex (codex review) 7m · done\n  status review-smith-7cdfd099\n\n' +
+    const text = 'The agent-smith plugin sent a message:\n  Agent Smith · ✓ hig-codex (codex review) · done · 7m\n  status review-smith-7cdfd099\n\n' +
       "  This is how Claude Code surfaces a prompt a plugin submits between turns — it starts this turn in the user's place. Address the message above.";
     for (const isExpanded of [false, true]) {
       const row = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', component: 'UserMessage', requestId: `row-${isExpanded}`,
         props: { text, origin: { kind: 'plugin', name: 'agent-smith' }, isExpanded } } as never);
-      expect(await row.find({ type: 'Text', text: /^Agent Smith · ✓ hig-codex \(codex review\) 7m · done$/ })).toBeDefined();
+      expect(await row.find({ type: 'Text', text: /^Agent Smith · ✓ hig-codex \(codex review\) · done · 7m$/ })).toBeDefined();
       expect(await row.find({ type: 'Text', text: /This is how Claude Code|sent a message|^status / })).toBeUndefined();
     }
+    const storedRow = await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', component: 'UserMessage', requestId: 'row-stored',
+      props: {
+        text: 'Agent Smith · ✗ ship · 1/2 stages passed · 2m\npipeline_status run-1',
+        origin: { kind: 'person' },
+        stored: { kind: 'plugin', name: 'agent-smith@local' },
+      } } as never);
+    expect(await storedRow.find({ type: 'Text', text: /^Agent Smith · ✗ ship · 1\/2 stages passed · 2m$/ })).toBeDefined();
+    expect(await storedRow.find({ type: 'Text', text: /pipeline_status/ })).toBeUndefined();
   });
 
   test("another session's job finishing in the same repo is not announced here", async ($, on) => {
@@ -1118,7 +1132,8 @@ describe('worker-first UI, inline prior turns, auto-follow, and O(active) idle p
     await clock.advance(1000);
     expect(await pane.find({ type: 'Markdown', text: '● Turn 2 live work.' })).toBeDefined();
     const priorBtn = await pane.find({ key: 'turn-job-ada-1' }) as { props?: Record<string, unknown> } | undefined;
-    expect(String(priorBtn?.props?.label)).toBe('▸ Turn 1 · steered · 14 tools · 1m12s');
+    expect(String(priorBtn?.props?.label)).toMatch(/^▸ 1  Inspect\s+steered · 1m12s$/);
+    expect(await pane.find({ type: 'Text', text: '▾ 2  Steered task' })).toBeDefined();
     expect(await pane.find({ type: 'Text', text: 'Earlier runs' })).toBeUndefined();
 
     await pane.press({ key: 'turn-job-ada-1' });
@@ -1205,5 +1220,242 @@ describe('worker-first UI, inline prior turns, auto-follow, and O(active) idle p
     await clock.advance(1_000);
     expect(host.io.reads.some((p) => p.includes('/ext-1/'))).toBe(true);
     expect(await $.command.run({ command: 'forge', args: 'all' })).toMatchObject({ text: expect.stringMatching(/1 running/) });
+  });
+
+  test('single-turn running worker renders one header line, no starting row, no turn list, and Task/Back/Close footer', async ($, on) => {
+    const files = canonicalJob('job-single', {
+      status: 'running', name: 'links1', workerId: 'links1', role: 'implement',
+      provider: 'agy', model: 'gemini-4-neon-xhigh', task: 'Refactor the links engine',
+      startedAt: iso(RUNNING_NOW - 5000), updatedAt: iso(RUNNING_NOW),
+    }, {
+      'progress.json': JSON.stringify({
+        lastEventAt: iso(RUNNING_NOW), toolCalls: 0,
+        digest: { phase: 'starting', filesRead: 0, searches: 0, edited: [], editedCount: 0, commands: 0, testRuns: 0, lastTestFailed: false, repeat: null },
+      }),
+      'view.json': JSON.stringify({ schema: 1, prompt: 'Refactor the links engine', preamble: '', truncated: false, tools: [], transcript: [], timeline: [] }),
+    });
+    forgeHost(on, files, ['job-single']);
+    await start($);
+    await launch($, 'job-single');
+    await $.command.run({ command: 'forge', args: 'links1' });
+    const pane = await $.ui.mount(PANE_TARGET);
+
+    expect(await pane.find({ type: 'Text', text: '⏺ links1 · implement · gemini-4-neon-xhigh · 5s' })).toBeDefined();
+    expect(await pane.find({ type: 'Text', text: /agy/ })).toBeUndefined();
+    expect(await pane.find({ type: 'Text', text: /turn 1/ })).toBeUndefined();
+    expect(await pane.find({ type: 'Text', text: /Starting/ })).toBeUndefined();
+    expect(await pane.find({ key: 'turn-job-single' })).toBeUndefined();
+    expect(await pane.find({ type: 'Text', text: 'Task: Refactor the links engine' })).toBeDefined();
+    expect(await pane.find({ type: 'Text', text: 'No worker activity recorded yet.' })).toBeDefined();
+    expect(await pane.find({ type: 'Text', text: 'Following live output.' })).toBeUndefined();
+    const btns = (await pane.findAll({ type: 'Button' })) as { props?: Record<string, unknown> }[];
+    expect(btns.map((b) => `${b.props?.hotkey}:${b.props?.label}`)).toEqual(['t:Task', 'b:Back', 'x:Close']);
+  });
+
+  test('three-turn worker reads task from stored messages, suppresses duplicate turn-start message, and formats turn rows without tool counts', async ($, on) => {
+    const t1Start = RUNNING_NOW - 5_448_000;
+    const t2Start = RUNNING_NOW - 288_000;
+    const t3Start = RUNNING_NOW - 5_000;
+    const steeredPrompt = 'Your previous turn completed.\n\nAfter you finish the 19 test failures, do the decided fix list';
+    const files: Record<string, string> = {
+      ...canonicalJob('job-l-1', {
+        status: 'succeeded', name: 'links2-neon', workerId: 'links2', turn: 1, role: 'implement',
+        provider: 'agy', model: 'gemini-4-neon-xhigh', task: 'Refactor the links engine',
+        startedAt: iso(t1Start), finishedAt: iso(t2Start), updatedAt: iso(t2Start), toolCalls: 614,
+      }, {
+        'acceptance.json': JSON.stringify({
+          state: 'accepted', pending: false,
+          checks: [
+            { name: 'a', ok: true, outputTail: '' }, { name: 'b', ok: true, outputTail: '' },
+            { name: 'c', ok: true, outputTail: '' }, { name: 'd', ok: true, outputTail: '' },
+          ],
+        }),
+      }),
+      ...canonicalJob('job-l-2', {
+        status: 'succeeded', name: 'links2-neon', workerId: 'links2', turn: 2, role: 'implement',
+        provider: 'agy', model: 'gemini-4-neon-xhigh', task: 'Fix the review findings',
+        startedAt: iso(t2Start), finishedAt: iso(t3Start), updatedAt: iso(t3Start), toolCalls: 41,
+      }, {
+        'acceptance.json': JSON.stringify({
+          state: 'rejected', pending: false,
+          checks: [{ name: 'lint', ok: false, outputTail: '' }],
+        }),
+      }),
+      ...canonicalJob('job-l-3', {
+        status: 'running', name: 'links2-neon', workerId: 'links2', turn: 3, role: 'implement',
+        provider: 'agy', model: 'gemini-4-neon-xhigh', task: 'Refactor the links engine',
+        startedAt: iso(t3Start), chainStartedAt: iso(t3Start), updatedAt: iso(RUNNING_NOW),
+      }, {
+        'progress.json': JSON.stringify({
+          lastEventAt: iso(RUNNING_NOW), toolCalls: 0,
+          digest: { phase: 'starting', filesRead: 0, searches: 0, edited: [], editedCount: 0, commands: 0, testRuns: 0, lastTestFailed: false, repeat: null },
+        }),
+        'view.json': JSON.stringify({
+          schema: 1, prompt: steeredPrompt, preamble: '', truncated: false, tools: [], transcript: [],
+          messages: [{ sender: 'follow_up', text: 'After you finish the 19 test failures, do the decided fix list' }],
+          timeline: [
+            { kind: 'message', sequence: 0, at: iso(RUNNING_NOW), text: 'After you finish the 19 test failures, do the decided fix list', delivery: 'turn-start', sender: 'follow_up' },
+            { kind: 'message', sequence: 1, at: iso(RUNNING_NOW + 100), text: 'Also check the empty-input edge case.', delivery: 'next-step', sender: 'follow_up' },
+          ],
+        }),
+      }),
+    };
+    forgeHost(on, files, ['job-l-1', 'job-l-2', 'job-l-3']);
+    await start($);
+    await launch($, 'job-l-1');
+    await $.command.run({ command: 'forge', args: 'links2-neon' });
+    const pane = await $.ui.mount(PANE_TARGET);
+
+    expect(await pane.find({ type: 'Text', text: '⏺ links2-neon · implement · gemini-4-neon-xhigh · turn 3 · 5s' })).toBeDefined();
+    expect(await pane.find({ type: 'Text', text: /Starting/ })).toBeUndefined();
+    const t1 = (await pane.find({ key: 'turn-job-l-1' })) as { props?: Record<string, unknown> } | undefined;
+    const t2 = (await pane.find({ key: 'turn-job-l-2' })) as { props?: Record<string, unknown> } | undefined;
+    expect(String(t1?.props?.label)).toMatch(/^▸ 1  Refactor the links engine\s+checks ✓ 4\/4 · 1h26m$/);
+    expect(String(t2?.props?.label)).toMatch(/^▸ 2  Fix the review findings\s+✗ lint · 4m43s$/);
+    expect(String(t1?.props?.label)).not.toMatch(/tools?/);
+    expect(String(t2?.props?.label)).not.toMatch(/tools?/);
+    expect(await pane.find({ type: 'Text', text: /^▾ 3  After you finish the 19 test failures, do the decided/ })).toBeDefined();
+    expect(await pane.find({ type: 'Text', text: '↳ follow-up read: After you finish the 19 test failures, do the decided fix list' })).toBeUndefined();
+    expect(await pane.find({ type: 'Text', text: '↳ follow-up read: Also check the empty-input edge case.' })).toBeDefined();
+    expect(await pane.find({ type: 'Text', text: 'Following live output.' })).toBeUndefined();
+
+    await pane.press({ key: 'task' });
+    expect(await pane.find({ type: 'Markdown', text: steeredPrompt })).toBeDefined();
+  });
+
+  test('earlier-turn rows built from manifests only (no view.json prompt) show each turn manifest task', async ($, on) => {
+    const t1Start = RUNNING_NOW - 120_000;
+    const t2Start = RUNNING_NOW - 60_000;
+    const t3Start = RUNNING_NOW - 5_000;
+    const files: Record<string, string> = {
+      ...canonicalJob('job-m-1', {
+        status: 'succeeded', name: 'Ada', workerId: 'ada', turn: 1, role: 'implement',
+        model: 'gemini-4-neon-xhigh', task: 'Refactor the links engine',
+        startedAt: iso(t1Start), finishedAt: iso(t2Start), updatedAt: iso(t2Start),
+      }),
+      ...canonicalJob('job-m-2', {
+        status: 'succeeded', name: 'Ada', workerId: 'ada', turn: 2, role: 'implement',
+        model: 'gemini-4-neon-xhigh', task: 'Fix the review findings',
+        startedAt: iso(t2Start), finishedAt: iso(t3Start), updatedAt: iso(t3Start),
+      }),
+      ...canonicalJob('job-m-3', {
+        status: 'running', name: 'Ada', workerId: 'ada', turn: 3, role: 'implement',
+        model: 'gemini-4-neon-xhigh', task: 'Verify edge cases',
+        startedAt: iso(t3Start), chainStartedAt: iso(t3Start), updatedAt: iso(RUNNING_NOW),
+      }, {
+        'view.json': JSON.stringify({
+          schema: 1,
+          prompt: 'Your previous turn completed.\n\nVerify edge cases',
+          messages: [{ sender: 'follow_up', text: 'Verify edge cases' }],
+          preamble: '', truncated: false, tools: [], transcript: [], timeline: [],
+        }),
+      }),
+    };
+    forgeHost(on, files, ['job-m-1', 'job-m-2', 'job-m-3']);
+    await start($);
+    await launch($, 'job-m-1');
+    await $.command.run({ command: 'forge', args: 'Ada' });
+    const pane = await $.ui.mount(PANE_TARGET);
+
+    const b1 = (await pane.find({ key: 'turn-job-m-1' })) as { props?: Record<string, unknown> } | undefined;
+    const b2 = (await pane.find({ key: 'turn-job-m-2' })) as { props?: Record<string, unknown> } | undefined;
+    expect(String(b1?.props?.label)).toMatch(/^▸ 1  Refactor the links engine\s+done · 1m00s$/);
+    expect(String(b2?.props?.label)).toMatch(/^▸ 2  Fix the review findings\s+done · 55s$/);
+    expect(await pane.find({ type: 'Text', text: '▾ 3  Verify edge cases' })).toBeDefined();
+  });
+
+  test('expanded tool, error, and group rows use ▾/✗ glyphs, un-dim expanded headers, and indent bodies by 2 columns per level', async ($, on) => {
+    const view = JSON.stringify({
+      schema: 1, prompt: 'Inspect', preamble: '', truncated: false, tools: [], transcript: [],
+      timeline: [
+        { kind: 'tool', sequence: 0, at: iso(RUNNING_NOW), stepIndex: 0, tool: 'Read', input: 'src/a.ts', output: 'line 1\nline 2', state: 'done' },
+        { kind: 'tool', sequence: 1, at: iso(RUNNING_NOW), stepIndex: 1, tool: 'Read', input: 'src/b.ts', output: 'b', state: 'done' },
+        { kind: 'tool', sequence: 2, at: iso(RUNNING_NOW), stepIndex: 2, tool: 'Grep', input: '{"pattern":"x"}', output: 'match', state: 'done' },
+        { kind: 'tool', sequence: 3, at: iso(RUNNING_NOW), stepIndex: 3, tool: 'Edit', input: '{"file_path":"src/c.ts"}', output: 'saved', state: 'done' },
+        { kind: 'tool', sequence: 4, at: iso(RUNNING_NOW), stepIndex: 4, tool: 'Bash', input: '{"command":"npm test"}', output: 'exit 1', state: 'error' },
+      ],
+    });
+    const files = canonicalJob('job-exp', { status: 'running', name: 'Exp', workerId: 'exp', role: 'implement' }, { 'view.json': view });
+    forgeHost(on, files, ['job-exp']);
+    await start($);
+    await launch($, 'job-exp');
+    await $.command.run({ command: 'forge', args: 'exp' });
+    const pane = await $.ui.mount(PANE_TARGET);
+
+    const collapsedEdit = (await pane.find({ key: 'event-3' })) as { props?: Record<string, unknown> } | undefined;
+    expect(String(collapsedEdit?.props?.label)).toBe('✓ editing c.ts');
+    expect(collapsedEdit?.props?.dimColor).toBe(true);
+    expect(await pane.find({ key: 'body-event-3' })).toBeUndefined();
+
+    const errorCmd = (await pane.find({ key: 'event-4' })) as { props?: Record<string, unknown>; children?: { props?: Record<string, unknown> }[] } | undefined;
+    expect(String(errorCmd?.props?.label)).toBe('✗ running tests');
+    expect(errorCmd?.props?.dimColor).toBe(false);
+    expect(errorCmd?.children?.[0]?.props?.color).toBe('red');
+    expect(await pane.find({ key: 'body-event-4' })).toBeUndefined();
+    expect(await pane.find({ type: 'Text', text: 'Bash {"command":"npm test"}\nexit 1' })).toBeUndefined();
+
+    await pane.press({ key: 'event-4' });
+    const errorExpanded = (await pane.find({ key: 'event-4' })) as { props?: Record<string, unknown> } | undefined;
+    expect(String(errorExpanded?.props?.label)).toBe('✗ running tests');
+    const errorBody = (await pane.find({ key: 'body-event-4' })) as { props?: Record<string, unknown>; children?: unknown[] } | undefined;
+    expect(errorBody?.props?.flexDirection).toBe('row');
+    expect(await pane.find({ type: 'Text', text: 'Bash {"command":"npm test"}\nexit 1' })).toBeDefined();
+    expect(await pane.find({ key: 'end-event-4' })).toBeDefined();
+
+    await pane.press({ key: 'event-4' });
+    expect(await pane.find({ key: 'body-event-4' })).toBeUndefined();
+    expect(await pane.find({ key: 'end-event-4' })).toBeUndefined();
+
+    await pane.press({ key: 'event-3' });
+    const expandedEdit = (await pane.find({ key: 'event-3' })) as { props?: Record<string, unknown> } | undefined;
+    expect(String(expandedEdit?.props?.label)).toBe('▾ editing c.ts');
+    expect(expandedEdit?.props?.dimColor).toBe(false);
+    const editBody = (await pane.find({ key: 'body-event-3' })) as { props?: Record<string, unknown> } | undefined;
+    expect(editBody?.props?.flexDirection).toBe('row');
+    expect(await pane.find({ type: 'Text', text: 'Edit {"file_path":"src/c.ts"}\nsaved' })).toBeDefined();
+
+    await pane.press({ key: 'group-0' });
+    const expandedGroup = (await pane.find({ key: 'group-0' })) as { props?: Record<string, unknown> } | undefined;
+    expect(String(expandedGroup?.props?.label)).toBe('▾ read 2 files · 1 search');
+    expect(expandedGroup?.props?.dimColor).toBe(false);
+    const groupBody = (await pane.find({ key: 'body-group-0' })) as { props?: Record<string, unknown> } | undefined;
+    expect(groupBody?.props?.flexDirection).toBe('row');
+
+    await pane.press({ key: 'event-0' });
+    const nestedRead = (await pane.find({ key: 'event-0' })) as { props?: Record<string, unknown> } | undefined;
+    expect(String(nestedRead?.props?.label)).toBe('▾ reading');
+    expect(nestedRead?.props?.dimColor).toBe(false);
+    const nestedBody = (await pane.find({ key: 'body-event-0' })) as { props?: Record<string, unknown> } | undefined;
+    expect(nestedBody?.props?.flexDirection).toBe('row');
+    expect(await pane.find({ type: 'Text', text: 'Read src/a.ts\nline 1\nline 2' })).toBeDefined();
+  });
+
+  test('error tool row is plain when NO_COLOR is set and expanded blocks get one trailing blank line without doubling prose gaps', async ($, on) => {
+    const view = JSON.stringify({
+      schema: 1, prompt: 'Inspect', preamble: '', truncated: false, tools: [], transcript: [],
+      timeline: [
+        { kind: 'tool', sequence: 0, at: iso(RUNNING_NOW), stepIndex: 0, tool: 'Bash', input: '{"command":"npm test"}', output: 'exit 1', state: 'error' },
+        { kind: 'tool', sequence: 1, at: iso(RUNNING_NOW), stepIndex: 1, tool: 'Edit', input: '{"file_path":"src/c.ts"}', output: 'saved', state: 'done' },
+        { kind: 'assistant', sequence: 2, at: iso(RUNNING_NOW), text: 'Checking output.' },
+      ],
+    });
+    const files = canonicalJob('job-col', { status: 'running', name: 'Col', workerId: 'col', role: 'implement' }, { 'view.json': view });
+    forgeHost(on, files, ['job-col'], { NO_COLOR: '1' });
+    await start($);
+    await launch($, 'job-col');
+    await $.command.run({ command: 'forge', args: 'col' });
+    const pane = await $.ui.mount(PANE_TARGET);
+
+    const errorBtn = (await pane.find({ key: 'event-0' })) as { children?: { props?: Record<string, unknown> }[] } | undefined;
+    expect(errorBtn?.children?.[0]?.props?.color).toBeUndefined();
+    expect(await pane.find({ key: 'end-event-0' })).toBeUndefined();
+    expect(await pane.find({ key: 'end-event-1' })).toBeUndefined();
+
+    await pane.press({ key: 'event-0' });
+    expect(await pane.find({ key: 'end-event-0' })).toBeDefined();
+
+    await pane.press({ key: 'event-1' });
+    expect(await pane.find({ key: 'end-event-1' })).toBeUndefined();
+    expect(await pane.find({ key: 'gap-event-2' })).toBeDefined();
   });
 });

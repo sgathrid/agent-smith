@@ -132,20 +132,20 @@ test('invalid recovered identity retains the existing conversation', () => {
   assert.equal(JSON.parse(readFileSync(file, 'utf8')).conversation, 'existing-session');
 });
 
-test('recovery fails a writing job whose cwd is gone, keeps a review, and summarises from the end', () => {
+test('recovery fails a writing job whose cwd is gone, keeps a review, and summarises from the head', () => {
   for (const [mode, expected] of [['implement', 'failed'], ['review', 'succeeded']] as const) {
     const { repo, jobId, file, result } = fixture();
     const gone = mkdtempSync(path.join(tmpdir(), 'completion-recovery-cwd-'));
     rmSync(gone, { recursive: true, force: true });
     writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, 'utf8')), mode, cwd: gone }));
-    const tail = 'Verdict: merge.';
-    writeResultFile(result.stateDir, { ...result, response: `${'Long preamble. '.repeat(120)}\n\n${tail}` });
+    const head = 'Verdict: merge.';
+    writeResultFile(result.stateDir, { ...result, response: `Status: DONE\n\n${head}\n\n${'Long detail. '.repeat(120)}` });
     assert.equal(reconcileOrphan(repo, jobId), true);
     const recovered = JSON.parse(readFileSync(file, 'utf8'));
     assert.equal(recovered.status, expected, mode);
     assert.equal(recovered.cwdMissingAtFinish, true);
     assert.equal(recovered.changedFilesUnknown, true);
-    assert.match(recovered.latestSummary, /Verdict: merge\.$/);
+    assert.equal(recovered.latestSummary, head);
   }
 });
 

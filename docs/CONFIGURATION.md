@@ -67,7 +67,7 @@ Only variables the code reads.
 | `AGENT_SMITH_STATE_DIR` | `providers/ndjson.ts` | `~/.agent-smith/state` | Provider state root used only when a spawn gives no `stateDir`. The forge always passes the job directory, so MCP/CLI jobs do not use it. |
 | `AGENT_SMITH_TASKS` | `surfaces/channel/src/mcp.ts` | unset (`0`) | `1` advertises `extensions['io.modelcontextprotocol/tasks']` on modern (`2026-07-28`) connections and registers `tasks/get`, `tasks/update` and `tasks/cancel`, returning `resultType: 'task'` for `spawn_job`/`follow_up` requests that advertise client Tasks support. |
 | `AGENT_SMITH_NO_CATALOG_WARMUP` | `surfaces/channel/src/server.ts` | unset | `1` skips the background model discovery the MCP server starts at launch. The first spawn that names a model then waits up to `CATALOG_COLD_WAIT_MS` for a cold catalog, unless a fresh `.agent-smith/catalogs/<provider>.json` already holds it. |
-| `AGENT_SMITH_CONFIRM_UNRESTRICTED` | `surfaces/channel/src/tools.ts` | enabled | `0` stops `spawn_job`/`follow_up` asking the user to confirm an explicit `unrestricted: true` for codex, claude or opencode, and drops the "not confirmed" ack warning. For automation with no one to answer. |
+| `AGENT_SMITH_CONFIRM_UNRESTRICTED` | `surfaces/channel/src/tools.ts` | enabled | `0` stops `spawn_job`/`follow_up`/`run_pipeline` asking the user to confirm an explicit `unrestricted: true` for codex, claude or opencode, and drops the "not confirmed" ack warning. For automation with no one to answer. |
 | `HOME`, `PATH` | `discovery.ts`, `ndjson.ts` | process env | `HOME` roots the default config dirs; `PATH` is probed for provider binaries (cached per binary+PATH). |
 
 Repo selection: the MCP server takes a positional repo path, else its process cwd.
@@ -162,14 +162,7 @@ includes `io.modelcontextprotocol/tasks`, `spawn_job` and `follow_up` return a p
 (`resultType: 'task'`, 24 h `ttlMs`) backed by `<repo>/.agent-smith/tasks/` and served via `tasks/get`,
 `tasks/update` and `tasks/cancel`.
 
-Confirming `unrestricted`: an explicit `unrestricted: true` on `spawn_job` or `follow_up` for codex,
-claude or opencode asks the user first via MCP form elicitation ("Allow codex worker "Ada" to run
-without approval prompts in <cwd>? It will be able to run any command."). Accept launches; decline,
-cancel or no answer within 10 minutes returns `isError` (`The user declined unrestricted access; rerun
-without unrestricted, or ask the user.`) and launches nothing. A client without form elicitation gets
-the launch as before plus an ack warning that it was not confirmed. Never asked for agy or kimi, for
-`unrestricted: false` or absent, for a setting `follow_up` inherits, or with
-`AGENT_SMITH_CONFIRM_UNRESTRICTED=0`. `run_pipeline`'s `unrestricted` is not confirmed.
+Confirming `unrestricted`: an explicit `unrestricted: true` on `spawn_job`, `follow_up` or `run_pipeline` for providers without `defaultUnrestricted` (codex, claude, opencode) asks the user first via MCP form elicitation ("Allow codex worker "Ada" to run without approval prompts in <cwd>? It will be able to run any command."; `run_pipeline` asks once per run, naming the stage or stages). Accept launches; decline, cancel or no answer within 10 minutes returns `isError` (`The user declined unrestricted access; rerun without unrestricted, or ask the user.`) and launches nothing. A client without form elicitation gets the launch as before plus an ack warning that it was not confirmed. Never asked for providers with `defaultUnrestricted` (agy, kimi), for `unrestricted: false` or absent, for a setting `follow_up` inherits, or with `AGENT_SMITH_CONFIRM_UNRESTRICTED=0`.
 
 ### `list_capabilities` (read-only, structured)
 Params: `refresh` boolean (default false; bypass the catalog cache), `provider` (only that
@@ -241,10 +234,7 @@ match, else return an error listing candidates.
 Result (`MessageAck`): `jobId` (the running head turn when `action: 'queued'`, or the new
 turn's ID when `action: 'started'`), `name, workerId, turn, action: 'queued'|'started',
 delivery: 'next-step'|'turn-end'|'now', status: 'running', provider, repo, timeoutMs`, plus
-`pendingMessages?`, `env?: 'set'|'kept'|'dropped'` (omitted when the worker never had `env`;
-`'dropped'` with `envKeys` naming the keys that have no value and a warning when values were lost
-after a restart, else `'set'` when passed on a cold start, `'kept'` when supplied by the session vault
-or live owner), `envKeys?`,
+`pendingMessages?`, `env?: 'set'|'kept'|'deferred'|'dropped'` (omitted when the worker never had `env`; `'dropped'` with `envKeys` naming the keys that have no value and a warning when values were lost after a restart, `'deferred'` when `env` is passed to a running worker and held until it goes idle, `'set'` when passed on a cold start, `'kept'` when supplied by the session vault or live owner), `envKeys?`,
 `checks?` (names), `warnings?`, `note?`.
 
 ### `steer` (structured)
@@ -278,10 +268,10 @@ Detailed rows (`JobSummary`): `jobId, name, workerId, turn, role, latestSummary,
 source, status, taskStatus, provider, mode, model, task, toolCalls, currentActivity, lastActivity, startedAt,
 updatedAt, finishedAt, chainStartedAt?, continuedFrom?, continuationKind?, supersededBy?, followedBy?, pendingMessages?, warnings[], nextAction, unrestricted?`, the same evidence fields,
 `lastEventAt`, `lastAliveAt`, and for running jobs `liveness`. `latestSummary` is
-untrusted: the worker's current message while it runs, the end of its final response once done.
+untrusted: the worker's current message while it runs, the head of its final response (after any leading `Status:` line) once done.
 
 ### `status` (read-only, structured)
-Params: `id` (required; a worker name resolves to the worker's latest turn; a `jobId` resolves to that exact turn, following only `supersededBy` steer replacements, not `followedBy`), `wait_ms` 1-60000 (long-poll while running), `response_format`
+Params: `id` (required; a worker name or `workerId` resolves to the worker's latest turn; a `jobId` resolves to that exact turn, following only `supersededBy` steer replacements, not `followedBy`), `wait_ms` 1-60000 (long-poll while running), `response_format`
 `concise|detailed` (default `concise`), `include_diff` (boolean), `report_only` (boolean).
 Concise result: `jobId, workerId, name, turn` (only if `> 1`), `status, provider, model, mode`, `acceptance {state, passed[], failed[]
 (check names), pending?, running?, reason?}` (`running`: the checks running now, while `pending`),

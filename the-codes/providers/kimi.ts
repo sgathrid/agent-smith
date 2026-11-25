@@ -227,8 +227,7 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
     if (role === 'assistant') {
       const content = str(raw, 'content');
       if (content !== undefined && content !== '') {
-        if (tx.finalText !== '') tx.finalText += '\n';
-        tx.finalText += content;
+        tx.finalText = content;
         out.push({ kind: 'text', at, text: content, stream: 'assistant' });
       }
 
@@ -447,6 +446,7 @@ function kimiHarnessDefaults(home: string = kimiHome()): { model?: string; effor
 export const kimiProvider: Provider = {
   name: 'kimi',
   supportsEffort: false,
+  defaultUnrestricted: 'always',
 
   harnessDefaults: () => kimiHarnessDefaults(),
 

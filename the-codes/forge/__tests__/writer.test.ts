@@ -18,7 +18,7 @@ import { normalize } from '../../harness/normalize.ts';
 import { readAllObservedJobs } from './observe.ts';
 import { writeAtomic, writeJsonAtomic, appendLine, createMarker } from '../atomic.ts';
 import { FILES, SCHEMA_VERSION, jobDir, jobFile, type ForgeManifest } from '../format.ts';
-import { JobWriter, appendBounded, summaryTail } from '../writer.ts';
+import { JobWriter, appendBounded, summaryHead } from '../writer.ts';
 import type { JobResult, ProviderEvent } from '../../providers/types.js';
 
 function repo(): string {
@@ -799,7 +799,7 @@ test('tool errors are counted in progress and the manifest, and do not fail the 
   assert.equal(m.toolCalls, 3);
 });
 
-test('latestSummary shows only the current message while running, and the END of the final response', () => {
+test('latestSummary shows only the current message while running, and the HEAD of the final response', () => {
   const r = repo();
   const w = startIn(r, r, 'review');
   w.onEvent({ kind: 'text', at: now(), stream: 'assistant', text: 'I am waiting for npm test to finish.' });
@@ -809,25 +809,26 @@ test('latestSummary shows only the current message while running, and the END of
   w.onEvent({ kind: 'text', at: now(), stream: 'assistant', text: 'Writing the report.' });
   assert.equal(w.snapshot()?.latestSummary, 'Tests pass. Writing the report.');
 
-  const response = `# Findings\n\n${'Preamble sentence. '.repeat(80)}\n\n## Verdict\n\nShip it: no defects found.`;
+  const response = `Status: DONE\n\nShip it: no defects found.\n\n${'Detail line. '.repeat(80)}\n\n## Verification\n\nAll checks passed.`;
   const m = w.finish(result({ response }), response);
   assert.ok((m.latestSummary ?? '').length <= 1_000);
-  assert.equal(m.latestSummary, '## Verdict\n\nShip it: no defects found.');
+  assert.equal(m.latestSummary, 'Ship it: no defects found.');
   assert.equal(m.summarySource, 'worker');
 });
 
-test('summaryTail cuts at a paragraph, else a line, else raw', () => {
-  assert.equal(summaryTail('short', 10), 'short');
-  assert.equal(summaryTail('aaaa\n\nbbbb\n\ncc', 9), 'cc');
-  assert.equal(summaryTail('aaaa\nbbbb', 7), 'bbbb');
-  assert.equal(summaryTail('abcdefghij', 4), 'ghij');
+test('summaryHead cuts at a paragraph, else a line, else raw', () => {
+  assert.equal(summaryHead('short', 10), 'short');
+  assert.equal(summaryHead('aaaa\n\nbbbb\n\ncc', 9), 'aaaa');
+  assert.equal(summaryHead('aaaa\nbbbb', 7), 'aaaa');
+  assert.equal(summaryHead('aaaa\nbbbb\ncccc', 9), 'aaaa\nbbbb');
+  assert.equal(summaryHead('abcdefghij', 4), 'abcd');
 });
 
-test('summaryTail skips a leading Status line', () => {
-  assert.equal(summaryTail('Status: DONE\n\nFixed the bug in parser.ts.', 100), 'Fixed the bug in parser.ts.');
-  assert.equal(summaryTail('Status: DONE_WITH_CONCERNS\nPartial fix.', 100), 'Partial fix.');
-  assert.equal(summaryTail('Status: BLOCKED', 100), '');
-  assert.equal(summaryTail('Report body\nStatus: DONE', 100), 'Report body\nStatus: DONE');
+test('summaryHead skips a leading Status line', () => {
+  assert.equal(summaryHead('Status: DONE\n\nFixed the bug in parser.ts.', 100), 'Fixed the bug in parser.ts.');
+  assert.equal(summaryHead('Status: DONE_WITH_CONCERNS\nPartial fix.', 100), 'Partial fix.');
+  assert.equal(summaryHead('Status: BLOCKED', 100), '');
+  assert.equal(summaryHead('Report body\nStatus: DONE', 100), 'Report body\nStatus: DONE');
 });
 
 test('a fast failure with no tool calls is marked failedEarly; a slow or busy one is not', () => {

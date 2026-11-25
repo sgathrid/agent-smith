@@ -36,6 +36,7 @@ export interface RadarJob {
   readonly task: string;
   readonly prompt?: string | null;
   readonly preamble?: string | null;
+  readonly messages?: readonly { readonly sender: 'follow_up' | 'steer'; readonly text: string }[];
   readonly warnings: readonly { code: string; message: string }[];
   readonly report: string | null;
   readonly reasoning: string | null;

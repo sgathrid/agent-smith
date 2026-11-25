@@ -28,7 +28,7 @@ export function withWorkerLookup<T extends object>(service: T): T & ServiceLooku
       if (identities.size !== 1) {
         throw new WorkerLookupError(`"${nameOrId}" matches ${identities.size} workers; pass a jobId.`, 'ambiguous', [...identities]);
       }
-      const targetId = merged.resolveTurn([...identities][0]!);
+      const targetId = merged.resolveTurn(String(candidates[candidates.length - 1]!.jobId));
       if (src.detail) return await src.detail(targetId) as JobDetail;
       return candidates[candidates.length - 1] as unknown as JobDetail;
     }
@@ -41,7 +41,14 @@ export function withWorkerLookup<T extends object>(service: T): T & ServiceLooku
     resolveWorker: lookup,
     resolveWorkerHead: lookup,
     messageTarget: lookup,
-    earlierTurns: async () => [],
+    earlierTurns: async (headOrId) => {
+      const head = typeof headOrId === 'string' ? await lookup(headOrId) : headOrId;
+      if (!src.list) return [];
+      const allTurns = await src.list({ limit: 500, groupByWorker: false });
+      const turns = allTurns.filter((j) => (j.workerId ?? j.jobId) === head.workerId);
+      const idx = turns.findIndex((j) => j.jobId === head.jobId);
+      return (idx > 0 ? turns.slice(0, idx) : []) as unknown as JobDetail[];
+    },
     followUp: async () => notMocked('followUp')(),
     steer: async () => notMocked('steer')(),
     cancel: notMocked('cancel'),

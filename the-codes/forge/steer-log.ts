@@ -101,31 +101,27 @@ export function buildSteeredPrompt(input: {
   verdict?: string | undefined;
   freshContinuation?: boolean;
   responseTail: string;
-  entries: readonly SteerEntry[];
+  entries: readonly { readonly prompt: string }[];
   syncedFiles?: readonly string[];
   brief: string;
 }): { rawPrompt: string; sentPrompt: string; prependBrief: boolean } {
   const steerBody =
     input.entries.length === 1
       ? input.entries[0]!.prompt
-      : input.entries.map((e, idx) => `[Steer ${idx + 1} (${e.createdAt})]\n${e.prompt}`).join('\n\n');
-  const tag = input.freshContinuation
-    ? '[FRESH CONTINUATION]'
-    : input.wasInterrupted
-      ? '[TURN INTERRUPTED]'
-      : `[FOLLOW-UP STEER · ${input.entries.length} queued update${input.entries.length === 1 ? '' : 's'}]`;
-  const statusLine = input.wasInterrupted
+      : input.entries.map((e, idx) => `${idx + 1}. ${e.prompt}`).join('\n\n');
+  const baseStatus = input.wasInterrupted
     ? 'Your previous turn was interrupted with updated instructions. Inspect your working tree before repeating any completed steps.'
     : `Your previous turn ${input.priorStatus === undefined || input.priorStatus === 'succeeded' ? 'completed' : `ended ${input.priorStatus}`}.`;
-  const syncedLine =
-    input.syncedFiles !== undefined && input.syncedFiles.length > 0
-      ? `\nSynced brief file(s) in your working tree: ${input.syncedFiles.join(', ')} (re-read before continuing).`
-      : '';
-  const tailBlock = input.freshContinuation && input.responseTail
-    ? `\nLast response excerpt from previous turn:\n${input.responseTail}\n`
-    : '';
-  const verdictBlock = input.verdict ? `\n${input.verdict}\n` : '';
-  const header = `${tag}\n${statusLine}${syncedLine}${verdictBlock}${tailBlock}\n[ORCHESTRATOR UPDATE]\n${steerBody}`;
+  const statusLine = input.freshContinuation ? `${baseStatus} This starts a fresh conversation.` : baseStatus;
+  const parts = [statusLine];
+  if (input.syncedFiles !== undefined && input.syncedFiles.length > 0) {
+    parts.push(`Synced brief file(s) in your working tree: ${input.syncedFiles.join(', ')} (re-read before continuing).`);
+  }
+  if (input.verdict) parts.push(input.verdict);
+  if (input.freshContinuation && input.responseTail) {
+    parts.push(`Last response excerpt from previous turn:\n${input.responseTail}`);
+  }
+  const header = `${parts.join('\n')}\n\n${steerBody}`;
   const prependBrief = input.brief !== '' && !header.startsWith(input.brief);
   const sentPrompt = prependBrief ? `${input.brief}\n\n${header}` : header;
   return { rawPrompt: header, sentPrompt, prependBrief };

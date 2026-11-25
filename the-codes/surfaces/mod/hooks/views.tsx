@@ -59,90 +59,131 @@ export function renderWorker(W: UiComponents, d: ForgeDetail, o: ViewOptions, a:
   const {Box,Text,Button,Markdown} = W;
   const job=d.job;
   const prompt=job.prompt??job.task;
+  const taskMessage=job.messages&&job.messages.length>0?job.messages[0]!.text:prompt;
   const head=workerHead(turns,job.workerId);
   const isPinned=o.pinnedTurnId!==null&&head!==undefined&&head.id!==job.id;
   const headerStart=isPinned?job.startedAt:effectiveStart(job);
   const span=headerStart===null?null:(job.endedAt??o.now)-headerStart;
   const turnNum=job.turn??1;
-  const meta=oneLine([[job.provider,job.model].filter(Boolean).join('·'),(turnNum>1||turns.length>1)?`turn ${turnNum}`:'',span===null?'':elapsed(span),checksLabel(job.acceptance)].filter(Boolean).join(' · '));
+  const modelPart=oneLine(job.model||(job.role?job.provider:'')||'');
+  const header=oneLine([`${pickGlyph(job.status)} ${workerHeading(job)}`,modelPart,(turnNum>1||turns.length>1)?`turn ${turnNum}`:'',span===null?'':elapsed(span),checksLabel(job.acceptance)].filter(Boolean).join(' · '));
   const failing=job.acceptance?.checks.filter(check => !check.ok) ?? [];
   const timelineProse=d.timeline.some(event => event.kind==='assistant');
   const note=(job.status==='running'||job.status==='attention')&&!timelineProse
     ? (job.reasoning?oneLine(job.reasoning,Math.max(1,o.width-6)):'') : '';
-  const statusRow=!(job.status==='running'&&job.progress);
+  const statusText=workerStatus(job);
+  const statusRow=!(job.status==='running'&&job.progress)&&!(job.status==='running'&&statusText==='Running');
   const queuedSteers=!statusRow?pendingSteersLabel(job.pendingSteers):'';
   const changedFiles=isTerminal(job.status)&&job.changedFileCount!=null&&job.changedFileCount>0&&(job.progress?.editedCount??0)===0
     ? job.changedFileCount : 0;
   const livenessLine=workerLivenessLine(job);
-  const currentIndex=turns.findIndex(t => t.id===job.id);
-  const priorTurns=currentIndex>=0?turns.slice(0,currentIndex):turns.filter(t => t.id!==job.id);
+  const showProgress=Boolean(job.progress)&&!(job.progress!.phase==='starting'&&(job.toolCount??0)===0&&job.progress!.filesRead===0&&job.progress!.searches===0&&job.progress!.commands===0&&job.progress!.editedCount===0&&job.progress!.testRuns===0&&job.progress!.repeat===null);
+  const storedTexts=new Set((job.messages??[]).map(m => oneLine(m.text)).filter(Boolean));
+  const taskOneLine=oneLine(taskMessage);
+  let suppressedFirstTaskMsg=false;
+  const visibleTimeline=d.timeline.filter(event => {
+    if (event.kind==='message') {
+      const eventLine=oneLine(event.text);
+      if (storedTexts.size>0) {
+        if (event.delivery==='turn-start'&&storedTexts.has(eventLine)) return false;
+      } else if (!suppressedFirstTaskMsg&&taskOneLine!==''&&eventLine===taskOneLine) {
+        suppressedFirstTaskMsg=true;
+        return false;
+      }
+    }
+    return true;
+  });
   return <Box flexDirection="column">
-    <Text bold color={o.colour?pickColor(job.status):undefined} wrap="truncate-end">{`${pickGlyph(job.status)} ${workerHeading(job)}`}</Text>
-    {meta!=='' && <Text dimColor wrap="truncate-end">{meta}</Text>}
-    {statusRow && <Text wrap="truncate-end">{workerStatus(job)}</Text>}
+    <Text bold color={o.colour?pickColor(job.status):undefined} wrap="truncate-end">{header}</Text>
+    {statusRow && <Text wrap="truncate-end">{statusText}</Text>}
     {queuedSteers!=='' && <Text color={o.colour?'cyan':undefined} wrap="truncate-end">{queuedSteers}</Text>}
     {changedFiles>0 && <Text dimColor wrap="truncate-end">{`Changed: ${changedFiles} ${changedFiles===1?'file':'files'}`}</Text>}
-    {(job.progress||note!==''||livenessLine!==null) && <Box flexDirection="column">
-      {job.progress && progressLines(job.progress, job.toolCount).map((line,i) => <Text key={`progress-${i}`} dimColor={i>0} wrap="truncate-end">{sanitizeText(line)}</Text>)}
+    {(showProgress||note!==''||livenessLine!==null) && <Box flexDirection="column">
+      {showProgress && progressLines(job.progress!, job.toolCount).map((line,i) => <Text key={`progress-${i}`} dimColor={i>0} wrap="truncate-end">{sanitizeText(line)}</Text>)}
       {note!=='' && <Text dimColor wrap="truncate-end">{`Note: ${note}`}</Text>}
       {livenessLine!==null && <Text dimColor={livenessLine.tone==='dim'} color={o.colour&&livenessLine.tone!=='dim'?livenessLine.tone:undefined} wrap="truncate-end">{livenessLine.text}</Text>}
     </Box>}
     {job.warnings.map((warning,i) => <Text key={`warning-${i}`} color={o.colour?'yellow':undefined} wrap="wrap">{sanitizeText(warning.message)}</Text>)}
     {isPinned && head && <Button key="return-live" plain label={oneLine(`↩ Back to Turn ${head.turn} (${isLive(head)?'live':'latest'})`,Math.max(1,o.width-2))} onPress={() => a.pickTurn(null)} />}
-    {priorTurns.length>0 && <Box flexDirection="column">
-      {priorTurns.map((turn,i) => <Button key={`turn-${turn.id}`} plain dimColor label={oneLine(priorTurnSummary(turn,i+1,o.now),Math.max(1,o.width-2))} onPress={() => a.pickTurn(turn.id)} />)}
-    </Box>}
-    <Button key="task" plain hotkey="t" label={o.taskOpen?'Task (as sent)':`Task: ${oneLine(prompt,Math.max(1,o.width-12))}`} onPress={a.task} />
+    {turns.length>1
+      ? <Box flexDirection="column">
+        {turns.map((turn,i) => turn.id===job.id
+          ? <Text key={`turn-${turn.id}`} bold wrap="truncate-end">{priorTurnSummary(turn,i+1,o.now,{width:Math.max(1,o.width-2),open:true,prompt,messages:job.messages})}</Text>
+          : <Button key={`turn-${turn.id}`} plain dimColor label={priorTurnSummary(turn,i+1,o.now,{width:Math.max(1,o.width-2)})} onPress={() => a.pickTurn(turn.id)} />)}
+      </Box>
+      : <Text dimColor wrap="truncate-end">{`Task: ${oneLine(taskMessage,Math.max(1,o.width-8))}`}</Text>}
     {o.taskOpen && <Markdown text={sanitizeText(job.preamble?`${job.preamble}\n\n${prompt}`:prompt)} />}
     {o.taskOpen && <Text dimColor wrap="wrap">{sanitizeText(`${oneLine(job.id)}\nWorker: ${oneLine(job.workerId)}${job.pipeline?`\nPipeline: ${oneLine(job.pipeline)} · ${oneLine(job.stage??'stage unknown')}`:''}${job.attempt!=null?`\nAttempt: ${job.attempt}`:''}`)}</Text>}
-    {condenseTimeline(d.timeline).flatMap((item,i,items) => {
+    {condenseTimeline(visibleTimeline).flatMap((item,i,items) => {
+      const followedByProse=i+1<items.length&&isProse(items[i+1]!)!==isProse(item);
       const row=item.kind==='group'
-        ? timelineGroup(W,item,o,a)
+        ? timelineGroup(W,item,o,a,!followedByProse)
         : item.event.kind==='assistant'
           ? <Markdown key={`event-${item.event.sequence}`} text={proseText(item.event.text)} />
           : item.event.kind==='message'
           ? <Text key={`event-${item.event.sequence}`} color={o.colour?'cyan':undefined} wrap="truncate-end">{messageLine(item.event.sender,item.event.text,o.width)}</Text>
-          : toolRow(W,`event-${item.event.sequence}`,item.event.tool,item.event.input,item.event.output,item.event.state,o,a);
+          : toolRow(W,`event-${item.event.sequence}`,item.event.tool,item.event.input,item.event.output,item.event.state,o,a,!followedByProse);
       return i>0&&isProse(items[i-1]!)!==isProse(item)
         ? [<Box key={`gap-${timelineKey(item)}`}><Text> </Text></Box>,row] : [row];
     })}
-    {d.timeline.length===0 && <Text dimColor wrap="wrap">{sanitizeText(job.latestSummary??'No worker activity recorded yet.')}</Text>}
+    {visibleTimeline.length===0 && <Text dimColor wrap="wrap">{sanitizeText(job.latestSummary??'No worker activity recorded yet.')}</Text>}
     {isTerminal(job.status)
       ? <Box flexDirection="column">
         <Text bold wrap="truncate-end">Result</Text>
         {job.report?.trim()?<Markdown text={sanitizeText(job.report)}/>:<Text dimColor wrap="wrap">No report was written.</Text>}
       </Box>
-      : <Text dimColor wrap="truncate-end">{o.following?'Following live output.':'Paused. Scroll to the bottom to follow again.'}</Text>}
+      : !o.following && <Text dimColor wrap="truncate-end">Paused. Scroll to the bottom to follow again.</Text>}
     {failing.map((check,i) => <Box key={`check-${i}`} flexDirection="column">
       <Text color={o.colour?'red':undefined} wrap="wrap">{sanitizeText([`✗ ${oneLine(check.name)}`,check.timedOut?'timed out':null,check.signal?`signal ${oneLine(check.signal)}`:null,
         check.skipped?`skipped: ${oneLine(check.skipped)}`:null,check.reason?oneLine(check.reason):null].filter(Boolean).join(' · '))}</Text>
       {check.outputTail && <Text dimColor wrap="wrap">{sanitizeText(check.outputTail)}</Text>}
     </Box>)}
     <Box flexDirection="row" gap={2}>
+      <Button key="task" plain label="Task" hotkey="t" onPress={a.task} />
       <Button key="back" plain label="Back" hotkey="b" onPress={a.back} />
       <Button key="close" plain label="Close" hotkey="x" onPress={a.close} />
     </Box>
   </Box>;
 }
 
-function toolRow(W: UiComponents,key:string,tool:string,input:string,output:string,state:string,o:ViewOptions,a:ViewActions): JSX.Element {
+function toolRow(W: UiComponents,key:string,tool:string,input:string,output:string,state:string,o:ViewOptions,a:ViewActions,trailingGap=true): JSX.Element {
   const {Box,Text,Button}=W;
-  const expanded=o.tools.includes(key)||state==='error';
+  const expanded=o.tools.includes(key);
+  const glyph=state==='active'?activeGlyph(o.now):state==='error'?'✗':expanded?'▾':'✓';
+  const label=`${glyph} ${oneLine(classify(tool,input).label,Math.max(1,o.width-3))}`;
   return <Box key={`row-${key}`} flexDirection="column">
-    <Button key={key} plain dimColor={state!=='error'} label={`${state==='active'?activeGlyph(o.now):state==='error'?'✗':'✓'} ${oneLine(classify(tool,input).label,Math.max(1,o.width-3))}`} onPress={() => a.tool(key)} />
-    {expanded&&<Text dimColor wrap="wrap">{sanitizeText(`${oneLine(tool)} ${input}${output?`\n${output}`:''}`)}</Text>}
+    {state==='error'
+      ? <Button key={key} plain dimColor={false} label={label} onPress={() => a.tool(key)}>
+        <Text color={o.colour?'red':undefined} wrap="truncate-end">{label}</Text>
+      </Button>
+      : <Button key={key} plain dimColor={!expanded} label={label} onPress={() => a.tool(key)} />}
+    {expanded&&<Box key={`body-${key}`} flexDirection="row">
+      <Text>{'  '}</Text>
+      <Box flexDirection="column">
+        <Text dimColor wrap="wrap">{sanitizeText(`${oneLine(tool)} ${input}${output?`\n${output}`:''}`)}</Text>
+      </Box>
+    </Box>}
+    {expanded&&trailingGap&&<Box key={`end-${key}`}><Text> </Text></Box>}
   </Box>;
 }
 
-function timelineGroup(W: UiComponents, item: Extract<TimelineItem,{kind:'group'}>, o: ViewOptions, a: ViewActions): JSX.Element {
-  const {Box,Button,Markdown}=W;
+function timelineGroup(W: UiComponents, item: Extract<TimelineItem,{kind:'group'}>, o: ViewOptions, a: ViewActions, trailingGap=true): JSX.Element {
+  const {Box,Text,Button,Markdown}=W;
+  const expanded=o.tools.includes(item.key);
+  const childOpts={...o,width:Math.max(1,o.width-2)};
   return <Box key={`row-${item.key}`} flexDirection="column">
-    <Button key={item.key} plain dimColor label={`✓ ${timelineGroupLabel(item.reads,item.searches,item.commands)}`} onPress={() => a.tool(item.key)} />
-    {o.tools.includes(item.key) && item.events.map(event => event.kind==='tool'
-      ? toolRow(W,`event-${event.sequence}`,event.tool,event.input,event.output,event.state,o,a)
-      : event.kind==='message'
-      ? <W.Text key={`event-${event.sequence}`} wrap="truncate-end">{messageLine(event.sender,event.text,o.width)}</W.Text>
-      : <Markdown key={`event-${event.sequence}`} text={proseText(event.text)} />)}
+    <Button key={item.key} plain dimColor={!expanded} label={`${expanded?'▾':'✓'} ${oneLine(timelineGroupLabel(item.reads,item.searches,item.commands),Math.max(1,o.width-3))}`} onPress={() => a.tool(item.key)} />
+    {expanded && <Box key={`body-${item.key}`} flexDirection="row">
+      <Text>{'  '}</Text>
+      <Box flexDirection="column">
+        {item.events.map((event,i) => event.kind==='tool'
+          ? toolRow(W,`event-${event.sequence}`,event.tool,event.input,event.output,event.state,childOpts,a,i<item.events.length-1)
+          : event.kind==='message'
+          ? <Text key={`event-${event.sequence}`} wrap="truncate-end">{messageLine(event.sender,event.text,childOpts.width)}</Text>
+          : <Markdown key={`event-${event.sequence}`} text={proseText(event.text)} />)}
+      </Box>
+    </Box>}
+    {expanded&&trailingGap&&<Box key={`end-${item.key}`}><Text> </Text></Box>}
   </Box>;
 }
 

@@ -350,7 +350,7 @@ export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
     onEvent: () => [],
   };
   let step = 0;
-  /** partID -> stepIndex */
+  let resetOnNextText = false;
   const partStep = new Map<string, number>();
 
   const translate = (raw: Record<string, unknown>): ProviderEvent[] => {
@@ -448,6 +448,7 @@ export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
       `anon-${step}`;
 
     if (toolName !== undefined && (stateWord !== '' || isToolType)) {
+      resetOnNextText = true;
       const isDone = DONE_WORDS.has(stateWord) || type.endsWith('.completed') || type.endsWith('.done');
       const isErr = ERROR_WORDS.has(stateWord) || type.endsWith('.error');
       const errorTexts = [
@@ -531,6 +532,10 @@ export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
     const isThinking = type.includes('thinking') || type.includes('reasoning');
     if (text !== undefined && text !== '') {
       if (!isThinking) {
+        if (resetOnNextText) {
+          tx.finalText = '';
+          resetOnNextText = false;
+        }
         if (tx.finalText !== '') tx.finalText += '\n';
         tx.finalText += text;
       }
@@ -541,10 +546,8 @@ export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
     }
 
     // ---- step boundaries ----------------------------------------------------
-    // One per assistant step. Their counters were handled above and there is
-    // nothing else a reader needs per step, so they are silent: one info notice
-    // per step would bury real warnings under hundreds of lines of noise.
     if (isStepStart || isStepFinish) {
+      if (isStepStart) resetOnNextText = true;
       // Verified in the installed OpenCode CLI: session.step.ended emits
       // step_finish with part.reason = data.finish. Tool-call/length finishes
       // end only a step; "stop" confirms the assistant finished normally.
@@ -727,6 +730,7 @@ export async function listOpencodeModels(run: RunFn, options?: ListModelsOptions
 
 export const opencodeProvider: Provider = {
   name: 'opencode',
+  defaultUnrestricted: false,
 
   available: () => binaryAvailable(opencodeBinary()),
 

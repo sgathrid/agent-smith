@@ -32,7 +32,7 @@ function fixture(opts: { failNames?: string[]; status?: () => string; cancelSett
     repo,
     spawnJob: async (req: Record<string, unknown>) => start(req),
     spawnTracked: async (req: Record<string, unknown>) => ({ ack: start(req), done: new Promise(() => {}) }),
-    detail: async (id: string) => { if (!existsSync(jobDir(repo, id))) throw new Error('no job'); return { jobId: id, name: `n-${id}`, workerId: id, status: opts.status?.() ?? 'succeeded', report: null, warnings: [] }; },
+    detail: async (id: string) => { if (!existsSync(jobDir(repo, id))) throw new Error('no job'); return { jobId: id, name: `n-${id}`, workerId: `w-${id}`, status: opts.status?.() ?? 'succeeded', report: null, warnings: [] }; },
     list: async () => [],
     cancel: (id: string) => ({ jobId: id, requested: true, signalled: true, note: 'x' }),
   });
@@ -59,10 +59,46 @@ test('from reuses mode, prompt, context, provider, model and checks; arguments o
 test('from a worker name resolves to its first turn', async () => {
   const f = fixture();
   await callTool(f.ctx, 'spawn_job', { ...base, checks: undefined });
-  (f.ctx.service as unknown as { list: () => unknown }).list = async () => [{ jobId: 'job-1', name: 'Ada', workerId: 'job-1', startedAt: '2026-01-01T00:00:00Z' }];
+  (f.ctx.service as unknown as { list: () => unknown }).list = async () => [{ jobId: 'job-1', name: 'Ada', workerId: 'w-job-1', startedAt: '2026-01-01T00:00:00Z' }];
   const r = await callTool(f.ctx, 'spawn_job', { from: 'Ada' });
   assert.equal(r.isError, undefined, errText(r));
   assert.equal(f.seen[1]!.prompt, 'look closely');
+});
+
+test('from on a two-turn worker works by name, workerId, and second turn jobId', async () => {
+  const f = fixture();
+  await callTool(f.ctx, 'spawn_job', base);
+  mkdirSync(jobDir(f.repo, 'job-2'), { recursive: true });
+  const turns = [
+    { jobId: 'job-1', name: 'Ada', workerId: 'w-ada', turn: 1, status: 'succeeded', startedAt: '2026-01-01T00:00:00Z', changedFiles: ['a.ts'], report: null, warnings: [] },
+    { jobId: 'job-2', name: 'Ada', workerId: 'w-ada', turn: 2, status: 'succeeded', startedAt: '2026-01-01T00:01:00Z', changedFiles: ['b.ts'], report: null, warnings: [] },
+  ];
+  const svc = f.ctx.service as unknown as {
+    list: () => Promise<typeof turns>;
+    detail: (id: string) => Promise<(typeof turns)[number]>;
+  };
+  svc.list = async () => turns;
+  svc.detail = async (id: string) => {
+    const found = turns.find((t) => t.jobId === id);
+    if (!found) throw new Error(`no job ${id}`);
+    return found;
+  };
+
+  for (const ref of ['Ada', 'w-ada', 'job-2']) {
+    const r = await callTool(f.ctx, 'spawn_job', { from: ref, prompt: `after ${ref}` });
+    assert.equal(r.isError, undefined, `from ${ref}: ${errText(r)}`);
+    const last = f.seen[f.seen.length - 1]!;
+    assert.equal(last.mode, 'review');
+    assert.equal(last.prompt, `after ${ref}`);
+    assert.deepEqual((last as { checks: { name: string }[] }).checks.map((c) => c.name), ['t']);
+  }
+
+  const st = body(await callTool(f.ctx, 'status', { id: 'w-ada' }));
+  assert.equal(st.jobId, 'job-2');
+  assert.equal(st.workerId, 'w-ada');
+  assert.deepEqual(st.changedFiles, ['a.ts', 'b.ts']);
+  assert.equal(st.earlierTurns.length, 1);
+  assert.equal(st.earlierTurns[0].jobId, 'job-1');
 });
 
 test('from with a different provider drops the inherited model, effort and unrestricted', async () => {

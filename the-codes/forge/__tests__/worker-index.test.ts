@@ -24,13 +24,13 @@ function syntheticRepo(n: number): { repo: string; workers: number } {
       mkdirSync(path.dirname(file), { recursive: true });
       const at = new Date(base + (w * TURNS_PER_WORKER + t) * 60_000).toISOString();
       writeFileSync(file, JSON.stringify({
-        schema: 1, jobId: id, name: `worker-${w}`, workerId: `job-${w}-1`, turn: t,
+        schema: 1, jobId: id, name: `worker-${w}`, workerId: `w-${w}`, turn: t,
         ...(t > 1 ? { continuedFrom: `job-${w}-${t - 1}`, continuationKind: 'follow-up' } : {}),
         ...(t < TURNS_PER_WORKER ? { followedBy: `job-${w}-${t + 1}` } : {}),
         provider: 'codex', mode: 'review', cwd: repo, status: 'succeeded',
         createdAt: at, startedAt: at, updatedAt: at, finishedAt: at,
       }));
-      appendTurnsLocked(repo, `job-${w}-1`, `worker-${w}`, [id]);
+      appendTurnsLocked(repo, `w-${w}`, `worker-${w}`, [id]);
     }
   }
   return { repo, workers };
@@ -48,7 +48,7 @@ async function timeLookups(n: number): Promise<Timings> {
   const service = new ForgeService({ repo });
   const mid = Math.floor(workers / 2);
   assert.equal(service.resolveWorkerHeadId(`worker-${mid}`), `job-${mid}-${TURNS_PER_WORKER}`);
-  assert.ok(existsSync(workerIndexPath(repo, `job-${mid}-1`)));
+  assert.ok(existsSync(workerIndexPath(repo, `w-${mid}`)));
   await new Promise((r) => setTimeout(r, 80));
   service.resolveWorkerHeadId(`worker-${mid}`);
   const byName: number[] = [];
@@ -95,14 +95,14 @@ test('a job started by another process after the cache was built is found by nam
   mkdirSync(path.dirname(file), { recursive: true });
   const at = new Date().toISOString();
   writeFileSync(file, JSON.stringify({
-    schema: 1, jobId: 'job-0-6', name: 'worker-0', workerId: 'job-0-1', turn: 6, continuedFrom: 'job-0-5',
+    schema: 1, jobId: 'job-0-6', name: 'worker-0', workerId: 'w-0', turn: 6, continuedFrom: 'job-0-5',
     continuationKind: 'follow-up', provider: 'codex', mode: 'review', cwd: repo, status: 'succeeded',
     createdAt: at, startedAt: at, updatedAt: at, finishedAt: at,
   }));
-  appendTurnsLocked(repo, 'job-0-1', 'worker-0', ['job-0-6']);
+  appendTurnsLocked(repo, 'w-0', 'worker-0', ['job-0-6']);
   assert.equal(late.resolveWorkerHeadId('job-0-6'), 'job-0-6');
   assert.equal(service.resolveWorkerHeadId('worker-0'), 'job-0-6');
-  assert.equal(service.resolveWorkerHeadId('job-0-1'), 'job-0-6');
+  assert.equal(service.resolveWorkerHeadId('w-0'), 'job-0-6');
   const nf = jobFile(repo, 'fresh-1', FILES.job);
   mkdirSync(path.dirname(nf), { recursive: true });
   writeFileSync(nf, JSON.stringify({ schema: 1, jobId: 'fresh-1', name: 'newcomer', provider: 'codex', mode: 'review', cwd: repo, status: 'succeeded', startedAt: at, createdAt: at }));
@@ -115,16 +115,16 @@ test('refresh never takes the worker lock for a turn its starter has not indexed
   const file = jobFile(repo, 'job-new-2', FILES.job);
   mkdirSync(path.dirname(file), { recursive: true });
   writeFileSync(file, JSON.stringify({
-    schema: 1, jobId: 'job-new-2', name: 'starting', workerId: 'job-new-1', turn: 2, continuedFrom: 'job-new-1',
+    schema: 1, jobId: 'job-new-2', name: 'starting', workerId: 'w-new', turn: 2, continuedFrom: 'job-new-1',
     provider: 'codex', mode: 'review', cwd: repo, status: 'running', createdAt: at, startedAt: at, updatedAt: at,
   }));
-  const lock = workerLockPath(repo, 'job-new-1');
+  const lock = workerLockPath(repo, 'w-new');
   mkdirSync(path.dirname(lock), { recursive: true });
   writeFileSync(lock, `${process.ppid}\n${at}\n`);
   const t0 = Date.now();
   new WorkerIndexStore(repo).refresh();
   assert.ok(Date.now() - t0 < 1_000, `refresh waited ${Date.now() - t0} ms on the starter's lock`);
-  assert.equal(existsSync(workerIndexFile(repo, 'job-new-1')), false);
+  assert.equal(existsSync(workerIndexFile(repo, 'w-new')), false);
 });
 
 test('refresh reads a continuation turn written by another process once, not on every jobs dir change', async () => {
@@ -138,8 +138,8 @@ test('refresh reads a continuation turn written by another process once, not on 
   const at = new Date().toISOString();
   const file = jobFile(repo, 'job-0-6', FILES.job);
   mkdirSync(path.dirname(file), { recursive: true });
-  writeFileSync(file, JSON.stringify({ schema: 1, jobId: 'job-0-6', name: 'worker-0', workerId: 'job-0-1', turn: 6, provider: 'codex', mode: 'review', cwd: repo, status: 'succeeded', createdAt: at, startedAt: at }));
-  appendTurnsLocked(repo, 'job-0-1', 'worker-0', ['job-0-6']);
+  writeFileSync(file, JSON.stringify({ schema: 1, jobId: 'job-0-6', name: 'worker-0', workerId: 'w-0', turn: 6, provider: 'codex', mode: 'review', cwd: repo, status: 'succeeded', createdAt: at, startedAt: at }));
+  appendTurnsLocked(repo, 'w-0', 'worker-0', ['job-0-6']);
   for (let i = 0; i < 3; i++) {
     await new Promise((r) => setTimeout(r, 80));
     mkdirSync(path.join(repo, '.agent-smith', 'jobs', `other-${i}`));

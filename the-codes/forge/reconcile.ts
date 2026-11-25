@@ -4,7 +4,7 @@ import { REASONS } from '../surfaces/mod/hooks/reasons.ts';
 import { FILES, SCHEMA_VERSION, cwdFacts, deriveOrphan, failureFields, deriveStatus, isTerminalForgeStatus, jobFile, normalizeDenials, ownerAlive, validOwnerPid, type ForgeManifest } from './format.ts';
 import { createMarker, writeAtomic, writeJsonAtomic } from './atomic.ts';
 import { readAcceptance, writeAcceptance } from './checks.ts';
-import { reportFor, summaryTail } from './writer.ts';
+import { reportFor, summaryHead } from './writer.ts';
 import { notSentWarning, undeliveredEntries } from './steer-log.ts';
 import type { JobResult } from '../providers/types.ts';
 
@@ -72,10 +72,8 @@ export function reconcileOrphan(repo: string, jobId: string, now = Date.now()): 
         })),
         usage: result.usage === undefined ? null : Object.fromEntries(
           Object.entries(result.usage).filter((entry) => typeof entry[1] === 'number')),
-        // The conclusion is at the end of the response (same rule as writer.finish).
-        latestSummary: summaryTail(result.response, 1_000) || manifest.latestSummary || null,
+        latestSummary: summaryHead(result.response, 1_000) || manifest.latestSummary || null,
         summarySource: result.response.trim() || manifest.latestSummary ? 'worker' : null,
-        // Recovery never runs the finish-time git diff.
         changedFilesUnknown: true,
         ...(facts.cwdMissing ? { cwdMissingAtFinish: true } : {}),
       });

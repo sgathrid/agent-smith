@@ -29,6 +29,7 @@ import {
   jobFile,
   jobsDir,
   newJobId,
+  newWorkerId,
   ownerAlive,
   readManifest,
   type ContinuationKind,
@@ -40,6 +41,7 @@ import {
   type SteerEntry,
   type WatchedFileSigs,
   senderOf,
+  taskTitle,
 } from './format.ts';
 import { reconcileOrphan } from './reconcile.ts';
 import { computeStaleReads, JobWriter, pipeEvents, reportFor } from './writer.ts';
@@ -137,7 +139,7 @@ function mergeOverrides(entries: readonly SteerEntry[]): MessageOverrides {
 
 function applyOverrides(spec: TurnSpec, o: MessageOverrides, provider: Provider): TurnSpec {
   if (Object.keys(o).length === 0) return spec;
-  const unrestricted = o.unrestricted === undefined ? spec.unrestricted : provider.name === 'kimi' ? true : o.unrestricted;
+  const unrestricted = o.unrestricted === undefined ? spec.unrestricted : provider.defaultUnrestricted === 'always' ? true : o.unrestricted;
   return {
     ...spec,
     ...(o.model === undefined ? {} : { model: o.model, modelRequested: o.model, modelResolved: o.model, modelSource: 'requested' as const }),
@@ -335,22 +337,18 @@ export class ForgeService {
     const envKeys = env === undefined ? [] : Object.keys(env);
     const cwd = request.cwd ?? this.repo;
     const unrestrictedRequested = request.unrestricted;
-    const unrestricted = provider.name === 'kimi'
+    const unrestricted = provider.defaultUnrestricted === 'always'
       ? true
       : unrestrictedRequested ?? (
-          provider.name === 'agy' && process.env['AGENT_SMITH_AGY_RESTRICTED'] !== '1'
+          provider.defaultUnrestricted === true && process.env['AGENT_SMITH_AGY_RESTRICTED'] !== '1'
         );
     const warnings: string[] = [];
-    if (unrestrictedRequested === false && provider.name === 'kimi') {
-      warnings.push(
-        'kimi print mode force-sets the auto permission policy; unrestricted:false cannot restrict it. The ack and job.json record the effective posture.',
-      );
-    }
     const checked = await validateModelAndEffort(
       provider,
       request.model,
       request.effort,
       request.lockHeldByCaller === true ? undefined : () => this.catalogFor(provider.name),
+      unrestrictedRequested,
     );
     const effort = checked.effort;
     warnings.push(...checked.warnings);
@@ -393,7 +391,7 @@ export class ForgeService {
     const jobId = newJobId(mode);
     const name = request.name?.trim() || `${mode}-${jobId.slice(-8)}`;
     if (name.length > 80) throw new Error('worker name must be at most 80 characters');
-    const workerId = request.workerId ?? jobId;
+    const workerId = request.workerId ?? newWorkerId();
     this.assertNameFree(name, workerId);
 
     const writer = this.newWriter(jobId);
@@ -458,6 +456,7 @@ export class ForgeService {
       continuedFrom: request.continuedFrom,
       continuationKind,
       chainStartedAt: continuationKind === 'follow-up' ? undefined : request.chainStartedAt,
+      messages: request.messages,
     }));
     try {
       this.recordTurnStart({
@@ -499,7 +498,7 @@ export class ForgeService {
       unrestricted,
       note:
         `queued · ${humanDuration(timeoutMs)} limit · ${
-          provider.name === 'kimi' ? 'auto policy (cannot restrict)' : unrestricted ? 'unrestricted' : 'approvals on'
+          provider.defaultUnrestricted === 'always' ? 'auto policy (cannot restrict)' : unrestricted ? 'unrestricted' : 'approvals on'
         }`,
       sandbox,
       sandboxFlags,
@@ -915,7 +914,7 @@ export class ForgeService {
       provider: input.provider,
       name: head.name,
       workerId: head.workerId ?? head.jobId,
-      task: head.task ?? undefined,
+      task: taskTitle(entries[0]!.prompt) || head.task || undefined,
       cwd,
       model: o.model ?? spec?.model ?? head.model ?? undefined,
       effort: o.effort ?? spec?.effort ?? head.effort ?? undefined,
@@ -1047,12 +1046,13 @@ export class ForgeService {
       preamble: prependBrief ? nextBrief : undefined,
       preambleApplied: nextBrief !== '',
       conversation,
-      task: parentSnap?.task ?? spec.task,
+      task: taskTitle(unconsumed[0]!.prompt) || parentSnap?.task || spec.task,
       watchedFiles: nextWatchedFiles,
       turn: nextTurn,
       continuedFrom: parent.jobId,
       continuationKind,
       chainStartedAt,
+      messages: unconsumed.map((e) => ({ text: e.prompt, sender: senderOf(e) })),
     }));
     if (spec.checks !== undefined) writeJsonAtomic(jobFile(this.repo, nextJobId, FILES.checksSpec), spec.checks);
     parent.live.consumedSteers = entries.length;
@@ -1273,9 +1273,8 @@ export class ForgeService {
       ...(request.unrestricted === undefined ? {} : { unrestricted: request.unrestricted }),
     };
     const warnings: string[] = [];
-    if (overrides.model !== undefined || overrides.effort !== undefined) {
-      warnings.push(...checkAgainstCatalog(first.provider, overrides.model, overrides.effort, await this.catalogFor(first.provider)));
-    }
+    const checkCatalog = overrides.model !== undefined || overrides.effort !== undefined;
+    const catalog = checkCatalog ? await this.catalogFor(first.provider) : undefined;
     const entry: SteerEntry = {
       id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       createdAt: new Date().toISOString(),
@@ -1291,15 +1290,16 @@ export class ForgeService {
       const headId = this.workerHeadId(workerId) ?? firstHeadId;
       const head = this.readManifestSync(headId);
       if (head === null) throw this.notFound(ref);
-      if (this.ownerLive(headId, head)) return this.enqueue(sender, headId, head, entry, env, warnings);
-      return this.coldStart(sender, head, entry, env, warnings);
+      if (this.ownerLive(headId, head)) return this.enqueue(sender, headId, head, entry, env, warnings, checkCatalog, catalog);
+      return this.coldStart(sender, head, entry, env, warnings, checkCatalog, catalog);
     }, { waitMs: LAUNCH_ACK_MS + LOCK_WAIT_MS });
   }
 
-  private enqueue(
+  private async enqueue(
     sender: MessageSender, headId: string, head: ForgeManifest, entry: SteerEntry,
     env: Readonly<Record<string, string>> | undefined, warnings: string[],
-  ): MessageAck {
+    checkCatalog: boolean, catalog: ModelCatalog | undefined,
+  ): Promise<MessageAck> {
     const live = this.live.get(headId);
     const running = head.status === 'running';
     const name = head.name ?? headId;
@@ -1336,8 +1336,18 @@ export class ForgeService {
     if (live !== undefined) live.writer.setPendingSteers(pending, at);
     else if (!running) this.setSettledPending(headId, pending);
     const workerId = head.workerId ?? headId;
-    const envAck = this.envForLiveOwner(workerId, headId, env, warnings);
+    const { ack: envAck } = this.resolveFollowUpEnv(workerId, headId, env, true, warnings);
     const provider = this.providerSafe(head.provider);
+    if (provider !== null) {
+      const checked = await validateModelAndEffort(
+        provider,
+        entry.overrides?.model,
+        entry.overrides?.effort,
+        checkCatalog ? async () => catalog : undefined,
+        entry.overrides?.unrestricted,
+      );
+      warnings.push(...checked.warnings);
+    }
     const canDeliverLive = running
       && provider?.liveInput === true
       && !live?.interruptRequested
@@ -1372,16 +1382,15 @@ export class ForgeService {
   private async coldStart(
     sender: MessageSender, head: ForgeManifest, entry: SteerEntry,
     env: Readonly<Record<string, string>> | undefined, warnings: string[],
+    checkCatalog: boolean, catalog: ModelCatalog | undefined,
   ): Promise<MessageAck> {
     this.assertResumable(head);
     const workerId = head.workerId ?? head.jobId;
-    const passed = env !== undefined && Object.keys(env).length > 0;
-    const known = { ...(this.envVault.get(workerId) ?? {}), ...(env ?? {}) };
-    const runEnv = Object.keys(known).length > 0 ? known : undefined;
-    const missing = this.envKeysOf(head.jobId).filter((k) => !(k in known));
-    if (missing.length > 0) warnings.push(`env ${missing.join(', ')} not set: values live only in memory and were lost; pass env again.`);
-    const envAck: Pick<MessageAck, 'env' | 'envKeys'> = missing.length > 0 ? { env: 'dropped', envKeys: missing }
-      : passed ? { env: 'set' } : runEnv !== undefined ? { env: 'kept' } : {};
+    const { ack: envAck, runEnv } = this.resolveFollowUpEnv(workerId, head.jobId, env, false, warnings);
+    const provider = this.providerSafe(head.provider);
+    if (checkCatalog && (entry.overrides?.model !== undefined || (entry.overrides?.effort !== undefined && provider?.supportsEffort !== false))) {
+      warnings.push(...checkAgainstCatalog(head.provider, entry.overrides?.model, entry.overrides?.effort, catalog));
+    }
     const acceptance = readAcceptance(this.repo, head.jobId);
     const onDisk = readSteerEntries(this.repo, head.jobId).length;
     const request = this.continuationRequest({
@@ -1402,15 +1411,31 @@ export class ForgeService {
     };
   }
 
-  private envForLiveOwner(workerId: string, headId: string, env: Readonly<Record<string, string>> | undefined, warnings: string[]): Pick<MessageAck, 'env'> {
+  private resolveFollowUpEnv(
+    workerId: string, headId: string, env: Readonly<Record<string, string>> | undefined,
+    liveOwner: boolean, warnings: string[],
+  ): { ack: Pick<MessageAck, 'env' | 'envKeys'>; runEnv?: Record<string, string> } {
     const vault = this.envVault.get(workerId);
-    if (env !== undefined && Object.keys(env).length > 0) {
-      const same = vault !== undefined && Object.entries(env).every(([k, v]) => vault[k] === v);
-      this.envVault.set(workerId, { ...(vault ?? {}), ...env });
-      if (!same) warnings.push('env applies from the next new turn after this worker goes idle; the running worker keeps the environment it started with.');
-      return { env: 'kept' };
+    const passed = env !== undefined && Object.keys(env).length > 0;
+    if (liveOwner) {
+      if (passed) {
+        const same = vault !== undefined && Object.entries(env).every(([k, v]) => vault[k] === v);
+        this.envVault.set(workerId, { ...(vault ?? {}), ...env });
+        if (!same) {
+          warnings.push('env applies from the next new turn after this worker goes idle; the running worker keeps the environment it started with.');
+          return { ack: { env: 'deferred' } };
+        }
+        return { ack: { env: 'kept' } };
+      }
+      return { ack: this.envKeysOf(headId).length > 0 || (vault !== undefined && Object.keys(vault).length > 0) ? { env: 'kept' } : {} };
     }
-    return this.envKeysOf(headId).length > 0 || (vault !== undefined && Object.keys(vault).length > 0) ? { env: 'kept' } : {};
+    const known = { ...(vault ?? {}), ...(env ?? {}) };
+    const runEnv = Object.keys(known).length > 0 ? known : undefined;
+    const missing = this.envKeysOf(headId).filter((k) => !(k in known));
+    if (missing.length > 0) warnings.push(`env ${missing.join(', ')} not set: values live only in memory and were lost; pass env again.`);
+    const ack: Pick<MessageAck, 'env' | 'envKeys'> = missing.length > 0 ? { env: 'dropped', envKeys: missing }
+      : passed ? { env: 'set' } : runEnv !== undefined ? { env: 'kept' } : {};
+    return { ack, ...(runEnv === undefined ? {} : { runEnv }) };
   }
 
   private envKeysOf(jobId: string): string[] {

@@ -1,4 +1,4 @@
-import {watch}from'node:fs';import {r as reasonFromText,ac as checksReason,ad as toolLabel}from'./chunk-normalize.js';/**
+import {watch}from'node:fs';import {r as reasonFromText,af as checksReason,ag as toolLabel}from'./chunk-normalize.js';/**
  * forge/watch.ts — wake when a job's files change, instead of re-reading them on a timer.
  *
  * A worker runs in another process (the detached supervisor) and reports only through
@@ -112,7 +112,7 @@ function headline(job) {
     const bad = rejected(job);
     const awaiting = job.kind === 'finished' && !job.run && !bad && job.checksRunning !== undefined;
     const glyph = bad ? GLYPH.failed : awaiting ? '…' : GLYPH[job.kind];
-    const parts = [`${glyph} ${who(job)}${d && job.kind !== 'attention' ? ` ${d}` : ''}`];
+    const parts = [`${glyph} ${who(job)}`];
     switch (job.kind) {
         case 'finished':
             if (job.run)
@@ -122,10 +122,11 @@ function headline(job) {
             else if (awaiting) {
                 parts.push('exited', typeof job.checksRunning === 'string' ? `checks running: ${job.checksRunning}` : 'checks pending');
             }
+            else if (job.checks && job.checks.total > 0) {
+                parts.push(`checks ${job.checks.passed}/${job.checks.total}`);
+            }
             else {
                 parts.push('done');
-                if (job.checks && job.checks.total > 0)
-                    parts.push(`checks ${job.checks.passed}/${job.checks.total}`);
             }
             break;
         case 'failed':
@@ -141,12 +142,14 @@ function headline(job) {
                 parts.push(`no output${d ? ` for ${d}` : ''}${job.liveness?.tool ? ` (in \`${job.liveness.tool}\`)` : ''}`);
             break;
     }
-    if (job.continuationKind === 'follow-up')
-        parts.push('follow-up');
-    else if (job.continuationKind === 'steer')
-        parts.push('steered');
-    if (job.alsoRan)
-        parts.push(job.alsoRan.from === job.alsoRan.to ? `also ran turn ${job.alsoRan.from}` : `also ran turns ${job.alsoRan.from}–${job.alsoRan.to}`);
+    if (d && job.kind !== 'attention')
+        parts.push(d);
+    if (job.turns) {
+        if (job.turns.from < job.turns.to)
+            parts.push(`turns ${job.turns.from}–${job.turns.to}`);
+        else if (job.turns.to > 1)
+            parts.push(`turn ${job.turns.to}`);
+    }
     if (job.steerNotApplied)
         parts.push(`queued follow-up not sent${job.droppedMessage ? `: "${compactExcerpt(job.droppedMessage, 80)}"` : ''}`);
     if (job.staleReads && job.staleReads.length > 0) {
@@ -176,7 +179,7 @@ function claudeText(jobs) {
         lines.push(`${one ? 'Agent Smith · ' : ''}${headline(job)}`);
     if (jobs.length > CLAUDE_JOBS)
         lines.push(`…and ${jobs.length - CLAUDE_JOBS} more; list_jobs shows them.`);
-    const ids = (run) => listed.filter((j) => !!j.run === run).map((j) => j.id);
+    const ids = (run) => listed.filter((j) => !!j.run === run).map((j) => (run ? j.id : j.workerId ?? j.id));
     if (ids(false).length > 0)
         lines.push(`status ${ids(false).join(', ')}`);
     if (ids(true).length > 0)

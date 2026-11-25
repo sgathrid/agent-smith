@@ -35,7 +35,8 @@ export interface WatchableJob {
   readonly continuationKind?: ContinuationKind | null;
   readonly steerNotApplied?: boolean;
   readonly droppedMessage?: string;
-  readonly alsoRan?: { readonly from: number; readonly to: number };
+  readonly turns?: { readonly from: number; readonly to: number };
+  readonly durationMs?: number | null;
   readonly staleReads?: readonly string[] | null;
   readonly liveness?: { readonly state: 'silent' | 'dead'; readonly silentForMs: number; readonly since: number | null; readonly tool?: string };
 }
@@ -114,9 +115,11 @@ export function toNotice(job: WatchableJob, kind: PushKind, now: number): Notice
     ? (job.liveness?.since == null ? NaN : now - job.liveness.since)
     : kind === 'attention'
       ? (job.lastEventAt === null ? NaN : now - Date.parse(job.lastEventAt))
-      : (start && job.finishedAt ? Date.parse(job.finishedAt) - Date.parse(start) : NaN);
+      : typeof job.durationMs === 'number' && Number.isFinite(job.durationMs)
+        ? job.durationMs
+        : (start && job.finishedAt ? Date.parse(job.finishedAt) - Date.parse(start) : NaN);
   return {
-    id: job.id, kind, name: job.name ?? null, provider: job.provider ?? null, role: job.role ?? null,
+    id: job.id, ...(job.workerId ? { workerId: job.workerId } : {}), kind, name: job.name ?? null, provider: job.provider ?? null, role: job.role ?? null,
     run,
     durationMs: Number.isFinite(span) ? span : null,
     changedFiles: job.changedFileCount ?? null,
@@ -127,7 +130,7 @@ export function toNotice(job: WatchableJob, kind: PushKind, now: number): Notice
     ...(job.continuationKind ? { continuationKind: job.continuationKind } : {}),
     ...(job.steerNotApplied ? { steerNotApplied: true } : {}),
     ...(job.droppedMessage ? { droppedMessage: job.droppedMessage } : {}),
-    ...(job.alsoRan ? { alsoRan: job.alsoRan } : {}),
+    ...(job.turns ? { turns: job.turns } : {}),
     ...(kind === 'finished' && job.checksRunning !== undefined ? { checksRunning: job.checksRunning } : {}),
     ...(kind === 'attention' && job.liveness ? { liveness: { state: job.liveness.state, ...(job.liveness.tool ? { tool: job.liveness.tool } : {}) } } : {}),
   };

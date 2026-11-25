@@ -592,6 +592,7 @@ function claudeHarnessDefaults(home: string = claudeHome()): { model?: string; e
 export const claudeProvider: Provider = {
   harnessDefaults: () => claudeHarnessDefaults(),
   name: 'claude',
+  defaultUnrestricted: false,
 
   available: () => binaryAvailable(claudeBinary()),
 

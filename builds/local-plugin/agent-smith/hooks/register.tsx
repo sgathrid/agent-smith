@@ -382,11 +382,10 @@ function registerBand(on: Parameters<Register>[0]): void {
   });
 
   on('ui.render', { component: 'UserMessage' }, async (_$, e, next) => {
-    // Claude Code 2.1.300 passes the prompt's origin as `stored`; older hosts as `origin`.
-    const origin = e.props.origin ?? e.props.stored;
+    const isPlugin = (o: { readonly kind: string; readonly name?: string } | undefined): boolean =>
+      o?.kind === 'plugin' && typeof o.name === 'string' && /^(?:plugin:)?agent-smith(?:[@:]|$)/.test(o.name);
     if (
-      origin?.kind === 'plugin' &&
-      origin.name === 'agent-smith' &&
+      (isPlugin(e.props.origin) || isPlugin(e.props.stored)) &&
       typeof e.props.text === 'string'
     ) {
       return next({ ...e, props: { ...e.props, text: sanitizeText(displayNoticeText(e.props.text)) } });

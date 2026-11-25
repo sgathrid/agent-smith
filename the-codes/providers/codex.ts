@@ -439,8 +439,7 @@ export function createCodexTranslator(maxChars: number): CodexTranslator {
       if (itemType === 'agent_message') {
         const text = str(item, 'text');
         if (text !== undefined && text !== '') {
-          if (state.finalText !== '') state.finalText += '\n';
-          state.finalText += text;
+          state.finalText = text;
           out.push({ kind: 'text', at, text, stream: 'assistant' });
         }
         return out;
@@ -576,11 +575,7 @@ export function createCodexTranslator(maxChars: number): CodexTranslator {
   return state;
 }
 
-// ---------------------------------------------------------------------------
-// Result
-// ---------------------------------------------------------------------------
-
-function buildResult(args: {
+export function buildResult(args: {
   jobId: string;
   startedAtMs: number;
   stateDir: string;
@@ -611,8 +606,6 @@ function buildResult(args: {
     status = 'success';
   }
 
-  // codex has no single "response" field; the concatenated agent_message items
-  // are the equivalent. If there were none, this is legitimately "".
   const out = jobResult({ provider: 'codex', jobId, status, error, exit, response: tx.finalText, startedAtMs, durationMs, stateDir });
   if (tx.usage !== undefined) out.usage = tx.usage;
   if (tx.threadId !== undefined) out.raw = { threadId: tx.threadId };
@@ -732,6 +725,7 @@ export function codexStderrLevel(text: string): 'info' | 'warn' {
 
 export const codexProvider: Provider = {
   name: 'codex',
+  defaultUnrestricted: false,
   harnessDefaults: () => codexHarnessDefaults(),
 
   available: () => binaryAvailable(codexBinary()),
