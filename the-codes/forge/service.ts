@@ -459,6 +459,7 @@ export class ForgeService {
       continuedFrom: request.continuedFrom,
       continuationKind,
       chainStartedAt: continuationKind === 'follow-up' ? undefined : request.chainStartedAt,
+      messages: request.messages,
     }));
     try {
       this.recordTurnStart({
@@ -1054,6 +1055,7 @@ export class ForgeService {
       continuedFrom: parent.jobId,
       continuationKind,
       chainStartedAt,
+      messages: unconsumed.map((e) => ({ text: e.prompt, sender: senderOf(e) })),
     }));
     if (spec.checks !== undefined) writeJsonAtomic(jobFile(this.repo, nextJobId, FILES.checksSpec), spec.checks);
     parent.live.consumedSteers = entries.length;

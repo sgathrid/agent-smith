@@ -30,6 +30,7 @@ import {
   type ForgeView,
   type ForgeViewEvent,
   type MessageSender,
+  type TurnMessage,
   type WatchedFileSigs,
 } from './format.ts';
 import type { JobResult, ProviderEvent, WorkerHandle } from '../providers/types.ts';
@@ -57,6 +58,7 @@ export interface StartInput {
   readonly cwd: string;
   readonly prompt: string;
   readonly preamble?: string;
+  readonly messages?: readonly TurnMessage[] | undefined;
   readonly unrestricted: boolean;
   readonly conversation: string | null;
   readonly timeoutMs: number;
@@ -125,8 +127,15 @@ export class JobWriter {
     const now = new Date().toISOString();
     const turn = typeof input.turn === 'number' && Number.isInteger(input.turn) && input.turn >= 1 ? input.turn : 1;
     const chainStartedAt = input.chainStartedAt ?? now;
-    this.view = { ...this.view, prompt: input.prompt.slice(0, 64_000), preamble: input.preamble?.slice(0, 4_000) ?? null,
-      truncated: input.prompt.length > 64_000 || (input.preamble?.length ?? 0) > 4_000 };
+    this.view = {
+      ...this.view,
+      prompt: input.prompt.slice(0, 64_000),
+      preamble: input.preamble?.slice(0, 4_000) ?? null,
+      ...(input.messages !== undefined && input.messages.length > 0
+        ? { messages: input.messages.map((m) => ({ sender: m.sender, text: m.text.slice(0, 64_000) })) }
+        : {}),
+      truncated: input.prompt.length > 64_000 || (input.preamble?.length ?? 0) > 4_000,
+    };
     this.conversation = input.conversation;
     const manifest: ForgeManifest = {
       schema: SCHEMA_VERSION,
