@@ -1,4 +1,4 @@
-import {l as readManifest,d as jobFile,F as FILES,o as ownerAlive,c as readPipeline,h as cancelPipeline,P as PROVIDERS,m as errMessage,n as findProvider,w as writeJsonAtomic,A as AgentSmithReader,q as normalize,t as writeAtomic,j as jobDir,u as SCHEMA_VERSION,x as validOwnerPid,k as isTerminalForgeStatus,y as reportFor,z as cwdFacts,B as normalizeDenials,C as deriveOrphan,E as deriveStatus,G as summaryTail,H as failureFields,R as REASONS,e as readAcceptance,I as writeAcceptance,J as createMarker,W as WORKERS_DIR,K as jobsDir,L as parseWorkerIndex,p as providerNames,N as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,O as normalizeContinuationKind,Q as nextActionFor,T as fileSig,U as JobWriter,i as isTerminalStatus,g as isMode,V as newJobId,X as markAcceptancePending,Y as humanDuration,Z as pipeEvents,_ as checksAbortRequested,$ as verdictBlock,a0 as runAcceptance,a1 as senderOf,a2 as markAcceptanceSuperseded,a3 as pipelineRecordPath,a4 as pickHead,f as isWorkerIdle,a5 as compareTurnPriority,a6 as computeStaleReads,a7 as SMITH_PAYLOAD,a8 as isForgeStatus}from'./chunk-normalize.js';import {existsSync,readFileSync,mkdirSync,appendFileSync,openSync,writeSync,closeSync,unlinkSync,statSync,renameSync,linkSync,readdirSync,realpathSync,lstatSync,copyFileSync}from'node:fs';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import path from'node:path';import {createHash}from'node:crypto';const LAUNCH_ACK_MS = 15_000;
+import {l as readManifest,d as jobFile,F as FILES,o as ownerAlive,c as readPipeline,h as cancelPipeline,P as PROVIDERS,n as errMessage,q as findProvider,w as writeJsonAtomic,A as AgentSmithReader,t as normalize,u as writeAtomic,j as jobDir,x as SCHEMA_VERSION,y as validOwnerPid,k as isTerminalForgeStatus,z as reportFor,B as cwdFacts,C as normalizeDenials,E as deriveOrphan,G as deriveStatus,H as summaryTail,I as failureFields,R as REASONS,e as readAcceptance,J as writeAcceptance,K as createMarker,W as WORKERS_DIR,L as jobsDir,N as parseWorkerIndex,p as providerNames,O as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,Q as normalizeContinuationKind,T as nextActionFor,U as fileSig,V as JobWriter,i as isTerminalStatus,g as isMode,X as newJobId,Y as markAcceptancePending,Z as humanDuration,_ as pipeEvents,$ as checksAbortRequested,a0 as verdictBlock,a1 as runAcceptance,a2 as senderOf,a3 as markAcceptanceSuperseded,a4 as pickHead,f as isWorkerIdle,a5 as compareTurnPriority,a6 as computeStaleReads,a7 as SMITH_PAYLOAD,a8 as isForgeStatus}from'./chunk-normalize.js';import {existsSync,readFileSync,mkdirSync,appendFileSync,openSync,writeSync,closeSync,unlinkSync,statSync,renameSync,linkSync,readdirSync,realpathSync,lstatSync,copyFileSync}from'node:fs';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import path from'node:path';import {createHash}from'node:crypto';const LAUNCH_ACK_MS = 15_000;
 async function launch(url, payload, onPrepared) {
     const child = fork(fileURLToPath(url), [], {
         detached: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
@@ -1564,7 +1564,7 @@ class ForgeService {
         });
     }
     assertNameFree(name, workerId) {
-        const busy = (jobId) => new Error(`"${name}" is busy (${jobId}); wait, cancel, or use another name.`);
+        const busy = (jobId) => new Error(`"${name}" is busy (${jobId}); use follow_up to message it, wait, cancel, or use another name.`);
         const canonicalConflict = this.findActiveIdentity(name, workerId);
         if (canonicalConflict !== null)
             throw busy(canonicalConflict.jobId);
@@ -2439,13 +2439,13 @@ class ForgeService {
         }
         catch (err) {
             if (err instanceof WorkerLookupError && err.kind === 'missing') {
-                throw new Error(`no job "${id}" in ${jobsDir(this.repo)}; call list_jobs for valid job IDs.`);
+                throw this.notFound(id);
             }
             throw err;
         }
         const known = this.live.has(headId) || (this.isSafeJobId(headId) && existsSync(jobDir(this.repo, headId)));
         if (!known) {
-            throw new Error(`no job "${id}" in ${jobsDir(this.repo)}; call list_jobs for valid job IDs.`);
+            throw this.notFound(id);
         }
         const resolvedFrom = headId !== trimmed ? trimmed : null;
         const discarded = this.cutQueue(headId);
@@ -2535,10 +2535,16 @@ class ForgeService {
             this.assertResumable(head);
         return this.numberedDetail(headId);
     }
-    messageHead(ref) {
-        if (existsSync(pipelineRecordPath(this.repo, ref))) {
-            throw new Error(`"${ref}" is a pipeline run; follow_up and steer apply to workers, not runs.`);
+    notFound(id) {
+        return new Error(`No worker "${id}"; see list_jobs.`);
+    }
+    rejectPipelineRun(ref, guidance) {
+        if (readPipeline(this.repo, ref) !== null) {
+            throw new Error(`"${ref}" is a pipeline run; ${guidance}`);
         }
+    }
+    messageHead(ref) {
+        this.rejectPipelineRun(ref, 'follow_up and steer apply to workers, not runs.');
         let headId;
         try {
             headId = this.resolveWorkerHeadId(ref);
@@ -2548,7 +2554,7 @@ class ForgeService {
         }
         const head = this.readManifestSync(headId);
         if (head === null)
-            throw new Error(`No worker "${ref}"; see list_jobs.`);
+            throw this.notFound(ref);
         if (head.pipeline !== null && head.pipeline !== undefined) {
             throw new Error(`"${head.name ?? headId}" is a pipeline stage (${headId}); run_pipeline manages its turns.`);
         }
@@ -2602,7 +2608,7 @@ class ForgeService {
             const headId = this.workerHeadId(workerId) ?? firstHeadId;
             const head = this.readManifestSync(headId);
             if (head === null)
-                throw new Error(`No worker "${ref}"; see list_jobs.`);
+                throw this.notFound(ref);
             if (this.ownerLive(headId, head))
                 return this.enqueue(sender, headId, head, entry, env, warnings);
             return this.coldStart(sender, head, entry, env, warnings);
@@ -2854,6 +2860,7 @@ class ForgeService {
         const trimmed = ref.trim();
         if (trimmed === '')
             throw new WorkerLookupError('worker is empty; pass a worker name, workerId or jobId.', 'missing');
+        this.rejectPipelineRun(trimmed, 'call pipeline_status.');
         this.workers.refresh();
         if (this.isJobId(trimmed)) {
             const m = this.readManifestRaw(trimmed);
@@ -2880,7 +2887,7 @@ class ForgeService {
             heads.push({ jobId: headId, manifest, session: turns.some((t) => this.spawnedIds.has(t.jobId)), idle: isWorkerIdle(head) });
         }
         if (heads.length === 0)
-            throw new WorkerLookupError(`No worker "${name}"; see list_jobs.`, 'missing');
+            throw new WorkerLookupError(this.notFound(name).message, 'missing');
         const startOf = (h) => Date.parse(h.manifest.startedAt ?? h.manifest.createdAt ?? '') || 0;
         const latest = (xs) => [...xs].sort((a, b) => startOf(b) - startOf(a) || b.jobId.localeCompare(a.jobId))[0];
         const running = heads.filter((h) => !h.idle);
@@ -3029,7 +3036,7 @@ class ForgeService {
         reconcileOrphan(this.repo, jobId);
         const observed = await readObservedJob(this.repo, jobId);
         if (observed === null) {
-            throw new Error(`no job "${jobId}" in ${jobsDir(this.repo)}; call list_jobs for valid job IDs.`);
+            throw this.notFound(jobId);
         }
         const reportPath = jobFile(this.repo, jobId, FILES.report);
         let report = null;

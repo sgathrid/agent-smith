@@ -20,7 +20,7 @@ that were already modified before it started. You supply the rest in `spawn_job`
   turn), and `status` reports `staleReads` if you edit them in the repository while the worker
   is running.
 - `checks`: commands that decide acceptance, such as tests or a build. The worker sees them,
-  and they run after it finishes.
+  and they run once it succeeds.
 - `mode`: `implement`, `review`, `moderate` or `verify`. Review and moderate request
   read-only access; the ack's `readOnlyEnforced` says whether the provider enforces it.
 - `name`: a readable worker name; `follow_up` and `steer` address the worker by it.
@@ -52,7 +52,7 @@ with `wait_ms` until the job settles.
 ## Talking to a worker
 
 The worker's name is its handle; you don't need to know whether it is running or idle.
-- `follow_up`: "do this next". Never cuts the turn. Ack `delivery` is `next-step` (a claude worker reads it at its next tool round), `turn-end` (other providers), or `now` (idle). During checks, it waits for the verdict and gets it.
+- `follow_up`: "do this next". Never cuts the turn. Ack `delivery` says when it lands: `next-step`, `turn-end` or `now` (idle). During checks, it waits for the verdict and gets it.
 - `steer`: "stop and do this instead". Cuts the running turn (in-flight tool call lost) or running checks.
 - Queued messages deliver whatever the turn's outcome; `cancel` discards them and reports the count.
 - `env` lives only in memory: ack `env` is `set`, `kept`, or `dropped` (pass `env` again after a restart).
@@ -68,16 +68,7 @@ DONE_WITH_CONCERNS or BLOCKED). Check it against `acceptance` (set by checks), t
 cleanly. `status` and `list_jobs` are concise by default; `response_format: "detailed"`
 returns the full record.
 
-When a job fails, its `nextAction` field suggests one next step:
-
-- canceled: nothing to do.
-- orphaned: `follow_up` if it has a conversation handle, otherwise rerun.
-- denied: see Permissions, or narrow the task if it was already unrestricted.
-- timeout: raise `timeoutMs` or split the task.
-- quiet (`liveness.state` silent): no event for 15 minutes but the worker process is running.
-  kimi reports a tool call only when it finishes, so a silent kimi job is often a long command.
-  `dead` means the process is gone while the job still reads running.
-- network-like error: retry once.
-- empty output: ask the worker what happened with `follow_up`.
-
-Otherwise read `error` and `warnings`.
+When a job fails, `nextAction` suggests one next step; otherwise read `error` and `warnings`.
+If a restricted worker was denied a tool, see Permissions. A running worker's `liveness` is
+`silent` after 15 minutes without an event (kimi reports a tool call only when it finishes,
+so that is often a long command) and `dead` when its process is gone.
