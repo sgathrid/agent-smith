@@ -26178,7 +26178,7 @@ const jobStatus = async (ctx, args) => {
     const wantDiff = boolean(args, 'include_diff') ?? false;
     let detail = await ctx.service.resolveWorker(id);
     let waited = false;
-    const worker = ctx.service.resolveTurn(id) !== detail.jobId;
+    let worker = ctx.service.resolveTurn(id) !== detail.jobId;
     if (waitMs !== undefined) {
         waited = true;
         const deadline = Date.now() + waitMs;
@@ -26187,6 +26187,7 @@ const jobStatus = async (ctx, args) => {
         while (unsettled(ctx, detail, worker) && Date.now() < deadline) {
             await waitForChange(jobDir(ctx.service.repo, detail.jobId), Math.min(maxSlice, deadline - Date.now()), { fallbackMs });
             detail = await ctx.service.resolveWorker(id);
+            worker = ctx.service.resolveTurn(id) !== detail.jobId;
         }
     }
     if (detail.jobId !== id)

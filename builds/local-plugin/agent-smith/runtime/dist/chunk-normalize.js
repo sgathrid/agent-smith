@@ -3,7 +3,7 @@ const TIMEOUT_RE = /timed? ?out|exceeded the .*budget|\btimeout\b/i;
 const AUTH_RE = /\b(?:unauthorized|unauthenticated)\b|authentication (?:failed|required)|invalid (?:api[ _-]?key|access token)|(?:access |auth |refresh )token (?:has )?expired|not (?:logged|signed) in|please (?:log|sign) in/i;
 const BUSY_RE = /resource[_ ]exhausted|no spare capacity|\b503\b|\bservice unavailable\b|\boverloaded\b|provider busy/i;
 const RATE_LIMIT_RE = /\brate[ _-]?limit(?:ed|ing)?\b|too many requests|\b429\b/i;
-const QUOTA_RE = /insufficient[_ ]quota|insufficient credits|quota (?:exceeded|exhausted)|exceeded.{0,30}quota|credit balance.{0,30}(?:low|exhausted)|billing.{0,30}(?:limit|exhausted)|out of credits|\b402\b|payment required/i;
+const QUOTA_RE = /insufficient[_ ](?:quota|credits|balance)|quota (?:exceeded|exhausted)|exceeded.{0,30}quota|credit balance.{0,30}(?:low|exhausted)|balance.{0,20}(?:low|exhausted|insufficient|depleted)|billing.{0,30}(?:limit|exhausted|suspended)|suspended.{0,40}(?:balance|billing|payment|credit|quota|unpaid)|please recharge|recharge (?:your )?(?:account|balance|credits)|out of credits|\b402\b|payment required/i;
 const COMPATIBILITY_RE = /unknown (?:option|argument|flag)|unrecognized (?:option|argument|flag|subcommand)|unexpected argument|unsupported (?:option|flag)|invalid value.{0,80}(?:--model|--effort|reasoning_effort)|unknown model|does not support effort|bad flag or model/i;
 const START_RE = /\bENOENT\b|spawn.{0,100}(?:not found|no such file)|couldn't start|could not start/i;
 const ORPHAN_RE = /orphaned|supervisor process exited|server stopped/i;
@@ -84,6 +84,18 @@ function reasonFromText(text) {
     if (t.length <= 32 && !t.includes('\n') && !t.includes(' — '))
         return t;
     return REASONS.workerError;
+}
+function noticeReason(failureReason, failureDetail) {
+    const classified = reasonFromText(failureReason || failureDetail);
+    if (classified !== REASONS.workerError)
+        return classified;
+    if (failureDetail) {
+        const fromDetail = reasonFromText(failureDetail);
+        if (fromDetail !== REASONS.workerError)
+            return fromDetail;
+        return failureDetail;
+    }
+    return classified;
 }/**
  * hooks/turns.ts — one definition of "which turn is a worker's head" and "is a
  * worker idle", shared by forge (service), the channel (status, watch, notices)
@@ -8299,4 +8311,4 @@ function asUsage(v) {
 /** Normalize a raw agent-smith job snapshot. */
 function normalize(raw) {
     return smithNormalizer(raw);
-}export{humanDuration as $,AgentSmithReader as A,validOwnerPid as B,reportFor as C,DEFAULT_TIMEOUT_MS as D,cwdFacts as E,FILES as F,normalizeDenials as G,deriveOrphan as H,deriveStatus as I,summaryHead as J,failureFields as K,writeAcceptance as L,MODES as M,createMarker as N,jobsDir as O,PROVIDERS as P,parseWorkerIndex as Q,REASONS as R,STAGE_PROMPTS as S,normalizeContinuationKind as T,nextActionFor as U,fileSig as V,WORKERS_DIR as W,JobWriter as X,newJobId$1 as Y,newWorkerId as Z,markAcceptancePending as _,MODE_PRESETS as a,pipeEvents as a0,checksAbortRequested as a1,verdictBlock as a2,runAcceptance as a3,senderOf as a4,taskTitle as a5,markAcceptanceSuperseded as a6,pickHead as a7,compareTurnPriority as a8,computeStaleReads as a9,SMITH_PAYLOAD as aa,isForgeStatus as ab,readJsonSafe as ac,pipelineRecordPath as ad,workerIndexPath as ae,checksReason as af,toolLabel as ag,inheritContinuedProviders as b,readPipeline as c,jobFile as d,readAcceptance as e,findProvider as f,isWorkerIdle as g,isMode as h,isTerminalStatus as i,jobDir as j,cancelPipeline as k,isTerminalForgeStatus as l,missingPipelineError as m,readManifest as n,ownerAlive as o,providerNames as p,getProvider as q,reasonFromText as r,startPipeline as s,errMessage as t,probeAvailability as u,validateSpec as v,writeJsonAtomic as w,normalize as x,writeAtomic as y,SCHEMA_VERSION as z};
+}export{humanDuration as $,AgentSmithReader as A,validOwnerPid as B,reportFor as C,DEFAULT_TIMEOUT_MS as D,cwdFacts as E,FILES as F,normalizeDenials as G,deriveOrphan as H,deriveStatus as I,summaryHead as J,failureFields as K,writeAcceptance as L,MODES as M,createMarker as N,jobsDir as O,PROVIDERS as P,parseWorkerIndex as Q,REASONS as R,STAGE_PROMPTS as S,normalizeContinuationKind as T,nextActionFor as U,fileSig as V,WORKERS_DIR as W,JobWriter as X,newJobId$1 as Y,newWorkerId as Z,markAcceptancePending as _,MODE_PRESETS as a,pipeEvents as a0,checksAbortRequested as a1,verdictBlock as a2,runAcceptance as a3,senderOf as a4,taskTitle as a5,markAcceptanceSuperseded as a6,pickHead as a7,compareTurnPriority as a8,computeStaleReads as a9,SMITH_PAYLOAD as aa,isForgeStatus as ab,noticeReason as ac,readJsonSafe as ad,pipelineRecordPath as ae,workerIndexPath as af,checksReason as ag,toolLabel as ah,inheritContinuedProviders as b,readPipeline as c,jobFile as d,readAcceptance as e,findProvider as f,isWorkerIdle as g,isMode as h,isTerminalStatus as i,jobDir as j,cancelPipeline as k,isTerminalForgeStatus as l,missingPipelineError as m,readManifest as n,ownerAlive as o,providerNames as p,getProvider as q,reasonFromText as r,startPipeline as s,errMessage as t,probeAvailability as u,validateSpec as v,writeJsonAtomic as w,normalize as x,writeAtomic as y,SCHEMA_VERSION as z};

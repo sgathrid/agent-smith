@@ -2922,13 +2922,27 @@ class ForgeService {
         throw new WorkerLookupError(`"${name}" matches ${pool.length} workers: ${candidates.join(', ')}; pass a jobId.`, 'ambiguous', pool.map((h) => h.jobId));
     }
     async resolveWorkerHead(nameOrWorkerIdOrJobId) {
-        return this.numberedDetail(this.resolveWorkerHeadId(nameOrWorkerIdOrJobId));
+        return this.resolveStableDetail(this.resolveWorkerHeadId(nameOrWorkerIdOrJobId));
     }
     async resolveWorker(nameOrId) {
         const trimmed = nameOrId.trim();
         if (this.isJobId(trimmed))
-            return this.numberedDetail(this.resolveTurn(trimmed));
+            return this.resolveStableDetail(this.resolveTurn(trimmed));
         return this.resolveWorkerHead(trimmed);
+    }
+    async resolveStableDetail(initialId) {
+        const seen = new Set();
+        let id = initialId;
+        while (true) {
+            seen.add(id);
+            const d = await this.numberedDetail(id);
+            const next = d.supersededBy ?? this.resolveTurn(d.jobId);
+            if (!next || next === d.jobId || seen.has(next))
+                return d;
+            id = this.resolveTurn(next);
+            if (seen.has(id))
+                return d;
+        }
     }
     async numberedDetail(jobId) {
         const d = await this.detail(jobId);
