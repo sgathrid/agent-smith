@@ -539,16 +539,16 @@ function buildSteeredPrompt(input) {
             ? '[TURN INTERRUPTED]'
             : `[FOLLOW-UP STEER · ${input.entries.length} queued update${input.entries.length === 1 ? '' : 's'}]`;
     const statusLine = input.wasInterrupted
-        ? `Your previous turn (${input.parentJobId}) was interrupted after ${input.toolCalls} tool call(s) with updated instructions from the orchestrator. Inspect your working tree before repeating any completed steps.`
-        : `Your previous turn (${input.parentJobId}) ${input.priorStatus === undefined || input.priorStatus === 'succeeded' ? 'completed' : `ended ${input.priorStatus}`} after ${input.toolCalls} tool call(s), and the orchestrator queued follow-up instructions for you.`;
+        ? 'Your previous turn was interrupted with updated instructions. Inspect your working tree before repeating any completed steps.'
+        : `Your previous turn ${input.priorStatus === undefined || input.priorStatus === 'succeeded' ? 'completed' : `ended ${input.priorStatus}`}.`;
     const syncedLine = input.syncedFiles !== undefined && input.syncedFiles.length > 0
         ? `\nSynced brief file(s) in your working tree: ${input.syncedFiles.join(', ')} (re-read before continuing).`
         : '';
-    const tailBlock = input.responseTail
+    const tailBlock = input.freshContinuation && input.responseTail
         ? `\nLast response excerpt from previous turn:\n${input.responseTail}\n`
         : '';
     const verdictBlock = input.verdict ? `\n${input.verdict}\n` : '';
-    const header = `[STEERED TURN CONTINUITY] ${tag}\n${statusLine}${syncedLine}${verdictBlock}${tailBlock}\n[ORCHESTRATOR UPDATE]\n${steerBody}`;
+    const header = `${tag}\n${statusLine}${syncedLine}${verdictBlock}${tailBlock}\n[ORCHESTRATOR UPDATE]\n${steerBody}`;
     const prependBrief = input.brief !== '' && !header.startsWith(input.brief);
     const sentPrompt = prependBrief ? `${input.brief}\n\n${header}` : header;
     return { rawPrompt: header, sentPrompt, prependBrief };
@@ -2221,19 +2221,19 @@ class ForgeService {
         const conversation = typeof head.conversation === 'string' && head.conversation !== '' ? head.conversation : undefined;
         const steered = entries.some((e) => senderOf(e) === 'steer');
         let responseTail = '';
-        try {
-            responseTail = readFileSync(jobFile(this.repo, head.jobId, FILES.report), 'utf8').trim().slice(-600);
+        if (conversation === undefined) {
+            try {
+                responseTail = readFileSync(jobFile(this.repo, head.jobId, FILES.report), 'utf8').trim().slice(-600);
+            }
+            catch { }
         }
-        catch { }
         const cwd = spec?.cwd ?? head.cwd ?? this.repo;
         const { watchedFiles, syncedFiles, notes } = this.syncContinuationFiles(cwd, head.watchedFiles, entries.flatMap((e) => e.files ?? []));
         const { rawPrompt } = buildSteeredPrompt({
-            parentJobId: head.jobId,
             wasInterrupted: false,
             priorStatus: head.status,
             verdict: input.verdict,
             freshContinuation: conversation === undefined,
-            toolCalls: head.toolCalls ?? 0,
             responseTail,
             entries,
             syncedFiles,
@@ -2339,12 +2339,10 @@ class ForgeService {
             resuming,
         });
         const { rawPrompt, sentPrompt, prependBrief } = buildSteeredPrompt({
-            parentJobId: parent.jobId,
             wasInterrupted,
             priorStatus: verdictStatus,
             freshContinuation: !resuming,
-            toolCalls: parent.writer.snapshot()?.toolCalls ?? 0,
-            responseTail: result.response.trim().slice(-600),
+            responseTail: resuming ? '' : result.response.trim().slice(-600),
             entries: unconsumed,
             syncedFiles,
             brief: nextBrief,

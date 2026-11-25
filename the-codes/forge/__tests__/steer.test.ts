@@ -7,6 +7,7 @@ import { test } from 'node:test';
 import type { SpawnSpec } from '../../providers/types.ts';
 import { readAcceptance } from '../checks.ts';
 import { FILES, jobFile } from '../format.ts';
+import { buildSteeredPrompt } from '../steer-log.ts';
 import { ForgeTasks } from '../../surfaces/channel/src/tasks.ts';
 import { callTool } from '../../surfaces/channel/src/tools.ts';
 import { isLive } from '../../surfaces/mod/hooks/dashboard.ts';
@@ -477,7 +478,7 @@ test('a queued follow-up behind a failed turn is delivered as the next turn (rev
   const t2Ready = ctrl.nextTurn();
   t1.finish({ status: 'error', exitCode: 1, response: '' });
   const t2 = await t2Ready;
-  assert.match(t2.spec.prompt, new RegExp(`Your previous turn \\(${ack.jobId}\\) ended failed`));
+  assert.match(t2.spec.prompt, /Your previous turn ended failed\./);
   assert.match(t2.spec.prompt, /Follow up after the turn\./);
   t2.finish({ status: 'success', response: 'Recovered.' });
   const finalManifest = await done;
@@ -524,4 +525,57 @@ test('a writing turn whose cwd vanished fails, and its queued follow-up is still
   const detail = await service.detail(ack.jobId);
   assert.equal(detail.status, 'failed');
   assert.equal(ctrl.turns.length, 2);
+});
+
+test('buildSteeredPrompt trims bloat on resumed continuations and keeps excerpt only when fresh', () => {
+  const entry = (id: string, createdAt: string, prompt: string) => ({
+    id, createdAt, prompt, delivery: 'queue' as const,
+  });
+
+  const resumedInterrupt = buildSteeredPrompt({
+    wasInterrupted: true,
+    freshContinuation: false,
+    responseTail: 'Previous partial output that is already in thread history.',
+    entries: [entry('s1', '2026-11-24T10:00:00.000Z', 'Switch to approach B.')],
+    syncedFiles: ['docs/spec.md'],
+    verdict: 'Checks failed: test',
+    brief: '',
+  });
+  assert.match(resumedInterrupt.rawPrompt, /^\[TURN INTERRUPTED\]\n/);
+  assert.doesNotMatch(resumedInterrupt.rawPrompt, /\[STEERED TURN CONTINUITY\]/);
+  assert.doesNotMatch(resumedInterrupt.rawPrompt, /Last response excerpt/);
+  assert.doesNotMatch(resumedInterrupt.rawPrompt, /tool call\(s\)/);
+  assert.match(resumedInterrupt.rawPrompt, /Inspect your working tree before repeating any completed steps\./);
+  assert.match(resumedInterrupt.rawPrompt, /Synced brief file\(s\) in your working tree: docs\/spec\.md/);
+  assert.match(resumedInterrupt.rawPrompt, /Checks failed: test/);
+  assert.match(resumedInterrupt.rawPrompt, /\[ORCHESTRATOR UPDATE\]\nSwitch to approach B\./);
+
+  const resumedMulti = buildSteeredPrompt({
+    wasInterrupted: false,
+    priorStatus: 'succeeded',
+    freshContinuation: false,
+    responseTail: 'Already in thread history.',
+    entries: [
+      entry('s1', '2026-11-24T10:00:00.000Z', 'First update.'),
+      entry('s2', '2026-11-24T10:01:00.000Z', 'Second update.'),
+    ],
+    brief: '',
+  });
+  assert.match(resumedMulti.rawPrompt, /^\[FOLLOW-UP STEER · 2 queued updates\]\nYour previous turn completed\./);
+  assert.doesNotMatch(resumedMulti.rawPrompt, /Last response excerpt/);
+  assert.match(resumedMulti.rawPrompt, /\[Steer 1 \(2026-11-24T10:00:00\.000Z\)\]\nFirst update\./);
+  assert.match(resumedMulti.rawPrompt, /\[Steer 2 \(2026-11-24T10:01:00\.000Z\)\]\nSecond update\./);
+
+  const fresh = buildSteeredPrompt({
+    wasInterrupted: false,
+    priorStatus: 'failed',
+    freshContinuation: true,
+    responseTail: 'Tail from the previous turn.',
+    entries: [entry('s1', '2026-11-24T10:00:00.000Z', 'Retry the fix.')],
+    brief: '',
+  });
+  assert.match(fresh.rawPrompt, /^\[FRESH CONTINUATION\]\nYour previous turn ended failed\./);
+  assert.doesNotMatch(fresh.rawPrompt, /\[STEERED TURN CONTINUITY\]/);
+  assert.match(fresh.rawPrompt, /Last response excerpt from previous turn:\nTail from the previous turn\./);
+  assert.match(fresh.rawPrompt, /\[ORCHESTRATOR UPDATE\]\nRetry the fix\./);
 });

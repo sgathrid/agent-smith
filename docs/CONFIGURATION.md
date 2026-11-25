@@ -91,8 +91,9 @@ never a CLI call on the spawn path.
 Sandbox posture per provider (recorded in `job.json`; the ack carries only `unrestricted` and `readOnlyEnforced`): agy default = `--dangerously-skip-permissions`
 (headless agy cannot prompt, so restricted means silent denial; opt out with `unrestricted:false`
 or `AGENT_SMITH_AGY_RESTRICTED=1`, which gives no flag and auto-denies unapproved tools;
-read-only is not enforceable). codex default = `-s workspace-write`, `-s read-only` for
-read-only modes, bypass flag when unrestricted (resume uses `-c sandbox_mode=...`). claude
+read-only is not enforceable). codex always pins `-c approval_policy="never"` (exec and
+resume); default = `-s workspace-write`, `-s read-only` for read-only modes, bypass flag
+when unrestricted (resume uses `-c sandbox_mode=...`). claude
 default = `--permission-mode dontAsk --permission-prompts none` (enforces read-only in read-only
 modes with `--allowedTools` and `--disallowedTools Edit Write NotebookEdit`),
 `--dangerously-skip-permissions` when unrestricted. opencode default = the agent's own rules
