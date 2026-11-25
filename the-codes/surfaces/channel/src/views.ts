@@ -212,11 +212,35 @@ function git(cwd: string, args: string[]): Promise<{ out: string; clipped: boole
   });
 }
 
-export async function jobDiff(d: JobDetail): Promise<{ diff: string | null; diffNote?: string }> {
+export function withWorkerFiles<T extends JobDetail>(head: T, earlier: readonly JobDetail[]): T {
+  if (earlier.length === 0) return head;
+  const turns = [...earlier, head];
+  const anyRecorded = turns.some(t => Array.isArray(t.changedFiles));
+  const changedFiles = [...new Set(turns.flatMap(t => t.changedFiles ?? []))];
+  const changedFilesUnknown = turns.some(t => t.changedFilesUnknown === true);
+  const changedFilesTruncated = turns.some(t => t.changedFilesTruncated === true);
+  return {
+    ...head,
+    ...(anyRecorded ? { changedFiles, changedFileCount: changedFiles.length } : {}),
+    ...(changedFilesUnknown ? { changedFilesUnknown: true } : {}),
+    ...(changedFilesTruncated ? { changedFilesTruncated: true } : {}),
+  };
+}
+
+export function withWorkerBaseline<T extends JobDetail>(head: T, earlier: readonly JobDetail[]): T {
+  if (earlier.length === 0) return head;
+  const baselineTurn = [...earlier, head].find(t => Boolean(t.gitBaseline?.head));
+  if (!baselineTurn) return head;
+  return { ...head, gitBaseline: baselineTurn.gitBaseline, cwd: baselineTurn.cwd ?? head.cwd };
+}
+
+export async function jobDiff(d: JobDetail, { runningTurnPending = false }: { runningTurnPending?: boolean } = {}): Promise<{ diff: string | null; diffNote?: string }> {
   const head = d.gitBaseline?.head;
   if (!d.gitBaseline || !head || !d.cwd) return { diff: null, diffNote: 'No diff: no git commit at spawn.' };
   if (!d.changedFiles) return { diff: null, diffNote: d.status === 'running' ? 'No diff yet: files are listed when the job finishes.' : 'No diff: no changed files recorded.' };
-  if (d.changedFiles.length === 0) return { diff: '', diffNote: 'No files changed.' };
+  if (d.changedFiles.length === 0) {
+    return { diff: '', diffNote: runningTurnPending ? "No files changed yet; the running turn's files are added when it finishes." : 'No files changed.' };
+  }
   try {
     const [tracked, untracked] = await Promise.all([
       git(d.cwd, ['diff', '--no-color', head, '--', ...d.changedFiles]),
@@ -232,6 +256,7 @@ export async function jobDiff(d: JobDetail): Promise<{ diff: string | null; diff
     if (added.length) notes.push(`Untracked, not in diff: ${added.join(', ')}.`);
     const preDirty = d.changedFiles.filter(f => d.gitBaseline!.dirty.includes(f));
     if (preDirty.length) notes.push(`Dirty before the job, so the diff includes earlier edits: ${preDirty.join(', ')}.`);
+    if (runningTurnPending) notes.push("The running turn's files are added when it finishes.");
     return { diff, ...(notes.length ? { diffNote: notes.join(' ') } : {}) };
   } catch (err) {
     return { diff: null, diffNote: `git diff failed: ${trimWords(String(err), 200)}. Run git diff ${head} -- <file> yourself.` };
