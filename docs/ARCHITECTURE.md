@@ -32,8 +32,8 @@ State lives in `<repo>/.agent-smith/jobs/<jobId>/` (gitignored). `FILES` in `for
 
 | File | Writer | Meaning |
 |---|---|---|
-| `job.json` | `JobWriter`; service-owned orphan recovery; atomic whole-file rewrite | The anchor and only mandatory file. Schema v1 manifest: identity, provider/mode/model (requested, resolved, source), sandbox, status, timestamps, `ownerPid`, `exitCode`, `error`, `deniedActions`, `usage`, `gitBaseline`, `changedFiles`, and finish evidence when it applies: `toolErrors` (tool calls that ended in an error), `failedEarly`, `changedFilesUnknown`, `cwdMissingAtFinish` (see Status derivation). Never deleted. A reader refuses a manifest with a higher `schema`. Holds `task` (first prompt line, 200 chars), not the full prompt. |
-| `progress.json` | `JobWriter`, coalesced to `PROGRESS_FLUSH_MS` = 250 ms | Advisory liveness: `lastEventAt` (last provider event), `lastAliveAt` and `workerPid` (the process owner's heartbeat, see Liveness), live `toolCalls` and `toolErrors`, recent activities, `lastActivity` (including completed tools), `latestText`, `latestSummary` (source `worker`: the current assistant message only, reset at each tool call; at finish the last 1 000 chars of the final response, cut at a paragraph or line boundary), warnings, and `digest`: what the worker has done so far, from its tool calls (`phase`, files read, searches, files edited through visible edit tools, commands, test runs and whether the last one explicitly failed, a repeated call). One classifier in `surfaces/mod/hooks/progress.ts` serves every provider and both the writer and the UI. It never reports a passing test or zero edits, because exit codes and shell edits are not always visible. |
+| `job.json` | `JobWriter`; service-owned orphan recovery; atomic whole-file rewrite | The anchor and only mandatory file. Schema v1 manifest: identity, provider/mode/model (requested, resolved, source), sandbox, status, timestamps, `ownerPid`, `exitCode`, `error`, `deniedActions`, `usage`, `gitBaseline`, `changedFiles`, and finish evidence when it applies: `toolErrors` (tool calls that ended in an error), `failedEarly`, `changedFilesUnknown`, `cwdMissingAtFinish` (see Status derivation). Never deleted. A reader refuses a manifest with a higher `schema`. Holds `task` (first prompt line, 200 chars; on continuations, the first message's label), not the full prompt. |
+| `progress.json` | `JobWriter`, coalesced to `PROGRESS_FLUSH_MS` = 250 ms | Advisory liveness: `lastEventAt` (last provider event), `lastAliveAt` and `workerPid` (the process owner's heartbeat, see Liveness), live `toolCalls` and `toolErrors`, recent activities, `lastActivity` (including completed tools), `latestText`, `latestSummary` (source `worker`: the current assistant message only, reset at each tool call; at finish the first 1 000 chars of the final response after any leading `Status:` line, cut at a paragraph or line boundary), warnings, and `digest`: what the worker has done so far, from its tool calls (`phase`, files read, searches, files edited through visible edit tools, commands, test runs and whether the last one explicitly failed, a repeated call). One classifier in `surfaces/mod/hooks/progress.ts` serves every provider and both the writer and the UI. It never reports a passing test or zero edits, because exit codes and shell edits are not always visible. |
 | `events.jsonl` | `providers/ndjson.ts` | Normalized `ProviderEvent` stream. Heartbeats are not written here. |
 | `argv.json` | `providers/ndjson.ts` | Exact argv and cwd. |
 | `stderr.log` | `providers/ndjson.ts` | Child stderr, verbatim. |
@@ -47,7 +47,7 @@ State lives in `<repo>/.agent-smith/jobs/<jobId>/` (gitignored). `FILES` in `for
 | `steer.consumed` | `ForgeService.pump` / `own` | Decimal count of `steer.jsonl` entries already delivered for this turn; callers read it to compute `pendingMessages` across processes. |
 | `steer.discard` | `ForgeService.cancel` | Decimal count of `steer.jsonl` entries at the moment `cancel` ran; undelivered entries before it are discarded, while entries appended after it still deliver. |
 | `steer.head` | `ForgeService.pump` | Child job ID written after a steered continuation anchor exists and before the parent stamps `supersededBy`; lets `resolveTurn` (status/cancel by `jobId`) cross that finish window. |
-| `view.json` | `JobWriter` | Bounded detail snapshot (`ForgeView`) for `/forge`: prompt, preamble, transcript, tools, and ordered `timeline` (including `message` events `{kind:'message', sequence, at, text, delivery:'next-step'|'turn-start', sender:'follow_up'|'steer'}` recorded when messages are read). |
+| `view.json` | `JobWriter` | Bounded detail snapshot (`ForgeView`) for `/forge`: prompt, preamble, `messages` (on continuations, `{sender, text}[]`), transcript, tools, and ordered `timeline` (including `message` events `{kind:'message', sequence, at, text, delivery:'next-step'|'turn-start', sender:'follow_up'|'steer'}` recorded when messages are read). |
 | `checks-spec.json` | `ForgeService` | The turn's configured `checks`, so `follow_up` and `from` inherit them. |
 | `request.json` | `spawn_job` handler (fresh spawns only) | The request the worker was started with (mode, prompt, context, files, cwd, provider, model, effort, timeout, unrestricted), so `spawn_job` `from` can reuse it. Its `checks` come from `checks-spec.json`. Absent for pipeline stages and older jobs. |
 | `acceptance.json` | `forge/checks.ts` (when `spawn_job` or `follow_up` has `checks`) | Sidecar, see Acceptance. Not in `FILES`. |
@@ -84,7 +84,7 @@ Identity and turn records: `workerId` is the logical worker across turns, `name`
 - `chainStartedAt` — inherited across a `steer` that replaces a turn only; reset to `startedAt` on `follow_up` and on a `steer` that starts an idle worker.
 - `pendingSteers` (manifest field name kept) — count of unconsumed queued messages on the head turn; agent-facing views expose it as `pendingMessages`.
 
-ID and name resolution: `status(id)` and `cancel(id)` treat a worker name as the worker's latest turn (`pickHead` in `mod/hooks/turns.ts`), and a `jobId` as that exact turn (following only `supersededBy`, not `followedBy`). `workerId` is not a separate handle (it equals turn 1's `jobId`). `follow_up(worker, ...)` and `steer(worker, ...)` accept a worker name or any turn's `jobId` (a `jobId` targets that turn's worker). Ambiguous worker names resolve in order: running worker > latest worker spawned by this server session > unique match > error listing candidates `"name (jobId, finished <iso>)"`.
+ID and name resolution: a new worker gets a `w-<hex>` `workerId`, never a `jobId`. `status(id)` and `cancel(id)` treat a worker name or `workerId` as the worker's latest turn (`pickHead` in `mod/hooks/turns.ts`), and a `jobId` as that exact turn (following only `supersededBy`, not `followedBy`). `follow_up(worker, ...)` and `steer(worker, ...)` accept a worker name, `workerId`, or any turn's `jobId` (a `jobId` targets that turn's worker). Ambiguous worker names resolve in order: running worker > latest worker spawned by this server session > unique match > error listing candidates `"name (jobId, finished <iso>)"`.
 
 #### Behaviour table
 
@@ -303,6 +303,7 @@ The brief also asks the worker to start its report with a `Status:` line and lis
 
 A continuation (`follow_up` or `steer` with `conversation` set) already holds the brief, so it gets only the context,
 check lines (when supplied), and—when a `follow_up` waited on checks—the bounded check verdict block; otherwise nothing is prepended.
+A queued or idle continuation reaches the worker as one status sentence, optional synced-files and verdict lines, a blank line, then the message (numbered `1.`, `2.` when several messages are delivered together).
 Pipeline retries that continue the same conversation pass neither. The brief is not
 prepended when the prompt already starts with it. `preambleApplied` is true when the sent
 prompt starts with the brief; `view.json` keeps the prepended brief as
@@ -317,9 +318,10 @@ the first spawn usually finds them cached. Discovery is also persisted to
 production launch validates in a fresh supervisor process with an empty memory cache: it reads the
 file the warm-up wrote instead of probing the CLI again.
 
-- `getCatalogs({providers?, refresh?, timeoutMs?})`: PATH-probes `available()` for each
-  provider, fans out `listModels()` in parallel (10 s per provider, guard +1 s), never
-  rejects. Cache per provider, `CATALOG_TTL_MS` = 5 min: in memory, then the repo's disk file above
+- `getCatalogs({providers?, refresh?, timeoutMs?})`: probes availability via `probeAvailability`
+  (each probe returns `installed`, `not-installed`, or `failed` with a reason), fans out `listModels()`
+  in parallel for installed providers (10 s per provider, guard +1 s), includes failed probes as
+  entries marked `probeFailed: true` with their `error`, and never rejects. Cache per provider, `CATALOG_TTL_MS` = 5 min: in memory, then the repo's disk file above
   when the caller passes `repo` (the service and `list_capabilities` do), so any process sees
   another's discovery. `refresh: true` skips both as a source of fresh data and rewrites the file.
   A usable result (no error, or models present) is cached and persisted. If discovery fails and an
@@ -470,7 +472,7 @@ Claude                MCP server (dist/server.js)      Claude Code hooks        
   whose process is gone (once more: `process gone 3m`); the text states the fact and never
   asks for an interrupt. It holds a pending acceptance verdict for the checks' budget, with one
   `$.prompt.submit` turn credited to the plugin. Claude Code shows that message to
-  the user in full, so it is the only notice: one line per worker, no worker summary. Only claimed ids are announced, so two sessions on one repo
+  the user in full, so it is the only notice: one line per worker, no worker summary, followed by `status <workerId>`. Only claimed ids are announced, so two sessions on one repo
   never wake each other. A `spawn_job` with `variants` returns `{jobs:[...]}` and every variant worker is claimed and watched. A claimed run is announced with its stage jobs when the
   run ends. `/clear` resets session state, so a worker claimed before it goes
   unannounced (the band still shows it).
@@ -523,13 +525,13 @@ user (up to 10 minutes) before anything launches.
 
 ## Safety and trust
 
-- An explicit `unrestricted: true` for codex, claude or opencode on `spawn_job`/`follow_up` is
+- An explicit `unrestricted: true` for providers without `defaultUnrestricted` (codex, claude, opencode) on `spawn_job`, `follow_up` or `run_pipeline` (asked once per run, naming the stages) is
   confirmed with the user through MCP form elicitation before launch (`tools.ts`
   `confirmUnrestricted`; the server handle reaches `callTool` as `HandlerContext.server`). It
   fails closed: decline, cancel or no answer returns `isError`. Clients without form elicitation
   launch with an ack warning; `AGENT_SMITH_CONFIRM_UNRESTRICTED=0` skips the prompt.
-- `unrestricted` defaults to false for providers that can prompt; agy defaults to true (with
-  an env opt-out) and kimi is always true because its print mode force-sets auto, so it cannot
+- `unrestricted` comes from each provider's `defaultUnrestricted` property: false for providers that can prompt, `true` for agy (with
+  an env opt-out), and `'always'` for kimi because its print mode force-sets auto, so it cannot
   be restricted. `job.json` records the effective posture, not a request that had no effect;
   read-only is not enforceable for kimi. Each harness
   owns its sandbox (see CONFIGURATION.md); the ack carries `unrestricted` and, for read-only modes, `readOnlyEnforced`.
@@ -540,12 +542,13 @@ user (up to 10 minutes) before anything launches.
   env vault per `workerId` for the Claude Code session (MCP server process lifetime), filled
   by `spawn_job`/`follow_up` `env` args and passed to every new owner over IPC (the
   supervisor launch payload, not disk); the owner holds it for its chain. `follow_up` acks
-  report `env: 'set' | 'kept' | 'dropped'` (omitted when the worker never had `env`): `'dropped'`
+  report `env: 'set' | 'kept' | 'deferred' | 'dropped'` (omitted when the worker never had `env`): `'dropped'`
   (with `envKeys` naming the missing keys and a warning) when any key the worker ever had has no
-  value in this call or the vault (for example after a Claude Code restart), else `'set'` when
-  passed in this call, `'kept'` when supplied by the vault or live owner.
+  value in this call or the vault (for example after a Claude Code restart), `'deferred'` when
+  `env` is passed to a running worker and held in the vault until it goes idle, `'set'` when
+  passed on a cold start, `'kept'` when supplied by the vault or live owner.
 - Worker-authored fields (`report`, `latestSummary`) are untrusted data; `latestSummary`
-  is bounded assistant output with source `worker`, never thinking or generic tool output.
+  is bounded assistant output (head of the final response after any leading `Status:` line) with source `worker`, never thinking or generic tool output.
   Verify with checks or the diff.
 - Cancellation: the marker is intent. Only the owning process holds the worker handle. `cancel`
   waits up to 5 s for the job or run to settle and reports `settled`; a settled cancel writes the
@@ -577,7 +580,7 @@ user (up to 10 minutes) before anything launches.
   tracks a worker's turns and `<workerId>.lock` serializes caller/owner handoffs for
   exactly-once message delivery.
 - **Session env vault**: `env` args stay in memory for the Claude Code session (passed to
-  owners over IPC, never written to disk); `follow_up` reports `env: 'set' | 'kept' | 'dropped'`.
+  owners over IPC, never written to disk); `follow_up` reports `env: 'set' | 'kept' | 'deferred' | 'dropped'`.
 - **Checks and notices**: `follow_up` during checks waits for the verdict and passes a bounded
   verdict block into the next turn; `steer` aborts checks (`aborted by steer`). Completion
   notices fire once per worker idle transition, covering all turns completed since the last notice.

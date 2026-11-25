@@ -351,7 +351,6 @@ export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
   };
   let step = 0;
   let resetOnNextText = false;
-  /** partID -> stepIndex */
   const partStep = new Map<string, number>();
 
   const translate = (raw: Record<string, unknown>): ProviderEvent[] => {
@@ -547,9 +546,6 @@ export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
     }
 
     // ---- step boundaries ----------------------------------------------------
-    // One per assistant step. Their counters were handled above and there is
-    // nothing else a reader needs per step, so they are silent: one info notice
-    // per step would bury real warnings under hundreds of lines of noise.
     if (isStepStart || isStepFinish) {
       if (isStepStart) resetOnNextText = true;
       // Verified in the installed OpenCode CLI: session.step.ended emits

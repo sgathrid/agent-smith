@@ -30,6 +30,7 @@ interface Provider {
   spawn(spec: SpawnSpec): Promise<WorkerHandle>;
   describeSandbox?(spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly' | 'artifactPath'>): SandboxInfo;
   readonly supportsEffort?: boolean;
+  readonly defaultUnrestricted?: boolean | 'always';
   readonly liveInput?: boolean; // true only for claude
   harnessDefaults?(): { model?: string; effort?: string };
   listModels?(options?: ListModelsOptions): Promise<ModelCatalog>;
@@ -408,3 +409,5 @@ Two deliberate choices:
 `total_tokens` but no `cache_write`; codex reports no `total_tokens`;
 Anthropic reports `cache_creation_input_tokens`. Inventing a total in any one
 adapter would make cross-provider totals wrong in a way that is hard to notice.
+
+`JobResult.response` is the final assistant message for every provider, not all prose from the run.

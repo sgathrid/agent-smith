@@ -89,25 +89,6 @@ export interface ProviderAvailability {
   reason?: string;
 }
 
-/**
- * Which providers exist on this machine.
- *
- * IMPLEMENTATION: each Provider.available() does a PATH walk + X_OK test (see
- * binaryOnPath in ndjson.ts). Deliberately NOT a `--version` subprocess probe:
- * - four spawns on every startup is slow for a check that runs on every render;
- * - `--version` on a broken install can hang waiting on a network auth check;
- * - agy/agy models and codex/codex --version have both been observed to be
- *   slow or interactive in the past.
- *
- * The trade-off is explicit: this answers "can I exec it", NOT "is it
- * authenticated". A provider can be available and still fail its first job on
- * a 402 or a missing key. That failure arrives as a JobResult with a real error
- * string, which is where it belongs — not as a false negative in detection that
- * hides the provider from the mod.
- *
- * All four probes run concurrently. Never rejects: a provider whose probe throws
- * is reported unavailable with the reason, because detectAvailable() feeds a UI.
- */
 export type AvailabilityStatus = 'installed' | 'not-installed' | 'failed';
 
 export interface AvailabilityProbe {

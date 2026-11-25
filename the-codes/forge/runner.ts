@@ -299,14 +299,6 @@ export interface RunnerDeps {
   readonly service: ForgeService;
   /** Unique pipeline invocation id; scopes artifacts away from concurrent runs. */
   readonly runId?: string | undefined;
-  /**
-   * Bypass tool approvals for pipeline stages.
-   *
-   * FALSE, and it stays false. A pipeline is unattended by construction, and
-   * unattended is exactly the condition under which agy soft-denies every tool
-   * and reports success having done nothing. The caller has to say yes out loud.
-   * See forge/service.ts's header.
-   */
   readonly unrestricted?: boolean | undefined;
   /** Test/observability tap. Must not throw; the runner does not guard it. */
   readonly onObservation?: ((stage: string, obs: Observation) => void) | undefined;

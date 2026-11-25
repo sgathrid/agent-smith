@@ -1,76 +1,3 @@
-/**
- * providers/agy.ts — Antigravity CLI (`agy`) adapter.
- *
- * ============================================================================
- * EVERYTHING IN THIS FILE'S EVENT SCHEMA WAS VERIFIED AGAINST THE REAL BINARY.
- * ============================================================================
- * Verified on 2026-10-06 with:
- *   $ agy --print=hello --print-timeout=20s --output-format stream-json \
- *         --model gemini-3.8-flash-low
- * Commands used to check: `agy --help`, `agy models`, and live `--print` runs.
- * ============================================================================
- *
- * ----------------------------------------------------------------------------
- * THE TRAP: exit 0, status "SUCCESS", empty response.
- * ----------------------------------------------------------------------------
- * agy runs headless. Headless agy CANNOT PROMPT for tool permission. So when a
- * tool needs approval nobody can give, agy auto-denies it, prints a human
- * warning to stderr, and then reports:
- *
- *     {"event":"result","result":{
- *        "conversation_id":"...","status":"SUCCESS","response":"",
- *        "duration_seconds":2.6,"num_turns":1,"usage":{...},
- *        "denied_actions":[{"action":"command","display_name":"RunCommand"}]}}
- *
- * The process exits 0. `result.status` is the string "SUCCESS". `response` is
- * empty. VERIFIED LIVE:
- *
- *     $ agy --print="Run the shell command: echo hi" --output-format stream-json ...
- *     ... step_update step_index=2 state=ERROR step_type=tool tool_name=run_command
- *         tool_info.error.type = "TOOL_ERROR"
- *         tool_info.error.message = "permission check failed for command \"echo hi\":
- *             user denied permission to run command: ... Proceed without
- *             performing this action."
- *     stderr: jetski: no output produced — a tool required the "command"
- *             permission that headless mode cannot prompt for, so it was
- *             auto-denied. ... Alternatively, re-run with
- *             --dangerously-skip-permissions to auto-approve all tools.
- *     $ echo $?
- *     0
- *
- * EVERY NAIVE INTEGRATION READS THIS AS A SUCCESSFUL JOB THAT PRODUCED NOTHING.
- * A pipeline that chains implement -> review would then review a patch that was
- * never written, and report green. That is worse than a crash, because it is
- * quiet.
- *
- * So `result.denied_actions` IS TREATED AS A FIRST-CLASS FAILURE SIGNAL, and
- * there are actually THREE independent ways to detect it in this file, because
- * each fails in a different situation:
- *
- *   (1) result.denied_actions is non-empty  -> JobStatus 'denied'.  [primary]
- *       Unless agy still finished with SUCCESS, exit 0 and a non-empty report:
- *       then 'success' with the denials marked nonfatal, as claude does.
- *   (2) tool_info.error.type === 'TOOL_ERROR' whose message mentions a
- *       permission check failure or denial            -> 'denied'.  [early signal]
- *   (3) status !== 'SUCCESS'                        -> 'error'.
- *       Unless agy delivered a non-empty response and the error is stale
- *       (no error_message step in this run, or later steps succeeded):
- *       then 'success' with a warning notice.
- *   (4) status === 'SUCCESS' AND response.trim() === '' AND no usage beyond the
- *       preamble -> still 'denied'/'error', never 'success'. [last-resort net]
- *
- * (4) is deliberately paranoid. An empty response from a model that burned
- * 135 output tokens is not a success; it is a model that was told to stop. We
- * only allow the empty-response case to be benign if the job also had zero tool
- * calls, because "you asked me nothing and I said nothing" is a legitimate
- * (if useless) success.
- *
- * THE FIX IS UPSTREAM TOO: `unrestricted: true` adds --dangerously-skip-permissions,
- * which is what makes this whole class of silent failure disappear. But we still
- * check, because a config-level allow-rule can deny a single command and the
- * flag does not override an explicit deny.
- */
-
 import {
   binaryAvailable,
   earlyVerdict,
@@ -352,13 +279,7 @@ export function createAgyTranslator(maxChars: number) {
   const steps = new Map<number, StepMemory>();
   const stepProse = new Map<number, string>();
   let lastProseStep: number | undefined;
-  /** Set by any denial signal; carried into JobResult. */
   const denials: DeniedAction[] = [];
-  // agy's final status repeats the conversation's last error, even one it
-  // recovered from or one from an earlier run on the same conversation. Stale:
-  // none this run, or a step finished after it. Trade-off: a failure agy
-  // reports only in the result (no error step this run) also reads as stale;
-  // buildResult still requires a response and exit 0 before calling it success.
   let sawErrorStep = false;
   let progressedAfterError = false;
   const errorIsStale = (): boolean => !sawErrorStep || progressedAfterError;
@@ -408,9 +329,6 @@ export function createAgyTranslator(maxChars: number) {
         if (delta !== undefined && delta !== '') {
           stepProse.set(stepIndex, (stepProse.get(stepIndex) ?? '') + delta);
           lastProseStep = stepIndex;
-          // agy streams prose as many small text_delta slices. We forward each
-          // one rather than buffering: the mod surface renders incrementally and
-          // a long answer would otherwise be invisible for minutes.
           out.push({ kind: 'text', at, text: delta, stream: 'assistant', delta: true });
         }
         return out;
@@ -561,14 +479,9 @@ export function buildResult(args: {
   if (early !== undefined) {
     ({ status, error } = early);
   } else if (distinctDenials.length > 0 && reportedStatus === 'SUCCESS' && exit.code === 0 && response.trim() !== '') {
-    // Denied calls, but agy finished and delivered a report: a success with a
-    // warning, exactly as claude reports it. The forge verdict keeps the
-    // denials visible as a note; an empty report still falls to THE TRAP.
     status = 'success';
     for (const d of distinctDenials) d.nonfatal = true;
   } else if (distinctDenials.length > 0) {
-    // THE TRAP. exit code 0, status "SUCCESS", empty response — and yet the
-    // job did nothing. Reported as a failure, loudly.
     status = 'denied';
     // Headless agy auto-denies tools it cannot prompt for unless run with
     // --dangerously-skip-permissions; an explicit deny rule overrides that flag.
@@ -589,10 +502,6 @@ export function buildResult(args: {
       error = resultEvent.error ?? 'worker error';
     }
   } else if (response.trim() === '' && sawAnyToolCall) {
-    // Paranoia net for (4) above. The model burned tokens and made tool calls
-    // but produced no final text, with no explicit denial. That is a failure
-    // shaped like a success. We allow the genuinely-empty case (no tool calls,
-    // nothing asked) to pass as success.
     status = 'denied';
     error = `no output${stderrClause(exit.stderr)}`;
   } else {
@@ -672,12 +581,6 @@ export const agyProvider: Provider = {
   name: 'agy',
   defaultUnrestricted: true,
 
-  /**
-   * PATH probe only. We deliberately do NOT run `agy models` here: available()
-   * is called for every provider on every startup and a network-touching probe
-   * would make startup slow and flaky. A resolvable binary is the contract;
-   * auth problems surface as a job error instead.
-   */
   available: () => binaryAvailable(agyBinary()),
 
   describeSandbox: sandboxPlan,

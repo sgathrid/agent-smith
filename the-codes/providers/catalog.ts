@@ -134,7 +134,6 @@ export async function probeProviders(): Promise<AvailabilityProbe[]> {
   return probeAvailability(providerSource());
 }
 
-/** Names of installed providers. PATH probes only: cheap, no model discovery. */
 export async function getInstalledProviders(): Promise<string[]> {
   const probes = await probeProviders();
   return probes.filter((p) => p.status === 'installed').map((p) => p.name);

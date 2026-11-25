@@ -575,10 +575,6 @@ export function createCodexTranslator(maxChars: number): CodexTranslator {
   return state;
 }
 
-// ---------------------------------------------------------------------------
-// Result
-// ---------------------------------------------------------------------------
-
 export function buildResult(args: {
   jobId: string;
   startedAtMs: number;
@@ -610,8 +606,6 @@ export function buildResult(args: {
     status = 'success';
   }
 
-  // codex has no single "response" field; the concatenated agent_message items
-  // are the equivalent. If there were none, this is legitimately "".
   const out = jobResult({ provider: 'codex', jobId, status, error, exit, response: tx.finalText, startedAtMs, durationMs, stateDir });
   if (tx.usage !== undefined) out.usage = tx.usage;
   if (tx.threadId !== undefined) out.raw = { threadId: tx.threadId };

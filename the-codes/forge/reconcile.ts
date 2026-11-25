@@ -74,7 +74,6 @@ export function reconcileOrphan(repo: string, jobId: string, now = Date.now()): 
           Object.entries(result.usage).filter((entry) => typeof entry[1] === 'number')),
         latestSummary: summaryHead(result.response, 1_000) || manifest.latestSummary || null,
         summarySource: result.response.trim() || manifest.latestSummary ? 'worker' : null,
-        // Recovery never runs the finish-time git diff.
         changedFilesUnknown: true,
         ...(facts.cwdMissing ? { cwdMissingAtFinish: true } : {}),
       });
