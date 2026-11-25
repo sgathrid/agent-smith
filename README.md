@@ -124,7 +124,7 @@ claude plugin install construct --marketplace sgathrid/agent-smith
 
 Agent Smith is a Claude Code plugin: a delegation skill, an MCP server that runs the provider CLIs, and an integrated terminal UI. Workers appear in the **native task list**; the live band and `/forge` show their activity, results, and check output.
 
-These are external workers integrated into Claude Code, not sessions created by its built-in `Agent` tool. Each uses its own provider's permissions. In particular, **agy runs unrestricted by default** and can be restricted, while **Kimi is always unrestricted** — its print mode cannot prompt or be restricted, and read-only modes are not enforced for it. Review restrictions otherwise vary by provider. See [provider permissions](docs/CONFIGURATION.md#harness-default-sources).
+These are external workers integrated into Claude Code, not sessions created by its built-in `Agent` tool. Each uses its own provider's permissions. In particular, **agy runs unrestricted by default** and can be restricted, while **Kimi is always unrestricted** — its print mode cannot prompt or be restricted, and read-only modes are not enforced for it. An explicit `unrestricted: true` is honoured without a prompt unless `AGENT_SMITH_CONFIRM_UNRESTRICTED=1` is set. Review restrictions otherwise vary by provider. See [provider permissions](docs/CONFIGURATION.md#harness-default-sources).
 
 For parallel workers editing code, give each its own git worktree. Worker state and reports live in `.agent-smith/` within your project.
 

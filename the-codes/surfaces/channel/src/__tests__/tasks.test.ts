@@ -260,6 +260,8 @@ test('ext-tasks V2 client negotiates Tasks, polls tasks/get, and receives comple
 });
 
 test('per-request capability gating, non-task tools, MRTR approval, and validation errors', async () => {
+  const priorConfirm = process.env.AGENT_SMITH_CONFIRM_UNRESTRICTED;
+  process.env.AGENT_SMITH_CONFIRM_UNRESTRICTED = '1';
   const h = rawTransport(true);
   await h.clientTransport.start();
   const baseCaps = { elicitation: { form: {} } };
@@ -348,6 +350,8 @@ test('per-request capability gating, non-task tools, MRTR approval, and validati
     assert.equal('content' in accepted.result, false);
     assert.equal(h.launches(), 2);
   } finally {
+    if (priorConfirm === undefined) delete process.env.AGENT_SMITH_CONFIRM_UNRESTRICTED;
+    else process.env.AGENT_SMITH_CONFIRM_UNRESTRICTED = priorConfirm;
     await h.cleanup();
   }
 });

@@ -11,7 +11,8 @@ import { buildSteeredPrompt } from '../steer-log.ts';
 import { ForgeTasks } from '../../surfaces/channel/src/tasks.ts';
 import { callTool } from '../../surfaces/channel/src/tools.ts';
 import { isLive } from '../../surfaces/mod/hooks/dashboard.ts';
-import { controlledProvider, makeService } from '../testing/steer-harness.ts';
+import { ForgeService } from '../service.ts';
+import { controlledProvider, makeService, withDefaultProvider } from '../testing/steer-harness.ts';
 import { waitFor } from '../testing/time.ts';
 
 test('steer(queue): coalesces multiple queued steers, opens child anchor before parent finishes, and resolves done with final manifest', async () => {
@@ -693,4 +694,50 @@ test('resolveWorker follows a steer that lands between resolveTurn and detail', 
   const resolved = await service.resolveWorker('parent');
   assert.equal(resolved.jobId, 'child');
   assert.equal(resolved.status, 'running');
+});
+
+test('follow_up with invalid model on running worker rejects without queuing or starting a continuation turn', async () => {
+  const ctrl = controlledProvider('codex');
+  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-steer-invalid-model-'));
+  const service = withDefaultProvider(new ForgeService({
+    repo,
+    flushMs: 5,
+    providerSource: () => ctrl.provider,
+    catalogSource: async () => [{
+      provider: 'codex',
+      models: [{ id: 'gpt-5', label: 'GPT-5', efforts: [] }],
+      defaultSource: 'unknown',
+      source: 'live',
+      stale: false,
+      verified: true,
+    }],
+  }), 'codex');
+
+  const turn1Ready = ctrl.nextTurn();
+  const { ack, done } = await service.spawnTracked({
+    mode: 'implement',
+    name: 'Ada',
+    prompt: 'Do initial work.',
+    model: 'gpt-5',
+  });
+  const turn1 = await turn1Ready;
+  turn1.emit({ kind: 'started', at: new Date().toISOString(), conversationId: 'thread-ada' });
+
+  await assert.rejects(
+    service.followUp({
+      worker: 'Ada',
+      prompt: 'do X',
+      model: 'nonexistent-model',
+    }),
+    /unknown model "nonexistent-model"/,
+  );
+
+  assert.equal(existsSync(jobFile(repo, ack.jobId, FILES.steer)), false);
+  const progress = JSON.parse(readFileSync(jobFile(repo, ack.jobId, FILES.progress), 'utf8')) as { pendingSteers?: number };
+  assert.equal(progress.pendingSteers ?? 0, 0);
+
+  turn1.finish({ status: 'success', response: 'Done initial work.' });
+  const finalManifest = await done;
+  assert.equal(finalManifest.jobId, ack.jobId);
+  assert.equal(ctrl.turns.length, 1);
 });

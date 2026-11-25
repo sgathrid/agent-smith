@@ -16,7 +16,7 @@ import { EFFORTS, validateEnv, type Stage } from '../../../pipeline/types.ts';
 import { MODES, MODE_PRESETS, isMode as isModeName } from '../../../forge/modes.ts';
 import { requireProvider, validateModelAndEffort } from '../../../forge/spawn-request.ts';
 import { getCatalogs, probeProviders } from '../../../providers/catalog.ts';
-import { findProvider, providerNames } from '../../../providers/registry.ts';
+import { effectiveDefaultUnrestricted, findProvider, providerNames } from '../../../providers/registry.ts';
 import type { ModelCatalog } from '../../../providers/types.ts';
 import { loadModelConfig, resolveRequest, describeAliases } from '../../../providers/aliases.ts';
 import { CONCISE_LIST_LIMIT, EARLIER_TURNS_CAP, conciseCapabilities, conciseRow, conciseStatus, concisePipeline, earlierTurn, jobDiff, jobLiveness, livenessView, parseSince, taskStatus, withWorkerBaseline, withWorkerFiles, type ResponseFormat } from './views.ts';
@@ -35,7 +35,7 @@ const WATCH_RECHECK_MS = 5_000;
 /** Long enough for a person to read the prompt and answer; the SDK default (60 s) is not. */
 const CONFIRM_TIMEOUT_MS = 10 * 60_000;
 export const DECLINED_UNRESTRICTED = 'The user declined unrestricted access; rerun without unrestricted, or ask the user.';
-export const UNCONFIRMED_UNRESTRICTED = 'unrestricted: true was not confirmed with the user: this client cannot show a confirmation prompt (no MCP elicitation support).';
+export const UNCONFIRMED_UNRESTRICTED = 'unrestricted not confirmed: this client cannot prompt the user.';
 interface EscalatingLaunch {
   unrestricted?: boolean | undefined;
   provider: string;
@@ -48,8 +48,8 @@ async function confirmUnrestricted(
   launches: readonly EscalatingLaunch[],
   kind: 'worker' | 'pipeline stage' = 'worker',
 ): Promise<{ refused?: ToolOutcome; warning?: string }> {
-  const escalating = launches.filter(l => l.unrestricted === true && !findProvider(l.provider)?.defaultUnrestricted);
-  if (escalating.length === 0 || process.env['AGENT_SMITH_CONFIRM_UNRESTRICTED'] === '0') return {};
+  const escalating = launches.filter(l => l.unrestricted === true && !effectiveDefaultUnrestricted(findProvider(l.provider)));
+  if (escalating.length === 0 || process.env['AGENT_SMITH_CONFIRM_UNRESTRICTED'] !== '1') return {};
   if (ctx.unrestrictedGate) return ctx.unrestrictedGate;
   if (!ctx.server?.getClientCapabilities()?.elicitation?.form) return { warning: UNCONFIRMED_UNRESTRICTED };
   const target = escalating.length === 1
@@ -123,13 +123,34 @@ async function resolveDefaultProvider(ctx: HandlerContext): Promise<string> {
   return defaultProvider(installed, undefined, detail);
 }
 
-async function spawnOne(ctx: HandlerContext, args: Args): Promise<Record<string, unknown>> {
+interface PreResolvedSpawn {
+  provider: string;
+  resolved: ReturnType<typeof resolveRequest>;
+  cfgErrors: readonly string[];
+  rawProvider?: string | undefined;
+  rawModel?: string | undefined;
+  rawEffort?: string | undefined;
+}
+
+async function spawnOne(ctx: HandlerContext, args: Args, preResolved?: PreResolvedSpawn): Promise<Record<string, unknown>> {
   const mode = allowed(args, 'mode', MODES); if (mode === undefined) throw new Error(`mode is required; one of ${MODES.join(', ')}.`);
-  const cfg = loadModelConfig({ repo: ctx.service.repo });
-  const rawProvider = allowed(args, 'provider', PROVIDERS);
-  const resolved = resolveRequest({ provider: rawProvider, model: text(args, 'model'), effort: allowed(args, 'effort', EFFORTS), mode }, cfg);
-  const provider = resolved.provider ?? await resolveDefaultProvider(ctx);
-  const notes = [...resolved.warnings, ...cfg.errors.map(e => `models.json: ${e}`)];
+  const rawProvider = preResolved ? preResolved.rawProvider : allowed(args, 'provider', PROVIDERS);
+  const rawModel = preResolved ? preResolved.rawModel : text(args, 'model');
+  const rawEffort = preResolved ? preResolved.rawEffort : allowed(args, 'effort', EFFORTS);
+  let resolved: ReturnType<typeof resolveRequest>;
+  let cfgErrors: readonly string[];
+  let provider: string;
+  if (preResolved) {
+    resolved = preResolved.resolved;
+    cfgErrors = preResolved.cfgErrors;
+    provider = preResolved.provider;
+  } else {
+    const cfg = loadModelConfig({ repo: ctx.service.repo });
+    resolved = resolveRequest({ provider: rawProvider, model: rawModel, effort: rawEffort, mode }, cfg);
+    cfgErrors = cfg.errors;
+    provider = resolved.provider ?? await resolveDefaultProvider(ctx);
+  }
+  const notes = [...resolved.warnings, ...cfgErrors.map(e => `models.json: ${e}`)];
   const withNotes = (ack: SpawnAck) => ({ ...slimAck(ack), provider: ack.provider ?? provider, ...(resolved.appliedAlias ? { aliasApplied: resolved.appliedAlias, aliasSource: resolved.source } : {}), ...(notes.length ? { warnings: [...(ack.warnings ?? []), ...notes] } : {}) });
   const checks = parseChecks(args.checks);
   const request = { mode, prompt: text(args, 'prompt', true)!, context: contextText(args), files: filesList(args), checks, cwd: workingDirectory(args), name: text(args, 'name'), task: text(args, 'task'), provider, model: resolved.model, effort: resolved.effort, timeoutMs: number(args, 'timeoutMs'), conversation: text(args, 'conversation'), unrestricted: boolean(args, 'unrestricted'), env: validateEnv(args.env),
@@ -142,7 +163,7 @@ async function spawnOne(ctx: HandlerContext, args: Args): Promise<Record<string,
   }]);
   if (gate.refused) throw new Error(refusedText(gate.refused));
   if (gate.warning) notes.push(gate.warning);
-  const saved = { mode, prompt: request.prompt, context: request.context, files: request.files, cwd: request.cwd, task: request.task, name: request.name, provider: rawProvider, model: text(args, 'model'), effort: allowed(args, 'effort', EFFORTS), timeoutMs: request.timeoutMs, unrestricted: request.unrestricted };
+  const saved = { mode, prompt: request.prompt, context: request.context, files: request.files, cwd: request.cwd, task: request.task, name: request.name, provider: rawProvider, model: rawModel, effort: rawEffort, timeoutMs: request.timeoutMs, unrestricted: request.unrestricted };
   const ack = await ctx.service.spawnJob(request);
   saveRequest(ctx, ack.jobId, saved);
   return checks?.length ? { ...withNotes(ack), checks: checks.map(c => c.name) } : withNotes(ack);
@@ -227,18 +248,22 @@ const spawnJob: Handler = async (ctx, args) => {
   const requests = variants.map((v, i) => overlay(shared, { ...v, name: names[i] }, baseProvider));
   let fallbackProvider: string | undefined;
   const getFallbackProvider = async () => fallbackProvider ??= await resolveDefaultProvider(ctx);
-  const resolvedProviders: string[] = [];
+  const preResolved: PreResolvedSpawn[] = [];
   for (const r of requests) {
-    const resolved = resolveRequest({ provider: allowed(r, 'provider', PROVIDERS), model: text(r, 'model'), effort: allowed(r, 'effort', EFFORTS), mode }, cfg);
-    resolvedProviders.push(resolved.provider ?? await getFallbackProvider());
+    const rawProvider = allowed(r, 'provider', PROVIDERS);
+    const rawModel = text(r, 'model');
+    const rawEffort = allowed(r, 'effort', EFFORTS);
+    const resolved = resolveRequest({ provider: rawProvider, model: rawModel, effort: rawEffort, mode }, cfg);
+    const provider = resolved.provider ?? await getFallbackProvider();
+    preResolved.push({ provider, resolved, cfgErrors: cfg.errors, rawProvider, rawModel, rawEffort });
   }
   const gate = await confirmUnrestricted(
     ctx,
     requests.map((r, i) => ({
       unrestricted: boolean(r, 'unrestricted'),
-      provider: resolvedProviders[i]!,
-      who: `${resolvedProviders[i]!} worker "${String(r.name)}"`,
-      label: `${String(r.name)}: ${resolvedProviders[i]!}`,
+      provider: preResolved[i]!.provider,
+      who: `${preResolved[i]!.provider} worker "${String(r.name)}"`,
+      label: `${String(r.name)}: ${preResolved[i]!.provider}`,
       cwd: cwd ?? ctx.service.repo,
     })),
   );
@@ -246,7 +271,7 @@ const spawnJob: Handler = async (ctx, args) => {
   const batchCtx: HandlerContext = { ...ctx, unrestrictedGate: gate.warning ? { warning: gate.warning } : {} };
   const jobs: Record<string, unknown>[] = [];
   for (const [i, r] of requests.entries()) {
-    try { jobs.push(await spawnOne(batchCtx, r)); } catch (err) { jobs.push({ name: names[i], error: err instanceof Error ? err.message : String(err) }); }
+    try { jobs.push(await spawnOne(batchCtx, r, preResolved[i])); } catch (err) { jobs.push({ name: names[i], error: err instanceof Error ? err.message : String(err) }); }
   }
   return structured({ jobs }, { compact: true });
 };
@@ -263,9 +288,11 @@ const followUp: Handler = async (ctx, args) => {
     checks: parseChecks(args.checks), model: text(args, 'model'), effort: allowed(args, 'effort', EFFORTS), timeoutMs: number(args, 'timeoutMs'),
     env: validateEnv(args.env), unrestricted: boolean(args, 'unrestricted'),
   };
+  let targetWorker = request.worker;
   const notes: string[] = [];
   if (request.unrestricted === true || request.model !== undefined || request.effort !== undefined) {
     const head = await ctx.service.messageTarget(request.worker);
+    targetWorker = head.workerId ?? head.jobId;
     const provider = head.provider ?? '';
     if (request.model !== undefined || request.effort !== undefined) {
       const cfg = loadModelConfig({ repo: ctx.service.repo });
@@ -282,7 +309,7 @@ const followUp: Handler = async (ctx, args) => {
     if (gate.refused) return gate.refused;
     if (gate.warning) notes.push(gate.warning);
   }
-  const ack = await ctx.service.followUp(request);
+  const ack = await ctx.service.followUp({ ...request, worker: targetWorker });
   try { ctx.onJobPrepared?.(ack.jobId); } catch {}
   return messageAck(ack, notes);
 };
@@ -324,13 +351,14 @@ const jobStatus: Handler = async (ctx, args) => {
   const id = text(args, 'id', true)!.trim(); const waitMs = number(args, 'wait_ms', MAX_WAIT_MS); const fmt = format(args); const wantDiff = boolean(args, 'include_diff') ?? false;
   let detail: JobDetail & { resolvedFrom?: string } = await ctx.service.resolveWorker(id); let waited = false;
   let worker = ctx.service.resolveTurn(id) !== detail.jobId;
+  const waitTarget = worker ? (detail.workerId ?? detail.jobId) : id;
   if (waitMs !== undefined) {
     waited = true; const deadline = Date.now() + waitMs; const fallbackMs = ctx.pollMs ?? WAIT_POLL_MS;
     const maxSlice = ctx.pollMs ?? WATCH_RECHECK_MS;
     while (unsettled(ctx, detail, worker) && Date.now() < deadline) {
       await waitForChange(jobDir(ctx.service.repo, detail.jobId), Math.min(maxSlice, deadline - Date.now()), { fallbackMs });
-      detail = await ctx.service.resolveWorker(id);
-      worker = ctx.service.resolveTurn(id) !== detail.jobId;
+      detail = await ctx.service.resolveWorker(waitTarget);
+      if (!worker) worker = ctx.service.resolveTurn(waitTarget) !== detail.jobId;
     }
   }
   if (detail.jobId !== id) detail = { ...detail, resolvedFrom: id };
@@ -464,15 +492,20 @@ const runPipeline: Handler = async (ctx, args) => {
   validateSpec(spec);
   const warnings = await validatePipelineStages(ctx, spec.stages);
   const unrestricted = boolean(raw, 'unrestricted');
+  const baseWorkDir = spec.workDir ?? ctx.service.repo;
+  const stagesByName = new Map(spec.stages.map(s => [s.name, s]));
   const gate = await confirmUnrestricted(
     ctx,
-    spec.stages.map(s => ({
-      unrestricted,
-      provider: s.provider,
-      who: `pipeline stage "${s.name}" (${s.provider})`,
-      label: `${s.name}: ${s.provider}`,
-      cwd: spec.workDir ?? ctx.service.repo,
-    })),
+    spec.stages.map(s => {
+      const own = s.workDir ?? (s.continues === undefined ? undefined : stagesByName.get(s.continues)?.workDir);
+      return {
+        unrestricted,
+        provider: s.provider,
+        who: `pipeline stage "${s.name}" (${s.provider})`,
+        label: `${s.name}: ${s.provider}`,
+        cwd: own ? path.resolve(baseWorkDir, own) : baseWorkDir,
+      };
+    }),
     'pipeline stage',
   );
   if (gate.refused) return gate.refused;

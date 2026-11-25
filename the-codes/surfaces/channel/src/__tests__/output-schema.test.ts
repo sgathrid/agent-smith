@@ -79,11 +79,11 @@ test('spawn_job acks validate, with and without checks and warnings', async () =
   assert.equal(plain.jobId, 'job-1'); assert.equal('taskHandle' in plain, false);
   const gated = assertValid('spawn_job', await callTool(ctx, 'spawn_job', { mode: 'review', provider: 'codex', prompt: 'x', checks: [{ name: 'tests', command: 'true' }] }), 'spawn_job checks');
   assert.deepEqual(gated.checks, ['tests']);
-  const prior = process.env.AGENT_SMITH_CONFIRM_UNRESTRICTED; delete process.env.AGENT_SMITH_CONFIRM_UNRESTRICTED;
+  const prior = process.env.AGENT_SMITH_CONFIRM_UNRESTRICTED; process.env.AGENT_SMITH_CONFIRM_UNRESTRICTED = '1';
   try {
     const warned = assertValid('spawn_job', await callTool(ctx, 'spawn_job', { mode: 'review', provider: 'codex', prompt: 'x', unrestricted: true }), 'spawn_job unconfirmed');
     assert.ok((warned.warnings as string[]).some(w => /not confirmed/.test(w)));
-  } finally { if (prior !== undefined) process.env.AGENT_SMITH_CONFIRM_UNRESTRICTED = prior; }
+  } finally { if (prior === undefined) delete process.env.AGENT_SMITH_CONFIRM_UNRESTRICTED; else process.env.AGENT_SMITH_CONFIRM_UNRESTRICTED = prior; }
 });
 
 test('status validates concise and detailed, for every lifecycle, with wait_ms and include_diff', async () => {

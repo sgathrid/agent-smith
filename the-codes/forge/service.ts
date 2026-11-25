@@ -8,6 +8,7 @@ import { AgentSmithReader, SMITH_PAYLOAD } from '../harness/agent-smith.ts';
 import { readObservedJob } from '../harness/registry.ts';
 import type { ObservedJob } from '../harness/types.ts';
 import { getCatalogs, getHarnessDefaults } from '../providers/catalog.ts';
+import { effectiveUnrestricted } from '../providers/registry.ts';
 import type {
   JobResult,
   ModelCatalog,
@@ -139,7 +140,7 @@ function mergeOverrides(entries: readonly SteerEntry[]): MessageOverrides {
 
 function applyOverrides(spec: TurnSpec, o: MessageOverrides, provider: Provider): TurnSpec {
   if (Object.keys(o).length === 0) return spec;
-  const unrestricted = o.unrestricted === undefined ? spec.unrestricted : provider.defaultUnrestricted === 'always' ? true : o.unrestricted;
+  const unrestricted = effectiveUnrestricted(provider, o.unrestricted === undefined ? spec.unrestricted : o.unrestricted);
   return {
     ...spec,
     ...(o.model === undefined ? {} : { model: o.model, modelRequested: o.model, modelResolved: o.model, modelSource: 'requested' as const }),
@@ -337,11 +338,7 @@ export class ForgeService {
     const envKeys = env === undefined ? [] : Object.keys(env);
     const cwd = request.cwd ?? this.repo;
     const unrestrictedRequested = request.unrestricted;
-    const unrestricted = provider.defaultUnrestricted === 'always'
-      ? true
-      : unrestrictedRequested ?? (
-          provider.defaultUnrestricted === true && process.env['AGENT_SMITH_AGY_RESTRICTED'] !== '1'
-        );
+    const unrestricted = effectiveUnrestricted(provider, unrestrictedRequested);
     const warnings: string[] = [];
     const checked = await validateModelAndEffort(
       provider,
@@ -1313,6 +1310,17 @@ export class ForgeService {
         throw new Error(`Cannot interrupt "${name}" (${headId}): no resumable conversation handle exists yet, so interrupting now would discard in-flight context and start fresh. Wait for a conversation ID, use follow_up, or pass allowFresh: true.`);
       }
     }
+    const provider = this.providerSafe(head.provider);
+    if (provider !== null) {
+      const checked = await validateModelAndEffort(
+        provider,
+        entry.overrides?.model,
+        entry.overrides?.effort,
+        checkCatalog ? async () => catalog : undefined,
+        entry.overrides?.unrestricted,
+      );
+      warnings.push(...checked.warnings);
+    }
     const checksRunning = !running && this.checksPending(headId);
     appendSteerEntry(this.repo, headId, entry);
     const at = entry.createdAt;
@@ -1337,17 +1345,6 @@ export class ForgeService {
     else if (!running) this.setSettledPending(headId, pending);
     const workerId = head.workerId ?? headId;
     const { ack: envAck } = this.resolveFollowUpEnv(workerId, headId, env, true, warnings);
-    const provider = this.providerSafe(head.provider);
-    if (provider !== null) {
-      const checked = await validateModelAndEffort(
-        provider,
-        entry.overrides?.model,
-        entry.overrides?.effort,
-        checkCatalog ? async () => catalog : undefined,
-        entry.overrides?.unrestricted,
-      );
-      warnings.push(...checked.warnings);
-    }
     const canDeliverLive = running
       && provider?.liveInput === true
       && !live?.interruptRequested

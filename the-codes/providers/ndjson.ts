@@ -9,36 +9,67 @@ import readline from 'node:readline';
 import type { JobResult, JobStatus, ProviderEvent, SpawnSpec, WorkerHandle } from './types.ts';
 import { recoveredErrorText, timedOutText } from './failure-text.ts';
 
-const pathProbeCache = new Map<string, boolean>();
+type ProbeCacheEntry = { ok: true; found: boolean } | { ok: false; error: unknown };
+const pathProbeCache = new Map<string, ProbeCacheEntry>();
+
+async function probeExecutable(target: string): Promise<boolean> {
+  try {
+    await access(target, constants.X_OK);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return false;
+    if (code === 'EACCES') {
+      try {
+        await access(target, constants.F_OK);
+        return false;
+      } catch (fErr) {
+        const fCode = (fErr as NodeJS.ErrnoException).code;
+        if (fCode === 'ENOENT' || fCode === 'ENOTDIR') return false;
+        throw fErr;
+      }
+    }
+    throw err;
+  }
+}
 
 export async function binaryOnPath(bin: string): Promise<boolean> {
   const pathEnv = process.env['PATH'] ?? '';
   const cacheKey = `${bin}|${pathEnv}`;
   const cached = pathProbeCache.get(cacheKey);
-  if (cached !== undefined) return cached;
-
-  if (bin.includes('/') || bin.includes(path.sep)) {
-    let direct = false;
-    try {
-      await access(bin, constants.X_OK);
-      direct = true;
-    } catch {}
-    pathProbeCache.set(cacheKey, direct);
-    return direct;
+  if (cached !== undefined) {
+    if (!cached.ok) throw cached.error;
+    return cached.found;
   }
 
-  const dirs = pathEnv.split(path.delimiter).filter((d) => d !== '');
-  let found = false;
-  for (const dir of dirs) {
-    const full = path.join(dir, bin);
-    try {
-      await access(full, constants.X_OK);
-      found = true;
-      break;
-    } catch {}
+  try {
+    if (bin.includes('/') || bin.includes(path.sep)) {
+      const direct = await probeExecutable(bin);
+      pathProbeCache.set(cacheKey, { ok: true, found: direct });
+      return direct;
+    }
+
+    const dirs = pathEnv.split(path.delimiter).filter((d) => d !== '');
+    let found = false;
+    let probeError: unknown;
+    for (const dir of dirs) {
+      const full = path.join(dir, bin);
+      try {
+        if (await probeExecutable(full)) {
+          found = true;
+          break;
+        }
+      } catch (err) {
+        probeError ??= err;
+      }
+    }
+    if (!found && probeError !== undefined) throw probeError;
+    pathProbeCache.set(cacheKey, { ok: true, found });
+    return found;
+  } catch (err) {
+    pathProbeCache.set(cacheKey, { ok: false, error: err });
+    throw err;
   }
-  pathProbeCache.set(cacheKey, found);
-  return found;
 }
 
 function stateRoot(): string {
@@ -395,11 +426,7 @@ export function writeResultFile(stateDir: string, result: unknown): void {
 }
 
 export async function binaryAvailable(binary: string): Promise<boolean> {
-  try {
-    return await binaryOnPath(binary);
-  } catch {
-    return false;
-  }
+  return binaryOnPath(binary);
 }
 
 export interface ExitInfo {

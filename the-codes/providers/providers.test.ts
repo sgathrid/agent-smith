@@ -1281,3 +1281,197 @@ test('all provider adapters: prose, tool call, final prose returns only final pr
     assert.equal(res.response, 'final prose');
   });
 });
+
+test('all provider adapters: prose then tool call and nothing after returns empty response and not success', async (t) => {
+  const exit = { code: 0, signal: null, killReason: undefined, stderr: '' };
+
+  await t.test('agy', () => {
+    const tx = createAgyTranslator(2000);
+    tx.onEvent({ event: 'step_update', step_update: { step_index: 1, step_type: 'agent_response', state: 'DONE', text_delta: 'earlier prose' } });
+    tx.onEvent({ event: 'step_update', step_update: { step_index: 2, step_type: 'tool', state: 'ACTIVE', tool_name: 'run_command', tool_info: {} } });
+    tx.onEvent({ event: 'step_update', step_update: { step_index: 2, step_type: 'tool', state: 'DONE', tool_name: 'run_command', tool_info: { output: 'ok' } } });
+    const res = buildAgyResult({
+      jobId: 'j',
+      resultEvent: { status: 'SUCCESS', response: '' },
+      exit,
+      startedAtMs: Date.now() - 10,
+      stateDir: '/tmp',
+      denials: tx.denials,
+      sawAnyToolCall: tx.stepsWereTools(),
+      errorIsStale: tx.errorIsStale(),
+      finalText: tx.finalText(),
+    });
+    assert.equal(res.response, '');
+    assert.notEqual(res.status, 'success');
+  });
+
+  await t.test('claude', () => {
+    const tx = createClaudeTranslator(2000);
+    tx.onEvent({ type: 'assistant', message: { content: [{ type: 'text', text: 'earlier prose' }, { type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ls' } }] } });
+    tx.onEvent({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] } });
+    tx.onEvent({ type: 'result', subtype: 'success', is_error: false, result: '' });
+    const res = buildClaudeResult({ jobId: 'j', startedAtMs: Date.now() - 10, stateDir: '/tmp', exit, tx });
+    assert.equal(res.response, '');
+    assert.notEqual(res.status, 'success');
+  });
+
+  await t.test('codex', () => {
+    const tx = createCodexTranslator(2000);
+    tx.onEvent({ type: 'item.completed', item: { id: 'm1', type: 'agent_message', text: 'earlier prose' } });
+    tx.onEvent({ type: 'item.started', item: { id: 'c1', type: 'command_execution', command: 'ls' } });
+    tx.onEvent({ type: 'item.completed', item: { id: 'c1', type: 'command_execution', command: 'ls', exit_code: 0 } });
+    tx.onEvent({ type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } });
+    const res = buildCodexResult({ jobId: 'j', startedAtMs: Date.now() - 10, stateDir: '/tmp', exit, tx });
+    assert.equal(res.response, '');
+    assert.notEqual(res.status, 'success');
+  });
+
+  await t.test('opencode', () => {
+    const tx = createOpencodeTranslator(2000);
+    tx.onEvent({ type: 'step_start' });
+    tx.onEvent({ type: 'text', text: 'earlier prose' });
+    tx.onEvent({ type: 'tool.started', part: { id: 'p1', tool: 'bash', state: { status: 'running', input: {} } } });
+    tx.onEvent({ type: 'tool.completed', part: { id: 'p1', tool: 'bash', state: { status: 'completed', output: 'ok' } } });
+    const res = buildOpencodeResult({ jobId: 'j', startedAtMs: Date.now() - 10, stateDir: '/tmp', exit, tx });
+    assert.equal(res.response, '');
+    assert.notEqual(res.status, 'success');
+  });
+
+  await t.test('kimi', () => {
+    const tx = createKimiTranslator(2000);
+    tx.onEvent({ role: 'assistant', content: 'earlier prose', tool_calls: [{ id: 'tc1', type: 'function', function: { name: 'Bash', arguments: '{}' } }] });
+    tx.onEvent({ role: 'tool', tool_call_id: 'tc1', content: 'ok' });
+    const res = buildKimiResult({ jobId: 'j', startedAtMs: Date.now() - 10, stateDir: '/tmp', exit, tx });
+    assert.equal(res.response, '');
+    assert.notEqual(res.status, 'success');
+  });
+});
+
+test('all provider adapters: prose, tool call, then empty final message returns empty response and not success', async (t) => {
+  const exit = { code: 0, signal: null, killReason: undefined, stderr: '' };
+
+  await t.test('agy', () => {
+    const tx = createAgyTranslator(2000);
+    tx.onEvent({ event: 'step_update', step_update: { step_index: 1, step_type: 'agent_response', state: 'DONE', text_delta: 'earlier prose' } });
+    tx.onEvent({ event: 'step_update', step_update: { step_index: 2, step_type: 'tool', state: 'ACTIVE', tool_name: 'run_command', tool_info: {} } });
+    tx.onEvent({ event: 'step_update', step_update: { step_index: 2, step_type: 'tool', state: 'DONE', tool_name: 'run_command', tool_info: { output: 'ok' } } });
+    tx.onEvent({ event: 'step_update', step_update: { step_index: 3, step_type: 'agent_response', state: 'DONE', text_delta: '' } });
+    const res = buildAgyResult({
+      jobId: 'j',
+      resultEvent: { status: 'SUCCESS', response: '' },
+      exit,
+      startedAtMs: Date.now() - 10,
+      stateDir: '/tmp',
+      denials: tx.denials,
+      sawAnyToolCall: tx.stepsWereTools(),
+      errorIsStale: tx.errorIsStale(),
+      finalText: tx.finalText(),
+    });
+    assert.equal(res.response, '');
+    assert.notEqual(res.status, 'success');
+  });
+
+  await t.test('claude', () => {
+    const tx = createClaudeTranslator(2000);
+    tx.onEvent({ type: 'assistant', message: { content: [{ type: 'text', text: 'earlier prose' }] } });
+    tx.onEvent({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ls' } }] } });
+    tx.onEvent({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] } });
+    tx.onEvent({ type: 'assistant', message: { content: [{ type: 'text', text: '' }] } });
+    tx.onEvent({ type: 'result', subtype: 'success', is_error: false, result: '' });
+    const res = buildClaudeResult({ jobId: 'j', startedAtMs: Date.now() - 10, stateDir: '/tmp', exit, tx });
+    assert.equal(res.response, '');
+    assert.notEqual(res.status, 'success');
+  });
+
+  await t.test('codex', () => {
+    const tx = createCodexTranslator(2000);
+    tx.onEvent({ type: 'item.completed', item: { id: 'm1', type: 'agent_message', text: 'earlier prose' } });
+    tx.onEvent({ type: 'item.started', item: { id: 'c1', type: 'command_execution', command: 'ls' } });
+    tx.onEvent({ type: 'item.completed', item: { id: 'c1', type: 'command_execution', command: 'ls', exit_code: 0 } });
+    tx.onEvent({ type: 'item.completed', item: { id: 'm2', type: 'agent_message', text: '' } });
+    tx.onEvent({ type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } });
+    const res = buildCodexResult({ jobId: 'j', startedAtMs: Date.now() - 10, stateDir: '/tmp', exit, tx });
+    assert.equal(res.response, '');
+    assert.notEqual(res.status, 'success');
+  });
+
+  await t.test('opencode', () => {
+    const tx = createOpencodeTranslator(2000);
+    tx.onEvent({ type: 'step_start' });
+    tx.onEvent({ type: 'text', text: 'earlier prose' });
+    tx.onEvent({ type: 'tool.started', part: { id: 'p1', tool: 'bash', state: { status: 'running', input: {} } } });
+    tx.onEvent({ type: 'tool.completed', part: { id: 'p1', tool: 'bash', state: { status: 'completed', output: 'ok' } } });
+    tx.onEvent({ type: 'text', text: '' });
+    const res = buildOpencodeResult({ jobId: 'j', startedAtMs: Date.now() - 10, stateDir: '/tmp', exit, tx });
+    assert.equal(res.response, '');
+    assert.notEqual(res.status, 'success');
+  });
+
+  await t.test('kimi', () => {
+    const tx = createKimiTranslator(2000);
+    tx.onEvent({ role: 'assistant', content: 'earlier prose' });
+    tx.onEvent({ role: 'assistant', tool_calls: [{ id: 'tc1', type: 'function', function: { name: 'Bash', arguments: '{}' } }] });
+    tx.onEvent({ role: 'tool', tool_call_id: 'tc1', content: 'ok' });
+    tx.onEvent({ role: 'assistant', content: '' });
+    const res = buildKimiResult({ jobId: 'j', startedAtMs: Date.now() - 10, stateDir: '/tmp', exit, tx });
+    assert.equal(res.response, '');
+    assert.notEqual(res.status, 'success');
+  });
+});
+
+test('claude: denied tool after prose with empty result is denied, and multi-turn crash keeps only final message', () => {
+  const exit = { code: 0, signal: null, killReason: undefined, stderr: '' };
+  const deniedTx = createClaudeTranslator(2000);
+  deniedTx.onEvent({ type: 'assistant', message: { content: [{ type: 'text', text: 'Let me run bash' }, { type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'rm -rf /' } }] } });
+  deniedTx.onEvent({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't1', is_error: true, content: 'Permission denied' }] } });
+  deniedTx.onEvent({ type: 'result', subtype: 'success', is_error: false, result: '', permission_denials: [{ tool_name: 'Bash', tool_use_id: 't1' }] });
+  const deniedRes = buildClaudeResult({ jobId: 'j', startedAtMs: Date.now() - 10, stateDir: '/tmp', exit, tx: deniedTx });
+  assert.equal(deniedRes.status, 'denied');
+  assert.equal(deniedRes.response, '');
+
+  const crashTx = createClaudeTranslator(2000);
+  crashTx.onEvent({ type: 'assistant', message: { content: [{ type: 'text', text: 'first' }] } });
+  crashTx.onEvent({ type: 'assistant', message: { content: [{ type: 'text', text: 'second' }] } });
+  const crashRes = buildClaudeResult({ jobId: 'j', startedAtMs: Date.now() - 10, stateDir: '/tmp', exit: { code: 1, signal: null, killReason: undefined, stderr: 'boom' }, tx: crashTx });
+  assert.equal(crashRes.response, 'second');
+});
+
+test('opencode: error then prose then tool call does not recover as success', () => {
+  const tx = createOpencodeTranslator(2000);
+  tx.onEvent({ type: 'error', error: { message: 'temporary failure' } });
+  tx.onEvent({ type: 'text', text: 'Retrying now...' });
+  tx.onEvent({ type: 'tool.started', part: { id: 'p1', tool: 'bash', state: { status: 'running', input: {} } } });
+  tx.onEvent({ type: 'tool.completed', part: { id: 'p1', tool: 'bash', state: { status: 'completed', output: 'ok' } } });
+  const res = buildOpencodeResult({ jobId: 'j', startedAtMs: Date.now() - 10, stateDir: '/tmp', exit: { code: 0, signal: null, killReason: undefined, stderr: '' }, tx });
+  assert.equal(res.status, 'error');
+  assert.equal(res.response, '');
+
+  const stopTx = createOpencodeTranslator(2000);
+  stopTx.onEvent({ type: 'step_start' });
+  stopTx.onEvent({ type: 'text', text: 'I will check.' });
+  stopTx.onEvent({ type: 'tool.completed', part: { id: 'p2', tool: 'bash', state: { status: 'completed', output: 'ok' } } });
+  stopTx.onEvent({ type: 'step_start' });
+  stopTx.onEvent({ type: 'step_finish', part: { reason: 'stop' } });
+  const stopRes = buildOpencodeResult({ jobId: 'j2', startedAtMs: Date.now() - 10, stateDir: '/tmp', exit: { code: 0, signal: null, killReason: undefined, stderr: '' }, tx: stopTx });
+  assert.equal(stopRes.status, 'malformed');
+  assert.equal(stopRes.response, '');
+});
+
+test('codex and kimi: empty final message after earlier prose clears finalText', () => {
+  const exit = { code: 0, signal: null, killReason: undefined, stderr: '' };
+
+  const codexTx = createCodexTranslator(2000);
+  codexTx.onEvent({ type: 'item.completed', item: { id: 'm1', type: 'agent_message', text: 'Working...' } });
+  codexTx.onEvent({ type: 'item.completed', item: { id: 'm2', type: 'agent_message', text: '' } });
+  codexTx.onEvent({ type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } });
+  const codexRes = buildCodexResult({ jobId: 'j', startedAtMs: Date.now() - 10, stateDir: '/tmp', exit, tx: codexTx });
+  assert.equal(codexRes.response, '');
+  assert.notEqual(codexRes.status, 'success');
+
+  const kimiTx = createKimiTranslator(2000);
+  kimiTx.onEvent({ role: 'assistant', content: 'Checking...' });
+  kimiTx.onEvent({ role: 'assistant', content: '' });
+  const kimiRes = buildKimiResult({ jobId: 'j', startedAtMs: Date.now() - 10, stateDir: '/tmp', exit, tx: kimiTx });
+  assert.equal(kimiRes.response, '');
+  assert.notEqual(kimiRes.status, 'success');
+});

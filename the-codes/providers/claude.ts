@@ -344,6 +344,7 @@ export function createClaudeTranslator(
         out.push({ kind: 'usage', at, usage });
       }
 
+      let resetInMessage = false;
       for (const block of content) {
         if (block === null || typeof block !== 'object') continue;
         const b = block as Record<string, unknown>;
@@ -351,20 +352,22 @@ export function createClaudeTranslator(
 
         if (bType === 'text') {
           const text = str(b, 'text');
-          if (text !== undefined && text !== '') {
-            // parent_tool_use_id present => this text came from a SUBAGENT
-            // (forwarded by --forward-subagent-text). We must not fold it into
-            // finalText: the top-level result is the moderator's own answer, and
-            // a subagent's chatter in there would corrupt the moderated output.
-            const parent = str(b, 'parent_tool_use_id');
-            if (parent !== undefined) {
+          const parent = str(b, 'parent_tool_use_id');
+          if (parent !== undefined) {
+            if (text !== undefined && text !== '') {
               out.push({
                 kind: 'text',
                 at,
                 text: `[subagent] ${text}`,
                 stream: 'assistant',
               });
-            } else {
+            }
+          } else {
+            if (!resetInMessage) {
+              tx.finalText = '';
+              resetInMessage = true;
+            }
+            if (text !== undefined && text !== '') {
               tx.finalText += text;
               out.push({ kind: 'text', at, text, stream: 'assistant' });
             }
@@ -381,6 +384,10 @@ export function createClaudeTranslator(
         }
 
         if (bType === 'tool_use') {
+          if (str(b, 'parent_tool_use_id') === undefined && raw['parent_tool_use_id'] == null) {
+            tx.finalText = '';
+            resetInMessage = true;
+          }
           const toolUseId = str(b, 'id') ?? `toolu-${step}`;
           const toolName = str(b, 'name') ?? 'unknown';
           const idx = step++;
@@ -411,6 +418,7 @@ export function createClaudeTranslator(
         if (block === null || typeof block !== 'object') continue;
         const b = block as Record<string, unknown>;
         if (str(b, 'type') !== 'tool_result') continue;
+        if (parentId === undefined || parentId === null) tx.finalText = '';
 
         const toolUseId = str(b, 'tool_use_id') ?? '';
         const idx = toolStep.get(toolUseId) ?? step++;
@@ -473,7 +481,9 @@ export function createClaudeTranslator(
       if (typeof turns === 'number') tx.numTurns = turns;
 
       const finalAnswer = str(raw, 'result');
-      if (finalAnswer !== undefined && finalAnswer !== '') tx.finalText = finalAnswer;
+      if (finalAnswer !== undefined) {
+        tx.finalText = finalAnswer.trim() === '' ? '' : finalAnswer;
+      }
       return out;
     }
 
@@ -523,6 +533,9 @@ export function buildResult(args: {
   } else if (exit.code !== 0) {
     status = 'error';
     error = `exited ${exit.code}${stderrClause(exit.stderr)}`;
+  } else if (tx.finalText.trim() === '') {
+    status = 'malformed';
+    error = `no output${stderrClause(exit.stderr)}`;
   } else {
     status = 'success';
   }

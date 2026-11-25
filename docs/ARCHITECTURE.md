@@ -525,11 +525,11 @@ user (up to 10 minutes) before anything launches.
 
 ## Safety and trust
 
-- An explicit `unrestricted: true` for providers without `defaultUnrestricted` (codex, claude, opencode) on `spawn_job`, `follow_up` or `run_pipeline` (asked once per run, naming the stages) is
+- When `AGENT_SMITH_CONFIRM_UNRESTRICTED=1`, an explicit `unrestricted: true` for providers without `defaultUnrestricted` (codex, claude, opencode) on `spawn_job`, `follow_up` or `run_pipeline` (asked once per run, naming the stages) is
   confirmed with the user through MCP form elicitation before launch (`tools.ts`
   `confirmUnrestricted`; the server handle reaches `callTool` as `HandlerContext.server`). It
   fails closed: decline, cancel or no answer returns `isError`. Clients without form elicitation
-  launch with an ack warning; `AGENT_SMITH_CONFIRM_UNRESTRICTED=0` skips the prompt.
+  launch with an ack warning (`unrestricted not confirmed: this client cannot prompt the user.`); when `AGENT_SMITH_CONFIRM_UNRESTRICTED` is unset or not `1`, `unrestricted: true` is honoured without a prompt or warning.
 - `unrestricted` comes from each provider's `defaultUnrestricted` property: false for providers that can prompt, `true` for agy (with
   an env opt-out), and `'always'` for kimi because its print mode force-sets auto, so it cannot
   be restricted. `job.json` records the effective posture, not a request that had no effect;
