@@ -1,7 +1,7 @@
 import type { ActivityEvent, RadarAcceptance, RadarJob } from '../types/index.d.ts';
-import { continuationLabel, countSummary, effectiveStart, elapsed, elapsedCell, failedChecks, failureWords, isTerminal, jobLabel, livenessWords, oneLine, pendingSteersLabel, pickGlyph } from './format.ts';
+import { continuationLabel, countSummary, effectiveStart, elapsed, elapsedCell, failedChecks, failureWords, fitCell, isTerminal, jobLabel, livenessWords, oneLine, pendingSteersLabel, pickGlyph } from './format.ts';
 import { classify } from './progress.ts';
-import { compareTurnPriority, type TurnLike } from './turns.ts';
+import { compareTurnPriority, extractSteerMessage, type TurnLike } from './turns.ts';
 
 export const ATTENTION_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -173,28 +173,41 @@ export function turnCount(job: RadarJob, allJobs: readonly RadarJob[]): number {
   return Math.max(1, job.turn ?? 1, observed);
 }
 
-export function priorTurnSummary(job: RadarJob, fallbackTurn: number, now: number): string {
+export function priorTurnSummary(
+  job: RadarJob,
+  fallbackTurn: number,
+  now: number,
+  options: { readonly width?: number; readonly open?: boolean; readonly prompt?: string | null } = {},
+): string {
   const turn = job.turn ?? fallbackTurn;
+  const open = options.open === true;
+  const prefix = `${open ? '▾' : '▸'} ${turn}  `;
+  const msg = oneLine(extractSteerMessage(options.prompt ?? job.prompt ?? job.task));
+  if (open) {
+    const shown = options.width !== undefined ? oneLine(msg, Math.max(1, options.width - prefix.length)) : msg;
+    return `${prefix}${shown}`.trimEnd();
+  }
   let state: string;
   if (job.supersededBy && isTerminal(job.status)) {
     state = 'steered';
   } else if (job.status === 'succeeded') {
-    if (job.acceptance?.state === 'rejected' && !job.acceptance.pending) {
-      state = job.acceptance.checks.length > 0 ? failedChecks(job) : 'checks failed';
-    } else {
-      state = 'done';
-    }
+    const checks = checksLabel(job.acceptance);
+    state = checks !== '' ? checks : job.acceptance?.state === 'rejected' && !job.acceptance.pending ? 'checks failed' : 'done';
   } else if (job.status === 'failed') {
     const why = failureWords(job);
     state = why === '' ? 'failed' : `failed · ${why}`;
   } else {
     state = job.status;
   }
-  const parts: string[] = [`▸ Turn ${turn}`, state];
-  if (job.toolCount !== null) parts.push(`${job.toolCount} ${job.toolCount === 1 ? 'tool' : 'tools'}`);
   const span = job.startedAt === null ? null : (job.endedAt ?? now) - job.startedAt;
-  if (span !== null) parts.push(elapsed(span));
-  return parts.join(' · ');
+  const right = [state, span !== null ? elapsed(span) : ''].filter(Boolean).join(' · ');
+  if (options.width !== undefined) {
+    const room = options.width - prefix.length - right.length - 2;
+    if (room >= 8) return `${prefix}${fitCell(msg, room)}  ${right}`;
+    return oneLine(`${prefix}${msg}${right ? ` · ${right}` : ''}`, options.width);
+  }
+  if (msg === '') return right ? `${prefix}${right}` : prefix.trimEnd();
+  return `${prefix}${msg}${right ? ` · ${right}` : ''}`.trimEnd();
 }
 
 const BOARD_ROWS = 12;

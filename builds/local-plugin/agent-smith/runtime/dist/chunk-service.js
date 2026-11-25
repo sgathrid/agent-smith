@@ -1,4 +1,4 @@
-import {l as readManifest,d as jobFile,F as FILES,o as ownerAlive,c as readPipeline,h as cancelPipeline,n as findProvider,p as providerNames,q as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,P as PROVIDERS,t as errMessage,w as writeJsonAtomic,A as AgentSmithReader,u as normalize,x as writeAtomic,j as jobDir,y as SCHEMA_VERSION,z as validOwnerPid,k as isTerminalForgeStatus,B as reportFor,C as cwdFacts,E as normalizeDenials,G as deriveOrphan,H as deriveStatus,I as summaryTail,J as failureFields,R as REASONS,e as readAcceptance,K as writeAcceptance,L as createMarker,W as WORKERS_DIR,N as jobsDir,O as parseWorkerIndex,Q as normalizeContinuationKind,T as nextActionFor,U as fileSig,V as JobWriter,i as isTerminalStatus,g as isMode,X as newJobId,Y as markAcceptancePending,Z as humanDuration,_ as pipeEvents,$ as checksAbortRequested,a0 as verdictBlock,a1 as runAcceptance,a2 as senderOf,a3 as markAcceptanceSuperseded,a4 as pickHead,f as isWorkerIdle,a5 as compareTurnPriority,a6 as computeStaleReads,a7 as SMITH_PAYLOAD,a8 as isForgeStatus}from'./chunk-normalize.js';import {existsSync,readFileSync,mkdirSync,appendFileSync,openSync,writeSync,closeSync,unlinkSync,statSync,renameSync,linkSync,readdirSync,realpathSync,lstatSync,copyFileSync}from'node:fs';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import path from'node:path';import {createHash}from'node:crypto';const LAUNCH_ACK_MS = 15_000;
+import {l as readManifest,d as jobFile,F as FILES,o as ownerAlive,c as readPipeline,h as cancelPipeline,n as findProvider,p as providerNames,q as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,P as PROVIDERS,t as errMessage,w as writeJsonAtomic,A as AgentSmithReader,u as normalize,x as writeAtomic,j as jobDir,y as SCHEMA_VERSION,z as validOwnerPid,k as isTerminalForgeStatus,B as reportFor,C as cwdFacts,E as normalizeDenials,G as deriveOrphan,H as deriveStatus,I as summaryTail,J as failureFields,R as REASONS,e as readAcceptance,K as writeAcceptance,L as createMarker,W as WORKERS_DIR,N as jobsDir,O as parseWorkerIndex,Q as normalizeContinuationKind,T as nextActionFor,U as fileSig,V as JobWriter,i as isTerminalStatus,g as isMode,X as newJobId,Y as markAcceptancePending,Z as humanDuration,_ as pipeEvents,$ as checksAbortRequested,a0 as verdictBlock,a1 as runAcceptance,a2 as senderOf,a3 as buildSteeredPrompt,a4 as taskTitle,a5 as markAcceptanceSuperseded,a6 as pickHead,f as isWorkerIdle,a7 as compareTurnPriority,a8 as computeStaleReads,a9 as SMITH_PAYLOAD,aa as isForgeStatus}from'./chunk-normalize.js';import {existsSync,readFileSync,mkdirSync,appendFileSync,openSync,writeSync,closeSync,unlinkSync,statSync,renameSync,linkSync,readdirSync,realpathSync,lstatSync,copyFileSync}from'node:fs';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import path from'node:path';import {createHash}from'node:crypto';const LAUNCH_ACK_MS = 15_000;
 async function launch(url, payload, onPrepared) {
     const child = fork(fileURLToPath(url), [], {
         detached: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
@@ -637,30 +637,6 @@ function liveDeliverable(e) {
 }
 function liveMessageText(e) {
     return e.prompt;
-}
-function buildSteeredPrompt(input) {
-    const steerBody = input.entries.length === 1
-        ? input.entries[0].prompt
-        : input.entries.map((e, idx) => `[Steer ${idx + 1} (${e.createdAt})]\n${e.prompt}`).join('\n\n');
-    const tag = input.freshContinuation
-        ? '[FRESH CONTINUATION]'
-        : input.wasInterrupted
-            ? '[TURN INTERRUPTED]'
-            : `[FOLLOW-UP STEER · ${input.entries.length} queued update${input.entries.length === 1 ? '' : 's'}]`;
-    const statusLine = input.wasInterrupted
-        ? 'Your previous turn was interrupted with updated instructions. Inspect your working tree before repeating any completed steps.'
-        : `Your previous turn ${input.priorStatus === undefined || input.priorStatus === 'succeeded' ? 'completed' : `ended ${input.priorStatus}`}.`;
-    const syncedLine = input.syncedFiles !== undefined && input.syncedFiles.length > 0
-        ? `\nSynced brief file(s) in your working tree: ${input.syncedFiles.join(', ')} (re-read before continuing).`
-        : '';
-    const tailBlock = input.freshContinuation && input.responseTail
-        ? `\nLast response excerpt from previous turn:\n${input.responseTail}\n`
-        : '';
-    const verdictBlock = input.verdict ? `\n${input.verdict}\n` : '';
-    const header = `${tag}\n${statusLine}${syncedLine}${verdictBlock}${tailBlock}\n[ORCHESTRATOR UPDATE]\n${steerBody}`;
-    const prependBrief = input.brief !== '' && !header.startsWith(input.brief);
-    const sentPrompt = prependBrief ? `${input.brief}\n\n${header}` : header;
-    return { rawPrompt: header, sentPrompt, prependBrief };
 }
 function readSteerHead(repo, jobId) {
     try {
@@ -2255,7 +2231,7 @@ class ForgeService {
             provider: input.provider,
             name: head.name,
             workerId: head.workerId ?? head.jobId,
-            task: head.task ?? undefined,
+            task: taskTitle(entries[0].prompt) || head.task || undefined,
             cwd,
             model: o.model ?? spec?.model ?? head.model ?? undefined,
             effort: o.effort ?? spec?.effort ?? head.effort ?? undefined,
@@ -2366,7 +2342,7 @@ class ForgeService {
             preamble: prependBrief ? nextBrief : undefined,
             preambleApplied: nextBrief !== '',
             conversation,
-            task: parentSnap?.task ?? spec.task,
+            task: taskTitle(unconsumed[0].prompt) || parentSnap?.task || spec.task,
             watchedFiles: nextWatchedFiles,
             turn: nextTurn,
             continuedFrom: parent.jobId,
