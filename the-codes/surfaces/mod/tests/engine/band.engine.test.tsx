@@ -823,6 +823,8 @@ describe('completion notices', () => {
     on('prompt.submit', (_$: unknown, e: any) => { said.prompts.push(e.text); said.origins.push(e.origin); return {text:e.text}; });
     on('classic.PostToolUse', () => { said.hookRuns++; return {}; });
     on('fs.write', (_$: unknown, e: any) => { files[e.path] = e.text; return {value:undefined}; });
+    on('turn.start', (_$: unknown, e: any) => ({ turnId: e.turnId }));
+    on('turn.complete', (_$: unknown, e: any) => ({ text: e.answer ?? '' }));
     return { ...r, said };
   }
   const ada = (status: string, more: Record<string, unknown> = {}) => canonicalJob('job-ada',
@@ -996,6 +998,63 @@ describe('completion notices', () => {
     await clock.advance(3000);
     expect(said.logs).toEqual([]);
     expect(said.prompts).toEqual([]);
+  });
+
+  test('a worker finishing mid-turn and read with status before turn.complete submits no prompt', async ($, on) => {
+    const files = ada('running');
+    const { clock, said } = noticeHost(on, files, ['job-ada']);
+    await start($);
+    await launched($, 'job-ada');
+    await ($ as any).turn.start({ turnId: 't-1', text: 'check' });
+    Object.assign(files, ada('succeeded', { finishedAt: iso(RUNNING_NOW + 1000) }));
+    await clock.advance(3000);
+    await clock.advance(3000);
+    expect(said.prompts).toEqual([]);
+    await settledRead($, 'job-ada');
+    await ($ as any).turn.complete({ turnId: 't-1', reason: 'answer', answer: 'done', durationMs: 100, isAborted: false });
+    await clock.advance(3000);
+    expect(said.prompts).toEqual([]);
+  });
+
+  test('a worker finishing mid-turn and not read submits once after turn.complete', async ($, on) => {
+    const files = ada('running');
+    const { clock, said } = noticeHost(on, files, ['job-ada']);
+    await start($);
+    await launched($, 'job-ada');
+    await ($ as any).turn.start({ turnId: 't-1', text: 'work' });
+    Object.assign(files, ada('succeeded', { finishedAt: iso(RUNNING_NOW + 1000) }));
+    await clock.advance(3000);
+    await clock.advance(3000);
+    expect(said.prompts).toEqual([]);
+    await ($ as any).turn.complete({ turnId: 't-1', reason: 'aborted', answer: '', durationMs: 100, isAborted: true });
+    expect(said.prompts).toHaveLength(1);
+    await clock.advance(3000);
+    expect(said.prompts).toHaveLength(1);
+  });
+
+  test('a subagent turn.start/turn.complete does not hold or release main-loop notices', async ($, on) => {
+    const files = ada('running');
+    const { clock, said } = noticeHost(on, files, ['job-ada']);
+    await start($);
+    await launched($, 'job-ada');
+    await ($ as any).turn.start({ turnId: 'sub-t1', agentId: 'sub-1', text: 'sub' });
+    Object.assign(files, ada('succeeded', { finishedAt: iso(RUNNING_NOW + 1000) }));
+    await clock.advance(3000);
+    await clock.advance(3000);
+    expect(said.prompts).toHaveLength(1);
+    await ($ as any).turn.complete({ turnId: 'sub-t1', agentId: 'sub-1', reason: 'answer', answer: 'ok', durationMs: 50, isAborted: false });
+    expect(said.prompts).toHaveLength(1);
+  });
+
+  test('with no turn events fired, completion notices announce on poll as before', async ($, on) => {
+    const files = ada('running');
+    const { clock, said } = noticeHost(on, files, ['job-ada']);
+    await start($);
+    await launched($, 'job-ada');
+    Object.assign(files, ada('succeeded', { finishedAt: iso(RUNNING_NOW + 1000) }));
+    await clock.advance(3000);
+    await clock.advance(3000);
+    expect(said.prompts).toHaveLength(1);
   });
 });
 
