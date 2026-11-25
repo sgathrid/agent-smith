@@ -2342,7 +2342,7 @@ class ForgeService {
             wasInterrupted,
             priorStatus: verdictStatus,
             freshContinuation: !resuming,
-            responseTail: resuming ? '' : result.response.trim().slice(-600),
+            responseTail: result.response.trim().slice(-600),
             entries: unconsumed,
             syncedFiles,
             brief: nextBrief,

@@ -93,7 +93,6 @@ test('Codex rejects an effort the CLI adapter does not support', () => {
 test('Codex translator maps exec_events.rs item schemas: reasoning, collab, file_change, mcp, web_search, statuses, unknown', () => {
   const tx = createCodexTranslator(200);
 
-  // reasoning reads `text` (not `summary`)
   const reasoning = tx.onEvent({
     type: 'item.completed',
     item: { id: 'r1', type: 'reasoning', text: 'Checking auth middleware first.' },
@@ -107,7 +106,6 @@ test('Codex translator maps exec_events.rs item schemas: reasoning, collab, file
     [],
   );
 
-  // collab_tool_call is a tool activity, not an unrecognised item type
   const collabStart = tx.onEvent({
     type: 'item.started',
     item: {
@@ -164,7 +162,6 @@ test('Codex translator maps exec_events.rs item schemas: reasoning, collab, file
   assert.equal(collabFail[0].activity.input, 'thr_child');
   assert.equal(collabFail[0].status, 'error');
 
-  // file_change preserves JSON `{ changes }` for progress classification and honours status
   const fileOk = tx.onEvent({
     type: 'item.completed',
     item: {
@@ -207,7 +204,6 @@ test('Codex translator maps exec_events.rs item schemas: reasoning, collab, file
   });
   assert.equal(fileFail[0].status, 'error');
 
-  // mcp_tool_call labels `server/tool`, previews `arguments` and `result`
   const mcpStart = tx.onEvent({
     type: 'item.started',
     item: {
@@ -244,7 +240,6 @@ test('Codex translator maps exec_events.rs item schemas: reasoning, collab, file
   assert.match(mcpEnd[0].activity.output ?? '', /PR #42/);
   assert.equal(mcpEnd[0].status, 'done');
 
-  // web_search preserves JSON `{ query }` for progress classification and previews `results`
   const searchStart = tx.onEvent({
     type: 'item.started',
     item: { id: 'w1', type: 'web_search', query: 'codex exec jsonl schema', action: { type: 'search' } },
@@ -272,7 +267,6 @@ test('Codex translator maps exec_events.rs item schemas: reasoning, collab, file
   assert.match(searchEnd[0].activity.output ?? '', /exec_events\.rs/);
   assert.equal(searchEnd[0].status, 'done');
 
-  // command_execution failed vs declined
   const cmdFail = tx.onEvent({
     type: 'item.completed',
     item: { id: 'cmd-fail', type: 'command_execution', command: 'false', aggregated_output: 'boom', exit_code: 1, status: 'failed' },
@@ -289,7 +283,6 @@ test('Codex translator maps exec_events.rs item schemas: reasoning, collab, file
   assert.equal(cmdDeclined[0].status, 'denied');
   assert.equal(cmdDeclined[0].activity.denied, true);
 
-  // unknown item types remain info notices, never dropped
   const unknown = tx.onEvent({
     type: 'item.completed',
     item: { id: 'u1', type: 'future_tool_kind', payload: 1 },

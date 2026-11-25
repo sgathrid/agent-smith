@@ -1,6 +1,3 @@
-/**
- * codex.spawn.test.ts — codex interrupt signalling (SIGINT first, SIGKILL escalation).
- */
 import assert from 'node:assert/strict';
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
@@ -55,7 +52,6 @@ test.after(() => {
 test('codex sends SIGINT first on cancel and timeout; exit code 1 with no turn.completed still yields cancelled/timeout', async () => {
   if (process.platform === 'win32') return;
 
-  // Cancel path
   const cancelDir = tempDir();
   const cancelReady = path.join(cancelDir, 'ready');
   const cancelSig = path.join(cancelDir, 'signal');
@@ -77,8 +73,6 @@ test('codex sends SIGINT first on cancel and timeout; exit code 1 with no turn.c
   assert.equal(cancelResult.status, 'cancelled');
   assert.equal(cancelResult.exitCode, 1);
 
-  // Timeout path: size timeoutMs generously above observed startup and wait for
-  // readiness so SIGINT never races fixture handler registration.
   const timeoutDir = tempDir();
   const timeoutReady = path.join(timeoutDir, 'ready');
   const timeoutSig = path.join(timeoutDir, 'signal');

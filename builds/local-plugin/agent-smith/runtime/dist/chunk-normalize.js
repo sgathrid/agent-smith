@@ -1907,10 +1907,6 @@ function spawnWorker(opts) {
                 throw err;
         }
     }
-    // RULE 4: polite first, then escalate. Default SIGTERM gives the CLI a chance
-    // to flush its result file; providers can pick another first signal (e.g.
-    // SIGINT for codex exec). Some CLIs ignore the first signal while a tool call
-    // is in flight, hence the SIGKILL escalation.
     const firstSignal = opts.terminateSignal ?? 'SIGTERM';
     function terminate(reason) {
         if (killReason !== undefined)
@@ -3420,11 +3416,6 @@ const claudeProvider = {
 };/**
  * providers/codex.ts — OpenAI Codex CLI adapter (`codex exec`).
  *
- * Flags re-checked against `codex exec --help` and `codex exec resume --help`
- * on codex-cli 0.172.0; JSONL event and item shapes checked against
- * `codex-rs/exec/src/exec_events.rs` at tag rust-v0.172.0. Earlier end-to-end
- * live transcript (codex-cli 0.160.1) is kept at the bottom of this header.
- *
  * ----------------------------------------------------------------------------
  * VERIFIED FLAGS (`codex exec --help` / `codex exec resume --help`, v0.172.0)
  * ----------------------------------------------------------------------------
@@ -3481,8 +3472,6 @@ const claudeProvider = {
  * 0.160.1 run — 22319 in, 12288 cached. We report what the CLI says and let
  * consumers decide the accounting policy; silently double-subtracting would be
  * worse.)
- *
- * Exit code is treated as corroboration, not proof — see buildResult.
  *
  * ----------------------------------------------------------------------------
  * TWO BEHAVIOURS THAT WILL BITE ANYONE WHO SPAWNS THIS NAIVELY
@@ -3678,10 +3667,6 @@ function toTokenUsage$2(u) {
     // No total_tokens from codex. Deliberately left undefined — see header.
     return Object.keys(out).length > 0 ? out : undefined;
 }
-/**
- * Item types defined in `ThreadItemDetails` (`exec_events.rs`, rust-v0.172.0).
- * Unknown item types still emit an info notice rather than being dropped.
- */
 const KNOWN_ITEM_TYPES = new Set([
     'agent_message',
     'reasoning',
@@ -3696,81 +3681,48 @@ const KNOWN_ITEM_TYPES = new Set([
 /** Item types that are NOT tool calls and must not become activities. */
 const NON_TOOL_ITEM_TYPES = new Set(['agent_message', 'reasoning', 'todo_list']);
 function formatCollabInput(item) {
-    const rawReceivers = item['receiver_thread_ids'];
-    const receivers = Array.isArray(rawReceivers)
-        ? rawReceivers.filter((r) => typeof r === 'string' && r !== '')
-        : [];
-    const prompt = str(item, 'prompt');
-    const hasPrompt = prompt !== undefined && prompt !== '';
-    if (receivers.length > 0 && hasPrompt)
-        return `${receivers.join(', ')}: ${prompt}`;
-    if (hasPrompt)
-        return prompt;
-    if (receivers.length > 0)
-        return receivers.join(', ');
-    return undefined;
+    const receivers = Array.isArray(item['receiver_thread_ids']) ? item['receiver_thread_ids'].join(', ') : '';
+    return [receivers, str(item, 'prompt') ?? ''].filter((s) => s !== '').join(': ') || undefined;
 }
 function formatCollabOutput(states) {
-    if (states === null || typeof states !== 'object' || Array.isArray(states))
-        return undefined;
-    const entries = Object.entries(states);
-    if (entries.length === 0)
-        return undefined;
-    return entries.map(([id, value]) => {
-        const rec = value !== null && typeof value === 'object' ? value : undefined;
-        const status = str(rec, 'status');
-        const message = str(rec, 'message');
-        if (status !== undefined && message !== undefined && message !== '')
-            return `${id}: ${status} (${message})`;
-        if (status !== undefined)
-            return `${id}: ${status}`;
-        return `${id}: ${JSON.stringify(value)}`;
-    }).join('; ');
+    const parts = Object.keys(states ?? {}).map((id) => {
+        const status = str(obj(states, id), 'status');
+        const message = str(obj(states, id), 'message');
+        return message ? `${id}: ${status} (${message})` : `${id}: ${status}`;
+    });
+    return parts.length > 0 ? parts.join('; ') : undefined;
 }
 function toolLabelFor(itemType, item) {
     if (itemType === 'command_execution')
         return str(item, 'command') ?? itemType;
-    if (itemType === 'mcp_tool_call') {
-        const server = str(item, 'server');
-        const tool = str(item, 'tool');
-        if (server && tool)
-            return `${server}/${tool}`;
-        return tool || server || itemType;
-    }
-    if (itemType === 'collab_tool_call') {
-        const tool = str(item, 'tool');
-        return tool ? `collab/${tool}` : itemType;
-    }
+    if (itemType === 'mcp_tool_call')
+        return `${str(item, 'server')}/${str(item, 'tool')}`;
+    if (itemType === 'collab_tool_call')
+        return `collab/${str(item, 'tool')}`;
     return itemType;
 }
 function inputPreviewFor(itemType, item, maxChars) {
     if (itemType === 'command_execution')
         return preview(item['command'], maxChars);
-    if (itemType === 'file_change') {
-        return Array.isArray(item['changes']) && item['changes'].length > 0
-            ? preview({ changes: item['changes'] }, maxChars)
-            : undefined;
-    }
+    if (itemType === 'file_change')
+        return preview({ changes: item['changes'] }, maxChars);
     if (itemType === 'mcp_tool_call')
         return preview(item['arguments'], maxChars);
     if (itemType === 'collab_tool_call')
         return preview(formatCollabInput(item), maxChars);
-    if (itemType === 'web_search') {
-        const query = str(item, 'query');
-        return query !== undefined && query !== '' ? preview({ query }, maxChars) : undefined;
-    }
+    if (itemType === 'web_search')
+        return preview({ query: item['query'] }, maxChars);
     return preview(item['input'], maxChars);
 }
 function outputPreviewFor(itemType, item, maxChars) {
-    if (itemType === 'mcp_tool_call') {
-        return preview(item['result'] ?? str(obj(item, 'error'), 'message') ?? item['output'], maxChars);
-    }
+    if (itemType === 'mcp_tool_call')
+        return preview(item['result'] ?? str(obj(item, 'error'), 'message'), maxChars);
     if (itemType === 'collab_tool_call')
-        return preview(formatCollabOutput(item['agents_states']), maxChars);
+        return preview(formatCollabOutput(obj(item, 'agents_states')), maxChars);
     if (itemType === 'web_search')
-        return preview(item['results'] ?? item['output'], maxChars);
+        return preview(item['results'], maxChars);
     if (itemType === 'error')
-        return preview(item['message'] ?? item['output'], maxChars);
+        return preview(item['message'], maxChars);
     return preview(item['aggregated_output'] ?? item['output'], maxChars);
 }
 /**
@@ -3847,9 +3799,8 @@ function createCodexTranslator(maxChars) {
             }
             if (itemType === 'reasoning') {
                 const text = str(item, 'text');
-                if (text !== undefined && text !== '') {
-                    out.push({ kind: 'text', at, text: preview(text, maxChars).text, stream: 'thinking' });
-                }
+                if (text)
+                    out.push({ kind: 'text', at, text: truncate(text, maxChars).text, stream: 'thinking' });
                 return out;
             }
             if (itemType === 'todo_list') {
@@ -3904,8 +3855,6 @@ function createCodexTranslator(maxChars) {
                 itemResult?.['isError'] === true || itemResult?.['is_error'] === true ||
                 (exitCode !== undefined && exitCode !== 0);
             let status = explicitError ? 'error' : 'done';
-            // command_execution reports status="declined" on rejected approvals; also
-            // check structured error/denial fields so rejections never render as done.
             const error = obj(item, 'error');
             const denialReason = str(item, 'decision') ?? str(item, 'approval_status') ?? str(error, 'type');
             const messages = [str(error, 'message'), str(item, 'message')].filter((m) => m !== undefined).map((m) => m.toLowerCase());

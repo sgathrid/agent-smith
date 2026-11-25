@@ -255,10 +255,6 @@ export function spawnWorker(opts: SpawnWorkerOptions): Promise<WorkerProcess> {
     }
   }
 
-  // RULE 4: polite first, then escalate. Default SIGTERM gives the CLI a chance
-  // to flush its result file; providers can pick another first signal (e.g.
-  // SIGINT for codex exec). Some CLIs ignore the first signal while a tool call
-  // is in flight, hence the SIGKILL escalation.
   const firstSignal: NodeJS.Signals = opts.terminateSignal ?? 'SIGTERM';
   function terminate(reason: 'cancelled' | 'timeout'): void {
     if (killReason !== undefined) return;
