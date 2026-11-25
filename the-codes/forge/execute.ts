@@ -79,7 +79,7 @@ export function readPipeline(repo: string, runId: string): PipelineRecord | null
 }
 
 export function missingPipelineError(runId: string): Error {
-  return new Error(`No pipeline run "${runId}"; use a runId from run_pipeline.`);
+  return new Error(`No pipeline run "${runId}".`);
 }
 
 export function cancelPipeline(repo: string, runId: string): { requested: boolean; runId: string; note: string } {

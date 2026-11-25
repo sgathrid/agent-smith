@@ -228,7 +228,7 @@ export class ForgeService {
 
   private assertNameFree(name: string, workerId: string): void {
     const busy = (jobId: string): Error =>
-      new Error(`"${name}" is busy (${jobId}); use follow_up to message it, wait, cancel, or use another name.`);
+      new Error(`"${name}" is busy: turn ${jobId} is running.`);
     const canonicalConflict = this.findActiveIdentity(name, workerId);
     if (canonicalConflict !== null) throw busy(canonicalConflict.jobId);
     for (const { writer } of this.live.values()) {
@@ -1219,17 +1219,17 @@ export class ForgeService {
   }
 
   private notFound(id: string): Error {
-    return new Error(`No worker "${id}"; see list_jobs.`);
+    return new Error(`No worker "${id}".`);
   }
 
-  private rejectPipelineRun(ref: string, guidance: string): void {
+  private rejectPipelineRun(ref: string): void {
     if (readPipeline(this.repo, ref) !== null) {
-      throw new Error(`"${ref}" is a pipeline run; ${guidance}`);
+      throw new Error(`"${ref}" is a pipeline run, not a worker.`);
     }
   }
 
   private messageHead(ref: string): { headId: string; head: ForgeManifest } {
-    this.rejectPipelineRun(ref, 'follow_up and steer apply to workers, not runs.');
+    this.rejectPipelineRun(ref);
     let headId: string;
     try {
       headId = this.resolveWorkerHeadId(ref);
@@ -1542,7 +1542,7 @@ export class ForgeService {
   resolveWorkerHeadId(ref: string): string {
     const trimmed = ref.trim();
     if (trimmed === '') throw new WorkerLookupError('worker is empty; pass a worker name, workerId or jobId.', 'missing');
-    this.rejectPipelineRun(trimmed, 'call pipeline_status.');
+    this.rejectPipelineRun(trimmed);
     this.workers.refresh();
     if (this.isJobId(trimmed)) {
       const m = this.readManifestRaw(trimmed);

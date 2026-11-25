@@ -180,7 +180,7 @@ test('a cancel for a job this process never started is recorded and admitted, no
   const r = repo();
   const service = new ForgeService({ repo: r });
 
-  assert.throws(() => service.cancel('implement-smith-deadbeef'), /No worker "implement-smith-deadbeef"; see list_jobs\./);
+  assert.throws(() => service.cancel('implement-smith-deadbeef'), /No worker "implement-smith-deadbeef"\./);
 
   const ack = await service.spawnJob({ mode: 'implement', prompt: 'quick one', provider: 'agy' });
   const settled = await waitForTerminal(r, ack.jobId, 20_000);

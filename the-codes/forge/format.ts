@@ -508,8 +508,8 @@ function baseNextAction(i: NextActionInput): string | null {
   if (BUSY_RE.test(err)) return 'Provider busy (temporary); follow_up to continue.';
   if (QUOTA_RE.test(err)) return 'Out of credits on the provider account.';
   if (RATE_LIMIT_RE.test(err)) return 'Rate limited; follow_up after a short wait.';
-  if (COMPATIBILITY_RE.test(err)) return 'Bad flag or model: read error and check list_capabilities before retrying.';
-  if (START_RE.test(err)) return "Couldn't start: read error and check list_capabilities for available providers.";
+  if (COMPATIBILITY_RE.test(err)) return 'Bad flag or model.';
+  if (START_RE.test(err)) return "Couldn't start.";
   if (i.failedEarly === true && i.jobStatus !== 'timeout') {
     return 'Route failed before any work (model/account): pick another model from list_capabilities or fix the account.';
   }

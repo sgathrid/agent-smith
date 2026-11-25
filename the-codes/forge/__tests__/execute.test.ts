@@ -85,5 +85,5 @@ test('a record written under the old 80-character name is still found by its 90-
 
 test('cancelPipeline names run_pipeline when runId is unknown', () => {
   const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-execute-'));
-  assert.throws(() => cancelPipeline(repo, 'missing-run'), /No pipeline run "missing-run"; use a runId from run_pipeline\./);
+  assert.throws(() => cancelPipeline(repo, 'missing-run'), /No pipeline run "missing-run"\./);
 });

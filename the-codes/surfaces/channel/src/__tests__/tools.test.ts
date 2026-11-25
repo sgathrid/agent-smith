@@ -572,7 +572,7 @@ test('tool failures are isError results that say what to do next', async () => {
   };
   await fail('spawn_job', { mode: 'review', prompt: 'x', cwd: 'rel' }, /absolute path/);
   await fail('spawn_job', { mode: 'review', prompt: 'x', cwd: path.join(cwd, 'nope') }, /is not a directory/);
-  await fail('follow_up', { worker: 'ghost', prompt: 'x', model: 'm' }, /No worker "ghost"; see list_jobs/);
+  await fail('follow_up', { worker: 'ghost', prompt: 'x', model: 'm' }, /No worker "ghost"/);
   await fail('follow_up', { worker: 'Ada', prompt: 'x', model: 'm' }, /matches 2 workers; pass a jobId/);
   for (const tool of ['follow_up', 'steer']) {
     await fail(tool, { prompt: 'x' }, /worker is required/);
@@ -582,7 +582,7 @@ test('tool failures are isError results that say what to do next', async () => {
   await fail('follow_up', { worker: 'Ada', prompt: 'x', checks: 'npm test' }, /checks must be an array/);
   await fail('status', {}, /id is required: a worker name or job ID/);
   await fail('cancel', {}, /id is required/);
-  await fail('pipeline_status', { runId: 'nope' }, /No pipeline run "nope"; use a runId from run_pipeline\./);
+  await fail('pipeline_status', { runId: 'nope' }, /No pipeline run "nope"\./);
   await fail('pipeline_status', {}, /runId is required/);
   await fail('spawn_job', { mode: '', prompt: 'x' }, /mode must be one of implement, review, moderate, verify \(got ""\)\./);
   await fail('spawn_job', { mode: 'review', effort: 123, prompt: 'x' }, /effort must be one of .* \(got 123\)\./);
@@ -594,7 +594,7 @@ test('tool failures are isError results that say what to do next', async () => {
   const realCtx = { service: new ForgeService({ repo: cwd }), catalogs: async () => [cat('codex')] } as HandlerContext;
   const runStatus = await callTool(realCtx, 'status', { id: 'run-123' });
   assert.equal(runStatus.isError, true);
-  assert.match(text(runStatus), /"run-123" is a pipeline run; call pipeline_status\./);
+  assert.match(text(runStatus), /"run-123" is a pipeline run, not a worker\./);
 });
 
 test('a failed job preparation never leaves checks pending', async () => {

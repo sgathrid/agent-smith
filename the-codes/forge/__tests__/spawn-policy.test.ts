@@ -435,9 +435,9 @@ test('resolveWorker takes a job id or a name, newest turn first, and refuses an 
     assert.ok(e.message.includes(first.jobId) && e.message.includes(second.jobId));
     return true;
   });
-  await assert.rejects(service.resolveWorker('nobody'), /No worker "nobody"; see list_jobs\./);
-  assert.throws(() => service.cancel('nobody'), /No worker "nobody"; see list_jobs\./);
-  await assert.rejects(service.detail('nobody'), /No worker "nobody"; see list_jobs\./);
+  await assert.rejects(service.resolveWorker('nobody'), /No worker "nobody"\./);
+  assert.throws(() => service.cancel('nobody'), /No worker "nobody"\./);
+  await assert.rejects(service.detail('nobody'), /No worker "nobody"\./);
 });
 
 test('env reaches the provider spec; only the keys are written to disk and acked', async () => {
