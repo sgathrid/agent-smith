@@ -1,10 +1,10 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { ClientCapabilities, ElicitResult } from '@modelcontextprotocol/server';
-import { DECLINED_UNRESTRICTED, UNCONFIRMED_UNRESTRICTED, callTool, type HandlerContext } from '../tools.ts';
+import { DECLINED_UNRESTRICTED, TOOL_DEFS, UNCONFIRMED_UNRESTRICTED, callTool, type HandlerContext } from '../tools.ts';
 import { withWorkerLookup } from './service-mock.ts';
 import { ForgeService } from '../../../../forge/service.ts';
 import { FILES, jobFile } from '../../../../forge/format.ts';
@@ -179,4 +179,65 @@ test('follow_up checks its target before asking: a worker with no saved conversa
   const stage = await callTool(ctx, 'follow_up', { worker: 'Stage', prompt: 'more', unrestricted: true });
   assert.match(text(stage), /is a pipeline stage/);
   assert.deepEqual(asked, []);
+});
+
+test('run_pipeline: asks once for unrestricted stages and refuses on decline without starting', async () => {
+  const stages = [
+    { name: 'impl', provider: 'codex', role: 'implement', prompt: 'x' },
+    { name: 'rev', provider: 'claude', role: 'review', prompt: 'y', dependsOn: ['impl'] },
+    { name: 'agy-step', provider: 'agy', role: 'moderate', prompt: 'z', dependsOn: ['rev'] },
+  ];
+  const declined = harness({ caps: FORM, action: 'decline' });
+  const r = await callTool(declined.ctx, 'run_pipeline', { spec: { name: 'p', workDir: declined.repo, unrestricted: true, stages } });
+  assert.equal(r.isError, true, text(r));
+  assert.equal(text(r), DECLINED_UNRESTRICTED);
+  assert.deepEqual(declined.asked, [
+    `Allow 2 pipeline stages (impl: codex, rev: claude) to run without approval prompts in ${declined.repo}? It will be able to run any command.`,
+  ]);
+  const pipelinesDir = path.join(declined.repo, '.agent-smith', 'pipelines');
+  assert.equal(existsSync(pipelinesDir) ? readdirSync(pipelinesDir).length : 0, 0);
+
+  const singleDeclined = harness({ caps: FORM, action: 'decline' });
+  const r2 = await callTool(singleDeclined.ctx, 'run_pipeline', {
+    spec: { name: 'p2', workDir: singleDeclined.repo, unrestricted: true, stages: [stages[0]!] },
+  });
+  assert.equal(r2.isError, true, text(r2));
+  assert.deepEqual(singleDeclined.asked, [
+    `Allow pipeline stage "impl" (codex) to run without approval prompts in ${singleDeclined.repo}? It will be able to run any command.`,
+  ]);
+});
+
+function hasUnrestrictedProperty(schema: unknown): boolean {
+  if (schema === null || typeof schema !== 'object') return false;
+  const obj = schema as Record<string, unknown>;
+  const props = obj.properties;
+  if (props !== null && typeof props === 'object') {
+    if ('unrestricted' in (props as Record<string, unknown>)) return true;
+    return Object.values(props as Record<string, unknown>).some(hasUnrestrictedProperty);
+  }
+  return false;
+}
+
+test('every launching tool in TOOL_DEFS enforces the unrestricted gate on an escalating request', async () => {
+  const launching = TOOL_DEFS.filter(t => t.annotations?.readOnlyHint === false && t.annotations?.openWorldHint === true);
+  assert.ok(launching.length >= 4);
+  const escalatingArgs: Record<string, (repo: string) => Record<string, unknown>> = {
+    spawn_job: () => spawnArgs,
+    follow_up: () => ({ worker: 'Ada', prompt: 'more', unrestricted: true }),
+    run_pipeline: (repo) => ({ spec: { name: 'p', workDir: repo, unrestricted: true, stages: [{ name: 'impl', provider: 'codex', role: 'implement', prompt: 'x' }] } }),
+  };
+  for (const def of launching) {
+    if (!(def.name in escalatingArgs)) {
+      assert.equal(hasUnrestrictedProperty(def.inputSchema), false, `launching tool ${def.name} accepts unrestricted but is not in escalatingArgs`);
+      continue;
+    }
+    const h = harness({ caps: FORM, action: 'decline' });
+    const r = await callTool(h.ctx, def.name, escalatingArgs[def.name]!(h.repo));
+    assert.equal(r.isError, true, `${def.name} must refuse on declined gate`);
+    assert.equal(text(r), DECLINED_UNRESTRICTED, `${def.name} refusal message`);
+    assert.equal(h.asked.length, 1, `${def.name} must ask once`);
+    assert.equal(h.spawned.length, 0, `${def.name} must not spawn`);
+    const pipelinesDir = path.join(h.repo, '.agent-smith', 'pipelines');
+    assert.equal(existsSync(pipelinesDir) ? readdirSync(pipelinesDir).length : 0, 0, `${def.name} must not start a pipeline`);
+  }
 });

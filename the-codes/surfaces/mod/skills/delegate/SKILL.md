@@ -55,7 +55,7 @@ The worker's name is its handle; you don't need to know whether it is running or
 - `follow_up`: "do this next". Never cuts the turn. Ack `delivery` says when it lands: `next-step`, `turn-end` or `now` (idle). During checks, it waits for the verdict and gets it.
 - `steer`: "stop and do this instead". Cuts the running turn (in-flight tool call lost) or running checks.
 - Queued messages deliver whatever the turn's outcome; `cancel` discards them and reports the count.
-- `env` lives only in memory: ack `env` is `set`, `kept`, or `dropped` (pass `env` again after a restart).
+- `env` lives only in memory: ack `env` is `set`, `kept`, `deferred` (applies after a running worker goes idle), or `dropped` (pass `env` again after a restart).
 
 `status` and `cancel` take a name (latest turn) or a `jobId` (that turn). `cancel` waits briefly and returns final status.
 

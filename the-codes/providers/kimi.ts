@@ -447,6 +447,7 @@ function kimiHarnessDefaults(home: string = kimiHome()): { model?: string; effor
 export const kimiProvider: Provider = {
   name: 'kimi',
   supportsEffort: false,
+  defaultUnrestricted: 'always',
 
   harnessDefaults: () => kimiHarnessDefaults(),
 

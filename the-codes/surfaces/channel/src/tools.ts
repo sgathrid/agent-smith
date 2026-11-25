@@ -16,7 +16,7 @@ import { EFFORTS, validateEnv, type Stage } from '../../../pipeline/types.ts';
 import { MODES, MODE_PRESETS, isMode as isModeName } from '../../../forge/modes.ts';
 import { requireProvider, validateModelAndEffort } from '../../../forge/spawn-request.ts';
 import { getCatalogs, getInstalledProviders } from '../../../providers/catalog.ts';
-import { providerNames } from '../../../providers/registry.ts';
+import { findProvider, providerNames } from '../../../providers/registry.ts';
 import type { ModelCatalog } from '../../../providers/types.ts';
 import { loadModelConfig, resolveRequest, describeAliases } from '../../../providers/aliases.ts';
 import { CONCISE_LIST_LIMIT, EARLIER_TURNS_CAP, conciseCapabilities, conciseRow, conciseStatus, concisePipeline, earlierTurn, jobDiff, jobLiveness, livenessView, parseSince, taskStatus, withWorkerBaseline, withWorkerFiles, type ResponseFormat } from './views.ts';
@@ -32,19 +32,32 @@ export const REPORT_HEAD_CHARS = 8_000;
 const WAIT_POLL_MS = 500;
 const WATCH_RECHECK_MS = 5_000;
 
-/** Providers that run restricted unless asked. agy and kimi are unrestricted by design: headless they cannot prompt (kimi's print mode forces auto). */
-const RESTRICTED_BY_DEFAULT = new Set(['codex', 'claude', 'opencode']);
 /** Long enough for a person to read the prompt and answer; the SDK default (60 s) is not. */
 const CONFIRM_TIMEOUT_MS = 10 * 60_000;
 export const DECLINED_UNRESTRICTED = 'The user declined unrestricted access; rerun without unrestricted, or ask the user.';
 export const UNCONFIRMED_UNRESTRICTED = 'unrestricted: true was not confirmed with the user: this client cannot show a confirmation prompt (no MCP elicitation support).';
-async function confirmUnrestricted(ctx: HandlerContext, req: { unrestricted?: boolean | undefined; provider: string; worker?: string | undefined; cwd: string; who?: string }): Promise<{ refused?: ToolOutcome; warning?: string }> {
-  if (req.unrestricted !== true || !RESTRICTED_BY_DEFAULT.has(req.provider) || process.env['AGENT_SMITH_CONFIRM_UNRESTRICTED'] === '0') return {};
+interface EscalatingLaunch {
+  unrestricted?: boolean | undefined;
+  provider: string;
+  who: string;
+  label?: string | undefined;
+  cwd: string;
+}
+async function confirmUnrestricted(
+  ctx: HandlerContext,
+  launches: readonly EscalatingLaunch[],
+  kind: 'worker' | 'pipeline stage' = 'worker',
+): Promise<{ refused?: ToolOutcome; warning?: string }> {
+  const escalating = launches.filter(l => l.unrestricted === true && !findProvider(l.provider)?.defaultUnrestricted);
+  if (escalating.length === 0 || process.env['AGENT_SMITH_CONFIRM_UNRESTRICTED'] === '0') return {};
   if (ctx.unrestrictedGate) return ctx.unrestrictedGate;
   if (!ctx.server?.getClientCapabilities()?.elicitation?.form) return { warning: UNCONFIRMED_UNRESTRICTED };
-  const who = req.who ?? (req.worker ? `${req.provider} worker "${req.worker}"` : `a new ${req.provider} worker`);
+  const target = escalating.length === 1
+    ? escalating[0]!.who
+    : `${escalating.length} ${kind}s (${escalating.map(e => e.label ?? e.who).join(', ')})`;
+  const cwds = [...new Set(escalating.map(e => e.cwd))].join(', ');
   try {
-    const answer = await ctx.server.elicitInput({ mode: 'form', message: `Allow ${who} to run without approval prompts in ${req.cwd}? It will be able to run any command.`, requestedSchema: { type: 'object', properties: {} } }, { timeout: CONFIRM_TIMEOUT_MS });
+    const answer = await ctx.server.elicitInput({ mode: 'form', message: `Allow ${target} to run without approval prompts in ${cwds}? It will be able to run any command.`, requestedSchema: { type: 'object', properties: {} } }, { timeout: CONFIRM_TIMEOUT_MS });
     return answer.action === 'accept' ? {} : { refused: failure(DECLINED_UNRESTRICTED) };
   } catch (err) {
     return { refused: failure(`Could not confirm unrestricted access with the user (${err instanceof Error ? err.message : String(err)}); rerun without unrestricted, or ask the user.`) };
@@ -113,7 +126,12 @@ async function spawnOne(ctx: HandlerContext, args: Args): Promise<Record<string,
   const checks = parseChecks(args.checks);
   const request = { mode, prompt: text(args, 'prompt', true)!, context: contextText(args), files: filesList(args), checks, cwd: workingDirectory(args), name: text(args, 'name'), task: text(args, 'task'), provider, model: resolved.model, effort: resolved.effort, timeoutMs: number(args, 'timeoutMs'), conversation: text(args, 'conversation'), unrestricted: boolean(args, 'unrestricted'), env: validateEnv(args.env),
     ownerChecks: true, onPrepared: ctx.onJobPrepared };
-  const gate = await confirmUnrestricted(ctx, { unrestricted: request.unrestricted, provider, worker: request.name, cwd: request.cwd ?? ctx.service.repo });
+  const gate = await confirmUnrestricted(ctx, [{
+    unrestricted: request.unrestricted,
+    provider,
+    who: request.name ? `${provider} worker "${request.name}"` : `a new ${provider} worker`,
+    cwd: request.cwd ?? ctx.service.repo,
+  }]);
   if (gate.refused) throw new Error(refusedText(gate.refused));
   if (gate.warning) notes.push(gate.warning);
   const saved = { mode, prompt: request.prompt, context: request.context, files: request.files, cwd: request.cwd, task: request.task, name: request.name, provider: rawProvider, model: text(args, 'model'), effort: allowed(args, 'effort', EFFORTS), timeoutMs: request.timeoutMs, unrestricted: request.unrestricted };
@@ -206,18 +224,18 @@ const spawnJob: Handler = async (ctx, args) => {
     const resolved = resolveRequest({ provider: allowed(r, 'provider', PROVIDERS), model: text(r, 'model'), effort: allowed(r, 'effort', EFFORTS), mode }, cfg);
     resolvedProviders.push(resolved.provider ?? await getFallbackProvider());
   }
-  const escalating = requests
-    .map((r, i) => ({ r, provider: resolvedProviders[i]! }))
-    .filter(({ r, provider }) => r.unrestricted === true && RESTRICTED_BY_DEFAULT.has(provider));
-  let batchCtx = ctx;
-  if (escalating.length > 0) {
-    const who = escalating.length === 1
-      ? `${escalating[0]!.provider} worker "${String(escalating[0]!.r.name)}"`
-      : `${escalating.length} workers (${escalating.map(e => `${String(e.r.name)}: ${e.provider}`).join(', ')})`;
-    const gate = await confirmUnrestricted(ctx, { unrestricted: true, provider: escalating[0]!.provider, cwd: cwd ?? ctx.service.repo, who });
-    if (gate.refused) return gate.refused;
-    batchCtx = { ...ctx, unrestrictedGate: gate.warning ? { warning: gate.warning } : {} };
-  }
+  const gate = await confirmUnrestricted(
+    ctx,
+    requests.map((r, i) => ({
+      unrestricted: boolean(r, 'unrestricted'),
+      provider: resolvedProviders[i]!,
+      who: `${resolvedProviders[i]!} worker "${String(r.name)}"`,
+      label: `${String(r.name)}: ${resolvedProviders[i]!}`,
+      cwd: cwd ?? ctx.service.repo,
+    })),
+  );
+  if (gate.refused) return gate.refused;
+  const batchCtx: HandlerContext = { ...ctx, unrestrictedGate: gate.warning ? { warning: gate.warning } : {} };
   const jobs: Record<string, unknown>[] = [];
   for (const [i, r] of requests.entries()) {
     try { jobs.push(await spawnOne(batchCtx, r)); } catch (err) { jobs.push({ name: names[i], error: err instanceof Error ? err.message : String(err) }); }
@@ -247,7 +265,12 @@ const followUp: Handler = async (ctx, args) => {
       Object.assign(request, { model: resolved.model, effort: resolved.effort });
       notes.push(...resolved.warnings, ...cfg.errors.map(e => `models.json: ${e}`));
     }
-    const gate = await confirmUnrestricted(ctx, { unrestricted: request.unrestricted, provider, worker: head.name, cwd: head.cwd ?? ctx.service.repo });
+    const gate = await confirmUnrestricted(ctx, [{
+      unrestricted: request.unrestricted,
+      provider,
+      who: head.name ? `${provider} worker "${head.name}"` : `a new ${provider} worker`,
+      cwd: head.cwd ?? ctx.service.repo,
+    }]);
     if (gate.refused) return gate.refused;
     if (gate.warning) notes.push(gate.warning);
   }
@@ -431,9 +454,23 @@ const runPipeline: Handler = async (ctx, args) => {
   const spec = await defaultMixedPipeline({ name: text(raw, 'name', true)!, task: task ?? '', stages, workDir: text(raw, 'workDir') ?? ctx.service.repo, concurrency: number(raw, 'concurrency', 32), modelConfig: loadModelConfig({ repo: ctx.service.repo }) }, ctx.catalogs);
   validateSpec(spec);
   const warnings = await validatePipelineStages(ctx, spec.stages);
+  const unrestricted = boolean(raw, 'unrestricted');
+  const gate = await confirmUnrestricted(
+    ctx,
+    spec.stages.map(s => ({
+      unrestricted,
+      provider: s.provider,
+      who: `pipeline stage "${s.name}" (${s.provider})`,
+      label: `${s.name}: ${s.provider}`,
+      cwd: spec.workDir ?? ctx.service.repo,
+    })),
+    'pipeline stage',
+  );
+  if (gate.refused) return gate.refused;
+  if (gate.warning) warnings.push(gate.warning);
   const run = ctx.service.supervisorUrl
-    ? await launchPipeline(ctx.service, spec, { unrestricted: boolean(raw, 'unrestricted') })
-    : startPipeline(ctx.service, spec, { unrestricted: boolean(raw, 'unrestricted') });
+    ? await launchPipeline(ctx.service, spec, { unrestricted })
+    : startPipeline(ctx.service, spec, { unrestricted });
   void run.done.catch(err => process.stderr.write(`agent-smith pipeline ${run.runId}: ${String(err)}\n`));
   return json({ runId: run.runId, repo: ctx.service.repo, stages: spec.stages.map(s => ({ name: s.name, provider: s.provider, ...(s.dependsOn?.length ? { dependsOn: s.dependsOn } : {}) })), ...(warnings.length ? { warnings } : {}) });
 };

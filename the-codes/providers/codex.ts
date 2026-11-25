@@ -732,6 +732,7 @@ export function codexStderrLevel(text: string): 'info' | 'warn' {
 
 export const codexProvider: Provider = {
   name: 'codex',
+  defaultUnrestricted: false,
   harnessDefaults: () => codexHarnessDefaults(),
 
   available: () => binaryAvailable(codexBinary()),

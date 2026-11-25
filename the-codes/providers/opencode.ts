@@ -727,6 +727,7 @@ export async function listOpencodeModels(run: RunFn, options?: ListModelsOptions
 
 export const opencodeProvider: Provider = {
   name: 'opencode',
+  defaultUnrestricted: false,
 
   available: () => binaryAvailable(opencodeBinary()),
 

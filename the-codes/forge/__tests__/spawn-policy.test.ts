@@ -22,6 +22,7 @@ function fakeProvider(name: string, withSandbox = true): Fake {
   const result = { status: 'SUCCESS', exitCode: 0, text: 'ok' } as unknown as JobResult;
   const provider = {
     name,
+    ...(name === 'kimi' ? { defaultUnrestricted: 'always' as const } : name === 'agy' ? { defaultUnrestricted: true } : {}),
     spawn: async (spec: SpawnSpec) => {
       specs.push(spec);
       return { cancel() {}, onEvent: () => () => {}, waitForResult: async () => result };

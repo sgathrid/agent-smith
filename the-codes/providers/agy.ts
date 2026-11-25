@@ -664,6 +664,7 @@ export async function listAgyModels(run: RunFn, options?: ListModelsOptions): Pr
 
 export const agyProvider: Provider = {
   name: 'agy',
+  defaultUnrestricted: true,
 
   /**
    * PATH probe only. We deliberately do NOT run `agy models` here: available()

@@ -170,7 +170,7 @@ const MESSAGE_OUTPUT = open({
   repo: typed('string'),
   timeoutMs: typed('integer'),
   pendingMessages: typed('integer', 'Messages accepted but not yet read, this one included.'),
-  env: { type: 'string', enum: ['set', 'kept', 'dropped'], description: 'dropped: the worker had env whose values were lost; envKeys names them.' },
+  env: { type: 'string', enum: ['set', 'kept', 'dropped', 'deferred'], description: 'dropped: the worker had env whose values were lost; envKeys names them. deferred: held until the running worker goes idle.' },
   envKeys: strings(),
   checks: strings('Acceptance checks the next turn runs.'),
   warnings: strings(),
