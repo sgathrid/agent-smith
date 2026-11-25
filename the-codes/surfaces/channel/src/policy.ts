@@ -1,6 +1,6 @@
 import type { ContinuationKind } from '../../mod/hooks/turns.ts';
 import { type NoticeJob, claudeText } from '../../mod/hooks/notice.ts';
-import { reasonFromText } from '../../mod/hooks/reasons.ts';
+import { noticeReason } from '../../mod/hooks/reasons.ts';
 
 export type PushKind = 'finished' | 'failed' | 'attention' | 'cancelled';
 
@@ -124,7 +124,7 @@ export function toNotice(job: WatchableJob, kind: PushKind, now: number): Notice
     durationMs: Number.isFinite(span) ? span : null,
     changedFiles: job.changedFileCount ?? null,
     checks: job.checks ?? null,
-    reason: run ? job.outcome! : kind === 'failed' ? job.failureDetail || reasonFromText(job.failureReason) : null,
+    reason: run ? job.outcome! : kind === 'failed' ? noticeReason(job.failureReason, job.failureDetail) : null,
     summary: job.summarySource === 'worker' ? job.latestSummary ?? null : null,
     ...(job.staleReads && job.staleReads.length > 0 ? { staleReads: job.staleReads } : {}),
     ...(job.continuationKind ? { continuationKind: job.continuationKind } : {}),

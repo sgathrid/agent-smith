@@ -323,13 +323,14 @@ function unsettled(ctx: HandlerContext, d: JobDetail, worker: boolean): boolean 
 const jobStatus: Handler = async (ctx, args) => {
   const id = text(args, 'id', true)!.trim(); const waitMs = number(args, 'wait_ms', MAX_WAIT_MS); const fmt = format(args); const wantDiff = boolean(args, 'include_diff') ?? false;
   let detail: JobDetail & { resolvedFrom?: string } = await ctx.service.resolveWorker(id); let waited = false;
-  const worker = ctx.service.resolveTurn(id) !== detail.jobId;
+  let worker = ctx.service.resolveTurn(id) !== detail.jobId;
   if (waitMs !== undefined) {
     waited = true; const deadline = Date.now() + waitMs; const fallbackMs = ctx.pollMs ?? WAIT_POLL_MS;
     const maxSlice = ctx.pollMs ?? WATCH_RECHECK_MS;
     while (unsettled(ctx, detail, worker) && Date.now() < deadline) {
       await waitForChange(jobDir(ctx.service.repo, detail.jobId), Math.min(maxSlice, deadline - Date.now()), { fallbackMs });
       detail = await ctx.service.resolveWorker(id);
+      worker = ctx.service.resolveTurn(id) !== detail.jobId;
     }
   }
   if (detail.jobId !== id) detail = { ...detail, resolvedFrom: id };

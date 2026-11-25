@@ -219,7 +219,7 @@ console.log(JSON.stringify(event));process.exitCode=1;
       const { buildBatch } = await import('../policy.ts');
       const observed = (await readJob(repo, ack.jobId, Date.now()))!;
       const notice = buildBatch([{ job: observed, seen: new Set(), observedInPriorPoll: true }], Date.now());
-      assert.match(notice.content!, provider === 'codex' ? /out of credits/ : /402: payment required/);
+      assert.match(notice.content!, /out of credits/);
     }
   } finally { await client.close(); rmSync(repo, { recursive: true, force: true }); }
 });

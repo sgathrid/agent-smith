@@ -43,6 +43,13 @@ test('provider setup and account failures do not suggest blind retries or broade
   }
   assert.match(nextActionFor({ ...F, error: '429 insufficient_quota' })!, /^Out of credits/);
   assert.match(nextActionFor({ ...F, error: 'quota exhausted' })!, /^Out of credits/);
+  for (const error of [
+    'exited 1 · stderr: error: failed to run prompt: provider.api_error: 429 Your account org-123 key-456 is suspended due to insufficient balance, please recharge your account or check your plan and billing details See log: /tmp/kimi.log',
+    '429 Your account is suspended, please recharge your account',
+    'provider.api_error: 429 balance exhausted, please recharge',
+  ]) {
+    assert.equal(nextActionFor({ ...F, error }), 'Out of credits on the provider account.');
+  }
   for (const error of ["unknown option '--permission-prompts'", "unexpected argument '--standalone'", 'unknown model "old-model"']) {
     assert.equal(nextActionFor({ ...F, error }), 'Bad flag or model.');
   }

@@ -168,7 +168,7 @@ test('the watch-hook notice carries follow-up and dropped-message markers', asyn
   const text = toNotice(found, 'failed', T0 + 5000);
   assert.equal((text as { continuationKind?: unknown }).continuationKind, 'follow-up');
   assert.equal(text.steerNotApplied, true);
-  assert.match(headline(text), /· failed: timed out after 4s · 4s · queued follow-up not sent: "add the edge-case test"$/);
+  assert.match(headline(text), /· failed: timed out · 4s · queued follow-up not sent: "add the edge-case test"$/);
   fs.rmSync(repo, { recursive: true, force: true });
 });
 

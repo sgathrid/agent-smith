@@ -1611,13 +1611,26 @@ export class ForgeService {
   }
 
   async resolveWorkerHead(nameOrWorkerIdOrJobId: string): Promise<JobDetail> {
-    return this.numberedDetail(this.resolveWorkerHeadId(nameOrWorkerIdOrJobId));
+    return this.resolveStableDetail(this.resolveWorkerHeadId(nameOrWorkerIdOrJobId));
   }
 
   async resolveWorker(nameOrId: string): Promise<JobDetail> {
     const trimmed = nameOrId.trim();
-    if (this.isJobId(trimmed)) return this.numberedDetail(this.resolveTurn(trimmed));
+    if (this.isJobId(trimmed)) return this.resolveStableDetail(this.resolveTurn(trimmed));
     return this.resolveWorkerHead(trimmed);
+  }
+
+  private async resolveStableDetail(initialId: string): Promise<JobDetail> {
+    const seen = new Set<string>();
+    let id = initialId;
+    while (true) {
+      seen.add(id);
+      const d = await this.numberedDetail(id);
+      const next = d.supersededBy ?? this.resolveTurn(d.jobId);
+      if (!next || next === d.jobId || seen.has(next)) return d;
+      id = this.resolveTurn(next);
+      if (seen.has(id)) return d;
+    }
   }
 
   private async numberedDetail(jobId: string): Promise<JobDetail> {

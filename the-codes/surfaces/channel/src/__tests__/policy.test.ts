@@ -187,6 +187,32 @@ test('the failure message is terse, specific, and ends with the next step', () =
   assert.ok(text.length < 220, `message is ${text.length} chars: ${text}`);
 });
 
+test('toNotice uses classified reason over raw stderr and falls back to raw excerpt when unclassified', async () => {
+  const { toNotice } = await import('../policy.ts');
+  const { headline } = await import('../../../mod/hooks/notice.ts');
+  const kimi = toNotice(job({
+    id: 'kimi-1',
+    name: 'final-kimi',
+    provider: 'kimi',
+    role: 'verify',
+    status: 'failed',
+    startedAt: '2026-10-03T16:39:55Z',
+    finishedAt: '2026-10-03T16:40:00Z',
+    failureReason: 'exited 1 · stderr: error: failed to run prompt: provider.api_error: 429 Your account org-123 key-456 is suspended due to insufficient balance, please recharge your account or check your plan and billing details See log: /tmp/kimi.log',
+    failureDetail: 'exited 1 · stderr: error: failed to run prompt: provider.api_error: 429 Your account org-123 key-456 is suspended due to insufficient balance, please recharge your account or check your plan and billing details See log: /tmp/kimi.log',
+  }), 'failed', NOW);
+  assert.equal(headline(kimi), '✗ final-kimi (kimi verify) · failed: out of credits · 5s');
+
+  const unknown = toNotice(job({
+    id: 'unknown-1',
+    status: 'failed',
+    finishedAt: '2026-10-03T16:40:00Z',
+    failureReason: 'worker error',
+    failureDetail: 'upstream gateway returned an unexpected opaque payload from node-7',
+  }), 'failed', NOW);
+  assert.match(headline(unknown), /upstream gateway returned an unexpected opaque payload from node-7/);
+});
+
 test('a duration is claimed only from a real start, never from the last event', () => {
   const quick = buildBatch(
     [cand(job({ status: 'failed', lastEventAt: '2026-10-03T16:39:56Z', finishedAt: '2026-10-03T16:40:00Z' }))],

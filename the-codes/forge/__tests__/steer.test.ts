@@ -633,3 +633,64 @@ test('a continuation turn stores its starting messages in view.json and its firs
     { sender: 'steer', text: 'Also check edge cases' },
   ]);
 });
+
+test('resolveWorker follows a steer that lands between resolveTurn and detail', async () => {
+  const ctrl = controlledProvider();
+  const { service, repo } = makeService(ctrl.provider);
+  const writeManifest = (id: string, extra: Record<string, unknown>) => {
+    const file = jobFile(repo, id, FILES.job);
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, JSON.stringify({
+      schema: 1,
+      jobId: id,
+      name: 'w',
+      workerId: 'w',
+      provider: 'codex',
+      mode: 'review',
+      cwd: repo,
+      status: 'running',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      startedAt: new Date().toISOString(),
+      finishedAt: null,
+      exitCode: null,
+      jobStatus: null,
+      error: null,
+      deniedActions: [],
+      usage: null,
+      toolCalls: 0,
+      unrestricted: false,
+      conversation: null,
+      task: 'work',
+      promptChars: 4,
+      pipeline: null,
+      stage: null,
+      attempt: null,
+      ...extra,
+    }));
+  };
+
+  writeManifest('parent', { turn: 1 });
+
+  const svc = service as unknown as { detail: (id: string) => Promise<Awaited<ReturnType<typeof service.detail>>> };
+  const origDetail = svc.detail.bind(service);
+  let raced = false;
+  svc.detail = async (id: string) => {
+    if (!raced && id === 'parent') {
+      raced = true;
+      writeManifest('child', { turn: 2, continuedFrom: 'parent', continuationKind: 'steer' });
+      writeFileSync(jobFile(repo, 'parent', FILES.steerHead), 'child\n');
+      writeManifest('parent', {
+        turn: 1,
+        status: 'canceled',
+        finishedAt: new Date().toISOString(),
+        supersededBy: 'child',
+      });
+    }
+    return origDetail(id);
+  };
+
+  const resolved = await service.resolveWorker('parent');
+  assert.equal(resolved.jobId, 'child');
+  assert.equal(resolved.status, 'running');
+});

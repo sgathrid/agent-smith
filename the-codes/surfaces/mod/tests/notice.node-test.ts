@@ -566,9 +566,31 @@ test('owned pipeline reports a stalled stage once while the pipeline keeps runni
   assert.deepEqual(due(first.owned, jobs, runs, NOW + 1).notices, []);
 });
 
-test('failure notice includes the provider diagnostic rather than only its category', () => {
+test('failure notice uses classified reason when known and falls back to raw excerpt when unclassified', () => {
+  const kimi = noticeFromRadar(row({
+    id: 'kimi-1',
+    name: 'final-kimi',
+    provider: 'kimi',
+    role: 'verify',
+    status: 'failed',
+    startedAt: NOW - 5_000,
+    endedAt: NOW,
+    failureReason: 'out of credits',
+    failureDetail: 'exited 1 · stderr: error: failed to run prompt: provider.api_error: 429 Your account org-123 key-456 is suspended due to insufficient balance, please recharge your account or check your plan and billing details See log: /tmp/kimi.log',
+  }), 'failed', NOW);
+  assert.equal(headline(kimi), '✗ final-kimi (kimi verify) · failed: out of credits · 5s');
+
   const n = noticeFromRadar(row({ id: 'quota', status: 'failed', failureReason: 'out of credits', failureDetail: 'HTTP 402: payment required for opencode/deepseek' }), 'failed', NOW);
-  assert.match(claudeText([n]), /402: payment required/);
+  assert.match(claudeText([n]), /out of credits/);
+  assert.doesNotMatch(claudeText([n]), /402: payment required/);
+
+  const raw = noticeFromRadar(row({
+    id: 'unknown',
+    status: 'failed',
+    failureReason: 'worker error',
+    failureDetail: 'upstream gateway returned an unexpected opaque payload from node-7',
+  }), 'failed', NOW);
+  assert.match(claudeText([raw]), /upstream gateway returned an unexpected opaque payload from node-7/);
 });
 
 test('parseLaunches yields one launch per started variant and skips failed or terminal items', () => {

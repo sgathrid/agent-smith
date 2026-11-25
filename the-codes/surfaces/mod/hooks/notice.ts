@@ -1,4 +1,4 @@
-import { STEER_NOT_APPLIED_RE, checksReason, reasonFromText } from './reasons.ts';
+import { STEER_NOT_APPLIED_RE, checksReason, noticeReason, reasonFromText } from './reasons.ts';
 import { isTerminal } from './format.ts';
 import { isWorkerIdle, pickHead, type ContinuationKind, type TurnLike } from './turns.ts';
 
@@ -384,7 +384,7 @@ export function noticeFromRadar(job: NoticeRow, kind: NoticeKind, now: number): 
     checks: checks.length > 0
       ? { passed: checks.filter((c) => c.ok).length, total: checks.length, failed: checks.filter((c) => !c.ok).flatMap((c) => (c.name ? [c.name] : [])) }
       : null,
-    reason: kind === 'failed' ? job.failureDetail || reasonFromText(job.failureReason) : null,
+    reason: kind === 'failed' ? noticeReason(job.failureReason, job.failureDetail) : null,
     summary: job.summarySource === 'worker' ? job.latestSummary ?? null : null,
     ...(job.staleReads && job.staleReads.length > 0 ? { staleReads: job.staleReads } : {}),
     ...(job.continuationKind ? { continuationKind: job.continuationKind } : {}),
