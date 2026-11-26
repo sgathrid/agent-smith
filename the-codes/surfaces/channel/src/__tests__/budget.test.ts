@@ -90,6 +90,14 @@ test('conciseRow: settled row shape and <= 450 byte budget with a full-length su
   assert.equal('turn' in turn1ZeroFiles, false);
   assert.equal('changedFileCount' in turn1ZeroFiles, false);
   assert.ok((turn1ZeroFiles.summary as string).length <= 160);
+
+  const failedRow = conciseRow(makeSummary(3, {
+    status: 'failed',
+    reason: 'timed out',
+    resumable: true,
+  }), NOW) as Record<string, unknown>;
+  assert.equal(failedRow.reason, 'timed out');
+  assert.equal(failedRow.resumable, true);
 });
 
 test('conciseRow: running row shape and <= 480 byte budget', () => {

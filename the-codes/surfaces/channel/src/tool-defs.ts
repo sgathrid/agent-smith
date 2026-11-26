@@ -74,6 +74,7 @@ const jobFields = {
   }, ['state', 'silentForMs']),
   toolErrors: typed('integer', 'Tool calls that ended in an error. Evidence, not a verdict: a worker can recover and succeed.'),
   failedEarly: typed('boolean', 'Failed before any tool call (model, region or account); error carries the provider text.'),
+  reason: typed(['string', 'null'], 'Short classification of a failure (e.g. "timed out", "denied command", "no output").'),
   changedFilesUnknown: typed('boolean', 'Changed files could not be computed at finish; a missing changedFiles then means unknown, not none.'),
   cwdMissingAtFinish: typed('boolean', 'The working directory was gone when the job finished; nothing in it could be checked.'),
 };
