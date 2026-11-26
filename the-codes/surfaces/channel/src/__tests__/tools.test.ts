@@ -823,7 +823,7 @@ test('steer forwards worker, prompt, context, files and allowFresh, and passes s
   assert.equal(body(res).action, 'interrupting');
   await callTool(ctx, 'steer', { worker: 'Ada', prompt: 'x' });
   assert.equal('allowFresh' in seen[1]!, false, 'allowFresh is sent only when passed');
-  fail = new Error('"Ada" (implement-smith-1) has no saved conversation; spawn_job with from:"Ada" starts it fresh with the original brief.');
+  fail = new Error('"Ada" (implement-smith-1) has no saved conversation to continue.');
   const err = await callTool(ctx, 'steer', { worker: 'Ada', prompt: 'x' });
   assert.equal(err.isError, true);
   assert.equal(text(err), fail.message);

@@ -214,7 +214,7 @@ console.log(JSON.stringify(event));process.exitCode=1;
       assert.equal(detail.resumable, false);
       const followed = await client.callTool({ name: 'follow_up', arguments: { worker: ack.jobId, prompt: 'continue' } });
       assert.equal(followed.isError, true);
-      assert.match((followed.content as Array<{ text: string }>)[0]!.text, /no saved conversation; spawn_job with from:.* the original brief/);
+      assert.match((followed.content as Array<{ text: string }>)[0]!.text, /has no saved conversation to continue/);
       const { readJob } = await import('../watch-source.ts');
       const { buildBatch } = await import('../policy.ts');
       const observed = (await readJob(repo, ack.jobId, Date.now()))!;

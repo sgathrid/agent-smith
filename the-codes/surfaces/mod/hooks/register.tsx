@@ -31,7 +31,6 @@ import {
   runFileName,
   unclaim,
   type Launch,
-  type NoticeJob,
   type Owned,
   type RunRecord,
 } from './notice.ts';
@@ -211,7 +210,7 @@ async function commitNoticeState(
       await $.fs.write(claimMarkerPath(repo, o.kind, o.id), `${new Date(at).toISOString()}\n`).catch(() => {});
     }
   }
-  const prevKeys = new Set(prevOwned.map((o) => `${o.kind}:${o.id}`));
+  const prevByKey = new Map(prevOwned.map((o) => [`${o.kind}:${o.id}`, o]));
   const nextByKey = new Map(nextOwned.map((o) => [`${o.kind}:${o.id}`, o]));
   await update($, notices, (current) => {
     const updated: Owned[] = [];
@@ -219,12 +218,24 @@ async function commitNoticeState(
     for (const c of current) {
       const k = `${c.kind}:${c.id}`;
       seenCurrent.add(k);
-      if (nextByKey.has(k)) updated.push(nextByKey.get(k)!);
-      else if (!prevKeys.has(k)) updated.push(c);
+      const prev = prevByKey.get(k);
+      if (prev !== undefined && c.id !== prev.id) {
+        updated.push(c);
+        continue;
+      }
+      const next = nextByKey.get(k);
+      if (next !== undefined) {
+        updated.push({
+          ...next,
+          ...(c.readHead !== undefined ? { readHead: c.readHead } : {}),
+        });
+      } else if (prev === undefined || c.readHead !== undefined) {
+        updated.push(c);
+      }
     }
     for (const o of nextOwned) {
       const k = `${o.kind}:${o.id}`;
-      if (!seenCurrent.has(k) && !prevKeys.has(k)) {
+      if (!seenCurrent.has(k) && !prevByKey.has(k)) {
         updated.push(o);
       }
     }
@@ -232,26 +243,43 @@ async function commitNoticeState(
   });
 }
 
+function ownedDiffers(a: readonly Owned[], b: readonly Owned[]): boolean {
+  return a.length !== b.length ||
+    a.some((o, i) =>
+      o.id !== b[i]?.id ||
+      o.kind !== b[i]?.kind ||
+      o.workerId !== b[i]?.workerId ||
+      o.saidAttention !== b[i]?.saidAttention ||
+      o.saidDead !== b[i]?.saidDead ||
+      o.saidExited !== b[i]?.saidExited ||
+      o.fromTurn !== b[i]?.fromTurn ||
+      o.readHead !== b[i]?.readHead);
+}
+
 async function holdAndCommitNotices(
   $: EngineInterface,
   repo: string,
-  prevOwned: readonly Owned[],
-  nextOwned: readonly Owned[],
-  dueNotices: readonly NoticeJob[],
+  jobs: readonly RadarJob[],
+  runs: ReadonlyMap<string, RunRecord>,
   at: number,
 ): Promise<void> {
   if (inMainTurn) return;
-  if (dueNotices.length === 0) {
-    await commitNoticeState($, repo, prevOwned, nextOwned, at);
+  const latest = await read($, notices);
+  if (latest.length === 0) return;
+  const fresh = due(latest, jobs, runs, at);
+  if (fresh.notices.length === 0) {
+    if (ownedDiffers(latest, fresh.owned)) {
+      await commitNoticeState($, repo, latest, fresh.owned, at);
+    }
     return;
   }
   if (submittingNotice) return;
   submittingNotice = true;
   void $.prompt
-    .submit({ text: claudeText(dueNotices) })
+    .submit({ text: claudeText(fresh.notices) })
     .then(async (res) => {
       if (!isPromptDropped(res)) {
-        await commitNoticeState($, repo, prevOwned, nextOwned, at);
+        await commitNoticeState($, repo, latest, fresh.owned, at);
       }
     })
     .catch(() => {})
@@ -276,20 +304,8 @@ async function announce($: EngineInterface, repo: string, jobs: readonly RadarJo
       } catch {}
     }
     const result = due(owned, jobs, runs, at);
-    const ownedChanged =
-      result.owned.length !== owned.length ||
-      result.owned.some((o, i) =>
-        o.id !== owned[i]?.id ||
-        o.kind !== owned[i]?.kind ||
-        o.workerId !== owned[i]?.workerId ||
-        o.saidAttention !== owned[i]?.saidAttention ||
-        o.saidDead !== owned[i]?.saidDead ||
-        o.saidExited !== owned[i]?.saidExited ||
-        o.fromTurn !== owned[i]?.fromTurn ||
-        o.readHead !== owned[i]?.readHead);
-    const changed = result.notices.length > 0 || ownedChanged;
-    if (!changed) return;
-    await holdAndCommitNotices($, repo, owned, result.owned, result.notices, at);
+    if (result.notices.length === 0 && !ownedDiffers(owned, result.owned)) return;
+    await holdAndCommitNotices($, repo, jobs, runs, at);
   } finally {
     announcing = false;
   }

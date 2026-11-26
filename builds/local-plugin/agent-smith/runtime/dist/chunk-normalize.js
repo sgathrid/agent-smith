@@ -2287,45 +2287,37 @@ function emptyResponseVerdict(response, stderr, options = {}) {
         error: `no output${options.detail ?? ''}${stderrClause(stderr)}`,
     };
 }
-function unstreamedSuffix(resultText, seenBeforeWork) {
-    let rest = resultText;
-    for (const chunk of seenBeforeWork) {
-        if (chunk === '')
-            continue;
-        const trimmed = rest.trimStart();
-        if (trimmed.startsWith(chunk)) {
-            rest = trimmed.slice(chunk.length);
-        }
-    }
-    return rest.trim() === '' ? '' : rest.trimStart();
-}
 function createAnswer() {
     let current = '';
     let lastKey;
     let hasMessage = false;
-    let explicitlyCleared = false;
-    const seenBeforeWork = [];
+    let sawText = false;
+    let blockedByWork = false;
     return {
         text(fragment, messageKey) {
-            explicitlyCleared = false;
+            sawText = true;
             if (messageKey !== undefined && hasMessage && messageKey === lastKey) {
                 current += fragment;
             }
             else {
-                if (current.trim() !== '')
-                    seenBeforeWork.push(current);
                 current = fragment;
                 lastKey = messageKey;
                 hasMessage = true;
             }
-        },
-        work() {
             if (current.trim() !== '')
-                seenBeforeWork.push(current);
+                blockedByWork = false;
+        },
+        emptyMessage() {
+            sawText = true;
             current = '';
             lastKey = undefined;
             hasMessage = false;
-            explicitlyCleared = false;
+        },
+        work() {
+            current = '';
+            lastKey = undefined;
+            hasMessage = false;
+            blockedByWork = true;
         },
         providerFinal(text, kind) {
             if (text === undefined)
@@ -2334,23 +2326,20 @@ function createAnswer() {
                 current = '';
                 lastKey = undefined;
                 hasMessage = false;
-                explicitlyCleared = true;
                 return;
             }
-            if (kind === 'authoritative') {
+            if (!sawText) {
                 current = text;
                 lastKey = undefined;
                 hasMessage = true;
-                explicitlyCleared = false;
                 return;
             }
-            if (!explicitlyCleared && current.trim() === '') {
-                const suffix = unstreamedSuffix(text, seenBeforeWork);
-                if (suffix !== '') {
-                    current = suffix;
-                    lastKey = undefined;
-                    hasMessage = true;
-                }
+            if (blockedByWork)
+                return;
+            if (current.trim() !== '' && kind === 'final-message') {
+                current = text;
+                lastKey = undefined;
+                hasMessage = true;
             }
         },
         value() {
@@ -2413,12 +2402,14 @@ function sandboxPlan$4(spec) {
             sandbox: 'agy --dangerously-skip-permissions (unrestricted)',
             flags: ['--dangerously-skip-permissions'],
             readOnlyEnforced: false,
+            unrestricted: true,
         };
     }
     return {
         sandbox: 'agy proceed-in-sandbox (cannot prompt; unapproved tools are auto-denied)',
         flags: [],
         readOnlyEnforced: false,
+        unrestricted: false,
     };
 }
 /**
@@ -2692,7 +2683,7 @@ function buildResult$4(args) {
     const { jobId, resultEvent, exit, startedAtMs, stateDir, denials, sawAnyToolCall } = args;
     const { errorIsStale } = args;
     const durationMs = Date.now() - startedAtMs;
-    args.answer.providerFinal(resultEvent?.response, 'includes-streamed');
+    args.answer.providerFinal(resultEvent?.response, 'run-prose');
     const response = args.answer.value();
     const reportedStatus = resultEvent?.status;
     const usage = toTokenUsage$4(resultEvent?.usage);
@@ -2904,6 +2895,7 @@ function sandboxPlan$3(spec) {
             sandbox: 'claude --dangerously-skip-permissions (unrestricted)',
             flags: ['--dangerously-skip-permissions'],
             readOnlyEnforced: false,
+            unrestricted: true,
         };
     }
     const flags = ['--permission-mode', 'dontAsk', '--permission-prompts', 'none'];
@@ -2918,12 +2910,14 @@ function sandboxPlan$3(spec) {
                 : `claude dontAsk + read-only allowlist (writes disallowed except the output artifact ${path.resolve(artifact)}; shell limited to inspection commands)`,
             flags,
             readOnlyEnforced: true,
+            unrestricted: false,
         };
     }
     return {
         sandbox: 'claude dontAsk (cannot prompt; non-allowed tools are denied and reported as denied)',
         flags,
         readOnlyEnforced: false,
+        unrestricted: false,
     };
 }
 function buildArgv$3(spec) {
@@ -3315,7 +3309,7 @@ function createClaudeTranslator(maxChars, input) {
             if (typeof turns === 'number')
                 tx.numTurns = turns;
             const finalAnswer = str(raw, 'result');
-            answer.providerFinal(finalAnswer, tx.deniedTools.length > 0 ? 'includes-streamed' : 'authoritative');
+            answer.providerFinal(finalAnswer, 'final-message');
             return out;
         }
         if (type === 'error') {
@@ -3589,7 +3583,7 @@ function envSandbox() {
 function sandboxPlan$2(spec, resuming = false) {
     const mode = (m) => {
         const flags = resuming ? ['-c', `sandbox_mode=${JSON.stringify(m)}`] : ['-s', m];
-        return { sandbox: `codex ${flags.join(' ')}`, flags, readOnlyEnforced: m === 'read-only' };
+        return { sandbox: `codex ${flags.join(' ')}`, flags, readOnlyEnforced: m === 'read-only', unrestricted: m === 'danger-full-access' };
     };
     const forced = envSandbox();
     if (forced !== undefined) {
@@ -3598,7 +3592,7 @@ function sandboxPlan$2(spec, resuming = false) {
     }
     if (spec.unrestricted) {
         const flags = UNRESTRICTED_FLAGS;
-        return { sandbox: `codex ${flags[0]} (unrestricted)`, flags, readOnlyEnforced: false };
+        return { sandbox: `codex ${flags[0]} (unrestricted)`, flags, readOnlyEnforced: false, unrestricted: true };
     }
     if (spec.readOnly === true && spec.artifactPath !== undefined) {
         // `-s read-only` blocks every write, `--add-dir` included (verified on codex
@@ -3610,7 +3604,7 @@ function sandboxPlan$2(spec, resuming = false) {
             '-c', `default_permissions=${JSON.stringify(ARTIFACT_PROFILE)}`,
             '-c', `permissions.${ARTIFACT_PROFILE}.filesystem=${tomlInlineTable({ ':root': 'read', [artifact]: 'write' })}`,
         ];
-        return { sandbox: `codex read-only except the output artifact ${artifact}`, flags, readOnlyEnforced: true };
+        return { sandbox: `codex read-only except the output artifact ${artifact}`, flags, readOnlyEnforced: true, unrestricted: false };
     }
     return mode(spec.readOnly === true ? 'read-only' : 'workspace-write');
 }
@@ -3719,7 +3713,7 @@ const KNOWN_ITEM_TYPES = new Set([
     'error',
 ]);
 /** Item types that are NOT tool calls and must not become activities. */
-const NON_TOOL_ITEM_TYPES = new Set(['agent_message', 'reasoning', 'todo_list']);
+const NON_TOOL_ITEM_TYPES = new Set(['agent_message', 'reasoning']);
 function formatCollabInput(item) {
     const receivers = Array.isArray(item['receiver_thread_ids']) ? item['receiver_thread_ids'].join(', ') : '';
     return [receivers, str(item, 'prompt') ?? ''].filter((s) => s !== '').join(': ') || undefined;
@@ -3845,14 +3839,14 @@ function createCodexTranslator(maxChars) {
                     out.push({ kind: 'text', at, text: truncate(text, maxChars).text, stream: 'thinking' });
                 return out;
             }
-            if (itemType === 'todo_list') {
+            if (isBookkeepingTool('codex', itemType)) {
                 out.push({ kind: 'notice', at, level: 'info', message: 'codex updated its todo list', raw: item });
                 return out;
             }
             if (NON_TOOL_ITEM_TYPES.has(itemType))
                 return out;
             const isReplay = type === 'item.completed' && completedToolIds.has(itemId);
-            if (!isReplay && !isBookkeepingTool('codex', itemType))
+            if (!isReplay)
                 answer.work();
             if (type === 'item.completed')
                 completedToolIds.add(itemId);
@@ -4161,6 +4155,7 @@ function sandboxPlan$1(spec) {
         sandbox: 'kimi print mode: auto permission policy (no approval prompts; config deny rules still apply)',
         flags: [],
         readOnlyEnforced: false,
+        unrestricted: true,
     };
 }
 function buildArgv$1(spec) {
@@ -4345,9 +4340,9 @@ function createKimiTranslator(maxChars) {
                 return !isBookkeepingTool('kimi', name);
             });
             if (content !== undefined) {
-                if (content === '') {
+                if (content.trim() === '') {
                     if (!hasAnyCall || hasRealCall)
-                        answer.text('');
+                        answer.emptyMessage();
                 }
                 else {
                     answer.text(content);
@@ -4684,12 +4679,13 @@ function opencodeBinary() {
 /** Sandbox flags for opencode. Shared by buildArgv and describeSandbox. */
 function sandboxPlan(spec) {
     if (spec.unrestricted) {
-        return { sandbox: 'opencode --auto (approve all non-denied permissions)', flags: ['--auto'], readOnlyEnforced: false };
+        return { sandbox: 'opencode --auto (approve all non-denied permissions)', flags: ['--auto'], readOnlyEnforced: false, unrestricted: true };
     }
     return {
         sandbox: "opencode default permissions (agent's configured rules; no CLI flag to restrict or enforce read-only)",
         flags: [],
         readOnlyEnforced: false,
+        unrestricted: false,
     };
 }
 /**
@@ -4914,6 +4910,7 @@ function createOpencodeTranslator(maxChars) {
         get finalText() {
             return answer.value();
         },
+        hasOpenTools: () => openParts.size > 0,
         sawTerminal: false,
         sawError: false,
         toolErrors: 0,
@@ -4923,10 +4920,9 @@ function createOpencodeTranslator(maxChars) {
         onEvent: () => [],
     };
     let step = 0;
-    let stepSeq = 0;
-    let stepKey = 'step-0';
     const partStep = new Map();
     const endedParts = new Set();
+    const openParts = new Set();
     const translate = (raw) => {
         const out = [];
         const at = nowIso();
@@ -5017,13 +5013,12 @@ function createOpencodeTranslator(maxChars) {
             const isDone = DONE_WORDS.has(stateWord) || type.endsWith('.completed') || type.endsWith('.done');
             const isErr = ERROR_WORDS.has(stateWord) || type.endsWith('.error');
             const isReplay = endedParts.has(partId);
-            if (!isReplay) {
-                if (isBookkeepingTool('opencode', toolName)) {
-                    stepKey = `step-${++stepSeq}`;
-                }
-                else {
-                    answer.work();
-                }
+            if (!isReplay && !isBookkeepingTool('opencode', toolName)) {
+                answer.work();
+                if (isDone || isErr)
+                    openParts.delete(partId);
+                else
+                    openParts.add(partId);
             }
             if (isDone || isErr)
                 endedParts.add(partId);
@@ -5107,23 +5102,27 @@ function createOpencodeTranslator(maxChars) {
         }
         // ---- text ---------------------------------------------------------------
         const text = deepString(raw, ['text', 'content', 'delta', 'textDelta']);
-        const isThinking = type.includes('thinking') || type.includes('reasoning');
+        const msgId = str(part, 'messageID') ?? str(part, 'messageId') ?? deepString(raw, ['messageID', 'messageId']);
+        const isThinking = type.includes('thinking') || type.includes('reasoning') || partType === 'thinking' || partType === 'reasoning';
         if (text !== undefined && text !== '') {
             if (!isThinking)
-                answer.text(text, stepKey);
+                answer.text(text, msgId);
             out.push({ kind: 'text', at, text, stream: isThinking ? 'thinking' : 'assistant' });
             // A text event is also our best evidence the run is producing output, so
             // it doubles as a terminal marker candidate below.
             return out;
         }
         if (!isThinking && (type === 'text' || partType === 'text') && hasEmptyText(raw, ['text', 'content', 'delta', 'textDelta'])) {
-            answer.text('');
+            if (msgId === undefined)
+                answer.emptyMessage();
+            else
+                answer.text('', msgId);
             return out;
         }
         // ---- step boundaries ----------------------------------------------------
         if (isStepStart || isStepFinish) {
-            if (isStepStart)
-                stepKey = `step-${++stepSeq}`;
+            if (isStepFinish && str(part, 'reason') === 'tool-calls')
+                answer.work();
             // Verified in the installed OpenCode CLI: session.step.ended emits
             // step_finish with part.reason = data.finish. Tool-call/length finishes
             // end only a step; "stop" confirms the assistant finished normally.
@@ -5210,6 +5209,8 @@ function buildResult(args) {
     const toolErrors = tx.toolErrors > 0 ? ` · ${tx.toolErrors} tool error(s)` : '';
     // An error the worker got past: more work and a final report followed it. A
     // signal kill is no evidence of completion, so it needs a real exit code.
+    if (tx.hasOpenTools())
+        tx.answer.work();
     const response = tx.answer.value();
     const recovered = tx.recovery.recovered(response, exit.code);
     const early = earlyVerdict(exit, durationMs);

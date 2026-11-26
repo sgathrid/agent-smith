@@ -40,7 +40,7 @@ await until(() => msgs.length >= 1 + followUps);
 out({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: 'slept', is_error: false }] }, session_id: 's1' });
 if (scenario === 'read') for (const m of msgs.slice(1)) replay(m);
 if (scenario === 'trimmed') for (const m of msgs.slice(1)) replay(m.trim());
-out({ type: 'assistant', message: { content: [{ type: 'text', text: 'done' }] }, session_id: 's1' });
+out({ type: 'assistant', message: { content: [{ type: 'text', text: 'turn one' }] }, session_id: 's1' });
 result('turn one');
 await until(() => ended);
 // The CLI runs a message that was already in the pipe at the turn's end as a further turn.

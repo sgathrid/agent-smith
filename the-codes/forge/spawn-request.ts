@@ -62,6 +62,7 @@ export interface SpawnAck {
   readonly note: string;
   readonly sandbox: string;
   readonly sandboxFlags: readonly string[];
+  readonly sandboxUnrestricted?: boolean;
   readonly readOnlyRequested: boolean;
   readonly readOnlyEnforced: boolean;
   readonly modelRequested: string | null;

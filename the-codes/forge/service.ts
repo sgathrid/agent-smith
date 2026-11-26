@@ -138,6 +138,18 @@ function mergeOverrides(entries: readonly SteerEntry[]): MessageOverrides {
   return out;
 }
 
+function continuationModelAndEffort(
+  head: Pick<ForgeManifest, 'model' | 'modelResolved' | 'effort'>,
+  entries: readonly SteerEntry[],
+  spec?: Pick<TurnSpec, 'model' | 'effort'>,
+): { model: string | undefined; effort: string | undefined } {
+  const o = mergeOverrides(entries);
+  return {
+    model: o.model ?? spec?.model ?? head.model ?? head.modelResolved ?? undefined,
+    effort: o.effort ?? spec?.effort ?? head.effort ?? undefined,
+  };
+}
+
 function applyOverrides(spec: TurnSpec, o: MessageOverrides, provider: Provider): TurnSpec {
   if (Object.keys(o).length === 0) return spec;
   const unrestricted = effectiveUnrestricted(provider, o.unrestricted === undefined ? spec.unrestricted : o.unrestricted);
@@ -499,6 +511,7 @@ export class ForgeService {
         }`,
       sandbox,
       sandboxFlags,
+      ...(sandboxInfo?.unrestricted === undefined ? {} : { sandboxUnrestricted: sandboxInfo.unrestricted }),
       readOnlyRequested,
       readOnlyEnforced,
       modelRequested: request.model ?? null,
@@ -905,6 +918,7 @@ export class ForgeService {
     const context = [...entries].reverse().find((e) => e.context !== undefined)?.context ?? spec?.context;
     const checks = o.checks ?? spec?.checks ?? input.headChecks;
     const env = input.env !== undefined && Object.keys(input.env).length > 0 ? input.env : undefined;
+    const { model, effort } = continuationModelAndEffort(head, entries, spec);
     return {
       mode: spec?.mode ?? head.mode ?? 'task',
       prompt: rawPrompt,
@@ -913,8 +927,8 @@ export class ForgeService {
       workerId: head.workerId ?? head.jobId,
       task: taskTitle(entries[0]!.prompt) || head.task || undefined,
       cwd,
-      model: o.model ?? spec?.model ?? head.model ?? undefined,
-      effort: o.effort ?? spec?.effort ?? head.effort ?? undefined,
+      model,
+      effort,
       timeoutMs: o.timeoutMs ?? spec?.timeoutMs ?? head.timeoutMs,
       unrestricted: o.unrestricted ?? spec?.unrestricted ?? head.unrestricted,
       ...(context === undefined ? {} : { context }),
@@ -1241,7 +1255,7 @@ export class ForgeService {
   private assertResumable(head: ForgeManifest): void {
     if (typeof head.conversation === 'string' && head.conversation !== '') return;
     const name = head.name ?? head.jobId;
-    throw new Error(`"${name}" (${head.jobId}) has no saved conversation; spawn_job with from:"${name}" starts it fresh with the original brief.`);
+    throw new Error(`"${name}" (${head.jobId}) has no saved conversation to continue.`);
   }
 
   async followUp(request: FollowUpRequest): Promise<MessageAck> {
@@ -1307,16 +1321,16 @@ export class ForgeService {
       const resumable = (typeof head.conversation === 'string' && head.conversation !== '') ||
         (live !== undefined && live.writer.currentConversation() !== null);
       if (!resumable && entry.allowFresh !== true) {
-        throw new Error(`Cannot interrupt "${name}" (${headId}): no resumable conversation handle exists yet, so interrupting now would discard in-flight context and start fresh. Wait for a conversation ID, use follow_up, or pass allowFresh: true.`);
+        throw new Error(`Cannot interrupt "${name}" (${headId}): no resumable conversation handle exists yet, so interrupting now would discard in-flight context and start fresh (pass allowFresh: true to discard it).`);
       }
     }
     const provider = this.providerSafe(head.provider);
-    const effectiveModel = entry.overrides?.model ?? head.model ?? undefined;
+    const { model: effectiveModel, effort: effectiveEffort } = continuationModelAndEffort(head, [...undeliveredEntries(this.repo, headId), entry]);
     if (provider !== null) {
       const checked = await validateModelAndEffort(
         provider,
         effectiveModel,
-        entry.overrides?.effort,
+        effectiveEffort,
         checkCatalog ? async () => catalog : undefined,
         entry.overrides?.unrestricted,
       );
@@ -1386,14 +1400,15 @@ export class ForgeService {
     const workerId = head.workerId ?? head.jobId;
     const { ack: envAck, runEnv } = this.resolveFollowUpEnv(workerId, head.jobId, env, false, warnings);
     const provider = this.providerSafe(head.provider);
-    const effectiveModel = entry.overrides?.model ?? head.model ?? undefined;
-    if (checkCatalog && (entry.overrides?.model !== undefined || (entry.overrides?.effort !== undefined && provider?.supportsEffort !== false))) {
-      warnings.push(...checkAgainstCatalog(head.provider, effectiveModel, entry.overrides?.effort, catalog));
+    const pendingEntries = undeliveredEntries(this.repo, head.jobId);
+    const { model: effectiveModel, effort: effectiveEffort } = continuationModelAndEffort(head, [...pendingEntries, entry]);
+    if (checkCatalog && (effectiveModel !== undefined || (effectiveEffort !== undefined && provider?.supportsEffort !== false))) {
+      warnings.push(...checkAgainstCatalog(head.provider, effectiveModel, effectiveEffort, catalog));
     }
     const acceptance = readAcceptance(this.repo, head.jobId);
     const onDisk = readSteerEntries(this.repo, head.jobId).length;
     const request = this.continuationRequest({
-      head, provider: head.provider, entries: [...undeliveredEntries(this.repo, head.jobId), entry],
+      head, provider: head.provider, entries: [...pendingEntries, entry],
       verdict: verdictBlock(acceptance), env: runEnv, headChecks: this.headChecks(head.jobId), replacesHead: false,
     });
     const { ack } = await this.spawnTracked({ ...request, ownerChecks: true, lockHeldByCaller: true });

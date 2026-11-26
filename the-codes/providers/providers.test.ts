@@ -1814,8 +1814,8 @@ test('all provider adapters: response rule table', async (t) => {
     await st.test('opencode', () => {
       const res = runOpencode([
         { type: 'step_start' },
-        { type: 'text', part: { type: 'text', text: 'hel' } },
-        { type: 'text', part: { type: 'text', text: 'lo' } },
+        { type: 'text', part: { type: 'text', messageID: 'm1', text: 'hel' } },
+        { type: 'text', part: { type: 'text', messageID: 'm1', text: 'lo' } },
         { type: 'step_finish', part: { reason: 'stop' } },
       ]);
       assert.equal(res.status, 'success');
@@ -1902,4 +1902,96 @@ test('opencode: 402 error.status envelope preserves HTTP 402 in error text', () 
   });
   assert.equal(res.status, 'error');
   assert.match(res.error ?? '', /^HTTP 402: /);
+});
+
+test('reviewers: agy/claude final field and opencode/kimi mapping regressions', async (t) => {
+  const exit = { code: 0, signal: null, killReason: undefined, stderr: '' };
+  const base = { jobId: 'j', startedAtMs: Date.now() - 10, stateDir: '/tmp', exit };
+
+  await t.test('agy: trimmed/newline pre-tool narration repeated in result.response stays empty', () => {
+    const tx1 = createAgyTranslator(2000);
+    tx1.onEvent({ event: 'step_update', step_update: { step_index: 1, step_type: 'agent_response', state: 'DONE', text_delta: 'I will inspect.' } });
+    tx1.onEvent({ event: 'step_update', step_update: { step_index: 2, step_type: 'tool', state: 'ACTIVE', tool_name: 'run_command', tool_info: {} } });
+    tx1.onEvent({ event: 'step_update', step_update: { step_index: 2, step_type: 'tool', state: 'DONE', tool_name: 'run_command', tool_info: { output: 'ok' } } });
+    const res1 = buildAgyResult({ ...base, resultEvent: { status: 'SUCCESS', response: 'I will inspect' }, denials: tx1.denials, sawAnyToolCall: tx1.stepsWereTools(), errorIsStale: tx1.errorIsStale(), answer: tx1.answer });
+    assert.equal(res1.response, '');
+    assert.notEqual(res1.status, 'success');
+
+    const tx2 = createAgyTranslator(2000);
+    tx2.onEvent({ event: 'step_update', step_update: { step_index: 1, step_type: 'agent_response', state: 'ACTIVE', text_delta: '\n' } });
+    tx2.onEvent({ event: 'step_update', step_update: { step_index: 1, step_type: 'agent_response', state: 'DONE', text_delta: 'Let me run tests.' } });
+    tx2.onEvent({ event: 'step_update', step_update: { step_index: 2, step_type: 'tool', state: 'ERROR', tool_name: 'run_command', tool_info: { error: { message: 'permission check failed' } } } });
+    const res2 = buildAgyResult({ ...base, resultEvent: { status: 'SUCCESS', response: '\nLet me run tests.' }, denials: tx2.denials, sawAnyToolCall: tx2.stepsWereTools(), errorIsStale: tx2.errorIsStale(), answer: tx2.answer });
+    assert.equal(res2.status, 'denied');
+    assert.equal(res2.response, '');
+  });
+
+  await t.test('claude: authoritative result replaces post-denial text and stays empty when no post-tool text ran', () => {
+    const tx1 = createClaudeTranslator(2000);
+    tx1.onEvent({ type: 'assistant', message: { content: [{ type: 'text', text: 'Short final' }] } });
+    tx1.onEvent({ type: 'result', subtype: 'success', is_error: false, result: 'Full authoritative report', permission_denials: [{ tool_name: 'Bash', tool_use_id: 't1' }] });
+    const res1 = buildClaudeResult({ ...base, tx: tx1 });
+    assert.equal(res1.status, 'success');
+    assert.equal(res1.response, 'Full authoritative report');
+
+    const tx2 = createClaudeTranslator(2000);
+    tx2.onEvent({ type: 'assistant', message: { content: [{ type: 'text', text: 'I will run tests.' }] } });
+    tx2.onEvent({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: {} }] } });
+    tx2.onEvent({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't1', is_error: true, content: 'exit 1' }] } });
+    tx2.onEvent({ type: 'result', subtype: 'success', is_error: false, result: 'I will run tests.' });
+    const res2 = buildClaudeResult({ ...base, tx: tx2 });
+    assert.equal(res2.response, '');
+    assert.notEqual(res2.status, 'success');
+  });
+
+  await t.test('opencode: messageID grouping, reasoning part, open tool / tool-calls finish', () => {
+    const tx1 = createOpencodeTranslator(2000);
+    tx1.onEvent({ type: 'step_start' });
+    tx1.onEvent({ type: 'text', part: { type: 'text', messageID: 'm1', text: 'Earlier answer' } });
+    tx1.onEvent({ type: 'text', part: { type: 'text', messageID: 'm2', text: 'Real answer' } });
+    tx1.onEvent({ type: 'step_finish', part: { reason: 'stop' } });
+    assert.equal(buildOpencodeResult({ ...base, tx: tx1 }).response, 'Real answer');
+
+    const tx2 = createOpencodeTranslator(2000);
+    tx2.onEvent({ type: 'step_start' });
+    tx2.onEvent({ type: 'text', part: { type: 'text', messageID: 'm1', text: 'First' } });
+    tx2.onEvent({ type: 'tool.completed', part: { id: 'p1', tool: 'todowrite', state: { status: 'completed', output: 'ok' } } });
+    tx2.onEvent({ type: 'text', part: { type: 'text', messageID: 'm1', text: 'Second' } });
+    tx2.onEvent({ type: 'step_finish', part: { reason: 'stop' } });
+    assert.equal(buildOpencodeResult({ ...base, tx: tx2 }).response, 'FirstSecond');
+
+    const tx3 = createOpencodeTranslator(2000);
+    tx3.onEvent({ type: 'step_start' });
+    tx3.onEvent({ type: 'text', part: { type: 'text', messageID: 'm1', text: 'Final answer.' } });
+    tx3.onEvent({ type: 'text', part: { type: 'text', messageID: 'm1', text: '' } });
+    tx3.onEvent({ type: 'step_finish', part: { reason: 'stop' } });
+    assert.equal(buildOpencodeResult({ ...base, tx: tx3 }).response, 'Final answer.');
+
+    const tx4 = createOpencodeTranslator(2000);
+    tx4.onEvent({ type: 'step_start' });
+    tx4.onEvent({ type: 'message.part.updated', part: { type: 'reasoning', text: 'Thinking only, no answer.' } });
+    tx4.onEvent({ type: 'step_finish', part: { reason: 'stop' } });
+    const res4 = buildOpencodeResult({ ...base, tx: tx4 });
+    assert.equal(res4.response, '');
+    assert.notEqual(res4.status, 'success');
+
+    const tx5 = createOpencodeTranslator(2000);
+    tx5.onEvent({ type: 'step_start' });
+    tx5.onEvent({ type: 'tool.started', part: { id: 'p1', tool: 'bash', state: { status: 'running', input: {} } } });
+    tx5.onEvent({ type: 'text', part: { type: 'text', messageID: 'm1', text: 'Still waiting.' } });
+    tx5.onEvent({ type: 'step_finish', part: { reason: 'tool-calls' } });
+    const res5 = buildOpencodeResult({ ...base, tx: tx5 });
+    assert.equal(res5.response, '');
+    assert.notEqual(res5.status, 'success');
+  });
+
+  await t.test('kimi: whitespace-only content on SetTodoList-only assistant record keeps prior answer', () => {
+    const tx = createKimiTranslator(2000);
+    tx.onEvent({ role: 'assistant', content: 'All done.' });
+    tx.onEvent({ role: 'assistant', content: '   ', tool_calls: [{ id: 'tc1', type: 'function', function: { name: 'SetTodoList', arguments: '{}' } }] });
+    tx.onEvent({ role: 'tool', tool_call_id: 'tc1', content: 'ok' });
+    const res = buildKimiResult({ ...base, tx });
+    assert.equal(res.status, 'success');
+    assert.equal(res.response, 'All done.');
+  });
 });

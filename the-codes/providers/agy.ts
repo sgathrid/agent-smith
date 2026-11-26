@@ -135,12 +135,14 @@ export function sandboxPlan(spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly'>):
       sandbox: 'agy --dangerously-skip-permissions (unrestricted)',
       flags: ['--dangerously-skip-permissions'],
       readOnlyEnforced: false,
+      unrestricted: true,
     };
   }
   return {
     sandbox: 'agy proceed-in-sandbox (cannot prompt; unapproved tools are auto-denied)',
     flags: [],
     readOnlyEnforced: false,
+    unrestricted: false,
   };
 }
 
@@ -449,7 +451,7 @@ export function buildResult(args: {
   const { errorIsStale } = args;
   const durationMs = Date.now() - startedAtMs;
 
-  args.answer.providerFinal(resultEvent?.response, 'includes-streamed');
+  args.answer.providerFinal(resultEvent?.response, 'run-prose');
   const response = args.answer.value();
   const reportedStatus = resultEvent?.status;
   const usage = toTokenUsage(resultEvent?.usage);

@@ -175,7 +175,7 @@ export function sandboxPlan(
 ): SandboxInfo {
   const mode = (m: CodexSandbox): SandboxInfo => {
     const flags = resuming ? ['-c', `sandbox_mode=${JSON.stringify(m)}`] : ['-s', m];
-    return { sandbox: `codex ${flags.join(' ')}`, flags, readOnlyEnforced: m === 'read-only' };
+    return { sandbox: `codex ${flags.join(' ')}`, flags, readOnlyEnforced: m === 'read-only', unrestricted: m === 'danger-full-access' };
   };
   const forced = envSandbox();
   if (forced !== undefined) {
@@ -184,7 +184,7 @@ export function sandboxPlan(
   }
   if (spec.unrestricted) {
     const flags = UNRESTRICTED_FLAGS;
-    return { sandbox: `codex ${flags[0]} (unrestricted)`, flags, readOnlyEnforced: false };
+    return { sandbox: `codex ${flags[0]} (unrestricted)`, flags, readOnlyEnforced: false, unrestricted: true };
   }
   if (spec.readOnly === true && spec.artifactPath !== undefined) {
     // `-s read-only` blocks every write, `--add-dir` included (verified on codex
@@ -196,7 +196,7 @@ export function sandboxPlan(
       '-c', `default_permissions=${JSON.stringify(ARTIFACT_PROFILE)}`,
       '-c', `permissions.${ARTIFACT_PROFILE}.filesystem=${tomlInlineTable({ ':root': 'read', [artifact]: 'write' })}`,
     ];
-    return { sandbox: `codex read-only except the output artifact ${artifact}`, flags, readOnlyEnforced: true };
+    return { sandbox: `codex read-only except the output artifact ${artifact}`, flags, readOnlyEnforced: true, unrestricted: false };
   }
   return mode(spec.readOnly === true ? 'read-only' : 'workspace-write');
 }
@@ -324,7 +324,7 @@ const KNOWN_ITEM_TYPES = new Set([
 ]);
 
 /** Item types that are NOT tool calls and must not become activities. */
-const NON_TOOL_ITEM_TYPES = new Set(['agent_message', 'reasoning', 'todo_list']);
+const NON_TOOL_ITEM_TYPES = new Set(['agent_message', 'reasoning']);
 
 function formatCollabInput(item: Record<string, unknown>): string | undefined {
   const receivers = Array.isArray(item['receiver_thread_ids']) ? item['receiver_thread_ids'].join(', ') : '';
@@ -456,7 +456,7 @@ export function createCodexTranslator(maxChars: number): CodexTranslator {
         return out;
       }
 
-      if (itemType === 'todo_list') {
+      if (isBookkeepingTool('codex', itemType)) {
         out.push({ kind: 'notice', at, level: 'info', message: 'codex updated its todo list', raw: item });
         return out;
       }
@@ -464,7 +464,7 @@ export function createCodexTranslator(maxChars: number): CodexTranslator {
       if (NON_TOOL_ITEM_TYPES.has(itemType)) return out;
 
       const isReplay = type === 'item.completed' && completedToolIds.has(itemId);
-      if (!isReplay && !isBookkeepingTool('codex', itemType)) answer.work();
+      if (!isReplay) answer.work();
       if (type === 'item.completed') completedToolIds.add(itemId);
       // ---- tool-ish items ----------------------------------------------------
       const tool = itemTool.get(itemId) ?? toolLabelFor(itemType, item);

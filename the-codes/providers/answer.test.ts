@@ -24,7 +24,7 @@ test('answer rule table', async (t) => {
     const a = createAnswer();
     a.text('earlier');
     a.work();
-    a.text('');
+    a.emptyMessage();
     assert.equal(a.value(), '');
     assert.equal(emptyResponseVerdict(a.value(), '')?.status, 'malformed');
   });
@@ -35,6 +35,11 @@ test('answer rule table', async (t) => {
     a.text('   ');
     assert.equal(a.value(), '');
     assert.equal(emptyResponseVerdict(a.value(), '')?.status, 'malformed');
+
+    const b = createAnswer();
+    b.text('Narration');
+    b.emptyMessage();
+    assert.equal(b.value(), '');
   });
 
   await t.test('5. answer, then only bookkeeping tool -> answer; success', () => {
@@ -60,27 +65,37 @@ test('answer rule table', async (t) => {
     assert.equal(a.value(), 'Second');
   });
 
-  await t.test('7. tool denied after prose with repeated final field -> empty; unstreamed suffix still works', () => {
-    const a = createAnswer();
-    a.text('I will try the tool.');
-    a.work();
-    a.providerFinal('I will try the tool.', 'includes-streamed');
-    assert.equal(a.value(), '');
+  await t.test('7. final field four-bullet contract', () => {
+    const emptyField = createAnswer();
+    emptyField.text('earlier');
+    emptyField.providerFinal('   ', 'final-message');
+    assert.equal(emptyField.value(), '');
 
-    const b = createAnswer();
-    b.text('Running the test suite to verify.');
-    b.work();
-    b.providerFinal('Done.\n\n### Summary\nAll 956 tests passed.', 'includes-streamed');
-    assert.equal(b.value(), 'Done.\n\n### Summary\nAll 956 tests passed.');
+    const blocked = createAnswer();
+    blocked.text('narration');
+    blocked.work();
+    blocked.providerFinal('narration', 'final-message');
+    assert.equal(blocked.value(), '');
 
-    const c = createAnswer();
-    c.text('earlier');
-    c.providerFinal('', 'authoritative');
-    assert.equal(c.value(), '');
-    c.providerFinal('from result', 'authoritative');
-    assert.equal(c.value(), 'from result');
-    c.providerFinal(undefined, 'authoritative');
-    assert.equal(c.value(), 'from result');
+    const blockedRunProse = createAnswer();
+    blockedRunProse.text('narration');
+    blockedRunProse.work();
+    blockedRunProse.providerFinal('narration', 'run-prose');
+    assert.equal(blockedRunProse.value(), '');
+
+    const noText = createAnswer();
+    noText.providerFinal('only in field', 'run-prose');
+    assert.equal(noText.value(), 'only in field');
+
+    const shortWithLongerField = createAnswer();
+    shortWithLongerField.text('Short final');
+    shortWithLongerField.providerFinal('Full authoritative report', 'final-message');
+    assert.equal(shortWithLongerField.value(), 'Full authoritative report');
+
+    const streamedStands = createAnswer();
+    streamedStands.text('final');
+    streamedStands.providerFinal('earlier\nfinal', 'run-prose');
+    assert.equal(streamedStands.value(), 'final');
   });
 
   await t.test('8. subagent text is never passed to text()', () => {

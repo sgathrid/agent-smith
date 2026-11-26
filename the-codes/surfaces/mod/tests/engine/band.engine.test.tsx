@@ -1151,6 +1151,36 @@ describe('completion notices', () => {
     await clock.advance(1000);
     expect(prompts).toHaveLength(3);
   });
+
+  test('status read while an attention prompt.submit is in flight preserves readHead and suppresses completion notice', async ($, on) => {
+    const files = ada('running', { startedAt: iso(RUNNING_NOW - 16 * 60_000), updatedAt: iso(RUNNING_NOW - 16 * 60_000) });
+    const { clock } = forgeHost(on, files, ['job-ada']);
+    let releaseSubmit: (() => void) | null = null;
+    const prompts: string[] = [];
+    on('fs.write', (_$: unknown, e: any) => { files[e.path] = e.text; return { value: undefined }; });
+    on('prompt.submit', async (_$: unknown, e: any) => {
+      prompts.push(e.text);
+      if (prompts.length === 1) {
+        await new Promise<void>((r) => { releaseSubmit = r; });
+      }
+      return { text: e.text };
+    });
+    on('turn.start', (_$: unknown, e: any) => ({ turnId: e.turnId }));
+    on('turn.complete', (_$: unknown, e: any) => ({ text: e.answer ?? '' }));
+
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
+    await launched($, 'job-ada');
+    await clock.advance(1000);
+    expect(prompts).toHaveLength(1);
+
+    Object.assign(files, ada('succeeded', { finishedAt: iso(RUNNING_NOW + 1000) }));
+    await settledRead($, 'job-ada');
+    releaseSubmit!();
+    await new Promise((r) => setTimeout(r, 20));
+
+    await clock.advance(1000);
+    expect(prompts).toHaveLength(1);
+  });
 });
 
 describe("a session cwd that is not the server's repo (#43)", () => {

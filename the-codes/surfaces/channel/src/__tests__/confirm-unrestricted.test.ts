@@ -4,7 +4,7 @@ import path from 'node:path';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { ClientCapabilities, ElicitResult } from '@modelcontextprotocol/server';
-import { DECLINED_UNRESTRICTED, TOOL_DEFS, UNCONFIRMED_UNRESTRICTED, callTool, type HandlerContext } from '../tools.ts';
+import { DECLINED_UNRESTRICTED, TOOL_DEFS, UNCONFIRMED_UNRESTRICTED, callTool, slimAck, type HandlerContext } from '../tools.ts';
 import { withWorkerLookup } from './service-mock.ts';
 import { ForgeService } from '../../../../forge/service.ts';
 import { FILES, jobFile } from '../../../../forge/format.ts';
@@ -408,4 +408,24 @@ test('AGENT_SMITH_CODEX_SANDBOX=read-only suppresses unrestricted escalation pro
   } finally {
     if (prior === undefined) delete process.env.AGENT_SMITH_CODEX_SANDBOX; else process.env.AGENT_SMITH_CODEX_SANDBOX = prior;
   }
+});
+
+test('slimAck omits sandbox on restricted agy even when description says auto-denied', () => {
+  const ack = slimAck({
+    jobId: 'j1',
+    name: 'a',
+    workerId: 'w1',
+    role: 'review',
+    provider: 'agy',
+    status: 'running',
+    dir: '/tmp',
+    repo: '/tmp',
+    timeoutMs: 1000,
+    unrestricted: false,
+    note: 'approvals on',
+    sandbox: 'agy proceed-in-sandbox (cannot prompt; unapproved tools are auto-denied)',
+    sandboxFlags: [],
+    sandboxUnrestricted: false,
+  } as never);
+  assert.equal('sandbox' in ack, false);
 });

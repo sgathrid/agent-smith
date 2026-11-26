@@ -254,7 +254,7 @@ export function parseSettledRead(
   if (typeof payload['supersededBy'] === 'string' && payload['supersededBy'].length > 0) return null;
   if (typeof status !== 'string' || !isTerminal(status)) return null;
   const acceptance = payload['acceptance'];
-  if (isObj(acceptance) && acceptance['pending'] === true) return null;
+  if (!isObj(acceptance) || acceptance['pending'] === true) return null;
   return { kind: 'job', id: jobId, ...(workerId !== undefined ? { workerId } : {}) };
 }
 

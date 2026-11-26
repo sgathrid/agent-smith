@@ -117,6 +117,18 @@ const RECOVERED_429_LINES = [
   }),
   JSON.stringify({
     conversation_id: CONV_ID,
+    event: 'step_update',
+    step_update: {
+      conversation_id: CONV_ID,
+      duration_seconds: 0,
+      state: 'DONE',
+      step_index: 472,
+      step_type: 'agent_response',
+      text_delta: 'Done.\n\n### Summary\nAll 956 tests passed.',
+    },
+  }),
+  JSON.stringify({
+    conversation_id: CONV_ID,
     event: 'result',
     result: {
       conversation_id: CONV_ID,

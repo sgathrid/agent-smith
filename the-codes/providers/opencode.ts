@@ -118,12 +118,13 @@ export function opencodeBinary(): string {
 /** Sandbox flags for opencode. Shared by buildArgv and describeSandbox. */
 export function sandboxPlan(spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly'>): SandboxInfo {
   if (spec.unrestricted) {
-    return { sandbox: 'opencode --auto (approve all non-denied permissions)', flags: ['--auto'], readOnlyEnforced: false };
+    return { sandbox: 'opencode --auto (approve all non-denied permissions)', flags: ['--auto'], readOnlyEnforced: false, unrestricted: true };
   }
   return {
     sandbox: "opencode default permissions (agent's configured rules; no CLI flag to restrict or enforce read-only)",
     flags: [],
     readOnlyEnforced: false,
+    unrestricted: false,
   };
 }
 
@@ -331,6 +332,7 @@ interface OpencodeTranslator {
   onEvent(raw: Record<string, unknown>): ProviderEvent[];
   answer: Answer;
   readonly finalText: string;
+  hasOpenTools(): boolean;
   sawTerminal: boolean;
   /** A fatal `error` / `session.error` event. A failed TOOL call never sets this. */
   sawError: boolean;
@@ -361,6 +363,7 @@ export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
     get finalText() {
       return answer.value();
     },
+    hasOpenTools: () => openParts.size > 0,
     sawTerminal: false,
     sawError: false,
     toolErrors: 0,
@@ -370,10 +373,9 @@ export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
     onEvent: () => [],
   };
   let step = 0;
-  let stepSeq = 0;
-  let stepKey = 'step-0';
   const partStep = new Map<string, number>();
   const endedParts = new Set<string>();
+  const openParts = new Set<string>();
 
   const translate = (raw: Record<string, unknown>): ProviderEvent[] => {
     const out: ProviderEvent[] = [];
@@ -473,12 +475,10 @@ export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
       const isDone = DONE_WORDS.has(stateWord) || type.endsWith('.completed') || type.endsWith('.done');
       const isErr = ERROR_WORDS.has(stateWord) || type.endsWith('.error');
       const isReplay = endedParts.has(partId);
-      if (!isReplay) {
-        if (isBookkeepingTool('opencode', toolName)) {
-          stepKey = `step-${++stepSeq}`;
-        } else {
-          answer.work();
-        }
+      if (!isReplay && !isBookkeepingTool('opencode', toolName)) {
+        answer.work();
+        if (isDone || isErr) openParts.delete(partId);
+        else openParts.add(partId);
       }
       if (isDone || isErr) endedParts.add(partId);
       const errorTexts = [
@@ -559,22 +559,24 @@ export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
 
     // ---- text ---------------------------------------------------------------
     const text = deepString(raw, ['text', 'content', 'delta', 'textDelta']);
-    const isThinking = type.includes('thinking') || type.includes('reasoning');
+    const msgId = str(part, 'messageID') ?? str(part, 'messageId') ?? deepString(raw, ['messageID', 'messageId']);
+    const isThinking = type.includes('thinking') || type.includes('reasoning') || partType === 'thinking' || partType === 'reasoning';
     if (text !== undefined && text !== '') {
-      if (!isThinking) answer.text(text, stepKey);
+      if (!isThinking) answer.text(text, msgId);
       out.push({ kind: 'text', at, text, stream: isThinking ? 'thinking' : 'assistant' });
       // A text event is also our best evidence the run is producing output, so
       // it doubles as a terminal marker candidate below.
       return out;
     }
     if (!isThinking && (type === 'text' || partType === 'text') && hasEmptyText(raw, ['text', 'content', 'delta', 'textDelta'])) {
-      answer.text('');
+      if (msgId === undefined) answer.emptyMessage();
+      else answer.text('', msgId);
       return out;
     }
 
     // ---- step boundaries ----------------------------------------------------
     if (isStepStart || isStepFinish) {
-      if (isStepStart) stepKey = `step-${++stepSeq}`;
+      if (isStepFinish && str(part, 'reason') === 'tool-calls') answer.work();
       // Verified in the installed OpenCode CLI: session.step.ended emits
       // step_finish with part.reason = data.finish. Tool-call/length finishes
       // end only a step; "stop" confirms the assistant finished normally.
@@ -674,6 +676,7 @@ export function buildResult(args: {
   const toolErrors = tx.toolErrors > 0 ? ` · ${tx.toolErrors} tool error(s)` : '';
   // An error the worker got past: more work and a final report followed it. A
   // signal kill is no evidence of completion, so it needs a real exit code.
+  if (tx.hasOpenTools()) tx.answer.work();
   const response = tx.answer.value();
   const recovered = tx.recovery.recovered(response, exit.code);
   const early = earlyVerdict(exit, durationMs);

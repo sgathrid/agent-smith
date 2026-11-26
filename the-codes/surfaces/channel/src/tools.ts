@@ -48,7 +48,7 @@ function isEscalatingLaunch(l: EscalatingLaunch): boolean {
   const provider = findProvider(l.provider);
   if (effectiveDefaultUnrestricted(provider)) return false;
   if (provider?.describeSandbox) {
-    return provider.describeSandbox({ unrestricted: true }).sandbox !== provider.describeSandbox({ unrestricted: false }).sandbox;
+    return provider.describeSandbox({ unrestricted: true }).unrestricted !== false;
   }
   return true;
 }
@@ -104,23 +104,13 @@ const listCapabilitiesTool: Handler = async (ctx, args) => {
   return structured(await listCapabilities(ctx, boolean(args, 'refresh') ?? false, fmt, allowed(args, 'provider', PROVIDERS)), { compact: fmt === 'concise' });
 };
 
-function sandboxContradictsUnrestricted(ack: SpawnAck): boolean {
-  if (!ack.sandbox) return false;
-  const sandboxIsUnrestricted =
-    ack.sandbox.includes('danger-full-access') ||
-    ack.sandbox.includes('(unrestricted)') ||
-    ack.sandbox.includes('bypass') ||
-    ack.sandbox.includes('auto');
-  return sandboxIsUnrestricted !== ack.unrestricted;
-}
-
 export function slimAck(ack: SpawnAck) {
   const out = {
     jobId: ack.jobId, name: ack.name, workerId: ack.workerId,
     ...(ack.turn !== undefined ? { turn: ack.turn } : {}),
     provider: ack.provider, model: ack.modelResolved ?? null, status: ack.status,
     timeoutMs: ack.timeoutMs, repo: ack.repo, unrestricted: ack.unrestricted,
-    ...(sandboxContradictsUnrestricted(ack) ? { sandbox: ack.sandbox } : {}),
+    ...(ack.sandboxUnrestricted !== undefined && ack.sandboxUnrestricted !== ack.unrestricted ? { sandbox: ack.sandbox } : {}),
     ...(ack.readOnlyRequested || (isModeName(ack.role) && MODE_PRESETS[ack.role].readOnly) ? { readOnlyEnforced: ack.readOnlyEnforced ?? false } : {}),
     ...(ack.envKeys?.length ? { envKeys: ack.envKeys } : {}),
     ...(ack.warnings?.length ? { warnings: ack.warnings } : {}),
@@ -199,11 +189,12 @@ function saveRequest(ctx: HandlerContext, jobId: string, saved: Record<string, u
 export const MAX_VARIANTS = 8;
 const VARIANT_KEYS = ['name', 'provider', 'model', 'effort'] as const;
 
-function overlay(base: Args, over: Args, baseProvider?: string): { args: Args; droppedUnrestricted?: string } {
+function overlay(base: Args, over: Args, baseProvider?: string, keepUnrestricted = false): { args: Args; droppedUnrestricted?: string } {
   const defined = Object.fromEntries(Object.entries(over).filter(([, v]) => v !== undefined));
   const switched = defined.provider !== undefined && baseProvider !== defined.provider;
-  const kept = switched ? Object.fromEntries(Object.entries(base).filter(([k]) => !['model', 'effort', 'unrestricted'].includes(k))) : base;
-  const dropped = switched && base.unrestricted !== undefined && defined.unrestricted === undefined
+  const dropKeys = keepUnrestricted ? ['model', 'effort'] : ['model', 'effort', 'unrestricted'];
+  const kept = switched ? Object.fromEntries(Object.entries(base).filter(([k]) => !dropKeys.includes(k))) : base;
+  const dropped = switched && !keepUnrestricted && base.unrestricted !== undefined && defined.unrestricted === undefined
     ? `unrestricted: ${String(base.unrestricted)} was dropped because the provider changed or was not shared.`
     : undefined;
   return { args: { ...kept, ...defined }, ...(dropped ? { droppedUnrestricted: dropped } : {}) };
@@ -272,7 +263,7 @@ const spawnJob: Handler = async (ctx, args) => {
     effort: allowed(shared, 'effort', EFFORTS),
     mode,
   }, cfg).provider;
-  const overlaid = variants.map((v, i) => overlay(shared, { ...v, name: names[i] }, baseProvider));
+  const overlaid = variants.map((v, i) => overlay(shared, { ...v, name: names[i] }, baseProvider, true));
   const requests = overlaid.map(o => o.args);
   let fallbackProvider: string | undefined;
   const getFallbackProvider = async () => fallbackProvider ??= await resolveDefaultProvider(ctx);
@@ -325,7 +316,7 @@ const followUp: Handler = async (ctx, args) => {
     const provider = head.provider ?? '';
     if (request.model !== undefined || request.effort !== undefined) {
       const cfg = loadModelConfig({ repo: ctx.service.repo });
-      const resolved = resolveRequest({ provider: provider || undefined, model: request.model ?? head.model ?? undefined, effort: request.effort }, cfg);
+      const resolved = resolveRequest({ provider: provider || undefined, model: request.model ?? head.model ?? head.modelResolved ?? undefined, effort: request.effort }, cfg);
       Object.assign(request, { ...(request.model !== undefined ? { model: resolved.model } : {}), effort: resolved.effort });
       notes.push(...resolved.warnings, ...cfg.errors.map(e => `models.json: ${e}`));
     }
@@ -392,8 +383,9 @@ const jobStatus: Handler = async (ctx, args) => {
   }
   if (detail.jobId !== id) detail = { ...detail, resolvedFrom: id };
   const reportPath = jobFile(ctx.service.repo, detail.jobId, FILES.report);
-  if (boolean(args, 'report_only')) return structured({ jobId: detail.jobId, status: detail.status, report: detail.report, reportPath });
-  const acceptance = readAcceptance(ctx.service.repo, detail.jobId); const wait = waited ? { waited: true, stillRunning: unsettled(ctx, detail, worker) } : {};
+  const acceptance = readAcceptance(ctx.service.repo, detail.jobId);
+  if (boolean(args, 'report_only')) return structured({ jobId: detail.jobId, status: detail.status, report: detail.report, reportPath, acceptance });
+  const wait = waited ? { waited: true, stillRunning: unsettled(ctx, detail, worker) } : {};
   const allEarlier = await ctx.service.earlierTurns(detail, worker ? Number.MAX_SAFE_INTEGER : EARLIER_TURNS_CAP);
   const earlier = allEarlier.slice(-EARLIER_TURNS_CAP);
   const viewDetail = worker ? withWorkerFiles(detail, allEarlier) : detail;

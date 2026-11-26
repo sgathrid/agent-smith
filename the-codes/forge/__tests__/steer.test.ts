@@ -211,7 +211,7 @@ test('follow_up/steer refuse a worker with no saved conversation, pipeline stage
 
   await assert.rejects(
     service.followUp({ worker: 'reviewer', prompt: 'More.' }),
-    new RegExp(`"reviewer" \\(${revAck.jobId}\\) has no saved conversation; spawn_job with from:"reviewer" starts it fresh`),
+    new RegExp(`"reviewer" \\(${revAck.jobId}\\) has no saved conversation to continue`),
   );
   await assert.rejects(service.steer({ worker: 'reviewer', prompt: 'More.' }), /has no saved conversation/);
 
@@ -788,4 +788,65 @@ test('effort-only follow_up validates against the worker model, not the provider
   const turn2 = await turn2Ready;
   turn2.finish({ status: 'success', response: 'Done 2.' });
   await done;
+});
+
+test('queued model override + effort follow-up and harness-default modelResolved validation', async () => {
+  const ctrl = controlledProvider();
+  const catalogSource = async () => [{
+    provider: ctrl.provider.name,
+    models: [
+      { id: 'model-a', label: 'A', efforts: ['high'] },
+      { id: 'model-b', label: 'B', efforts: ['low'] },
+    ],
+    defaultModel: 'model-a',
+    defaultSource: 'harness-config' as const,
+    source: 'live' as const,
+    stale: false,
+    verified: true,
+  }];
+  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-queued-'));
+  const service = withDefaultProvider(new ForgeService({
+    repo,
+    flushMs: 5,
+    providerSource: () => ctrl.provider,
+    catalogSource,
+    harnessDefaults: () => ({ model: 'model-b' }),
+  }));
+
+  const turn1Ready = ctrl.nextTurn();
+  const { ack, done } = await service.spawnTracked({
+    mode: 'implement',
+    name: 'Ada',
+    prompt: 'Initial',
+    model: 'model-a',
+  });
+  const turn1 = await turn1Ready;
+  turn1.emit({ kind: 'started', at: new Date().toISOString(), conversationId: 'thread-ada' });
+
+  await service.followUp({ worker: 'Ada', prompt: 'switch model', model: 'model-b' });
+  await assert.rejects(
+    service.followUp({ worker: 'Ada', prompt: 'bad effort for b', effort: 'high' }),
+    /effort "high" is not valid for codex model "model-b"/,
+  );
+
+  const turn2Ready = ctrl.nextTurn();
+  turn1.finish({ status: 'success', response: 'Done.' });
+  const turn2 = await turn2Ready;
+  turn2.finish({ status: 'success', response: 'Done 2.' });
+  await done;
+
+  const turn3Ready = ctrl.nextTurn();
+  const { ack: ack2, done: done2 } = await service.spawnTracked({
+    mode: 'implement',
+    name: 'Bo',
+    prompt: 'Use harness default',
+  });
+  const turn3 = await turn3Ready;
+  turn3.emit({ kind: 'started', at: new Date().toISOString(), conversationId: 'thread-bo' });
+  await assert.rejects(
+    service.followUp({ worker: ack2.jobId, prompt: 'bad effort for modelResolved', effort: 'high' }),
+    /effort "high" is not valid for codex model "model-b"/,
+  );
+  turn3.finish({ status: 'success', response: 'Done 3.' });
+  await done2;
 });

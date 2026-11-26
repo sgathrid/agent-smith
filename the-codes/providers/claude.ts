@@ -58,6 +58,7 @@ export function sandboxPlan(spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly' | 
       sandbox: 'claude --dangerously-skip-permissions (unrestricted)',
       flags: ['--dangerously-skip-permissions'],
       readOnlyEnforced: false,
+      unrestricted: true,
     };
   }
   const flags = ['--permission-mode', 'dontAsk', '--permission-prompts', 'none'];
@@ -72,12 +73,14 @@ export function sandboxPlan(spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly' | 
         : `claude dontAsk + read-only allowlist (writes disallowed except the output artifact ${path.resolve(artifact)}; shell limited to inspection commands)`,
       flags,
       readOnlyEnforced: true,
+      unrestricted: false,
     };
   }
   return {
     sandbox: 'claude dontAsk (cannot prompt; non-allowed tools are denied and reported as denied)',
     flags,
     readOnlyEnforced: false,
+    unrestricted: false,
   };
 }
 
@@ -488,7 +491,7 @@ export function createClaudeTranslator(
       if (typeof turns === 'number') tx.numTurns = turns;
 
       const finalAnswer = str(raw, 'result');
-      answer.providerFinal(finalAnswer, tx.deniedTools.length > 0 ? 'includes-streamed' : 'authoritative');
+      answer.providerFinal(finalAnswer, 'final-message');
       return out;
     }
 

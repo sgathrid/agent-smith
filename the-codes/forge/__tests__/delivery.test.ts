@@ -406,7 +406,7 @@ test('follow_up N and steer N: no saved conversation -> the spawn_job from: erro
   await s.spawnTracked({ mode: 'implement', name: 'w', prompt: 'Turn one.' });
   const t1 = await ready;
   await settle(repo, t1);
-  await assert.rejects(s.followUp({ worker: 'w', prompt: 'x' }), /no saved conversation; spawn_job with from:"w" starts it fresh with the original brief/);
+  await assert.rejects(s.followUp({ worker: 'w', prompt: 'x' }), /has no saved conversation to continue/);
   await assert.rejects(s.steer({ worker: 'w', prompt: 'x' }), /no saved conversation/);
 });
 

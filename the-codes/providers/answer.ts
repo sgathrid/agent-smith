@@ -1,9 +1,12 @@
 import { stderrClause } from './failure-text.ts';
 
+export type ProviderFinalKind = 'final-message' | 'run-prose';
+
 export interface Answer {
   text(fragment: string, messageKey?: string): void;
+  emptyMessage(): void;
   work(): void;
-  providerFinal(text: string | undefined, kind: 'authoritative' | 'includes-streamed'): void;
+  providerFinal(text: string | undefined, kind: ProviderFinalKind): void;
   value(): string;
 }
 
@@ -31,67 +34,56 @@ export function emptyResponseVerdict(
   };
 }
 
-function unstreamedSuffix(resultText: string, seenBeforeWork: readonly string[]): string {
-  let rest = resultText;
-  for (const chunk of seenBeforeWork) {
-    if (chunk === '') continue;
-    const trimmed = rest.trimStart();
-    if (trimmed.startsWith(chunk)) {
-      rest = trimmed.slice(chunk.length);
-    }
-  }
-  return rest.trim() === '' ? '' : rest.trimStart();
-}
-
 export function createAnswer(): Answer {
   let current = '';
   let lastKey: string | undefined;
   let hasMessage = false;
-  let explicitlyCleared = false;
-  const seenBeforeWork: string[] = [];
+  let sawText = false;
+  let blockedByWork = false;
 
   return {
     text(fragment: string, messageKey?: string): void {
-      explicitlyCleared = false;
+      sawText = true;
       if (messageKey !== undefined && hasMessage && messageKey === lastKey) {
         current += fragment;
       } else {
-        if (current.trim() !== '') seenBeforeWork.push(current);
         current = fragment;
         lastKey = messageKey;
         hasMessage = true;
       }
+      if (current.trim() !== '') blockedByWork = false;
     },
-    work(): void {
-      if (current.trim() !== '') seenBeforeWork.push(current);
+    emptyMessage(): void {
+      sawText = true;
       current = '';
       lastKey = undefined;
       hasMessage = false;
-      explicitlyCleared = false;
     },
-    providerFinal(text: string | undefined, kind: 'authoritative' | 'includes-streamed'): void {
+    work(): void {
+      current = '';
+      lastKey = undefined;
+      hasMessage = false;
+      blockedByWork = true;
+    },
+    providerFinal(text: string | undefined, kind: ProviderFinalKind): void {
       if (text === undefined) return;
       if (text.trim() === '') {
         current = '';
         lastKey = undefined;
         hasMessage = false;
-        explicitlyCleared = true;
         return;
       }
-      if (kind === 'authoritative') {
+      if (!sawText) {
         current = text;
         lastKey = undefined;
         hasMessage = true;
-        explicitlyCleared = false;
         return;
       }
-      if (!explicitlyCleared && current.trim() === '') {
-        const suffix = unstreamedSuffix(text, seenBeforeWork);
-        if (suffix !== '') {
-          current = suffix;
-          lastKey = undefined;
-          hasMessage = true;
-        }
+      if (blockedByWork) return;
+      if (current.trim() !== '' && kind === 'final-message') {
+        current = text;
+        lastKey = undefined;
+        hasMessage = true;
       }
     },
     value(): string {

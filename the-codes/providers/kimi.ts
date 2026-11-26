@@ -53,6 +53,7 @@ export function sandboxPlan(spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly'>):
     sandbox: 'kimi print mode: auto permission policy (no approval prompts; config deny rules still apply)',
     flags: [],
     readOnlyEnforced: false,
+    unrestricted: true,
   };
 }
 
@@ -242,8 +243,8 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
         return !isBookkeepingTool('kimi', name);
       });
       if (content !== undefined) {
-        if (content === '') {
-          if (!hasAnyCall || hasRealCall) answer.text('');
+        if (content.trim() === '') {
+          if (!hasAnyCall || hasRealCall) answer.emptyMessage();
         } else {
           answer.text(content);
           out.push({ kind: 'text', at, text: content, stream: 'assistant' });
