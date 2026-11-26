@@ -392,8 +392,17 @@ export function createAgyTranslator(maxChars: number) {
         answer.work();
         sawErrorStep = true;
         progressedAfterError = false;
-        // agy's stream carries no error text here; the final result does.
-        out.push({ kind: 'notice', at, level: 'error', message: 'agy error', raw: su });
+        const suObj = obj(raw, 'step_update');
+        const detail = (
+          str(suObj, 'text_delta') ??
+          str(suObj, 'error') ??
+          str(obj(suObj, 'error'), 'message') ??
+          str(suObj, 'message') ??
+          su.tool_info?.error?.message ??
+          ''
+        ).replace(/\s+/g, ' ').trim();
+        const message = detail === '' ? 'agy error' : truncate(`agy error: ${detail}`, 200).text;
+        out.push({ kind: 'notice', at, level: 'error', message, raw: su });
         return out;
       }
 

@@ -5,6 +5,7 @@ import { BAND_ROWS, buildLine, isShown, noColor, rowBudget } from '../../hooks/b
 import type { RadarJob } from '../../../types/index.d.ts';
 import { proseText } from '../../hooks/views.tsx';
 import { updateLine } from '../../hooks/update.ts';
+import { register as registerMod } from '../../hooks/register.tsx';
 
 const ID = 'job-1';
 const RUNNING_NOW = Date.parse('2026-10-03T16:49:45.031Z');
@@ -837,6 +838,7 @@ describe('completion notices', () => {
     const r = await launched($, 'job-ada');
     expect(r.result.structuredContent.jobId).toBe('job-ada');
     expect(Object.hasOwn(files, '/work/.agent-smith/claims/job-job-ada')).toBe(true);
+    await ($ as any).turn.complete({ turnId: 't-launch', reason: 'answer', answer: 'ok', durationMs: 10, isAborted: false });
 
     await clock.advance(3000);
     expect(said.logs).toEqual([]);
@@ -870,6 +872,7 @@ describe('completion notices', () => {
     const { clock, said } = noticeHost(on, files, ['job-ada']);
     await start($);
     await launched($, 'job-ada');
+    await ($ as any).turn.complete({ turnId: 't-launch', reason: 'answer', answer: 'ok', durationMs: 10, isAborted: false });
     Object.assign(files, ada('succeeded', { finishedAt: iso(RUNNING_NOW + 1000) }));
     await settledRead($, 'job-ada', { agentId: 'sub-1' });
     await clock.advance(3000);
@@ -931,6 +934,7 @@ describe('completion notices', () => {
     const { clock, said } = noticeHost(on, files, ['job-ada', 'job-bo']);
     await start($);
     await $.tool.call({ tool: 'mcp__plugin_agent-smith_agent-smith__spawn_job', variantJobs: ['job-ada', 'job-bo'], repo: '/work' });
+    await ($ as any).turn.complete({ turnId: 't-launch', reason: 'answer', answer: 'ok', durationMs: 10, isAborted: false });
     Object.assign(files, ada('succeeded', { finishedAt: iso(RUNNING_NOW + 1000) }),
       canonicalJob('job-bo', { status: 'succeeded', name: 'Bo', workerId: 'w-bo', provider: 'codex', role: 'review', finishedAt: iso(RUNNING_NOW + 1000) },
         { 'acceptance.json': JSON.stringify({ state: 'accepted', checks: [] }) }));
@@ -951,6 +955,7 @@ describe('completion notices', () => {
       await start($);
       await launched($, 'job-ada');
       await $.tool.call({ tool: 'mcp__plugin_agent-smith_agent-smith__cancel', jobId: 'job-ada', settled });
+      await ($ as any).turn.complete({ turnId: 't-launch', reason: 'answer', answer: 'ok', durationMs: 10, isAborted: false });
       Object.assign(files, ada('succeeded', { finishedAt: iso(RUNNING_NOW + 1000) }));
       await clock.advance(3000);
       await clock.advance(3000);
@@ -1036,6 +1041,7 @@ describe('completion notices', () => {
     const { clock, said } = noticeHost(on, files, ['job-ada']);
     await start($);
     await launched($, 'job-ada');
+    await ($ as any).turn.complete({ turnId: 't-launch', reason: 'answer', answer: 'ok', durationMs: 10, isAborted: false });
     await ($ as any).turn.start({ turnId: 'sub-t1', agentId: 'sub-1', text: 'sub' });
     Object.assign(files, ada('succeeded', { finishedAt: iso(RUNNING_NOW + 1000) }));
     await clock.advance(3000);
@@ -1048,12 +1054,113 @@ describe('completion notices', () => {
   test('with no turn events fired, completion notices announce on poll as before', async ($, on) => {
     const files = ada('running');
     const { clock, said } = noticeHost(on, files, ['job-ada']);
-    await start($);
+    await $.session.start({ surface: null, isInteractive: false, cwd: '/work' } as never);
     await launched($, 'job-ada');
     Object.assign(files, ada('succeeded', { finishedAt: iso(RUNNING_NOW + 1000) }));
     await clock.advance(3000);
     await clock.advance(3000);
     expect(said.prompts).toHaveLength(1);
+  });
+
+  test('with no turn.start fired, a main-loop launch tool call holds notices until turn.complete and settled status read submits no prompt', async ($, on) => {
+    const files = ada('running');
+    const { clock, said } = noticeHost(on, files, ['job-ada']);
+    await start($);
+    await launched($, 'job-ada');
+    Object.assign(files, ada('succeeded', { finishedAt: iso(RUNNING_NOW + 1000) }));
+    await clock.advance(3000);
+    await clock.advance(3000);
+    expect(said.prompts).toEqual([]);
+    await settledRead($, 'job-ada');
+    await ($ as any).turn.complete({ turnId: 't-1', reason: 'answer', answer: 'done', durationMs: 100, isAborted: false });
+    await clock.advance(3000);
+    expect(said.prompts).toEqual([]);
+  });
+
+  test('with no turn.start fired, a main-loop launch tool call without a status read submits once after turn.complete', async ($, on) => {
+    const files = ada('running');
+    const { clock, said } = noticeHost(on, files, ['job-ada']);
+    await start($);
+    await launched($, 'job-ada');
+    Object.assign(files, ada('succeeded', { finishedAt: iso(RUNNING_NOW + 1000) }));
+    await clock.advance(3000);
+    await clock.advance(3000);
+    expect(said.prompts).toEqual([]);
+    await ($ as any).turn.complete({ turnId: 't-1', reason: 'answer', answer: 'done', durationMs: 100, isAborted: false });
+    expect(said.prompts).toHaveLength(1);
+    await clock.advance(3000);
+    expect(said.prompts).toHaveLength(1);
+  });
+
+  test('a tool call carrying an agentId does not hold main-loop notices', async ($, on) => {
+    const files = ada('running');
+    const { clock, said } = noticeHost(on, files, ['job-ada']);
+    await start($);
+    await $.tool.call({ tool: 'mcp__plugin_agent-smith_agent-smith__spawn_job', jobId: 'job-ada', repo: '/work', agentId: 'sub-1' });
+    Object.assign(files, ada('succeeded', { finishedAt: iso(RUNNING_NOW + 1000) }));
+    await clock.advance(3000);
+    await clock.advance(3000);
+    expect(said.prompts).toHaveLength(1);
+  });
+
+  test('when registering turn hooks throws, a main-loop tool call does not hold notices', async () => {
+    const files = ada('running');
+    const prompts: string[] = [];
+    const store = new Map<string, { value: unknown; version: number }>();
+    const ticks: (() => void)[] = [];
+    const hook$ = {
+      env: { get: async () => undefined },
+      clock: {
+        now: async () => RUNNING_NOW,
+        every: (_ms: number, fn: () => void) => { ticks.push(fn); return { cancel: () => {} }; },
+      },
+      fs: {
+        read: async (p: string) => {
+          if (!Object.hasOwn(files, p)) throw new Error(`ENOENT: ${p}`);
+          return files[p]!;
+        },
+        exists: async (p: string) => p === '/work/.agent-smith/jobs' || Object.hasOwn(files, p),
+        list: async () => [{ name: 'job-ada', kind: 'dir', size: 0 }],
+        write: async (p: string, text: string) => { files[p] = text; },
+      },
+      state: {
+        get: async (ref: { plugin: string; key: string }) => store.get(`${ref.plugin}:${ref.key}`) ?? { value: undefined, version: 0 },
+        set: async (ref: { plugin: string; key: string }, value: unknown) => {
+          const k = `${ref.plugin}:${ref.key}`;
+          const version = (store.get(k)?.version ?? 0) + 1;
+          store.set(k, { value, version });
+          return { isSet: true, version };
+        },
+      },
+      command: { register: async () => {} },
+      prompt: { submit: async (input: { text: string }) => { prompts.push(input.text); return { text: input.text }; } },
+      plugin: { root: '/plugin' },
+      ui: { toast: async () => {} },
+    };
+    const handlers: { event: string; matcher?: unknown; fn: (...args: any[]) => any }[] = [];
+    const throwingOn = (event: string, matcherOrFn: any, maybeFn?: any) => {
+      if (event === 'turn.start' || event === 'turn.complete') {
+        throw new Error(`unsupported event: ${event}`);
+      }
+      const fn = typeof matcherOrFn === 'function' ? matcherOrFn : maybeFn;
+      const matcher = typeof matcherOrFn === 'function' ? undefined : matcherOrFn;
+      handlers.push({ event, matcher, fn });
+    };
+    registerMod(throwingOn as never);
+    const sessionStart = handlers.find((h) => h.event === 'session.start')!.fn;
+    await sessionStart(hook$, { surface: 'terminal', isInteractive: true, cwd: '/work' }, async (e: any) => ({ cwd: e.cwd }));
+    const launchHook = handlers.find((h) => h.event === 'tool.call' && (h.matcher as any)?.tool?.test('mcp__plugin_agent-smith_agent-smith__spawn_job'))!.fn;
+    const launchNext = Object.assign(
+      async (e: any) => launchAck(e),
+      { origin: { plugin: 'engine', tier: 'core' } },
+    );
+    await launchHook(hook$, { tool: 'mcp__plugin_agent-smith_agent-smith__spawn_job', jobId: 'job-ada', repo: '/work' }, launchNext);
+    Object.assign(files, ada('succeeded', { finishedAt: iso(RUNNING_NOW + 1000) }));
+    for (const tick of ticks) tick();
+    await new Promise((r) => setTimeout(r, 20));
+    for (const tick of ticks) tick();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(prompts).toHaveLength(1);
   });
 
   test('turn.start firing while announce awaits file reads holds the notice without submitting or committing', async ($, on) => {
@@ -1170,6 +1277,7 @@ describe('completion notices', () => {
 
     await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
     await launched($, 'job-ada');
+    await ($ as any).turn.complete({ turnId: 't-launch', reason: 'answer', answer: 'ok', durationMs: 10, isAborted: false });
     await clock.advance(1000);
     expect(prompts).toHaveLength(1);
 
@@ -1201,6 +1309,7 @@ describe('completion notices', () => {
 
     await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
     await $.tool.call({ tool: 'mcp__plugin_agent-smith_agent-smith__spawn_job', jobId: 'job-ada', workerId: 'w-ada', repo: '/work' });
+    await ($ as any).turn.complete({ turnId: 't-launch', reason: 'answer', answer: 'ok', durationMs: 10, isAborted: false });
     await clock.advance(1000);
     expect(prompts).toHaveLength(1);
 

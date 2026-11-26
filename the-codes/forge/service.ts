@@ -382,7 +382,7 @@ export class ForgeService {
     const readOnlyEnforced = sandboxInfo?.readOnlyEnforced ?? false;
     if (provider.name === 'agy' && preset?.runsCommands === true && !unrestricted) {
       warnings.push(
-        'agy cannot prompt for permission headless; commands will be denied and the job will return an empty result. Retry with unrestricted:true if this job needs shell access.',
+        'agy cannot prompt for permission headless; commands will be denied and the job will return an empty result.',
       );
     }
     const brief = buildBrief({

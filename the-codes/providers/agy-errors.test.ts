@@ -396,6 +396,19 @@ describe('agy stale and recovered error handling', () => {
     assert.equal(notices[0]!.level, 'error');
     assert.equal(notices[0]!.message, 'agy error');
 
+    const withText = createAgyTranslator(2000);
+    const longDetail = 'rate limit exceeded '.repeat(20);
+    const textNotices = withText
+      .onEvent({
+        event: 'step_update',
+        step_update: { step_index: 1, step_type: 'error_message', state: 'DONE', text_delta: longDetail },
+      })
+      .filter((e): e is Extract<typeof e, { kind: 'notice' }> => e.kind === 'notice');
+    assert.equal(textNotices.length, 1);
+    assert.ok(textNotices[0]!.message.startsWith('agy error: rate limit exceeded'));
+    assert.ok(textNotices[0]!.message.length <= 201);
+    assert.ok(textNotices[0]!.message.endsWith('…'));
+
     const res = buildResult({
       jobId: 'failed-job',
       resultEvent,
