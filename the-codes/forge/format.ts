@@ -368,7 +368,7 @@ export function failureFields(
   let reason: string;
   if (result.status === 'timeout') reason = REASONS.timedOut;
   else if (result.status === 'cancelled') reason = 'canceled';
-  else if (result.status === 'denied' || (denials.length > 0 && verdict.reason !== null && DENIED_RE.test(verdict.reason))) {
+  else if (denials.length > 0 && (result.status === 'denied' || (verdict.reason !== null && DENIED_RE.test(verdict.reason)))) {
     reason = deniedReason(denialNames(denials));
   } else if (verdict.reason === REASONS.noOutput) reason = REASONS.noOutput;
   else if (verdict.reason === CWD_GONE_REASON && adapterError === '') reason = 'working directory gone';
@@ -393,7 +393,7 @@ export function deriveStatus(d: StatusDerivation): StatusVerdict {
     if (d.jobStatus === 'timeout') return { status: 'failed', suspicious: false, reason: REASONS.timedOut };
     if (d.jobStatus === 'cancelled') return { status: 'failed', suspicious: false, reason: 'canceled' };
     if (d.jobStatus === 'denied') {
-      return { status: 'failed', suspicious: true, reason: deniedReason(denialNames(denials)) };
+      return { status: 'failed', suspicious: true, reason: denials.length > 0 ? deniedReason(denialNames(denials)) : REASONS.workerError };
     }
     return { status: 'failed', suspicious: false, reason: REASONS.workerError };
   }

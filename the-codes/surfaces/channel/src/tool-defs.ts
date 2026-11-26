@@ -167,6 +167,8 @@ const MESSAGE_OUTPUT = open({
   delivery: { type: 'string', enum: ['next-step', 'turn-end', 'now'], description: 'next-step: read inside the running turn; turn-end: starts the next turn when this one ends; now: a new turn started.' },
   status: { type: 'string', enum: ['running'] },
   provider: typed(['string', 'null']),
+  model: typed('string'),
+  effort: typed('string'),
   repo: typed('string'),
   timeoutMs: typed('integer'),
   pendingMessages: typed('integer', 'Messages accepted but not yet read, this one included.'),

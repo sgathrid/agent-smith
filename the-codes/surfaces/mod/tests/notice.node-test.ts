@@ -320,17 +320,31 @@ test('the hold follows the checks budget; past it the notice says exited, checks
   assert.deepEqual(final.owned, []);
 });
 
-test('a claimed run is announced with its stage jobs when it ends, not before', () => {
+test('a claimed run is announced without its stage jobs when it ends, not before', () => {
   const owned = claim([], launch('run-1', 'run'), NOW);
   const record = (status: RunRecord['status'], finishedAt: number | null): RunRecord => ({
     runId: 'run-1', pipeline: 'ship', status, startedAt: NOW - 120_000, finishedAt,
     stageResults: { test: { stage: 'test', status: 'passed', acceptance: 'passed', jobId: 'stage-1' } },
   });
-  const stage = row({ id: 'stage-1', status: 'succeeded', endedAt: NOW, name: 'T', provider: 'codex' });
+  const stage = row({ id: 'stage-1', status: 'succeeded', endedAt: NOW, name: 'T', provider: 'codex', pipeline: 'run-1' });
   assert.deepEqual(due(owned, [stage], new Map([['run-1', record('running', null)]]), NOW).notices, [], 'a finished stage waits for its run');
   const r = due(owned, [stage], new Map([['run-1', record('passed', NOW)]]), NOW);
-  assert.deepEqual(r.notices.map((n) => n.id), ['run-1', 'stage-1']);
-  assert.match(claudeText(r.notices), /✓ ship · 1\/1 stages passed · 2m/);
+  assert.deepEqual(r.notices.map((n) => n.id), ['run-1']);
+  const text = claudeText(r.notices);
+  assert.match(text, /✓ ship · 1\/1 stages passed · 2m/);
+  assert.doesNotMatch(text, /stage-1/);
+  assert.doesNotMatch(text, /^status /m);
+});
+
+test('a stage job owned separately is not announced on its own when the session owns its pipeline run', () => {
+  const owned = claim(claim([], launch('run-1', 'run'), NOW), launch('stage-1', 'job'), NOW);
+  const run: RunRecord = {
+    runId: 'run-1', pipeline: 'ship', status: 'passed', startedAt: NOW - 120_000, finishedAt: NOW,
+    stageResults: { test: { stage: 'test', status: 'passed', acceptance: 'passed', jobId: 'stage-1' } },
+  };
+  const stage = row({ id: 'stage-1', status: 'succeeded', endedAt: NOW, name: 'T', provider: 'codex', pipeline: 'run-1' });
+  const r = due(owned, [stage], new Map([['run-1', run]]), NOW);
+  assert.deepEqual(r.notices.map((n) => n.id), ['run-1']);
 });
 
 test('a claim that never shows up expires silently', () => {

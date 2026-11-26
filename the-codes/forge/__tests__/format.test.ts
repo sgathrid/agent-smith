@@ -346,9 +346,16 @@ test('deriveStatus and failureFields: timeout/cancel outrank earlier denial; den
   assert.equal(canceledVerdict.status, 'failed');
   assert.equal(canceledVerdict.reason, 'canceled');
   assert.equal(failureFields(canceledVerdict, { status: 'cancelled', error: 'cancelled', deniedActions: denials }).reason, 'canceled');
+  assert.equal(failureFields({ status: 'failed', suspicious: true, reason: 'denied run_command' }, { status: 'cancelled', error: 'cancelled', deniedActions: denials }).reason, 'canceled');
 
   const deniedVerdict = deriveStatus({ ok: false, jobStatus: 'denied', deniedActions: denials, report: '' });
   assert.equal(deniedVerdict.status, 'failed');
   assert.equal(deniedVerdict.reason, 'denied run_command');
   assert.equal(failureFields(deniedVerdict, { status: 'denied', error: 'denied run_command', deniedActions: denials }).reason, 'denied run_command');
+  assert.equal(failureFields({ status: 'failed', suspicious: false, reason: 'worker error' }, { status: 'denied', error: 'worker error', deniedActions: denials }).reason, 'denied run_command');
+
+  const bareDeniedVerdict = deriveStatus({ ok: false, jobStatus: 'denied', deniedActions: [], report: '' });
+  assert.equal(bareDeniedVerdict.status, 'failed');
+  assert.equal(failureFields(bareDeniedVerdict, { status: 'denied', error: 'denied bash' }).reason, 'denied bash');
+  assert.equal(failureFields(bareDeniedVerdict, { status: 'denied', error: 'no output' }).reason, 'no output');
 });

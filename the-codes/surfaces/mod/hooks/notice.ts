@@ -27,6 +27,7 @@ export interface NoticeRow {
   readonly continuationKind?: NoticeContinuationKind | null;
   readonly pendingMessages?: number | null;
   readonly warnings?: readonly { readonly code: string; readonly message?: string }[] | null;
+  readonly pipeline?: string | null;
   readonly staleReads?: readonly string[] | null;
   readonly acceptance?: { readonly pending?: boolean; readonly budgetMs?: number; readonly running?: string; readonly checks: readonly { readonly ok: boolean; readonly name?: string }[] };
   readonly liveness?: { readonly state: string; readonly silentForMs: number; readonly since: number | null; readonly tool?: string } | null;
@@ -587,6 +588,12 @@ export function due(
       keep.push(entry);
     }
   };
+  const ownedRuns = new Set(owned.filter((o) => o.kind === 'run').map((o) => o.id));
+  const ownedStageIds = new Set<string>();
+  for (const runId of ownedRuns) {
+    const run = runs.get(runId);
+    if (run) for (const sid of stageJobIds(run)) ownedStageIds.add(sid);
+  }
   const refreshed = (until: number) => Math.max(until, now + MAX_JOB_MS + 60 * 60_000);
   for (const o of owned) {
     if (o.kind === 'run') {
@@ -594,11 +601,6 @@ export function due(
       const notice = run ? noticeFromRun(run) : null;
       if (run && notice) {
         pushNotice(notice);
-        for (const sid of stageJobIds(run)) {
-          const stage = byId.get(sid);
-          const kind = stage ? kindOf(stage.status) : null;
-          if (stage && kind && kind !== 'attention') pushNotice(noticeFromRadar(stage, kind, now));
-        }
         continue;
       }
       const said = new Set(o.saidStageAttention ?? []);
@@ -613,6 +615,7 @@ export function due(
       continue;
     }
     const own = byId.get(o.id);
+    if (ownedStageIds.has(o.id) || (own?.pipeline != null && ownedRuns.has(own.pipeline))) continue;
     const workerId = o.workerId ?? own?.workerId;
     const fromTurn = o.fromTurn ?? own?.turn ?? (own ? 1 : undefined);
     let current: Owned = { ...o, ...(workerId ? { workerId } : {}), ...(fromTurn !== undefined ? { fromTurn } : {}) };

@@ -5,6 +5,7 @@ import type { CallToolResult } from '@modelcontextprotocol/server';
 import type { Server } from '@modelcontextprotocol/server';
 import type { ForgeStatus } from '../../../forge/format.ts';
 import type { FollowUpRequest, ForgeService, JobDetail, MessageAck, SpawnAck, SteerRequest } from '../../../forge/service.ts';
+import { failedReason } from '../../../forge/summary.ts';
 import { launchPipeline } from '../../../forge/supervisor.ts';
 import { FILES, jobDir, jobFile } from '../../../forge/format.ts';
 import { waitForChange } from '../../../forge/watch.ts';
@@ -93,7 +94,9 @@ export function failure(message: string, detail?: unknown): ToolOutcome { return
 
 export function fullStatus(detail: JobDetail, acceptance: ReturnType<typeof readAcceptance>, now = Date.now()) {
   const live = jobLiveness(detail, now);
-  return { ...detail, resumable: Boolean(detail.conversation), ...(live === null ? {} : { liveness: livenessView(live) }), taskStatus: taskStatus(detail.status), report: detail.report?.slice(0, REPORT_HEAD_CHARS) ?? null, reportTruncated: (detail.report?.length ?? 0) > REPORT_HEAD_CHARS, acceptance };
+  const { reason: _r, ...rest } = detail;
+  const reason = failedReason(detail);
+  return { ...rest, ...(reason !== null ? { reason } : {}), resumable: Boolean(detail.conversation), ...(live === null ? {} : { liveness: livenessView(live) }), taskStatus: taskStatus(detail.status), report: detail.report?.slice(0, REPORT_HEAD_CHARS) ?? null, reportTruncated: (detail.report?.length ?? 0) > REPORT_HEAD_CHARS, acceptance };
 }
 
 type Args = Record<string, unknown>;
@@ -399,7 +402,7 @@ const jobStatus: Handler = async (ctx, args) => {
 const pipelineStatus: Handler = async (ctx, args) => {
   const runId = text(args, 'runId', true)!; const r = readPipeline(ctx.service.repo, runId);
   if (!r) throw missingPipelineError(runId);
-  return json(format(args) === 'concise' ? concisePipeline(r) : r);
+  return structured(format(args) === 'concise' ? concisePipeline(r) : r, { compact: true });
 };
 
 function quietNotice(repo: string, kind: 'job' | 'run', id: string): boolean {
@@ -445,7 +448,7 @@ const cancelJob: Handler = async (ctx, args) => {
       const settled = status === 'passed' || status === 'partial' || status === 'failed';
       return { runId: id, status, settled };
     });
-    return json(out);
+    return structured(out, { compact: true });
   }
   const checksRunning = (jobId: string) => {
     const a = readAcceptance(ctx.service.repo, jobId) as { pending?: boolean; running?: string };
@@ -485,7 +488,7 @@ const cancelJob: Handler = async (ctx, args) => {
       ? { ...body, checksCanceled: false, checksNote: 'The process running the acceptance checks will stop them; status shows acceptance.' }
       : { ...body, checksCanceled: true };
   });
-  return json(out);
+  return structured(out, { compact: true });
 };
 
 async function validatePipelineStages(ctx: HandlerContext, stages: readonly Stage[]): Promise<string[]> {
@@ -535,7 +538,7 @@ const runPipeline: Handler = async (ctx, args) => {
     ? await launchPipeline(ctx.service, spec, { unrestricted })
     : startPipeline(ctx.service, spec, { unrestricted });
   void run.done.catch(err => process.stderr.write(`agent-smith pipeline ${run.runId}: ${String(err)}\n`));
-  return json({ runId: run.runId, repo: ctx.service.repo, stages: spec.stages.map(s => ({ name: s.name, provider: s.provider, ...(s.dependsOn?.length ? { dependsOn: s.dependsOn } : {}) })), ...(warnings.length ? { warnings } : {}) });
+  return structured({ runId: run.runId, repo: ctx.service.repo, stages: spec.stages.map(s => ({ name: s.name, provider: s.provider, ...(s.dependsOn?.length ? { dependsOn: s.dependsOn } : {}) })), ...(warnings.length ? { warnings } : {}) }, { compact: true });
 };
 
 const HANDLERS: Readonly<Record<string, Handler>> = {

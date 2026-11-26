@@ -91,13 +91,19 @@ test('conciseRow: settled row shape and <= 450 byte budget with a full-length su
   assert.equal('changedFileCount' in turn1ZeroFiles, false);
   assert.ok((turn1ZeroFiles.summary as string).length <= 160);
 
-  const failedRow = conciseRow(makeSummary(3, {
+  const failedRow = conciseRow({ ...makeSummary(3, {
     status: 'failed',
-    reason: 'timed out',
+    reason: undefined,
     resumable: true,
-  }), NOW) as Record<string, unknown>;
+  }), error: 'timed out after 2m' } as never, NOW) as Record<string, unknown>;
   assert.equal(failedRow.reason, 'timed out');
   assert.equal(failedRow.resumable, true);
+
+  const canceledRow = conciseRow({ ...makeSummary(4, {
+    status: 'canceled',
+    reason: 'timed out',
+  }), error: 'timed out after 2m' } as never, NOW) as Record<string, unknown>;
+  assert.equal('reason' in canceledRow, false);
 });
 
 test('conciseRow: running row shape and <= 480 byte budget', () => {

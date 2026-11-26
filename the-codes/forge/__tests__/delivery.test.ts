@@ -897,3 +897,40 @@ test('fuzz: messages at random points across turn end, checks and owner exit are
   }
   process.stderr.write(`fuzz: ${seeds} seeds in ${Date.now() - started} ms\n`);
 });
+
+test('a follow_up turn that failsEarly does not stick its effort to the next turn, and acks report model/effort only when present', async () => {
+  const repo = newRepo();
+  const ctrl = controlledProvider();
+  const s = serviceOn(repo, ctrl.provider);
+  const { t1 } = await startWorker(s, ctrl, { model: 'm-1' });
+  await settle(repo, t1);
+
+  const t2Ready = ctrl.nextTurn();
+  const fu2 = await s.followUp({ worker: 'w', prompt: 'TRY-HIGH', effort: 'high' });
+  const t2 = await t2Ready;
+  assert.equal(fu2.model, 'm-1');
+  assert.equal(fu2.effort, 'high');
+  assert.equal(t2.spec.effort, 'high');
+  await settle(repo, t2, { status: 'error', exitCode: 1, durationMs: 50, error: 'Variant unavailable for m-1: high', response: '' });
+  assert.equal(readManifest(repo, t2.spec.jobId!).failedEarly, true);
+
+  const t3Ready = ctrl.nextTurn();
+  const fu3 = await s.followUp({ worker: 'w', prompt: 'RETRY-PLAIN' });
+  const t3 = await t3Ready;
+  assert.equal(t3.spec.model, 'm-1');
+  assert.equal(t3.spec.effort, undefined);
+  assert.equal(fu3.model, 'm-1');
+  assert.equal('effort' in fu3, false);
+  await settle(repo, t3);
+});
+
+test('follow_up ack omits model and effort when the worker has neither', async () => {
+  const repo = newRepo();
+  const ctrl = controlledProvider();
+  const s = withDefaultProvider(new ForgeService({ repo, flushMs: 5, providerSource: () => ctrl.provider, catalogSource: async () => [], harnessDefaults: () => ({}) }));
+  const { t1 } = await startWorker(s, ctrl);
+  const fu = await s.followUp({ worker: 'w', prompt: 'PLAIN' });
+  assert.equal('model' in fu, false);
+  assert.equal('effort' in fu, false);
+  t1.finish({ status: 'success', response: 'ok' });
+});

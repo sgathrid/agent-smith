@@ -139,7 +139,7 @@ function mergeOverrides(entries: readonly SteerEntry[]): MessageOverrides {
 }
 
 function continuationModelAndEffort(
-  head: Pick<ForgeManifest, 'model' | 'modelResolved' | 'effort'>,
+  head: Partial<Pick<ForgeManifest, 'model' | 'modelResolved' | 'effort'>>,
   entries: readonly SteerEntry[],
   spec?: Pick<TurnSpec, 'model' | 'effort'>,
 ): { model: string | undefined; effort: string | undefined } {
@@ -885,6 +885,25 @@ export class ForgeService {
     }
   }
 
+  private continuationSettings(
+    head: ForgeManifest,
+    entries: readonly SteerEntry[],
+    spec?: Pick<TurnSpec, 'model' | 'effort'>,
+  ): { model: string | undefined; effort: string | undefined } {
+    let base: ForgeManifest | null = head;
+    const seen = new Set<string>();
+    while (base !== null && base.failedEarly === true) {
+      if (seen.has(base.jobId) || !base.continuedFrom) {
+        base = null;
+        break;
+      }
+      seen.add(base.jobId);
+      base = this.readManifestSync(base.continuedFrom);
+    }
+    const baseSpec = base !== null && base.jobId === head.jobId ? spec : undefined;
+    return continuationModelAndEffort(base ?? {}, entries, baseSpec);
+  }
+
   private continuationRequest(input: {
     readonly head: ForgeManifest;
     readonly spec?: TurnSpec | undefined;
@@ -918,7 +937,7 @@ export class ForgeService {
     const context = [...entries].reverse().find((e) => e.context !== undefined)?.context ?? spec?.context;
     const checks = o.checks ?? spec?.checks ?? input.headChecks;
     const env = input.env !== undefined && Object.keys(input.env).length > 0 ? input.env : undefined;
-    const { model, effort } = continuationModelAndEffort(head, entries, spec);
+    const { model, effort } = this.continuationSettings(head, entries, spec);
     return {
       mode: spec?.mode ?? head.mode ?? 'task',
       prompt: rawPrompt,
@@ -1325,7 +1344,7 @@ export class ForgeService {
       }
     }
     const provider = this.providerSafe(head.provider);
-    const { model: effectiveModel, effort: effectiveEffort } = continuationModelAndEffort(head, [...undeliveredEntries(this.repo, headId), entry]);
+    const { model: effectiveModel, effort: effectiveEffort } = this.continuationSettings(head, [...undeliveredEntries(this.repo, headId), entry]);
     if (provider !== null) {
       const checked = await validateModelAndEffort(
         provider,
@@ -1382,6 +1401,8 @@ export class ForgeService {
       jobId: headId, name, workerId, turn,
       action: sender === 'steer' && (running || checksRunning) ? 'interrupting' : 'queued',
       delivery, status: 'running', provider: head.provider, repo: this.repo,
+      ...(effectiveModel === undefined ? {} : { model: effectiveModel }),
+      ...(effectiveEffort === undefined || provider?.supportsEffort === false ? {} : { effort: effectiveEffort }),
       timeoutMs: entry.overrides?.timeoutMs ?? head.timeoutMs ?? DEFAULT_TIMEOUT_MS,
       pendingMessages: pending,
       ...envAck,
@@ -1401,7 +1422,7 @@ export class ForgeService {
     const { ack: envAck, runEnv } = this.resolveFollowUpEnv(workerId, head.jobId, env, false, warnings);
     const provider = this.providerSafe(head.provider);
     const pendingEntries = undeliveredEntries(this.repo, head.jobId);
-    const { model: effectiveModel, effort: effectiveEffort } = continuationModelAndEffort(head, [...pendingEntries, entry]);
+    const { model: effectiveModel, effort: effectiveEffort } = this.continuationSettings(head, [...pendingEntries, entry]);
     if (checkCatalog && (effectiveModel !== undefined || (effectiveEffort !== undefined && provider?.supportsEffort !== false))) {
       warnings.push(...checkAgainstCatalog(head.provider, effectiveModel, effectiveEffort, catalog));
     }
@@ -1417,6 +1438,8 @@ export class ForgeService {
     return {
       jobId: ack.jobId, name: ack.name, workerId: ack.workerId, turn: ack.turn,
       action: 'started', delivery: 'now', status: 'running', provider: ack.provider, repo: this.repo,
+      ...(effectiveModel === undefined ? {} : { model: effectiveModel }),
+      ...(effectiveEffort === undefined || provider?.supportsEffort === false ? {} : { effort: effectiveEffort }),
       timeoutMs: ack.timeoutMs,
       ...envAck,
       ...(checks !== undefined && checks.length > 0 ? { checks } : {}),
@@ -1810,7 +1833,6 @@ export class ForgeService {
       conversation: typeof raw['conversation'] === 'string' ? raw['conversation'] : null,
       effort: typeof raw['effort'] === 'string' ? raw['effort'] : null,
       cwd: manifest?.cwd ?? null,
-      ...(manifest?.reason ? { reason: manifest.reason } : {}),
       ...(manifest === null
         ? {}
         : {
