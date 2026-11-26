@@ -139,15 +139,23 @@ function mergeOverrides(entries: readonly SteerEntry[]): MessageOverrides {
 }
 
 export function continuationModelAndEffort(
-  head: Partial<Pick<ForgeManifest, 'model' | 'modelResolved' | 'effort'>>,
+  head: Partial<Pick<ForgeManifest, 'model' | 'modelRequested' | 'modelResolved' | 'modelSource' | 'effort'>>,
   entries: readonly SteerEntry[],
   spec?: Pick<TurnSpec, 'model' | 'effort'>,
-): { model: string | undefined; effort: string | undefined } {
+  defaultModel?: string,
+): { modelRequested: string | undefined; modelExpected: string | undefined; effort: string | undefined } {
   const o = mergeOverrides(entries);
-  return {
-    model: o.model === 'default' ? undefined : (o.model ?? spec?.model ?? head.model ?? head.modelResolved ?? undefined),
-    effort: o.effort === 'default' ? undefined : (o.effort ?? spec?.effort ?? head.effort ?? undefined),
-  };
+  const inheritedRequested = head.modelRequested !== undefined
+    ? (head.modelRequested ?? undefined)
+    : (head.modelSource === 'reported' || head.modelSource === 'harness-config' ? undefined : (head.model ?? undefined));
+  const modelRequested = o.model === 'default' ? undefined : (o.model ?? spec?.model ?? inheritedRequested);
+  const modelExpected = modelRequested ?? defaultModel ?? (
+    o.model === 'default' || head.modelSource === 'reported'
+      ? undefined
+      : (head.model ?? head.modelResolved ?? undefined)
+  );
+  const effort = o.effort === 'default' ? undefined : (o.effort ?? spec?.effort ?? head.effort ?? undefined);
+  return { modelRequested, modelExpected, effort };
 }
 
 function applyOverrides(spec: TurnSpec, o: MessageOverrides, provider: Provider, defaultModel?: string): TurnSpec {
@@ -926,7 +934,7 @@ export class ForgeService {
     const context = [...entries].reverse().find((e) => e.context !== undefined)?.context ?? spec?.context;
     const checks = o.checks ?? spec?.checks ?? input.headChecks;
     const env = input.env !== undefined && Object.keys(input.env).length > 0 ? input.env : undefined;
-    const { model, effort } = continuationModelAndEffort(head, entries, spec);
+    const { modelRequested: model, effort } = continuationModelAndEffort(head, entries, spec);
     return {
       mode: spec?.mode ?? head.mode ?? 'task',
       prompt: rawPrompt,
@@ -1018,8 +1026,8 @@ export class ForgeService {
   }> {
     const { provider, parent, result, report, entries, unconsumed, verdictStatus } = input;
     const parentSnap = parent.writer.snapshot();
-    const { model: nextModel, effort: nextEffort } = continuationModelAndEffort(parentSnap ?? {}, unconsumed, input.spec);
     const defaultModel = this.harnessDefaults(provider.name).model;
+    const { modelRequested: nextModel, effort: nextEffort } = continuationModelAndEffort(parentSnap ?? {}, unconsumed, input.spec, defaultModel);
     const overrides = {
       ...mergeOverrides(unconsumed),
       ...(nextModel === undefined && input.spec.model !== undefined ? { model: 'default' } : {}),
@@ -1340,12 +1348,16 @@ export class ForgeService {
       }
     }
     const provider = this.providerSafe(head.provider);
-    const { model: effectiveModel, effort: effectiveEffort } = continuationModelAndEffort(head, [...undeliveredEntries(this.repo, headId), entry]);
-    const ackModel = effectiveModel ?? this.harnessDefaults(head.provider).model ?? undefined;
+    const { modelExpected: ackModel, effort: effectiveEffort } = continuationModelAndEffort(
+      head,
+      [...undeliveredEntries(this.repo, headId), entry],
+      undefined,
+      this.harnessDefaults(head.provider).model,
+    );
     if (provider !== null) {
       const checked = await validateModelAndEffort(
         provider,
-        effectiveModel,
+        ackModel,
         effectiveEffort,
         checkCatalog ? async () => catalog : undefined,
         entry.overrides?.unrestricted,
@@ -1419,7 +1431,12 @@ export class ForgeService {
     const { ack: envAck, runEnv } = this.resolveFollowUpEnv(workerId, head.jobId, env, false, warnings);
     const provider = this.providerSafe(head.provider);
     const pendingEntries = undeliveredEntries(this.repo, head.jobId);
-    const { model: effectiveModel, effort: effectiveEffort } = continuationModelAndEffort(head, [...pendingEntries, entry]);
+    const { modelExpected: effectiveModel, effort: effectiveEffort } = continuationModelAndEffort(
+      head,
+      [...pendingEntries, entry],
+      undefined,
+      this.harnessDefaults(head.provider).model,
+    );
     if (checkCatalog && (effectiveModel !== undefined || (effectiveEffort !== undefined && provider?.supportsEffort !== false))) {
       warnings.push(...checkAgainstCatalog(head.provider, effectiveModel, effectiveEffort, catalog));
     }

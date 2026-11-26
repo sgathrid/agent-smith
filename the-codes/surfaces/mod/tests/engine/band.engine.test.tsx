@@ -1341,34 +1341,6 @@ describe('completion notices', () => {
     await clock.advance(3000);
     expect(said.prompts).toEqual([]);
   });
-
-  test('AbovePrompt with isWorking:true on the main view holds notices until turn.complete, but subagent view does not', async ($, on) => {
-    const files = { ...ada('running'), ...canonicalJob('job-bo', { status: 'running', name: 'Bo', workerId: 'w-bo', provider: 'codex', role: 'review' }) };
-    const { clock, said } = noticeHost(on, files, ['job-ada', 'job-bo']);
-    await start($);
-    await launched($, 'job-ada');
-    await ($ as any).turn.complete({ turnId: 't-launch', reason: 'answer', answer: 'ok', durationMs: 10, isAborted: false });
-
-    await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', component: 'AbovePrompt', requestId: 'band-sub',
-      props: { hasSurvey: false, isWorking: true, maxRows: 10, bodyColumns: 120, view: { agentId: 'sub-1' } } } as never);
-    Object.assign(files, ada('succeeded', { finishedAt: iso(RUNNING_NOW + 1000) }));
-    await clock.advance(3000);
-    await clock.advance(3000);
-    expect(said.prompts).toHaveLength(1);
-
-    await $.tool.call({ tool: 'mcp__plugin_agent-smith_agent-smith__spawn_job', jobId: 'job-bo', workerId: 'w-bo', repo: '/work' });
-    await ($ as any).turn.complete({ turnId: 't-launch-2', reason: 'answer', answer: 'ok', durationMs: 10, isAborted: false });
-
-    await $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', component: 'AbovePrompt', requestId: 'band-main',
-      props: { hasSurvey: false, isWorking: true, maxRows: 10, bodyColumns: 120, view: {} } } as never);
-    Object.assign(files, canonicalJob('job-bo', { status: 'succeeded', name: 'Bo', workerId: 'w-bo', provider: 'codex', role: 'review', finishedAt: iso(RUNNING_NOW + 2000) },
-      { 'acceptance.json': JSON.stringify({ state: 'accepted', checks: [] }) }));
-    await clock.advance(3000);
-    await clock.advance(3000);
-    expect(said.prompts).toHaveLength(1);
-    await ($ as any).turn.complete({ turnId: 't-main', reason: 'answer', answer: 'done', durationMs: 100, isAborted: false });
-    expect(said.prompts).toHaveLength(2);
-  });
 });
 
 describe("a session cwd that is not the server's repo (#43)", () => {

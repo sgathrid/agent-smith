@@ -973,37 +973,52 @@ test('follow_up inherits effort from an early-failed turn and clears it with eff
   }
 });
 
-test('follow_up with model: "default" clears inherited model on cold-start and queued paths, and ack reports harness default', async () => {
-  for (const mode of ['cold-start', 'queued'] as const) {
-    const repo = newRepo();
-    const ctrl = controlledProvider();
-    const s = withDefaultProvider(new ForgeService({
-      repo,
-      flushMs: 5,
-      providerSource: () => ctrl.provider,
-      catalogSource: async () => [],
-      harnessDefaults: () => ({ model: 'harness-default-m' }),
-    }));
-    const { t1 } = await startWorker(s, ctrl, { model: 'm-1' });
-    if (mode === 'cold-start') {
+test('follow_up with model: "default" clears inherited model for subsequent turns on cold-start and queued paths even when provider reports a model', async () => {
+  for (const [hasDefault, defaultModel] of [[false, undefined], [true, 'harness-default-m']] as const) {
+    for (const mode of ['cold-start', 'queued'] as const) {
+      const repo = newRepo();
+      const ctrl = controlledProvider();
+      const s = withDefaultProvider(new ForgeService({
+        repo,
+        flushMs: 5,
+        providerSource: () => ctrl.provider,
+        catalogSource: async () => [],
+        harnessDefaults: () => (defaultModel ? { model: defaultModel } : {}),
+      }));
+      const { t1 } = await startWorker(s, ctrl, { model: 'm-1' });
       await settle(repo, t1);
+
       const t2Ready = ctrl.nextTurn();
       const fu2 = await s.followUp({ worker: 'w', prompt: 'RESET-MODEL', model: 'default' });
       const t2 = await t2Ready;
       assert.equal(t2.spec.model, undefined);
-      assert.equal(readManifest(repo, t2.spec.jobId!).modelResolved, 'harness-default-m');
-      assert.equal(fu2.model, 'harness-default-m');
-      await settle(repo, t2);
-    } else {
-      const t2Ready = ctrl.nextTurn();
-      const fu2 = await s.followUp({ worker: 'w', prompt: 'QUEUED-RESET', model: 'default' });
-      assert.equal(fu2.delivery, 'turn-end');
-      assert.equal(fu2.model, 'harness-default-m');
-      t1.finish({ status: 'success', response: 'ok' });
-      const t2 = await t2Ready;
-      assert.equal(t2.spec.model, undefined);
-      assert.equal(readManifest(repo, t2.spec.jobId!).modelResolved, 'harness-default-m');
-      await settle(repo, t2);
+      assert.equal(readManifest(repo, t2.spec.jobId!).modelResolved, defaultModel ?? null);
+      if (hasDefault) assert.equal(fu2.model, defaultModel);
+      else assert.equal('model' in fu2, false);
+
+      t2.emit({ kind: 'started', at: new Date().toISOString(), conversationId: 'conv-1', model: 'provider-reported-m' });
+      await new Promise((r) => setTimeout(r, 20));
+
+      if (mode === 'cold-start') {
+        await settle(repo, t2);
+        const t3Ready = ctrl.nextTurn();
+        const fu3 = await s.followUp({ worker: 'w', prompt: 'PLAIN-AFTER-CLEAR' });
+        const t3 = await t3Ready;
+        assert.equal(t3.spec.model, undefined);
+        if (hasDefault) assert.equal(fu3.model, defaultModel);
+        else assert.equal('model' in fu3, false);
+        await settle(repo, t3);
+      } else {
+        const t3Ready = ctrl.nextTurn();
+        const fu3 = await s.followUp({ worker: 'w', prompt: 'QUEUED-AFTER-CLEAR' });
+        assert.equal(fu3.delivery, 'turn-end');
+        if (hasDefault) assert.equal(fu3.model, defaultModel);
+        else assert.equal('model' in fu3, false);
+        t2.finish({ status: 'success', response: 'ok' });
+        const t3 = await t3Ready;
+        assert.equal(t3.spec.model, undefined);
+        await settle(repo, t3);
+      }
     }
   }
 });

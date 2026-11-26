@@ -26157,7 +26157,7 @@ const followUp = async (ctx, args) => {
         const provider = head.provider ?? '';
         if (request.model !== undefined || request.effort !== undefined) {
             const inherited = continuationModelAndEffort(head, []);
-            const modelArg = request.model === 'default' ? undefined : (request.model ?? inherited.model);
+            const modelArg = request.model === 'default' ? undefined : (request.model ?? inherited.modelExpected);
             const effortArg = request.effort === 'default' ? undefined : request.effort;
             if (modelArg !== undefined || effortArg !== undefined) {
                 const cfg = loadModelConfig({ repo: ctx.service.repo });
