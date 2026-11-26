@@ -159,6 +159,7 @@ export class AgentSmithReader implements JobStateReader {
       [SMITH_PAYLOAD.exitCode]: manifest?.exitCode ?? null,
       [SMITH_PAYLOAD.jobStatus]: manifest?.jobStatus ?? null,
       [SMITH_PAYLOAD.error]: orphan?.reason ?? manifest?.error ?? null,
+      reason: orphan?.reason ?? manifest?.reason ?? null,
       [SMITH_PAYLOAD.deniedActions]: normalizeDenials(manifest?.deniedActions),
       [SMITH_PAYLOAD.usage]: manifest?.usage ?? null,
       ...(Array.isArray(manifest?.changedFiles) && manifest.changedFilesTruncated !== true

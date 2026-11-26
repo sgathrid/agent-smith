@@ -213,6 +213,18 @@ test('pipelineOutcome names the first stage that did not pass, in the short word
     build: { stage: 'build', status: 'failed', failure: { code: 'exit-1', message: 'worker soft-denied 1 tool action(s) (view_file)' } },
   })), '0/1 stages passed · build: denied view_file');
   assert.equal(pipelineOutcome(record({ a: { stage: 'a', status: 'passed' } })), '1/1 stages passed');
+  assert.equal(pipelineOutcome(record({
+    a: { stage: 'a', status: 'failed', failure: { code: 'exit-1', message: 'exited 1' } },
+    b: { stage: 'b', status: 'failed', acceptance: 'failed', verification: { failing: [{ check: { name: 'tests' } }] } },
+    c: { stage: 'c', status: 'skipped' },
+  })), '0/3 stages passed · a: exit 1, b: checks failed: tests');
+  assert.equal(pipelineOutcome(record({
+    s1: { stage: 's1', status: 'failed', failure: { message: 'exited 1' } },
+    s2: { stage: 's2', status: 'failed', failure: { message: 'timed out after 2m' } },
+    s3: { stage: 's3', status: 'failed', failure: { message: 'exited 2' } },
+    s4: { stage: 's4', status: 'failed', failure: { message: 'exited 3' } },
+    s5: { stage: 's5', status: 'failed', failure: { message: 'exited 4' } },
+  })), '0/5 stages passed · s1: exit 1, s2: timed out, s3: exit 2, +2 more');
 });
 
 test('launch tools match under the plugin and the dev.sh server names, nothing else', () => {
@@ -320,17 +332,31 @@ test('the hold follows the checks budget; past it the notice says exited, checks
   assert.deepEqual(final.owned, []);
 });
 
-test('a claimed run is announced with its stage jobs when it ends, not before', () => {
+test('a claimed run is announced without its stage jobs when it ends, not before', () => {
   const owned = claim([], launch('run-1', 'run'), NOW);
   const record = (status: RunRecord['status'], finishedAt: number | null): RunRecord => ({
     runId: 'run-1', pipeline: 'ship', status, startedAt: NOW - 120_000, finishedAt,
     stageResults: { test: { stage: 'test', status: 'passed', acceptance: 'passed', jobId: 'stage-1' } },
   });
-  const stage = row({ id: 'stage-1', status: 'succeeded', endedAt: NOW, name: 'T', provider: 'codex' });
+  const stage = row({ id: 'stage-1', status: 'succeeded', endedAt: NOW, name: 'T', provider: 'codex', pipeline: 'run-1' });
   assert.deepEqual(due(owned, [stage], new Map([['run-1', record('running', null)]]), NOW).notices, [], 'a finished stage waits for its run');
   const r = due(owned, [stage], new Map([['run-1', record('passed', NOW)]]), NOW);
-  assert.deepEqual(r.notices.map((n) => n.id), ['run-1', 'stage-1']);
-  assert.match(claudeText(r.notices), /✓ ship · 1\/1 stages passed · 2m/);
+  assert.deepEqual(r.notices.map((n) => n.id), ['run-1']);
+  const text = claudeText(r.notices);
+  assert.match(text, /✓ ship · 1\/1 stages passed · 2m/);
+  assert.doesNotMatch(text, /stage-1/);
+  assert.doesNotMatch(text, /^status /m);
+});
+
+test('a stage job owned separately is not announced on its own when the session owns its pipeline run', () => {
+  const owned = claim(claim([], launch('run-1', 'run'), NOW), launch('stage-1', 'job'), NOW);
+  const run: RunRecord = {
+    runId: 'run-1', pipeline: 'ship', status: 'passed', startedAt: NOW - 120_000, finishedAt: NOW,
+    stageResults: { test: { stage: 'test', status: 'passed', acceptance: 'passed', jobId: 'stage-1' } },
+  };
+  const stage = row({ id: 'stage-1', status: 'succeeded', endedAt: NOW, name: 'T', provider: 'codex', pipeline: 'run-1' });
+  const r = due(owned, [stage], new Map([['run-1', run]]), NOW);
+  assert.deepEqual(r.notices.map((n) => n.id), ['run-1']);
 });
 
 test('a claim that never shows up expires silently', () => {
@@ -394,7 +420,12 @@ test('parseSettledRead and unclaim retire a notice once status reads a settled j
   assert.equal(parseSettledRead(`${PLUGIN}status`, { jobId: 'j1', status: 'running' }), null);
   assert.equal(parseSettledRead(`${PLUGIN}status`, { jobId: 'j1', status: 'succeeded', acceptance: { pending: true } }), null);
   assert.deepEqual(parseSettledRead(`${PLUGIN}status`, { jobId: 'j1', status: 'succeeded', acceptance: { state: 'accepted', pending: false } }), { kind: 'job', id: 'j1' });
+  assert.deepEqual(parseSettledRead(`${PLUGIN}status`, { jobId: 'j1', workerId: 'w1', status: 'failed', reason: 'timed out', error: 'timed out after 2m', acceptance: { state: 'unchecked' } }), { kind: 'job', id: 'j1', workerId: 'w1' });
+  assert.deepEqual(parseSettledRead(`${PLUGIN}status`, { jobId: 'j1', workerId: 'w1', status: 'failed', error: 'exit 1', acceptance: { state: 'unchecked', checks: [] } }), { kind: 'job', id: 'j1', workerId: 'w1' });
   assert.deepEqual(parseSettledRead(`${PLUGIN}pipeline_status`, { runId: 'r1', status: 'passed' }), { kind: 'run', id: 'r1' });
+  assert.deepEqual(parseSettledRead(`${PLUGIN}pipeline_status`, { runId: 'r1', status: 'failed', error: 'stage build failed' }), { kind: 'run', id: 'r1' });
+  assert.equal(parseSettledRead(`${PLUGIN}status`, { error: 'No worker "ghost"' }), null);
+  assert.equal(parseSettledRead(`${PLUGIN}status`, { isError: true, content: [{ type: 'text', text: JSON.stringify({ jobId: 'j1', status: 'failed', acceptance: { state: 'unchecked' } }) }] }), null);
 
   const owned = claim(claim([], launch('j1'), NOW), launch('j2'), NOW);
   const read = unclaim(owned, { kind: 'job', id: 'j1' });

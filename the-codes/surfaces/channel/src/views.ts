@@ -1,12 +1,12 @@
 import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import type { JobDetail, JobSummary } from '../../../forge/service.ts';
+import { failedReason } from '../../../forge/summary.ts';
 import type { ContinuationKind } from '../../../forge/format.ts';
 import type { Acceptance } from '../../../forge/checks.ts';
 import type { PipelineRecord } from '../../../forge/execute.ts';
 import { livenessOf, type Liveness } from '../../mod/hooks/stale.ts';
 import { isTerminalStatus } from '../../mod/hooks/turns.ts';
-import { reasonFromText } from '../../mod/hooks/reasons.ts';
 
 export type ResponseFormat = 'concise' | 'detailed';
 export const CONCISE_LIST_LIMIT = 20;
@@ -55,11 +55,6 @@ const warningTexts = (ws: JobSummary['warnings'], error: string | null): string[
   const e = error ? flat(error) : '';
   return [...new Set(ws.map(w => flat(w.message)).filter(m => e === '' || !(e.includes(m) || m.includes(e))).map(m => trimWords(m, 200)))];
 };
-function failedReason(d: JobDetail): string | null {
-  if (d.status !== 'failed') return null;
-  const stored = d.reason;
-  return stored ? stored : reasonFromText(d.error);
-}
 
 export function jobLiveness(j: JobSummary, now = Date.now()): Liveness | null {
   return livenessOf({ status: j.status, updatedAt: j.updatedAt, lastEventAt: j.lastEventAt, lastAliveAt: j.lastAliveAt,
@@ -100,6 +95,7 @@ export function conciseRow(j: JobSummary & { turn?: number; continuedFrom?: stri
         ? checkVerdicts(j.acceptance) : null,
       changedFileCount: typeof j.changedFileCount === 'number' && j.changedFileCount > 0 ? j.changedFileCount : null,
       warningCount: j.warnings.length || null,
+      reason: failedReason(j),
       resumable: j.status === 'failed' ? (j.resumable ?? Boolean((j as { conversation?: string | null }).conversation)) : null,
       ...evidence(j),
     });

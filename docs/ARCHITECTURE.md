@@ -461,14 +461,16 @@ Claude                MCP server (dist/server.js)      Claude Code hooks        
   announces claimed workers that reached idle, or
   went quiet (once: `no output for 16m`, with `(in \`npm test\`)` when a call is open), or
   whose process is gone (once more: `process gone 3m`); the text states the fact and never
-  asks for an interrupt. While the main loop is mid-turn (`turn.start` to `turn.complete`,
-  ignoring subagent turns with `agentId`), `announce` holds notices without committing notice
-  state and decides at main-loop `turn.complete` (after any `status`/`cancel` reads in that
-  turn have retired their notices); on hosts without `turn.start`/`turn.complete`, registration
-  is ignored and polling decides on each tick. It holds a pending acceptance verdict for the checks' budget, with one
+  asks for an interrupt. While the main loop is mid-turn (`turn.start` or a main-loop `tool.call`
+  on a launch, `status`, `pipeline_status`, or `cancel` tool to `turn.complete`, ignoring
+  subagent turns and calls with `agentId`, gated on an interactive session and successful
+  turn-hook registration), `announce` holds notices without committing notice state and decides
+  at main-loop `turn.complete` (after any `status`/`cancel` reads in that turn have retired
+  their notices); on headless sessions or hosts without `turn.start`/`turn.complete`, polling
+  decides on each tick. It holds a pending acceptance verdict for the checks' budget, with one
   `$.prompt.submit` turn credited to the plugin. Claude Code shows that message to
   the user in full, so it is the only notice: one line per worker, no worker summary, followed by `status <workerId>`. Only claimed ids are announced, so two sessions on one repo
-  never wake each other. A `spawn_job` with `variants` returns `{jobs:[...]}` and every variant worker is claimed and watched. A claimed run is announced with its stage jobs when the
+  never wake each other. A `spawn_job` with `variants` returns `{jobs:[...]}` and every variant worker is claimed and watched. A claimed run is announced without its stage jobs when the
   run ends. `/clear` resets session state, so a worker claimed before it goes
   unannounced (the band still shows it).
 - **Hook watcher** (`watch-hook.ts`), the fallback when no mod claims the launch: `build-plugin.mjs` generates `hooks/watch-hooks.json`

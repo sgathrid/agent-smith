@@ -74,6 +74,7 @@ const jobFields = {
   }, ['state', 'silentForMs']),
   toolErrors: typed('integer', 'Tool calls that ended in an error. Evidence, not a verdict: a worker can recover and succeed.'),
   failedEarly: typed('boolean', 'Failed before any tool call (model, region or account); error carries the provider text.'),
+  reason: typed(['string', 'null'], 'Short classification of a failure (e.g. "timed out", "denied command", "no output").'),
   changedFilesUnknown: typed('boolean', 'Changed files could not be computed at finish; a missing changedFiles then means unknown, not none.'),
   cwdMissingAtFinish: typed('boolean', 'The working directory was gone when the job finished; nothing in it could be checked.'),
 };
@@ -166,6 +167,8 @@ const MESSAGE_OUTPUT = open({
   delivery: { type: 'string', enum: ['next-step', 'turn-end', 'now'], description: 'next-step: read inside the running turn; turn-end: starts the next turn when this one ends; now: a new turn started.' },
   status: { type: 'string', enum: ['running'] },
   provider: typed(['string', 'null']),
+  model: typed('string'),
+  effort: typed('string'),
   repo: typed('string'),
   timeoutMs: typed('integer'),
   pendingMessages: typed('integer', 'Messages accepted but not yet read, this one included.'),
@@ -194,7 +197,10 @@ const RAW_TOOL_DEFS: readonly ToolDef[] = [
   }) },
   { name: 'follow_up', annotations: { title: 'Follow up', ...LAUNCHES }, description: 'Send a worker its next message ("do this next"); never cuts the current turn. A running worker reads it at its next step when its provider supports that, else when the turn ends; an idle worker starts a new turn in the same conversation. Queued messages are delivered whatever the turn\'s outcome; cancel discards them. Settings, checks, watched files and env carry over; arguments here apply from the next turn. env: "dropped" in the ack means the env values were lost.', inputSchema: schema({
     worker: { ...string, description: "Worker name, workerId, or any turn's job ID." }, prompt: string, context: messageContext, files: moreFiles,
-    checks: { ...checksSchema, description: 'Replaces the inherited checks; [] clears them.' }, model: string, effort: { type: 'string', enum: EFFORTS }, timeoutMs: { type: 'integer', minimum: 1 }, env: envAgain,
+    checks: { ...checksSchema, description: 'Replaces the inherited checks; [] clears them.' },
+    model: { ...string, description: 'Replaces the inherited model; "default" clears it.' },
+    effort: { type: 'string', enum: [...EFFORTS, 'default'], description: 'Replaces the inherited effort; "default" clears it.' },
+    timeoutMs: { type: 'integer', minimum: 1 }, env: envAgain,
     unrestricted: { type: 'boolean', description: 'Skip worker approval prompts.' },
   }, ['worker', 'prompt']) },
   { name: 'steer', annotations: { title: 'Steer', ...LAUNCHES, destructiveHint: true }, description: 'Redirect a worker now ("stop and do this instead"): cuts its running turn (the tool call in flight is lost) or running checks and continues the same conversation with this message; an idle worker starts a new turn. Before the provider reports a conversation handle this fails unless allowFresh is true. To let the current work finish, use follow_up.', inputSchema: schema({

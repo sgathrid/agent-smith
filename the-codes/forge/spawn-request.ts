@@ -106,6 +106,8 @@ export interface MessageAck {
   readonly delivery: 'next-step' | 'turn-end' | 'now';
   readonly status: 'running';
   readonly provider: string;
+  readonly model?: string;
+  readonly effort?: string;
   readonly repo: string;
   readonly timeoutMs: number;
   readonly pendingMessages?: number;
