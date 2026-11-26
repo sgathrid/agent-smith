@@ -11,7 +11,8 @@ import { buildSteeredPrompt } from '../steer-log.ts';
 import { ForgeTasks } from '../../surfaces/channel/src/tasks.ts';
 import { callTool } from '../../surfaces/channel/src/tools.ts';
 import { isLive } from '../../surfaces/mod/hooks/dashboard.ts';
-import { controlledProvider, makeService } from '../testing/steer-harness.ts';
+import { ForgeService } from '../service.ts';
+import { controlledProvider, makeService, withDefaultProvider } from '../testing/steer-harness.ts';
 import { waitFor } from '../testing/time.ts';
 
 test('steer(queue): coalesces multiple queued steers, opens child anchor before parent finishes, and resolves done with final manifest', async () => {
@@ -210,7 +211,7 @@ test('follow_up/steer refuse a worker with no saved conversation, pipeline stage
 
   await assert.rejects(
     service.followUp({ worker: 'reviewer', prompt: 'More.' }),
-    new RegExp(`"reviewer" \\(${revAck.jobId}\\) has no saved conversation; spawn_job with from:"reviewer" starts it fresh`),
+    new RegExp(`"reviewer" \\(${revAck.jobId}\\) has no saved conversation to continue`),
   );
   await assert.rejects(service.steer({ worker: 'reviewer', prompt: 'More.' }), /has no saved conversation/);
 
@@ -632,4 +633,220 @@ test('a continuation turn stores its starting messages in view.json and its firs
     { sender: 'follow_up', text: 'Interrupt with new plan\nDetails' },
     { sender: 'steer', text: 'Also check edge cases' },
   ]);
+});
+
+test('resolveWorker follows a steer that lands between resolveTurn and detail', async () => {
+  const ctrl = controlledProvider();
+  const { service, repo } = makeService(ctrl.provider);
+  const writeManifest = (id: string, extra: Record<string, unknown>) => {
+    const file = jobFile(repo, id, FILES.job);
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, JSON.stringify({
+      schema: 1,
+      jobId: id,
+      name: 'w',
+      workerId: 'w',
+      provider: 'codex',
+      mode: 'review',
+      cwd: repo,
+      status: 'running',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      startedAt: new Date().toISOString(),
+      finishedAt: null,
+      exitCode: null,
+      jobStatus: null,
+      error: null,
+      deniedActions: [],
+      usage: null,
+      toolCalls: 0,
+      unrestricted: false,
+      conversation: null,
+      task: 'work',
+      promptChars: 4,
+      pipeline: null,
+      stage: null,
+      attempt: null,
+      ...extra,
+    }));
+  };
+
+  writeManifest('parent', { turn: 1 });
+
+  const svc = service as unknown as { detail: (id: string) => Promise<Awaited<ReturnType<typeof service.detail>>> };
+  const origDetail = svc.detail.bind(service);
+  let raced = false;
+  svc.detail = async (id: string) => {
+    if (!raced && id === 'parent') {
+      raced = true;
+      writeManifest('child', { turn: 2, continuedFrom: 'parent', continuationKind: 'steer' });
+      writeFileSync(jobFile(repo, 'parent', FILES.steerHead), 'child\n');
+      writeManifest('parent', {
+        turn: 1,
+        status: 'canceled',
+        finishedAt: new Date().toISOString(),
+        supersededBy: 'child',
+      });
+    }
+    return origDetail(id);
+  };
+
+  const resolved = await service.resolveWorker('parent');
+  assert.equal(resolved.jobId, 'child');
+  assert.equal(resolved.status, 'running');
+});
+
+test('follow_up with invalid model on running worker rejects without queuing or starting a continuation turn', async () => {
+  const ctrl = controlledProvider('codex');
+  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-steer-invalid-model-'));
+  const service = withDefaultProvider(new ForgeService({
+    repo,
+    flushMs: 5,
+    providerSource: () => ctrl.provider,
+    catalogSource: async () => [{
+      provider: 'codex',
+      models: [{ id: 'gpt-5', label: 'GPT-5', efforts: [] }],
+      defaultSource: 'unknown',
+      source: 'live',
+      stale: false,
+      verified: true,
+    }],
+  }), 'codex');
+
+  const turn1Ready = ctrl.nextTurn();
+  const { ack, done } = await service.spawnTracked({
+    mode: 'implement',
+    name: 'Ada',
+    prompt: 'Do initial work.',
+    model: 'gpt-5',
+  });
+  const turn1 = await turn1Ready;
+  turn1.emit({ kind: 'started', at: new Date().toISOString(), conversationId: 'thread-ada' });
+
+  await assert.rejects(
+    service.followUp({
+      worker: 'Ada',
+      prompt: 'do X',
+      model: 'nonexistent-model',
+    }),
+    /unknown model "nonexistent-model"/,
+  );
+
+  assert.equal(existsSync(jobFile(repo, ack.jobId, FILES.steer)), false);
+  const progress = JSON.parse(readFileSync(jobFile(repo, ack.jobId, FILES.progress), 'utf8')) as { pendingSteers?: number };
+  assert.equal(progress.pendingSteers ?? 0, 0);
+
+  turn1.finish({ status: 'success', response: 'Done initial work.' });
+  const finalManifest = await done;
+  assert.equal(finalManifest.jobId, ack.jobId);
+  assert.equal(ctrl.turns.length, 1);
+});
+
+test('effort-only follow_up validates against the worker model, not the provider default model', async () => {
+  const ctrl = controlledProvider();
+  const catalogSource = async () => [{
+    provider: ctrl.provider.name,
+    models: [
+      { id: 'default-low-only', label: 'Low', efforts: ['low'] },
+      { id: 'worker-high-only', label: 'High', efforts: ['high'] },
+    ],
+    defaultModel: 'default-low-only',
+    defaultSource: 'harness-config' as const,
+    source: 'live' as const,
+    stale: false,
+    verified: true,
+  }];
+  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-effort-'));
+  const service = withDefaultProvider(new ForgeService({
+    repo,
+    flushMs: 5,
+    providerSource: () => ctrl.provider,
+    catalogSource,
+  }));
+
+  const turn1Ready = ctrl.nextTurn();
+  const { ack, done } = await service.spawnTracked({
+    mode: 'implement',
+    name: 'Ada',
+    prompt: 'Do initial work.',
+    model: 'worker-high-only',
+    effort: 'high',
+  });
+  const turn1 = await turn1Ready;
+  turn1.emit({ kind: 'started', at: new Date().toISOString(), conversationId: 'thread-ada' });
+
+  await assert.rejects(
+    service.followUp({ worker: 'Ada', prompt: 'try low', effort: 'low' }),
+    /effort "low" is not valid for codex model "worker-high-only"/,
+  );
+
+  const goodAck = await service.followUp({ worker: 'Ada', prompt: 'try high', effort: 'high' });
+  assert.equal(goodAck.warnings?.some((w) => /effort "high"/.test(w)) ?? false, false);
+
+  const turn2Ready = ctrl.nextTurn();
+  turn1.finish({ status: 'success', response: 'Done.' });
+  const turn2 = await turn2Ready;
+  turn2.finish({ status: 'success', response: 'Done 2.' });
+  await done;
+});
+
+test('queued model override + effort follow-up and harness-default modelResolved validation', async () => {
+  const ctrl = controlledProvider();
+  const catalogSource = async () => [{
+    provider: ctrl.provider.name,
+    models: [
+      { id: 'model-a', label: 'A', efforts: ['high'] },
+      { id: 'model-b', label: 'B', efforts: ['low'] },
+    ],
+    defaultModel: 'model-a',
+    defaultSource: 'harness-config' as const,
+    source: 'live' as const,
+    stale: false,
+    verified: true,
+  }];
+  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-queued-'));
+  const service = withDefaultProvider(new ForgeService({
+    repo,
+    flushMs: 5,
+    providerSource: () => ctrl.provider,
+    catalogSource,
+    harnessDefaults: () => ({ model: 'model-b' }),
+  }));
+
+  const turn1Ready = ctrl.nextTurn();
+  const { ack, done } = await service.spawnTracked({
+    mode: 'implement',
+    name: 'Ada',
+    prompt: 'Initial',
+    model: 'model-a',
+  });
+  const turn1 = await turn1Ready;
+  turn1.emit({ kind: 'started', at: new Date().toISOString(), conversationId: 'thread-ada' });
+
+  await service.followUp({ worker: 'Ada', prompt: 'switch model', model: 'model-b' });
+  await assert.rejects(
+    service.followUp({ worker: 'Ada', prompt: 'bad effort for b', effort: 'high' }),
+    /effort "high" is not valid for codex model "model-b"/,
+  );
+
+  const turn2Ready = ctrl.nextTurn();
+  turn1.finish({ status: 'success', response: 'Done.' });
+  const turn2 = await turn2Ready;
+  turn2.finish({ status: 'success', response: 'Done 2.' });
+  await done;
+
+  const turn3Ready = ctrl.nextTurn();
+  const { ack: ack2, done: done2 } = await service.spawnTracked({
+    mode: 'implement',
+    name: 'Bo',
+    prompt: 'Use harness default',
+  });
+  const turn3 = await turn3Ready;
+  turn3.emit({ kind: 'started', at: new Date().toISOString(), conversationId: 'thread-bo' });
+  await assert.rejects(
+    service.followUp({ worker: ack2.jobId, prompt: 'bad effort for modelResolved', effort: 'high' }),
+    /effort "high" is not valid for codex model "model-b"/,
+  );
+  turn3.finish({ status: 'success', response: 'Done 3.' });
+  await done2;
 });

@@ -1,9 +1,9 @@
 import type { UiComponents } from 'claude-code';
 import type { RadarJob } from '../types/index.d.ts';
 import type { ForgeDetail } from './canonical.ts';
-import { checksLabel, condenseTimeline, forgeList, isLive, needsAttention, priorTurnSummary, scopeLine, statusLine, timelineGroupLabel, workerHead, workerHeading, workerLivenessLine, workerStatus, type TimelineItem } from './dashboard.ts';
-import { effectiveStart, elapsed, isTerminal, oneLine, pendingSteersLabel, pickColor, pickGlyph, sanitizeText } from './format.ts';
-import { classify, progressLines } from './progress.ts';
+import { changedFilesPhrase, condenseTimeline, forgeList, isLive, needsAttention, paneChecksLabel, priorTurnSummary, scopeLine, statusLine, timelineGroupLabel, workerHead, workerHeading, workerLivenessLine, workerStatus, type TimelineItem } from './dashboard.ts';
+import { effectiveStart, elapsed, failureWords, isTerminal, oneLine, pendingSteersLabel, pickColor, pickGlyph, sanitizeText } from './format.ts';
+import { classify, progressSummaryLine } from './progress.ts';
 
 export interface ViewActions {
   pick(job: RadarJob): Promise<void>;
@@ -65,19 +65,21 @@ export function renderWorker(W: UiComponents, d: ForgeDetail, o: ViewOptions, a:
   const headerStart=isPinned?job.startedAt:effectiveStart(job);
   const span=headerStart===null?null:(job.endedAt??o.now)-headerStart;
   const turnNum=job.turn??1;
-  const modelPart=oneLine(job.model||(job.role?job.provider:'')||'');
-  const header=oneLine([`${pickGlyph(job.status)} ${workerHeading(job)}`,modelPart,(turnNum>1||turns.length>1)?`turn ${turnNum}`:'',span===null?'':elapsed(span),checksLabel(job.acceptance)].filter(Boolean).join(' · '));
+  const provider=oneLine(job.provider??'');
+  const model=oneLine(job.model??'');
+  const modelAlreadyPrefixed=provider!==''&&model.toLowerCase().startsWith(provider.toLowerCase())&&/^[-/:_.\s]/.test(model.slice(provider.length));
+  const modelPart=provider!==''&&model!==''?(modelAlreadyPrefixed?model:`${provider} ${model}`):(model||provider);
+  const line1=oneLine([`${pickGlyph(job.status)} ${workerHeading(job)}`,(turnNum>1||turns.length>1)?`turn ${turnNum}`:'',span===null?'':elapsed(span)].filter(Boolean).join(' · '));
+  const reasonPart=job.status==='failed'?failureWords(job):'';
+  const filesPart=isTerminal(job.status)?changedFilesPhrase(job):'';
+  const line2=oneLine([modelPart,paneChecksLabel(job.acceptance),reasonPart,pendingSteersLabel(job.pendingSteers),filesPart].filter(Boolean).join(' · '));
   const failing=job.acceptance?.checks.filter(check => !check.ok) ?? [];
   const timelineProse=d.timeline.some(event => event.kind==='assistant');
   const note=(job.status==='running'||job.status==='attention')&&!timelineProse
     ? (job.reasoning?oneLine(job.reasoning,Math.max(1,o.width-6)):'') : '';
-  const statusText=workerStatus(job);
-  const statusRow=!(job.status==='running'&&job.progress)&&!(job.status==='running'&&statusText==='Running');
-  const queuedSteers=!statusRow?pendingSteersLabel(job.pendingSteers):'';
-  const changedFiles=isTerminal(job.status)&&job.changedFileCount!=null&&job.changedFileCount>0&&(job.progress?.editedCount??0)===0
-    ? job.changedFileCount : 0;
   const livenessLine=workerLivenessLine(job);
-  const showProgress=Boolean(job.progress)&&!(job.progress!.phase==='starting'&&(job.toolCount??0)===0&&job.progress!.filesRead===0&&job.progress!.searches===0&&job.progress!.commands===0&&job.progress!.editedCount===0&&job.progress!.testRuns===0&&job.progress!.repeat===null);
+  const showProgress=(job.status==='running'||job.status==='attention')&&Boolean(job.progress)&&!(job.progress!.phase==='starting'&&(job.toolCount??0)===0&&job.progress!.filesRead===0&&job.progress!.searches===0&&job.progress!.commands===0&&job.progress!.editedCount===0&&job.progress!.testRuns===0&&job.progress!.repeat===null);
+  const line3=showProgress?progressSummaryLine(job.progress!):'';
   const storedTexts=new Set((job.messages??[]).map(m => oneLine(m.text)).filter(Boolean));
   const taskOneLine=oneLine(taskMessage);
   let suppressedFirstTaskMsg=false;
@@ -94,17 +96,14 @@ export function renderWorker(W: UiComponents, d: ForgeDetail, o: ViewOptions, a:
     return true;
   });
   return <Box flexDirection="column">
-    <Text bold color={o.colour?pickColor(job.status):undefined} wrap="truncate-end">{header}</Text>
-    {statusRow && <Text wrap="truncate-end">{statusText}</Text>}
-    {queuedSteers!=='' && <Text color={o.colour?'cyan':undefined} wrap="truncate-end">{queuedSteers}</Text>}
-    {changedFiles>0 && <Text dimColor wrap="truncate-end">{`Changed: ${changedFiles} ${changedFiles===1?'file':'files'}`}</Text>}
-    {(showProgress||note!==''||livenessLine!==null) && <Box flexDirection="column">
-      {showProgress && progressLines(job.progress!, job.toolCount).map((line,i) => <Text key={`progress-${i}`} dimColor={i>0} wrap="truncate-end">{sanitizeText(line)}</Text>)}
-      {note!=='' && <Text dimColor wrap="truncate-end">{`Note: ${note}`}</Text>}
-      {livenessLine!==null && <Text dimColor={livenessLine.tone==='dim'} color={o.colour&&livenessLine.tone!=='dim'?livenessLine.tone:undefined} wrap="truncate-end">{livenessLine.text}</Text>}
-    </Box>}
+    <Text bold color={o.colour?pickColor(job.status):undefined} wrap="truncate-end">{line1}</Text>
+    {line2!=='' && <Text dimColor wrap="truncate-end">{line2}</Text>}
+    {line3!=='' && <Text wrap="truncate-end">{sanitizeText(line3)}</Text>}
+    {note!=='' && <Text dimColor wrap="truncate-end">{`Note: ${note}`}</Text>}
+    {livenessLine!==null && <Text dimColor={livenessLine.tone==='dim'} color={o.colour&&livenessLine.tone!=='dim'?livenessLine.tone:undefined} wrap="truncate-end">{livenessLine.text}</Text>}
     {job.warnings.map((warning,i) => <Text key={`warning-${i}`} color={o.colour?'yellow':undefined} wrap="wrap">{sanitizeText(warning.message)}</Text>)}
     {isPinned && head && <Button key="return-live" plain label={oneLine(`↩ Back to Turn ${head.turn} (${isLive(head)?'live':'latest'})`,Math.max(1,o.width-2))} onPress={() => a.pickTurn(null)} />}
+    <Box key="header-gap"><Text> </Text></Box>
     {turns.length>1
       ? <Box flexDirection="column">
         {turns.map((turn,i) => turn.id===job.id
@@ -114,6 +113,7 @@ export function renderWorker(W: UiComponents, d: ForgeDetail, o: ViewOptions, a:
       : <Text dimColor wrap="truncate-end">{`Task: ${oneLine(taskMessage,Math.max(1,o.width-8))}`}</Text>}
     {o.taskOpen && <Markdown text={sanitizeText(job.preamble?`${job.preamble}\n\n${prompt}`:prompt)} />}
     {o.taskOpen && <Text dimColor wrap="wrap">{sanitizeText(`${oneLine(job.id)}\nWorker: ${oneLine(job.workerId)}${job.pipeline?`\nPipeline: ${oneLine(job.pipeline)} · ${oneLine(job.stage??'stage unknown')}`:''}${job.attempt!=null?`\nAttempt: ${job.attempt}`:''}`)}</Text>}
+    {visibleTimeline.length>0 && <Box key="transcript-gap"><Text> </Text></Box>}
     {condenseTimeline(visibleTimeline).flatMap((item,i,items) => {
       const followedByProse=i+1<items.length&&isProse(items[i+1]!)!==isProse(item);
       const row=item.kind==='group'

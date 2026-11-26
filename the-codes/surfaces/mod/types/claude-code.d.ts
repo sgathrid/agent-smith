@@ -340,6 +340,8 @@ declare module 'claude-code' {
     (event: 'command.run', matcher: { command: string }, handler: CommandHandler): void;
     (event: 'tool.call', matcher: ToolCallMatcher, handler: Handler<ToolCallEvent>): void;
     (event: 'session.start', handler: Handler): void;
+    (event: 'turn.start', handler: Handler<{ readonly agentId?: string }>): void;
+    (event: 'turn.complete', handler: Handler<{ readonly agentId?: string }>): void;
     (event: 'ui.close', handler: Handler<{ id: string }>): void;
     (event: 'ui.scroll', handler: Handler<{ component: string; requestId: string; origin: { kind: 'person' | 'plugin' }; offset: number; by: number; bodyRows: number; contentRows: number }>): void;
   }

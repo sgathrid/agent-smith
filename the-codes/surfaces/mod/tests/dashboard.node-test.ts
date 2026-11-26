@@ -34,7 +34,8 @@ test('failed rows show their failure reason and do not show unchecked when no ch
 });
 test('acceptance reads as a pass count or the failing check names',()=>{
   assert.equal(checksLabel(undefined),'');
-  assert.equal(checksLabel({state:'unchecked',pending:true,checks:[]}),'checking');
+  assert.equal(checksLabel({state:'unchecked',pending:true,checks:[]}),'');
+  assert.equal(checksLabel({state:'unchecked',pending:true,running:'tests',checks:[]}),'checking');
   assert.equal(checksLabel({state:'accepted',checks:[{name:'tests',ok:true,outputTail:''},{name:'lint',ok:true,outputTail:''}]}),'checks ✓ 2/2');
   assert.equal(checksLabel({state:'rejected',checks:[{name:'tests',ok:true,outputTail:''},{name:'lint',ok:false,outputTail:''}]}),'✗ lint');
   assert.equal(checksLabel({state:'unchecked',checks:[]}),'');

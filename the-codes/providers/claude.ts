@@ -27,6 +27,7 @@ import { DEFAULT_DISCOVERY_TIMEOUT_MS, configDir, errMessage, readTextSafe, runC
 import type { RunFn } from './discovery.ts';
 import path from 'node:path';
 import { deniedText, noResultText, stderrClause } from './failure-text.ts';
+import { createAnswer, emptyResponseVerdict, type Answer } from './answer.ts';
 
 export function claudeBinary(): string {
   return process.env['AGENT_SMITH_CLAUDE_BIN'] ?? 'claude';
@@ -57,6 +58,7 @@ export function sandboxPlan(spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly' | 
       sandbox: 'claude --dangerously-skip-permissions (unrestricted)',
       flags: ['--dangerously-skip-permissions'],
       readOnlyEnforced: false,
+      unrestricted: true,
     };
   }
   const flags = ['--permission-mode', 'dontAsk', '--permission-prompts', 'none'];
@@ -71,12 +73,14 @@ export function sandboxPlan(spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly' | 
         : `claude dontAsk + read-only allowlist (writes disallowed except the output artifact ${path.resolve(artifact)}; shell limited to inspection commands)`,
       flags,
       readOnlyEnforced: true,
+      unrestricted: false,
     };
   }
   return {
     sandbox: 'claude dontAsk (cannot prompt; non-allowed tools are denied and reported as denied)',
     flags,
     readOnlyEnforced: false,
+    unrestricted: false,
   };
 }
 
@@ -239,7 +243,7 @@ function isPermissionDenial(text: string | undefined): boolean {
 
 interface ClaudeTranslator {
   onEvent(raw: Record<string, unknown>): ProviderEvent[];
-  finalText: string;
+  answer: Answer;
   sessionId?: string;
   model?: string;
   sawResult: boolean;
@@ -255,8 +259,9 @@ export function createClaudeTranslator(
   maxChars: number,
   input?: Pick<ClaudeLiveInput, 'replayed' | 'end'>,
 ): ClaudeTranslator {
+  const answer = createAnswer('claude');
   const tx: ClaudeTranslator = {
-    finalText: '',
+    answer,
     sawResult: false,
     sawErrorResult: false,
     deniedTools: [],
@@ -264,7 +269,10 @@ export function createClaudeTranslator(
   };
   const toolStep = new Map<string, number>();
   const deniedIds = new Set<string>();
+  const toolNames = new Map<string, string>();
+  const endedTools = new Set<string>();
   let step = 0;
+  let fallbackKeySeq = 0;
 
   const recordDenial = (id: string): boolean => {
     if (deniedIds.has(id)) return false;
@@ -344,6 +352,10 @@ export function createClaudeTranslator(
         out.push({ kind: 'usage', at, usage });
       }
 
+      const envelopeParent = str(raw, 'parent_tool_use_id');
+      const msgKey = str(message, 'id') ?? `anon-${++fallbackKeySeq}`;
+      let sawEmptyText = false;
+      let sawNonEmptyText = false;
       for (const block of content) {
         if (block === null || typeof block !== 'object') continue;
         const b = block as Record<string, unknown>;
@@ -351,21 +363,22 @@ export function createClaudeTranslator(
 
         if (bType === 'text') {
           const text = str(b, 'text');
-          if (text !== undefined && text !== '') {
-            // parent_tool_use_id present => this text came from a SUBAGENT
-            // (forwarded by --forward-subagent-text). We must not fold it into
-            // finalText: the top-level result is the moderator's own answer, and
-            // a subagent's chatter in there would corrupt the moderated output.
-            const parent = str(b, 'parent_tool_use_id');
-            if (parent !== undefined) {
+          const parent = str(b, 'parent_tool_use_id') ?? envelopeParent;
+          if (parent !== undefined) {
+            if (text !== undefined && text !== '') {
               out.push({
                 kind: 'text',
                 at,
                 text: `[subagent] ${text}`,
                 stream: 'assistant',
               });
+            }
+          } else if (text !== undefined) {
+            if (text === '') {
+              sawEmptyText = true;
             } else {
-              tx.finalText += text;
+              sawNonEmptyText = true;
+              answer.text(text, msgKey);
               out.push({ kind: 'text', at, text, stream: 'assistant' });
             }
           }
@@ -383,6 +396,9 @@ export function createClaudeTranslator(
         if (bType === 'tool_use') {
           const toolUseId = str(b, 'id') ?? `toolu-${step}`;
           const toolName = str(b, 'name') ?? 'unknown';
+          const isSubagent = str(b, 'parent_tool_use_id') !== undefined || envelopeParent !== undefined;
+          toolNames.set(toolUseId, toolName);
+          if (!isSubagent) answer.tool(toolName);
           const idx = step++;
           toolStep.set(toolUseId, idx);
           const input = preview(b['input'], maxChars);
@@ -393,6 +409,7 @@ export function createClaudeTranslator(
           continue;
         }
       }
+      if (sawEmptyText && !sawNonEmptyText) answer.emptyMessage();
       return out;
     }
 
@@ -411,8 +428,12 @@ export function createClaudeTranslator(
         if (block === null || typeof block !== 'object') continue;
         const b = block as Record<string, unknown>;
         if (str(b, 'type') !== 'tool_result') continue;
-
         const toolUseId = str(b, 'tool_use_id') ?? '';
+        const isSubagent = (parentId !== undefined && parentId !== null) || b['parent_tool_use_id'] != null;
+        const isReplay = toolUseId !== '' && endedTools.has(toolUseId);
+        if (!isSubagent && !isReplay) answer.tool(toolNames.get(toolUseId) ?? '');
+        if (toolUseId !== '') endedTools.add(toolUseId);
+
         const idx = toolStep.get(toolUseId) ?? step++;
         if (toolUseId !== '') toolStep.set(toolUseId, idx);
 
@@ -473,7 +494,7 @@ export function createClaudeTranslator(
       if (typeof turns === 'number') tx.numTurns = turns;
 
       const finalAnswer = str(raw, 'result');
-      if (finalAnswer !== undefined && finalAnswer !== '') tx.finalText = finalAnswer;
+      answer.providerFinal(finalAnswer, 'final-message');
       return out;
     }
 
@@ -508,10 +529,11 @@ export function buildResult(args: {
   let status: JobStatus;
   let error: string | undefined;
 
+  const response = tx.answer.value();
   const early = earlyVerdict(exit, durationMs);
   if (early !== undefined) {
     ({ status, error } = early);
-  } else if (tx.deniedTools.length > 0 && !(tx.sawResult && !tx.sawErrorResult && exit.code === 0 && tx.finalText.trim() !== '')) {
+  } else if (tx.deniedTools.length > 0 && !(tx.sawResult && !tx.sawErrorResult && exit.code === 0 && response.trim() !== '')) {
     status = 'denied';
     error = deniedText(tx.deniedTools, exit.stderr);
   } else if (!tx.sawResult) {
@@ -524,10 +546,15 @@ export function buildResult(args: {
     status = 'error';
     error = `exited ${exit.code}${stderrClause(exit.stderr)}`;
   } else {
-    status = 'success';
+    const empty = emptyResponseVerdict(response, exit.stderr);
+    if (empty !== undefined) {
+      ({ status, error } = empty);
+    } else {
+      status = 'success';
+    }
   }
 
-  const out = jobResult({ provider: 'claude', jobId, status, error, exit, response: tx.finalText, startedAtMs, durationMs, stateDir });
+  const out = jobResult({ provider: 'claude', jobId, status, error, exit, response, startedAtMs, durationMs, stateDir });
   if (tx.deniedTools.length > 0) {
     out.deniedActions = tx.deniedTools.map((id) => ({ action: 'tool', displayName: id, nonfatal: true }));
   }

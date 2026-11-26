@@ -299,9 +299,7 @@ test('a running worker with a progress digest shows what it is doing and what it
   expect(String(row?.props?.label)).toMatch(/pp-engine\s+editing loader\.py · 3 files edited · last test run failed/);
   await band.press({key:'band-ada'});
   const pane = await $.ui.mount(PANE_TARGET);
-  expect(await pane.find({type:'Text',text:/^Editing · 21 files read · 14 searches · 2 commands · 59 tool calls$/})).toBeDefined();
-  expect(await pane.find({type:'Text',text:/^Edited: config\.py, loader\.py, test_config\.py$/})).toBeDefined();
-  expect(await pane.find({type:'Text',text:/^Tests: ran 2 times · last run failed$/})).toBeDefined();
+  expect(await pane.find({type:'Text',text:/^Editing · 21 files read · 14 searches · 2 commands · tests ran 2× · last run failed$/})).toBeDefined();
   const toolRow = await pane.find({key:'event-1'}) as { props?: Record<string,unknown> } | undefined;
   expect(String(toolRow?.props?.label)).toBe('  reading');
   await clock.advance(1000);
@@ -436,7 +434,7 @@ test('prose and tool rows read apart: a blank row at each turn, dimmed tools, no
   expect(failed?.props?.dimColor).toBe(false);
   expect(await pane.find({type:'Text',text:/^Note:/})).toBeUndefined();
   expect(await pane.find({type:'Text',text:/^Running · running/})).toBeUndefined();
-  expect(await pane.find({type:'Text',text:/^Tests: ran 1 time · last run failed/})).toBeDefined();
+  expect(await pane.find({type:'Text',text:/tests ran 1× · last run failed/})).toBeDefined();
 });
 
 test('after a launch only that job shows; a pipeline launch shows its stage jobs', async ($, on) => {
@@ -465,7 +463,7 @@ test('/forge <name> searches the whole repository, so an older worker still open
   const pane = await $.ui.mount(PANE_TARGET);
   expect(await pane.find({key:'back'})).toBeDefined();
   expect(await pane.find({type:'Text',text:/Grace/})).toBeDefined();
-  expect(await pane.find({type:'Text',text:/failed · server stopped/})).toBeDefined();
+  expect(await pane.find({type:'Text',text:/server stopped/})).toBeDefined();
   expect(host.toasts).toHaveLength(0);
 });
 
@@ -489,7 +487,8 @@ test('the worker view is one scroll: header, task, transcript, then result and f
   await start($);
   await $.command.run({command:'forge',args:'Ada'});
   const pane = await $.ui.mount(PANE_TARGET);
-  expect(await pane.find({type:'Text',text:/Ada · reviewer · gpt-6-sol · 5s/})).toBeDefined();
+  expect(await pane.find({type:'Text',text:/Ada · reviewer · 5s/})).toBeDefined();
+  expect(await pane.find({type:'Text',text:'codex gpt-6-sol'})).toBeDefined();
   expect(await pane.find({type:'Text',text:/Task: Long task instructions/})).toBeDefined();
   expect(await pane.find({type:'Markdown',text:/Mode preamble/})).toBeUndefined();
   expect(await pane.find({type:'Text',text:'Following live output.'})).toBeUndefined();
@@ -543,13 +542,13 @@ test('scrolling up pauses following and scrolling back to the end resumes it', a
 test('canonical acceptance refreshes in an open worker view; a read failure keeps the rows', async ($, on) => {
   const ids = ['job-native-1'];
   const files = canonicalJob('job-native-1', {status:'succeeded',name:'Ada',workerId:'ada',finishedAt:iso(RUNNING_NOW-1000),toolCalls:1},
-    {'acceptance.json':JSON.stringify({state:'unchecked',pending:true,checks:[]}),'result.md':'Worker report'});
+    {'acceptance.json':JSON.stringify({state:'unchecked',pending:true,running:'tests',checks:[]}),'result.md':'Worker report'});
   const { clock } = forgeHost(on, files, ids);
   await start($);
   await launch($, 'job-native-1');
   await $.command.run({command:'forge',args:'job-native-1'});
   const pane = await $.ui.mount(PANE_TARGET);
-  expect(await pane.find({type:'Text',text:/checking/})).toBeDefined();
+  expect(await pane.find({type:'Text',text:/checks running/})).toBeDefined();
   files['/work/.agent-smith/jobs/job-native-1/acceptance.json']=JSON.stringify({state:'rejected',pending:false,checks:[
     {name:'tests',ok:false,outputTail:'',timedOut:true,signal:'SIGTERM',reason:'command timed out'}]});
   await clock.advance(1000);
@@ -823,6 +822,8 @@ describe('completion notices', () => {
     on('prompt.submit', (_$: unknown, e: any) => { said.prompts.push(e.text); said.origins.push(e.origin); return {text:e.text}; });
     on('classic.PostToolUse', () => { said.hookRuns++; return {}; });
     on('fs.write', (_$: unknown, e: any) => { files[e.path] = e.text; return {value:undefined}; });
+    on('turn.start', (_$: unknown, e: any) => ({ turnId: e.turnId }));
+    on('turn.complete', (_$: unknown, e: any) => ({ text: e.answer ?? '' }));
     return { ...r, said };
   }
   const ada = (status: string, more: Record<string, unknown> = {}) => canonicalJob('job-ada',
@@ -996,6 +997,224 @@ describe('completion notices', () => {
     await clock.advance(3000);
     expect(said.logs).toEqual([]);
     expect(said.prompts).toEqual([]);
+  });
+
+  test('a worker finishing mid-turn and read with status before turn.complete submits no prompt', async ($, on) => {
+    const files = ada('running');
+    const { clock, said } = noticeHost(on, files, ['job-ada']);
+    await start($);
+    await launched($, 'job-ada');
+    await ($ as any).turn.start({ turnId: 't-1', text: 'check' });
+    Object.assign(files, ada('succeeded', { finishedAt: iso(RUNNING_NOW + 1000) }));
+    await clock.advance(3000);
+    await clock.advance(3000);
+    expect(said.prompts).toEqual([]);
+    await settledRead($, 'job-ada');
+    await ($ as any).turn.complete({ turnId: 't-1', reason: 'answer', answer: 'done', durationMs: 100, isAborted: false });
+    await clock.advance(3000);
+    expect(said.prompts).toEqual([]);
+  });
+
+  test('a worker finishing mid-turn and not read submits once after turn.complete', async ($, on) => {
+    const files = ada('running');
+    const { clock, said } = noticeHost(on, files, ['job-ada']);
+    await start($);
+    await launched($, 'job-ada');
+    await ($ as any).turn.start({ turnId: 't-1', text: 'work' });
+    Object.assign(files, ada('succeeded', { finishedAt: iso(RUNNING_NOW + 1000) }));
+    await clock.advance(3000);
+    await clock.advance(3000);
+    expect(said.prompts).toEqual([]);
+    await ($ as any).turn.complete({ turnId: 't-1', reason: 'aborted', answer: '', durationMs: 100, isAborted: true });
+    expect(said.prompts).toHaveLength(1);
+    await clock.advance(3000);
+    expect(said.prompts).toHaveLength(1);
+  });
+
+  test('a subagent turn.start/turn.complete does not hold or release main-loop notices', async ($, on) => {
+    const files = ada('running');
+    const { clock, said } = noticeHost(on, files, ['job-ada']);
+    await start($);
+    await launched($, 'job-ada');
+    await ($ as any).turn.start({ turnId: 'sub-t1', agentId: 'sub-1', text: 'sub' });
+    Object.assign(files, ada('succeeded', { finishedAt: iso(RUNNING_NOW + 1000) }));
+    await clock.advance(3000);
+    await clock.advance(3000);
+    expect(said.prompts).toHaveLength(1);
+    await ($ as any).turn.complete({ turnId: 'sub-t1', agentId: 'sub-1', reason: 'answer', answer: 'ok', durationMs: 50, isAborted: false });
+    expect(said.prompts).toHaveLength(1);
+  });
+
+  test('with no turn events fired, completion notices announce on poll as before', async ($, on) => {
+    const files = ada('running');
+    const { clock, said } = noticeHost(on, files, ['job-ada']);
+    await start($);
+    await launched($, 'job-ada');
+    Object.assign(files, ada('succeeded', { finishedAt: iso(RUNNING_NOW + 1000) }));
+    await clock.advance(3000);
+    await clock.advance(3000);
+    expect(said.prompts).toHaveLength(1);
+  });
+
+  test('turn.start firing while announce awaits file reads holds the notice without submitting or committing', async ($, on) => {
+    const files: Record<string, string> = {
+      ...ada('running'),
+      '/work/.agent-smith/pipelines/p1.json': JSON.stringify({ runId: 'p1', pipeline: 'pipe', startedAt: RUNNING_NOW, finishedAt: null, status: 'running', stageResults: {} }),
+    };
+    let releaseRead: (() => void) | null = null;
+    const readPaused = new Promise<void>((r) => { releaseRead = r; });
+    let holdReads = false;
+    const said = { prompts: [] as string[] };
+    const clock = mock.clock(on as never, { now: RUNNING_NOW });
+    on('session.start', (_$: unknown, e: any) => ({ sessionId: 's', cwd: e.cwd }));
+    on('command.register', () => ({ value: undefined }));
+    on('env.get', () => ({ value: undefined }));
+    on('fs.list', () => ({ value: [{ name: 'job-ada', kind: 'dir', size: 0 }] }));
+    on('fs.exists', (_$: unknown, e: any) => {
+      const p = String(e.path);
+      const name = p.slice(p.lastIndexOf('/') + 1);
+      return { value: p === '/work/.agent-smith/jobs' || Object.hasOwn(files, p) || Object.hasOwn(files, name) };
+    });
+    on('fs.read', async (_$: unknown, e: any) => {
+      const p = String(e.path);
+      const name = p.slice(p.lastIndexOf('/') + 1);
+      if (holdReads && p.endsWith('p1.json')) await readPaused;
+      const body = files[p] ?? files[name];
+      return body !== undefined ? { value: body } : { deny: `ENOENT: ${p}` };
+    });
+    on('fs.write', (_$: unknown, e: any) => { files[e.path] = e.text; return { value: undefined }; });
+    on('tool.call', (_$: unknown, e: any) => LAUNCH_TOOL.test(e.tool) ? launchAck(e) : { deny: 'unexpected' });
+    on('ui.render', ($: any, e: any) => $.ui.resolve(e).Text({ children: 'REST' }));
+    on('prompt.submit', (_$: unknown, e: any) => { said.prompts.push(e.text); return { text: e.text }; });
+    on('turn.start', (_$: unknown, e: any) => ({ turnId: e.turnId }));
+    on('turn.complete', (_$: unknown, e: any) => ({ text: e.answer ?? '' }));
+
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
+    await $.tool.call({ tool: 'mcp__plugin_agent-smith_agent-smith__run_pipeline', runId: 'p1', repo: '/work' });
+    Object.assign(files, ada('succeeded', { finishedAt: iso(RUNNING_NOW + 1000) }));
+    files['/work/.agent-smith/pipelines/p1.json'] = JSON.stringify({ runId: 'p1', pipeline: 'pipe', startedAt: RUNNING_NOW, finishedAt: RUNNING_NOW + 1000, status: 'passed', stageResults: {} });
+    holdReads = true;
+    const advanceP = clock.advance(1000);
+    await new Promise((r) => setTimeout(r, 20));
+    await ($ as any).turn.start({ turnId: 't-race', text: 'user prompt' });
+    releaseRead!();
+    await advanceP;
+    await new Promise((r) => setTimeout(r, 20));
+    expect(said.prompts).toEqual([]);
+    await ($ as any).turn.complete({ turnId: 't-race', reason: 'answer', answer: 'ok', durationMs: 50, isAborted: false });
+    expect(said.prompts).toHaveLength(1);
+  });
+
+  test('dropped or rejected prompt.submit leaves notice pending for the next poll without duplicate sends', async ($, on) => {
+    const files = ada('running');
+    const { clock } = forgeHost(on, files, ['job-ada']);
+    let mode: 'drop' | 'reject' | 'pending' | 'accept' = 'drop';
+    let releasePending: (() => void) | null = null;
+    const prompts: string[] = [];
+    on('fs.write', (_$: unknown, e: any) => { files[e.path] = e.text; return { value: undefined }; });
+    on('prompt.submit', async (_$: unknown, e: any) => {
+      prompts.push(e.text);
+      if (mode === 'drop') return { drop: 'session input held' };
+      if (mode === 'reject') throw new Error('host busy');
+      if (mode === 'pending') {
+        await new Promise<void>((r) => { releasePending = r; });
+        return { text: e.text };
+      }
+      return { text: e.text };
+    });
+    on('turn.start', (_$: unknown, e: any) => ({ turnId: e.turnId }));
+    on('turn.complete', (_$: unknown, e: any) => ({ text: e.answer ?? '' }));
+
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
+    await launched($, 'job-ada');
+    await ($ as any).turn.start({ turnId: 't-1', text: 'work' });
+    Object.assign(files, ada('succeeded', { finishedAt: iso(RUNNING_NOW + 1000) }));
+    await ($ as any).turn.complete({ turnId: 't-1', reason: 'aborted', answer: '', durationMs: 100, isAborted: true });
+    expect(prompts).toHaveLength(1);
+
+    mode = 'reject';
+    await clock.advance(1000);
+    expect(prompts).toHaveLength(2);
+
+    mode = 'pending';
+    await clock.advance(1000);
+    expect(prompts).toHaveLength(3);
+
+    await clock.advance(1000);
+    await clock.advance(1000);
+    expect(prompts).toHaveLength(3);
+
+    releasePending!();
+    await new Promise((r) => setTimeout(r, 20));
+
+    mode = 'accept';
+    await clock.advance(1000);
+    expect(prompts).toHaveLength(3);
+  });
+
+  test('status read while an attention prompt.submit is in flight preserves readHead and suppresses completion notice', async ($, on) => {
+    const files = ada('running', { startedAt: iso(RUNNING_NOW - 16 * 60_000), updatedAt: iso(RUNNING_NOW - 16 * 60_000) });
+    const { clock } = forgeHost(on, files, ['job-ada']);
+    let releaseSubmit: (() => void) | null = null;
+    const prompts: string[] = [];
+    on('fs.write', (_$: unknown, e: any) => { files[e.path] = e.text; return { value: undefined }; });
+    on('prompt.submit', async (_$: unknown, e: any) => {
+      prompts.push(e.text);
+      if (prompts.length === 1) {
+        await new Promise<void>((r) => { releaseSubmit = r; });
+      }
+      return { text: e.text };
+    });
+    on('turn.start', (_$: unknown, e: any) => ({ turnId: e.turnId }));
+    on('turn.complete', (_$: unknown, e: any) => ({ text: e.answer ?? '' }));
+
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
+    await launched($, 'job-ada');
+    await clock.advance(1000);
+    expect(prompts).toHaveLength(1);
+
+    Object.assign(files, ada('succeeded', { finishedAt: iso(RUNNING_NOW + 1000) }));
+    await settledRead($, 'job-ada');
+    releaseSubmit!();
+    await new Promise((r) => setTimeout(r, 20));
+
+    await clock.advance(1000);
+    expect(prompts).toHaveLength(1);
+  });
+
+  test('newer turn recorded and read while prior prompt.submit is in flight stays retired', async ($, on) => {
+    const files = ada('running', { startedAt: iso(RUNNING_NOW - 16 * 60_000), updatedAt: iso(RUNNING_NOW - 16 * 60_000) });
+    const ids = ['job-ada'];
+    const { clock } = forgeHost(on, files, ids);
+    let releaseSubmit: (() => void) | null = null;
+    const prompts: string[] = [];
+    on('fs.write', (_$: unknown, e: any) => { files[e.path] = e.text; return { value: undefined }; });
+    on('prompt.submit', async (_$: unknown, e: any) => {
+      prompts.push(e.text);
+      if (prompts.length === 1) {
+        await new Promise<void>((r) => { releaseSubmit = r; });
+      }
+      return { text: e.text };
+    });
+    on('turn.start', (_$: unknown, e: any) => ({ turnId: e.turnId }));
+    on('turn.complete', (_$: unknown, e: any) => ({ text: e.answer ?? '' }));
+
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
+    await $.tool.call({ tool: 'mcp__plugin_agent-smith_agent-smith__spawn_job', jobId: 'job-ada', workerId: 'w-ada', repo: '/work' });
+    await clock.advance(1000);
+    expect(prompts).toHaveLength(1);
+
+    Object.assign(files, canonicalJob('job-ada-2',
+      { status: 'succeeded', name: 'Ada', workerId: 'w-ada', provider: 'codex', role: 'review', continuedFrom: 'job-ada', finishedAt: iso(RUNNING_NOW + 1000), updatedAt: iso(RUNNING_NOW + 1000) },
+      { 'acceptance.json': JSON.stringify({ state: 'accepted', checks: [{ name: 'tests', ok: true }] }) }));
+    ids.push('job-ada-2');
+    await $.tool.call({ tool: 'mcp__plugin_agent-smith_agent-smith__follow_up', jobId: 'job-ada-2', workerId: 'w-ada', repo: '/work' });
+    await settledRead($, 'job-ada-2');
+    releaseSubmit!();
+    await new Promise((r) => setTimeout(r, 20));
+
+    await clock.advance(1000);
+    expect(prompts).toHaveLength(1);
   });
 });
 
@@ -1240,8 +1459,8 @@ describe('worker-first UI, inline prior turns, auto-follow, and O(active) idle p
     await $.command.run({ command: 'forge', args: 'links1' });
     const pane = await $.ui.mount(PANE_TARGET);
 
-    expect(await pane.find({ type: 'Text', text: '⏺ links1 · implement · gemini-4-neon-xhigh · 5s' })).toBeDefined();
-    expect(await pane.find({ type: 'Text', text: /agy/ })).toBeUndefined();
+    expect(await pane.find({ type: 'Text', text: '⏺ links1 · implement · 5s' })).toBeDefined();
+    expect(await pane.find({ type: 'Text', text: 'agy gemini-4-neon-xhigh' })).toBeDefined();
     expect(await pane.find({ type: 'Text', text: /turn 1/ })).toBeUndefined();
     expect(await pane.find({ type: 'Text', text: /Starting/ })).toBeUndefined();
     expect(await pane.find({ key: 'turn-job-single' })).toBeUndefined();
@@ -1306,7 +1525,8 @@ describe('worker-first UI, inline prior turns, auto-follow, and O(active) idle p
     await $.command.run({ command: 'forge', args: 'links2-neon' });
     const pane = await $.ui.mount(PANE_TARGET);
 
-    expect(await pane.find({ type: 'Text', text: '⏺ links2-neon · implement · gemini-4-neon-xhigh · turn 3 · 5s' })).toBeDefined();
+    expect(await pane.find({ type: 'Text', text: '⏺ links2-neon · implement · turn 3 · 5s' })).toBeDefined();
+    expect(await pane.find({ type: 'Text', text: 'agy gemini-4-neon-xhigh' })).toBeDefined();
     expect(await pane.find({ type: 'Text', text: /Starting/ })).toBeUndefined();
     const t1 = (await pane.find({ key: 'turn-job-l-1' })) as { props?: Record<string, unknown> } | undefined;
     const t2 = (await pane.find({ key: 'turn-job-l-2' })) as { props?: Record<string, unknown> } | undefined;
@@ -1457,5 +1677,129 @@ describe('worker-first UI, inline prior turns, auto-follow, and O(active) idle p
     await pane.press({ key: 'event-1' });
     expect(await pane.find({ key: 'end-event-1' })).toBeUndefined();
     expect(await pane.find({ key: 'gap-event-2' })).toBeDefined();
+  });
+
+  test('worker header shows provider alone when model is unknown and avoids duplicating prefixed model names', async ($, on) => {
+    const unknownModel = canonicalJob('job-no-model', { status: 'running', name: 'NoModel', workerId: 'no-model', role: 'implement', provider: 'agy', model: null });
+    const prefixedModel = canonicalJob('job-prefixed', { status: 'running', name: 'Prefixed', workerId: 'prefixed', role: 'review', provider: 'claude', model: 'claude-sonnet-4-5' });
+    forgeHost(on, { ...unknownModel, ...prefixedModel }, ['job-no-model', 'job-prefixed']);
+    await start($);
+    await launch($, 'job-no-model');
+    await launch($, 'job-prefixed');
+    await $.command.run({ command: 'forge', args: 'NoModel' });
+    const pane = await $.ui.mount(PANE_TARGET);
+    expect(await pane.find({ type: 'Text', text: /NoModel · implement · 5s/ })).toBeDefined();
+    expect(await pane.find({ type: 'Text', text: 'agy' })).toBeDefined();
+    await $.command.run({ command: 'forge', args: 'Prefixed' });
+    expect(await pane.find({ type: 'Text', text: /Prefixed · review · 5s/ })).toBeDefined();
+    expect(await pane.find({ type: 'Text', text: 'claude-sonnet-4-5' })).toBeDefined();
+    expect(await pane.find({ type: 'Text', text: /claude claude-sonnet-4-5/ })).toBeUndefined();
+  });
+
+  test('transcript-gap adds one blank line when timeline has rows, none when empty, and does not double before prose', async ($, on) => {
+    const emptyFiles = canonicalJob('job-empty', { status: 'running', name: 'Empty', workerId: 'empty', role: 'implement', provider: 'codex', model: 'gpt-6' }, {
+      'view.json': JSON.stringify({ schema: 1, prompt: 'Do it', preamble: '', truncated: false, tools: [], transcript: [], timeline: [] }),
+    });
+    const proseFiles = canonicalJob('job-prose', { status: 'running', name: 'Prose', workerId: 'prose', role: 'implement', provider: 'codex', model: 'gpt-6' }, {
+      'view.json': JSON.stringify({
+        schema: 1, prompt: 'Do it', preamble: '', truncated: false, tools: [], transcript: [],
+        timeline: [{ sequence: 1, kind: 'assistant', at: iso(RUNNING_NOW - 1000), text: 'First thought.' }],
+      }),
+    });
+    forgeHost(on, { ...emptyFiles, ...proseFiles }, ['job-empty', 'job-prose']);
+    await start($);
+    await launch($, 'job-empty');
+    await launch($, 'job-prose');
+    await $.command.run({ command: 'forge', args: 'Empty' });
+    const pane = await $.ui.mount(PANE_TARGET);
+    expect(await pane.find({ key: 'transcript-gap' })).toBeUndefined();
+    expect(await pane.find({ type: 'Text', text: 'No worker activity recorded yet.' })).toBeDefined();
+    await $.command.run({ command: 'forge', args: 'Prose' });
+    expect(await pane.find({ key: 'transcript-gap' })).toBeDefined();
+    expect(await pane.find({ key: 'gap-event-1' })).toBeUndefined();
+    expect((await pane.findAll({ key: 'transcript-gap' })).length).toBe(1);
+  });
+
+  test('worker header checks label: silent while worker runs with checks defined, checking while running, verdict when done', async ($, on) => {
+    const files = canonicalJob('job-chk', { status: 'running', name: 'Chk', workerId: 'chk', role: 'implement', provider: 'agy', model: 'gemini-4-hydrogen' }, {
+      'acceptance.json': JSON.stringify({ state: 'unchecked', pending: true, checks: [] }),
+    });
+    const { clock } = forgeHost(on, files, ['job-chk']);
+    await start($);
+    await $.command.run({ command: 'forge', args: 'Chk' });
+    const pane = await $.ui.mount(PANE_TARGET);
+    expect(await pane.find({ type: 'Text', text: /Chk · implement · 5s$/ })).toBeDefined();
+    expect(await pane.find({ type: 'Text', text: 'agy gemini-4-hydrogen' })).toBeDefined();
+    expect(await pane.find({ type: 'Text', text: /checks running|checking/ })).toBeUndefined();
+
+    files['/work/.agent-smith/jobs/job-chk/job.json'] = JSON.stringify({
+      ...JSON.parse(files['/work/.agent-smith/jobs/job-chk/job.json']!),
+      status: 'succeeded', finishedAt: iso(RUNNING_NOW + 1000), updatedAt: iso(RUNNING_NOW + 1000),
+    });
+    files['/work/.agent-smith/jobs/job-chk/acceptance.json'] = JSON.stringify({ state: 'unchecked', pending: true, running: 'tests', checks: [] });
+    await clock.advance(1000);
+    expect(await pane.find({ type: 'Text', text: 'agy gemini-4-hydrogen · checks running' })).toBeDefined();
+
+    files['/work/.agent-smith/jobs/job-chk/acceptance.json'] = JSON.stringify({
+      state: 'accepted', pending: false, checks: [{ name: 'tests', ok: true, outputTail: '' }],
+    });
+    await clock.advance(1000);
+    expect(await pane.find({ type: 'Text', text: 'agy gemini-4-hydrogen · checks 1/1' })).toBeDefined();
+  });
+
+  test('three-line header renders running, finished, failed, and checks-running states', async ($, on) => {
+    const files: Record<string, string> = {
+      ...canonicalJob('job-s1', {
+        status: 'running', name: 'cleanup-058', workerId: 'w-s1', turn: 2, role: 'implement',
+        provider: 'agy', model: 'gemini-4-hydrogen', startedAt: iso(RUNNING_NOW - 113_000), pendingSteers: 1,
+      }, {
+        'progress.json': JSON.stringify({
+          lastEventAt: iso(RUNNING_NOW), toolCalls: 33,
+          digest: { phase: 'exploring', filesRead: 22, searches: 10, edited: [], editedCount: 0, commands: 0, testRuns: 1, lastTestFailed: false, repeat: null },
+        }),
+      }),
+      ...canonicalJob('job-s2', {
+        status: 'succeeded', name: 'arch-doc', workerId: 'w-s2', role: 'implement',
+        provider: 'agy', model: 'gemini-4-hydrogen', startedAt: iso(RUNNING_NOW - 24_000), finishedAt: iso(RUNNING_NOW),
+        changedFiles: ['README.md'],
+      }, {
+        'acceptance.json': JSON.stringify({
+          state: 'accepted', pending: false,
+          checks: [{ name: 'lint', ok: true, outputTail: '' }, { name: 'tests', ok: true, outputTail: '' }],
+        }),
+      }),
+      ...canonicalJob('job-s3', {
+        status: 'failed', name: 'final-kimi', workerId: 'w-s3', role: 'verify',
+        provider: 'kimi', model: 'k3.1-pro-highspeed', startedAt: iso(RUNNING_NOW - 5_000), finishedAt: iso(RUNNING_NOW),
+        error: '429 insufficient_quota',
+      }),
+      ...canonicalJob('job-s4', {
+        status: 'succeeded', name: 'links2', workerId: 'w-s4', turn: 3, role: 'implement',
+        provider: 'codex', model: 'gpt-6.2-sol', startedAt: iso(RUNNING_NOW - 240_000), finishedAt: iso(RUNNING_NOW),
+      }, {
+        'acceptance.json': JSON.stringify({ state: 'unchecked', pending: true, running: 'tests', checks: [] }),
+      }),
+    };
+    forgeHost(on, files, ['job-s1', 'job-s2', 'job-s3', 'job-s4']);
+    await start($);
+    for (const id of ['job-s1', 'job-s2', 'job-s3', 'job-s4']) await launch($, id);
+
+    await $.command.run({ command: 'forge', args: 'cleanup-058' });
+    const pane = await $.ui.mount(PANE_TARGET);
+    expect(await pane.find({ type: 'Text', text: '⏺ cleanup-058 · implement · turn 2 · 1m53s' })).toBeDefined();
+    expect(await pane.find({ type: 'Text', text: 'agy gemini-4-hydrogen · 1 queued' })).toBeDefined();
+    expect(await pane.find({ type: 'Text', text: 'Exploring · 22 files read · 10 searches · tests ran 1×' })).toBeDefined();
+
+    await $.command.run({ command: 'forge', args: 'arch-doc' });
+    expect(await pane.find({ type: 'Text', text: '✓ arch-doc · implement · 24s' })).toBeDefined();
+    expect(await pane.find({ type: 'Text', text: 'agy gemini-4-hydrogen · checks 2/2 · 1 file changed' })).toBeDefined();
+
+    await $.command.run({ command: 'forge', args: 'final-kimi' });
+    expect(await pane.find({ type: 'Text', text: '✗ final-kimi · verify · 5s' })).toBeDefined();
+    expect(await pane.find({ type: 'Text', text: 'kimi k3.1-pro-highspeed · out of credits' })).toBeDefined();
+
+    await $.command.run({ command: 'forge', args: 'links2' });
+    expect(await pane.find({ type: 'Text', text: '✓ links2 · implement · turn 3 · 4m' })).toBeDefined();
+    expect(await pane.find({ type: 'Text', text: 'codex gpt-6.2-sol · checks running' })).toBeDefined();
   });
 });

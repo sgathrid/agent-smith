@@ -100,7 +100,7 @@ test('the same call four times in a row is called out as repeating', () => {
   for (let i = 0; i < 3; i += 1) run(t, i, 'run_command', { CommandLine: 'git grep -n load_config' });
   assert.equal(t.digest().repeat, null);
   run(t, 3, 'run_command', { CommandLine: 'git grep -n load_config' });
-  assert.match(progressPhrase(t.digest(), 'git grep'), /^repeating git grep ×4/);
+  assert.match(progressPhrase(t.digest(), 'git grep'), /^4× in a row: git grep/);
 });
 
 test('the band phrase leads with what is happening, then edits, tests and reads', () => {
@@ -161,7 +161,7 @@ test('a tool call whose parameters never arrived is not called a repeat', () => 
   for (let i = 0; i < 17; i += 1) t.start(i, 'bash', i % 2 === 0 ? undefined : '');
   const d = t.digest();
   assert.equal(d.repeat, null);
-  assert.equal(/repeating/.test(progressPhrase(d, 'running a command')), false);
+  assert.equal(/in a row/.test(progressPhrase(d, 'running a command')), false);
   assert.equal(classify('bash', undefined).kind, 'command');
 });
 

@@ -17,7 +17,6 @@ export const EARLIER_TURNS_CAP = 5;
 const EARLIER_SUMMARY_CHARS = 120;
 const OUTPUT_TAIL_CHARS = 500;
 const DIFF_MAX_CHARS = 40_000;
-const DETAIL_HINT = 'use response_format: "detailed"';
 const flat = (s: string): string => s.replace(/\s+/g, ' ').trim();
 
 export type TaskStatus = 'working' | 'input_required' | 'completed' | 'failed' | 'cancelled';
@@ -101,6 +100,7 @@ export function conciseRow(j: JobSummary & { turn?: number; continuedFrom?: stri
         ? checkVerdicts(j.acceptance) : null,
       changedFileCount: typeof j.changedFileCount === 'number' && j.changedFileCount > 0 ? j.changedFileCount : null,
       warningCount: j.warnings.length || null,
+      resumable: j.status === 'failed' ? (j.resumable ?? Boolean((j as { conversation?: string | null }).conversation)) : null,
       ...evidence(j),
     });
   }
@@ -157,15 +157,15 @@ export function conciseStatus(d: JobDetail & { turn?: number; continuedFrom?: st
     pendingMessages: d.pendingSteers ? d.pendingSteers : null,
     changedFileCount: d.changedFiles && files.length > 0 ? files.length : null,
     changedFiles: files.length ? files.slice(0, CONCISE_FILES_CAP) : null,
-    changedFilesNote: files.length > CONCISE_FILES_CAP || d.changedFilesTruncated ? `First ${Math.min(files.length, CONCISE_FILES_CAP)} shown; ${DETAIL_HINT} or include_diff for all.` : null,
+    changedFilesNote: files.length > CONCISE_FILES_CAP || d.changedFilesTruncated ? `First ${Math.min(files.length, CONCISE_FILES_CAP)} of ${files.length}${d.changedFilesTruncated ? '+' : ''} shown.` : null,
     ...evidence(d),
     staleReads: d.staleReads?.length ? d.staleReads : null,
-    nextAction: d.nextAction,
+    resumable: running || d.status === 'succeeded' ? null : (d.resumable ?? Boolean(d.conversation)),
     reason: failedReason(d),
     error: d.error ? trimWords(d.error, 500) : null,
     warnings: warnings.length ? warnings : null,
     summary: summary && !report.includes(summary) ? trimWords(summary, 300) : null,
-    report: report ? (cut ? `${report.slice(0, CONCISE_REPORT_CHARS)}\n…[truncated: ${CONCISE_REPORT_CHARS} of ${report.length} chars; ${DETAIL_HINT} for more]` : report) : null,
+    report: report ? (cut ? `${report.slice(0, CONCISE_REPORT_CHARS)}\n…[truncated: ${CONCISE_REPORT_CHARS} of ${report.length} chars shown]` : report) : null,
     reportTruncated: cut || null,
     ...extra,
   });
@@ -291,8 +291,8 @@ export function conciseCapabilities(providers: readonly CapabilityProvider[], on
       ...(p.defaultModel ? { defaultModel: p.defaultModel } : {}),
       ...(p.defaultEffort ? { defaultEffort: p.defaultEffort } : {}),
       ...(efforts ? { efforts } : {}),
-      ...(listed ? { models: rows } : { modelCount: rows.length, more: `pass provider: "${p.name}" to list its ${rows.length} models` }),
-      ...(p.verified === false ? { unverified: 'model list unconfirmed; prefer a known model' } : {}),
+      ...(listed ? { models: rows } : { modelCount: rows.length, more: `0 of ${rows.length} models shown` }),
+      ...(p.verified === false ? { unverified: 'model list unconfirmed' } : {}),
       ...(p.stale ? { stale: true } : {}),
       ...(p.error ? { error: p.error } : {}),
     };

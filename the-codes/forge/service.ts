@@ -8,6 +8,7 @@ import { AgentSmithReader, SMITH_PAYLOAD } from '../harness/agent-smith.ts';
 import { readObservedJob } from '../harness/registry.ts';
 import type { ObservedJob } from '../harness/types.ts';
 import { getCatalogs, getHarnessDefaults } from '../providers/catalog.ts';
+import { effectiveUnrestricted } from '../providers/registry.ts';
 import type {
   JobResult,
   ModelCatalog,
@@ -137,9 +138,21 @@ function mergeOverrides(entries: readonly SteerEntry[]): MessageOverrides {
   return out;
 }
 
+function continuationModelAndEffort(
+  head: Pick<ForgeManifest, 'model' | 'modelResolved' | 'effort'>,
+  entries: readonly SteerEntry[],
+  spec?: Pick<TurnSpec, 'model' | 'effort'>,
+): { model: string | undefined; effort: string | undefined } {
+  const o = mergeOverrides(entries);
+  return {
+    model: o.model ?? spec?.model ?? head.model ?? head.modelResolved ?? undefined,
+    effort: o.effort ?? spec?.effort ?? head.effort ?? undefined,
+  };
+}
+
 function applyOverrides(spec: TurnSpec, o: MessageOverrides, provider: Provider): TurnSpec {
   if (Object.keys(o).length === 0) return spec;
-  const unrestricted = o.unrestricted === undefined ? spec.unrestricted : provider.defaultUnrestricted === 'always' ? true : o.unrestricted;
+  const unrestricted = effectiveUnrestricted(provider, o.unrestricted === undefined ? spec.unrestricted : o.unrestricted);
   return {
     ...spec,
     ...(o.model === undefined ? {} : { model: o.model, modelRequested: o.model, modelResolved: o.model, modelSource: 'requested' as const }),
@@ -337,11 +350,7 @@ export class ForgeService {
     const envKeys = env === undefined ? [] : Object.keys(env);
     const cwd = request.cwd ?? this.repo;
     const unrestrictedRequested = request.unrestricted;
-    const unrestricted = provider.defaultUnrestricted === 'always'
-      ? true
-      : unrestrictedRequested ?? (
-          provider.defaultUnrestricted === true && process.env['AGENT_SMITH_AGY_RESTRICTED'] !== '1'
-        );
+    const unrestricted = effectiveUnrestricted(provider, unrestrictedRequested);
     const warnings: string[] = [];
     const checked = await validateModelAndEffort(
       provider,
@@ -502,6 +511,7 @@ export class ForgeService {
         }`,
       sandbox,
       sandboxFlags,
+      ...(sandboxInfo?.unrestricted === undefined ? {} : { sandboxUnrestricted: sandboxInfo.unrestricted }),
       readOnlyRequested,
       readOnlyEnforced,
       modelRequested: request.model ?? null,
@@ -908,6 +918,7 @@ export class ForgeService {
     const context = [...entries].reverse().find((e) => e.context !== undefined)?.context ?? spec?.context;
     const checks = o.checks ?? spec?.checks ?? input.headChecks;
     const env = input.env !== undefined && Object.keys(input.env).length > 0 ? input.env : undefined;
+    const { model, effort } = continuationModelAndEffort(head, entries, spec);
     return {
       mode: spec?.mode ?? head.mode ?? 'task',
       prompt: rawPrompt,
@@ -916,8 +927,8 @@ export class ForgeService {
       workerId: head.workerId ?? head.jobId,
       task: taskTitle(entries[0]!.prompt) || head.task || undefined,
       cwd,
-      model: o.model ?? spec?.model ?? head.model ?? undefined,
-      effort: o.effort ?? spec?.effort ?? head.effort ?? undefined,
+      model,
+      effort,
       timeoutMs: o.timeoutMs ?? spec?.timeoutMs ?? head.timeoutMs,
       unrestricted: o.unrestricted ?? spec?.unrestricted ?? head.unrestricted,
       ...(context === undefined ? {} : { context }),
@@ -1244,7 +1255,7 @@ export class ForgeService {
   private assertResumable(head: ForgeManifest): void {
     if (typeof head.conversation === 'string' && head.conversation !== '') return;
     const name = head.name ?? head.jobId;
-    throw new Error(`"${name}" (${head.jobId}) has no saved conversation; spawn_job with from:"${name}" starts it fresh with the original brief.`);
+    throw new Error(`"${name}" (${head.jobId}) has no saved conversation to continue.`);
   }
 
   async followUp(request: FollowUpRequest): Promise<MessageAck> {
@@ -1310,8 +1321,20 @@ export class ForgeService {
       const resumable = (typeof head.conversation === 'string' && head.conversation !== '') ||
         (live !== undefined && live.writer.currentConversation() !== null);
       if (!resumable && entry.allowFresh !== true) {
-        throw new Error(`Cannot interrupt "${name}" (${headId}): no resumable conversation handle exists yet, so interrupting now would discard in-flight context and start fresh. Wait for a conversation ID, use follow_up, or pass allowFresh: true.`);
+        throw new Error(`Cannot interrupt "${name}" (${headId}): no resumable conversation handle exists yet, so interrupting now would discard in-flight context and start fresh (pass allowFresh: true to discard it).`);
       }
+    }
+    const provider = this.providerSafe(head.provider);
+    const { model: effectiveModel, effort: effectiveEffort } = continuationModelAndEffort(head, [...undeliveredEntries(this.repo, headId), entry]);
+    if (provider !== null) {
+      const checked = await validateModelAndEffort(
+        provider,
+        effectiveModel,
+        effectiveEffort,
+        checkCatalog ? async () => catalog : undefined,
+        entry.overrides?.unrestricted,
+      );
+      warnings.push(...checked.warnings);
     }
     const checksRunning = !running && this.checksPending(headId);
     appendSteerEntry(this.repo, headId, entry);
@@ -1337,17 +1360,6 @@ export class ForgeService {
     else if (!running) this.setSettledPending(headId, pending);
     const workerId = head.workerId ?? headId;
     const { ack: envAck } = this.resolveFollowUpEnv(workerId, headId, env, true, warnings);
-    const provider = this.providerSafe(head.provider);
-    if (provider !== null) {
-      const checked = await validateModelAndEffort(
-        provider,
-        entry.overrides?.model,
-        entry.overrides?.effort,
-        checkCatalog ? async () => catalog : undefined,
-        entry.overrides?.unrestricted,
-      );
-      warnings.push(...checked.warnings);
-    }
     const canDeliverLive = running
       && provider?.liveInput === true
       && !live?.interruptRequested
@@ -1388,13 +1400,15 @@ export class ForgeService {
     const workerId = head.workerId ?? head.jobId;
     const { ack: envAck, runEnv } = this.resolveFollowUpEnv(workerId, head.jobId, env, false, warnings);
     const provider = this.providerSafe(head.provider);
-    if (checkCatalog && (entry.overrides?.model !== undefined || (entry.overrides?.effort !== undefined && provider?.supportsEffort !== false))) {
-      warnings.push(...checkAgainstCatalog(head.provider, entry.overrides?.model, entry.overrides?.effort, catalog));
+    const pendingEntries = undeliveredEntries(this.repo, head.jobId);
+    const { model: effectiveModel, effort: effectiveEffort } = continuationModelAndEffort(head, [...pendingEntries, entry]);
+    if (checkCatalog && (effectiveModel !== undefined || (effectiveEffort !== undefined && provider?.supportsEffort !== false))) {
+      warnings.push(...checkAgainstCatalog(head.provider, effectiveModel, effectiveEffort, catalog));
     }
     const acceptance = readAcceptance(this.repo, head.jobId);
     const onDisk = readSteerEntries(this.repo, head.jobId).length;
     const request = this.continuationRequest({
-      head, provider: head.provider, entries: [...undeliveredEntries(this.repo, head.jobId), entry],
+      head, provider: head.provider, entries: [...pendingEntries, entry],
       verdict: verdictBlock(acceptance), env: runEnv, headChecks: this.headChecks(head.jobId), replacesHead: false,
     });
     const { ack } = await this.spawnTracked({ ...request, ownerChecks: true, lockHeldByCaller: true });
@@ -1432,7 +1446,7 @@ export class ForgeService {
     const known = { ...(vault ?? {}), ...(env ?? {}) };
     const runEnv = Object.keys(known).length > 0 ? known : undefined;
     const missing = this.envKeysOf(headId).filter((k) => !(k in known));
-    if (missing.length > 0) warnings.push(`env ${missing.join(', ')} not set: values live only in memory and were lost; pass env again.`);
+    if (missing.length > 0) warnings.push(`env ${missing.join(', ')} not set: values live only in memory and were lost.`);
     const ack: Pick<MessageAck, 'env' | 'envKeys'> = missing.length > 0 ? { env: 'dropped', envKeys: missing }
       : passed ? { env: 'set' } : runEnv !== undefined ? { env: 'kept' } : {};
     return { ack, ...(runEnv === undefined ? {} : { runEnv }) };
@@ -1571,10 +1585,8 @@ export class ForgeService {
       const workerId = m?.workerId ?? trimmed;
       return this.workerHeadId(workerId) ?? this.resolveTurn(trimmed);
     }
-    if (this.isSafeJobId(trimmed)) {
-      const byWorkerId = this.workerHeadId(trimmed);
-      if (byWorkerId !== null) return byWorkerId;
-    }
+    const byWorkerId = this.workerHeadId(trimmed);
+    if (byWorkerId !== null) return byWorkerId;
     return this.resolveName(trimmed);
   }
 
@@ -1611,13 +1623,32 @@ export class ForgeService {
   }
 
   async resolveWorkerHead(nameOrWorkerIdOrJobId: string): Promise<JobDetail> {
-    return this.numberedDetail(this.resolveWorkerHeadId(nameOrWorkerIdOrJobId));
+    return this.resolveStableDetail(this.resolveWorkerHeadId(nameOrWorkerIdOrJobId));
+  }
+
+  async resolveWorkerTarget(nameOrId: string): Promise<{ detail: JobDetail; isWorker: boolean }> {
+    const trimmed = nameOrId.trim();
+    if (this.isJobId(trimmed)) {
+      return { detail: await this.resolveStableDetail(this.resolveTurn(trimmed)), isWorker: false };
+    }
+    return { detail: await this.resolveWorkerHead(trimmed), isWorker: true };
   }
 
   async resolveWorker(nameOrId: string): Promise<JobDetail> {
-    const trimmed = nameOrId.trim();
-    if (this.isJobId(trimmed)) return this.numberedDetail(this.resolveTurn(trimmed));
-    return this.resolveWorkerHead(trimmed);
+    return (await this.resolveWorkerTarget(nameOrId)).detail;
+  }
+
+  private async resolveStableDetail(initialId: string): Promise<JobDetail> {
+    const seen = new Set<string>();
+    let id = initialId;
+    while (true) {
+      seen.add(id);
+      const d = await this.numberedDetail(id);
+      const next = d.supersededBy ?? this.resolveTurn(d.jobId);
+      if (!next || next === d.jobId || seen.has(next)) return d;
+      id = this.resolveTurn(next);
+      if (seen.has(id)) return d;
+    }
   }
 
   private async numberedDetail(jobId: string): Promise<JobDetail> {

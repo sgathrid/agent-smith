@@ -4,12 +4,12 @@ import path from 'node:path';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { ClientCapabilities, ElicitResult } from '@modelcontextprotocol/server';
-import { DECLINED_UNRESTRICTED, TOOL_DEFS, UNCONFIRMED_UNRESTRICTED, callTool, type HandlerContext } from '../tools.ts';
+import { DECLINED_UNRESTRICTED, TOOL_DEFS, UNCONFIRMED_UNRESTRICTED, callTool, slimAck, type HandlerContext } from '../tools.ts';
 import { withWorkerLookup } from './service-mock.ts';
 import { ForgeService } from '../../../../forge/service.ts';
 import { FILES, jobFile } from '../../../../forge/format.ts';
 
-delete process.env.AGENT_SMITH_CONFIRM_UNRESTRICTED;
+process.env.AGENT_SMITH_CONFIRM_UNRESTRICTED = '1';
 const FORM: ClientCapabilities = { elicitation: { form: {} } };
 const body = (r: { content: unknown }) => JSON.parse(((r.content as { text: string }[])[0]!).text);
 const text = (r: { content: unknown }) => ((r.content as { text: string }[])[0]!).text;
@@ -73,16 +73,19 @@ test('no elicitation capability: proceeds as before, with a warning in the ack',
   }
 });
 
-test('AGENT_SMITH_CONFIRM_UNRESTRICTED=0 disables the prompt and the warning', async () => {
+test('default (AGENT_SMITH_CONFIRM_UNRESTRICTED unset or not 1) launches restricted-by-default provider with unrestricted: true without asking or warning', async () => {
   const prior = process.env.AGENT_SMITH_CONFIRM_UNRESTRICTED;
-  process.env.AGENT_SMITH_CONFIRM_UNRESTRICTED = '0';
   try {
-    for (const caps of [FORM, {}]) {
-      const h = harness({ caps, action: 'decline' });
-      const r = await callTool(h.ctx, 'spawn_job', spawnArgs);
-      assert.equal(r.isError, undefined, text(r));
-      assert.equal(h.asked.length, 0); assert.equal(h.spawned[0]!.unrestricted, true);
-      assert.equal((body(r).warnings ?? []).includes(UNCONFIRMED_UNRESTRICTED), false);
+    for (const val of [undefined, '0'] as const) {
+      if (val === undefined) delete process.env.AGENT_SMITH_CONFIRM_UNRESTRICTED;
+      else process.env.AGENT_SMITH_CONFIRM_UNRESTRICTED = val;
+      for (const caps of [FORM, {}]) {
+        const h = harness({ caps, action: 'decline' });
+        const r = await callTool(h.ctx, 'spawn_job', spawnArgs);
+        assert.equal(r.isError, undefined, text(r));
+        assert.equal(h.asked.length, 0); assert.equal(h.spawned[0]!.unrestricted, true);
+        assert.equal((body(r).warnings ?? []).includes(UNCONFIRMED_UNRESTRICTED), false);
+      }
     }
   } finally {
     if (prior === undefined) delete process.env.AGENT_SMITH_CONFIRM_UNRESTRICTED; else process.env.AGENT_SMITH_CONFIRM_UNRESTRICTED = prior;
@@ -98,6 +101,152 @@ test('no prompt for agy, for unrestricted false or absent, or for an inherited s
   assert.equal((await callTool(h.ctx, 'follow_up', { worker: 'Ada', prompt: 'more' })).isError, undefined);
   assert.equal(h.asked.length, 0);
   assert.equal(h.spawned.length, 5);
+});
+
+test('follow_up binds to the resolved workerId before elicitation, not the original name', async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), 'smith-confirm-followup-id-'));
+  const followUpCalls: Array<Record<string, unknown>> = [];
+  let targetId = 'w-1111aaaa';
+  const service = withWorkerLookup({
+    repo,
+    messageTarget: async (ref: string) => ({
+      jobId: ref === 'Ada' && targetId === 'w-2222bbbb' ? 'job-2' : 'job-1',
+      workerId: targetId,
+      name: 'Ada',
+      provider: targetId === 'w-1111aaaa' ? 'codex' : 'claude',
+      cwd: repo,
+      status: 'succeeded',
+      mode: 'review',
+      unrestricted: false,
+    }),
+    followUp: async (r: Record<string, unknown>) => {
+      followUpCalls.push(r);
+      return { jobId: 'job-1', name: 'Ada', workerId: String(r.worker), turn: 2, action: 'started', delivery: 'now', status: 'running', provider: 'codex', repo, timeoutMs: 1_000 };
+    },
+  }) as never;
+  const server: HandlerContext['server'] = {
+    getClientCapabilities: () => FORM,
+    elicitInput: async () => {
+      targetId = 'w-2222bbbb';
+      return { action: 'accept' };
+    },
+  };
+  const ctx: HandlerContext = { service, catalogs: async () => [], server };
+  const r = await callTool(ctx, 'follow_up', { worker: 'Ada', prompt: 'more', unrestricted: true });
+  assert.equal(r.isError, undefined, text(r));
+  assert.equal(followUpCalls[0]!.worker, 'w-1111aaaa');
+});
+
+test('status with wait_ms follows the resolved workerId when the name is reused mid-wait', async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), 'smith-status-wait-id-'));
+  mkdirSync(jobFile(repo, 'job-a', FILES.job).replace(/\/[^/]+$/, ''), { recursive: true });
+  mkdirSync(jobFile(repo, 'job-b', FILES.job).replace(/\/[^/]+$/, ''), { recursive: true });
+  let reused = false;
+  const service = withWorkerLookup({
+    repo,
+    spawnedIds: [],
+    resolveTurn: (id: string) => id,
+    resolveWorker: async (ref: string) => {
+      if (ref === 'Ada' && reused) {
+        return { jobId: 'job-b', workerId: 'w-bbbb', name: 'Ada', status: 'succeeded', provider: 'codex', mode: 'review', cwd: repo, report: 'worker B report', unrestricted: false };
+      }
+      if (ref === 'w-aaaa' && reused) {
+        return { jobId: 'job-a', workerId: 'w-aaaa', name: 'Ada', status: 'succeeded', provider: 'codex', mode: 'review', cwd: repo, report: 'worker A report', unrestricted: false };
+      }
+      return { jobId: 'job-a', workerId: 'w-aaaa', name: 'Ada', status: 'running', provider: 'codex', mode: 'review', cwd: repo, report: null, unrestricted: false };
+    },
+    earlierTurns: async () => [],
+  }) as never;
+  const ctx: HandlerContext = { service, pollMs: 10 };
+  setTimeout(() => { reused = true; }, 15);
+  const r = await callTool(ctx, 'status', { id: 'Ada', wait_ms: 200, report_only: true });
+  assert.equal(r.isError, undefined, text(r));
+  assert.equal(body(r).jobId, 'job-a');
+  assert.equal(body(r).report, 'worker A report');
+});
+
+test('spawn_job variants use the provider, model and effort resolved before batch confirmation', async () => {
+  const repo = mkdtempSync(path.join(tmpdir(), 'smith-variants-frozen-'));
+  mkdirSync(path.join(repo, '.agent-smith'), { recursive: true });
+  const cfgPath = path.join(repo, '.agent-smith', 'models.json');
+  writeFileSync(cfgPath, JSON.stringify({
+    aliases: {
+      a: { provider: 'agy', model: 'm-agy' },
+      b: { provider: 'codex', model: 'm-codex' },
+    },
+  }));
+  const spawned: Array<Record<string, unknown>> = [];
+  const asked: string[] = [];
+  const service = withWorkerLookup({
+    repo,
+    spawnJob: async (r: Record<string, unknown>) => {
+      spawned.push(r);
+      return { jobId: `job-${spawned.length}`, name: r.name ?? 'w', provider: r.provider, modelResolved: r.model, timeoutMs: 1_000, unrestricted: r.unrestricted };
+    },
+  }) as never;
+  const server: HandlerContext['server'] = {
+    getClientCapabilities: () => FORM,
+    elicitInput: async (params) => {
+      asked.push(params.message);
+      writeFileSync(cfgPath, JSON.stringify({
+        aliases: {
+          a: { provider: 'claude', model: 'm-claude' },
+          b: { provider: 'codex', model: 'm-codex' },
+        },
+      }));
+      return { action: 'accept' };
+    },
+  };
+  const ctx: HandlerContext = { service, catalogs: async () => [], server };
+  const r = await callTool(ctx, 'spawn_job', {
+    mode: 'review',
+    prompt: 'check',
+    unrestricted: true,
+    variants: [{ name: 'va', model: 'a' }, { name: 'vb', model: 'b' }],
+  });
+  assert.equal(r.isError, undefined, text(r));
+  assert.equal(asked.length, 1);
+  assert.equal(spawned[0]!.provider, 'agy');
+  assert.equal(spawned[0]!.model, 'm-agy');
+  assert.equal(spawned[1]!.provider, 'codex');
+  assert.equal(spawned[1]!.model, 'm-codex');
+});
+
+test('AGENT_SMITH_AGY_RESTRICTED=1 requires confirmation for agy with unrestricted: true', async () => {
+  const prior = process.env.AGENT_SMITH_AGY_RESTRICTED;
+  process.env.AGENT_SMITH_AGY_RESTRICTED = '1';
+  try {
+    const h = harness({ caps: FORM, action: 'decline' });
+    const r = await callTool(h.ctx, 'spawn_job', { ...spawnArgs, provider: 'agy' });
+    assert.equal(r.isError, true);
+    assert.equal(text(r), DECLINED_UNRESTRICTED);
+    assert.equal(h.asked.length, 1);
+    assert.equal(h.spawned.length, 0);
+  } finally {
+    if (prior === undefined) delete process.env.AGENT_SMITH_AGY_RESTRICTED;
+    else process.env.AGENT_SMITH_AGY_RESTRICTED = prior;
+  }
+});
+
+test('run_pipeline confirmation names each stage effective workDir including continues inheritance', async () => {
+  const h = harness({ caps: FORM, action: 'decline' });
+  const stageDir = path.join(h.repo, 'sub-pkg');
+  const r = await callTool(h.ctx, 'run_pipeline', {
+    spec: {
+      name: 'p',
+      workDir: h.repo,
+      unrestricted: true,
+      stages: [
+        { name: 'a', provider: 'codex', workDir: 'sub-pkg', prompt: 'one' },
+        { name: 'b', provider: 'codex', continues: 'a', dependsOn: ['a'], prompt: 'two' },
+      ],
+    },
+  });
+  assert.equal(r.isError, true);
+  assert.equal(text(r), DECLINED_UNRESTRICTED);
+  assert.equal(h.asked.length, 1);
+  assert.ok(h.asked[0]!.includes(stageDir), `expected ${stageDir} in: ${h.asked[0]}`);
+  assert.ok(!h.asked[0]!.includes(`in ${h.repo}?`), `did not expect root ${h.repo} in: ${h.asked[0]}`);
 });
 
 test('the prompt names an unnamed worker generically and asks only after validation passes', async () => {
@@ -219,25 +368,64 @@ function hasUnrestrictedProperty(schema: unknown): boolean {
 }
 
 test('every launching tool in TOOL_DEFS enforces the unrestricted gate on an escalating request', async () => {
-  const launching = TOOL_DEFS.filter(t => t.annotations?.readOnlyHint === false && t.annotations?.openWorldHint === true);
-  assert.ok(launching.length >= 4);
-  const escalatingArgs: Record<string, (repo: string) => Record<string, unknown>> = {
-    spawn_job: () => spawnArgs,
-    follow_up: () => ({ worker: 'Ada', prompt: 'more', unrestricted: true }),
-    run_pipeline: (repo) => ({ spec: { name: 'p', workDir: repo, unrestricted: true, stages: [{ name: 'impl', provider: 'codex', role: 'implement', prompt: 'x' }] } }),
-  };
-  for (const def of launching) {
-    if (!(def.name in escalatingArgs)) {
-      assert.equal(hasUnrestrictedProperty(def.inputSchema), false, `launching tool ${def.name} accepts unrestricted but is not in escalatingArgs`);
-      continue;
+  const prior = process.env.AGENT_SMITH_CONFIRM_UNRESTRICTED;
+  process.env.AGENT_SMITH_CONFIRM_UNRESTRICTED = '1';
+  try {
+    const launching = TOOL_DEFS.filter(t => t.annotations?.readOnlyHint === false && t.annotations?.openWorldHint === true);
+    assert.ok(launching.length >= 4);
+    const escalatingArgs: Record<string, (repo: string) => Record<string, unknown>> = {
+      spawn_job: () => spawnArgs,
+      follow_up: () => ({ worker: 'Ada', prompt: 'more', unrestricted: true }),
+      run_pipeline: (repo) => ({ spec: { name: 'p', workDir: repo, unrestricted: true, stages: [{ name: 'impl', provider: 'codex', role: 'implement', prompt: 'x' }] } }),
+    };
+    for (const def of launching) {
+      if (!(def.name in escalatingArgs)) {
+        assert.equal(hasUnrestrictedProperty(def.inputSchema), false, `launching tool ${def.name} accepts unrestricted but is not in escalatingArgs`);
+        continue;
+      }
+      const h = harness({ caps: FORM, action: 'decline' });
+      const r = await callTool(h.ctx, def.name, escalatingArgs[def.name]!(h.repo));
+      assert.equal(r.isError, true, `${def.name} must refuse on declined gate`);
+      assert.equal(text(r), DECLINED_UNRESTRICTED, `${def.name} refusal message`);
+      assert.equal(h.asked.length, 1, `${def.name} must ask once`);
+      assert.equal(h.spawned.length, 0, `${def.name} must not spawn`);
+      const pipelinesDir = path.join(h.repo, '.agent-smith', 'pipelines');
+      assert.equal(existsSync(pipelinesDir) ? readdirSync(pipelinesDir).length : 0, 0, `${def.name} must not start a pipeline`);
     }
-    const h = harness({ caps: FORM, action: 'decline' });
-    const r = await callTool(h.ctx, def.name, escalatingArgs[def.name]!(h.repo));
-    assert.equal(r.isError, true, `${def.name} must refuse on declined gate`);
-    assert.equal(text(r), DECLINED_UNRESTRICTED, `${def.name} refusal message`);
-    assert.equal(h.asked.length, 1, `${def.name} must ask once`);
-    assert.equal(h.spawned.length, 0, `${def.name} must not spawn`);
-    const pipelinesDir = path.join(h.repo, '.agent-smith', 'pipelines');
-    assert.equal(existsSync(pipelinesDir) ? readdirSync(pipelinesDir).length : 0, 0, `${def.name} must not start a pipeline`);
+  } finally {
+    if (prior === undefined) delete process.env.AGENT_SMITH_CONFIRM_UNRESTRICTED; else process.env.AGENT_SMITH_CONFIRM_UNRESTRICTED = prior;
   }
+});
+
+test('AGENT_SMITH_CODEX_SANDBOX=read-only suppresses unrestricted escalation prompt', async () => {
+  const prior = process.env.AGENT_SMITH_CODEX_SANDBOX;
+  process.env.AGENT_SMITH_CODEX_SANDBOX = 'read-only';
+  try {
+    const h = harness({ caps: FORM, action: 'decline' });
+    const r = await callTool(h.ctx, 'spawn_job', spawnArgs);
+    assert.equal(r.isError, undefined, text(r));
+    assert.equal(h.asked.length, 0);
+  } finally {
+    if (prior === undefined) delete process.env.AGENT_SMITH_CODEX_SANDBOX; else process.env.AGENT_SMITH_CODEX_SANDBOX = prior;
+  }
+});
+
+test('slimAck omits sandbox on restricted agy even when description says auto-denied', () => {
+  const ack = slimAck({
+    jobId: 'j1',
+    name: 'a',
+    workerId: 'w1',
+    role: 'review',
+    provider: 'agy',
+    status: 'running',
+    dir: '/tmp',
+    repo: '/tmp',
+    timeoutMs: 1000,
+    unrestricted: false,
+    note: 'approvals on',
+    sandbox: 'agy proceed-in-sandbox (cannot prompt; unapproved tools are auto-denied)',
+    sandboxFlags: [],
+    sandboxUnrestricted: false,
+  } as never);
+  assert.equal('sandbox' in ack, false);
 });

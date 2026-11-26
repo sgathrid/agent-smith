@@ -27,6 +27,7 @@ import { DEFAULT_DISCOVERY_TIMEOUT_MS, errMessage, runCapture } from './discover
 import type { RunFn } from './discovery.ts';
 import { exitReason } from '../surfaces/mod/hooks/reasons.ts';
 import { deniedText, noResultText, stderrClause } from './failure-text.ts';
+import { createAnswer, emptyResponseVerdict, type Answer } from './answer.ts';
 
 export function agyBinary(): string {
   return process.env['AGENT_SMITH_AGY_BIN'] ?? 'agy';
@@ -134,12 +135,14 @@ export function sandboxPlan(spec: Pick<SpawnSpec, 'unrestricted' | 'readOnly'>):
       sandbox: 'agy --dangerously-skip-permissions (unrestricted)',
       flags: ['--dangerously-skip-permissions'],
       readOnlyEnforced: false,
+      unrestricted: true,
     };
   }
   return {
     sandbox: 'agy proceed-in-sandbox (cannot prompt; unapproved tools are auto-denied)',
     flags: [],
     readOnlyEnforced: false,
+    unrestricted: false,
   };
 }
 
@@ -277,8 +280,7 @@ export function recoveredNotice(final: JobResult, resultEvent: AgyResultEvent | 
 
 export function createAgyTranslator(maxChars: number) {
   const steps = new Map<number, StepMemory>();
-  const stepProse = new Map<number, string>();
-  let lastProseStep: number | undefined;
+  const answer = createAnswer('agy');
   const denials: DeniedAction[] = [];
   let sawErrorStep = false;
   let progressedAfterError = false;
@@ -326,10 +328,11 @@ export function createAgyTranslator(maxChars: number) {
       // --- agent prose / thinking --------------------------------------------
       if (stepType === 'agent_response') {
         const delta = su.text_delta;
-        if (delta !== undefined && delta !== '') {
-          stepProse.set(stepIndex, (stepProse.get(stepIndex) ?? '') + delta);
-          lastProseStep = stepIndex;
-          out.push({ kind: 'text', at, text: delta, stream: 'assistant', delta: true });
+        if (delta !== undefined) {
+          answer.text(delta, String(stepIndex));
+          if (delta !== '') {
+            out.push({ kind: 'text', at, text: delta, stream: 'assistant', delta: true });
+          }
         }
         return out;
       }
@@ -338,6 +341,7 @@ export function createAgyTranslator(maxChars: number) {
       if (stepType === 'tool') {
         const info = su.tool_info;
         const toolName = su.tool_name ?? info?.name ?? 'unknown';
+        answer.tool(toolName);
         const mem = steps.get(stepIndex) ?? {};
         steps.set(stepIndex, mem);
 
@@ -385,6 +389,7 @@ export function createAgyTranslator(maxChars: number) {
 
       // --- error_message: agy's own API/transport errors ----------------------
       if (stepType === 'error_message') {
+        answer.work();
         sawErrorStep = true;
         progressedAfterError = false;
         // agy's stream carries no error text here; the final result does.
@@ -419,10 +424,10 @@ export function createAgyTranslator(maxChars: number) {
 
   return {
     onEvent,
+    answer,
     denials,
     stepsWereTools: (): boolean => [...steps.values()].some((m) => m.tool !== undefined),
     errorIsStale,
-    finalText: (): string | undefined => (lastProseStep === undefined ? undefined : stepProse.get(lastProseStep)),
   };
 }
 
@@ -440,13 +445,14 @@ export function buildResult(args: {
   sawAnyToolCall: boolean;
   /** From the translator: agy's reported error predates this run's last progress. */
   errorIsStale: boolean;
-  finalText?: string;
+  answer: Answer;
 }): JobResult {
   const { jobId, resultEvent, exit, startedAtMs, stateDir, denials, sawAnyToolCall } = args;
   const { errorIsStale } = args;
   const durationMs = Date.now() - startedAtMs;
 
-  const response = args.finalText ?? resultEvent?.response ?? '';
+  args.answer.providerFinal(resultEvent?.response, 'run-prose');
+  const response = args.answer.value();
   const reportedStatus = resultEvent?.status;
   const usage = toTokenUsage(resultEvent?.usage);
 
@@ -501,11 +507,13 @@ export function buildResult(args: {
       status = 'error';
       error = resultEvent.error ?? 'worker error';
     }
-  } else if (response.trim() === '' && sawAnyToolCall) {
-    status = 'denied';
-    error = `no output${stderrClause(exit.stderr)}`;
   } else {
-    status = 'success';
+    const empty = emptyResponseVerdict(response, exit.stderr, { status: sawAnyToolCall ? 'denied' : 'malformed' });
+    if (empty !== undefined) {
+      ({ status, error } = empty);
+    } else {
+      status = 'success';
+    }
   }
 
   // Exit code is corroboration, not the decision. A non-zero exit with a
@@ -616,7 +624,7 @@ export const agyProvider: Provider = {
           denials: translator.denials,
           sawAnyToolCall: translator.stepsWereTools(),
           errorIsStale: translator.errorIsStale(),
-          finalText: translator.finalText(),
+          answer: translator.answer,
         }),
       afterResult(final) {
         const recovered = recoveredNotice(final, resultEvent);

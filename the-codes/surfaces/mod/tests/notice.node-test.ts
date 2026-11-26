@@ -441,7 +441,7 @@ test('claims follow the worker: a follow-up or steer ack extends the one claim, 
     assert.equal(owned.length, 1, 'one claim per worker');
   }
 
-  const settled = parseSettledRead(`${PLUGIN}status`, { jobId: 'turn-1', workerId: 'ada', status: 'succeeded' });
+  const settled = parseSettledRead(`${PLUGIN}status`, { jobId: 'turn-1', workerId: 'ada', status: 'succeeded', acceptance: { state: 'accepted', pending: false } });
   assert.deepEqual(settled, { kind: 'job', id: 'turn-1', workerId: 'ada' });
   assert.deepEqual(unclaim(owned, settled!).map((o) => [o.id, o.readHead]), [['turn-2', 'turn-1']]);
 
@@ -514,7 +514,7 @@ describe('one notice per idle transition', () => {
   test("a settled read of an earlier turn while a follow-up runs does not swallow the worker's notice", () => {
     let owned = claim([], spawn, NOW);
     owned = due(owned, [done('t1', 1, { followedBy: 't2' }), ada('t2', 2)], new Map(), NOW + 3000).owned;
-    owned = unclaim(owned, parseSettledRead(`${PLUGIN}status`, { jobId: 't1', workerId: 'ada', status: 'succeeded' })!);
+    owned = unclaim(owned, parseSettledRead(`${PLUGIN}status`, { jobId: 't1', workerId: 'ada', status: 'succeeded', acceptance: { state: 'accepted', pending: false } })!);
     const r = due(owned, [done('t1', 1, { followedBy: 't2' }), done('t2', 2)], new Map(), NOW + 5000);
     assert.deepEqual(r.notices.map((n) => n.id), ['t2']);
     const again = unclaim(claim([], spawn, NOW), { kind: 'job', id: 't1', workerId: 'ada' });
@@ -524,7 +524,7 @@ describe('one notice per idle transition', () => {
   test('a new turn started after a settled read moves the claim to it: no range for the turn already read', () => {
     let owned = claim([], spawn, NOW);
     owned = due(owned, [ada('t1', 1)], new Map(), NOW + 500).owned;
-    owned = unclaim(owned, parseSettledRead(`${PLUGIN}status`, { jobId: 't1', workerId: 'ada', status: 'succeeded' })!);
+    owned = unclaim(owned, parseSettledRead(`${PLUGIN}status`, { jobId: 't1', workerId: 'ada', status: 'succeeded', acceptance: { state: 'accepted', pending: false } })!);
     owned = claim(owned, parseLaunch(`${PLUGIN}follow_up`, { jobId: 't2', workerId: 'ada', status: 'running', action: 'started', turn: 2, repo: '/repo' })!, NOW + 2000);
     assert.deepEqual(owned.map((o) => [o.id, o.fromTurn, o.readHead]), [['t2', undefined, undefined]]);
     const r = due(owned, [done('t1', 1, { followedBy: 't2' }), done('t2', 2, { continuationKind: 'follow-up' })], new Map(), NOW + 5000);
@@ -566,9 +566,31 @@ test('owned pipeline reports a stalled stage once while the pipeline keeps runni
   assert.deepEqual(due(first.owned, jobs, runs, NOW + 1).notices, []);
 });
 
-test('failure notice includes the provider diagnostic rather than only its category', () => {
+test('failure notice uses classified reason when known and falls back to raw excerpt when unclassified', () => {
+  const kimi = noticeFromRadar(row({
+    id: 'kimi-1',
+    name: 'final-kimi',
+    provider: 'kimi',
+    role: 'verify',
+    status: 'failed',
+    startedAt: NOW - 5_000,
+    endedAt: NOW,
+    failureReason: 'out of credits',
+    failureDetail: 'exited 1 · stderr: error: failed to run prompt: provider.api_error: 429 Your account org-123 key-456 is suspended due to insufficient balance, please recharge your account or check your plan and billing details See log: /tmp/kimi.log',
+  }), 'failed', NOW);
+  assert.equal(headline(kimi), '✗ final-kimi (kimi verify) · failed: out of credits · 5s');
+
   const n = noticeFromRadar(row({ id: 'quota', status: 'failed', failureReason: 'out of credits', failureDetail: 'HTTP 402: payment required for opencode/deepseek' }), 'failed', NOW);
-  assert.match(claudeText([n]), /402: payment required/);
+  assert.match(claudeText([n]), /out of credits/);
+  assert.doesNotMatch(claudeText([n]), /402: payment required/);
+
+  const raw = noticeFromRadar(row({
+    id: 'unknown',
+    status: 'failed',
+    failureReason: 'worker error',
+    failureDetail: 'upstream gateway returned an unexpected opaque payload from node-7',
+  }), 'failed', NOW);
+  assert.match(claudeText([raw]), /upstream gateway returned an unexpected opaque payload from node-7/);
 });
 
 test('parseLaunches yields one launch per started variant and skips failed or terminal items', () => {
@@ -650,4 +672,8 @@ describe('refusesStatusWait', () => {
     const twins = [row('job-1', 'running'), row('job-2', 'running', { workerId: 'w-2' })];
     assert.equal(refusesStatusWait(own(), twins, 'links1-neon'), false);
   });
+});
+
+test('parseSettledRead returns null when status omits acceptance', () => {
+  assert.equal(parseSettledRead(`${PLUGIN}status`, { jobId: 'j1', status: 'succeeded' }), null);
 });

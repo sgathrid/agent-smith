@@ -67,7 +67,7 @@ Only variables the code reads.
 | `AGENT_SMITH_STATE_DIR` | `providers/ndjson.ts` | `~/.agent-smith/state` | Provider state root used only when a spawn gives no `stateDir`. The forge always passes the job directory, so MCP/CLI jobs do not use it. |
 | `AGENT_SMITH_TASKS` | `surfaces/channel/src/mcp.ts` | unset (`0`) | `1` advertises `extensions['io.modelcontextprotocol/tasks']` on modern (`2026-07-28`) connections and registers `tasks/get`, `tasks/update` and `tasks/cancel`, returning `resultType: 'task'` for `spawn_job`/`follow_up` requests that advertise client Tasks support. |
 | `AGENT_SMITH_NO_CATALOG_WARMUP` | `surfaces/channel/src/server.ts` | unset | `1` skips the background model discovery the MCP server starts at launch. The first spawn that names a model then waits up to `CATALOG_COLD_WAIT_MS` for a cold catalog, unless a fresh `.agent-smith/catalogs/<provider>.json` already holds it. |
-| `AGENT_SMITH_CONFIRM_UNRESTRICTED` | `surfaces/channel/src/tools.ts` | enabled | `0` stops `spawn_job`/`follow_up`/`run_pipeline` asking the user to confirm an explicit `unrestricted: true` for codex, claude or opencode, and drops the "not confirmed" ack warning. For automation with no one to answer. |
+| `AGENT_SMITH_CONFIRM_UNRESTRICTED` | `surfaces/channel/src/tools.ts` | unset | `1` makes `spawn_job`/`follow_up`/`run_pipeline` ask the user to confirm an explicit `unrestricted: true` for codex, claude or opencode (or warn when the client cannot prompt). Unset or any other value honours `unrestricted: true` without a prompt or warning. |
 | `HOME`, `PATH` | `discovery.ts`, `ndjson.ts` | process env | `HOME` roots the default config dirs; `PATH` is probed for provider binaries (cached per binary+PATH). |
 
 Repo selection: the MCP server takes a positional repo path, else its process cwd.
@@ -162,7 +162,7 @@ includes `io.modelcontextprotocol/tasks`, `spawn_job` and `follow_up` return a p
 (`resultType: 'task'`, 24 h `ttlMs`) backed by `<repo>/.agent-smith/tasks/` and served via `tasks/get`,
 `tasks/update` and `tasks/cancel`.
 
-Confirming `unrestricted`: an explicit `unrestricted: true` on `spawn_job`, `follow_up` or `run_pipeline` for providers without `defaultUnrestricted` (codex, claude, opencode) asks the user first via MCP form elicitation ("Allow codex worker "Ada" to run without approval prompts in <cwd>? It will be able to run any command."; `run_pipeline` asks once per run, naming the stage or stages). Accept launches; decline, cancel or no answer within 10 minutes returns `isError` (`The user declined unrestricted access; rerun without unrestricted, or ask the user.`) and launches nothing. A client without form elicitation gets the launch as before plus an ack warning that it was not confirmed. Never asked for providers with `defaultUnrestricted` (agy, kimi), for `unrestricted: false` or absent, for a setting `follow_up` inherits, or with `AGENT_SMITH_CONFIRM_UNRESTRICTED=0`.
+Confirming `unrestricted`: by default (`AGENT_SMITH_CONFIRM_UNRESTRICTED` unset or not `1`), an explicit `unrestricted: true` is honoured without a confirmation prompt or warning. When `AGENT_SMITH_CONFIRM_UNRESTRICTED=1`, an explicit `unrestricted: true` on `spawn_job`, `follow_up` or `run_pipeline` for providers without `defaultUnrestricted` (codex, claude, opencode) asks the user first via MCP form elicitation ("Allow codex worker "Ada" to run without approval prompts in <cwd>? It will be able to run any command."; `run_pipeline` asks once per run, naming the stage or stages). Accept launches; decline, cancel or no answer within 10 minutes returns `isError` (`The user declined unrestricted access; rerun without unrestricted, or ask the user.`) and launches nothing. A client without form elicitation gets the launch with an ack warning (`unrestricted not confirmed: this client cannot prompt the user.`). Never asked for providers with `defaultUnrestricted` (agy, kimi), for `unrestricted: false` or absent, or for a setting `follow_up` inherits.
 
 ### `list_capabilities` (read-only, structured)
 Params: `refresh` boolean (default false; bypass the catalog cache), `provider` (only that
@@ -196,7 +196,7 @@ roleDefaults}`, `aliasConfigErrors?`, `modes[{name,description,readOnly,runsComm
 | `provider` | enum | default: alias/roleDefault provider, else the only installed provider; with several installed the call fails with `provider is required: installed are …` |
 | `model`, `effort` | string, enum | optional; validated against a fresh catalog, otherwise warnings only |
 | `timeoutMs` | integer >= 1 | default 2 700 000, clamped 1 000 to 21 600 000 |
-| `unrestricted` | boolean | default true for agy; always true for kimi (it cannot be restricted); false for other providers; `true` for codex, claude or opencode asks the user to confirm (above) |
+| `unrestricted` | boolean | default true for agy; always true for kimi (it cannot be restricted); false for other providers; when `AGENT_SMITH_CONFIRM_UNRESTRICTED=1`, `true` for codex, claude or opencode asks the user to confirm (above) |
 | `cwd` | string | absolute existing directory; default server repo; checks resolve against it |
 | `files` | array | relative paths of brief/spec files in `repo` (max 32 files, 4 MiB total; symlinks escaping `repo` are rejected); copied into `cwd` when `cwd !== repo`, excluded from `changedFiles` unless modified by the worker, and watched for `staleReads` |
 | `conversation` | string | native conversation handle to resume |
@@ -261,12 +261,12 @@ or relative `30m`/`2h`/`1d`; jobs last active at or after it), `session` (only j
 process; empty after a restart), `response_format` `concise|detailed` (default `concise`). Groups by `workerId` by default (one row per worker, selecting the head turn). Running first,
 then newest.
 Concise rows (compact JSON):
-- Settled: `name, jobId, turn` (only if `> 1`), `status, provider, model, mode, summary` (<= 160 chars), `durationMs, finishedAt, acceptance` (verdict), `changedFileCount` (only if `> 0`), `warningCount?`, and finish evidence fields when they apply (`toolErrors, failedEarly, changedFilesUnknown, cwdMissingAtFinish`).
+- Settled: `name, jobId, turn` (only if `> 1`), `status, provider, model, mode, summary` (<= 160 chars), `durationMs, finishedAt, acceptance` (verdict), `changedFileCount` (only if `> 0`), `warningCount?`, `resumable` (on `failed` rows), and finish evidence fields when they apply (`toolErrors, failedEarly, changedFilesUnknown, cwdMissingAtFinish`).
 - Running: `name, jobId, turn` (only if `> 1`), `status, provider, model, mode, liveness, lastActivity, digest, elapsedMs, toolCalls, pendingMessages?`.
 Concise rows omit `workerId`, `taskStatus`, `chainStartedAt`, `startedAt` (settled), `continuedFrom`, `continuationKind`, `supersededBy`, and `followedBy`.
 Detailed rows (`JobSummary`): `jobId, name, workerId, turn, role, latestSummary, summarySource,
 source, status, taskStatus, provider, mode, model, task, toolCalls, currentActivity, lastActivity, startedAt,
-updatedAt, finishedAt, chainStartedAt?, continuedFrom?, continuationKind?, supersededBy?, followedBy?, pendingMessages?, warnings[], nextAction, unrestricted?`, the same evidence fields,
+updatedAt, finishedAt, chainStartedAt?, continuedFrom?, continuationKind?, supersededBy?, followedBy?, pendingMessages?, warnings[], resumable?, unrestricted?`, the same evidence fields,
 `lastEventAt`, `lastAliveAt`, and for running jobs `liveness`. `latestSummary` is
 untrusted: the worker's current message while it runs, the head of its final response (after any leading `Status:` line) once done.
 
@@ -278,7 +278,7 @@ Concise result: `jobId, workerId, name, turn` (only if `> 1`), `status, provider
 `supersededBy?` (only if set), `resolvedFrom?` (only if set), `liveness` and `lastActivity` (running jobs),
 `durationMs, pendingMessages?`, `changedFileCount`, `changedFiles` (first 20), `changedFilesNote?`,
 finish evidence fields (`toolErrors, failedEarly, changedFilesUnknown, cwdMissingAtFinish`), `staleReads?`,
-`nextAction`, `reason`, `error` (<= 500 chars), `warnings` (deduped strings),
+`resumable` (when not running and not succeeded), `reason`, `error` (<= 500 chars), `warnings` (deduped strings),
 `earlierTurns` (`[{turn, jobId, status, summary (<= 120 chars)}]`), `report`
 (first 2 000 chars; a trailing note says it was cut and `reportTruncated` is true), `reportPath`,
 `summary` only when the report does not already contain it, and with `wait_ms`: `waited`, `stillRunning`. Null fields are omitted.
@@ -297,7 +297,7 @@ event.
 
 Finish evidence, present only when true or nonzero: `toolErrors` (tool calls that ended in an
 error; a warning, not a verdict), `failedEarly` (failed before any tool call: model, region or
-account; `error` keeps the provider text and `nextAction` suggests another route),
+account; `error` keeps the provider text),
 `changedFilesUnknown` (changed files could not be computed, so a missing `changedFiles` means
 unknown, not none), `cwdMissingAtFinish` (the cwd was gone at finish; a writing job then fails
 with reason `working directory gone`).

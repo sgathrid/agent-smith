@@ -3,7 +3,7 @@
  *
  * One spelling per case, so every provider fails in the same words. Detail that
  * only a developer needs (event-shape gaps, flag advice) belongs in code
- * comments; advice for the orchestrator is nextActionFor's job (forge/format.ts).
+ * comments; failure classification is reasonFromText's job (surfaces/mod/hooks/reasons.ts).
  */
 
 const STDERR_TAIL_CHARS = 300;

@@ -25,6 +25,10 @@ test('old prose maps to the same short reasons', () => {
     ['insufficient_quota: You exceeded your current quota', 'out of credits'],
     ['insufficient_quota', 'out of credits'],
     ['quota exhausted', 'out of credits'],
+    ['exited 1 · stderr: error: failed to run prompt: provider.api_error: 429 Your account org-123 key-456 is suspended due to insufficient balance, please recharge your account or check your plan and billing details See log: /tmp/kimi.log', 'out of credits'],
+    ['429 Your account is suspended, please recharge your account', 'out of credits'],
+    ['provider.api_error: 429 balance exhausted, please recharge', 'out of credits'],
+    ['429 account suspended due to unpaid billing', 'out of credits'],
     ['429 Too Many Requests', 'rate limited'],
     ["error: unexpected argument '--effort' found", 'bad flag or model'],
     ['spawn codex ENOENT', "couldn't start"],
@@ -48,4 +52,18 @@ test('a stored reason keeps its count when read back', () => {
 test('an unavailable file or model is not a busy provider', () => {
   assert.notEqual(reasonFromText('file unavailable: /w/x.py'), 'provider busy');
   assert.equal(reasonFromText('503 Service Unavailable'), 'provider busy');
+});
+
+test('provider API access errors are not tool denials, while tool permission denials are', () => {
+  assert.equal(reasonFromText('Access denied'), 'Access denied');
+  assert.equal(reasonFromText('403 Permission denied'), '403 Permission denied');
+  assert.equal(reasonFromText('HTTP 403 Permission denied for /v1/messages'), 'worker error');
+  assert.match(reasonFromText('permission check failed for command rm: user denied permission to run command'), /^denied\b/);
+  assert.match(reasonFromText('auto-denied by permission policy'), /^denied\b/);
+});
+
+test('quota outranks timeout consistently', () => {
+  assert.equal(reasonFromText('quota exhausted; request timed out'), 'out of credits');
+  assert.equal(reasonFromText('RESOURCE_EXHAUSTED: insufficient balance'), 'out of credits');
+  assert.equal(reasonFromText('HTTP 402: Upstream request failed: Insufficient account funds'), 'out of credits');
 });

@@ -114,6 +114,18 @@ test('CLI run uses the canonical forge, records a pipeline, and resumes a named 
     assert.match(out, /role\s+implement/);
     assert.match(out, /task\s+Make a small change/);
     assert.match(out, /summary\s+\[worker\]/);
+
+    out = '';
+    const byNameCode = await cmdStatus('Ada', repo);
+    assert.equal(byNameCode, 0);
+    assert.match(out, new RegExp(`id\\s+${grouped[0]!.jobId}`));
+    assert.match(out, /name\s+Ada/);
+
+    out = '';
+    err = '';
+    const byWorkerIdCode = await cmdStatus(first.workerId, repo);
+    assert.equal(byWorkerIdCode, 0, err);
+    assert.match(out, new RegExp(`id\\s+${grouped[0]!.jobId}`));
   } finally {
     process.stdout.write = stdout;
     process.stderr.write = stderr;

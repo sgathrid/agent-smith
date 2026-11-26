@@ -37,7 +37,6 @@ function makeSummary(i: number, extra: Partial<JobSummary> = {}): JobSummary {
     updatedAt: isoAgo(15_000),
     finishedAt: isoAgo(15_000),
     warnings: [],
-    nextAction: null,
     ...extra,
   };
 }
@@ -192,9 +191,10 @@ test('conciseStatus + earlierTurn: 4-turn status overhead (report text excluded)
 });
 
 test('conciseStatus: a failed turn keeps why it failed; a running turn keeps liveness', () => {
-  const failed = conciseStatus(makeDetail(9, { status: 'failed', error: 'provider exited 1: auth expired', warnings: [{ code: 'tool_error', message: 'auth expired' }], nextAction: 'Re-authenticate, then follow_up.' }), null) as Record<string, unknown>;
+  const failed = conciseStatus(makeDetail(9, { status: 'failed', error: 'provider exited 1: auth expired', warnings: [{ code: 'tool_error', message: 'auth expired' }], conversation: 'conv-9' }), null) as Record<string, unknown>;
   assert.ok(typeof failed.error === 'string' && (failed.error as string).includes('auth expired'));
-  assert.equal(failed.nextAction, 'Re-authenticate, then follow_up.');
+  assert.equal(failed.reason, 'exit 1');
+  assert.equal(failed.resumable, true);
   assert.equal(failed.provider, 'codex');
   const running = conciseStatus(makeDetail(10, { status: 'running', finishedAt: null, lastEventAt: isoAgo(5_000), lastAliveAt: isoAgo(2_000), lastActivity: { stepIndex: 3, tool: 'Edit', input: 'a.ts', status: 'active' } }), null, {}, NOW) as Record<string, unknown>;
   assert.ok(running.liveness, 'running status carries liveness');

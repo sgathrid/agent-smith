@@ -6,11 +6,13 @@ import path from 'node:path';
 import { test } from 'node:test';
 
 import type { JobResult, ModelCatalog, Provider, SpawnSpec } from '../../providers/types.ts';
+import { buildArgv as buildCodexArgv, sandboxPlan as codexSandboxPlan } from '../../providers/codex.ts';
+import { slimAck } from '../../surfaces/channel/src/tools.ts';
 import { buildBrief } from '../brief.ts';
 import { MODE_PRESETS } from '../modes.ts';
 import { ForgeService } from '../service.ts';
 import { scaled, waitFor } from '../testing/time.ts';
-import { withDefaultProvider } from '../testing/steer-harness.ts';
+import { controlledProvider, withDefaultProvider } from '../testing/steer-harness.ts';
 
 interface Fake {
   provider: Provider;
@@ -407,7 +409,7 @@ test('a provider without per-run effort control records no effort and warns', as
   (fake.provider as Provider & { supportsEffort?: boolean }).supportsEffort = false;
   const { service } = svc(fake);
   const ack = await service.spawnJob({ mode: 'implement', prompt: 'x', effort: 'high' });
-  assert.ok(ack.warnings?.some((w) => /has no per-run effort flag/.test(w)));
+  assert.equal(ack.warnings?.find((w) => /has no per-run effort flag/.test(w)), 'kimi has no per-run effort flag; effort "high" was ignored.');
   const job = JSON.parse(readFileSync(path.join(ack.dir, 'job.json'), 'utf8'));
   assert.equal(job.effort, null, 'an effort that was not applied must not be recorded as if it was');
   assert.equal(fake.specs[0]?.effort, undefined, 'the adapter is not asked to honor an impossible knob');
@@ -488,4 +490,44 @@ test('warmCatalogs discovers once in the background and a spawn joins it instead
   const rejecting = new ForgeService({ repo, providerSource: () => f.provider, catalogSource: async () => { throw new Error('boom'); } });
   rejecting.warmCatalogs();
   await new Promise(r => setImmediate(r));
+});
+
+test('AGENT_SMITH_CODEX_SANDBOX=danger-full-access keeps unrestricted: false as the request and removing it restores restricted on follow_up', async () => {
+  const prior = process.env['AGENT_SMITH_CODEX_SANDBOX'];
+  process.env['AGENT_SMITH_CODEX_SANDBOX'] = 'danger-full-access';
+  try {
+    const ctrl = controlledProvider();
+    const provider: Provider = {
+      ...ctrl.provider,
+      name: 'codex',
+      describeSandbox: (s) => codexSandboxPlan(s),
+    };
+    const { service, repo } = svc({ provider, specs: [] });
+    const turn1Ready = ctrl.nextTurn();
+    const { ack, done } = await service.spawnTracked({ mode: 'implement', prompt: 'x', provider: 'codex', unrestricted: false });
+    const turn1 = await turn1Ready;
+    turn1.emit({ kind: 'started', at: new Date().toISOString(), conversationId: 't-1' });
+    assert.equal(ack.unrestricted, false);
+    assert.match(ack.sandbox, /danger-full-access/);
+    assert.match(String(slimAck(ack).sandbox ?? ''), /danger-full-access/);
+    const manifest = JSON.parse(readFileSync(path.join(repo, '.agent-smith/jobs', ack.jobId, 'job.json'), 'utf8')) as { unrestricted: boolean };
+    assert.equal(manifest.unrestricted, false);
+
+    delete process.env['AGENT_SMITH_CODEX_SANDBOX'];
+    await service.followUp({ worker: ack.jobId, prompt: 'continue' });
+    const turn2Ready = ctrl.nextTurn();
+    turn1.finish({ status: 'success', response: 'ok' });
+    const turn2 = await turn2Ready;
+    assert.equal(turn2.spec.unrestricted, false);
+    const argv2 = buildCodexArgv({ ...turn2.spec, conversation: 't-1' });
+    assert.ok(!argv2.includes('--dangerously-bypass-approvals-and-sandbox'));
+    assert.ok(argv2.some((a) => a.includes('workspace-write')));
+    turn2.finish({ status: 'success', response: 'ok 2' });
+    const finalManifest = await done;
+    const manifest2 = JSON.parse(readFileSync(path.join(repo, '.agent-smith/jobs', finalManifest.jobId, 'job.json'), 'utf8')) as { unrestricted: boolean };
+    assert.equal(manifest2.unrestricted, false);
+  } finally {
+    if (prior === undefined) delete process.env['AGENT_SMITH_CODEX_SANDBOX'];
+    else process.env['AGENT_SMITH_CODEX_SANDBOX'] = prior;
+  }
 });

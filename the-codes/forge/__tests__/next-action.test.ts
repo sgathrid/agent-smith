@@ -4,31 +4,27 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 
-import { FILES, ORPHAN_REASON, diffChangedFiles, jobFile, nextActionFor, CHANGED_FILES_CAP, type ForgeManifest } from '../format.ts';
+import { FILES, ORPHAN_REASON, diffChangedFiles, failureFields, jobFile, CHANGED_FILES_CAP, type ForgeManifest } from '../format.ts';
+import { REASONS, reasonFromText } from '../../surfaces/mod/hooks/reasons.ts';
 import { JobWriter, parsePorcelainZ } from '../writer.ts';
 import { initGitRepo } from '../testing/git-repo.ts';
 import type { JobResult } from '../../providers/types.js';
 import { waitFor } from '../testing/time.ts';
 
-const F = { status: 'failed' } as const;
-
-test('nextAction taxonomy', () => {
-  assert.match(nextActionFor({ ...F, error: 'x — network issue connecting to the server' }) ?? '', /^Network error/);
-  assert.match(nextActionFor({ ...F, deniedCount: 1 }) ?? '', /unrestricted:true/);
-  assert.match(nextActionFor({ ...F, jobStatus: 'timeout' }) ?? '', /timeoutMs/);
-  assert.match(nextActionFor({ ...F, error: 'no output' }) ?? '', /^No output/);
-  assert.match(nextActionFor({ ...F, exitCode: 0, report: '   ' }) ?? '', /^No output/);
-  assert.doesNotMatch(nextActionFor({ ...F, exitCode: 0, report: 'hi' }) ?? '', /^No output/);
-  assert.match(nextActionFor({ ...F, error: ORPHAN_REASON }) ?? '', /^Server stopped/);
-  assert.equal(nextActionFor({ status: 'canceled' }), null);
-  assert.match(nextActionFor({ ...F, error: 'boom', exitCode: 1 }) ?? '', /status\.error/);
-  assert.equal(nextActionFor({ status: 'succeeded' }), null);
-  assert.equal(nextActionFor({ status: 'running' }), null);
+test('failure reason taxonomy', () => {
+  assert.equal(reasonFromText('x — network issue connecting to the server'), REASONS.networkError);
+  assert.equal(failureFields({ status: 'failed', suspicious: true, reason: 'denied' }, { status: 'denied', deniedActions: [{ action: 'command', displayName: 'RunCommand' }] }).reason, 'denied RunCommand');
+  assert.equal(failureFields({ status: 'failed', suspicious: false, reason: REASONS.timedOut }, { status: 'timeout' }).reason, REASONS.timedOut);
+  assert.equal(reasonFromText('no output'), REASONS.noOutput);
+  assert.equal(failureFields({ status: 'failed', suspicious: true, reason: REASONS.noOutput }, { status: 'success', error: '' }).reason, REASONS.noOutput);
+  assert.equal(reasonFromText(ORPHAN_REASON), REASONS.serverStopped);
+  assert.equal(reasonFromText('boom'), 'boom');
+  assert.equal(reasonFromText('a long unrecognisable failure message that exceeds thirty two characters'), REASONS.workerError);
 });
 
-test('provider setup and account failures do not suggest blind retries or broader permissions', () => {
+test('provider setup and account failures classify to short reasons', () => {
   for (const error of ['authentication failed', '401 Unauthorized', 'invalid API key', 'refresh token expired']) {
-    assert.match(nextActionFor({ ...F, error })!, /^Not logged in/);
+    assert.equal(reasonFromText(error), REASONS.notLoggedIn);
   }
   for (const error of [
     'RESOURCE_EXHAUSTED: TPM quota exhausted. No spare capacity is currently available… Resource exhausted. Please try again later.',
@@ -36,24 +32,24 @@ test('provider setup and account failures do not suggest blind retries or broade
     '14 UNAVAILABLE: Service unavailable',
     'overloaded',
   ]) {
-    assert.equal(nextActionFor({ ...F, error }), 'Provider busy (temporary); follow_up to continue.');
+    assert.equal(reasonFromText(error), REASONS.providerBusy);
   }
   for (const error of ['429 Too Many Requests', 'rate_limit exceeded']) {
-    assert.equal(nextActionFor({ ...F, error }), 'Rate limited; follow_up after a short wait.');
+    assert.equal(reasonFromText(error), REASONS.rateLimited);
   }
-  assert.match(nextActionFor({ ...F, error: '429 insufficient_quota' })!, /^Out of credits/);
-  assert.match(nextActionFor({ ...F, error: 'quota exhausted' })!, /^Out of credits/);
+  assert.equal(reasonFromText('429 insufficient_quota'), REASONS.outOfCredits);
+  assert.equal(reasonFromText('quota exhausted'), REASONS.outOfCredits);
+  for (const error of [
+    'exited 1 · stderr: error: failed to run prompt: provider.api_error: 429 Your account org-123 key-456 is suspended due to insufficient balance, please recharge your account or check your plan and billing details See log: /tmp/kimi.log',
+    '429 Your account is suspended, please recharge your account',
+    'provider.api_error: 429 balance exhausted, please recharge',
+  ]) {
+    assert.equal(reasonFromText(error), REASONS.outOfCredits);
+  }
   for (const error of ["unknown option '--permission-prompts'", "unexpected argument '--standalone'", 'unknown model "old-model"']) {
-    assert.equal(nextActionFor({ ...F, error }), 'Bad flag or model.');
+    assert.equal(reasonFromText(error), REASONS.badFlagOrModel);
   }
-  assert.equal(nextActionFor({ ...F, error: 'spawn codex ENOENT' }), "Couldn't start.");
-  assert.match(nextActionFor({ ...F, jobStatus: 'denied' })!, /^Ask the user/);
-  assert.equal(nextActionFor({ status: 'succeeded', error: 'unauthorized rate limit' }), null);
-  const steer = nextActionFor({ ...F, jobStatus: 'timeout', steerNotApplied: true })!;
-  assert.match(steer, /timeoutMs/);
-  assert.match(steer, /queued message was discarded: send it again with follow_up/);
-  assert.doesNotMatch(nextActionFor({ ...F, jobStatus: 'timeout' })!, /steer/);
-  assert.equal(nextActionFor({ status: 'canceled', steerNotApplied: true }), null);
+  assert.equal(reasonFromText('spawn codex ENOENT'), REASONS.couldntStart);
 });
 
 test('diffChangedFiles excludes dirty-and-unchanged, caps at 200', () => {
@@ -134,11 +130,11 @@ test('start() does not wait on git', async () => {
   assert.ok(landed.head, 'baseline lands once git settles');
 });
 
-test('a route that failed before any work names the route, after specific diagnoses', () => {
-  const location = 'Selected model is not supported in the selected location';
-  assert.match(nextActionFor({ ...F, error: location, failedEarly: true }) ?? '', /^Route failed before any work.*list_capabilities/);
-  assert.match(nextActionFor({ ...F, error: location }) ?? '', /^Read status.error/, 'without the flag nothing changes');
-  assert.match(nextActionFor({ ...F, error: 'HTTP 402: Insufficient account funds', failedEarly: true }) ?? '', /^Out of credits/);
-  assert.match(nextActionFor({ ...F, error: 'Upstream request failed: Insufficient account funds', failedEarly: true }) ?? '', /^Route failed/);
-  assert.match(nextActionFor({ ...F, error: 'no output', failedEarly: true }) ?? '', /^Route failed/);
+test('provider API access errors are not tool denials, and quota outranks timeout', () => {
+  assert.equal(reasonFromText('Access denied'), 'Access denied');
+  assert.equal(reasonFromText('403 Permission denied'), '403 Permission denied');
+  assert.equal(reasonFromText('HTTP 402: Insufficient account funds'), REASONS.outOfCredits);
+  assert.equal(reasonFromText('worker soft-denied 1 tool action(s) (view_file)'), 'denied view_file');
+  assert.match(reasonFromText('permission check failed: user denied permission to run command'), /^denied\b/);
+  assert.equal(reasonFromText('quota exhausted; request timed out'), REASONS.outOfCredits);
 });

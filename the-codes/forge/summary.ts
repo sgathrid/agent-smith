@@ -1,6 +1,6 @@
 import type { ObservedJob } from '../harness/types.ts';
 import type { ProgressDigest } from '../surfaces/mod/hooks/progress.ts';
-import { normalizeContinuationKind, nextActionFor, type ContinuationKind, type ForgeActivity, type ForgeStatus, type WatchedFileSigs } from './format.ts';
+import { normalizeContinuationKind, type ContinuationKind, type ForgeActivity, type ForgeStatus, type WatchedFileSigs } from './format.ts';
 import type { Acceptance } from './checks.ts';
 
 export interface ListFilter {
@@ -31,7 +31,7 @@ export interface JobSummary {
   readonly updatedAt: string | null;
   readonly finishedAt: string | null;
   readonly warnings: readonly { code: string; message: string }[];
-  readonly nextAction: string | null;
+  readonly resumable?: boolean;
   readonly unrestricted?: boolean;
   readonly supersededBy?: string | null;
   readonly followedBy?: string;
@@ -107,17 +107,7 @@ export function toSummary(observed: ObservedJob): JobSummary {
     status: observed.status,
     provider: typeof raw['provider'] === 'string' ? raw['provider'] : observed.label,
     unrestricted: raw['unrestricted'] === true,
-    nextAction: nextActionFor({
-      status: observed.status,
-      jobStatus: typeof raw['job_status'] === 'string' ? raw['job_status'] : null,
-      error: [typeof raw['error'] === 'string' ? raw['error'] : '', ...observed.warnings.map((w) => w.message)].join(' — '),
-      report: observed.output,
-      exitCode: typeof raw['exit_code'] === 'number' ? raw['exit_code'] : null,
-      deniedCount: Array.isArray(raw['denied_actions']) ? raw['denied_actions'].length : 0,
-      unrestricted: raw['unrestricted'] === true,
-      steerNotApplied: observed.warnings.some((w) => w.code === 'steer_not_applied'),
-      failedEarly: raw['failedEarly'] === true,
-    }),
+    resumable: typeof raw['conversation'] === 'string' && raw['conversation'] !== '',
     mode: observed.mode,
     model: observed.model,
     task,

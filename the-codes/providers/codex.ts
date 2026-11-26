@@ -113,6 +113,7 @@ import type {
   WorkerHandle,
 } from './types.ts';
 import type { ListModelsOptions, ModelCatalog, ModelInfo, SandboxInfo } from './types.ts';
+import { createAnswer, emptyResponseVerdict, type Answer } from './answer.ts';
 import { DEFAULT_DISCOVERY_TIMEOUT_MS, configDir, errMessage, parseTomlTopLevel, readTextSafe, runCapture } from './discovery.ts';
 import type { RunFn } from './discovery.ts';
 import path from 'node:path';
@@ -174,7 +175,7 @@ export function sandboxPlan(
 ): SandboxInfo {
   const mode = (m: CodexSandbox): SandboxInfo => {
     const flags = resuming ? ['-c', `sandbox_mode=${JSON.stringify(m)}`] : ['-s', m];
-    return { sandbox: `codex ${flags.join(' ')}`, flags, readOnlyEnforced: m === 'read-only' };
+    return { sandbox: `codex ${flags.join(' ')}`, flags, readOnlyEnforced: m === 'read-only', unrestricted: m === 'danger-full-access' };
   };
   const forced = envSandbox();
   if (forced !== undefined) {
@@ -183,7 +184,7 @@ export function sandboxPlan(
   }
   if (spec.unrestricted) {
     const flags = UNRESTRICTED_FLAGS;
-    return { sandbox: `codex ${flags[0]} (unrestricted)`, flags, readOnlyEnforced: false };
+    return { sandbox: `codex ${flags[0]} (unrestricted)`, flags, readOnlyEnforced: false, unrestricted: true };
   }
   if (spec.readOnly === true && spec.artifactPath !== undefined) {
     // `-s read-only` blocks every write, `--add-dir` included (verified on codex
@@ -195,7 +196,7 @@ export function sandboxPlan(
       '-c', `default_permissions=${JSON.stringify(ARTIFACT_PROFILE)}`,
       '-c', `permissions.${ARTIFACT_PROFILE}.filesystem=${tomlInlineTable({ ':root': 'read', [artifact]: 'write' })}`,
     ];
-    return { sandbox: `codex read-only except the output artifact ${artifact}`, flags, readOnlyEnforced: true };
+    return { sandbox: `codex read-only except the output artifact ${artifact}`, flags, readOnlyEnforced: true, unrestricted: false };
   }
   return mode(spec.readOnly === true ? 'read-only' : 'workspace-write');
 }
@@ -323,7 +324,7 @@ const KNOWN_ITEM_TYPES = new Set([
 ]);
 
 /** Item types that are NOT tool calls and must not become activities. */
-const NON_TOOL_ITEM_TYPES = new Set(['agent_message', 'reasoning', 'todo_list']);
+const NON_TOOL_ITEM_TYPES = new Set(['agent_message', 'reasoning']);
 
 function formatCollabInput(item: Record<string, unknown>): string | undefined {
   const receivers = Array.isArray(item['receiver_thread_ids']) ? item['receiver_thread_ids'].join(', ') : '';
@@ -368,7 +369,7 @@ interface CodexTranslator {
   threadId?: string;
   sawTurnCompleted: boolean;
   error?: string;
-  finalText: string;
+  answer: Answer;
   usage?: TokenUsage;
 }
 
@@ -381,15 +382,17 @@ interface CodexTranslator {
  */
 export function createCodexTranslator(maxChars: number): CodexTranslator {
   let step = 0;
+  const answer = createAnswer('codex');
   const state: CodexTranslator = {
     sawTurnCompleted: false,
-    finalText: '',
+    answer,
     onEvent: () => [],
   };
   /** item.id -> stepIndex, so item.started/completed pair up. */
   const itemStep = new Map<string, number>();
   /** item.id -> tool label, for the DONE event (the START may be absent). */
   const itemTool = new Map<string, string>();
+  const completedToolIds = new Set<string>();
 
   state.onEvent = (raw: Record<string, unknown>): ProviderEvent[] => {
     const out: ProviderEvent[] = [];
@@ -438,9 +441,13 @@ export function createCodexTranslator(maxChars: number): CodexTranslator {
       // Assistant prose.
       if (itemType === 'agent_message') {
         const text = str(item, 'text');
-        if (text !== undefined && text !== '') {
-          state.finalText = text;
-          out.push({ kind: 'text', at, text, stream: 'assistant' });
+        if (text !== undefined) {
+          if (text === '') {
+            answer.emptyMessage();
+          } else {
+            answer.text(text);
+            out.push({ kind: 'text', at, text, stream: 'assistant' });
+          }
         }
         return out;
       }
@@ -452,12 +459,16 @@ export function createCodexTranslator(maxChars: number): CodexTranslator {
       }
 
       if (itemType === 'todo_list') {
+        answer.tool(itemType);
         out.push({ kind: 'notice', at, level: 'info', message: 'codex updated its todo list', raw: item });
         return out;
       }
 
       if (NON_TOOL_ITEM_TYPES.has(itemType)) return out;
 
+      const isReplay = type === 'item.completed' && completedToolIds.has(itemId);
+      if (!isReplay) answer.tool(itemType);
+      if (type === 'item.completed') completedToolIds.add(itemId);
       // ---- tool-ish items ----------------------------------------------------
       const tool = itemTool.get(itemId) ?? toolLabelFor(itemType, item);
       if (!itemTool.has(itemId)) itemTool.set(itemId, tool);
@@ -588,6 +599,7 @@ export function buildResult(args: {
   let status: JobStatus;
   let error: string | undefined;
 
+  const response = tx.answer.value();
   const early = earlyVerdict(exit, durationMs);
   if (early !== undefined) {
     ({ status, error } = early);
@@ -603,10 +615,15 @@ export function buildResult(args: {
     status = 'error';
     error = tx.error ?? `exited ${exit.code}${stderrClause(exit.stderr)}`;
   } else {
-    status = 'success';
+    const empty = emptyResponseVerdict(response, exit.stderr);
+    if (empty !== undefined) {
+      ({ status, error } = empty);
+    } else {
+      status = 'success';
+    }
   }
 
-  const out = jobResult({ provider: 'codex', jobId, status, error, exit, response: tx.finalText, startedAtMs, durationMs, stateDir });
+  const out = jobResult({ provider: 'codex', jobId, status, error, exit, response, startedAtMs, durationMs, stateDir });
   if (tx.usage !== undefined) out.usage = tx.usage;
   if (tx.threadId !== undefined) out.raw = { threadId: tx.threadId };
   return out;

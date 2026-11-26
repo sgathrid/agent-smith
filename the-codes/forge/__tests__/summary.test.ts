@@ -46,18 +46,18 @@ test('toSummary leaves digest and changedFileCount absent when the job has none'
   assert.equal(toSummary(observed({ changed_files: 'not-a-list' })).changedFileCount, undefined);
 });
 
-test('toSummary carries finish evidence and liveness inputs, and failedEarly reaches nextAction', () => {
+test('toSummary carries finish evidence, liveness inputs, and resumable', () => {
   const raw = { failedEarly: true, toolErrors: 3, changedFilesUnknown: true, cwdMissingAtFinish: true,
-    job_status: 'error', error: 'Selected model is not supported in the selected location',
+    job_status: 'error', error: 'Selected model is not supported in the selected location', conversation: 'thread-9',
     last_event_at: '2026-10-27T10:00:00.000Z', last_alive_at: '2026-10-27T10:00:30.000Z' };
   const s = toSummary(observed(raw, 'failed'));
   assert.deepEqual([s.failedEarly, s.toolErrors, s.changedFilesUnknown, s.cwdMissingAtFinish], [true, 3, true, true]);
   assert.equal(s.lastEventAt, '2026-10-27T10:00:00.000Z');
   assert.equal(s.lastAliveAt, '2026-10-27T10:00:30.000Z');
-  assert.match(s.nextAction ?? '', /^Route failed before any work/);
+  assert.equal(s.resumable, true);
   const plain = toSummary(observed({ job_status: 'error', error: 'Selected model is not supported in the selected location' }, 'failed'));
-  assert.doesNotMatch(plain.nextAction ?? '', /^Route failed before any work/);
   assert.equal(plain.failedEarly, undefined);
+  assert.equal(plain.resumable, false);
 });
 
 test('toSummary projects unified turn-chain fields and defaults turn/chainStartedAt cleanly', () => {

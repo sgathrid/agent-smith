@@ -207,16 +207,7 @@ call, `tool` (the first command of a shell call, else the tool name). `attention
 `liveness {state, silentForMs, tool?}` as the sole liveness truth. kimi reports a tool call
 only when it ends, so a kimi job in a long command reads `silent`, not `in-tool`.
 
-`nextActionFor` derives (never stores) an imperative for the orchestrator on
-`failed`/`canceled` jobs: canceled -> nothing to do; orphaned -> `follow_up` if it has a
-conversation handle else rerun; denied -> use an approved path or ask authorization before
-retrying unrestricted; authentication/quota -> resolve the account problem; rate limit ->
-wait or reduce concurrency; incompatible arguments -> run `doctor` and check capabilities;
-`failedEarly` -> pick another model from `list_capabilities` or fix the account (after the
-specific diagnoses, before the generic ones; never for a timeout);
-timeout -> raise `timeoutMs`/split; network-ish error -> retry once;
-empty output -> ask via `follow_up`; otherwise read `error` and `warnings`. `null` for
-running/succeeded. Surfaced in `list_jobs` and `status`.
+`classifyFailure` and `reasonFromText` (`surfaces/mod/hooks/reasons.ts`) classify failure text into a short `reason` on failed jobs (`server stopped`, `denied`, `not logged in`, `provider busy`, `out of credits`, `rate limited`, `bad flag or model`, `couldn't start`, `timed out`, `network error`, `no output`, `crashed`, `setup failed`, `checks failed`, or `exit N`). `resumable` reports whether a saved conversation handle exists. Both are surfaced in `status` and `list_jobs`.
 
 ## MCP Tasks (`io.modelcontextprotocol/tasks`)
 
@@ -470,7 +461,11 @@ Claude                MCP server (dist/server.js)      Claude Code hooks        
   announces claimed workers that reached idle, or
   went quiet (once: `no output for 16m`, with `(in \`npm test\`)` when a call is open), or
   whose process is gone (once more: `process gone 3m`); the text states the fact and never
-  asks for an interrupt. It holds a pending acceptance verdict for the checks' budget, with one
+  asks for an interrupt. While the main loop is mid-turn (`turn.start` to `turn.complete`,
+  ignoring subagent turns with `agentId`), `announce` holds notices without committing notice
+  state and decides at main-loop `turn.complete` (after any `status`/`cancel` reads in that
+  turn have retired their notices); on hosts without `turn.start`/`turn.complete`, registration
+  is ignored and polling decides on each tick. It holds a pending acceptance verdict for the checks' budget, with one
   `$.prompt.submit` turn credited to the plugin. Claude Code shows that message to
   the user in full, so it is the only notice: one line per worker, no worker summary, followed by `status <workerId>`. Only claimed ids are announced, so two sessions on one repo
   never wake each other. A `spawn_job` with `variants` returns `{jobs:[...]}` and every variant worker is claimed and watched. A claimed run is announced with its stage jobs when the
@@ -525,11 +520,11 @@ user (up to 10 minutes) before anything launches.
 
 ## Safety and trust
 
-- An explicit `unrestricted: true` for providers without `defaultUnrestricted` (codex, claude, opencode) on `spawn_job`, `follow_up` or `run_pipeline` (asked once per run, naming the stages) is
+- When `AGENT_SMITH_CONFIRM_UNRESTRICTED=1`, an explicit `unrestricted: true` for providers without `defaultUnrestricted` (codex, claude, opencode) on `spawn_job`, `follow_up` or `run_pipeline` (asked once per run, naming the stages) is
   confirmed with the user through MCP form elicitation before launch (`tools.ts`
   `confirmUnrestricted`; the server handle reaches `callTool` as `HandlerContext.server`). It
   fails closed: decline, cancel or no answer returns `isError`. Clients without form elicitation
-  launch with an ack warning; `AGENT_SMITH_CONFIRM_UNRESTRICTED=0` skips the prompt.
+  launch with an ack warning (`unrestricted not confirmed: this client cannot prompt the user.`); when `AGENT_SMITH_CONFIRM_UNRESTRICTED` is unset or not `1`, `unrestricted: true` is honoured without a prompt or warning.
 - `unrestricted` comes from each provider's `defaultUnrestricted` property: false for providers that can prompt, `true` for agy (with
   an env opt-out), and `'always'` for kimi because its print mode force-sets auto, so it cannot
   be restricted. `job.json` records the effective posture, not a request that had no effect;

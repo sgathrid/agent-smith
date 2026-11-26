@@ -188,4 +188,5 @@ export interface SandboxInfo {
   sandbox: string;
   flags: string[];
   readOnlyEnforced: boolean;
+  unrestricted?: boolean;
 }

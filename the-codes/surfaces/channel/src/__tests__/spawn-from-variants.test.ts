@@ -316,7 +316,7 @@ test('from preserves raw provider so role defaults re-apply and another-provider
   assert.equal(f.seen[2]!.model, 'gemini-2.5');
 });
 
-test('overlay drops base model, effort and unrestricted when a variant names a different or unresolved provider', async () => {
+test('overlay drops base model and effort when a variant names a different or unresolved provider, while keeping explicit unrestricted', async () => {
   const f = fixture();
   const r = await callTool(f.ctx, 'spawn_job', {
     mode: 'review', prompt: 'x', model: 'gpt-5.4', effort: 'high', unrestricted: false,
@@ -326,13 +326,14 @@ test('overlay drops base model, effort and unrestricted when a variant names a d
   assert.equal(f.seen[0]!.provider, 'codex');
   assert.equal(f.seen[0]!.model, undefined);
   assert.equal(f.seen[0]!.effort, undefined);
-  assert.equal(f.seen[0]!.unrestricted, undefined);
+  assert.equal(f.seen[0]!.unrestricted, false);
   assert.equal(f.seen[1]!.provider, 'agy');
   assert.equal(f.seen[1]!.model, undefined);
   assert.equal(f.seen[1]!.effort, undefined);
-  assert.equal(f.seen[1]!.unrestricted, undefined);
+  assert.equal(f.seen[1]!.unrestricted, false);
   assert.equal(f.seen[2]!.provider, 'agy');
   assert.equal(f.seen[2]!.effort, 'low');
+  assert.equal(f.seen[2]!.unrestricted, false);
 });
 
 test('cancel waits for supersededBy to settle and cancels the new head that appears during the wait', async () => {
@@ -363,4 +364,64 @@ test('cancel waits for supersededBy to settle and cancels the new head that appe
   assert.equal(c.settled, true);
   assert.ok(existsSync(claimMarkerPath(f.repo, 'job', 'turn-1')));
   assert.ok(existsSync(claimMarkerPath(f.repo, 'job', 'turn-2')));
+});
+
+test('variants without a shared provider keep top-level unrestricted: true', async () => {
+  const f = fixture();
+  const r = await callTool(f.ctx, 'spawn_job', {
+    mode: 'review',
+    prompt: 'check',
+    unrestricted: true,
+    variants: [{ provider: 'codex' }, { provider: 'agy' }],
+  });
+  assert.equal(r.isError, undefined, errText(r));
+  assert.equal(f.seen.length, 2);
+  assert.equal(f.seen[0]!.unrestricted, true);
+  assert.equal(f.seen[1]!.unrestricted, true);
+});
+
+test('status on a job ID keeps exact-turn semantics even if a steer lands during wait', async () => {
+  const f = fixture({ cancelSettleMs: 10 });
+  mkdirSync(jobDir(f.repo, 'turn-1'), { recursive: true });
+  mkdirSync(jobDir(f.repo, 'turn-2'), { recursive: true });
+  mkdirSync(jobDir(f.repo, 'turn-3'), { recursive: true });
+  let steered = false;
+  const svc = f.ctx.service as unknown as {
+    resolveTurn: (id: string) => string;
+    detail: (id: string) => Promise<unknown>;
+  };
+  svc.resolveTurn = (id: string) => (id === 'turn-1' && steered ? 'turn-2' : id);
+  svc.detail = async (id: string) => {
+    if (id === 'turn-1') {
+      return { jobId: 'turn-1', name: 'w', workerId: 'turn-1', status: 'running', report: null, warnings: [] };
+    }
+    if (id === 'turn-2') {
+      return { jobId: 'turn-2', name: 'w', workerId: 'turn-1', status: 'succeeded', followedBy: 'turn-3', report: 'steered', warnings: [] };
+    }
+    return { jobId: 'turn-3', name: 'w', workerId: 'turn-1', status: 'succeeded', report: 'follow-up', warnings: [] };
+  };
+  setTimeout(() => { steered = true; }, 10);
+  const res = body(await callTool(f.ctx, 'status', { id: 'turn-1', wait_ms: 200 }));
+  assert.equal(res.jobId, 'turn-2');
+  assert.equal(res.report, 'steered');
+});
+
+test('status with report_only: true carries acceptance', async () => {
+  const f = fixture();
+  mkdirSync(jobDir(f.repo, 'turn-1'), { recursive: true });
+  writeFileSync(path.join(jobDir(f.repo, 'turn-1'), ACCEPTANCE_FILE), JSON.stringify({ state: 'unchecked', pending: true }));
+  const res = body(await callTool(f.ctx, 'status', { id: 'turn-1', report_only: true }));
+  assert.equal(res.acceptance?.pending, true);
+});
+
+test('spawn_job with unrestricted: false, no shared provider, and agy variant keeps unrestricted: false', async () => {
+  const f = fixture();
+  const r = await callTool(f.ctx, 'spawn_job', {
+    mode: 'review',
+    prompt: 'check',
+    unrestricted: false,
+    variants: [{ provider: 'agy' }],
+  });
+  assert.equal(r.isError, undefined, errText(r));
+  assert.equal(f.seen[0]!.unrestricted, false);
 });

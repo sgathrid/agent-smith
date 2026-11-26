@@ -86,7 +86,7 @@ setTimeout(()=>{console.log(JSON.stringify({type:'item.completed',item:{id:'answ
 test('MCP asks the user before unrestricted codex, over the wire; a decline launches nothing', async () => {
   const repo = mkdtempSync(path.join(os.tmpdir(), 'smith-elicit-'));
   const env = Object.fromEntries(Object.entries(process.env).filter((e): e is [string, string] => e[1] !== undefined && e[0] !== 'AGENT_SMITH_CONFIRM_UNRESTRICTED'));
-  const transport = new StdioClientTransport({ command: process.execPath, args: ['--experimental-strip-types', server, repo], env: { ...env, AGENT_SMITH_CODEX_BIN: path.join(repo, 'never-run') }, stderr: 'pipe' });
+  const transport = new StdioClientTransport({ command: process.execPath, args: ['--experimental-strip-types', server, repo], env: { ...env, AGENT_SMITH_CONFIRM_UNRESTRICTED: '1', AGENT_SMITH_CODEX_BIN: path.join(repo, 'never-run') }, stderr: 'pipe' });
   const client = new Client({ name: 'smith-elicit-test', version: '1' }, { capabilities: { elicitation: { form: {} } } });
   const asked: string[] = [];
   client.setRequestHandler(ElicitRequestSchema, async (request) => { asked.push(request.params.message); return { action: 'decline' }; });
@@ -214,12 +214,12 @@ console.log(JSON.stringify(event));process.exitCode=1;
       assert.equal(detail.resumable, false);
       const followed = await client.callTool({ name: 'follow_up', arguments: { worker: ack.jobId, prompt: 'continue' } });
       assert.equal(followed.isError, true);
-      assert.match((followed.content as Array<{ text: string }>)[0]!.text, /no saved conversation; spawn_job with from:.* the original brief/);
+      assert.match((followed.content as Array<{ text: string }>)[0]!.text, /has no saved conversation to continue/);
       const { readJob } = await import('../watch-source.ts');
       const { buildBatch } = await import('../policy.ts');
       const observed = (await readJob(repo, ack.jobId, Date.now()))!;
       const notice = buildBatch([{ job: observed, seen: new Set(), observedInPriorPoll: true }], Date.now());
-      assert.match(notice.content!, provider === 'codex' ? /out of credits/ : /402: payment required/);
+      assert.match(notice.content!, /out of credits/);
     }
   } finally { await client.close(); rmSync(repo, { recursive: true, force: true }); }
 });

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import process$1 from'node:process';import {randomUUID,randomBytes}from'node:crypto';import {readFileSync,existsSync,statSync,rmSync,writeFileSync,mkdirSync,linkSync,unlinkSync,renameSync,readdirSync}from'node:fs';import path from'node:path';import {l as livenessOf,L as LIVENESS_STATES,w as waitForChange,c as claimMarkerPath}from'./chunk-stale.js';import {E as EFFORTS$1,M as MAX_WATCHED_FILES,v as validateEnv,g as getCatalogs,l as launchPipeline,r as requireProvider,a as validateModelAndEffort,p as probeProviders,F as ForgeService}from'./chunk-service.js';import {i as isTerminalStatus,r as reasonFromText,M as MODES$1,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS,b as inheritContinuedProviders,S as STAGE_PROMPTS,v as validateSpec,s as startPipeline,c as readPipeline,m as missingPipelineError,j as jobDir,d as jobFile,F as FILES,e as readAcceptance,f as findProvider,g as isWorkerIdle,p as providerNames,h as isMode,k as cancelPipeline,l as isTerminalForgeStatus}from'./chunk-normalize.js';import os from'node:os';import {execFile}from'node:child_process';import'node:url';import'node:timers/promises';import'node:fs/promises';import'node:readline';//#region rolldown:runtime
+import process$1 from'node:process';import {randomUUID,randomBytes}from'node:crypto';import {readFileSync,existsSync,statSync,rmSync,writeFileSync,mkdirSync,linkSync,unlinkSync,renameSync,readdirSync}from'node:fs';import path from'node:path';import {l as livenessOf,L as LIVENESS_STATES,w as waitForChange,c as claimMarkerPath}from'./chunk-stale.js';import {E as EFFORTS$1,M as MAX_WATCHED_FILES,v as validateEnv,g as getCatalogs,l as launchPipeline,r as requireProvider,a as validateModelAndEffort,p as probeProviders,F as ForgeService}from'./chunk-service.js';import {i as isTerminalStatus,r as reasonFromText,M as MODES$1,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS,b as inheritContinuedProviders,S as STAGE_PROMPTS,v as validateSpec,s as startPipeline,c as readPipeline,m as missingPipelineError,j as jobDir,d as jobFile,F as FILES,e as readAcceptance,f as isWorkerIdle,p as providerNames,g as findProvider,h as effectiveDefaultUnrestricted,k as isMode,l as cancelPipeline,n as isTerminalForgeStatus}from'./chunk-normalize.js';import os from'node:os';import {execFile}from'node:child_process';import'node:url';import'node:timers/promises';import'node:fs/promises';import'node:readline';//#region rolldown:runtime
 var __create = Object.create;
 var __defProp = Object.defineProperty;
 var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
@@ -25227,7 +25227,6 @@ const CONCISE_FILES_CAP = 20;
 const EARLIER_TURNS_CAP = 5;
 const EARLIER_SUMMARY_CHARS = 120;
 const DIFF_MAX_CHARS = 40_000;
-const DETAIL_HINT = 'use response_format: "detailed"';
 const flat = (s) => s.replace(/\s+/g, ' ').trim();
 function taskStatus(status) {
     switch (status) {
@@ -25309,6 +25308,7 @@ function conciseRow(j, now = Date.now()) {
                 ? checkVerdicts(j.acceptance) : null,
             changedFileCount: typeof j.changedFileCount === 'number' && j.changedFileCount > 0 ? j.changedFileCount : null,
             warningCount: j.warnings.length || null,
+            resumable: j.status === 'failed' ? (j.resumable ?? Boolean(j.conversation)) : null,
             ...evidence(j),
         });
     }
@@ -25363,15 +25363,15 @@ function conciseStatus(d, acceptance, extra = {}, now = Date.now()) {
         pendingMessages: d.pendingSteers ? d.pendingSteers : null,
         changedFileCount: d.changedFiles && files.length > 0 ? files.length : null,
         changedFiles: files.length ? files.slice(0, CONCISE_FILES_CAP) : null,
-        changedFilesNote: files.length > CONCISE_FILES_CAP || d.changedFilesTruncated ? `First ${Math.min(files.length, CONCISE_FILES_CAP)} shown; ${DETAIL_HINT} or include_diff for all.` : null,
+        changedFilesNote: files.length > CONCISE_FILES_CAP || d.changedFilesTruncated ? `First ${Math.min(files.length, CONCISE_FILES_CAP)} of ${files.length}${d.changedFilesTruncated ? '+' : ''} shown.` : null,
         ...evidence(d),
         staleReads: d.staleReads?.length ? d.staleReads : null,
-        nextAction: d.nextAction,
+        resumable: running || d.status === 'succeeded' ? null : (d.resumable ?? Boolean(d.conversation)),
         reason: failedReason(d),
         error: d.error ? trimWords(d.error, 500) : null,
         warnings: warnings.length ? warnings : null,
         summary: summary && !report.includes(summary) ? trimWords(summary, 300) : null,
-        report: report ? (cut ? `${report.slice(0, CONCISE_REPORT_CHARS)}\n…[truncated: ${CONCISE_REPORT_CHARS} of ${report.length} chars; ${DETAIL_HINT} for more]` : report) : null,
+        report: report ? (cut ? `${report.slice(0, CONCISE_REPORT_CHARS)}\n…[truncated: ${CONCISE_REPORT_CHARS} of ${report.length} chars shown]` : report) : null,
         reportTruncated: cut || null,
         ...extra,
     });
@@ -25497,8 +25497,8 @@ function conciseCapabilities(providers, only) {
             ...(p.defaultModel ? { defaultModel: p.defaultModel } : {}),
             ...(p.defaultEffort ? { defaultEffort: p.defaultEffort } : {}),
             ...(efforts ? { efforts } : {}),
-            ...(listed ? { models: rows } : { modelCount: rows.length, more: `pass provider: "${p.name}" to list its ${rows.length} models` }),
-            ...(p.verified === false ? { unverified: 'model list unconfirmed; prefer a known model' } : {}),
+            ...(listed ? { models: rows } : { modelCount: rows.length, more: `0 of ${rows.length} models shown` }),
+            ...(p.verified === false ? { unverified: 'model list unconfirmed' } : {}),
             ...(p.stale ? { stale: true } : {}),
             ...(p.error ? { error: p.error } : {}),
         };
@@ -25576,7 +25576,6 @@ const jobFields = {
     continuationKind: { type: ['string', 'null'], enum: [...CONTINUATION_KINDS, null], description: 'How this turn continued from continuedFrom.' },
     pendingMessages: typed('integer', 'Messages accepted but not yet read by the worker.'),
     pendingSteers: typed('integer', 'pendingMessages in the detailed record.'),
-    nextAction: typed(['string', 'null'], 'Suggested next step for this job, when there is one.'),
     warnings: { type: 'array', items: { type: ['string', 'object'] }, description: 'Messages when concise; {code, message} records when detailed.' },
     liveness: open({
         state: { type: 'string', enum: [...LIVENESS_STATES], description: 'active: an event in the last 15 minutes. in-tool: a tool call has started and not ended (a long command). silent: no event for 15 minutes while the worker process is still running (or, for jobs from older versions, no event for 15 minutes). dead: the worker process has not been seen for 2 minutes though the job is still running. waiting: reserved; not reported yet.' },
@@ -25610,7 +25609,7 @@ const STATUS_OUTPUT = open({
     durationMs: typed(['number', 'null']),
     changedFileCount: typed('integer'), changedFiles: strings("Files changed across the worker's turns, or in that turn for a job ID (the first 20 when concise)."),
     reportPath: typed('string', 'Absolute path to the full report.'),
-    resumable: typed('boolean', 'Whether a saved conversation exists (detailed); an idle worker needs one for follow_up and steer.'),
+    resumable: typed('boolean', 'Whether a saved conversation exists (detailed, and concise when not running/succeeded or failed in list_jobs); an idle worker needs one for follow_up and steer.'),
     staleReads: { type: ['array', 'null'], items: { type: 'string' }, description: 'Watched brief files that changed in the repository while the job ran.' },
     error: typed(['string', 'null']),
     summary: typed('string', 'Worker-written summary, when the report does not already contain it.'),
@@ -25701,12 +25700,12 @@ const RAW_TOOL_DEFS = [
             from: { ...string, description: 'Worker name, workerId, or job ID whose request to reuse.' },
             variants: { type: 'array', minItems: 1, maxItems: 8, description: 'One job per entry, each overriding name, provider, model or effort.', items: { type: 'object', additionalProperties: false, properties: { name: { ...string, maxLength: 80 }, provider: { type: 'string', enum: PROVIDERS }, model: string, effort: { type: 'string', enum: EFFORTS } } } }, context: contextSchema, files: filesSchema, name: { ...string, description: 'Worker name, kept across turns.' }, task: { ...string, description: 'Short label; defaults to the first prompt line.' }, cwd: { type: 'string', description: 'Absolute existing working directory. Defaults to the server repository.' },
             provider: { type: 'string', enum: PROVIDERS }, model: string, effort: { type: 'string', enum: EFFORTS },
-            timeoutMs: { type: 'integer', minimum: 1, default: DEFAULT_TIMEOUT_MS }, unrestricted: { type: 'boolean', description: 'Skip worker approval prompts. Default true for agy and kimi, false otherwise; true for codex, claude or opencode asks the user to confirm.' }, conversation: string, checks: { ...checksSchema, description: 'Commands that define done; they run in cwd after the job succeeds.' }, env: envSchema,
+            timeoutMs: { type: 'integer', minimum: 1, default: DEFAULT_TIMEOUT_MS }, unrestricted: { type: 'boolean', description: 'Skip worker approval prompts. Default true for agy and kimi, false otherwise.' }, conversation: string, checks: { ...checksSchema, description: 'Commands that define done; they run in cwd after the job succeeds.' }, env: envSchema,
         }) },
-    { name: 'follow_up', annotations: { title: 'Follow up', ...LAUNCHES }, description: 'Send a worker its next message ("do this next"); never cuts the current turn. A running worker reads it at its next step when its provider supports that, else when the turn ends; an idle worker starts a new turn in the same conversation. Queued messages are delivered whatever the turn\'s outcome; cancel discards them. Settings, checks, watched files and env carry over; arguments here apply from the next turn. env: "dropped" in the ack means the env values were lost: pass env again.', inputSchema: schema({
+    { name: 'follow_up', annotations: { title: 'Follow up', ...LAUNCHES }, description: 'Send a worker its next message ("do this next"); never cuts the current turn. A running worker reads it at its next step when its provider supports that, else when the turn ends; an idle worker starts a new turn in the same conversation. Queued messages are delivered whatever the turn\'s outcome; cancel discards them. Settings, checks, watched files and env carry over; arguments here apply from the next turn. env: "dropped" in the ack means the env values were lost.', inputSchema: schema({
             worker: { ...string, description: "Worker name, workerId, or any turn's job ID." }, prompt: string, context: messageContext, files: moreFiles,
             checks: { ...checksSchema, description: 'Replaces the inherited checks; [] clears them.' }, model: string, effort: { type: 'string', enum: EFFORTS }, timeoutMs: { type: 'integer', minimum: 1 }, env: envAgain,
-            unrestricted: { type: 'boolean', description: 'Skip worker approval prompts; true for codex, claude or opencode asks the user to confirm.' },
+            unrestricted: { type: 'boolean', description: 'Skip worker approval prompts.' },
         }, ['worker', 'prompt']) },
     { name: 'steer', annotations: { title: 'Steer', ...LAUNCHES, destructiveHint: true }, description: 'Redirect a worker now ("stop and do this instead"): cuts its running turn (the tool call in flight is lost) or running checks and continues the same conversation with this message; an idle worker starts a new turn. Before the provider reports a conversation handle this fails unless allowFresh is true. To let the current work finish, use follow_up.', inputSchema: schema({
             worker: { ...string, description: "Worker name, workerId, or any turn's job ID." }, prompt: string, context: messageContext, files: moreFiles,
@@ -25892,10 +25891,21 @@ const WATCH_RECHECK_MS = 5_000;
 /** Long enough for a person to read the prompt and answer; the SDK default (60 s) is not. */
 const CONFIRM_TIMEOUT_MS = 10 * 60_000;
 const DECLINED_UNRESTRICTED = 'The user declined unrestricted access; rerun without unrestricted, or ask the user.';
-const UNCONFIRMED_UNRESTRICTED = 'unrestricted: true was not confirmed with the user: this client cannot show a confirmation prompt (no MCP elicitation support).';
+const UNCONFIRMED_UNRESTRICTED = 'unrestricted not confirmed: this client cannot prompt the user.';
+function isEscalatingLaunch(l) {
+    if (l.unrestricted !== true)
+        return false;
+    const provider = findProvider(l.provider);
+    if (effectiveDefaultUnrestricted(provider))
+        return false;
+    if (provider?.describeSandbox) {
+        return provider.describeSandbox({ unrestricted: true }).unrestricted !== false;
+    }
+    return true;
+}
 async function confirmUnrestricted(ctx, launches, kind = 'worker') {
-    const escalating = launches.filter(l => l.unrestricted === true && !findProvider(l.provider)?.defaultUnrestricted);
-    if (escalating.length === 0 || process.env['AGENT_SMITH_CONFIRM_UNRESTRICTED'] === '0')
+    const escalating = launches.filter(isEscalatingLaunch);
+    if (escalating.length === 0 || process.env['AGENT_SMITH_CONFIRM_UNRESTRICTED'] !== '1')
         return {};
     if (ctx.unrestrictedGate)
         return ctx.unrestrictedGate;
@@ -25935,6 +25945,7 @@ function slimAck(ack) {
         ...(ack.turn !== undefined ? { turn: ack.turn } : {}),
         provider: ack.provider, model: ack.modelResolved ?? null, status: ack.status,
         timeoutMs: ack.timeoutMs, repo: ack.repo, unrestricted: ack.unrestricted,
+        ...(ack.sandboxUnrestricted !== undefined && ack.sandboxUnrestricted !== ack.unrestricted ? { sandbox: ack.sandbox } : {}),
         ...(ack.readOnlyRequested || (isMode(ack.role) && MODE_PRESETS[ack.role].readOnly) ? { readOnlyEnforced: ack.readOnlyEnforced ?? false } : {}),
         ...(ack.envKeys?.length ? { envKeys: ack.envKeys } : {}),
         ...(ack.warnings?.length ? { warnings: ack.warnings } : {}),
@@ -25956,15 +25967,28 @@ async function resolveDefaultProvider(ctx) {
         : undefined;
     return defaultProvider(installed, undefined, detail);
 }
-async function spawnOne(ctx, args) {
+async function spawnOne(ctx, args, preResolved, extraWarnings = []) {
     const mode = allowed(args, 'mode', MODES$1);
     if (mode === undefined)
         throw new Error(`mode is required; one of ${MODES$1.join(', ')}.`);
-    const cfg = loadModelConfig({ repo: ctx.service.repo });
-    const rawProvider = allowed(args, 'provider', PROVIDERS);
-    const resolved = resolveRequest({ provider: rawProvider, model: text(args, 'model'), effort: allowed(args, 'effort', EFFORTS$1), mode }, cfg);
-    const provider = resolved.provider ?? await resolveDefaultProvider(ctx);
-    const notes = [...resolved.warnings, ...cfg.errors.map(e => `models.json: ${e}`)];
+    const rawProvider = preResolved ? preResolved.rawProvider : allowed(args, 'provider', PROVIDERS);
+    const rawModel = preResolved ? preResolved.rawModel : text(args, 'model');
+    const rawEffort = preResolved ? preResolved.rawEffort : allowed(args, 'effort', EFFORTS$1);
+    let resolved;
+    let cfgErrors;
+    let provider;
+    if (preResolved) {
+        resolved = preResolved.resolved;
+        cfgErrors = preResolved.cfgErrors;
+        provider = preResolved.provider;
+    }
+    else {
+        const cfg = loadModelConfig({ repo: ctx.service.repo });
+        resolved = resolveRequest({ provider: rawProvider, model: rawModel, effort: rawEffort, mode }, cfg);
+        cfgErrors = cfg.errors;
+        provider = resolved.provider ?? await resolveDefaultProvider(ctx);
+    }
+    const notes = [...extraWarnings, ...resolved.warnings, ...cfgErrors.map(e => `models.json: ${e}`)];
     const withNotes = (ack) => ({ ...slimAck(ack), provider: ack.provider ?? provider, ...(resolved.appliedAlias ? { aliasApplied: resolved.appliedAlias, aliasSource: resolved.source } : {}), ...(notes.length ? { warnings: [...(ack.warnings ?? []), ...notes] } : {}) });
     const checks = parseChecks(args.checks);
     const request = { mode, prompt: text(args, 'prompt', true), context: contextText(args), files: filesList(args), checks, cwd: workingDirectory(args), name: text(args, 'name'), task: text(args, 'task'), provider, model: resolved.model, effort: resolved.effort, timeoutMs: number(args, 'timeoutMs'), conversation: text(args, 'conversation'), unrestricted: boolean(args, 'unrestricted'), env: validateEnv(args.env),
@@ -25979,7 +26003,7 @@ async function spawnOne(ctx, args) {
         throw new Error(refusedText(gate.refused));
     if (gate.warning)
         notes.push(gate.warning);
-    const saved = { mode, prompt: request.prompt, context: request.context, files: request.files, cwd: request.cwd, task: request.task, name: request.name, provider: rawProvider, model: text(args, 'model'), effort: allowed(args, 'effort', EFFORTS$1), timeoutMs: request.timeoutMs, unrestricted: request.unrestricted };
+    const saved = { mode, prompt: request.prompt, context: request.context, files: request.files, cwd: request.cwd, task: request.task, name: request.name, provider: rawProvider, model: rawModel, effort: rawEffort, timeoutMs: request.timeoutMs, unrestricted: request.unrestricted };
     const ack = await ctx.service.spawnJob(request);
     saveRequest(ctx, ack.jobId, saved);
     return checks?.length ? { ...withNotes(ack), checks: checks.map(c => c.name) } : withNotes(ack);
@@ -25993,11 +26017,15 @@ function saveRequest(ctx, jobId, saved) {
 }
 const MAX_VARIANTS = 8;
 const VARIANT_KEYS = ['name', 'provider', 'model', 'effort'];
-function overlay(base, over, baseProvider) {
+function overlay(base, over, baseProvider, keepUnrestricted = false) {
     const defined = Object.fromEntries(Object.entries(over).filter(([, v]) => v !== undefined));
     const switched = defined.provider !== undefined && baseProvider !== defined.provider;
-    const kept = switched ? Object.fromEntries(Object.entries(base).filter(([k]) => !['model', 'effort', 'unrestricted'].includes(k))) : base;
-    return { ...kept, ...defined };
+    const dropKeys = keepUnrestricted ? ['model', 'effort'] : ['model', 'effort', 'unrestricted'];
+    const kept = switched ? Object.fromEntries(Object.entries(base).filter(([k]) => !dropKeys.includes(k))) : base;
+    const dropped = switched && !keepUnrestricted && base.unrestricted !== undefined && defined.unrestricted === undefined
+        ? `unrestricted: ${String(base.unrestricted)} was dropped because the provider changed or was not shared.`
+        : undefined;
+    return { args: { ...kept, ...defined }, ...(dropped ? { droppedUnrestricted: dropped } : {}) };
 }
 async function inheritFrom(ctx, args) {
     const from = text(args, 'from', true);
@@ -26026,9 +26054,11 @@ async function inheritFrom(ctx, args) {
     return overlay(saved, rest, baseProvider);
 }
 const spawnJob = async (ctx, args) => {
-    const base = args.from === undefined ? args : await inheritFrom(ctx, args);
-    if (args.variants === undefined)
-        return structured(await spawnOne(ctx, base), { compact: true });
+    const inherited = args.from === undefined ? { args } : await inheritFrom(ctx, args);
+    const base = inherited.args;
+    if (args.variants === undefined) {
+        return structured(await spawnOne(ctx, base, undefined, inherited.droppedUnrestricted ? [inherited.droppedUnrestricted] : []), { compact: true });
+    }
     if (ctx.onJobPrepared)
         throw new Error('variants start several jobs, and a task-augmented call tracks one; call spawn_job once per variant.');
     if (!Array.isArray(args.variants) || args.variants.length === 0 || args.variants.length > MAX_VARIANTS)
@@ -26070,19 +26100,24 @@ const spawnJob = async (ctx, args) => {
         effort: allowed(shared, 'effort', EFFORTS$1),
         mode,
     }, cfg).provider;
-    const requests = variants.map((v, i) => overlay(shared, { ...v, name: names[i] }, baseProvider));
+    const overlaid = variants.map((v, i) => overlay(shared, { ...v, name: names[i] }, baseProvider, true));
+    const requests = overlaid.map(o => o.args);
     let fallbackProvider;
     const getFallbackProvider = async () => fallbackProvider ??= await resolveDefaultProvider(ctx);
-    const resolvedProviders = [];
+    const preResolved = [];
     for (const r of requests) {
-        const resolved = resolveRequest({ provider: allowed(r, 'provider', PROVIDERS), model: text(r, 'model'), effort: allowed(r, 'effort', EFFORTS$1), mode }, cfg);
-        resolvedProviders.push(resolved.provider ?? await getFallbackProvider());
+        const rawProvider = allowed(r, 'provider', PROVIDERS);
+        const rawModel = text(r, 'model');
+        const rawEffort = allowed(r, 'effort', EFFORTS$1);
+        const resolved = resolveRequest({ provider: rawProvider, model: rawModel, effort: rawEffort, mode }, cfg);
+        const provider = resolved.provider ?? await getFallbackProvider();
+        preResolved.push({ provider, resolved, cfgErrors: cfg.errors, rawProvider, rawModel, rawEffort });
     }
     const gate = await confirmUnrestricted(ctx, requests.map((r, i) => ({
         unrestricted: boolean(r, 'unrestricted'),
-        provider: resolvedProviders[i],
-        who: `${resolvedProviders[i]} worker "${String(r.name)}"`,
-        label: `${String(r.name)}: ${resolvedProviders[i]}`,
+        provider: preResolved[i].provider,
+        who: `${preResolved[i].provider} worker "${String(r.name)}"`,
+        label: `${String(r.name)}: ${preResolved[i].provider}`,
         cwd: cwd ?? ctx.service.repo,
     })));
     if (gate.refused)
@@ -26090,8 +26125,9 @@ const spawnJob = async (ctx, args) => {
     const batchCtx = { ...ctx, unrestrictedGate: gate.warning ? { warning: gate.warning } : {} };
     const jobs = [];
     for (const [i, r] of requests.entries()) {
+        const dropped = [inherited.droppedUnrestricted, overlaid[i].droppedUnrestricted].filter((w) => w !== undefined);
         try {
-            jobs.push(await spawnOne(batchCtx, r));
+            jobs.push(await spawnOne(batchCtx, r, preResolved[i], dropped));
         }
         catch (err) {
             jobs.push({ name: names[i], error: err instanceof Error ? err.message : String(err) });
@@ -26110,14 +26146,16 @@ const followUp = async (ctx, args) => {
         checks: parseChecks(args.checks), model: text(args, 'model'), effort: allowed(args, 'effort', EFFORTS$1), timeoutMs: number(args, 'timeoutMs'),
         env: validateEnv(args.env), unrestricted: boolean(args, 'unrestricted'),
     };
+    let targetWorker = request.worker;
     const notes = [];
     if (request.unrestricted === true || request.model !== undefined || request.effort !== undefined) {
         const head = await ctx.service.messageTarget(request.worker);
+        targetWorker = head.workerId ?? head.jobId;
         const provider = head.provider ?? '';
         if (request.model !== undefined || request.effort !== undefined) {
             const cfg = loadModelConfig({ repo: ctx.service.repo });
-            const resolved = resolveRequest({ provider: provider || undefined, model: request.model, effort: request.effort }, cfg);
-            Object.assign(request, { model: resolved.model, effort: resolved.effort });
+            const resolved = resolveRequest({ provider: provider || undefined, model: request.model ?? head.model ?? head.modelResolved ?? undefined, effort: request.effort }, cfg);
+            Object.assign(request, { ...(request.model !== undefined ? { model: resolved.model } : {}), effort: resolved.effort });
             notes.push(...resolved.warnings, ...cfg.errors.map(e => `models.json: ${e}`));
         }
         const gate = await confirmUnrestricted(ctx, [{
@@ -26131,7 +26169,7 @@ const followUp = async (ctx, args) => {
         if (gate.warning)
             notes.push(gate.warning);
     }
-    const ack = await ctx.service.followUp(request);
+    const ack = await ctx.service.followUp({ ...request, worker: targetWorker });
     try {
         ctx.onJobPrepared?.(ack.jobId);
     }
@@ -26162,7 +26200,7 @@ const listJobs = async (ctx, args) => {
         return structured(workers.map(j => { const live = jobLiveness(j); return { ...j, taskStatus: taskStatus(j.status), ...(live === null ? {} : { liveness: livenessView(live) }) }; }));
     const rows = workers.slice(0, limit).map(j => conciseRow(j));
     return structured(workers.length > rows.length
-        ? { items: rows, more: `More than ${rows.length} jobs match; narrow with since, status or session, or raise limit.` }
+        ? { items: rows, more: `More than ${rows.length} jobs match; ${rows.length} shown.` }
         : rows, { compact: true });
 };
 function unsettled(ctx, d, worker) {
@@ -26176,9 +26214,10 @@ const jobStatus = async (ctx, args) => {
     const waitMs = number(args, 'wait_ms', MAX_WAIT_MS);
     const fmt = format(args);
     const wantDiff = boolean(args, 'include_diff') ?? false;
-    let detail = await ctx.service.resolveWorker(id);
+    const { detail: resolvedDetail, isWorker: worker } = await ctx.service.resolveWorkerTarget(id);
+    let detail = resolvedDetail;
     let waited = false;
-    const worker = ctx.service.resolveTurn(id) !== detail.jobId;
+    const waitTarget = worker ? (detail.workerId ?? detail.jobId) : id;
     if (waitMs !== undefined) {
         waited = true;
         const deadline = Date.now() + waitMs;
@@ -26186,15 +26225,15 @@ const jobStatus = async (ctx, args) => {
         const maxSlice = ctx.pollMs ?? WATCH_RECHECK_MS;
         while (unsettled(ctx, detail, worker) && Date.now() < deadline) {
             await waitForChange(jobDir(ctx.service.repo, detail.jobId), Math.min(maxSlice, deadline - Date.now()), { fallbackMs });
-            detail = await ctx.service.resolveWorker(id);
+            detail = await ctx.service.resolveWorker(waitTarget);
         }
     }
     if (detail.jobId !== id)
         detail = { ...detail, resolvedFrom: id };
     const reportPath = jobFile(ctx.service.repo, detail.jobId, FILES.report);
-    if (boolean(args, 'report_only'))
-        return structured({ jobId: detail.jobId, status: detail.status, report: detail.report, reportPath });
     const acceptance = readAcceptance(ctx.service.repo, detail.jobId);
+    if (boolean(args, 'report_only'))
+        return structured({ jobId: detail.jobId, status: detail.status, report: detail.report, reportPath, acceptance });
     const wait = waited ? { waited: true, stillRunning: unsettled(ctx, detail, worker) } : {};
     const allEarlier = await ctx.service.earlierTurns(detail, worker ? Number.MAX_SAFE_INTEGER : EARLIER_TURNS_CAP);
     const earlier = allEarlier.slice(-EARLIER_TURNS_CAP);
@@ -26342,13 +26381,18 @@ const runPipeline = async (ctx, args) => {
     validateSpec(spec);
     const warnings = await validatePipelineStages(ctx, spec.stages);
     const unrestricted = boolean(raw, 'unrestricted');
-    const gate = await confirmUnrestricted(ctx, spec.stages.map(s => ({
-        unrestricted,
-        provider: s.provider,
-        who: `pipeline stage "${s.name}" (${s.provider})`,
-        label: `${s.name}: ${s.provider}`,
-        cwd: spec.workDir ?? ctx.service.repo,
-    })), 'pipeline stage');
+    const baseWorkDir = spec.workDir ?? ctx.service.repo;
+    const stagesByName = new Map(spec.stages.map(s => [s.name, s]));
+    const gate = await confirmUnrestricted(ctx, spec.stages.map(s => {
+        const own = s.workDir ?? (s.continues === undefined ? undefined : stagesByName.get(s.continues)?.workDir);
+        return {
+            unrestricted,
+            provider: s.provider,
+            who: `pipeline stage "${s.name}" (${s.provider})`,
+            label: `${s.name}: ${s.provider}`,
+            cwd: own ? path.resolve(baseWorkDir, own) : baseWorkDir,
+        };
+    }), 'pipeline stage');
     if (gate.refused)
         return gate.refused;
     if (gate.warning)

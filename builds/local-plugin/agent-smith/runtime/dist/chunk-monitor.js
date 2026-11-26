@@ -1,4 +1,4 @@
-import path from'node:path';import {fileURLToPath}from'node:url';import {r as reasonFromText,ac as readJsonSafe,ad as pipelineRecordPath,A as AgentSmithReader,x as normalize,e as readAcceptance,T as normalizeContinuationKind,l as isTerminalForgeStatus,W as WORKERS_DIR,g as isWorkerIdle,O as jobsDir,j as jobDir,a7 as pickHead,ae as workerIndexPath,Q as parseWorkerIndex}from'./chunk-normalize.js';import {a as claudeText,d as droppedMessageQuote,b as pipelineOutcome,A as ACCEPTANCE_HOLD_MS,l as livenessOf,w as waitForChange}from'./chunk-stale.js';function pushKindFor(job) {
+import path from'node:path';import {fileURLToPath}from'node:url';import {ad as noticeReason,ae as readJsonSafe,af as pipelineRecordPath,A as AgentSmithReader,y as normalize,e as readAcceptance,U as normalizeContinuationKind,n as isTerminalForgeStatus,W as WORKERS_DIR,f as isWorkerIdle,Q as jobsDir,j as jobDir,a8 as pickHead,ag as workerIndexPath,T as parseWorkerIndex}from'./chunk-normalize.js';import {a as claudeText,d as droppedMessageQuote,b as pipelineOutcome,A as ACCEPTANCE_HOLD_MS,l as livenessOf,w as waitForChange}from'./chunk-stale.js';function pushKindFor(job) {
     switch (job.status) {
         case 'succeeded':
             return 'finished';
@@ -63,7 +63,7 @@ function toNotice(job, kind, now) {
         durationMs: Number.isFinite(span) ? span : null,
         changedFiles: job.changedFileCount ?? null,
         checks: job.checks ?? null,
-        reason: run ? job.outcome : kind === 'failed' ? job.failureDetail || reasonFromText(job.failureReason) : null,
+        reason: run ? job.outcome : kind === 'failed' ? noticeReason(job.failureReason, job.failureDetail) : null,
         summary: job.summarySource === 'worker' ? job.latestSummary ?? null : null,
         ...(job.staleReads && job.staleReads.length > 0 ? { staleReads: job.staleReads } : {}),
         ...(job.continuationKind ? { continuationKind: job.continuationKind } : {}),

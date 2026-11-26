@@ -191,9 +191,101 @@ async function adoptRepo($: EngineInterface, repo: string): Promise<boolean> {
 const trimSlashes = (p: string): string => p.replace(/\/+$/, '') || p;
 
 let announcing = false;
+let submittingNotice = false;
+let inMainTurn = false;
+
+function isPromptDropped(result: unknown): boolean {
+  return result !== null && typeof result === 'object' && typeof (result as { drop?: unknown }).drop === 'string';
+}
+
+async function commitNoticeState(
+  $: EngineInterface,
+  repo: string,
+  prevOwned: readonly Owned[],
+  nextOwned: readonly Owned[],
+  at: number,
+): Promise<void> {
+  for (const o of nextOwned) {
+    if (!prevOwned.some((prev) => prev.kind === o.kind && prev.id === o.id)) {
+      await $.fs.write(claimMarkerPath(repo, o.kind, o.id), `${new Date(at).toISOString()}\n`).catch(() => {});
+    }
+  }
+  const prevByKey = new Map(prevOwned.map((o) => [`${o.kind}:${o.id}`, o]));
+  const nextByKey = new Map(nextOwned.map((o) => [`${o.kind}:${o.id}`, o]));
+  await update($, notices, (current) => {
+    const updated: Owned[] = [];
+    const seenCurrent = new Set<string>();
+    for (const c of current) {
+      const k = `${c.kind}:${c.id}`;
+      seenCurrent.add(k);
+      const prev = prevByKey.get(k);
+      const next = nextByKey.get(k);
+      if (next !== undefined) {
+        updated.push({
+          ...next,
+          ...(c.readHead !== undefined ? { readHead: c.readHead } : {}),
+        });
+      } else if (prev === undefined || c.readHead !== undefined) {
+        updated.push(c);
+      }
+    }
+    for (const o of nextOwned) {
+      const k = `${o.kind}:${o.id}`;
+      if (!seenCurrent.has(k) && !prevByKey.has(k)) {
+        updated.push(o);
+      }
+    }
+    return updated;
+  });
+}
+
+function ownedDiffers(a: readonly Owned[], b: readonly Owned[]): boolean {
+  return a.length !== b.length ||
+    a.some((o, i) =>
+      o.id !== b[i]?.id ||
+      o.kind !== b[i]?.kind ||
+      o.workerId !== b[i]?.workerId ||
+      o.saidAttention !== b[i]?.saidAttention ||
+      o.saidDead !== b[i]?.saidDead ||
+      o.saidExited !== b[i]?.saidExited ||
+      o.fromTurn !== b[i]?.fromTurn ||
+      o.readHead !== b[i]?.readHead);
+}
+
+async function holdAndCommitNotices(
+  $: EngineInterface,
+  repo: string,
+  jobs: readonly RadarJob[],
+  runs: ReadonlyMap<string, RunRecord>,
+  at: number,
+): Promise<void> {
+  if (inMainTurn) return;
+  const latest = await read($, notices);
+  if (latest.length === 0) return;
+  const fresh = due(latest, jobs, runs, at);
+  if (fresh.notices.length === 0) {
+    if (ownedDiffers(latest, fresh.owned)) {
+      await commitNoticeState($, repo, latest, fresh.owned, at);
+    }
+    return;
+  }
+  if (inMainTurn || submittingNotice) return;
+  submittingNotice = true;
+  void $.prompt
+    .submit({ text: claudeText(fresh.notices) })
+    .then(async (res) => {
+      if (!isPromptDropped(res)) {
+        await commitNoticeState($, repo, latest, fresh.owned, at);
+      }
+    })
+    .catch(() => {})
+    .finally(() => {
+      submittingNotice = false;
+    });
+}
 
 async function announce($: EngineInterface, repo: string, jobs: readonly RadarJob[], at: number): Promise<void> {
-  if (announcing) return;
+  if (inMainTurn || announcing || submittingNotice) return;
   announcing = true;
   try {
     const owned = await read($, notices);
@@ -208,31 +300,8 @@ async function announce($: EngineInterface, repo: string, jobs: readonly RadarJo
       } catch {}
     }
     const result = due(owned, jobs, runs, at);
-    const ownedChanged =
-      result.owned.length !== owned.length ||
-      result.owned.some((o, i) =>
-        o.id !== owned[i]?.id ||
-        o.kind !== owned[i]?.kind ||
-        o.workerId !== owned[i]?.workerId ||
-        o.saidAttention !== owned[i]?.saidAttention ||
-        o.saidDead !== owned[i]?.saidDead ||
-        o.saidExited !== owned[i]?.saidExited ||
-        o.fromTurn !== owned[i]?.fromTurn ||
-        o.readHead !== owned[i]?.readHead);
-    const changed = result.notices.length > 0 || ownedChanged;
-    if (!changed) return;
-    for (const o of result.owned) {
-      if (!owned.some((prev) => prev.kind === o.kind && prev.id === o.id)) {
-        await $.fs.write(claimMarkerPath(repo, o.kind, o.id), `${new Date(at).toISOString()}\n`).catch(() => {});
-      }
-    }
-    const seen = new Set([
-      ...owned.map((o) => `${o.kind}:${o.id}`),
-      ...result.owned.map((o) => `${o.kind}:${o.id}`),
-    ]);
-    await update($, notices, (current) => [...result.owned, ...current.filter((c) => !seen.has(`${c.kind}:${c.id}`))]);
-    if (result.notices.length === 0) return;
-    void $.prompt.submit({ text: claudeText(result.notices) }).catch(() => {});
+    if (result.notices.length === 0 && !ownedDiffers(owned, result.owned)) return;
+    await holdAndCommitNotices($, repo, jobs, runs, at);
   } finally {
     announcing = false;
   }
@@ -265,6 +334,7 @@ export async function startBand($: EngineInterface, cwd?: string): Promise<void>
   followingSite = null;
   detailCache = null;
   polling = false;
+  inMainTurn = false;
   idleEntries = null;
   settledJobCache.clear();
 
@@ -355,7 +425,33 @@ async function pollNativeTasks($: EngineInterface, rows: readonly RadarJob[]): P
 
 let interactive = false;
 
+async function flushTurnNotices($: EngineInterface): Promise<void> {
+  const cfg = await read($, bandConfig);
+  if (cfg.repo === '' || await read($, readError) !== null) return;
+  if ((await read($, notices)).length === 0) return;
+  await pollBand($);
+  if (await read($, readError) !== null) return;
+  await announce($, cfg.repo, await read($, bandJobs), await $.clock.now());
+}
+
 function registerBand(on: Parameters<Register>[0]): void {
+  try {
+    on('turn.start', async (_$, e, next) => {
+      if (e.agentId === undefined) inMainTurn = true;
+      return next(e);
+    });
+
+    on('turn.complete', async ($, e, next) => {
+      try {
+        return await next(e);
+      } finally {
+        if (e.agentId === undefined) {
+          inMainTurn = false;
+          await flushTurnNotices($).catch(() => {});
+        }
+      }
+    });
+  } catch {}
   on('tool.call', { tool: LAUNCH_TOOL }, async ($, e, next) => {
     const r = await next(e) as { result?: unknown; text?: unknown; deny?: string; isError?: boolean } | undefined;
     if (r && r.deny === undefined && r.isError !== true) {

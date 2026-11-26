@@ -1,7 +1,7 @@
 import { WorkerLookupError, type ForgeService, type JobDetail } from '../../../../forge/service.ts';
 
 export type ServiceLookup = Pick<ForgeService,
-  'resolveTurn' | 'resolveWorkerHeadId' | 'resolveWorker' | 'resolveWorkerHead' | 'messageTarget' | 'earlierTurns' | 'followUp' | 'steer' | 'cancel' | 'spawnedIds'>;
+  'resolveTurn' | 'resolveWorkerHeadId' | 'resolveWorker' | 'resolveWorkerTarget' | 'resolveWorkerHead' | 'messageTarget' | 'earlierTurns' | 'followUp' | 'steer' | 'cancel' | 'spawnedIds'>;
 
 interface LooseSource {
   readonly detail?: (id: string) => Promise<unknown>;
@@ -39,6 +39,11 @@ export function withWorkerLookup<T extends object>(service: T): T & ServiceLooku
     resolveTurn: (id) => id.trim(),
     resolveWorkerHeadId: (ref) => ref.trim(),
     resolveWorker: lookup,
+    resolveWorkerTarget: async (ref) => {
+      const trimmed = ref.trim();
+      const detail = await merged.resolveWorker(trimmed);
+      return { detail, isWorker: detail.jobId !== merged.resolveTurn(trimmed) };
+    },
     resolveWorkerHead: lookup,
     messageTarget: lookup,
     earlierTurns: async (headOrId) => {
