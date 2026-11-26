@@ -74,6 +74,7 @@ const jobFields = {
   }, ['state', 'silentForMs']),
   toolErrors: typed('integer', 'Tool calls that ended in an error. Evidence, not a verdict: a worker can recover and succeed.'),
   failedEarly: typed('boolean', 'Failed before any tool call (model, region or account); error carries the provider text.'),
+  reason: typed(['string', 'null'], 'Short classification of a failure (e.g. "timed out", "denied command", "no output").'),
   changedFilesUnknown: typed('boolean', 'Changed files could not be computed at finish; a missing changedFiles then means unknown, not none.'),
   cwdMissingAtFinish: typed('boolean', 'The working directory was gone when the job finished; nothing in it could be checked.'),
 };
@@ -166,6 +167,8 @@ const MESSAGE_OUTPUT = open({
   delivery: { type: 'string', enum: ['next-step', 'turn-end', 'now'], description: 'next-step: read inside the running turn; turn-end: starts the next turn when this one ends; now: a new turn started.' },
   status: { type: 'string', enum: ['running'] },
   provider: typed(['string', 'null']),
+  model: typed('string'),
+  effort: typed('string'),
   repo: typed('string'),
   timeoutMs: typed('integer'),
   pendingMessages: typed('integer', 'Messages accepted but not yet read, this one included.'),
