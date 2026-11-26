@@ -113,7 +113,7 @@ import type {
   WorkerHandle,
 } from './types.ts';
 import type { ListModelsOptions, ModelCatalog, ModelInfo, SandboxInfo } from './types.ts';
-import { createAnswer, emptyResponseVerdict, isBookkeepingTool, type Answer } from './answer.ts';
+import { createAnswer, emptyResponseVerdict, type Answer } from './answer.ts';
 import { DEFAULT_DISCOVERY_TIMEOUT_MS, configDir, errMessage, parseTomlTopLevel, readTextSafe, runCapture } from './discovery.ts';
 import type { RunFn } from './discovery.ts';
 import path from 'node:path';
@@ -382,7 +382,7 @@ interface CodexTranslator {
  */
 export function createCodexTranslator(maxChars: number): CodexTranslator {
   let step = 0;
-  const answer = createAnswer();
+  const answer = createAnswer('codex');
   const state: CodexTranslator = {
     sawTurnCompleted: false,
     answer,
@@ -442,8 +442,10 @@ export function createCodexTranslator(maxChars: number): CodexTranslator {
       if (itemType === 'agent_message') {
         const text = str(item, 'text');
         if (text !== undefined) {
-          answer.text(text);
-          if (text !== '') {
+          if (text === '') {
+            answer.emptyMessage();
+          } else {
+            answer.text(text);
             out.push({ kind: 'text', at, text, stream: 'assistant' });
           }
         }
@@ -456,7 +458,8 @@ export function createCodexTranslator(maxChars: number): CodexTranslator {
         return out;
       }
 
-      if (isBookkeepingTool('codex', itemType)) {
+      if (itemType === 'todo_list') {
+        answer.tool(itemType);
         out.push({ kind: 'notice', at, level: 'info', message: 'codex updated its todo list', raw: item });
         return out;
       }
@@ -464,7 +467,7 @@ export function createCodexTranslator(maxChars: number): CodexTranslator {
       if (NON_TOOL_ITEM_TYPES.has(itemType)) return out;
 
       const isReplay = type === 'item.completed' && completedToolIds.has(itemId);
-      if (!isReplay) answer.work();
+      if (!isReplay) answer.tool(itemType);
       if (type === 'item.completed') completedToolIds.add(itemId);
       // ---- tool-ish items ----------------------------------------------------
       const tool = itemTool.get(itemId) ?? toolLabelFor(itemType, item);

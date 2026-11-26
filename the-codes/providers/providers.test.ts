@@ -1983,6 +1983,25 @@ test('reviewers: agy/claude final field and opencode/kimi mapping regressions', 
     const res5 = buildOpencodeResult({ ...base, tx: tx5 });
     assert.equal(res5.response, '');
     assert.notEqual(res5.status, 'success');
+
+    const tx6 = createOpencodeTranslator(2000);
+    tx6.onEvent({ type: 'step_start' });
+    tx6.onEvent({ type: 'text', part: { type: 'text', messageID: 'm1', text: 'Here is the answer' } });
+    tx6.onEvent({ type: 'tool.completed', part: { id: 'p1', tool: 'todowrite', state: { status: 'completed', output: 'ok' } } });
+    tx6.onEvent({ type: 'step_finish', part: { reason: 'tool-calls' } });
+    tx6.onEvent({ type: 'step_start' });
+    tx6.onEvent({ type: 'step_finish', part: { reason: 'stop' } });
+    const res6 = buildOpencodeResult({ ...base, tx: tx6 });
+    assert.equal(res6.status, 'success');
+    assert.equal(res6.response, 'Here is the answer');
+  });
+
+  await t.test('agy: empty text_delta does not block result.response fallback', () => {
+    const tx = createAgyTranslator(2000);
+    tx.onEvent({ event: 'step_update', step_update: { step_index: 1, step_type: 'agent_response', state: 'ACTIVE', text_delta: '' } });
+    const res = buildAgyResult({ ...base, resultEvent: { status: 'SUCCESS', response: 'Final report' }, denials: tx.denials, sawAnyToolCall: tx.stepsWereTools(), errorIsStale: tx.errorIsStale(), answer: tx.answer });
+    assert.equal(res.status, 'success');
+    assert.equal(res.response, 'Final report');
   });
 
   await t.test('kimi: whitespace-only content on SetTodoList-only assistant record keeps prior answer', () => {

@@ -1181,6 +1181,41 @@ describe('completion notices', () => {
     await clock.advance(1000);
     expect(prompts).toHaveLength(1);
   });
+
+  test('newer turn recorded and read while prior prompt.submit is in flight stays retired', async ($, on) => {
+    const files = ada('running', { startedAt: iso(RUNNING_NOW - 16 * 60_000), updatedAt: iso(RUNNING_NOW - 16 * 60_000) });
+    const ids = ['job-ada'];
+    const { clock } = forgeHost(on, files, ids);
+    let releaseSubmit: (() => void) | null = null;
+    const prompts: string[] = [];
+    on('fs.write', (_$: unknown, e: any) => { files[e.path] = e.text; return { value: undefined }; });
+    on('prompt.submit', async (_$: unknown, e: any) => {
+      prompts.push(e.text);
+      if (prompts.length === 1) {
+        await new Promise<void>((r) => { releaseSubmit = r; });
+      }
+      return { text: e.text };
+    });
+    on('turn.start', (_$: unknown, e: any) => ({ turnId: e.turnId }));
+    on('turn.complete', (_$: unknown, e: any) => ({ text: e.answer ?? '' }));
+
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
+    await $.tool.call({ tool: 'mcp__plugin_agent-smith_agent-smith__spawn_job', jobId: 'job-ada', workerId: 'w-ada', repo: '/work' });
+    await clock.advance(1000);
+    expect(prompts).toHaveLength(1);
+
+    Object.assign(files, canonicalJob('job-ada-2',
+      { status: 'succeeded', name: 'Ada', workerId: 'w-ada', provider: 'codex', role: 'review', continuedFrom: 'job-ada', finishedAt: iso(RUNNING_NOW + 1000), updatedAt: iso(RUNNING_NOW + 1000) },
+      { 'acceptance.json': JSON.stringify({ state: 'accepted', checks: [{ name: 'tests', ok: true }] }) }));
+    ids.push('job-ada-2');
+    await $.tool.call({ tool: 'mcp__plugin_agent-smith_agent-smith__follow_up', jobId: 'job-ada-2', workerId: 'w-ada', repo: '/work' });
+    await settledRead($, 'job-ada-2');
+    releaseSubmit!();
+    await new Promise((r) => setTimeout(r, 20));
+
+    await clock.advance(1000);
+    expect(prompts).toHaveLength(1);
+  });
 });
 
 describe("a session cwd that is not the server's repo (#43)", () => {

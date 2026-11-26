@@ -432,7 +432,7 @@ describe('agy stale and recovered error handling', () => {
     for (const exit of [{ code: 1, signal: null, killReason: undefined, stderr: '' }, { code: null, signal: 'SIGTERM', killReason: 'cancelled', stderr: '' }]) {
       const res = buildResult({
         jobId: 'x', resultEvent: resultEvent as never, exit: exit as never, startedAtMs: Date.now() - 1, stateDir: '/tmp',
-        denials: [], sawAnyToolCall: false, errorIsStale: true, answer: createAnswer(),
+        denials: [], sawAnyToolCall: false, errorIsStale: true, answer: createAnswer('agy'),
       });
       assert.notEqual(res.status, 'success');
       assert.equal(recoveredNotice(res, resultEvent as never), undefined);

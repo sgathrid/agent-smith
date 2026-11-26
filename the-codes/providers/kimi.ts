@@ -36,7 +36,7 @@ import {
 } from './discovery.ts';
 import type { RunFn } from './discovery.ts';
 import { noResultText, stderrClause } from './failure-text.ts';
-import { createAnswer, emptyResponseVerdict, isBookkeepingTool, type Answer } from './answer.ts';
+import { createAnswer, emptyResponseVerdict, type Answer } from './answer.ts';
 import path from 'node:path';
 
 export function kimiBinary(): string {
@@ -141,7 +141,7 @@ export interface KimiTranslator {
 }
 
 export function createKimiTranslator(maxChars: number): KimiTranslator {
-  const answer = createAnswer();
+  const answer = createAnswer('kimi');
   const tx: KimiTranslator = {
     answer,
     get finalText() {
@@ -235,16 +235,9 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
       const content = str(raw, 'content');
       const calls = raw['tool_calls'];
       const hasAnyCall = Array.isArray(calls) && calls.length > 0;
-      const hasRealCall = Array.isArray(calls) && calls.some((rawCall) => {
-        if (rawCall === null || typeof rawCall !== 'object' || Array.isArray(rawCall)) return false;
-        const call = rawCall as Record<string, unknown>;
-        const fn = obj(call, 'function');
-        const name = str(fn, 'name') ?? str(call, 'name') ?? 'tool';
-        return !isBookkeepingTool('kimi', name);
-      });
       if (content !== undefined) {
         if (content.trim() === '') {
-          if (!hasAnyCall || hasRealCall) answer.emptyMessage();
+          if (!hasAnyCall) answer.emptyMessage();
         } else {
           answer.text(content);
           out.push({ kind: 'text', at, text: content, stream: 'assistant' });
@@ -262,12 +255,12 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
             raw,
           });
         } else {
-          if (hasRealCall) answer.work();
           for (const rawCall of calls) {
             if (rawCall === null || typeof rawCall !== 'object' || Array.isArray(rawCall)) continue;
             const call = rawCall as Record<string, unknown>;
             const fn = obj(call, 'function');
             const name = str(fn, 'name') ?? str(call, 'name') ?? 'tool';
+            answer.tool(name);
             const id = str(call, 'id') ?? str(call, 'tool_call_id') ?? `call-${step}`;
 
             let args: unknown = fn?.['arguments'] ?? call['arguments'];
@@ -306,7 +299,7 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
         });
         return out;
       }
-      if (!isBookkeepingTool('kimi', toolNames.get(id) ?? '')) answer.work();
+      answer.tool(toolNames.get(id) ?? '');
       const content = contentText(raw['content']);
       const output = truncate(content, maxChars);
       const status: ActivityStatus = toolOutputIsError(content) ? 'error' : 'done';

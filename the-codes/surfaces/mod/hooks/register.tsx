@@ -219,10 +219,6 @@ async function commitNoticeState(
       const k = `${c.kind}:${c.id}`;
       seenCurrent.add(k);
       const prev = prevByKey.get(k);
-      if (prev !== undefined && c.id !== prev.id) {
-        updated.push(c);
-        continue;
-      }
       const next = nextByKey.get(k);
       if (next !== undefined) {
         updated.push({
@@ -273,7 +269,7 @@ async function holdAndCommitNotices(
     }
     return;
   }
-  if (submittingNotice) return;
+  if (inMainTurn || submittingNotice) return;
   submittingNotice = true;
   void $.prompt
     .submit({ text: claudeText(fresh.notices) })

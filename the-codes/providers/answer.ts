@@ -5,6 +5,7 @@ export type ProviderFinalKind = 'final-message' | 'run-prose';
 export interface Answer {
   text(fragment: string, messageKey?: string): void;
   emptyMessage(): void;
+  tool(name: string): void;
   work(): void;
   providerFinal(text: string | undefined, kind: ProviderFinalKind): void;
   value(): string;
@@ -18,7 +19,7 @@ const BOOKKEEPING_TOOLS: Readonly<Record<string, ReadonlySet<string>>> = {
   agy: new Set(),
 };
 
-export function isBookkeepingTool(provider: string, toolName: string): boolean {
+function isBookkeepingTool(provider: string, toolName: string): boolean {
   return BOOKKEEPING_TOOLS[provider]?.has(toolName) ?? false;
 }
 
@@ -34,15 +35,23 @@ export function emptyResponseVerdict(
   };
 }
 
-export function createAnswer(): Answer {
+export function createAnswer(provider: string): Answer {
   let current = '';
   let lastKey: string | undefined;
   let hasMessage = false;
   let sawText = false;
   let blockedByWork = false;
 
+  function work(): void {
+    current = '';
+    lastKey = undefined;
+    hasMessage = false;
+    blockedByWork = true;
+  }
+
   return {
     text(fragment: string, messageKey?: string): void {
+      if (fragment === '') return;
       sawText = true;
       if (messageKey !== undefined && hasMessage && messageKey === lastKey) {
         current += fragment;
@@ -59,12 +68,10 @@ export function createAnswer(): Answer {
       lastKey = undefined;
       hasMessage = false;
     },
-    work(): void {
-      current = '';
-      lastKey = undefined;
-      hasMessage = false;
-      blockedByWork = true;
+    tool(name: string): void {
+      if (!isBookkeepingTool(provider, name)) work();
     },
+    work,
     providerFinal(text: string | undefined, kind: ProviderFinalKind): void {
       if (text === undefined) return;
       if (text.trim() === '') {

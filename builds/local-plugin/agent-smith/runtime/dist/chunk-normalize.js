@@ -2287,14 +2287,22 @@ function emptyResponseVerdict(response, stderr, options = {}) {
         error: `no output${options.detail ?? ''}${stderrClause(stderr)}`,
     };
 }
-function createAnswer() {
+function createAnswer(provider) {
     let current = '';
     let lastKey;
     let hasMessage = false;
     let sawText = false;
     let blockedByWork = false;
+    function work() {
+        current = '';
+        lastKey = undefined;
+        hasMessage = false;
+        blockedByWork = true;
+    }
     return {
         text(fragment, messageKey) {
+            if (fragment === '')
+                return;
             sawText = true;
             if (messageKey !== undefined && hasMessage && messageKey === lastKey) {
                 current += fragment;
@@ -2313,12 +2321,11 @@ function createAnswer() {
             lastKey = undefined;
             hasMessage = false;
         },
-        work() {
-            current = '';
-            lastKey = undefined;
-            hasMessage = false;
-            blockedByWork = true;
+        tool(name) {
+            if (!isBookkeepingTool(provider, name))
+                work();
         },
+        work,
         providerFinal(text, kind) {
             if (text === undefined)
                 return;
@@ -2528,7 +2535,7 @@ function recoveredNotice(final, resultEvent) {
 }
 function createAgyTranslator(maxChars) {
     const steps = new Map();
-    const answer = createAnswer();
+    const answer = createAnswer('agy');
     const denials = [];
     let sawErrorStep = false;
     let progressedAfterError = false;
@@ -2585,8 +2592,7 @@ function createAgyTranslator(maxChars) {
             if (stepType === 'tool') {
                 const info = su.tool_info;
                 const toolName = su.tool_name ?? info?.name ?? 'unknown';
-                if (!isBookkeepingTool('agy', toolName))
-                    answer.work();
+                answer.tool(toolName);
                 const mem = steps.get(stepIndex) ?? {};
                 steps.set(stepIndex, mem);
                 if (state === 'ACTIVE') {
@@ -3070,7 +3076,7 @@ function isPermissionDenial(text) {
         (hay.includes('denied') || hay.includes('not allowed') || hay.includes('requested permissions')));
 }
 function createClaudeTranslator(maxChars, input) {
-    const answer = createAnswer();
+    const answer = createAnswer('claude');
     const tx = {
         answer,
         sawResult: false,
@@ -3080,7 +3086,7 @@ function createClaudeTranslator(maxChars, input) {
     };
     const toolStep = new Map();
     const deniedIds = new Set();
-    const bookkeepingTools = new Set();
+    const toolNames = new Map();
     const endedTools = new Set();
     let step = 0;
     let fallbackKeySeq = 0;
@@ -3162,6 +3168,8 @@ function createClaudeTranslator(maxChars, input) {
             }
             const envelopeParent = str(raw, 'parent_tool_use_id');
             const msgKey = str(message, 'id') ?? `anon-${++fallbackKeySeq}`;
+            let sawEmptyText = false;
+            let sawNonEmptyText = false;
             for (const block of content) {
                 if (block === null || typeof block !== 'object')
                     continue;
@@ -3181,8 +3189,12 @@ function createClaudeTranslator(maxChars, input) {
                         }
                     }
                     else if (text !== undefined) {
-                        answer.text(text, msgKey);
-                        if (text !== '') {
+                        if (text === '') {
+                            sawEmptyText = true;
+                        }
+                        else {
+                            sawNonEmptyText = true;
+                            answer.text(text, msgKey);
                             out.push({ kind: 'text', at, text, stream: 'assistant' });
                         }
                     }
@@ -3199,12 +3211,9 @@ function createClaudeTranslator(maxChars, input) {
                     const toolUseId = str(b, 'id') ?? `toolu-${step}`;
                     const toolName = str(b, 'name') ?? 'unknown';
                     const isSubagent = str(b, 'parent_tool_use_id') !== undefined || envelopeParent !== undefined;
-                    if (isBookkeepingTool('claude', toolName)) {
-                        bookkeepingTools.add(toolUseId);
-                    }
-                    else if (!isSubagent) {
-                        answer.work();
-                    }
+                    toolNames.set(toolUseId, toolName);
+                    if (!isSubagent)
+                        answer.tool(toolName);
                     const idx = step++;
                     toolStep.set(toolUseId, idx);
                     const input = preview(b['input'], maxChars);
@@ -3217,6 +3226,8 @@ function createClaudeTranslator(maxChars, input) {
                     continue;
                 }
             }
+            if (sawEmptyText && !sawNonEmptyText)
+                answer.emptyMessage();
             return out;
         }
         if (type === 'user') {
@@ -3240,8 +3251,8 @@ function createClaudeTranslator(maxChars, input) {
                 const toolUseId = str(b, 'tool_use_id') ?? '';
                 const isSubagent = (parentId !== undefined && parentId !== null) || b['parent_tool_use_id'] != null;
                 const isReplay = toolUseId !== '' && endedTools.has(toolUseId);
-                if (!isSubagent && !isReplay && !bookkeepingTools.has(toolUseId))
-                    answer.work();
+                if (!isSubagent && !isReplay)
+                    answer.tool(toolNames.get(toolUseId) ?? '');
                 if (toolUseId !== '')
                     endedTools.add(toolUseId);
                 const idx = toolStep.get(toolUseId) ?? step++;
@@ -3768,7 +3779,7 @@ function outputPreviewFor(itemType, item, maxChars) {
  */
 function createCodexTranslator(maxChars) {
     let step = 0;
-    const answer = createAnswer();
+    const answer = createAnswer('codex');
     const state = {
         sawTurnCompleted: false,
         answer,
@@ -3826,8 +3837,11 @@ function createCodexTranslator(maxChars) {
             if (itemType === 'agent_message') {
                 const text = str(item, 'text');
                 if (text !== undefined) {
-                    answer.text(text);
-                    if (text !== '') {
+                    if (text === '') {
+                        answer.emptyMessage();
+                    }
+                    else {
+                        answer.text(text);
                         out.push({ kind: 'text', at, text, stream: 'assistant' });
                     }
                 }
@@ -3839,7 +3853,8 @@ function createCodexTranslator(maxChars) {
                     out.push({ kind: 'text', at, text: truncate(text, maxChars).text, stream: 'thinking' });
                 return out;
             }
-            if (isBookkeepingTool('codex', itemType)) {
+            if (itemType === 'todo_list') {
+                answer.tool(itemType);
                 out.push({ kind: 'notice', at, level: 'info', message: 'codex updated its todo list', raw: item });
                 return out;
             }
@@ -3847,7 +3862,7 @@ function createCodexTranslator(maxChars) {
                 return out;
             const isReplay = type === 'item.completed' && completedToolIds.has(itemId);
             if (!isReplay)
-                answer.work();
+                answer.tool(itemType);
             if (type === 'item.completed')
                 completedToolIds.add(itemId);
             // ---- tool-ish items ----------------------------------------------------
@@ -4239,7 +4254,7 @@ function contentText(value) {
     }
 }
 function createKimiTranslator(maxChars) {
-    const answer = createAnswer();
+    const answer = createAnswer('kimi');
     const tx = {
         answer,
         get finalText() {
@@ -4331,17 +4346,9 @@ function createKimiTranslator(maxChars) {
             const content = str(raw, 'content');
             const calls = raw['tool_calls'];
             const hasAnyCall = Array.isArray(calls) && calls.length > 0;
-            const hasRealCall = Array.isArray(calls) && calls.some((rawCall) => {
-                if (rawCall === null || typeof rawCall !== 'object' || Array.isArray(rawCall))
-                    return false;
-                const call = rawCall;
-                const fn = obj(call, 'function');
-                const name = str(fn, 'name') ?? str(call, 'name') ?? 'tool';
-                return !isBookkeepingTool('kimi', name);
-            });
             if (content !== undefined) {
                 if (content.trim() === '') {
-                    if (!hasAnyCall || hasRealCall)
+                    if (!hasAnyCall)
                         answer.emptyMessage();
                 }
                 else {
@@ -4361,14 +4368,13 @@ function createKimiTranslator(maxChars) {
                     });
                 }
                 else {
-                    if (hasRealCall)
-                        answer.work();
                     for (const rawCall of calls) {
                         if (rawCall === null || typeof rawCall !== 'object' || Array.isArray(rawCall))
                             continue;
                         const call = rawCall;
                         const fn = obj(call, 'function');
                         const name = str(fn, 'name') ?? str(call, 'name') ?? 'tool';
+                        answer.tool(name);
                         const id = str(call, 'id') ?? str(call, 'tool_call_id') ?? `call-${step}`;
                         let args = fn?.['arguments'] ?? call['arguments'];
                         if (typeof args === 'string') {
@@ -4407,8 +4413,7 @@ function createKimiTranslator(maxChars) {
                 });
                 return out;
             }
-            if (!isBookkeepingTool('kimi', toolNames.get(id) ?? ''))
-                answer.work();
+            answer.tool(toolNames.get(id) ?? '');
             const content = contentText(raw['content']);
             const output = truncate(content, maxChars);
             const status = toolOutputIsError(content) ? 'error' : 'done';
@@ -4904,13 +4909,13 @@ const TRANSPORT_ERROR_TYPE = 'provider.transport';
  * (observed live) and totally unknown types (spec'd above).
  */
 function createOpencodeTranslator(maxChars) {
-    const answer = createAnswer();
+    const answer = createAnswer('opencode');
     const tx = {
         answer,
         get finalText() {
             return answer.value();
         },
-        hasOpenTools: () => openParts.size > 0,
+        openToolNames: () => openParts.values(),
         sawTerminal: false,
         sawError: false,
         toolErrors: 0,
@@ -4922,7 +4927,7 @@ function createOpencodeTranslator(maxChars) {
     let step = 0;
     const partStep = new Map();
     const endedParts = new Set();
-    const openParts = new Set();
+    const openParts = new Map();
     const translate = (raw) => {
         const out = [];
         const at = nowIso();
@@ -5013,12 +5018,12 @@ function createOpencodeTranslator(maxChars) {
             const isDone = DONE_WORDS.has(stateWord) || type.endsWith('.completed') || type.endsWith('.done');
             const isErr = ERROR_WORDS.has(stateWord) || type.endsWith('.error');
             const isReplay = endedParts.has(partId);
-            if (!isReplay && !isBookkeepingTool('opencode', toolName)) {
-                answer.work();
+            if (!isReplay) {
+                answer.tool(toolName);
                 if (isDone || isErr)
                     openParts.delete(partId);
                 else
-                    openParts.add(partId);
+                    openParts.set(partId, toolName);
             }
             if (isDone || isErr)
                 endedParts.add(partId);
@@ -5121,8 +5126,6 @@ function createOpencodeTranslator(maxChars) {
         }
         // ---- step boundaries ----------------------------------------------------
         if (isStepStart || isStepFinish) {
-            if (isStepFinish && str(part, 'reason') === 'tool-calls')
-                answer.work();
             // Verified in the installed OpenCode CLI: session.step.ended emits
             // step_finish with part.reason = data.finish. Tool-call/length finishes
             // end only a step; "stop" confirms the assistant finished normally.
@@ -5209,8 +5212,8 @@ function buildResult(args) {
     const toolErrors = tx.toolErrors > 0 ? ` · ${tx.toolErrors} tool error(s)` : '';
     // An error the worker got past: more work and a final report followed it. A
     // signal kill is no evidence of completion, so it needs a real exit code.
-    if (tx.hasOpenTools())
-        tx.answer.work();
+    for (const name of tx.openToolNames())
+        tx.answer.tool(name);
     const response = tx.answer.value();
     const recovered = tx.recovery.recovered(response, exit.code);
     const early = earlyVerdict(exit, durationMs);

@@ -108,7 +108,7 @@ import type { ListModelsOptions, ModelCatalog, ModelInfo, SandboxInfo } from './
 import { DEFAULT_DISCOVERY_TIMEOUT_MS, errMessage, runCapture } from './discovery.ts';
 import type { RunFn } from './discovery.ts';
 import { deniedText, stderrClause } from './failure-text.ts';
-import { createAnswer, emptyResponseVerdict, isBookkeepingTool, type Answer } from './answer.ts';
+import { createAnswer, emptyResponseVerdict, type Answer } from './answer.ts';
 
 
 export function opencodeBinary(): string {
@@ -332,7 +332,7 @@ interface OpencodeTranslator {
   onEvent(raw: Record<string, unknown>): ProviderEvent[];
   answer: Answer;
   readonly finalText: string;
-  hasOpenTools(): boolean;
+  openToolNames(): Iterable<string>;
   sawTerminal: boolean;
   /** A fatal `error` / `session.error` event. A failed TOOL call never sets this. */
   sawError: boolean;
@@ -357,13 +357,13 @@ interface OpencodeTranslator {
  * (observed live) and totally unknown types (spec'd above).
  */
 export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
-  const answer = createAnswer();
+  const answer = createAnswer('opencode');
   const tx: OpencodeTranslator = {
     answer,
     get finalText() {
       return answer.value();
     },
-    hasOpenTools: () => openParts.size > 0,
+    openToolNames: () => openParts.values(),
     sawTerminal: false,
     sawError: false,
     toolErrors: 0,
@@ -375,7 +375,7 @@ export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
   let step = 0;
   const partStep = new Map<string, number>();
   const endedParts = new Set<string>();
-  const openParts = new Set<string>();
+  const openParts = new Map<string, string>();
 
   const translate = (raw: Record<string, unknown>): ProviderEvent[] => {
     const out: ProviderEvent[] = [];
@@ -475,10 +475,10 @@ export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
       const isDone = DONE_WORDS.has(stateWord) || type.endsWith('.completed') || type.endsWith('.done');
       const isErr = ERROR_WORDS.has(stateWord) || type.endsWith('.error');
       const isReplay = endedParts.has(partId);
-      if (!isReplay && !isBookkeepingTool('opencode', toolName)) {
-        answer.work();
+      if (!isReplay) {
+        answer.tool(toolName);
         if (isDone || isErr) openParts.delete(partId);
-        else openParts.add(partId);
+        else openParts.set(partId, toolName);
       }
       if (isDone || isErr) endedParts.add(partId);
       const errorTexts = [
@@ -576,7 +576,6 @@ export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
 
     // ---- step boundaries ----------------------------------------------------
     if (isStepStart || isStepFinish) {
-      if (isStepFinish && str(part, 'reason') === 'tool-calls') answer.work();
       // Verified in the installed OpenCode CLI: session.step.ended emits
       // step_finish with part.reason = data.finish. Tool-call/length finishes
       // end only a step; "stop" confirms the assistant finished normally.
@@ -676,7 +675,7 @@ export function buildResult(args: {
   const toolErrors = tx.toolErrors > 0 ? ` · ${tx.toolErrors} tool error(s)` : '';
   // An error the worker got past: more work and a final report followed it. A
   // signal kill is no evidence of completion, so it needs a real exit code.
-  if (tx.hasOpenTools()) tx.answer.work();
+  for (const name of tx.openToolNames()) tx.answer.tool(name);
   const response = tx.answer.value();
   const recovered = tx.recovery.recovered(response, exit.code);
   const early = earlyVerdict(exit, durationMs);

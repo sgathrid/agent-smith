@@ -27,7 +27,7 @@ import { DEFAULT_DISCOVERY_TIMEOUT_MS, errMessage, runCapture } from './discover
 import type { RunFn } from './discovery.ts';
 import { exitReason } from '../surfaces/mod/hooks/reasons.ts';
 import { deniedText, noResultText, stderrClause } from './failure-text.ts';
-import { createAnswer, emptyResponseVerdict, isBookkeepingTool, type Answer } from './answer.ts';
+import { createAnswer, emptyResponseVerdict, type Answer } from './answer.ts';
 
 export function agyBinary(): string {
   return process.env['AGENT_SMITH_AGY_BIN'] ?? 'agy';
@@ -280,7 +280,7 @@ export function recoveredNotice(final: JobResult, resultEvent: AgyResultEvent | 
 
 export function createAgyTranslator(maxChars: number) {
   const steps = new Map<number, StepMemory>();
-  const answer = createAnswer();
+  const answer = createAnswer('agy');
   const denials: DeniedAction[] = [];
   let sawErrorStep = false;
   let progressedAfterError = false;
@@ -341,7 +341,7 @@ export function createAgyTranslator(maxChars: number) {
       if (stepType === 'tool') {
         const info = su.tool_info;
         const toolName = su.tool_name ?? info?.name ?? 'unknown';
-        if (!isBookkeepingTool('agy', toolName)) answer.work();
+        answer.tool(toolName);
         const mem = steps.get(stepIndex) ?? {};
         steps.set(stepIndex, mem);
 

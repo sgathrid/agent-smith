@@ -27,7 +27,7 @@ import { DEFAULT_DISCOVERY_TIMEOUT_MS, configDir, errMessage, readTextSafe, runC
 import type { RunFn } from './discovery.ts';
 import path from 'node:path';
 import { deniedText, noResultText, stderrClause } from './failure-text.ts';
-import { createAnswer, emptyResponseVerdict, isBookkeepingTool, type Answer } from './answer.ts';
+import { createAnswer, emptyResponseVerdict, type Answer } from './answer.ts';
 
 export function claudeBinary(): string {
   return process.env['AGENT_SMITH_CLAUDE_BIN'] ?? 'claude';
@@ -259,7 +259,7 @@ export function createClaudeTranslator(
   maxChars: number,
   input?: Pick<ClaudeLiveInput, 'replayed' | 'end'>,
 ): ClaudeTranslator {
-  const answer = createAnswer();
+  const answer = createAnswer('claude');
   const tx: ClaudeTranslator = {
     answer,
     sawResult: false,
@@ -269,7 +269,7 @@ export function createClaudeTranslator(
   };
   const toolStep = new Map<string, number>();
   const deniedIds = new Set<string>();
-  const bookkeepingTools = new Set<string>();
+  const toolNames = new Map<string, string>();
   const endedTools = new Set<string>();
   let step = 0;
   let fallbackKeySeq = 0;
@@ -354,6 +354,8 @@ export function createClaudeTranslator(
 
       const envelopeParent = str(raw, 'parent_tool_use_id');
       const msgKey = str(message, 'id') ?? `anon-${++fallbackKeySeq}`;
+      let sawEmptyText = false;
+      let sawNonEmptyText = false;
       for (const block of content) {
         if (block === null || typeof block !== 'object') continue;
         const b = block as Record<string, unknown>;
@@ -372,8 +374,11 @@ export function createClaudeTranslator(
               });
             }
           } else if (text !== undefined) {
-            answer.text(text, msgKey);
-            if (text !== '') {
+            if (text === '') {
+              sawEmptyText = true;
+            } else {
+              sawNonEmptyText = true;
+              answer.text(text, msgKey);
               out.push({ kind: 'text', at, text, stream: 'assistant' });
             }
           }
@@ -392,11 +397,8 @@ export function createClaudeTranslator(
           const toolUseId = str(b, 'id') ?? `toolu-${step}`;
           const toolName = str(b, 'name') ?? 'unknown';
           const isSubagent = str(b, 'parent_tool_use_id') !== undefined || envelopeParent !== undefined;
-          if (isBookkeepingTool('claude', toolName)) {
-            bookkeepingTools.add(toolUseId);
-          } else if (!isSubagent) {
-            answer.work();
-          }
+          toolNames.set(toolUseId, toolName);
+          if (!isSubagent) answer.tool(toolName);
           const idx = step++;
           toolStep.set(toolUseId, idx);
           const input = preview(b['input'], maxChars);
@@ -407,6 +409,7 @@ export function createClaudeTranslator(
           continue;
         }
       }
+      if (sawEmptyText && !sawNonEmptyText) answer.emptyMessage();
       return out;
     }
 
@@ -428,7 +431,7 @@ export function createClaudeTranslator(
         const toolUseId = str(b, 'tool_use_id') ?? '';
         const isSubagent = (parentId !== undefined && parentId !== null) || b['parent_tool_use_id'] != null;
         const isReplay = toolUseId !== '' && endedTools.has(toolUseId);
-        if (!isSubagent && !isReplay && !bookkeepingTools.has(toolUseId)) answer.work();
+        if (!isSubagent && !isReplay) answer.tool(toolNames.get(toolUseId) ?? '');
         if (toolUseId !== '') endedTools.add(toolUseId);
 
         const idx = toolStep.get(toolUseId) ?? step++;
