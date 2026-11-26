@@ -213,6 +213,18 @@ test('pipelineOutcome names the first stage that did not pass, in the short word
     build: { stage: 'build', status: 'failed', failure: { code: 'exit-1', message: 'worker soft-denied 1 tool action(s) (view_file)' } },
   })), '0/1 stages passed · build: denied view_file');
   assert.equal(pipelineOutcome(record({ a: { stage: 'a', status: 'passed' } })), '1/1 stages passed');
+  assert.equal(pipelineOutcome(record({
+    a: { stage: 'a', status: 'failed', failure: { code: 'exit-1', message: 'exited 1' } },
+    b: { stage: 'b', status: 'failed', acceptance: 'failed', verification: { failing: [{ check: { name: 'tests' } }] } },
+    c: { stage: 'c', status: 'skipped' },
+  })), '0/3 stages passed · a: exit 1, b: checks failed: tests');
+  assert.equal(pipelineOutcome(record({
+    s1: { stage: 's1', status: 'failed', failure: { message: 'exited 1' } },
+    s2: { stage: 's2', status: 'failed', failure: { message: 'timed out after 2m' } },
+    s3: { stage: 's3', status: 'failed', failure: { message: 'exited 2' } },
+    s4: { stage: 's4', status: 'failed', failure: { message: 'exited 3' } },
+    s5: { stage: 's5', status: 'failed', failure: { message: 'exited 4' } },
+  })), '0/5 stages passed · s1: exit 1, s2: timed out, s3: exit 2, +2 more');
 });
 
 test('launch tools match under the plugin and the dev.sh server names, nothing else', () => {
@@ -408,7 +420,12 @@ test('parseSettledRead and unclaim retire a notice once status reads a settled j
   assert.equal(parseSettledRead(`${PLUGIN}status`, { jobId: 'j1', status: 'running' }), null);
   assert.equal(parseSettledRead(`${PLUGIN}status`, { jobId: 'j1', status: 'succeeded', acceptance: { pending: true } }), null);
   assert.deepEqual(parseSettledRead(`${PLUGIN}status`, { jobId: 'j1', status: 'succeeded', acceptance: { state: 'accepted', pending: false } }), { kind: 'job', id: 'j1' });
+  assert.deepEqual(parseSettledRead(`${PLUGIN}status`, { jobId: 'j1', workerId: 'w1', status: 'failed', reason: 'timed out', error: 'timed out after 2m', acceptance: { state: 'unchecked' } }), { kind: 'job', id: 'j1', workerId: 'w1' });
+  assert.deepEqual(parseSettledRead(`${PLUGIN}status`, { jobId: 'j1', workerId: 'w1', status: 'failed', error: 'exit 1', acceptance: { state: 'unchecked', checks: [] } }), { kind: 'job', id: 'j1', workerId: 'w1' });
   assert.deepEqual(parseSettledRead(`${PLUGIN}pipeline_status`, { runId: 'r1', status: 'passed' }), { kind: 'run', id: 'r1' });
+  assert.deepEqual(parseSettledRead(`${PLUGIN}pipeline_status`, { runId: 'r1', status: 'failed', error: 'stage build failed' }), { kind: 'run', id: 'r1' });
+  assert.equal(parseSettledRead(`${PLUGIN}status`, { error: 'No worker "ghost"' }), null);
+  assert.equal(parseSettledRead(`${PLUGIN}status`, { isError: true, content: [{ type: 'text', text: JSON.stringify({ jobId: 'j1', status: 'failed', acceptance: { state: 'unchecked' } }) }] }), null);
 
   const owned = claim(claim([], launch('j1'), NOW), launch('j2'), NOW);
   const read = unclaim(owned, { kind: 'job', id: 'j1' });

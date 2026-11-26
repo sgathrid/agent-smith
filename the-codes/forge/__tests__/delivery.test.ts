@@ -898,30 +898,114 @@ test('fuzz: messages at random points across turn end, checks and owner exit are
   process.stderr.write(`fuzz: ${seeds} seeds in ${Date.now() - started} ms\n`);
 });
 
-test('a follow_up turn that failsEarly does not stick its effort to the next turn, and acks report model/effort only when present', async () => {
-  const repo = newRepo();
-  const ctrl = controlledProvider();
-  const s = serviceOn(repo, ctrl.provider);
-  const { t1 } = await startWorker(s, ctrl, { model: 'm-1' });
-  await settle(repo, t1);
+test('follow_up inherits effort from an early-failed turn and clears it with effort: "default" (cold-start and queued)', async () => {
+  for (const mode of ['cold-start', 'queued'] as const) {
+    const repo = newRepo();
+    const ctrl = controlledProvider();
+    const s = serviceOn(repo, ctrl.provider);
+    const { t1 } = await startWorker(s, ctrl, { model: 'm-1' });
+    await settle(repo, t1);
 
-  const t2Ready = ctrl.nextTurn();
-  const fu2 = await s.followUp({ worker: 'w', prompt: 'TRY-HIGH', effort: 'high' });
-  const t2 = await t2Ready;
-  assert.equal(fu2.model, 'm-1');
-  assert.equal(fu2.effort, 'high');
-  assert.equal(t2.spec.effort, 'high');
-  await settle(repo, t2, { status: 'error', exitCode: 1, durationMs: 50, error: 'Variant unavailable for m-1: high', response: '' });
-  assert.equal(readManifest(repo, t2.spec.jobId!).failedEarly, true);
+    const t2Ready = ctrl.nextTurn();
+    const fu2 = await s.followUp({ worker: 'w', prompt: 'TRY-HIGH', effort: 'high' });
+    const t2 = await t2Ready;
+    assert.equal(fu2.model, 'm-1');
+    assert.equal(fu2.effort, 'high');
+    assert.equal(t2.spec.effort, 'high');
 
-  const t3Ready = ctrl.nextTurn();
-  const fu3 = await s.followUp({ worker: 'w', prompt: 'RETRY-PLAIN' });
-  const t3 = await t3Ready;
-  assert.equal(t3.spec.model, 'm-1');
-  assert.equal(t3.spec.effort, undefined);
-  assert.equal(fu3.model, 'm-1');
-  assert.equal('effort' in fu3, false);
-  await settle(repo, t3);
+    if (mode === 'cold-start') {
+      await settle(repo, t2, { status: 'error', exitCode: 1, durationMs: 50, error: 'Variant unavailable for m-1: high', response: '' });
+      assert.equal(readManifest(repo, t2.spec.jobId!).failedEarly, true);
+
+      const t3Ready = ctrl.nextTurn();
+      const fu3 = await s.followUp({ worker: 'w', prompt: 'RETRY-PLAIN' });
+      const t3 = await t3Ready;
+      assert.equal(t3.spec.model, 'm-1');
+      assert.equal(t3.spec.effort, 'high');
+      assert.equal(fu3.model, 'm-1');
+      assert.equal(fu3.effort, 'high');
+      await settle(repo, t3, { status: 'error', exitCode: 1, durationMs: 50, error: 'Variant unavailable for m-1: high', response: '' });
+
+      const t4Ready = ctrl.nextTurn();
+      const fu4 = await s.followUp({ worker: 'w', prompt: 'CLEAR-EFFORT', effort: 'default' });
+      const t4 = await t4Ready;
+      assert.equal(t4.spec.model, 'm-1');
+      assert.equal(t4.spec.effort, undefined);
+      assert.equal(fu4.model, 'm-1');
+      assert.equal('effort' in fu4, false);
+      await settle(repo, t4);
+
+      const t5Ready = ctrl.nextTurn();
+      const fu5 = await s.followUp({ worker: 'w', prompt: 'AFTER-CLEAR' });
+      const t5 = await t5Ready;
+      assert.equal(t5.spec.effort, undefined);
+      assert.equal('effort' in fu5, false);
+      await settle(repo, t5);
+    } else {
+      const t3Ready = ctrl.nextTurn();
+      const fu3 = await s.followUp({ worker: 'w', prompt: 'QUEUED-PLAIN' });
+      assert.equal(fu3.delivery, 'turn-end');
+      assert.equal(fu3.model, 'm-1');
+      assert.equal(fu3.effort, 'high');
+      t2.finish({ status: 'error', exitCode: 1, durationMs: 50, error: 'Variant unavailable for m-1: high', response: '' });
+      const t3 = await t3Ready;
+      assert.equal(t3.spec.model, 'm-1');
+      assert.equal(t3.spec.effort, 'high');
+
+      const t4Ready = ctrl.nextTurn();
+      const fu4 = await s.followUp({ worker: 'w', prompt: 'QUEUED-CLEAR', effort: 'default' });
+      assert.equal(fu4.delivery, 'turn-end');
+      assert.equal(fu4.model, 'm-1');
+      assert.equal('effort' in fu4, false);
+      t3.finish({ status: 'error', exitCode: 1, durationMs: 50, error: 'Variant unavailable for m-1: high', response: '' });
+      const t4 = await t4Ready;
+      assert.equal(t4.spec.model, 'm-1');
+      assert.equal(t4.spec.effort, undefined);
+      await settle(repo, t4);
+
+      const t5Ready = ctrl.nextTurn();
+      const fu5 = await s.followUp({ worker: 'w', prompt: 'AFTER-CLEAR' });
+      const t5 = await t5Ready;
+      assert.equal(t5.spec.effort, undefined);
+      assert.equal('effort' in fu5, false);
+      await settle(repo, t5);
+    }
+  }
+});
+
+test('follow_up with model: "default" clears inherited model on cold-start and queued paths, and ack reports harness default', async () => {
+  for (const mode of ['cold-start', 'queued'] as const) {
+    const repo = newRepo();
+    const ctrl = controlledProvider();
+    const s = withDefaultProvider(new ForgeService({
+      repo,
+      flushMs: 5,
+      providerSource: () => ctrl.provider,
+      catalogSource: async () => [],
+      harnessDefaults: () => ({ model: 'harness-default-m' }),
+    }));
+    const { t1 } = await startWorker(s, ctrl, { model: 'm-1' });
+    if (mode === 'cold-start') {
+      await settle(repo, t1);
+      const t2Ready = ctrl.nextTurn();
+      const fu2 = await s.followUp({ worker: 'w', prompt: 'RESET-MODEL', model: 'default' });
+      const t2 = await t2Ready;
+      assert.equal(t2.spec.model, undefined);
+      assert.equal(readManifest(repo, t2.spec.jobId!).modelResolved, 'harness-default-m');
+      assert.equal(fu2.model, 'harness-default-m');
+      await settle(repo, t2);
+    } else {
+      const t2Ready = ctrl.nextTurn();
+      const fu2 = await s.followUp({ worker: 'w', prompt: 'QUEUED-RESET', model: 'default' });
+      assert.equal(fu2.delivery, 'turn-end');
+      assert.equal(fu2.model, 'harness-default-m');
+      t1.finish({ status: 'success', response: 'ok' });
+      const t2 = await t2Ready;
+      assert.equal(t2.spec.model, undefined);
+      assert.equal(readManifest(repo, t2.spec.jobId!).modelResolved, 'harness-default-m');
+      await settle(repo, t2);
+    }
+  }
 });
 
 test('follow_up ack omits model and effort when the worker has neither', async () => {

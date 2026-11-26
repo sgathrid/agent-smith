@@ -224,7 +224,7 @@ export function parseSettledRead(
 ): { readonly kind: 'job' | 'run'; readonly id: string; readonly resolvedFrom?: string; readonly workerId?: string } | null {
   if (typeof toolName !== 'string' || !STATUS_TOOL.test(toolName)) return null;
   const payload = unwrapResponse(response);
-  if (payload === null || typeof payload['error'] === 'string') return null;
+  if (payload === null) return null;
   const bare = toolName.slice(toolName.lastIndexOf('__') + 2);
   const workerId = typeof payload['workerId'] === 'string' && payload['workerId'].length > 0 ? payload['workerId'] : undefined;
   if (bare === 'cancel') {
@@ -423,9 +423,13 @@ export function pipelineOutcome(run: RunRecord): string {
   const stages = Object.values(run.stageResults)
     .filter((s): s is NonNullable<typeof s> => s !== null && typeof s === 'object' && typeof s.stage === 'string');
   const passed = stages.filter((s) => s.status === 'passed' && s.acceptance !== 'failed').length;
-  const bad = stages.find((s) => s.status === 'failed' || s.acceptance === 'failed');
+  const failed = stages.filter((s) => s.status === 'failed' || s.acceptance === 'failed');
   const head = `${passed}/${stages.length} stages passed`;
-  if (bad) return `${head} · ${String(bad.stage)}: ${stageReason(bad)}`;
+  if (failed.length > 0) {
+    const shown = failed.slice(0, 3).map((s) => `${String(s.stage)}: ${stageReason(s)}`);
+    if (failed.length > 3) shown.push(`+${failed.length - 3} more`);
+    return `${head} · ${shown.join(', ')}`;
+  }
   return run.error && run.status !== 'passed' ? `${head} · ${reasonFromText(run.error)}` : head;
 }
 

@@ -4,7 +4,15 @@ import { claimMarkerPath } from '../../mod/hooks/notice.ts';
 import type { CallToolResult } from '@modelcontextprotocol/server';
 import type { Server } from '@modelcontextprotocol/server';
 import type { ForgeStatus } from '../../../forge/format.ts';
-import type { FollowUpRequest, ForgeService, JobDetail, MessageAck, SpawnAck, SteerRequest } from '../../../forge/service.ts';
+import {
+  continuationModelAndEffort,
+  type FollowUpRequest,
+  type ForgeService,
+  type JobDetail,
+  type MessageAck,
+  type SpawnAck,
+  type SteerRequest,
+} from '../../../forge/service.ts';
 import { failedReason } from '../../../forge/summary.ts';
 import { launchPipeline } from '../../../forge/supervisor.ts';
 import { FILES, jobDir, jobFile } from '../../../forge/format.ts';
@@ -308,7 +316,7 @@ function messageAck(ack: MessageAck, notes: readonly string[] = []): ToolOutcome
 const followUp: Handler = async (ctx, args) => {
   const request: FollowUpRequest = {
     worker: text(args, 'worker', true)!, prompt: text(args, 'prompt', true)!, context: contextText(args), files: filesList(args),
-    checks: parseChecks(args.checks), model: text(args, 'model'), effort: allowed(args, 'effort', EFFORTS), timeoutMs: number(args, 'timeoutMs'),
+    checks: parseChecks(args.checks), model: text(args, 'model'), effort: allowed(args, 'effort', [...EFFORTS, 'default']), timeoutMs: number(args, 'timeoutMs'),
     env: validateEnv(args.env), unrestricted: boolean(args, 'unrestricted'),
   };
   let targetWorker = request.worker;
@@ -318,10 +326,18 @@ const followUp: Handler = async (ctx, args) => {
     targetWorker = head.workerId ?? head.jobId;
     const provider = head.provider ?? '';
     if (request.model !== undefined || request.effort !== undefined) {
-      const cfg = loadModelConfig({ repo: ctx.service.repo });
-      const resolved = resolveRequest({ provider: provider || undefined, model: request.model ?? head.model ?? head.modelResolved ?? undefined, effort: request.effort }, cfg);
-      Object.assign(request, { ...(request.model !== undefined ? { model: resolved.model } : {}), effort: resolved.effort });
-      notes.push(...resolved.warnings, ...cfg.errors.map(e => `models.json: ${e}`));
+      const inherited = continuationModelAndEffort(head, []);
+      const modelArg = request.model === 'default' ? undefined : (request.model ?? inherited.model);
+      const effortArg = request.effort === 'default' ? undefined : request.effort;
+      if (modelArg !== undefined || effortArg !== undefined) {
+        const cfg = loadModelConfig({ repo: ctx.service.repo });
+        const resolved = resolveRequest({ provider: provider || undefined, model: modelArg, effort: effortArg }, cfg);
+        Object.assign(request, {
+          ...(request.model !== undefined && request.model !== 'default' ? { model: resolved.model } : {}),
+          ...(request.effort !== 'default' ? { effort: resolved.effort } : {}),
+        });
+        notes.push(...resolved.warnings, ...cfg.errors.map(e => `models.json: ${e}`));
+      }
     }
     const gate = await confirmUnrestricted(ctx, [{
       unrestricted: request.unrestricted,

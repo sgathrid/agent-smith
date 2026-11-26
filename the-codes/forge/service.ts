@@ -138,25 +138,33 @@ function mergeOverrides(entries: readonly SteerEntry[]): MessageOverrides {
   return out;
 }
 
-function continuationModelAndEffort(
+export function continuationModelAndEffort(
   head: Partial<Pick<ForgeManifest, 'model' | 'modelResolved' | 'effort'>>,
   entries: readonly SteerEntry[],
   spec?: Pick<TurnSpec, 'model' | 'effort'>,
 ): { model: string | undefined; effort: string | undefined } {
   const o = mergeOverrides(entries);
   return {
-    model: o.model ?? spec?.model ?? head.model ?? head.modelResolved ?? undefined,
-    effort: o.effort ?? spec?.effort ?? head.effort ?? undefined,
+    model: o.model === 'default' ? undefined : (o.model ?? spec?.model ?? head.model ?? head.modelResolved ?? undefined),
+    effort: o.effort === 'default' ? undefined : (o.effort ?? spec?.effort ?? head.effort ?? undefined),
   };
 }
 
-function applyOverrides(spec: TurnSpec, o: MessageOverrides, provider: Provider): TurnSpec {
+function applyOverrides(spec: TurnSpec, o: MessageOverrides, provider: Provider, defaultModel?: string): TurnSpec {
   if (Object.keys(o).length === 0) return spec;
   const unrestricted = effectiveUnrestricted(provider, o.unrestricted === undefined ? spec.unrestricted : o.unrestricted);
+  const { model: _m, effort: _e, ...rest } = spec;
+  const baseSpec: TurnSpec = {
+    ...rest,
+    model: o.model === 'default' ? undefined : spec.model,
+    effort: o.effort === 'default' ? undefined : spec.effort,
+  };
   return {
-    ...spec,
-    ...(o.model === undefined ? {} : { model: o.model, modelRequested: o.model, modelResolved: o.model, modelSource: 'requested' as const }),
-    ...(o.effort === undefined || provider.supportsEffort === false ? {} : { effort: o.effort }),
+    ...baseSpec,
+    ...(o.model === undefined ? {} : o.model === 'default'
+      ? { modelRequested: null, modelResolved: defaultModel ?? null, modelSource: defaultModel ? 'harness-config' as const : 'unknown' as const }
+      : { model: o.model, modelRequested: o.model, modelResolved: o.model, modelSource: 'requested' as const }),
+    ...(o.effort === undefined || o.effort === 'default' || provider.supportsEffort === false ? {} : { effort: o.effort }),
     ...(o.timeoutMs === undefined ? {} : { timeoutMs: resolveTimeoutMs(o.timeoutMs) }),
     ...(o.checks === undefined ? {} : { checks: o.checks }),
     unrestricted,
@@ -885,25 +893,6 @@ export class ForgeService {
     }
   }
 
-  private continuationSettings(
-    head: ForgeManifest,
-    entries: readonly SteerEntry[],
-    spec?: Pick<TurnSpec, 'model' | 'effort'>,
-  ): { model: string | undefined; effort: string | undefined } {
-    let base: ForgeManifest | null = head;
-    const seen = new Set<string>();
-    while (base !== null && base.failedEarly === true) {
-      if (seen.has(base.jobId) || !base.continuedFrom) {
-        base = null;
-        break;
-      }
-      seen.add(base.jobId);
-      base = this.readManifestSync(base.continuedFrom);
-    }
-    const baseSpec = base !== null && base.jobId === head.jobId ? spec : undefined;
-    return continuationModelAndEffort(base ?? {}, entries, baseSpec);
-  }
-
   private continuationRequest(input: {
     readonly head: ForgeManifest;
     readonly spec?: TurnSpec | undefined;
@@ -937,7 +926,7 @@ export class ForgeService {
     const context = [...entries].reverse().find((e) => e.context !== undefined)?.context ?? spec?.context;
     const checks = o.checks ?? spec?.checks ?? input.headChecks;
     const env = input.env !== undefined && Object.keys(input.env).length > 0 ? input.env : undefined;
-    const { model, effort } = this.continuationSettings(head, entries, spec);
+    const { model, effort } = continuationModelAndEffort(head, entries, spec);
     return {
       mode: spec?.mode ?? head.mode ?? 'task',
       prompt: rawPrompt,
@@ -1028,7 +1017,15 @@ export class ForgeService {
     turn: { rawPrompt: string; prependBrief: boolean; resuming: boolean; context: string | undefined };
   }> {
     const { provider, parent, result, report, entries, unconsumed, verdictStatus } = input;
-    const spec = this.withSandbox(applyOverrides(input.spec, mergeOverrides(unconsumed), provider), input.spec, provider);
+    const parentSnap = parent.writer.snapshot();
+    const { model: nextModel, effort: nextEffort } = continuationModelAndEffort(parentSnap ?? {}, unconsumed, input.spec);
+    const defaultModel = this.harnessDefaults(provider.name).model;
+    const overrides = {
+      ...mergeOverrides(unconsumed),
+      ...(nextModel === undefined && input.spec.model !== undefined ? { model: 'default' } : {}),
+      ...(nextEffort === undefined && input.spec.effort !== undefined ? { effort: 'default' } : {}),
+    };
+    const spec = this.withSandbox(applyOverrides(input.spec, overrides, provider, defaultModel), input.spec, provider);
     const conversation = parent.writer.currentConversation();
     const wasInterrupted = parent.live.interruptRequested && verdictStatus !== 'succeeded';
     if (conversation === null && !wasInterrupted) {
@@ -1064,7 +1061,6 @@ export class ForgeService {
       brief: nextBrief,
     });
     const nextLiveEntry = newLiveJob(nextWriter, spec.timeoutMs);
-    const parentSnap = parent.writer.snapshot();
     const nextTurn = (parentSnap?.turn ?? 1) + 1;
     const continuationKind: ContinuationKind = parent.live.interruptRequested ? 'steer' : 'follow-up';
     const chainStartedAt = continuationKind === 'steer'
@@ -1344,7 +1340,8 @@ export class ForgeService {
       }
     }
     const provider = this.providerSafe(head.provider);
-    const { model: effectiveModel, effort: effectiveEffort } = this.continuationSettings(head, [...undeliveredEntries(this.repo, headId), entry]);
+    const { model: effectiveModel, effort: effectiveEffort } = continuationModelAndEffort(head, [...undeliveredEntries(this.repo, headId), entry]);
+    const ackModel = effectiveModel ?? this.harnessDefaults(head.provider).model ?? undefined;
     if (provider !== null) {
       const checked = await validateModelAndEffort(
         provider,
@@ -1401,7 +1398,7 @@ export class ForgeService {
       jobId: headId, name, workerId, turn,
       action: sender === 'steer' && (running || checksRunning) ? 'interrupting' : 'queued',
       delivery, status: 'running', provider: head.provider, repo: this.repo,
-      ...(effectiveModel === undefined ? {} : { model: effectiveModel }),
+      ...(ackModel === undefined ? {} : { model: ackModel }),
       ...(effectiveEffort === undefined || provider?.supportsEffort === false ? {} : { effort: effectiveEffort }),
       timeoutMs: entry.overrides?.timeoutMs ?? head.timeoutMs ?? DEFAULT_TIMEOUT_MS,
       pendingMessages: pending,
@@ -1422,7 +1419,7 @@ export class ForgeService {
     const { ack: envAck, runEnv } = this.resolveFollowUpEnv(workerId, head.jobId, env, false, warnings);
     const provider = this.providerSafe(head.provider);
     const pendingEntries = undeliveredEntries(this.repo, head.jobId);
-    const { model: effectiveModel, effort: effectiveEffort } = this.continuationSettings(head, [...pendingEntries, entry]);
+    const { model: effectiveModel, effort: effectiveEffort } = continuationModelAndEffort(head, [...pendingEntries, entry]);
     if (checkCatalog && (effectiveModel !== undefined || (effectiveEffort !== undefined && provider?.supportsEffort !== false))) {
       warnings.push(...checkAgainstCatalog(head.provider, effectiveModel, effectiveEffort, catalog));
     }
@@ -1435,10 +1432,11 @@ export class ForgeService {
     const { ack } = await this.spawnTracked({ ...request, ownerChecks: true, lockHeldByCaller: true });
     writeConsumedCount(this.repo, head.jobId, onDisk);
     const checks = request.checks?.map((c) => c.name);
+    const ackModel = effectiveModel ?? ack.modelResolved ?? undefined;
     return {
       jobId: ack.jobId, name: ack.name, workerId: ack.workerId, turn: ack.turn,
       action: 'started', delivery: 'now', status: 'running', provider: ack.provider, repo: this.repo,
-      ...(effectiveModel === undefined ? {} : { model: effectiveModel }),
+      ...(ackModel === undefined ? {} : { model: ackModel }),
       ...(effectiveEffort === undefined || provider?.supportsEffort === false ? {} : { effort: effectiveEffort }),
       timeoutMs: ack.timeoutMs,
       ...envAck,

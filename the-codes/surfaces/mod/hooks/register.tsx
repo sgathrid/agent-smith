@@ -520,6 +520,7 @@ function registerBand(on: Parameters<Register>[0]): void {
 
     if (e.props.hasSurvey) return rest;
     if (e.props.view?.agentId !== undefined) return rest;
+    if (e.props.isWorking === true) setMainTurn(true);
 
     const error = await read($, readError);
     if (error) {

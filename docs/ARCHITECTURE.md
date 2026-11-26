@@ -470,7 +470,7 @@ Claude                MCP server (dist/server.js)      Claude Code hooks        
   decides on each tick. It holds a pending acceptance verdict for the checks' budget, with one
   `$.prompt.submit` turn credited to the plugin. Claude Code shows that message to
   the user in full, so it is the only notice: one line per worker, no worker summary, followed by `status <workerId>`. Only claimed ids are announced, so two sessions on one repo
-  never wake each other. A `spawn_job` with `variants` returns `{jobs:[...]}` and every variant worker is claimed and watched. A claimed run is announced with its stage jobs when the
+  never wake each other. A `spawn_job` with `variants` returns `{jobs:[...]}` and every variant worker is claimed and watched. A claimed run is announced without its stage jobs when the
   run ends. `/clear` resets session state, so a worker claimed before it goes
   unannounced (the band still shows it).
 - **Hook watcher** (`watch-hook.ts`), the fallback when no mod claims the launch: `build-plugin.mjs` generates `hooks/watch-hooks.json`

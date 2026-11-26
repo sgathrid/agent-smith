@@ -870,6 +870,17 @@ test('follow_up expands a model alias for the worker\'s provider before it reach
   assert.deepEqual([body(res).action, body(res).delivery, body(res).jobId], ['started', 'now', 'implement-smith-2']);
 });
 
+test('follow_up accepts model: "default" and effort: "default" and forwards them to the service without alias errors', async () => {
+  const seen: Array<Record<string, unknown>> = [];
+  const ctx = withService({
+    followUp: async (req: Record<string, unknown>) => { seen.push(req); return messageAck({ action: 'started', delivery: 'now', jobId: 'implement-smith-2', turn: 2 }); },
+    detail: async () => detail({ name: 'Ada', provider: 'codex', model: 'gpt-6.1-sol' }),
+  });
+  const res = await callTool(ctx, 'follow_up', { worker: 'Ada', prompt: 'Reset.', model: 'default', effort: 'default' });
+  assert.equal(res.isError, undefined, text(res));
+  assert.deepEqual([seen[0]!.model, seen[0]!.effort], ['default', 'default']);
+});
+
 test('steer forwards worker, prompt, context, files and allowFresh, and passes service errors through', async () => {
   const seen: Array<Record<string, unknown>> = [];
   let fail: Error | null = null;

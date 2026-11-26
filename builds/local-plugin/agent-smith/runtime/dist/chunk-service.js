@@ -1,111 +1,4 @@
-import {n as normalizeContinuationKind,o as reasonFromText,q as readManifest,c as jobFile,F as FILES,t as ownerAlive,r as readPipeline,e as cancelPipeline,g as findProvider,p as providerNames,u as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,w as errMessage,P as PROVIDERS,x as probeAvailability,y as writeJsonAtomic,A as AgentSmithReader,z as normalize,B as writeAtomic,j as jobDir,C as SCHEMA_VERSION,E as validOwnerPid,l as isTerminalForgeStatus,G as reportFor,H as cwdFacts,I as normalizeDenials,J as deriveOrphan,K as deriveStatus,L as summaryHead,N as failureFields,R as REASONS,d as readAcceptance,O as writeAcceptance,Q as createMarker,W as WORKERS_DIR,T as jobsDir,U as parseWorkerIndex,V as fileSig,X as JobWriter,i as isTerminalStatus,k as isMode,Y as effectiveUnrestricted,Z as newJobId,_ as newWorkerId,$ as markAcceptancePending,a0 as humanDuration,a1 as pipeEvents,a2 as checksAbortRequested,a3 as verdictBlock,a4 as runAcceptance,a5 as senderOf,a6 as taskTitle,a7 as markAcceptanceSuperseded,a8 as pickHead,f as isWorkerIdle,a9 as compareTurnPriority,aa as computeStaleReads,ab as SMITH_PAYLOAD,ac as isForgeStatus}from'./chunk-normalize.js';import {existsSync,readFileSync,mkdirSync,appendFileSync,openSync,writeSync,closeSync,unlinkSync,statSync,renameSync,linkSync,readdirSync,realpathSync,lstatSync,copyFileSync}from'node:fs';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import path from'node:path';import {createHash}from'node:crypto';function failedReason(d) {
-    if (d.status !== 'failed')
-        return null;
-    const stored = d.reason;
-    return stored ? stored : reasonFromText(d.error);
-}
-function toSummary(observed) {
-    const raw = observed.raw;
-    const toolCalls = typeof raw['tool_calls'] === 'number' ? raw['tool_calls'] : null;
-    const task = typeof raw['task'] === 'string' && raw['task'] !== '' ? raw['task'] : null;
-    const changedFiles = raw['changed_files'];
-    const digest = readDigest(raw['digest']);
-    const activities = Array.isArray(raw['recent_activities']) ? raw['recent_activities'] : [];
-    const currentActivity = observed.status === 'running'
-        ? [...activities].reverse().find(isActiveForgeActivity) ?? null
-        : null;
-    const turn = typeof raw['turn'] === 'number' && Number.isInteger(raw['turn']) && raw['turn'] >= 1 ? raw['turn'] : 1;
-    const continuedFrom = typeof raw['continuedFrom'] === 'string' && raw['continuedFrom'] !== '' ? raw['continuedFrom'] : undefined;
-    const continuationKind = normalizeContinuationKind(raw['continuationKind']) ?? (continuedFrom !== undefined ? 'follow-up' : undefined);
-    const chainStartedAt = typeof raw['chainStartedAt'] === 'string' && raw['chainStartedAt'] !== ''
-        ? raw['chainStartedAt']
-        : (observed.startedAt ?? undefined);
-    const reason = failedReason({
-        status: observed.status,
-        reason: typeof raw['reason'] === 'string' && raw['reason'] !== '' ? raw['reason'] : null,
-        error: typeof raw['error'] === 'string' ? raw['error'] : null,
-    });
-    return {
-        jobId: observed.jobId,
-        name: typeof raw['name'] === 'string' && raw['name'] ? raw['name'] : observed.jobId,
-        workerId: typeof raw['workerId'] === 'string' && raw['workerId'] !== '' ? raw['workerId'] : observed.jobId,
-        turn,
-        role: typeof raw['role'] === 'string' ? raw['role'] : observed.mode,
-        latestSummary: raw['summarySource'] === 'worker' && typeof raw['latestSummary'] === 'string' ? raw['latestSummary'] : null,
-        summarySource: raw['summarySource'] === 'worker' ? 'worker' : null,
-        status: observed.status,
-        provider: typeof raw['provider'] === 'string' ? raw['provider'] : observed.label,
-        unrestricted: raw['unrestricted'] === true,
-        resumable: typeof raw['conversation'] === 'string' && raw['conversation'] !== '',
-        mode: observed.mode,
-        model: observed.model,
-        task,
-        toolCalls,
-        currentActivity,
-        lastActivity: isForgeActivity(raw['last_activity']) ? raw['last_activity']
-            : [...activities].reverse().find(isForgeActivity) ?? null,
-        startedAt: observed.startedAt,
-        updatedAt: observed.updatedAt,
-        finishedAt: observed.finishedAt,
-        warnings: observed.warnings.map((w) => ({ code: w.code, message: w.message })),
-        ...(reason !== null ? { reason } : {}),
-        ...(typeof raw['supersededBy'] === 'string' || raw['supersededBy'] === null
-            ? { supersededBy: raw['supersededBy'] }
-            : {}),
-        ...(typeof raw['followedBy'] === 'string' && raw['followedBy'] !== '' ? { followedBy: raw['followedBy'] } : {}),
-        ...(continuedFrom !== undefined ? { continuedFrom } : {}),
-        ...(continuationKind !== undefined ? { continuationKind } : {}),
-        ...(chainStartedAt !== undefined ? { chainStartedAt } : {}),
-        ...(typeof raw['pendingSteers'] === 'number'
-            ? { pendingSteers: raw['pendingSteers'] }
-            : {}),
-        ...(Array.isArray(changedFiles) ? { changedFileCount: changedFiles.length } : {}),
-        ...(digest !== null ? { digest } : {}),
-        ...(typeof raw['toolErrors'] === 'number' && raw['toolErrors'] > 0 ? { toolErrors: raw['toolErrors'] } : {}),
-        ...(raw['failedEarly'] === true ? { failedEarly: true } : {}),
-        ...(raw['changedFilesUnknown'] === true ? { changedFilesUnknown: true } : {}),
-        ...(raw['cwdMissingAtFinish'] === true ? { cwdMissingAtFinish: true } : {}),
-        ...(typeof raw['last_event_at'] === 'string' ? { lastEventAt: raw['last_event_at'] } : {}),
-        ...(typeof raw['last_alive_at'] === 'string' ? { lastAliveAt: raw['last_alive_at'] } : {}),
-    };
-}
-function readDigest(v) {
-    if (v === null || typeof v !== 'object' || Array.isArray(v))
-        return null;
-    const d = v;
-    if (typeof d['phase'] !== 'string' || !Array.isArray(d['edited']))
-        return null;
-    const n = (key) => typeof d[key] === 'number' ? d[key] : 0;
-    const repeat = d['repeat'];
-    const r = repeat !== null && typeof repeat === 'object' && !Array.isArray(repeat)
-        ? repeat : null;
-    return {
-        phase: (['starting', 'exploring', 'editing', 'testing', 'running'].includes(d['phase'])
-            ? d['phase'] : 'running'),
-        filesRead: n('filesRead'),
-        searches: n('searches'),
-        commands: n('commands'),
-        testRuns: n('testRuns'),
-        edited: d['edited'].filter((e) => typeof e === 'string'),
-        editedCount: n('editedCount'),
-        lastTestFailed: d['lastTestFailed'] === true,
-        repeat: r !== null && typeof r['label'] === 'string' && typeof r['count'] === 'number'
-            ? { label: r['label'], count: r['count'] } : null,
-    };
-}
-function isForgeActivity(value) {
-    if (typeof value !== 'object' || value === null)
-        return false;
-    const activity = value;
-    return typeof activity['stepIndex'] === 'number' && typeof activity['tool'] === 'string'
-        && ['active', 'done', 'denied', 'error'].includes(String(activity['status']));
-}
-function isActiveForgeActivity(value) {
-    if (typeof value !== 'object' || value === null)
-        return false;
-    const activity = value;
-    return typeof activity['stepIndex'] === 'number' && typeof activity['tool'] === 'string' && activity['status'] === 'active';
-}const LAUNCH_ACK_MS = 15_000;
+import {n as readManifest,c as jobFile,F as FILES,o as ownerAlive,r as readPipeline,e as cancelPipeline,A as AgentSmithReader,q as normalize,t as errMessage,P as PROVIDERS,g as findProvider,u as probeAvailability,w as writeJsonAtomic,x as writeAtomic,j as jobDir,y as SCHEMA_VERSION,z as validOwnerPid,l as isTerminalForgeStatus,B as reportFor,C as cwdFacts,E as normalizeDenials,G as deriveOrphan,H as deriveStatus,I as summaryHead,J as failureFields,R as REASONS,d as readAcceptance,K as writeAcceptance,L as createMarker,W as WORKERS_DIR,N as jobsDir,O as parseWorkerIndex,p as providerNames,Q as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,T as normalizeContinuationKind,U as reasonFromText,V as fileSig,X as JobWriter,i as isTerminalStatus,k as isMode,Y as effectiveUnrestricted,Z as newJobId,_ as newWorkerId,$ as markAcceptancePending,a0 as humanDuration,a1 as pipeEvents,a2 as checksAbortRequested,a3 as verdictBlock,a4 as runAcceptance,a5 as senderOf,a6 as taskTitle,a7 as markAcceptanceSuperseded,a8 as pickHead,f as isWorkerIdle,a9 as compareTurnPriority,aa as computeStaleReads,ab as SMITH_PAYLOAD,ac as isForgeStatus}from'./chunk-normalize.js';import {existsSync,readFileSync,mkdirSync,appendFileSync,openSync,writeSync,closeSync,unlinkSync,statSync,renameSync,linkSync,readdirSync,realpathSync,lstatSync,copyFileSync}from'node:fs';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import path from'node:path';import {createHash}from'node:crypto';const LAUNCH_ACK_MS = 15_000;
 async function launch(url, payload, onPrepared) {
     const child = fork(fileURLToPath(url), [], {
         detached: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
@@ -189,221 +82,66 @@ async function launchPipeline(service, spec, options) {
     })();
     return { ...ack, done, cancel: () => { cancelPipeline(service.repo, ack.runId); } };
 }/**
- * pipeline/types.ts — vocabulary for mixed-provider stage pipelines.
+ * registry.ts — `readObservedJob()`, one fault-isolating read of one job.
  *
- * The headline feature this file exists for:
- *
- *     implement → gemini   ·   review → codex   ·   moderate → claude-sonnet
- *
- * One task, a different worker per stage. Nothing in this file knows how to
- * talk to any worker; `StageRunner` (below) is the seam, and it is injected.
- *
- * WHY NO IMPORT FROM providers/
- * providers/ is written concurrently by another engineer. If pipeline/ imported
- * a concrete provider client we would have a compile-order dependency on work
- * that does not exist yet, and pipeline/ could not be tested without spawning
- * real agents. So the dependency points *inward*: pipeline/ declares the shape
- * it needs, forge/ supplies an implementation over providers/ at the composition
- * root (forge/runner.ts, forge/execute.ts). See `createRunnerRouter` in pipeline.ts for the wiring point.
+ * WHY FAULT ISOLATION MATTERS: readers read state a live worker is rewriting. A
+ * reader that throws (bad symlink, exotic errno) must degrade to an `unknown`
+ * job, never to a crashed band. Every call here is wrapped.
  */
+const READER = new AgentSmithReader();
 /**
- * Reasoning effort, where the worker supports it.
+ * Read + normalize one job, isolating failures.
  *
- * Evidence (measured on this user's own jobs): raising effort to `high` cost
- * **+50% wall clock and 1.9x thinking tokens for ZERO accuracy gain** on an
- * in-band task. That is why `low` is the default everywhere in this codebase
- * and why escalation — not the default — is what buys effort.
+ * Returns `null` if the reader returns null (job not known to it), and an
+ * `unknown` job if either the read or the normalize threw. A throw here
+ * is a bug we want visible in tests, but it must not take down a caller that
+ * is polling every 100ms.
  */
-const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
-const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
-/**
- * Worker `env` keys that are refused, because they change how the worker
- * binary is found, loaded or configured. The env is applied when the CLI is
- * spawned, BEFORE any sandbox it sets up exists: `PATH` can swap the binary
- * for a shim, `NODE_OPTIONS=--import=…` or `DYLD_INSERT_LIBRARIES` run code
- * ahead of the worker, and a provider config dir can drop its read-only
- * settings, while the ack would still report the sandbox as enforced.
- * Matched case-insensitively (Windows env names are).
- */
-const ENV_DENYLIST = {
-    PATH: 'would change which worker binary runs',
-    HOME: 'would change which config the worker loads',
-    SHELL: 'would change the shell the worker runs commands with',
-    TMPDIR: 'would move the worker\'s temporary and sandbox files',
-    NODE_OPTIONS: 'would run code before the worker starts',
-    NODE_PATH: 'would change which modules the worker loads',
-    PYTHONPATH: 'would change which modules the worker loads',
-    PYTHONHOME: 'would change which runtime the worker loads',
-    PYTHONSTARTUP: 'would run code before the worker starts',
-    // Shell startup files: a shell-based launcher sources these before the worker body runs.
-    BASH_ENV: 'would run code before the worker starts',
-    ENV: 'would run code before the worker starts',
-    ZDOTDIR: 'would run code before the worker starts',
-    SHELLOPTS: 'would change how the shell runs the worker',
-    PROMPT_COMMAND: 'would run code before the worker starts',
-    PERL5OPT: 'would run code before the worker starts',
-    RUBYOPT: 'would run code before the worker starts',
-};
-/**
- * Key prefixes refused for the same reason: the dynamic loader (`LD_`, `DYLD_`),
- * XDG config/data dirs, Agent Smith's own settings (`AGENT_SMITH_*_BIN`,
- * `_HOME`, `_CODEX_SANDBOX`, …) and each provider's config (`CLAUDE_CONFIG_DIR`,
- * `CODEX_HOME`, `KIMI_CODE_HOME`, `OPENCODE_*`, `AGY_*`). The adapters' own
- * keys are all covered here; do not list them again above.
- */
-const ENV_DENY_PREFIXES = {
-    LD_: 'would change which libraries the worker loads',
-    DYLD_: 'would change which libraries the worker loads',
-    XDG_: 'would change which config the worker loads',
-    AGENT_SMITH_: 'is Agent Smith\'s own setting, not the worker\'s',
-    AGY_: 'would change the provider\'s config',
-    CLAUDE_: 'would change the provider\'s config',
-    CODEX_: 'would change the provider\'s config',
-    OPENCODE_: 'would change the provider\'s config',
-    KIMI_: 'would change the provider\'s config',
-};
-/** Why a worker `env` key is refused, or null when it is allowed. */
-function deniedEnvReason(key) {
-    const upper = key.toUpperCase();
-    const exact = ENV_DENYLIST[upper];
-    if (exact !== undefined)
-        return exact;
-    for (const [prefix, why] of Object.entries(ENV_DENY_PREFIXES))
-        if (upper.startsWith(prefix))
-            return why;
-    return null;
+async function readObservedJob(cwd, jobId) {
+    const provider = READER.provider;
+    let raw;
+    try {
+        raw = await READER.read(cwd, jobId);
+    }
+    catch (err) {
+        // Surface as unknown rather than propagating.
+        return unknownJob(provider, jobId, errText(err));
+    }
+    if (raw === null)
+        return null;
+    try {
+        return normalize(raw);
+    }
+    catch (err) {
+        return unknownJob(provider, jobId, `normalize: ${errText(err)}`);
+    }
 }
-/** Validate a worker `env` map: plain identifier keys not on the denylist, string values without NUL. Returns it unchanged, or undefined when absent. */
-function validateEnv(raw, label = 'env') {
-    if (raw === undefined)
-        return undefined;
-    if (raw === null || typeof raw !== 'object' || Array.isArray(raw))
-        throw new Error(`${label} must be an object of string values.`);
-    const out = {};
-    for (const [key, value] of Object.entries(raw)) {
-        if (!ENV_KEY.test(key))
-            throw new Error(`${label} key "${key}" is not a valid variable name (letters, digits, underscore; no leading digit).`);
-        const denied = deniedEnvReason(key);
-        if (denied !== null)
-            throw new Error(`${label}.${key} ${denied}; it is not allowed in a worker env.`);
-        if (typeof value !== 'string' || value.includes('\0'))
-            throw new Error(`${label}.${key} must be a string without NUL characters.`);
-        out[key] = value;
-    }
-    return out;
-}const MIN_TIMEOUT_MS = 1_000;
-const MAX_TIMEOUT_MS = 6 * 60 * 60_000;
-function resolveTimeoutMs(ms) {
-    if (ms === undefined)
-        return DEFAULT_TIMEOUT_MS$1;
-    if (!Number.isFinite(ms) || ms <= 0) {
-        throw new RangeError(`timeoutMs must be a positive finite number, got ${ms}`);
-    }
-    return Math.min(MAX_TIMEOUT_MS, Math.max(MIN_TIMEOUT_MS, Math.floor(ms)));
-}
-function requireProvider(name) {
-    if (findProvider(name) === undefined) {
-        throw new Error(`unknown provider "${name}". Known providers: ${providerNames().join(', ')}.`);
-    }
-    return getProvider(name);
-}
-function modeError(mode) {
-    const lines = MODES.map((m) => `  ${m}: ${MODE_PRESETS[m].description}`).join('\n');
-    return new Error(`${mode === '' ? 'mode is required' : `unknown mode "${mode}"`}. Valid modes:\n${lines}`);
-}
-const ENV_KEYS_FILE = 'env-keys.json';
-const AGY_EFFORT_SUFFIX = /-(low|medium|high)$/;
-function checkAgainstCatalog(provider, model, effort, catalog) {
-    const warnings = [];
-    if (model === undefined && effort === undefined)
-        return warnings;
-    const fresh = catalog !== undefined &&
-        !catalog.stale &&
-        catalog.error === undefined &&
-        catalog.verified !== false &&
-        catalog.source !== 'static' &&
-        catalog.models.length > 0;
-    if (!fresh) {
-        const why = catalog === undefined
-            ? 'no catalog available'
-            : catalog.error !== undefined
-                ? `catalog error: ${catalog.error}`
-                : catalog.stale
-                    ? 'catalog is stale'
-                    : catalog.models.length === 0
-                        ? 'catalog is empty'
-                        : catalog.source === 'static'
-                            ? 'catalog is a static alias list; full model names are also valid'
-                            : 'catalog is unverified';
-        warnings.push(`could not verify ${[model === undefined ? '' : `model "${model}"`, effort === undefined ? '' : `effort "${effort}"`].filter(Boolean).join(' / ')} for ${provider} (${why}); passing it through unchecked.`);
-        return warnings;
-    }
-    const ids = catalog.models.map((m) => m.id);
-    let match = model === undefined ? undefined : catalog.models.find((m) => m.id === model);
-    if (model !== undefined && match === undefined && provider === 'agy') {
-        const base = model.replace(AGY_EFFORT_SUFFIX, '');
-        if (base !== model)
-            match = catalog.models.find((m) => m.id === base);
-    }
-    if (model !== undefined && match === undefined) {
-        throw new Error(`unknown model "${model}" for ${provider}. Valid model ids: ${ids.join(', ')}.`);
-    }
-    if (effort !== undefined) {
-        const target = match ?? (catalog.defaultModel === undefined ? undefined : catalog.models.find((m) => m.id === catalog.defaultModel));
-        const efforts = Array.isArray(target?.efforts) ? target.efforts : [];
-        if (target !== undefined && efforts.length > 0 && !efforts.includes(effort)) {
-            throw new Error(`effort "${effort}" is not valid for ${provider} model "${target.id}". Valid efforts: ${efforts.join(', ')}.`);
-        }
-    }
-    return warnings;
-}
-async function validateModelAndEffort(provider, model, effort, getCatalog, unrestricted) {
-    const warnings = [];
-    if (unrestricted === false && provider.defaultUnrestricted === 'always') {
-        warnings.push(`${provider.name} print mode force-sets the auto permission policy; unrestricted:false cannot restrict it. The ack and job.json record the effective posture.`);
-    }
-    const effectiveEffort = provider.supportsEffort === false ? undefined : effort;
-    if (effort !== undefined && provider.supportsEffort === false) {
-        warnings.push(`${provider.name} has no per-run effort flag; effort "${effort}" was ignored.`);
-    }
-    if ((model !== undefined || effectiveEffort !== undefined) && getCatalog !== undefined) {
-        warnings.push(...checkAgainstCatalog(provider.name, model, effectiveEffort, await getCatalog()));
-    }
-    return { effort: effectiveEffort, warnings };
-}
-function turnStartInput(provider, spec, turn) {
+/** A defensive `unknown` ObservedJob used when a read/normalize fails. */
+function unknownJob(provider, jobId, detail) {
     return {
-        name: spec.name,
-        workerId: spec.workerId,
-        task: turn.task,
         provider,
-        mode: spec.mode,
-        model: spec.model ?? null,
-        effort: spec.effort ?? null,
-        cwd: spec.cwd,
-        prompt: turn.prompt,
-        ...(turn.preamble === undefined ? {} : { preamble: turn.preamble }),
-        unrestricted: spec.unrestricted,
-        conversation: turn.conversation,
-        timeoutMs: spec.timeoutMs,
-        pipeline: spec.pipeline,
-        stage: spec.stage,
-        attempt: spec.attempt,
-        modelRequested: spec.modelRequested,
-        modelResolved: spec.modelResolved,
-        modelSource: spec.modelSource,
-        preambleApplied: turn.preambleApplied,
-        sandbox: spec.sandbox,
-        sandboxFlags: [...spec.sandboxFlags],
-        readOnlyRequested: spec.readOnlyRequested,
-        readOnlyEnforced: spec.readOnlyEnforced,
-        ...(turn.turn === undefined ? {} : { turn: turn.turn }),
-        ...(turn.continuedFrom === undefined ? {} : { continuedFrom: turn.continuedFrom }),
-        ...(turn.continuationKind === undefined ? {} : { continuationKind: turn.continuationKind }),
-        ...(turn.chainStartedAt === undefined ? {} : { chainStartedAt: turn.chainStartedAt }),
-        ...(turn.watchedFiles === undefined ? {} : { watchedFiles: turn.watchedFiles }),
-        ...(turn.messages !== undefined && turn.messages.length > 0 ? { messages: turn.messages } : {}),
+        jobId,
+        status: "unknown",
+        warnings: [
+            { code: "incomplete_state", message: `Failed to read state: ${detail}` },
+        ],
+        output: null,
+        startedAt: null,
+        updatedAt: null,
+        finishedAt: null,
+        mode: null,
+        model: null,
+        label: null,
+        outputTruncated: false,
+        usage: null,
+        partial: true,
+        raw: {},
     };
+}
+function errText(err) {
+    if (err instanceof Error)
+        return err.message;
+    return String(err);
 }/**
  * providers/catalog.ts — cached model discovery across providers.
  *
@@ -555,67 +293,6 @@ async function getCatalogs(options = {}) {
     catch (e) {
         return [failed('*', errMessage(e))];
     }
-}/**
- * registry.ts — `readObservedJob()`, one fault-isolating read of one job.
- *
- * WHY FAULT ISOLATION MATTERS: readers read state a live worker is rewriting. A
- * reader that throws (bad symlink, exotic errno) must degrade to an `unknown`
- * job, never to a crashed band. Every call here is wrapped.
- */
-const READER = new AgentSmithReader();
-/**
- * Read + normalize one job, isolating failures.
- *
- * Returns `null` if the reader returns null (job not known to it), and an
- * `unknown` job if either the read or the normalize threw. A throw here
- * is a bug we want visible in tests, but it must not take down a caller that
- * is polling every 100ms.
- */
-async function readObservedJob(cwd, jobId) {
-    const provider = READER.provider;
-    let raw;
-    try {
-        raw = await READER.read(cwd, jobId);
-    }
-    catch (err) {
-        // Surface as unknown rather than propagating.
-        return unknownJob(provider, jobId, errText(err));
-    }
-    if (raw === null)
-        return null;
-    try {
-        return normalize(raw);
-    }
-    catch (err) {
-        return unknownJob(provider, jobId, `normalize: ${errText(err)}`);
-    }
-}
-/** A defensive `unknown` ObservedJob used when a read/normalize fails. */
-function unknownJob(provider, jobId, detail) {
-    return {
-        provider,
-        jobId,
-        status: "unknown",
-        warnings: [
-            { code: "incomplete_state", message: `Failed to read state: ${detail}` },
-        ],
-        output: null,
-        startedAt: null,
-        updatedAt: null,
-        finishedAt: null,
-        mode: null,
-        model: null,
-        label: null,
-        outputTruncated: false,
-        usage: null,
-        partial: true,
-        raw: {},
-    };
-}
-function errText(err) {
-    if (err instanceof Error)
-        return err.message;
-    return String(err);
 }const DIRTY_FILES_CAP = 20;
 function workspaceLine(mode, cwd) {
     if (mode === 'review' || mode === 'moderate')
@@ -1361,6 +1038,226 @@ class WorkerIndexStore {
     workerOf(jobId) {
         return this.jobWorker.get(jobId);
     }
+}const MIN_TIMEOUT_MS = 1_000;
+const MAX_TIMEOUT_MS = 6 * 60 * 60_000;
+function resolveTimeoutMs(ms) {
+    if (ms === undefined)
+        return DEFAULT_TIMEOUT_MS$1;
+    if (!Number.isFinite(ms) || ms <= 0) {
+        throw new RangeError(`timeoutMs must be a positive finite number, got ${ms}`);
+    }
+    return Math.min(MAX_TIMEOUT_MS, Math.max(MIN_TIMEOUT_MS, Math.floor(ms)));
+}
+function requireProvider(name) {
+    if (findProvider(name) === undefined) {
+        throw new Error(`unknown provider "${name}". Known providers: ${providerNames().join(', ')}.`);
+    }
+    return getProvider(name);
+}
+function modeError(mode) {
+    const lines = MODES.map((m) => `  ${m}: ${MODE_PRESETS[m].description}`).join('\n');
+    return new Error(`${mode === '' ? 'mode is required' : `unknown mode "${mode}"`}. Valid modes:\n${lines}`);
+}
+const ENV_KEYS_FILE = 'env-keys.json';
+const AGY_EFFORT_SUFFIX = /-(low|medium|high)$/;
+function checkAgainstCatalog(provider, model, effort, catalog) {
+    const warnings = [];
+    if (model === undefined && effort === undefined)
+        return warnings;
+    const fresh = catalog !== undefined &&
+        !catalog.stale &&
+        catalog.error === undefined &&
+        catalog.verified !== false &&
+        catalog.source !== 'static' &&
+        catalog.models.length > 0;
+    if (!fresh) {
+        const why = catalog === undefined
+            ? 'no catalog available'
+            : catalog.error !== undefined
+                ? `catalog error: ${catalog.error}`
+                : catalog.stale
+                    ? 'catalog is stale'
+                    : catalog.models.length === 0
+                        ? 'catalog is empty'
+                        : catalog.source === 'static'
+                            ? 'catalog is a static alias list; full model names are also valid'
+                            : 'catalog is unverified';
+        warnings.push(`could not verify ${[model === undefined ? '' : `model "${model}"`, effort === undefined ? '' : `effort "${effort}"`].filter(Boolean).join(' / ')} for ${provider} (${why}); passing it through unchecked.`);
+        return warnings;
+    }
+    const ids = catalog.models.map((m) => m.id);
+    let match = model === undefined ? undefined : catalog.models.find((m) => m.id === model);
+    if (model !== undefined && match === undefined && provider === 'agy') {
+        const base = model.replace(AGY_EFFORT_SUFFIX, '');
+        if (base !== model)
+            match = catalog.models.find((m) => m.id === base);
+    }
+    if (model !== undefined && match === undefined) {
+        throw new Error(`unknown model "${model}" for ${provider}. Valid model ids: ${ids.join(', ')}.`);
+    }
+    if (effort !== undefined) {
+        const target = match ?? (catalog.defaultModel === undefined ? undefined : catalog.models.find((m) => m.id === catalog.defaultModel));
+        const efforts = Array.isArray(target?.efforts) ? target.efforts : [];
+        if (target !== undefined && efforts.length > 0 && !efforts.includes(effort)) {
+            throw new Error(`effort "${effort}" is not valid for ${provider} model "${target.id}". Valid efforts: ${efforts.join(', ')}.`);
+        }
+    }
+    return warnings;
+}
+async function validateModelAndEffort(provider, model, effort, getCatalog, unrestricted) {
+    const warnings = [];
+    if (unrestricted === false && provider.defaultUnrestricted === 'always') {
+        warnings.push(`${provider.name} print mode force-sets the auto permission policy; unrestricted:false cannot restrict it. The ack and job.json record the effective posture.`);
+    }
+    const effectiveEffort = provider.supportsEffort === false ? undefined : effort;
+    if (effort !== undefined && provider.supportsEffort === false) {
+        warnings.push(`${provider.name} has no per-run effort flag; effort "${effort}" was ignored.`);
+    }
+    if ((model !== undefined || effectiveEffort !== undefined) && getCatalog !== undefined) {
+        warnings.push(...checkAgainstCatalog(provider.name, model, effectiveEffort, await getCatalog()));
+    }
+    return { effort: effectiveEffort, warnings };
+}
+function turnStartInput(provider, spec, turn) {
+    return {
+        name: spec.name,
+        workerId: spec.workerId,
+        task: turn.task,
+        provider,
+        mode: spec.mode,
+        model: spec.model ?? null,
+        effort: spec.effort ?? null,
+        cwd: spec.cwd,
+        prompt: turn.prompt,
+        ...(turn.preamble === undefined ? {} : { preamble: turn.preamble }),
+        unrestricted: spec.unrestricted,
+        conversation: turn.conversation,
+        timeoutMs: spec.timeoutMs,
+        pipeline: spec.pipeline,
+        stage: spec.stage,
+        attempt: spec.attempt,
+        modelRequested: spec.modelRequested,
+        modelResolved: spec.modelResolved,
+        modelSource: spec.modelSource,
+        preambleApplied: turn.preambleApplied,
+        sandbox: spec.sandbox,
+        sandboxFlags: [...spec.sandboxFlags],
+        readOnlyRequested: spec.readOnlyRequested,
+        readOnlyEnforced: spec.readOnlyEnforced,
+        ...(turn.turn === undefined ? {} : { turn: turn.turn }),
+        ...(turn.continuedFrom === undefined ? {} : { continuedFrom: turn.continuedFrom }),
+        ...(turn.continuationKind === undefined ? {} : { continuationKind: turn.continuationKind }),
+        ...(turn.chainStartedAt === undefined ? {} : { chainStartedAt: turn.chainStartedAt }),
+        ...(turn.watchedFiles === undefined ? {} : { watchedFiles: turn.watchedFiles }),
+        ...(turn.messages !== undefined && turn.messages.length > 0 ? { messages: turn.messages } : {}),
+    };
+}function failedReason(d) {
+    if (d.status !== 'failed')
+        return null;
+    const stored = d.reason;
+    return stored ? stored : reasonFromText(d.error);
+}
+function toSummary(observed) {
+    const raw = observed.raw;
+    const toolCalls = typeof raw['tool_calls'] === 'number' ? raw['tool_calls'] : null;
+    const task = typeof raw['task'] === 'string' && raw['task'] !== '' ? raw['task'] : null;
+    const changedFiles = raw['changed_files'];
+    const digest = readDigest(raw['digest']);
+    const activities = Array.isArray(raw['recent_activities']) ? raw['recent_activities'] : [];
+    const currentActivity = observed.status === 'running'
+        ? [...activities].reverse().find(isActiveForgeActivity) ?? null
+        : null;
+    const turn = typeof raw['turn'] === 'number' && Number.isInteger(raw['turn']) && raw['turn'] >= 1 ? raw['turn'] : 1;
+    const continuedFrom = typeof raw['continuedFrom'] === 'string' && raw['continuedFrom'] !== '' ? raw['continuedFrom'] : undefined;
+    const continuationKind = normalizeContinuationKind(raw['continuationKind']) ?? (continuedFrom !== undefined ? 'follow-up' : undefined);
+    const chainStartedAt = typeof raw['chainStartedAt'] === 'string' && raw['chainStartedAt'] !== ''
+        ? raw['chainStartedAt']
+        : (observed.startedAt ?? undefined);
+    const reason = failedReason({
+        status: observed.status,
+        reason: typeof raw['reason'] === 'string' && raw['reason'] !== '' ? raw['reason'] : null,
+        error: typeof raw['error'] === 'string' ? raw['error'] : null,
+    });
+    return {
+        jobId: observed.jobId,
+        name: typeof raw['name'] === 'string' && raw['name'] ? raw['name'] : observed.jobId,
+        workerId: typeof raw['workerId'] === 'string' && raw['workerId'] !== '' ? raw['workerId'] : observed.jobId,
+        turn,
+        role: typeof raw['role'] === 'string' ? raw['role'] : observed.mode,
+        latestSummary: raw['summarySource'] === 'worker' && typeof raw['latestSummary'] === 'string' ? raw['latestSummary'] : null,
+        summarySource: raw['summarySource'] === 'worker' ? 'worker' : null,
+        status: observed.status,
+        provider: typeof raw['provider'] === 'string' ? raw['provider'] : observed.label,
+        unrestricted: raw['unrestricted'] === true,
+        resumable: typeof raw['conversation'] === 'string' && raw['conversation'] !== '',
+        mode: observed.mode,
+        model: observed.model,
+        task,
+        toolCalls,
+        currentActivity,
+        lastActivity: isForgeActivity(raw['last_activity']) ? raw['last_activity']
+            : [...activities].reverse().find(isForgeActivity) ?? null,
+        startedAt: observed.startedAt,
+        updatedAt: observed.updatedAt,
+        finishedAt: observed.finishedAt,
+        warnings: observed.warnings.map((w) => ({ code: w.code, message: w.message })),
+        ...(reason !== null ? { reason } : {}),
+        ...(typeof raw['supersededBy'] === 'string' || raw['supersededBy'] === null
+            ? { supersededBy: raw['supersededBy'] }
+            : {}),
+        ...(typeof raw['followedBy'] === 'string' && raw['followedBy'] !== '' ? { followedBy: raw['followedBy'] } : {}),
+        ...(continuedFrom !== undefined ? { continuedFrom } : {}),
+        ...(continuationKind !== undefined ? { continuationKind } : {}),
+        ...(chainStartedAt !== undefined ? { chainStartedAt } : {}),
+        ...(typeof raw['pendingSteers'] === 'number'
+            ? { pendingSteers: raw['pendingSteers'] }
+            : {}),
+        ...(Array.isArray(changedFiles) ? { changedFileCount: changedFiles.length } : {}),
+        ...(digest !== null ? { digest } : {}),
+        ...(typeof raw['toolErrors'] === 'number' && raw['toolErrors'] > 0 ? { toolErrors: raw['toolErrors'] } : {}),
+        ...(raw['failedEarly'] === true ? { failedEarly: true } : {}),
+        ...(raw['changedFilesUnknown'] === true ? { changedFilesUnknown: true } : {}),
+        ...(raw['cwdMissingAtFinish'] === true ? { cwdMissingAtFinish: true } : {}),
+        ...(typeof raw['last_event_at'] === 'string' ? { lastEventAt: raw['last_event_at'] } : {}),
+        ...(typeof raw['last_alive_at'] === 'string' ? { lastAliveAt: raw['last_alive_at'] } : {}),
+    };
+}
+function readDigest(v) {
+    if (v === null || typeof v !== 'object' || Array.isArray(v))
+        return null;
+    const d = v;
+    if (typeof d['phase'] !== 'string' || !Array.isArray(d['edited']))
+        return null;
+    const n = (key) => typeof d[key] === 'number' ? d[key] : 0;
+    const repeat = d['repeat'];
+    const r = repeat !== null && typeof repeat === 'object' && !Array.isArray(repeat)
+        ? repeat : null;
+    return {
+        phase: (['starting', 'exploring', 'editing', 'testing', 'running'].includes(d['phase'])
+            ? d['phase'] : 'running'),
+        filesRead: n('filesRead'),
+        searches: n('searches'),
+        commands: n('commands'),
+        testRuns: n('testRuns'),
+        edited: d['edited'].filter((e) => typeof e === 'string'),
+        editedCount: n('editedCount'),
+        lastTestFailed: d['lastTestFailed'] === true,
+        repeat: r !== null && typeof r['label'] === 'string' && typeof r['count'] === 'number'
+            ? { label: r['label'], count: r['count'] } : null,
+    };
+}
+function isForgeActivity(value) {
+    if (typeof value !== 'object' || value === null)
+        return false;
+    const activity = value;
+    return typeof activity['stepIndex'] === 'number' && typeof activity['tool'] === 'string'
+        && ['active', 'done', 'denied', 'error'].includes(String(activity['status']));
+}
+function isActiveForgeActivity(value) {
+    if (typeof value !== 'object' || value === null)
+        return false;
+    const activity = value;
+    return typeof activity['stepIndex'] === 'number' && typeof activity['tool'] === 'string' && activity['status'] === 'active';
 }/**
  * watched-files.ts — brief/spec files a worker is told to read, copied into its
  * cwd and tracked by signature so a later edit on either side is noticed.
@@ -1481,6 +1378,109 @@ function syncWatchedFiles(repo, cwd, files, previousWatched, onWarning) {
             ? prev : { repoSig, cwdSig };
     }
     return out;
+}/**
+ * pipeline/types.ts — vocabulary for mixed-provider stage pipelines.
+ *
+ * The headline feature this file exists for:
+ *
+ *     implement → gemini   ·   review → codex   ·   moderate → claude-sonnet
+ *
+ * One task, a different worker per stage. Nothing in this file knows how to
+ * talk to any worker; `StageRunner` (below) is the seam, and it is injected.
+ *
+ * WHY NO IMPORT FROM providers/
+ * providers/ is written concurrently by another engineer. If pipeline/ imported
+ * a concrete provider client we would have a compile-order dependency on work
+ * that does not exist yet, and pipeline/ could not be tested without spawning
+ * real agents. So the dependency points *inward*: pipeline/ declares the shape
+ * it needs, forge/ supplies an implementation over providers/ at the composition
+ * root (forge/runner.ts, forge/execute.ts). See `createRunnerRouter` in pipeline.ts for the wiring point.
+ */
+/**
+ * Reasoning effort, where the worker supports it.
+ *
+ * Evidence (measured on this user's own jobs): raising effort to `high` cost
+ * **+50% wall clock and 1.9x thinking tokens for ZERO accuracy gain** on an
+ * in-band task. That is why `low` is the default everywhere in this codebase
+ * and why escalation — not the default — is what buys effort.
+ */
+const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/**
+ * Worker `env` keys that are refused, because they change how the worker
+ * binary is found, loaded or configured. The env is applied when the CLI is
+ * spawned, BEFORE any sandbox it sets up exists: `PATH` can swap the binary
+ * for a shim, `NODE_OPTIONS=--import=…` or `DYLD_INSERT_LIBRARIES` run code
+ * ahead of the worker, and a provider config dir can drop its read-only
+ * settings, while the ack would still report the sandbox as enforced.
+ * Matched case-insensitively (Windows env names are).
+ */
+const ENV_DENYLIST = {
+    PATH: 'would change which worker binary runs',
+    HOME: 'would change which config the worker loads',
+    SHELL: 'would change the shell the worker runs commands with',
+    TMPDIR: 'would move the worker\'s temporary and sandbox files',
+    NODE_OPTIONS: 'would run code before the worker starts',
+    NODE_PATH: 'would change which modules the worker loads',
+    PYTHONPATH: 'would change which modules the worker loads',
+    PYTHONHOME: 'would change which runtime the worker loads',
+    PYTHONSTARTUP: 'would run code before the worker starts',
+    // Shell startup files: a shell-based launcher sources these before the worker body runs.
+    BASH_ENV: 'would run code before the worker starts',
+    ENV: 'would run code before the worker starts',
+    ZDOTDIR: 'would run code before the worker starts',
+    SHELLOPTS: 'would change how the shell runs the worker',
+    PROMPT_COMMAND: 'would run code before the worker starts',
+    PERL5OPT: 'would run code before the worker starts',
+    RUBYOPT: 'would run code before the worker starts',
+};
+/**
+ * Key prefixes refused for the same reason: the dynamic loader (`LD_`, `DYLD_`),
+ * XDG config/data dirs, Agent Smith's own settings (`AGENT_SMITH_*_BIN`,
+ * `_HOME`, `_CODEX_SANDBOX`, …) and each provider's config (`CLAUDE_CONFIG_DIR`,
+ * `CODEX_HOME`, `KIMI_CODE_HOME`, `OPENCODE_*`, `AGY_*`). The adapters' own
+ * keys are all covered here; do not list them again above.
+ */
+const ENV_DENY_PREFIXES = {
+    LD_: 'would change which libraries the worker loads',
+    DYLD_: 'would change which libraries the worker loads',
+    XDG_: 'would change which config the worker loads',
+    AGENT_SMITH_: 'is Agent Smith\'s own setting, not the worker\'s',
+    AGY_: 'would change the provider\'s config',
+    CLAUDE_: 'would change the provider\'s config',
+    CODEX_: 'would change the provider\'s config',
+    OPENCODE_: 'would change the provider\'s config',
+    KIMI_: 'would change the provider\'s config',
+};
+/** Why a worker `env` key is refused, or null when it is allowed. */
+function deniedEnvReason(key) {
+    const upper = key.toUpperCase();
+    const exact = ENV_DENYLIST[upper];
+    if (exact !== undefined)
+        return exact;
+    for (const [prefix, why] of Object.entries(ENV_DENY_PREFIXES))
+        if (upper.startsWith(prefix))
+            return why;
+    return null;
+}
+/** Validate a worker `env` map: plain identifier keys not on the denylist, string values without NUL. Returns it unchanged, or undefined when absent. */
+function validateEnv(raw, label = 'env') {
+    if (raw === undefined)
+        return undefined;
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw))
+        throw new Error(`${label} must be an object of string values.`);
+    const out = {};
+    for (const [key, value] of Object.entries(raw)) {
+        if (!ENV_KEY.test(key))
+            throw new Error(`${label} key "${key}" is not a valid variable name (letters, digits, underscore; no leading digit).`);
+        const denied = deniedEnvReason(key);
+        if (denied !== null)
+            throw new Error(`${label}.${key} ${denied}; it is not allowed in a worker env.`);
+        if (typeof value !== 'string' || value.includes('\0'))
+            throw new Error(`${label}.${key} must be a string without NUL characters.`);
+        out[key] = value;
+    }
+    return out;
 }function newLiveJob(writer, timeoutMs) {
     return {
         writer,
@@ -1508,18 +1508,26 @@ function mergeOverrides(entries) {
 function continuationModelAndEffort(head, entries, spec) {
     const o = mergeOverrides(entries);
     return {
-        model: o.model ?? spec?.model ?? head.model ?? head.modelResolved ?? undefined,
-        effort: o.effort ?? spec?.effort ?? head.effort ?? undefined,
+        model: o.model === 'default' ? undefined : (o.model ?? spec?.model ?? head.model ?? head.modelResolved ?? undefined),
+        effort: o.effort === 'default' ? undefined : (o.effort ?? spec?.effort ?? head.effort ?? undefined),
     };
 }
-function applyOverrides(spec, o, provider) {
+function applyOverrides(spec, o, provider, defaultModel) {
     if (Object.keys(o).length === 0)
         return spec;
     const unrestricted = effectiveUnrestricted(provider, o.unrestricted === undefined ? spec.unrestricted : o.unrestricted);
+    const { model: _m, effort: _e, ...rest } = spec;
+    const baseSpec = {
+        ...rest,
+        model: o.model === 'default' ? undefined : spec.model,
+        effort: o.effort === 'default' ? undefined : spec.effort,
+    };
     return {
-        ...spec,
-        ...(o.model === undefined ? {} : { model: o.model, modelRequested: o.model, modelResolved: o.model, modelSource: 'requested' }),
-        ...(o.effort === undefined || provider.supportsEffort === false ? {} : { effort: o.effort }),
+        ...baseSpec,
+        ...(o.model === undefined ? {} : o.model === 'default'
+            ? { modelRequested: null, modelResolved: defaultModel ?? null, modelSource: defaultModel ? 'harness-config' : 'unknown' }
+            : { model: o.model, modelRequested: o.model, modelResolved: o.model, modelSource: 'requested' }),
+        ...(o.effort === undefined || o.effort === 'default' || provider.supportsEffort === false ? {} : { effort: o.effort }),
         ...(o.timeoutMs === undefined ? {} : { timeoutMs: resolveTimeoutMs(o.timeoutMs) }),
         ...(o.checks === undefined ? {} : { checks: o.checks }),
         unrestricted,
@@ -2226,20 +2234,6 @@ class ForgeService {
             catch { }
         }
     }
-    continuationSettings(head, entries, spec) {
-        let base = head;
-        const seen = new Set();
-        while (base !== null && base.failedEarly === true) {
-            if (seen.has(base.jobId) || !base.continuedFrom) {
-                base = null;
-                break;
-            }
-            seen.add(base.jobId);
-            base = this.readManifestSync(base.continuedFrom);
-        }
-        const baseSpec = base !== null && base.jobId === head.jobId ? spec : undefined;
-        return continuationModelAndEffort(base ?? {}, entries, baseSpec);
-    }
     continuationRequest(input) {
         const { head, spec, entries } = input;
         const o = mergeOverrides(entries);
@@ -2267,7 +2261,7 @@ class ForgeService {
         const context = [...entries].reverse().find((e) => e.context !== undefined)?.context ?? spec?.context;
         const checks = o.checks ?? spec?.checks ?? input.headChecks;
         const env = input.env !== undefined && Object.keys(input.env).length > 0 ? input.env : undefined;
-        const { model, effort } = this.continuationSettings(head, entries, spec);
+        const { model, effort } = continuationModelAndEffort(head, entries, spec);
         return {
             mode: spec?.mode ?? head.mode ?? 'task',
             prompt: rawPrompt,
@@ -2339,7 +2333,15 @@ class ForgeService {
     }
     async chainContinuation(input) {
         const { provider, parent, result, report, entries, unconsumed, verdictStatus } = input;
-        const spec = this.withSandbox(applyOverrides(input.spec, mergeOverrides(unconsumed), provider), input.spec, provider);
+        const parentSnap = parent.writer.snapshot();
+        const { model: nextModel, effort: nextEffort } = continuationModelAndEffort(parentSnap ?? {}, unconsumed, input.spec);
+        const defaultModel = this.harnessDefaults(provider.name).model;
+        const overrides = {
+            ...mergeOverrides(unconsumed),
+            ...(nextModel === undefined && input.spec.model !== undefined ? { model: 'default' } : {}),
+            ...(nextEffort === undefined && input.spec.effort !== undefined ? { effort: 'default' } : {}),
+        };
+        const spec = this.withSandbox(applyOverrides(input.spec, overrides, provider, defaultModel), input.spec, provider);
         const conversation = parent.writer.currentConversation();
         const wasInterrupted = parent.live.interruptRequested && verdictStatus !== 'succeeded';
         if (conversation === null && !wasInterrupted) {
@@ -2374,7 +2376,6 @@ class ForgeService {
             brief: nextBrief,
         });
         const nextLiveEntry = newLiveJob(nextWriter, spec.timeoutMs);
-        const parentSnap = parent.writer.snapshot();
         const nextTurn = (parentSnap?.turn ?? 1) + 1;
         const continuationKind = parent.live.interruptRequested ? 'steer' : 'follow-up';
         const chainStartedAt = continuationKind === 'steer'
@@ -2655,7 +2656,8 @@ class ForgeService {
             }
         }
         const provider = this.providerSafe(head.provider);
-        const { model: effectiveModel, effort: effectiveEffort } = this.continuationSettings(head, [...undeliveredEntries(this.repo, headId), entry]);
+        const { model: effectiveModel, effort: effectiveEffort } = continuationModelAndEffort(head, [...undeliveredEntries(this.repo, headId), entry]);
+        const ackModel = effectiveModel ?? this.harnessDefaults(head.provider).model ?? undefined;
         if (provider !== null) {
             const checked = await validateModelAndEffort(provider, effectiveModel, effectiveEffort, checkCatalog ? async () => catalog : undefined, entry.overrides?.unrestricted);
             warnings.push(...checked.warnings);
@@ -2709,7 +2711,7 @@ class ForgeService {
             jobId: headId, name, workerId, turn,
             action: sender === 'steer' && (running || checksRunning) ? 'interrupting' : 'queued',
             delivery, status: 'running', provider: head.provider, repo: this.repo,
-            ...(effectiveModel === undefined ? {} : { model: effectiveModel }),
+            ...(ackModel === undefined ? {} : { model: ackModel }),
             ...(effectiveEffort === undefined || provider?.supportsEffort === false ? {} : { effort: effectiveEffort }),
             timeoutMs: entry.overrides?.timeoutMs ?? head.timeoutMs ?? DEFAULT_TIMEOUT_MS$1,
             pendingMessages: pending,
@@ -2725,7 +2727,7 @@ class ForgeService {
         const { ack: envAck, runEnv } = this.resolveFollowUpEnv(workerId, head.jobId, env, false, warnings);
         const provider = this.providerSafe(head.provider);
         const pendingEntries = undeliveredEntries(this.repo, head.jobId);
-        const { model: effectiveModel, effort: effectiveEffort } = this.continuationSettings(head, [...pendingEntries, entry]);
+        const { model: effectiveModel, effort: effectiveEffort } = continuationModelAndEffort(head, [...pendingEntries, entry]);
         if (checkCatalog && (effectiveModel !== undefined || (effectiveEffort !== undefined && provider?.supportsEffort !== false))) {
             warnings.push(...checkAgainstCatalog(head.provider, effectiveModel, effectiveEffort, catalog));
         }
@@ -2738,10 +2740,11 @@ class ForgeService {
         const { ack } = await this.spawnTracked({ ...request, ownerChecks: true, lockHeldByCaller: true });
         writeConsumedCount(this.repo, head.jobId, onDisk);
         const checks = request.checks?.map((c) => c.name);
+        const ackModel = effectiveModel ?? ack.modelResolved ?? undefined;
         return {
             jobId: ack.jobId, name: ack.name, workerId: ack.workerId, turn: ack.turn,
             action: 'started', delivery: 'now', status: 'running', provider: ack.provider, repo: this.repo,
-            ...(effectiveModel === undefined ? {} : { model: effectiveModel }),
+            ...(ackModel === undefined ? {} : { model: ackModel }),
             ...(effectiveEffort === undefined || provider?.supportsEffort === false ? {} : { effort: effectiveEffort }),
             timeoutMs: ack.timeoutMs,
             ...envAck,
@@ -3200,4 +3203,4 @@ function describe(err) {
     if (err instanceof Error)
         return err.message;
     return String(err);
-}export{EFFORTS as E,ForgeService as F,MAX_WATCHED_FILES as M,validateModelAndEffort as a,failedReason as f,getCatalogs as g,launchPipeline as l,probeProviders as p,requireProvider as r,validateEnv as v};
+}export{EFFORTS as E,ForgeService as F,MAX_WATCHED_FILES as M,validateModelAndEffort as a,continuationModelAndEffort as c,failedReason as f,getCatalogs as g,launchPipeline as l,probeProviders as p,requireProvider as r,validateEnv as v};

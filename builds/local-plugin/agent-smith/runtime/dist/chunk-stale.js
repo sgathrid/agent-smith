@@ -1,4 +1,4 @@
-import {watch}from'node:fs';import {o as reasonFromText,ah as checksReason,ai as toolLabel}from'./chunk-normalize.js';/**
+import {watch}from'node:fs';import {U as reasonFromText,ah as checksReason,ai as toolLabel}from'./chunk-normalize.js';/**
  * forge/watch.ts — wake when a job's files change, instead of re-reading them on a timer.
  *
  * A worker runs in another process (the detached supervisor) and reports only through
@@ -298,10 +298,14 @@ function pipelineOutcome(run) {
     const stages = Object.values(run.stageResults)
         .filter((s) => s !== null && typeof s === 'object' && typeof s.stage === 'string');
     const passed = stages.filter((s) => s.status === 'passed' && s.acceptance !== 'failed').length;
-    const bad = stages.find((s) => s.status === 'failed' || s.acceptance === 'failed');
+    const failed = stages.filter((s) => s.status === 'failed' || s.acceptance === 'failed');
     const head = `${passed}/${stages.length} stages passed`;
-    if (bad)
-        return `${head} · ${String(bad.stage)}: ${stageReason(bad)}`;
+    if (failed.length > 0) {
+        const shown = failed.slice(0, 3).map((s) => `${String(s.stage)}: ${stageReason(s)}`);
+        if (failed.length > 3)
+            shown.push(`+${failed.length - 3} more`);
+        return `${head} · ${shown.join(', ')}`;
+    }
     return run.error && run.status !== 'passed' ? `${head} · ${reasonFromText(run.error)}` : head;
 }
 function stageReason(s) {

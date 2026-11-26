@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import process$1 from'node:process';import {randomUUID,randomBytes}from'node:crypto';import {readFileSync,existsSync,statSync,rmSync,writeFileSync,mkdirSync,linkSync,unlinkSync,renameSync,readdirSync}from'node:fs';import path from'node:path';import {l as livenessOf,L as LIVENESS_STATES,w as waitForChange,c as claimMarkerPath}from'./chunk-stale.js';import {f as failedReason,E as EFFORTS$1,M as MAX_WATCHED_FILES,v as validateEnv,g as getCatalogs,l as launchPipeline,r as requireProvider,a as validateModelAndEffort,p as probeProviders,F as ForgeService}from'./chunk-service.js';import {i as isTerminalStatus,M as MODES$1,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS,b as inheritContinuedProviders,S as STAGE_PROMPTS,v as validateSpec,s as startPipeline,r as readPipeline,m as missingPipelineError,j as jobDir,c as jobFile,F as FILES,d as readAcceptance,e as cancelPipeline,f as isWorkerIdle,p as providerNames,g as findProvider,h as effectiveDefaultUnrestricted,k as isMode,l as isTerminalForgeStatus}from'./chunk-normalize.js';import os from'node:os';import {execFile}from'node:child_process';import'node:url';import'node:timers/promises';import'node:fs/promises';import'node:readline';//#region rolldown:runtime
+import process$1 from'node:process';import {randomUUID,randomBytes}from'node:crypto';import {readFileSync,existsSync,statSync,rmSync,writeFileSync,mkdirSync,linkSync,unlinkSync,renameSync,readdirSync}from'node:fs';import path from'node:path';import {l as livenessOf,L as LIVENESS_STATES,w as waitForChange,c as claimMarkerPath}from'./chunk-stale.js';import {f as failedReason,E as EFFORTS$1,M as MAX_WATCHED_FILES,v as validateEnv,g as getCatalogs,l as launchPipeline,c as continuationModelAndEffort,r as requireProvider,a as validateModelAndEffort,p as probeProviders,F as ForgeService}from'./chunk-service.js';import {i as isTerminalStatus,M as MODES$1,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS,b as inheritContinuedProviders,S as STAGE_PROMPTS,v as validateSpec,s as startPipeline,r as readPipeline,m as missingPipelineError,j as jobDir,c as jobFile,F as FILES,d as readAcceptance,e as cancelPipeline,f as isWorkerIdle,p as providerNames,g as findProvider,h as effectiveDefaultUnrestricted,k as isMode,l as isTerminalForgeStatus}from'./chunk-normalize.js';import os from'node:os';import {execFile}from'node:child_process';import'node:url';import'node:timers/promises';import'node:fs/promises';import'node:readline';//#region rolldown:runtime
 var __create = Object.create;
 var __defProp = Object.defineProperty;
 var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
@@ -25702,7 +25702,10 @@ const RAW_TOOL_DEFS = [
         }) },
     { name: 'follow_up', annotations: { title: 'Follow up', ...LAUNCHES }, description: 'Send a worker its next message ("do this next"); never cuts the current turn. A running worker reads it at its next step when its provider supports that, else when the turn ends; an idle worker starts a new turn in the same conversation. Queued messages are delivered whatever the turn\'s outcome; cancel discards them. Settings, checks, watched files and env carry over; arguments here apply from the next turn. env: "dropped" in the ack means the env values were lost.', inputSchema: schema({
             worker: { ...string, description: "Worker name, workerId, or any turn's job ID." }, prompt: string, context: messageContext, files: moreFiles,
-            checks: { ...checksSchema, description: 'Replaces the inherited checks; [] clears them.' }, model: string, effort: { type: 'string', enum: EFFORTS }, timeoutMs: { type: 'integer', minimum: 1 }, env: envAgain,
+            checks: { ...checksSchema, description: 'Replaces the inherited checks; [] clears them.' },
+            model: { ...string, description: 'Replaces the inherited model; "default" clears it.' },
+            effort: { type: 'string', enum: [...EFFORTS, 'default'], description: 'Replaces the inherited effort; "default" clears it.' },
+            timeoutMs: { type: 'integer', minimum: 1 }, env: envAgain,
             unrestricted: { type: 'boolean', description: 'Skip worker approval prompts.' },
         }, ['worker', 'prompt']) },
     { name: 'steer', annotations: { title: 'Steer', ...LAUNCHES, destructiveHint: true }, description: 'Redirect a worker now ("stop and do this instead"): cuts its running turn (the tool call in flight is lost) or running checks and continues the same conversation with this message; an idle worker starts a new turn. Before the provider reports a conversation handle this fails unless allowFresh is true. To let the current work finish, use follow_up.', inputSchema: schema({
@@ -26143,7 +26146,7 @@ function messageAck(ack, notes = []) {
 const followUp = async (ctx, args) => {
     const request = {
         worker: text(args, 'worker', true), prompt: text(args, 'prompt', true), context: contextText(args), files: filesList(args),
-        checks: parseChecks(args.checks), model: text(args, 'model'), effort: allowed(args, 'effort', EFFORTS$1), timeoutMs: number(args, 'timeoutMs'),
+        checks: parseChecks(args.checks), model: text(args, 'model'), effort: allowed(args, 'effort', [...EFFORTS$1, 'default']), timeoutMs: number(args, 'timeoutMs'),
         env: validateEnv(args.env), unrestricted: boolean(args, 'unrestricted'),
     };
     let targetWorker = request.worker;
@@ -26153,10 +26156,18 @@ const followUp = async (ctx, args) => {
         targetWorker = head.workerId ?? head.jobId;
         const provider = head.provider ?? '';
         if (request.model !== undefined || request.effort !== undefined) {
-            const cfg = loadModelConfig({ repo: ctx.service.repo });
-            const resolved = resolveRequest({ provider: provider || undefined, model: request.model ?? head.model ?? head.modelResolved ?? undefined, effort: request.effort }, cfg);
-            Object.assign(request, { ...(request.model !== undefined ? { model: resolved.model } : {}), effort: resolved.effort });
-            notes.push(...resolved.warnings, ...cfg.errors.map(e => `models.json: ${e}`));
+            const inherited = continuationModelAndEffort(head, []);
+            const modelArg = request.model === 'default' ? undefined : (request.model ?? inherited.model);
+            const effortArg = request.effort === 'default' ? undefined : request.effort;
+            if (modelArg !== undefined || effortArg !== undefined) {
+                const cfg = loadModelConfig({ repo: ctx.service.repo });
+                const resolved = resolveRequest({ provider: provider || undefined, model: modelArg, effort: effortArg }, cfg);
+                Object.assign(request, {
+                    ...(request.model !== undefined && request.model !== 'default' ? { model: resolved.model } : {}),
+                    ...(request.effort !== 'default' ? { effort: resolved.effort } : {}),
+                });
+                notes.push(...resolved.warnings, ...cfg.errors.map(e => `models.json: ${e}`));
+            }
         }
         const gate = await confirmUnrestricted(ctx, [{
                 unrestricted: request.unrestricted,

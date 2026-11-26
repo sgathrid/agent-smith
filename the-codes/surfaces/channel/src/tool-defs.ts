@@ -197,7 +197,10 @@ const RAW_TOOL_DEFS: readonly ToolDef[] = [
   }) },
   { name: 'follow_up', annotations: { title: 'Follow up', ...LAUNCHES }, description: 'Send a worker its next message ("do this next"); never cuts the current turn. A running worker reads it at its next step when its provider supports that, else when the turn ends; an idle worker starts a new turn in the same conversation. Queued messages are delivered whatever the turn\'s outcome; cancel discards them. Settings, checks, watched files and env carry over; arguments here apply from the next turn. env: "dropped" in the ack means the env values were lost.', inputSchema: schema({
     worker: { ...string, description: "Worker name, workerId, or any turn's job ID." }, prompt: string, context: messageContext, files: moreFiles,
-    checks: { ...checksSchema, description: 'Replaces the inherited checks; [] clears them.' }, model: string, effort: { type: 'string', enum: EFFORTS }, timeoutMs: { type: 'integer', minimum: 1 }, env: envAgain,
+    checks: { ...checksSchema, description: 'Replaces the inherited checks; [] clears them.' },
+    model: { ...string, description: 'Replaces the inherited model; "default" clears it.' },
+    effort: { type: 'string', enum: [...EFFORTS, 'default'], description: 'Replaces the inherited effort; "default" clears it.' },
+    timeoutMs: { type: 'integer', minimum: 1 }, env: envAgain,
     unrestricted: { type: 'boolean', description: 'Skip worker approval prompts.' },
   }, ['worker', 'prompt']) },
   { name: 'steer', annotations: { title: 'Steer', ...LAUNCHES, destructiveHint: true }, description: 'Redirect a worker now ("stop and do this instead"): cuts its running turn (the tool call in flight is lost) or running checks and continues the same conversation with this message; an idle worker starts a new turn. Before the provider reports a conversation handle this fails unless allowFresh is true. To let the current work finish, use follow_up.', inputSchema: schema({
