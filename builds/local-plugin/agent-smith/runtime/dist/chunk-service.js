@@ -1,4 +1,111 @@
-import {o as readManifest,d as jobFile,F as FILES,q as ownerAlive,c as readPipeline,l as cancelPipeline,g as findProvider,p as providerNames,t as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,u as errMessage,P as PROVIDERS,w as probeAvailability,x as writeJsonAtomic,A as AgentSmithReader,y as normalize,z as writeAtomic,j as jobDir,B as SCHEMA_VERSION,C as validOwnerPid,n as isTerminalForgeStatus,E as reportFor,G as cwdFacts,H as normalizeDenials,I as deriveOrphan,J as deriveStatus,K as summaryHead,L as failureFields,R as REASONS,e as readAcceptance,N as writeAcceptance,O as createMarker,W as WORKERS_DIR,Q as jobsDir,T as parseWorkerIndex,U as normalizeContinuationKind,V as fileSig,X as JobWriter,i as isTerminalStatus,k as isMode,Y as effectiveUnrestricted,Z as newJobId,_ as newWorkerId,$ as markAcceptancePending,a0 as humanDuration,a1 as pipeEvents,a2 as checksAbortRequested,a3 as verdictBlock,a4 as runAcceptance,a5 as senderOf,a6 as taskTitle,a7 as markAcceptanceSuperseded,a8 as pickHead,f as isWorkerIdle,a9 as compareTurnPriority,aa as computeStaleReads,ab as SMITH_PAYLOAD,ac as isForgeStatus}from'./chunk-normalize.js';import {existsSync,readFileSync,mkdirSync,appendFileSync,openSync,writeSync,closeSync,unlinkSync,statSync,renameSync,linkSync,readdirSync,realpathSync,lstatSync,copyFileSync}from'node:fs';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import path from'node:path';import {createHash}from'node:crypto';const LAUNCH_ACK_MS = 15_000;
+import {n as normalizeContinuationKind,o as reasonFromText,q as readManifest,c as jobFile,F as FILES,t as ownerAlive,r as readPipeline,e as cancelPipeline,g as findProvider,p as providerNames,u as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,w as errMessage,P as PROVIDERS,x as probeAvailability,y as writeJsonAtomic,A as AgentSmithReader,z as normalize,B as writeAtomic,j as jobDir,C as SCHEMA_VERSION,E as validOwnerPid,l as isTerminalForgeStatus,G as reportFor,H as cwdFacts,I as normalizeDenials,J as deriveOrphan,K as deriveStatus,L as summaryHead,N as failureFields,R as REASONS,d as readAcceptance,O as writeAcceptance,Q as createMarker,W as WORKERS_DIR,T as jobsDir,U as parseWorkerIndex,V as fileSig,X as JobWriter,i as isTerminalStatus,k as isMode,Y as effectiveUnrestricted,Z as newJobId,_ as newWorkerId,$ as markAcceptancePending,a0 as humanDuration,a1 as pipeEvents,a2 as checksAbortRequested,a3 as verdictBlock,a4 as runAcceptance,a5 as senderOf,a6 as taskTitle,a7 as markAcceptanceSuperseded,a8 as pickHead,f as isWorkerIdle,a9 as compareTurnPriority,aa as computeStaleReads,ab as SMITH_PAYLOAD,ac as isForgeStatus}from'./chunk-normalize.js';import {existsSync,readFileSync,mkdirSync,appendFileSync,openSync,writeSync,closeSync,unlinkSync,statSync,renameSync,linkSync,readdirSync,realpathSync,lstatSync,copyFileSync}from'node:fs';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import path from'node:path';import {createHash}from'node:crypto';function failedReason(d) {
+    if (d.status !== 'failed')
+        return null;
+    const stored = d.reason;
+    return stored ? stored : reasonFromText(d.error);
+}
+function toSummary(observed) {
+    const raw = observed.raw;
+    const toolCalls = typeof raw['tool_calls'] === 'number' ? raw['tool_calls'] : null;
+    const task = typeof raw['task'] === 'string' && raw['task'] !== '' ? raw['task'] : null;
+    const changedFiles = raw['changed_files'];
+    const digest = readDigest(raw['digest']);
+    const activities = Array.isArray(raw['recent_activities']) ? raw['recent_activities'] : [];
+    const currentActivity = observed.status === 'running'
+        ? [...activities].reverse().find(isActiveForgeActivity) ?? null
+        : null;
+    const turn = typeof raw['turn'] === 'number' && Number.isInteger(raw['turn']) && raw['turn'] >= 1 ? raw['turn'] : 1;
+    const continuedFrom = typeof raw['continuedFrom'] === 'string' && raw['continuedFrom'] !== '' ? raw['continuedFrom'] : undefined;
+    const continuationKind = normalizeContinuationKind(raw['continuationKind']) ?? (continuedFrom !== undefined ? 'follow-up' : undefined);
+    const chainStartedAt = typeof raw['chainStartedAt'] === 'string' && raw['chainStartedAt'] !== ''
+        ? raw['chainStartedAt']
+        : (observed.startedAt ?? undefined);
+    const reason = failedReason({
+        status: observed.status,
+        reason: typeof raw['reason'] === 'string' && raw['reason'] !== '' ? raw['reason'] : null,
+        error: typeof raw['error'] === 'string' ? raw['error'] : null,
+    });
+    return {
+        jobId: observed.jobId,
+        name: typeof raw['name'] === 'string' && raw['name'] ? raw['name'] : observed.jobId,
+        workerId: typeof raw['workerId'] === 'string' && raw['workerId'] !== '' ? raw['workerId'] : observed.jobId,
+        turn,
+        role: typeof raw['role'] === 'string' ? raw['role'] : observed.mode,
+        latestSummary: raw['summarySource'] === 'worker' && typeof raw['latestSummary'] === 'string' ? raw['latestSummary'] : null,
+        summarySource: raw['summarySource'] === 'worker' ? 'worker' : null,
+        status: observed.status,
+        provider: typeof raw['provider'] === 'string' ? raw['provider'] : observed.label,
+        unrestricted: raw['unrestricted'] === true,
+        resumable: typeof raw['conversation'] === 'string' && raw['conversation'] !== '',
+        mode: observed.mode,
+        model: observed.model,
+        task,
+        toolCalls,
+        currentActivity,
+        lastActivity: isForgeActivity(raw['last_activity']) ? raw['last_activity']
+            : [...activities].reverse().find(isForgeActivity) ?? null,
+        startedAt: observed.startedAt,
+        updatedAt: observed.updatedAt,
+        finishedAt: observed.finishedAt,
+        warnings: observed.warnings.map((w) => ({ code: w.code, message: w.message })),
+        ...(reason !== null ? { reason } : {}),
+        ...(typeof raw['supersededBy'] === 'string' || raw['supersededBy'] === null
+            ? { supersededBy: raw['supersededBy'] }
+            : {}),
+        ...(typeof raw['followedBy'] === 'string' && raw['followedBy'] !== '' ? { followedBy: raw['followedBy'] } : {}),
+        ...(continuedFrom !== undefined ? { continuedFrom } : {}),
+        ...(continuationKind !== undefined ? { continuationKind } : {}),
+        ...(chainStartedAt !== undefined ? { chainStartedAt } : {}),
+        ...(typeof raw['pendingSteers'] === 'number'
+            ? { pendingSteers: raw['pendingSteers'] }
+            : {}),
+        ...(Array.isArray(changedFiles) ? { changedFileCount: changedFiles.length } : {}),
+        ...(digest !== null ? { digest } : {}),
+        ...(typeof raw['toolErrors'] === 'number' && raw['toolErrors'] > 0 ? { toolErrors: raw['toolErrors'] } : {}),
+        ...(raw['failedEarly'] === true ? { failedEarly: true } : {}),
+        ...(raw['changedFilesUnknown'] === true ? { changedFilesUnknown: true } : {}),
+        ...(raw['cwdMissingAtFinish'] === true ? { cwdMissingAtFinish: true } : {}),
+        ...(typeof raw['last_event_at'] === 'string' ? { lastEventAt: raw['last_event_at'] } : {}),
+        ...(typeof raw['last_alive_at'] === 'string' ? { lastAliveAt: raw['last_alive_at'] } : {}),
+    };
+}
+function readDigest(v) {
+    if (v === null || typeof v !== 'object' || Array.isArray(v))
+        return null;
+    const d = v;
+    if (typeof d['phase'] !== 'string' || !Array.isArray(d['edited']))
+        return null;
+    const n = (key) => typeof d[key] === 'number' ? d[key] : 0;
+    const repeat = d['repeat'];
+    const r = repeat !== null && typeof repeat === 'object' && !Array.isArray(repeat)
+        ? repeat : null;
+    return {
+        phase: (['starting', 'exploring', 'editing', 'testing', 'running'].includes(d['phase'])
+            ? d['phase'] : 'running'),
+        filesRead: n('filesRead'),
+        searches: n('searches'),
+        commands: n('commands'),
+        testRuns: n('testRuns'),
+        edited: d['edited'].filter((e) => typeof e === 'string'),
+        editedCount: n('editedCount'),
+        lastTestFailed: d['lastTestFailed'] === true,
+        repeat: r !== null && typeof r['label'] === 'string' && typeof r['count'] === 'number'
+            ? { label: r['label'], count: r['count'] } : null,
+    };
+}
+function isForgeActivity(value) {
+    if (typeof value !== 'object' || value === null)
+        return false;
+    const activity = value;
+    return typeof activity['stepIndex'] === 'number' && typeof activity['tool'] === 'string'
+        && ['active', 'done', 'denied', 'error'].includes(String(activity['status']));
+}
+function isActiveForgeActivity(value) {
+    if (typeof value !== 'object' || value === null)
+        return false;
+    const activity = value;
+    return typeof activity['stepIndex'] === 'number' && typeof activity['tool'] === 'string' && activity['status'] === 'active';
+}const LAUNCH_ACK_MS = 15_000;
 async function launch(url, payload, onPrepared) {
     const child = fork(fileURLToPath(url), [], {
         detached: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
@@ -1254,101 +1361,6 @@ class WorkerIndexStore {
     workerOf(jobId) {
         return this.jobWorker.get(jobId);
     }
-}function toSummary(observed) {
-    const raw = observed.raw;
-    const toolCalls = typeof raw['tool_calls'] === 'number' ? raw['tool_calls'] : null;
-    const task = typeof raw['task'] === 'string' && raw['task'] !== '' ? raw['task'] : null;
-    const changedFiles = raw['changed_files'];
-    const digest = readDigest(raw['digest']);
-    const activities = Array.isArray(raw['recent_activities']) ? raw['recent_activities'] : [];
-    const currentActivity = observed.status === 'running'
-        ? [...activities].reverse().find(isActiveForgeActivity) ?? null
-        : null;
-    const turn = typeof raw['turn'] === 'number' && Number.isInteger(raw['turn']) && raw['turn'] >= 1 ? raw['turn'] : 1;
-    const continuedFrom = typeof raw['continuedFrom'] === 'string' && raw['continuedFrom'] !== '' ? raw['continuedFrom'] : undefined;
-    const continuationKind = normalizeContinuationKind(raw['continuationKind']) ?? (continuedFrom !== undefined ? 'follow-up' : undefined);
-    const chainStartedAt = typeof raw['chainStartedAt'] === 'string' && raw['chainStartedAt'] !== ''
-        ? raw['chainStartedAt']
-        : (observed.startedAt ?? undefined);
-    return {
-        jobId: observed.jobId,
-        name: typeof raw['name'] === 'string' && raw['name'] ? raw['name'] : observed.jobId,
-        workerId: typeof raw['workerId'] === 'string' && raw['workerId'] !== '' ? raw['workerId'] : observed.jobId,
-        turn,
-        role: typeof raw['role'] === 'string' ? raw['role'] : observed.mode,
-        latestSummary: raw['summarySource'] === 'worker' && typeof raw['latestSummary'] === 'string' ? raw['latestSummary'] : null,
-        summarySource: raw['summarySource'] === 'worker' ? 'worker' : null,
-        status: observed.status,
-        provider: typeof raw['provider'] === 'string' ? raw['provider'] : observed.label,
-        unrestricted: raw['unrestricted'] === true,
-        resumable: typeof raw['conversation'] === 'string' && raw['conversation'] !== '',
-        mode: observed.mode,
-        model: observed.model,
-        task,
-        toolCalls,
-        currentActivity,
-        lastActivity: isForgeActivity(raw['last_activity']) ? raw['last_activity']
-            : [...activities].reverse().find(isForgeActivity) ?? null,
-        startedAt: observed.startedAt,
-        updatedAt: observed.updatedAt,
-        finishedAt: observed.finishedAt,
-        warnings: observed.warnings.map((w) => ({ code: w.code, message: w.message })),
-        ...(typeof raw['supersededBy'] === 'string' || raw['supersededBy'] === null
-            ? { supersededBy: raw['supersededBy'] }
-            : {}),
-        ...(typeof raw['followedBy'] === 'string' && raw['followedBy'] !== '' ? { followedBy: raw['followedBy'] } : {}),
-        ...(continuedFrom !== undefined ? { continuedFrom } : {}),
-        ...(continuationKind !== undefined ? { continuationKind } : {}),
-        ...(chainStartedAt !== undefined ? { chainStartedAt } : {}),
-        ...(typeof raw['pendingSteers'] === 'number'
-            ? { pendingSteers: raw['pendingSteers'] }
-            : {}),
-        ...(Array.isArray(changedFiles) ? { changedFileCount: changedFiles.length } : {}),
-        ...(digest !== null ? { digest } : {}),
-        ...(typeof raw['toolErrors'] === 'number' && raw['toolErrors'] > 0 ? { toolErrors: raw['toolErrors'] } : {}),
-        ...(raw['failedEarly'] === true ? { failedEarly: true } : {}),
-        ...(raw['changedFilesUnknown'] === true ? { changedFilesUnknown: true } : {}),
-        ...(raw['cwdMissingAtFinish'] === true ? { cwdMissingAtFinish: true } : {}),
-        ...(typeof raw['last_event_at'] === 'string' ? { lastEventAt: raw['last_event_at'] } : {}),
-        ...(typeof raw['last_alive_at'] === 'string' ? { lastAliveAt: raw['last_alive_at'] } : {}),
-    };
-}
-function readDigest(v) {
-    if (v === null || typeof v !== 'object' || Array.isArray(v))
-        return null;
-    const d = v;
-    if (typeof d['phase'] !== 'string' || !Array.isArray(d['edited']))
-        return null;
-    const n = (key) => typeof d[key] === 'number' ? d[key] : 0;
-    const repeat = d['repeat'];
-    const r = repeat !== null && typeof repeat === 'object' && !Array.isArray(repeat)
-        ? repeat : null;
-    return {
-        phase: (['starting', 'exploring', 'editing', 'testing', 'running'].includes(d['phase'])
-            ? d['phase'] : 'running'),
-        filesRead: n('filesRead'),
-        searches: n('searches'),
-        commands: n('commands'),
-        testRuns: n('testRuns'),
-        edited: d['edited'].filter((e) => typeof e === 'string'),
-        editedCount: n('editedCount'),
-        lastTestFailed: d['lastTestFailed'] === true,
-        repeat: r !== null && typeof r['label'] === 'string' && typeof r['count'] === 'number'
-            ? { label: r['label'], count: r['count'] } : null,
-    };
-}
-function isForgeActivity(value) {
-    if (typeof value !== 'object' || value === null)
-        return false;
-    const activity = value;
-    return typeof activity['stepIndex'] === 'number' && typeof activity['tool'] === 'string'
-        && ['active', 'done', 'denied', 'error'].includes(String(activity['status']));
-}
-function isActiveForgeActivity(value) {
-    if (typeof value !== 'object' || value === null)
-        return false;
-    const activity = value;
-    return typeof activity['stepIndex'] === 'number' && typeof activity['tool'] === 'string' && activity['status'] === 'active';
 }/**
  * watched-files.ts — brief/spec files a worker is told to read, copied into its
  * cwd and tracked by signature so a later edit on either side is noticed.
@@ -1705,7 +1717,7 @@ class ForgeService {
         const sandboxFlags = sandboxInfo?.flags ?? [];
         const readOnlyEnforced = sandboxInfo?.readOnlyEnforced ?? false;
         if (provider.name === 'agy' && preset?.runsCommands === true && !unrestricted) {
-            warnings.push('agy cannot prompt for permission headless; commands will be denied and the job will return an empty result. Retry with unrestricted:true if this job needs shell access.');
+            warnings.push('agy cannot prompt for permission headless; commands will be denied and the job will return an empty result.');
         }
         const brief = buildBrief({
             mode,
@@ -2214,6 +2226,20 @@ class ForgeService {
             catch { }
         }
     }
+    continuationSettings(head, entries, spec) {
+        let base = head;
+        const seen = new Set();
+        while (base !== null && base.failedEarly === true) {
+            if (seen.has(base.jobId) || !base.continuedFrom) {
+                base = null;
+                break;
+            }
+            seen.add(base.jobId);
+            base = this.readManifestSync(base.continuedFrom);
+        }
+        const baseSpec = base !== null && base.jobId === head.jobId ? spec : undefined;
+        return continuationModelAndEffort(base ?? {}, entries, baseSpec);
+    }
     continuationRequest(input) {
         const { head, spec, entries } = input;
         const o = mergeOverrides(entries);
@@ -2241,7 +2267,7 @@ class ForgeService {
         const context = [...entries].reverse().find((e) => e.context !== undefined)?.context ?? spec?.context;
         const checks = o.checks ?? spec?.checks ?? input.headChecks;
         const env = input.env !== undefined && Object.keys(input.env).length > 0 ? input.env : undefined;
-        const { model, effort } = continuationModelAndEffort(head, entries, spec);
+        const { model, effort } = this.continuationSettings(head, entries, spec);
         return {
             mode: spec?.mode ?? head.mode ?? 'task',
             prompt: rawPrompt,
@@ -2629,7 +2655,7 @@ class ForgeService {
             }
         }
         const provider = this.providerSafe(head.provider);
-        const { model: effectiveModel, effort: effectiveEffort } = continuationModelAndEffort(head, [...undeliveredEntries(this.repo, headId), entry]);
+        const { model: effectiveModel, effort: effectiveEffort } = this.continuationSettings(head, [...undeliveredEntries(this.repo, headId), entry]);
         if (provider !== null) {
             const checked = await validateModelAndEffort(provider, effectiveModel, effectiveEffort, checkCatalog ? async () => catalog : undefined, entry.overrides?.unrestricted);
             warnings.push(...checked.warnings);
@@ -2683,6 +2709,8 @@ class ForgeService {
             jobId: headId, name, workerId, turn,
             action: sender === 'steer' && (running || checksRunning) ? 'interrupting' : 'queued',
             delivery, status: 'running', provider: head.provider, repo: this.repo,
+            ...(effectiveModel === undefined ? {} : { model: effectiveModel }),
+            ...(effectiveEffort === undefined || provider?.supportsEffort === false ? {} : { effort: effectiveEffort }),
             timeoutMs: entry.overrides?.timeoutMs ?? head.timeoutMs ?? DEFAULT_TIMEOUT_MS$1,
             pendingMessages: pending,
             ...envAck,
@@ -2697,7 +2725,7 @@ class ForgeService {
         const { ack: envAck, runEnv } = this.resolveFollowUpEnv(workerId, head.jobId, env, false, warnings);
         const provider = this.providerSafe(head.provider);
         const pendingEntries = undeliveredEntries(this.repo, head.jobId);
-        const { model: effectiveModel, effort: effectiveEffort } = continuationModelAndEffort(head, [...pendingEntries, entry]);
+        const { model: effectiveModel, effort: effectiveEffort } = this.continuationSettings(head, [...pendingEntries, entry]);
         if (checkCatalog && (effectiveModel !== undefined || (effectiveEffort !== undefined && provider?.supportsEffort !== false))) {
             warnings.push(...checkAgainstCatalog(head.provider, effectiveModel, effectiveEffort, catalog));
         }
@@ -2713,6 +2741,8 @@ class ForgeService {
         return {
             jobId: ack.jobId, name: ack.name, workerId: ack.workerId, turn: ack.turn,
             action: 'started', delivery: 'now', status: 'running', provider: ack.provider, repo: this.repo,
+            ...(effectiveModel === undefined ? {} : { model: effectiveModel }),
+            ...(effectiveEffort === undefined || provider?.supportsEffort === false ? {} : { effort: effectiveEffort }),
             timeoutMs: ack.timeoutMs,
             ...envAck,
             ...(checks !== undefined && checks.length > 0 ? { checks } : {}),
@@ -3101,7 +3131,6 @@ class ForgeService {
             conversation: typeof raw['conversation'] === 'string' ? raw['conversation'] : null,
             effort: typeof raw['effort'] === 'string' ? raw['effort'] : null,
             cwd: manifest?.cwd ?? null,
-            ...(manifest?.reason ? { reason: manifest.reason } : {}),
             ...(manifest === null
                 ? {}
                 : {
@@ -3171,4 +3200,4 @@ function describe(err) {
     if (err instanceof Error)
         return err.message;
     return String(err);
-}export{EFFORTS as E,ForgeService as F,MAX_WATCHED_FILES as M,validateModelAndEffort as a,getCatalogs as g,launchPipeline as l,probeProviders as p,requireProvider as r,validateEnv as v};
+}export{EFFORTS as E,ForgeService as F,MAX_WATCHED_FILES as M,validateModelAndEffort as a,failedReason as f,getCatalogs as g,launchPipeline as l,probeProviders as p,requireProvider as r,validateEnv as v};
