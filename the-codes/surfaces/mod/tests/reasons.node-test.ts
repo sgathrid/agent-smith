@@ -64,4 +64,6 @@ test('provider API access errors are not tool denials, while tool permission den
 
 test('quota outranks timeout consistently', () => {
   assert.equal(reasonFromText('quota exhausted; request timed out'), 'out of credits');
+  assert.equal(reasonFromText('RESOURCE_EXHAUSTED: insufficient balance'), 'out of credits');
+  assert.equal(reasonFromText('HTTP 402: Upstream request failed: Insufficient account funds'), 'out of credits');
 });

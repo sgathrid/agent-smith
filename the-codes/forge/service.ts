@@ -1311,10 +1311,11 @@ export class ForgeService {
       }
     }
     const provider = this.providerSafe(head.provider);
+    const effectiveModel = entry.overrides?.model ?? head.model ?? undefined;
     if (provider !== null) {
       const checked = await validateModelAndEffort(
         provider,
-        entry.overrides?.model,
+        effectiveModel,
         entry.overrides?.effort,
         checkCatalog ? async () => catalog : undefined,
         entry.overrides?.unrestricted,
@@ -1385,8 +1386,9 @@ export class ForgeService {
     const workerId = head.workerId ?? head.jobId;
     const { ack: envAck, runEnv } = this.resolveFollowUpEnv(workerId, head.jobId, env, false, warnings);
     const provider = this.providerSafe(head.provider);
+    const effectiveModel = entry.overrides?.model ?? head.model ?? undefined;
     if (checkCatalog && (entry.overrides?.model !== undefined || (entry.overrides?.effort !== undefined && provider?.supportsEffort !== false))) {
-      warnings.push(...checkAgainstCatalog(head.provider, entry.overrides?.model, entry.overrides?.effort, catalog));
+      warnings.push(...checkAgainstCatalog(head.provider, effectiveModel, entry.overrides?.effort, catalog));
     }
     const acceptance = readAcceptance(this.repo, head.jobId);
     const onDisk = readSteerEntries(this.repo, head.jobId).length;
@@ -1609,10 +1611,16 @@ export class ForgeService {
     return this.resolveStableDetail(this.resolveWorkerHeadId(nameOrWorkerIdOrJobId));
   }
 
-  async resolveWorker(nameOrId: string): Promise<JobDetail> {
+  async resolveWorkerTarget(nameOrId: string): Promise<{ detail: JobDetail; isWorker: boolean }> {
     const trimmed = nameOrId.trim();
-    if (this.isJobId(trimmed)) return this.resolveStableDetail(this.resolveTurn(trimmed));
-    return this.resolveWorkerHead(trimmed);
+    if (this.isJobId(trimmed)) {
+      return { detail: await this.resolveStableDetail(this.resolveTurn(trimmed)), isWorker: false };
+    }
+    return { detail: await this.resolveWorkerHead(trimmed), isWorker: true };
+  }
+
+  async resolveWorker(nameOrId: string): Promise<JobDetail> {
+    return (await this.resolveWorkerTarget(nameOrId)).detail;
   }
 
   private async resolveStableDetail(initialId: string): Promise<JobDetail> {

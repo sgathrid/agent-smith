@@ -31,6 +31,7 @@ import {
   runFileName,
   unclaim,
   type Launch,
+  type NoticeJob,
   type Owned,
   type RunRecord,
 } from './notice.ts';
@@ -191,10 +192,76 @@ async function adoptRepo($: EngineInterface, repo: string): Promise<boolean> {
 const trimSlashes = (p: string): string => p.replace(/\/+$/, '') || p;
 
 let announcing = false;
+let submittingNotice = false;
 let inMainTurn = false;
 
+function isPromptDropped(result: unknown): boolean {
+  return result !== null && typeof result === 'object' && typeof (result as { drop?: unknown }).drop === 'string';
+}
+
+async function commitNoticeState(
+  $: EngineInterface,
+  repo: string,
+  prevOwned: readonly Owned[],
+  nextOwned: readonly Owned[],
+  at: number,
+): Promise<void> {
+  for (const o of nextOwned) {
+    if (!prevOwned.some((prev) => prev.kind === o.kind && prev.id === o.id)) {
+      await $.fs.write(claimMarkerPath(repo, o.kind, o.id), `${new Date(at).toISOString()}\n`).catch(() => {});
+    }
+  }
+  const prevKeys = new Set(prevOwned.map((o) => `${o.kind}:${o.id}`));
+  const nextByKey = new Map(nextOwned.map((o) => [`${o.kind}:${o.id}`, o]));
+  await update($, notices, (current) => {
+    const updated: Owned[] = [];
+    const seenCurrent = new Set<string>();
+    for (const c of current) {
+      const k = `${c.kind}:${c.id}`;
+      seenCurrent.add(k);
+      if (nextByKey.has(k)) updated.push(nextByKey.get(k)!);
+      else if (!prevKeys.has(k)) updated.push(c);
+    }
+    for (const o of nextOwned) {
+      const k = `${o.kind}:${o.id}`;
+      if (!seenCurrent.has(k) && !prevKeys.has(k)) {
+        updated.push(o);
+      }
+    }
+    return updated;
+  });
+}
+
+async function holdAndCommitNotices(
+  $: EngineInterface,
+  repo: string,
+  prevOwned: readonly Owned[],
+  nextOwned: readonly Owned[],
+  dueNotices: readonly NoticeJob[],
+  at: number,
+): Promise<void> {
+  if (inMainTurn) return;
+  if (dueNotices.length === 0) {
+    await commitNoticeState($, repo, prevOwned, nextOwned, at);
+    return;
+  }
+  if (submittingNotice) return;
+  submittingNotice = true;
+  void $.prompt
+    .submit({ text: claudeText(dueNotices) })
+    .then(async (res) => {
+      if (!isPromptDropped(res)) {
+        await commitNoticeState($, repo, prevOwned, nextOwned, at);
+      }
+    })
+    .catch(() => {})
+    .finally(() => {
+      submittingNotice = false;
+    });
+}
+
 async function announce($: EngineInterface, repo: string, jobs: readonly RadarJob[], at: number): Promise<void> {
-  if (inMainTurn || announcing) return;
+  if (inMainTurn || announcing || submittingNotice) return;
   announcing = true;
   try {
     const owned = await read($, notices);
@@ -222,18 +289,7 @@ async function announce($: EngineInterface, repo: string, jobs: readonly RadarJo
         o.readHead !== owned[i]?.readHead);
     const changed = result.notices.length > 0 || ownedChanged;
     if (!changed) return;
-    for (const o of result.owned) {
-      if (!owned.some((prev) => prev.kind === o.kind && prev.id === o.id)) {
-        await $.fs.write(claimMarkerPath(repo, o.kind, o.id), `${new Date(at).toISOString()}\n`).catch(() => {});
-      }
-    }
-    const seen = new Set([
-      ...owned.map((o) => `${o.kind}:${o.id}`),
-      ...result.owned.map((o) => `${o.kind}:${o.id}`),
-    ]);
-    await update($, notices, (current) => [...result.owned, ...current.filter((c) => !seen.has(`${c.kind}:${c.id}`))]);
-    if (result.notices.length === 0) return;
-    void $.prompt.submit({ text: claudeText(result.notices) }).catch(() => {});
+    await holdAndCommitNotices($, repo, owned, result.owned, result.notices, at);
   } finally {
     announcing = false;
   }

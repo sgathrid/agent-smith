@@ -110,7 +110,6 @@ export function effectiveUnrestricted(
 ): boolean {
   const def = effectiveDefaultUnrestricted(provider);
   if (def === 'always') return true;
-  if (provider.name === 'codex' && process.env['AGENT_SMITH_CODEX_SANDBOX'] === 'danger-full-access') return true;
   return requested ?? def;
 }
 

@@ -36,6 +36,7 @@ import {
 } from './discovery.ts';
 import type { RunFn } from './discovery.ts';
 import { noResultText, stderrClause } from './failure-text.ts';
+import { createAnswer, emptyResponseVerdict, isBookkeepingTool, type Answer } from './answer.ts';
 import path from 'node:path';
 
 export function kimiBinary(): string {
@@ -127,7 +128,8 @@ function contentText(value: unknown): string {
 
 export interface KimiTranslator {
   onEvent(raw: Record<string, unknown>): ProviderEvent[];
-  finalText: string;
+  answer: Answer;
+  readonly finalText: string;
   sawError: boolean;
   recovery: ErrorRecovery;
   error?: string;
@@ -138,8 +140,12 @@ export interface KimiTranslator {
 }
 
 export function createKimiTranslator(maxChars: number): KimiTranslator {
+  const answer = createAnswer();
   const tx: KimiTranslator = {
-    finalText: '',
+    answer,
+    get finalText() {
+      return answer.value();
+    },
     sawError: false,
     recovery: new ErrorRecovery(),
     completedTools: 0,
@@ -226,16 +232,24 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
 
     if (role === 'assistant') {
       const content = str(raw, 'content');
+      const calls = raw['tool_calls'];
+      const hasAnyCall = Array.isArray(calls) && calls.length > 0;
+      const hasRealCall = Array.isArray(calls) && calls.some((rawCall) => {
+        if (rawCall === null || typeof rawCall !== 'object' || Array.isArray(rawCall)) return false;
+        const call = rawCall as Record<string, unknown>;
+        const fn = obj(call, 'function');
+        const name = str(fn, 'name') ?? str(call, 'name') ?? 'tool';
+        return !isBookkeepingTool('kimi', name);
+      });
       if (content !== undefined) {
         if (content === '') {
-          tx.finalText = '';
+          if (!hasAnyCall || hasRealCall) answer.text('');
         } else {
-          tx.finalText = content;
+          answer.text(content);
           out.push({ kind: 'text', at, text: content, stream: 'assistant' });
         }
       }
 
-      const calls = raw['tool_calls'];
       if (calls !== undefined) {
         if (!Array.isArray(calls)) {
           tx.unrecognised.add('assistant:tool_calls');
@@ -247,7 +261,7 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
             raw,
           });
         } else {
-          if (calls.length > 0) tx.finalText = '';
+          if (hasRealCall) answer.work();
           for (const rawCall of calls) {
             if (rawCall === null || typeof rawCall !== 'object' || Array.isArray(rawCall)) continue;
             const call = rawCall as Record<string, unknown>;
@@ -280,7 +294,6 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
     }
 
     if (role === 'tool') {
-      tx.finalText = '';
       const id = str(raw, 'tool_call_id') ?? str(raw, 'id') ?? `tool-${step}`;
       if (ended.has(id)) {
         out.push({
@@ -292,6 +305,7 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
         });
         return out;
       }
+      if (!isBookkeepingTool('kimi', toolNames.get(id) ?? '')) answer.work();
       const content = contentText(raw['content']);
       const output = truncate(content, maxChars);
       const status: ActivityStatus = toolOutputIsError(content) ? 'error' : 'done';
@@ -353,7 +367,8 @@ export function buildResult(args: {
 
   let status: JobStatus;
   let error: string | undefined;
-  const recovered = tx.recovery.recovered(tx.finalText, exit.code);
+  const response = tx.answer.value();
+  const recovered = tx.recovery.recovered(response, exit.code);
   const early = earlyVerdict(exit, durationMs);
   if (early !== undefined) {
     ({ status, error } = early);
@@ -365,15 +380,17 @@ export function buildResult(args: {
     error = exit.code === null
       ? `${noResultText({ code: exit.code, signal: exit.signal, stderr: '' })}${unrecognised}${stderrClause(exit.stderr)}`
       : `exited ${exit.code}${unrecognised}${stderrClause(exit.stderr)}`;
-  } else if (tx.finalText.trim() === '') {
-    const tools = tx.completedTools > 0 ? ` · ${tx.completedTools} tool step(s) completed` : '';
-    status = 'malformed';
-    error = `no output${unrecognised}${tools}${stderrClause(exit.stderr)}`;
   } else {
-    status = 'success';
+    const tools = tx.completedTools > 0 ? ` · ${tx.completedTools} tool step(s) completed` : '';
+    const empty = emptyResponseVerdict(response, exit.stderr, { detail: `${unrecognised}${tools}` });
+    if (empty !== undefined) {
+      ({ status, error } = empty);
+    } else {
+      status = 'success';
+    }
   }
 
-  const out = jobResult({ provider: 'kimi', jobId, status, error, exit, response: tx.finalText, startedAtMs, durationMs, stateDir });
+  const out = jobResult({ provider: 'kimi', jobId, status, error, exit, response, startedAtMs, durationMs, stateDir });
   if (tx.usage !== undefined) out.usage = tx.usage;
   const raw: Record<string, unknown> = {};
   if (tx.sessionId !== undefined) raw['sessionId'] = tx.sessionId;

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import process$1 from'node:process';import {randomUUID,randomBytes}from'node:crypto';import {readFileSync,existsSync,statSync,rmSync,writeFileSync,mkdirSync,linkSync,unlinkSync,renameSync,readdirSync}from'node:fs';import path from'node:path';import {l as livenessOf,L as LIVENESS_STATES,w as waitForChange,c as claimMarkerPath}from'./chunk-stale.js';import {E as EFFORTS$1,M as MAX_WATCHED_FILES,v as validateEnv,g as getCatalogs,l as launchPipeline,r as requireProvider,a as validateModelAndEffort,p as probeProviders,F as ForgeService}from'./chunk-service.js';import {i as isTerminalStatus,r as reasonFromText,M as MODES$1,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS,b as inheritContinuedProviders,S as STAGE_PROMPTS,v as validateSpec,s as startPipeline,c as readPipeline,m as missingPipelineError,j as jobDir,d as jobFile,F as FILES,e as readAcceptance,f as effectiveDefaultUnrestricted,g as findProvider,h as isWorkerIdle,p as providerNames,k as isMode,l as cancelPipeline,n as isTerminalForgeStatus}from'./chunk-normalize.js';import os from'node:os';import {execFile}from'node:child_process';import'node:url';import'node:timers/promises';import'node:fs/promises';import'node:readline';//#region rolldown:runtime
+import process$1 from'node:process';import {randomUUID,randomBytes}from'node:crypto';import {readFileSync,existsSync,statSync,rmSync,writeFileSync,mkdirSync,linkSync,unlinkSync,renameSync,readdirSync}from'node:fs';import path from'node:path';import {l as livenessOf,L as LIVENESS_STATES,w as waitForChange,c as claimMarkerPath}from'./chunk-stale.js';import {E as EFFORTS$1,M as MAX_WATCHED_FILES,v as validateEnv,g as getCatalogs,l as launchPipeline,r as requireProvider,a as validateModelAndEffort,p as probeProviders,F as ForgeService}from'./chunk-service.js';import {i as isTerminalStatus,r as reasonFromText,M as MODES$1,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS,b as inheritContinuedProviders,S as STAGE_PROMPTS,v as validateSpec,s as startPipeline,c as readPipeline,m as missingPipelineError,j as jobDir,d as jobFile,F as FILES,e as readAcceptance,f as isWorkerIdle,p as providerNames,g as findProvider,h as effectiveDefaultUnrestricted,k as isMode,l as cancelPipeline,n as isTerminalForgeStatus}from'./chunk-normalize.js';import os from'node:os';import {execFile}from'node:child_process';import'node:url';import'node:timers/promises';import'node:fs/promises';import'node:readline';//#region rolldown:runtime
 var __create = Object.create;
 var __defProp = Object.defineProperty;
 var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
@@ -25892,8 +25892,19 @@ const WATCH_RECHECK_MS = 5_000;
 const CONFIRM_TIMEOUT_MS = 10 * 60_000;
 const DECLINED_UNRESTRICTED = 'The user declined unrestricted access; rerun without unrestricted, or ask the user.';
 const UNCONFIRMED_UNRESTRICTED = 'unrestricted not confirmed: this client cannot prompt the user.';
+function isEscalatingLaunch(l) {
+    if (l.unrestricted !== true)
+        return false;
+    const provider = findProvider(l.provider);
+    if (effectiveDefaultUnrestricted(provider))
+        return false;
+    if (provider?.describeSandbox) {
+        return provider.describeSandbox({ unrestricted: true }).sandbox !== provider.describeSandbox({ unrestricted: false }).sandbox;
+    }
+    return true;
+}
 async function confirmUnrestricted(ctx, launches, kind = 'worker') {
-    const escalating = launches.filter(l => l.unrestricted === true && !effectiveDefaultUnrestricted(findProvider(l.provider)));
+    const escalating = launches.filter(isEscalatingLaunch);
     if (escalating.length === 0 || process.env['AGENT_SMITH_CONFIRM_UNRESTRICTED'] !== '1')
         return {};
     if (ctx.unrestrictedGate)
@@ -25928,12 +25939,22 @@ const listCapabilitiesTool = async (ctx, args) => {
     const fmt = format(args);
     return structured(await listCapabilities(ctx, boolean(args, 'refresh') ?? false, fmt, allowed(args, 'provider', PROVIDERS)), { compact: fmt === 'concise' });
 };
+function sandboxContradictsUnrestricted(ack) {
+    if (!ack.sandbox)
+        return false;
+    const sandboxIsUnrestricted = ack.sandbox.includes('danger-full-access') ||
+        ack.sandbox.includes('(unrestricted)') ||
+        ack.sandbox.includes('bypass') ||
+        ack.sandbox.includes('auto');
+    return sandboxIsUnrestricted !== ack.unrestricted;
+}
 function slimAck(ack) {
     const out = {
         jobId: ack.jobId, name: ack.name, workerId: ack.workerId,
         ...(ack.turn !== undefined ? { turn: ack.turn } : {}),
         provider: ack.provider, model: ack.modelResolved ?? null, status: ack.status,
         timeoutMs: ack.timeoutMs, repo: ack.repo, unrestricted: ack.unrestricted,
+        ...(sandboxContradictsUnrestricted(ack) ? { sandbox: ack.sandbox } : {}),
         ...(ack.readOnlyRequested || (isMode(ack.role) && MODE_PRESETS[ack.role].readOnly) ? { readOnlyEnforced: ack.readOnlyEnforced ?? false } : {}),
         ...(ack.envKeys?.length ? { envKeys: ack.envKeys } : {}),
         ...(ack.warnings?.length ? { warnings: ack.warnings } : {}),
@@ -25955,7 +25976,7 @@ async function resolveDefaultProvider(ctx) {
         : undefined;
     return defaultProvider(installed, undefined, detail);
 }
-async function spawnOne(ctx, args, preResolved) {
+async function spawnOne(ctx, args, preResolved, extraWarnings = []) {
     const mode = allowed(args, 'mode', MODES$1);
     if (mode === undefined)
         throw new Error(`mode is required; one of ${MODES$1.join(', ')}.`);
@@ -25976,7 +25997,7 @@ async function spawnOne(ctx, args, preResolved) {
         cfgErrors = cfg.errors;
         provider = resolved.provider ?? await resolveDefaultProvider(ctx);
     }
-    const notes = [...resolved.warnings, ...cfgErrors.map(e => `models.json: ${e}`)];
+    const notes = [...extraWarnings, ...resolved.warnings, ...cfgErrors.map(e => `models.json: ${e}`)];
     const withNotes = (ack) => ({ ...slimAck(ack), provider: ack.provider ?? provider, ...(resolved.appliedAlias ? { aliasApplied: resolved.appliedAlias, aliasSource: resolved.source } : {}), ...(notes.length ? { warnings: [...(ack.warnings ?? []), ...notes] } : {}) });
     const checks = parseChecks(args.checks);
     const request = { mode, prompt: text(args, 'prompt', true), context: contextText(args), files: filesList(args), checks, cwd: workingDirectory(args), name: text(args, 'name'), task: text(args, 'task'), provider, model: resolved.model, effort: resolved.effort, timeoutMs: number(args, 'timeoutMs'), conversation: text(args, 'conversation'), unrestricted: boolean(args, 'unrestricted'), env: validateEnv(args.env),
@@ -26009,7 +26030,10 @@ function overlay(base, over, baseProvider) {
     const defined = Object.fromEntries(Object.entries(over).filter(([, v]) => v !== undefined));
     const switched = defined.provider !== undefined && baseProvider !== defined.provider;
     const kept = switched ? Object.fromEntries(Object.entries(base).filter(([k]) => !['model', 'effort', 'unrestricted'].includes(k))) : base;
-    return { ...kept, ...defined };
+    const dropped = switched && base.unrestricted !== undefined && defined.unrestricted === undefined
+        ? `unrestricted: ${String(base.unrestricted)} was dropped because the provider changed or was not shared.`
+        : undefined;
+    return { args: { ...kept, ...defined }, ...(dropped ? { droppedUnrestricted: dropped } : {}) };
 }
 async function inheritFrom(ctx, args) {
     const from = text(args, 'from', true);
@@ -26038,9 +26062,11 @@ async function inheritFrom(ctx, args) {
     return overlay(saved, rest, baseProvider);
 }
 const spawnJob = async (ctx, args) => {
-    const base = args.from === undefined ? args : await inheritFrom(ctx, args);
-    if (args.variants === undefined)
-        return structured(await spawnOne(ctx, base), { compact: true });
+    const inherited = args.from === undefined ? { args } : await inheritFrom(ctx, args);
+    const base = inherited.args;
+    if (args.variants === undefined) {
+        return structured(await spawnOne(ctx, base, undefined, inherited.droppedUnrestricted ? [inherited.droppedUnrestricted] : []), { compact: true });
+    }
     if (ctx.onJobPrepared)
         throw new Error('variants start several jobs, and a task-augmented call tracks one; call spawn_job once per variant.');
     if (!Array.isArray(args.variants) || args.variants.length === 0 || args.variants.length > MAX_VARIANTS)
@@ -26082,7 +26108,8 @@ const spawnJob = async (ctx, args) => {
         effort: allowed(shared, 'effort', EFFORTS$1),
         mode,
     }, cfg).provider;
-    const requests = variants.map((v, i) => overlay(shared, { ...v, name: names[i] }, baseProvider));
+    const overlaid = variants.map((v, i) => overlay(shared, { ...v, name: names[i] }, baseProvider));
+    const requests = overlaid.map(o => o.args);
     let fallbackProvider;
     const getFallbackProvider = async () => fallbackProvider ??= await resolveDefaultProvider(ctx);
     const preResolved = [];
@@ -26106,8 +26133,9 @@ const spawnJob = async (ctx, args) => {
     const batchCtx = { ...ctx, unrestrictedGate: gate.warning ? { warning: gate.warning } : {} };
     const jobs = [];
     for (const [i, r] of requests.entries()) {
+        const dropped = [inherited.droppedUnrestricted, overlaid[i].droppedUnrestricted].filter((w) => w !== undefined);
         try {
-            jobs.push(await spawnOne(batchCtx, r, preResolved[i]));
+            jobs.push(await spawnOne(batchCtx, r, preResolved[i], dropped));
         }
         catch (err) {
             jobs.push({ name: names[i], error: err instanceof Error ? err.message : String(err) });
@@ -26134,8 +26162,8 @@ const followUp = async (ctx, args) => {
         const provider = head.provider ?? '';
         if (request.model !== undefined || request.effort !== undefined) {
             const cfg = loadModelConfig({ repo: ctx.service.repo });
-            const resolved = resolveRequest({ provider: provider || undefined, model: request.model, effort: request.effort }, cfg);
-            Object.assign(request, { model: resolved.model, effort: resolved.effort });
+            const resolved = resolveRequest({ provider: provider || undefined, model: request.model ?? head.model ?? undefined, effort: request.effort }, cfg);
+            Object.assign(request, { ...(request.model !== undefined ? { model: resolved.model } : {}), effort: resolved.effort });
             notes.push(...resolved.warnings, ...cfg.errors.map(e => `models.json: ${e}`));
         }
         const gate = await confirmUnrestricted(ctx, [{
@@ -26194,9 +26222,9 @@ const jobStatus = async (ctx, args) => {
     const waitMs = number(args, 'wait_ms', MAX_WAIT_MS);
     const fmt = format(args);
     const wantDiff = boolean(args, 'include_diff') ?? false;
-    let detail = await ctx.service.resolveWorker(id);
+    const { detail: resolvedDetail, isWorker: worker } = await ctx.service.resolveWorkerTarget(id);
+    let detail = resolvedDetail;
     let waited = false;
-    let worker = ctx.service.resolveTurn(id) !== detail.jobId;
     const waitTarget = worker ? (detail.workerId ?? detail.jobId) : id;
     if (waitMs !== undefined) {
         waited = true;
@@ -26206,8 +26234,6 @@ const jobStatus = async (ctx, args) => {
         while (unsettled(ctx, detail, worker) && Date.now() < deadline) {
             await waitForChange(jobDir(ctx.service.repo, detail.jobId), Math.min(maxSlice, deadline - Date.now()), { fallbackMs });
             detail = await ctx.service.resolveWorker(waitTarget);
-            if (!worker)
-                worker = ctx.service.resolveTurn(waitTarget) !== detail.jobId;
         }
     }
     if (detail.jobId !== id)

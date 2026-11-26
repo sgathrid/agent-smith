@@ -108,6 +108,7 @@ import type { ListModelsOptions, ModelCatalog, ModelInfo, SandboxInfo } from './
 import { DEFAULT_DISCOVERY_TIMEOUT_MS, errMessage, runCapture } from './discovery.ts';
 import type { RunFn } from './discovery.ts';
 import { deniedText, stderrClause } from './failure-text.ts';
+import { createAnswer, emptyResponseVerdict, isBookkeepingTool, type Answer } from './answer.ts';
 
 
 export function opencodeBinary(): string {
@@ -227,6 +228,20 @@ function deepString(o: Record<string, unknown>, keys: string[]): string | undefi
   return undefined;
 }
 
+function hasEmptyText(o: Record<string, unknown>, keys: string[]): boolean {
+  for (const k of keys) {
+    if (str(o, k) === '') return true;
+  }
+  for (const nest of ['part', 'message', 'properties', 'data', 'info']) {
+    const inner = obj(o, nest);
+    if (inner === undefined) continue;
+    for (const k of keys) {
+      if (str(inner, k) === '') return true;
+    }
+  }
+  return false;
+}
+
 /** Locate a `tokens`/`usage` object anywhere one or two levels down. */
 function findUsage(o: Record<string, unknown>): Record<string, unknown> | undefined {
   const direct = obj(o, 'usage') ?? obj(o, 'tokens');
@@ -314,7 +329,8 @@ const TRANSPORT_ERROR_TYPE = 'provider.transport';
 
 interface OpencodeTranslator {
   onEvent(raw: Record<string, unknown>): ProviderEvent[];
-  finalText: string;
+  answer: Answer;
+  readonly finalText: string;
   sawTerminal: boolean;
   /** A fatal `error` / `session.error` event. A failed TOOL call never sets this. */
   sawError: boolean;
@@ -339,8 +355,12 @@ interface OpencodeTranslator {
  * (observed live) and totally unknown types (spec'd above).
  */
 export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
+  const answer = createAnswer();
   const tx: OpencodeTranslator = {
-    finalText: '',
+    answer,
+    get finalText() {
+      return answer.value();
+    },
     sawTerminal: false,
     sawError: false,
     toolErrors: 0,
@@ -350,7 +370,10 @@ export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
     onEvent: () => [],
   };
   let step = 0;
+  let stepSeq = 0;
+  let stepKey = 'step-0';
   const partStep = new Map<string, number>();
+  const endedParts = new Set<string>();
 
   const translate = (raw: Record<string, unknown>): ProviderEvent[] => {
     const out: ProviderEvent[] = [];
@@ -371,7 +394,7 @@ export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
       const e = obj(raw, 'error');
       const data = obj(e ?? {}, 'data');
       const message = str(e, 'message') ?? str(data, 'message') ?? str(raw, 'message') ?? 'opencode error';
-      const statusCode = data?.['statusCode'];
+      const statusCode = data?.['statusCode'] ?? e?.['status'] ?? e?.['statusCode'];
       tx.error = typeof statusCode === 'number' ? `HTTP ${statusCode}: ${message}` : message;
       const errorType = str(e, 'type');
       // Quota / no-route failures are the two I actually hit. They are
@@ -447,9 +470,17 @@ export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
       `anon-${step}`;
 
     if (toolName !== undefined && (stateWord !== '' || isToolType)) {
-      tx.finalText = '';
       const isDone = DONE_WORDS.has(stateWord) || type.endsWith('.completed') || type.endsWith('.done');
       const isErr = ERROR_WORDS.has(stateWord) || type.endsWith('.error');
+      const isReplay = endedParts.has(partId);
+      if (!isReplay) {
+        if (isBookkeepingTool('opencode', toolName)) {
+          stepKey = `step-${++stepSeq}`;
+        } else {
+          answer.work();
+        }
+      }
+      if (isDone || isErr) endedParts.add(partId);
       const errorTexts = [
         str(partState, 'error'),
         str(obj(partState, 'error'), 'message'),
@@ -530,23 +561,20 @@ export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
     const text = deepString(raw, ['text', 'content', 'delta', 'textDelta']);
     const isThinking = type.includes('thinking') || type.includes('reasoning');
     if (text !== undefined && text !== '') {
-      if (!isThinking) {
-        if (tx.finalText !== '') tx.finalText += '\n';
-        tx.finalText += text;
-      }
+      if (!isThinking) answer.text(text, stepKey);
       out.push({ kind: 'text', at, text, stream: isThinking ? 'thinking' : 'assistant' });
       // A text event is also our best evidence the run is producing output, so
       // it doubles as a terminal marker candidate below.
       return out;
     }
-    if (text === '' && !isThinking && (type === 'text' || partType === 'text')) {
-      tx.finalText = '';
+    if (!isThinking && (type === 'text' || partType === 'text') && hasEmptyText(raw, ['text', 'content', 'delta', 'textDelta'])) {
+      answer.text('');
       return out;
     }
 
     // ---- step boundaries ----------------------------------------------------
     if (isStepStart || isStepFinish) {
-      if (isStepStart) tx.finalText = '';
+      if (isStepStart) stepKey = `step-${++stepSeq}`;
       // Verified in the installed OpenCode CLI: session.step.ended emits
       // step_finish with part.reason = data.finish. Tool-call/length finishes
       // end only a step; "stop" confirms the assistant finished normally.
@@ -646,7 +674,8 @@ export function buildResult(args: {
   const toolErrors = tx.toolErrors > 0 ? ` · ${tx.toolErrors} tool error(s)` : '';
   // An error the worker got past: more work and a final report followed it. A
   // signal kill is no evidence of completion, so it needs a real exit code.
-  const recovered = tx.recovery.recovered(tx.finalText, exit.code);
+  const response = tx.answer.value();
+  const recovered = tx.recovery.recovered(response, exit.code);
   const early = earlyVerdict(exit, durationMs);
   if (early !== undefined) {
     ({ status, error } = early);
@@ -664,20 +693,16 @@ export function buildResult(args: {
   } else if (exit.code !== 0 && recovered === undefined) {
     status = 'error';
     error = `exited ${exit.code}${unrecognised}${toolErrors}${stderrClause(exit.stderr)}`;
-  } else if (tx.finalText.trim() === '') {
-    // Exited 0 with no text and no error event. Do not call that a success.
-    // Be honest about why: with an unverified parser this is the shape most
-    // likely to mean "we did not understand the output", not "the model said
-    // nothing", and the two demand different fixes.
-    // Most likely an event-shape gap in the adapter, not an empty model reply:
-    // check events.jsonl and extend the parser.
-    status = 'malformed';
-    error = `no output${unrecognised}${toolErrors}${stderrClause(exit.stderr)}`;
   } else {
-    status = 'success';
+    const empty = emptyResponseVerdict(response, exit.stderr, { detail: `${unrecognised}${toolErrors}` });
+    if (empty !== undefined) {
+      ({ status, error } = empty);
+    } else {
+      status = 'success';
+    }
   }
 
-  const out = jobResult({ provider: 'opencode', jobId, status, error, exit, response: tx.finalText, startedAtMs, durationMs, stateDir });
+  const out = jobResult({ provider: 'opencode', jobId, status, error, exit, response, startedAtMs, durationMs, stateDir });
   if (tx.usage !== undefined) out.usage = tx.usage;
   if (tx.unrecognised.size > 0) out.raw = { unrecognisedEventTypes: [...tx.unrecognised] };
   if (tx.sessionId !== undefined) {

@@ -1,9 +1,9 @@
 export const NETWORK_RE = /network issue|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|fetch failed|connection (?:reset|refused|closed|error)|temporarily unavailable/i;
 export const TIMEOUT_RE = /timed? ?out|exceeded the .*budget|\btimeout\b/i;
 export const AUTH_RE = /\b(?:unauthorized|unauthenticated)\b|authentication (?:failed|required)|invalid (?:api[ _-]?key|access token)|(?:access |auth |refresh )token (?:has )?expired|not (?:logged|signed) in|please (?:log|sign) in/i;
-export const BUSY_RE = /resource[_ ]exhausted|no spare capacity|\b503\b|\bservice unavailable\b|\boverloaded\b|provider busy/i;
+export const BUSY_RE = /resource[_ ]exhausted(?!.*(?:insufficient|balance|credits|funds|billing|recharge|\b402\b))|no spare capacity|\b503\b|\bservice unavailable\b|\boverloaded\b|provider busy/i;
 export const RATE_LIMIT_RE = /\brate[ _-]?limit(?:ed|ing)?\b|too many requests|\b429\b/i;
-export const QUOTA_RE = /insufficient[_ ](?:quota|credits|balance)|quota (?:exceeded|exhausted)|exceeded.{0,30}quota|credit balance.{0,30}(?:low|exhausted)|balance.{0,20}(?:low|exhausted|insufficient|depleted)|billing.{0,30}(?:limit|exhausted|suspended)|suspended.{0,40}(?:balance|billing|payment|credit|quota|unpaid)|please recharge|recharge (?:your )?(?:account|balance|credits)|out of credits|\b402\b|payment required/i;
+export const QUOTA_RE = /insufficient[_ ](?:quota|credits|balance)|insufficient.{0,20}funds|quota (?:exceeded|exhausted)|exceeded.{0,30}quota|credit balance.{0,30}(?:low|exhausted)|balance.{0,20}(?:low|exhausted|insufficient|depleted)|billing.{0,30}(?:limit|exhausted|suspended)|suspended.{0,40}(?:balance|billing|payment|credit|quota|unpaid)|please recharge|recharge (?:your )?(?:account|balance|credits)|out of credits|\b402\b|payment required/i;
 export const COMPATIBILITY_RE = /unknown (?:option|argument|flag)|unrecognized (?:option|argument|flag|subcommand)|unexpected argument|unsupported (?:option|flag)|invalid value.{0,80}(?:--model|--effort|reasoning_effort)|unknown model|does not support effort|bad flag or model/i;
 export const START_RE = /\bENOENT\b|spawn.{0,100}(?:not found|no such file)|couldn't start|could not start/i;
 export const ORPHAN_RE = /orphaned|supervisor process exited|server stopped/i;
@@ -33,6 +33,7 @@ const FAILURE_PATTERNS: ReadonlyArray<readonly [FailureKind, RegExp]> = [
   ['rateLimited', RATE_LIMIT_RE],
   ['badFlagOrModel', COMPATIBILITY_RE],
   ['couldntStart', START_RE],
+  ['noOutput', /^no output\b/i],
   ['timedOut', TIMEOUT_RE],
   ['networkError', NETWORK_RE],
   ['noOutput', NO_OUTPUT_RE],

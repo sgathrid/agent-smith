@@ -446,6 +446,10 @@ test('probeAvailability: non-ENOENT filesystem error (ENAMETOOLONG) reports fail
     process.env['AGENT_SMITH_CODEX_BIN'] = nonExec;
     const notExec = await probeAvailability([codexProvider]);
     assert.equal(notExec[0]!.status, 'not-installed');
+
+    process.env['AGENT_SMITH_CODEX_BIN'] = dir;
+    const isDir = await probeAvailability([codexProvider]);
+    assert.equal(isDir[0]!.status, 'not-installed');
   } finally {
     if (savedBin === undefined) delete process.env['AGENT_SMITH_CODEX_BIN'];
     else process.env['AGENT_SMITH_CODEX_BIN'] = savedBin;

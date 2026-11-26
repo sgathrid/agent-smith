@@ -1,9 +1,9 @@
-import {randomBytes,randomUUID,createHash}from'node:crypto';import {readFileSync,existsSync,mkdirSync,writeFileSync,createWriteStream,openSync,fsyncSync,closeSync,renameSync,unlinkSync,statSync,copyFileSync,constants as constants$1}from'node:fs';import path from'node:path';import {spawn,execFile}from'node:child_process';import {access,constants,open,readdir}from'node:fs/promises';import os from'node:os';import readline from'node:readline';const NETWORK_RE = /network issue|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|fetch failed|connection (?:reset|refused|closed|error)|temporarily unavailable/i;
+import {randomBytes,randomUUID,createHash}from'node:crypto';import {readFileSync,existsSync,mkdirSync,writeFileSync,createWriteStream,openSync,fsyncSync,closeSync,renameSync,unlinkSync,statSync,copyFileSync,constants as constants$1}from'node:fs';import path from'node:path';import {spawn,execFile}from'node:child_process';import {access,constants,stat,open,readdir}from'node:fs/promises';import os from'node:os';import readline from'node:readline';const NETWORK_RE = /network issue|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|fetch failed|connection (?:reset|refused|closed|error)|temporarily unavailable/i;
 const TIMEOUT_RE = /timed? ?out|exceeded the .*budget|\btimeout\b/i;
 const AUTH_RE = /\b(?:unauthorized|unauthenticated)\b|authentication (?:failed|required)|invalid (?:api[ _-]?key|access token)|(?:access |auth |refresh )token (?:has )?expired|not (?:logged|signed) in|please (?:log|sign) in/i;
-const BUSY_RE = /resource[_ ]exhausted|no spare capacity|\b503\b|\bservice unavailable\b|\boverloaded\b|provider busy/i;
+const BUSY_RE = /resource[_ ]exhausted(?!.*(?:insufficient|balance|credits|funds|billing|recharge|\b402\b))|no spare capacity|\b503\b|\bservice unavailable\b|\boverloaded\b|provider busy/i;
 const RATE_LIMIT_RE = /\brate[ _-]?limit(?:ed|ing)?\b|too many requests|\b429\b/i;
-const QUOTA_RE = /insufficient[_ ](?:quota|credits|balance)|quota (?:exceeded|exhausted)|exceeded.{0,30}quota|credit balance.{0,30}(?:low|exhausted)|balance.{0,20}(?:low|exhausted|insufficient|depleted)|billing.{0,30}(?:limit|exhausted|suspended)|suspended.{0,40}(?:balance|billing|payment|credit|quota|unpaid)|please recharge|recharge (?:your )?(?:account|balance|credits)|out of credits|\b402\b|payment required/i;
+const QUOTA_RE = /insufficient[_ ](?:quota|credits|balance)|insufficient.{0,20}funds|quota (?:exceeded|exhausted)|exceeded.{0,30}quota|credit balance.{0,30}(?:low|exhausted)|balance.{0,20}(?:low|exhausted|insufficient|depleted)|billing.{0,30}(?:limit|exhausted|suspended)|suspended.{0,40}(?:balance|billing|payment|credit|quota|unpaid)|please recharge|recharge (?:your )?(?:account|balance|credits)|out of credits|\b402\b|payment required/i;
 const COMPATIBILITY_RE = /unknown (?:option|argument|flag)|unrecognized (?:option|argument|flag|subcommand)|unexpected argument|unsupported (?:option|flag)|invalid value.{0,80}(?:--model|--effort|reasoning_effort)|unknown model|does not support effort|bad flag or model/i;
 const START_RE = /\bENOENT\b|spawn.{0,100}(?:not found|no such file)|couldn't start|could not start/i;
 const ORPHAN_RE = /orphaned|supervisor process exited|server stopped/i;
@@ -19,6 +19,7 @@ const FAILURE_PATTERNS = [
     ['rateLimited', RATE_LIMIT_RE],
     ['badFlagOrModel', COMPATIBILITY_RE],
     ['couldntStart', START_RE],
+    ['noOutput', /^no output\b/i],
     ['timedOut', TIMEOUT_RE],
     ['networkError', NETWORK_RE],
     ['noOutput', NO_OUTPUT_RE],
@@ -1688,7 +1689,7 @@ function recoveredErrorText(label, message, at) {
 async function probeExecutable(target) {
     try {
         await access(target, constants.X_OK);
-        return true;
+        return (await stat(target)).isFile();
     }
     catch (err) {
         const code = err.code;
@@ -2268,6 +2269,94 @@ function parseTomlTopLevel(text) {
             out[m[1]] = m[2] ?? m[3] ?? m[4] ?? '';
     }
     return out;
+}const BOOKKEEPING_TOOLS = {
+    opencode: new Set(['todowrite']),
+    kimi: new Set(['SetTodoList']),
+    claude: new Set(['TodoWrite']),
+    codex: new Set(['todo_list']),
+    agy: new Set(),
+};
+function isBookkeepingTool(provider, toolName) {
+    return BOOKKEEPING_TOOLS[provider]?.has(toolName) ?? false;
+}
+function emptyResponseVerdict(response, stderr, options = {}) {
+    if (response.trim() !== '')
+        return undefined;
+    return {
+        status: options.status ?? 'malformed',
+        error: `no output${options.detail ?? ''}${stderrClause(stderr)}`,
+    };
+}
+function unstreamedSuffix(resultText, seenBeforeWork) {
+    let rest = resultText;
+    for (const chunk of seenBeforeWork) {
+        if (chunk === '')
+            continue;
+        const trimmed = rest.trimStart();
+        if (trimmed.startsWith(chunk)) {
+            rest = trimmed.slice(chunk.length);
+        }
+    }
+    return rest.trim() === '' ? '' : rest.trimStart();
+}
+function createAnswer() {
+    let current = '';
+    let lastKey;
+    let hasMessage = false;
+    let explicitlyCleared = false;
+    const seenBeforeWork = [];
+    return {
+        text(fragment, messageKey) {
+            explicitlyCleared = false;
+            if (messageKey !== undefined && hasMessage && messageKey === lastKey) {
+                current += fragment;
+            }
+            else {
+                if (current.trim() !== '')
+                    seenBeforeWork.push(current);
+                current = fragment;
+                lastKey = messageKey;
+                hasMessage = true;
+            }
+        },
+        work() {
+            if (current.trim() !== '')
+                seenBeforeWork.push(current);
+            current = '';
+            lastKey = undefined;
+            hasMessage = false;
+            explicitlyCleared = false;
+        },
+        providerFinal(text, kind) {
+            if (text === undefined)
+                return;
+            if (text.trim() === '') {
+                current = '';
+                lastKey = undefined;
+                hasMessage = false;
+                explicitlyCleared = true;
+                return;
+            }
+            if (kind === 'authoritative') {
+                current = text;
+                lastKey = undefined;
+                hasMessage = true;
+                explicitlyCleared = false;
+                return;
+            }
+            if (!explicitlyCleared && current.trim() === '') {
+                const suffix = unstreamedSuffix(text, seenBeforeWork);
+                if (suffix !== '') {
+                    current = suffix;
+                    lastKey = undefined;
+                    hasMessage = true;
+                }
+            }
+        },
+        value() {
+            return current.trim() === '' ? '' : current;
+        },
+    };
 }function agyBinary() {
     return process.env['AGENT_SMITH_AGY_BIN'] ?? 'agy';
 }
@@ -2448,8 +2537,7 @@ function recoveredNotice(final, resultEvent) {
 }
 function createAgyTranslator(maxChars) {
     const steps = new Map();
-    const stepProse = new Map();
-    let lastProseStep;
+    const answer = createAnswer();
     const denials = [];
     let sawErrorStep = false;
     let progressedAfterError = false;
@@ -2494,18 +2582,20 @@ function createAgyTranslator(maxChars) {
             // --- agent prose / thinking --------------------------------------------
             if (stepType === 'agent_response') {
                 const delta = su.text_delta;
-                if (delta !== undefined && delta !== '') {
-                    stepProse.set(stepIndex, (stepProse.get(stepIndex) ?? '') + delta);
-                    lastProseStep = stepIndex;
-                    out.push({ kind: 'text', at, text: delta, stream: 'assistant', delta: true });
+                if (delta !== undefined) {
+                    answer.text(delta, String(stepIndex));
+                    if (delta !== '') {
+                        out.push({ kind: 'text', at, text: delta, stream: 'assistant', delta: true });
+                    }
                 }
                 return out;
             }
             // --- tool calls ---------------------------------------------------------
             if (stepType === 'tool') {
-                lastProseStep = undefined;
                 const info = su.tool_info;
                 const toolName = su.tool_name ?? info?.name ?? 'unknown';
+                if (!isBookkeepingTool('agy', toolName))
+                    answer.work();
                 const mem = steps.get(stepIndex) ?? {};
                 steps.set(stepIndex, mem);
                 if (state === 'ACTIVE') {
@@ -2558,7 +2648,7 @@ function createAgyTranslator(maxChars) {
             }
             // --- error_message: agy's own API/transport errors ----------------------
             if (stepType === 'error_message') {
-                lastProseStep = undefined;
+                answer.work();
                 sawErrorStep = true;
                 progressedAfterError = false;
                 // agy's stream carries no error text here; the final result does.
@@ -2589,10 +2679,10 @@ function createAgyTranslator(maxChars) {
     }
     return {
         onEvent,
+        answer,
         denials,
         stepsWereTools: () => [...steps.values()].some((m) => m.tool !== undefined),
         errorIsStale,
-        finalText: () => (lastProseStep === undefined ? undefined : stepProse.get(lastProseStep)),
     };
 }
 // ---------------------------------------------------------------------------
@@ -2602,10 +2692,8 @@ function buildResult$4(args) {
     const { jobId, resultEvent, exit, startedAtMs, stateDir, denials, sawAnyToolCall } = args;
     const { errorIsStale } = args;
     const durationMs = Date.now() - startedAtMs;
-    const explicitEmptyResult = resultEvent?.response !== undefined && resultEvent.response.trim() === '';
-    const finalText = args.finalText !== undefined && args.finalText.trim() !== '' ? args.finalText : undefined;
-    const resultResponse = resultEvent?.response !== undefined && resultEvent.response.trim() !== '' ? resultEvent.response : undefined;
-    const response = explicitEmptyResult ? '' : (finalText ?? resultResponse ?? '');
+    args.answer.providerFinal(resultEvent?.response, 'includes-streamed');
+    const response = args.answer.value();
     const reportedStatus = resultEvent?.status;
     const usage = toTokenUsage$4(resultEvent?.usage);
     // Normalize agy's denied_actions into our shape. Present-but-empty is the
@@ -2664,12 +2752,14 @@ function buildResult$4(args) {
             error = resultEvent.error ?? 'worker error';
         }
     }
-    else if (response.trim() === '' && sawAnyToolCall) {
-        status = 'denied';
-        error = `no output${stderrClause(exit.stderr)}`;
-    }
     else {
-        status = 'success';
+        const empty = emptyResponseVerdict(response, exit.stderr, { status: sawAnyToolCall ? 'denied' : 'malformed' });
+        if (empty !== undefined) {
+            ({ status, error } = empty);
+        }
+        else {
+            status = 'success';
+        }
     }
     // Exit code is corroboration, not the decision. A non-zero exit with a
     // SUCCESS-looking result event still has to be a failure.
@@ -2780,7 +2870,7 @@ const agyProvider = {
                 denials: translator.denials,
                 sawAnyToolCall: translator.stepsWereTools(),
                 errorIsStale: translator.errorIsStale(),
-                finalText: translator.finalText(),
+                answer: translator.answer,
             }),
             afterResult(final) {
                 const recovered = recoveredNotice(final, resultEvent);
@@ -2986,8 +3076,9 @@ function isPermissionDenial(text) {
         (hay.includes('denied') || hay.includes('not allowed') || hay.includes('requested permissions')));
 }
 function createClaudeTranslator(maxChars, input) {
+    const answer = createAnswer();
     const tx = {
-        finalText: '',
+        answer,
         sawResult: false,
         sawErrorResult: false,
         deniedTools: [],
@@ -2995,7 +3086,10 @@ function createClaudeTranslator(maxChars, input) {
     };
     const toolStep = new Map();
     const deniedIds = new Set();
+    const bookkeepingTools = new Set();
+    const endedTools = new Set();
     let step = 0;
+    let fallbackKeySeq = 0;
     const recordDenial = (id) => {
         if (deniedIds.has(id))
             return false;
@@ -3072,7 +3166,8 @@ function createClaudeTranslator(maxChars, input) {
                 tx.usage = usage;
                 out.push({ kind: 'usage', at, usage });
             }
-            let resetInMessage = false;
+            const envelopeParent = str(raw, 'parent_tool_use_id');
+            const msgKey = str(message, 'id') ?? `anon-${++fallbackKeySeq}`;
             for (const block of content) {
                 if (block === null || typeof block !== 'object')
                     continue;
@@ -3080,7 +3175,7 @@ function createClaudeTranslator(maxChars, input) {
                 const bType = str(b, 'type');
                 if (bType === 'text') {
                     const text = str(b, 'text');
-                    const parent = str(b, 'parent_tool_use_id');
+                    const parent = str(b, 'parent_tool_use_id') ?? envelopeParent;
                     if (parent !== undefined) {
                         if (text !== undefined && text !== '') {
                             out.push({
@@ -3091,13 +3186,9 @@ function createClaudeTranslator(maxChars, input) {
                             });
                         }
                     }
-                    else {
-                        if (!resetInMessage) {
-                            tx.finalText = '';
-                            resetInMessage = true;
-                        }
-                        if (text !== undefined && text !== '') {
-                            tx.finalText += text;
+                    else if (text !== undefined) {
+                        answer.text(text, msgKey);
+                        if (text !== '') {
                             out.push({ kind: 'text', at, text, stream: 'assistant' });
                         }
                     }
@@ -3111,12 +3202,15 @@ function createClaudeTranslator(maxChars, input) {
                     continue;
                 }
                 if (bType === 'tool_use') {
-                    if (str(b, 'parent_tool_use_id') === undefined && raw['parent_tool_use_id'] == null) {
-                        tx.finalText = '';
-                        resetInMessage = true;
-                    }
                     const toolUseId = str(b, 'id') ?? `toolu-${step}`;
                     const toolName = str(b, 'name') ?? 'unknown';
+                    const isSubagent = str(b, 'parent_tool_use_id') !== undefined || envelopeParent !== undefined;
+                    if (isBookkeepingTool('claude', toolName)) {
+                        bookkeepingTools.add(toolUseId);
+                    }
+                    else if (!isSubagent) {
+                        answer.work();
+                    }
                     const idx = step++;
                     toolStep.set(toolUseId, idx);
                     const input = preview(b['input'], maxChars);
@@ -3149,9 +3243,13 @@ function createClaudeTranslator(maxChars, input) {
                 const b = block;
                 if (str(b, 'type') !== 'tool_result')
                     continue;
-                if (parentId === undefined || parentId === null)
-                    tx.finalText = '';
                 const toolUseId = str(b, 'tool_use_id') ?? '';
+                const isSubagent = (parentId !== undefined && parentId !== null) || b['parent_tool_use_id'] != null;
+                const isReplay = toolUseId !== '' && endedTools.has(toolUseId);
+                if (!isSubagent && !isReplay && !bookkeepingTools.has(toolUseId))
+                    answer.work();
+                if (toolUseId !== '')
+                    endedTools.add(toolUseId);
                 const idx = toolStep.get(toolUseId) ?? step++;
                 if (toolUseId !== '')
                     toolStep.set(toolUseId, idx);
@@ -3217,9 +3315,7 @@ function createClaudeTranslator(maxChars, input) {
             if (typeof turns === 'number')
                 tx.numTurns = turns;
             const finalAnswer = str(raw, 'result');
-            if (finalAnswer !== undefined) {
-                tx.finalText = finalAnswer.trim() === '' ? '' : finalAnswer;
-            }
+            answer.providerFinal(finalAnswer, tx.deniedTools.length > 0 ? 'includes-streamed' : 'authoritative');
             return out;
         }
         if (type === 'error') {
@@ -3242,11 +3338,12 @@ function buildResult$3(args) {
     const durationMs = Date.now() - startedAtMs;
     let status;
     let error;
+    const response = tx.answer.value();
     const early = earlyVerdict(exit, durationMs);
     if (early !== undefined) {
         ({ status, error } = early);
     }
-    else if (tx.deniedTools.length > 0 && !(tx.sawResult && !tx.sawErrorResult && exit.code === 0 && tx.finalText.trim() !== '')) {
+    else if (tx.deniedTools.length > 0 && !(tx.sawResult && !tx.sawErrorResult && exit.code === 0 && response.trim() !== '')) {
         status = 'denied';
         error = deniedText(tx.deniedTools, exit.stderr);
     }
@@ -3262,14 +3359,16 @@ function buildResult$3(args) {
         status = 'error';
         error = `exited ${exit.code}${stderrClause(exit.stderr)}`;
     }
-    else if (tx.finalText.trim() === '') {
-        status = 'malformed';
-        error = `no output${stderrClause(exit.stderr)}`;
-    }
     else {
-        status = 'success';
+        const empty = emptyResponseVerdict(response, exit.stderr);
+        if (empty !== undefined) {
+            ({ status, error } = empty);
+        }
+        else {
+            status = 'success';
+        }
     }
-    const out = jobResult({ provider: 'claude', jobId, status, error, exit, response: tx.finalText, startedAtMs, durationMs, stateDir });
+    const out = jobResult({ provider: 'claude', jobId, status, error, exit, response, startedAtMs, durationMs, stateDir });
     if (tx.deniedTools.length > 0) {
         out.deniedActions = tx.deniedTools.map((id) => ({ action: 'tool', displayName: id, nonfatal: true }));
     }
@@ -3675,15 +3774,17 @@ function outputPreviewFor(itemType, item, maxChars) {
  */
 function createCodexTranslator(maxChars) {
     let step = 0;
+    const answer = createAnswer();
     const state = {
         sawTurnCompleted: false,
-        finalText: '',
+        answer,
         onEvent: () => [],
     };
     /** item.id -> stepIndex, so item.started/completed pair up. */
     const itemStep = new Map();
     /** item.id -> tool label, for the DONE event (the START may be absent). */
     const itemTool = new Map();
+    const completedToolIds = new Set();
     state.onEvent = (raw) => {
         const out = [];
         const type = str(raw, 'type');
@@ -3731,11 +3832,8 @@ function createCodexTranslator(maxChars) {
             if (itemType === 'agent_message') {
                 const text = str(item, 'text');
                 if (text !== undefined) {
-                    if (text === '') {
-                        state.finalText = '';
-                    }
-                    else {
-                        state.finalText = text;
+                    answer.text(text);
+                    if (text !== '') {
                         out.push({ kind: 'text', at, text, stream: 'assistant' });
                     }
                 }
@@ -3753,7 +3851,11 @@ function createCodexTranslator(maxChars) {
             }
             if (NON_TOOL_ITEM_TYPES.has(itemType))
                 return out;
-            state.finalText = '';
+            const isReplay = type === 'item.completed' && completedToolIds.has(itemId);
+            if (!isReplay && !isBookkeepingTool('codex', itemType))
+                answer.work();
+            if (type === 'item.completed')
+                completedToolIds.add(itemId);
             // ---- tool-ish items ----------------------------------------------------
             const tool = itemTool.get(itemId) ?? toolLabelFor(itemType, item);
             if (!itemTool.has(itemId))
@@ -3872,6 +3974,7 @@ function buildResult$2(args) {
     const durationMs = Date.now() - startedAtMs;
     let status;
     let error;
+    const response = tx.answer.value();
     const early = earlyVerdict(exit, durationMs);
     if (early !== undefined) {
         ({ status, error } = early);
@@ -3889,14 +3992,16 @@ function buildResult$2(args) {
         status = 'error';
         error = tx.error ?? `exited ${exit.code}${stderrClause(exit.stderr)}`;
     }
-    else if (tx.finalText.trim() === '') {
-        status = 'malformed';
-        error = `no output${stderrClause(exit.stderr)}`;
-    }
     else {
-        status = 'success';
+        const empty = emptyResponseVerdict(response, exit.stderr);
+        if (empty !== undefined) {
+            ({ status, error } = empty);
+        }
+        else {
+            status = 'success';
+        }
     }
-    const out = jobResult({ provider: 'codex', jobId, status, error, exit, response: tx.finalText, startedAtMs, durationMs, stateDir });
+    const out = jobResult({ provider: 'codex', jobId, status, error, exit, response, startedAtMs, durationMs, stateDir });
     if (tx.usage !== undefined)
         out.usage = tx.usage;
     if (tx.threadId !== undefined)
@@ -4139,8 +4244,12 @@ function contentText(value) {
     }
 }
 function createKimiTranslator(maxChars) {
+    const answer = createAnswer();
     const tx = {
-        finalText: '',
+        answer,
+        get finalText() {
+            return answer.value();
+        },
         sawError: false,
         recovery: new ErrorRecovery(),
         completedTools: 0,
@@ -4225,16 +4334,26 @@ function createKimiTranslator(maxChars) {
         }
         if (role === 'assistant') {
             const content = str(raw, 'content');
+            const calls = raw['tool_calls'];
+            const hasAnyCall = Array.isArray(calls) && calls.length > 0;
+            const hasRealCall = Array.isArray(calls) && calls.some((rawCall) => {
+                if (rawCall === null || typeof rawCall !== 'object' || Array.isArray(rawCall))
+                    return false;
+                const call = rawCall;
+                const fn = obj(call, 'function');
+                const name = str(fn, 'name') ?? str(call, 'name') ?? 'tool';
+                return !isBookkeepingTool('kimi', name);
+            });
             if (content !== undefined) {
                 if (content === '') {
-                    tx.finalText = '';
+                    if (!hasAnyCall || hasRealCall)
+                        answer.text('');
                 }
                 else {
-                    tx.finalText = content;
+                    answer.text(content);
                     out.push({ kind: 'text', at, text: content, stream: 'assistant' });
                 }
             }
-            const calls = raw['tool_calls'];
             if (calls !== undefined) {
                 if (!Array.isArray(calls)) {
                     tx.unrecognised.add('assistant:tool_calls');
@@ -4247,8 +4366,8 @@ function createKimiTranslator(maxChars) {
                     });
                 }
                 else {
-                    if (calls.length > 0)
-                        tx.finalText = '';
+                    if (hasRealCall)
+                        answer.work();
                     for (const rawCall of calls) {
                         if (rawCall === null || typeof rawCall !== 'object' || Array.isArray(rawCall))
                             continue;
@@ -4282,7 +4401,6 @@ function createKimiTranslator(maxChars) {
             return out;
         }
         if (role === 'tool') {
-            tx.finalText = '';
             const id = str(raw, 'tool_call_id') ?? str(raw, 'id') ?? `tool-${step}`;
             if (ended.has(id)) {
                 out.push({
@@ -4294,6 +4412,8 @@ function createKimiTranslator(maxChars) {
                 });
                 return out;
             }
+            if (!isBookkeepingTool('kimi', toolNames.get(id) ?? ''))
+                answer.work();
             const content = contentText(raw['content']);
             const output = truncate(content, maxChars);
             const status = toolOutputIsError(content) ? 'error' : 'done';
@@ -4345,7 +4465,8 @@ function buildResult$1(args) {
         : '';
     let status;
     let error;
-    const recovered = tx.recovery.recovered(tx.finalText, exit.code);
+    const response = tx.answer.value();
+    const recovered = tx.recovery.recovered(response, exit.code);
     const early = earlyVerdict(exit, durationMs);
     if (early !== undefined) {
         ({ status, error } = early);
@@ -4360,15 +4481,17 @@ function buildResult$1(args) {
             ? `${noResultText({ code: exit.code, signal: exit.signal, stderr: '' })}${unrecognised}${stderrClause(exit.stderr)}`
             : `exited ${exit.code}${unrecognised}${stderrClause(exit.stderr)}`;
     }
-    else if (tx.finalText.trim() === '') {
-        const tools = tx.completedTools > 0 ? ` · ${tx.completedTools} tool step(s) completed` : '';
-        status = 'malformed';
-        error = `no output${unrecognised}${tools}${stderrClause(exit.stderr)}`;
-    }
     else {
-        status = 'success';
+        const tools = tx.completedTools > 0 ? ` · ${tx.completedTools} tool step(s) completed` : '';
+        const empty = emptyResponseVerdict(response, exit.stderr, { detail: `${unrecognised}${tools}` });
+        if (empty !== undefined) {
+            ({ status, error } = empty);
+        }
+        else {
+            status = 'success';
+        }
     }
-    const out = jobResult({ provider: 'kimi', jobId, status, error, exit, response: tx.finalText, startedAtMs, durationMs, stateDir });
+    const out = jobResult({ provider: 'kimi', jobId, status, error, exit, response, startedAtMs, durationMs, stateDir });
     if (tx.usage !== undefined)
         out.usage = tx.usage;
     const raw = {};
@@ -4665,6 +4788,22 @@ function deepString(o, keys) {
     }
     return undefined;
 }
+function hasEmptyText(o, keys) {
+    for (const k of keys) {
+        if (str(o, k) === '')
+            return true;
+    }
+    for (const nest of ['part', 'message', 'properties', 'data', 'info']) {
+        const inner = obj(o, nest);
+        if (inner === undefined)
+            continue;
+        for (const k of keys) {
+            if (str(inner, k) === '')
+                return true;
+        }
+    }
+    return false;
+}
 /** Locate a `tokens`/`usage` object anywhere one or two levels down. */
 function findUsage(o) {
     const direct = obj(o, 'usage') ?? obj(o, 'tokens');
@@ -4769,8 +4908,12 @@ const TRANSPORT_ERROR_TYPE = 'provider.transport';
  * (observed live) and totally unknown types (spec'd above).
  */
 function createOpencodeTranslator(maxChars) {
+    const answer = createAnswer();
     const tx = {
-        finalText: '',
+        answer,
+        get finalText() {
+            return answer.value();
+        },
         sawTerminal: false,
         sawError: false,
         toolErrors: 0,
@@ -4780,7 +4923,10 @@ function createOpencodeTranslator(maxChars) {
         onEvent: () => [],
     };
     let step = 0;
+    let stepSeq = 0;
+    let stepKey = 'step-0';
     const partStep = new Map();
+    const endedParts = new Set();
     const translate = (raw) => {
         const out = [];
         const at = nowIso();
@@ -4798,7 +4944,7 @@ function createOpencodeTranslator(maxChars) {
             const e = obj(raw, 'error');
             const data = obj(e ?? {}, 'data');
             const message = str(e, 'message') ?? str(data, 'message') ?? str(raw, 'message') ?? 'opencode error';
-            const statusCode = data?.['statusCode'];
+            const statusCode = data?.['statusCode'] ?? e?.['status'] ?? e?.['statusCode'];
             tx.error = typeof statusCode === 'number' ? `HTTP ${statusCode}: ${message}` : message;
             const errorType = str(e, 'type');
             // Quota / no-route failures are the two I actually hit. They are
@@ -4868,9 +5014,19 @@ function createOpencodeTranslator(maxChars) {
             deepString(raw, ['callID', 'callId', 'id', 'partID', 'partId']) ??
             `anon-${step}`;
         if (toolName !== undefined && (stateWord !== '' || isToolType)) {
-            tx.finalText = '';
             const isDone = DONE_WORDS.has(stateWord) || type.endsWith('.completed') || type.endsWith('.done');
             const isErr = ERROR_WORDS.has(stateWord) || type.endsWith('.error');
+            const isReplay = endedParts.has(partId);
+            if (!isReplay) {
+                if (isBookkeepingTool('opencode', toolName)) {
+                    stepKey = `step-${++stepSeq}`;
+                }
+                else {
+                    answer.work();
+                }
+            }
+            if (isDone || isErr)
+                endedParts.add(partId);
             const errorTexts = [
                 str(partState, 'error'),
                 str(obj(partState, 'error'), 'message'),
@@ -4953,24 +5109,21 @@ function createOpencodeTranslator(maxChars) {
         const text = deepString(raw, ['text', 'content', 'delta', 'textDelta']);
         const isThinking = type.includes('thinking') || type.includes('reasoning');
         if (text !== undefined && text !== '') {
-            if (!isThinking) {
-                if (tx.finalText !== '')
-                    tx.finalText += '\n';
-                tx.finalText += text;
-            }
+            if (!isThinking)
+                answer.text(text, stepKey);
             out.push({ kind: 'text', at, text, stream: isThinking ? 'thinking' : 'assistant' });
             // A text event is also our best evidence the run is producing output, so
             // it doubles as a terminal marker candidate below.
             return out;
         }
-        if (text === '' && !isThinking && (type === 'text' || partType === 'text')) {
-            tx.finalText = '';
+        if (!isThinking && (type === 'text' || partType === 'text') && hasEmptyText(raw, ['text', 'content', 'delta', 'textDelta'])) {
+            answer.text('');
             return out;
         }
         // ---- step boundaries ----------------------------------------------------
         if (isStepStart || isStepFinish) {
             if (isStepStart)
-                tx.finalText = '';
+                stepKey = `step-${++stepSeq}`;
             // Verified in the installed OpenCode CLI: session.step.ended emits
             // step_finish with part.reason = data.finish. Tool-call/length finishes
             // end only a step; "stop" confirms the assistant finished normally.
@@ -5057,7 +5210,8 @@ function buildResult(args) {
     const toolErrors = tx.toolErrors > 0 ? ` · ${tx.toolErrors} tool error(s)` : '';
     // An error the worker got past: more work and a final report followed it. A
     // signal kill is no evidence of completion, so it needs a real exit code.
-    const recovered = tx.recovery.recovered(tx.finalText, exit.code);
+    const response = tx.answer.value();
+    const recovered = tx.recovery.recovered(response, exit.code);
     const early = earlyVerdict(exit, durationMs);
     if (early !== undefined) {
         ({ status, error } = early);
@@ -5079,20 +5233,16 @@ function buildResult(args) {
         status = 'error';
         error = `exited ${exit.code}${unrecognised}${toolErrors}${stderrClause(exit.stderr)}`;
     }
-    else if (tx.finalText.trim() === '') {
-        // Exited 0 with no text and no error event. Do not call that a success.
-        // Be honest about why: with an unverified parser this is the shape most
-        // likely to mean "we did not understand the output", not "the model said
-        // nothing", and the two demand different fixes.
-        // Most likely an event-shape gap in the adapter, not an empty model reply:
-        // check events.jsonl and extend the parser.
-        status = 'malformed';
-        error = `no output${unrecognised}${toolErrors}${stderrClause(exit.stderr)}`;
-    }
     else {
-        status = 'success';
+        const empty = emptyResponseVerdict(response, exit.stderr, { detail: `${unrecognised}${toolErrors}` });
+        if (empty !== undefined) {
+            ({ status, error } = empty);
+        }
+        else {
+            status = 'success';
+        }
     }
-    const out = jobResult({ provider: 'opencode', jobId, status, error, exit, response: tx.finalText, startedAtMs, durationMs, stateDir });
+    const out = jobResult({ provider: 'opencode', jobId, status, error, exit, response, startedAtMs, durationMs, stateDir });
     if (tx.usage !== undefined)
         out.usage = tx.usage;
     if (tx.unrecognised.size > 0)
@@ -5235,8 +5385,6 @@ function effectiveDefaultUnrestricted(provider) {
 function effectiveUnrestricted(provider, requested) {
     const def = effectiveDefaultUnrestricted(provider);
     if (def === 'always')
-        return true;
-    if (provider.name === 'codex' && process.env['AGENT_SMITH_CODEX_SANDBOX'] === 'danger-full-access')
         return true;
     return requested ?? def;
 }
@@ -8352,4 +8500,4 @@ function asUsage(v) {
 /** Normalize a raw agent-smith job snapshot. */
 function normalize(raw) {
     return smithNormalizer(raw);
-}export{markAcceptancePending as $,AgentSmithReader as A,SCHEMA_VERSION as B,validOwnerPid as C,DEFAULT_TIMEOUT_MS as D,reportFor as E,FILES as F,cwdFacts as G,normalizeDenials as H,deriveOrphan as I,deriveStatus as J,summaryHead as K,failureFields as L,MODES as M,writeAcceptance as N,createMarker as O,PROVIDERS as P,jobsDir as Q,REASONS as R,STAGE_PROMPTS as S,parseWorkerIndex as T,normalizeContinuationKind as U,fileSig as V,WORKERS_DIR as W,JobWriter as X,effectiveUnrestricted as Y,newJobId$1 as Z,newWorkerId as _,MODE_PRESETS as a,humanDuration as a0,pipeEvents as a1,checksAbortRequested as a2,verdictBlock as a3,runAcceptance as a4,senderOf as a5,taskTitle as a6,markAcceptanceSuperseded as a7,pickHead as a8,compareTurnPriority as a9,computeStaleReads as aa,SMITH_PAYLOAD as ab,isForgeStatus as ac,noticeReason as ad,readJsonSafe as ae,pipelineRecordPath as af,workerIndexPath as ag,checksReason as ah,toolLabel as ai,inheritContinuedProviders as b,readPipeline as c,jobFile as d,readAcceptance as e,effectiveDefaultUnrestricted as f,findProvider as g,isWorkerIdle as h,isTerminalStatus as i,jobDir as j,isMode as k,cancelPipeline as l,missingPipelineError as m,isTerminalForgeStatus as n,readManifest as o,providerNames as p,ownerAlive as q,reasonFromText as r,startPipeline as s,getProvider as t,errMessage as u,validateSpec as v,probeAvailability as w,writeJsonAtomic as x,normalize as y,writeAtomic as z};
+}export{markAcceptancePending as $,AgentSmithReader as A,SCHEMA_VERSION as B,validOwnerPid as C,DEFAULT_TIMEOUT_MS as D,reportFor as E,FILES as F,cwdFacts as G,normalizeDenials as H,deriveOrphan as I,deriveStatus as J,summaryHead as K,failureFields as L,MODES as M,writeAcceptance as N,createMarker as O,PROVIDERS as P,jobsDir as Q,REASONS as R,STAGE_PROMPTS as S,parseWorkerIndex as T,normalizeContinuationKind as U,fileSig as V,WORKERS_DIR as W,JobWriter as X,effectiveUnrestricted as Y,newJobId$1 as Z,newWorkerId as _,MODE_PRESETS as a,humanDuration as a0,pipeEvents as a1,checksAbortRequested as a2,verdictBlock as a3,runAcceptance as a4,senderOf as a5,taskTitle as a6,markAcceptanceSuperseded as a7,pickHead as a8,compareTurnPriority as a9,computeStaleReads as aa,SMITH_PAYLOAD as ab,isForgeStatus as ac,noticeReason as ad,readJsonSafe as ae,pipelineRecordPath as af,workerIndexPath as ag,checksReason as ah,toolLabel as ai,inheritContinuedProviders as b,readPipeline as c,jobFile as d,readAcceptance as e,isWorkerIdle as f,findProvider as g,effectiveDefaultUnrestricted as h,isTerminalStatus as i,jobDir as j,isMode as k,cancelPipeline as l,missingPipelineError as m,isTerminalForgeStatus as n,readManifest as o,providerNames as p,ownerAlive as q,reasonFromText as r,startPipeline as s,getProvider as t,errMessage as u,validateSpec as v,probeAvailability as w,writeJsonAtomic as x,normalize as y,writeAtomic as z};

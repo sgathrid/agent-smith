@@ -18,6 +18,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildResult, createAgyTranslator, recoveredNotice } from './agy.ts';
+import { createAnswer } from './answer.ts';
 import { JobWriter } from '../forge/writer.ts';
 
 const CONV_ID = 'cb4b43aa-dc46-47e7-98b3-3ebcf6c8219c';
@@ -265,7 +266,7 @@ describe('agy stale and recovered error handling', () => {
         denials: tx.denials,
         sawAnyToolCall: tx.stepsWereTools(),
         errorIsStale: tx.errorIsStale(),
-        finalText: tx.finalText(),
+        answer: tx.answer,
       });
 
       assert.equal(res.status, 'success');
@@ -329,6 +330,7 @@ describe('agy stale and recovered error handling', () => {
         denials: tx.denials,
         sawAnyToolCall: tx.stepsWereTools(),
         errorIsStale: tx.errorIsStale(),
+        answer: tx.answer,
       });
 
       assert.equal(res.status, 'success');
@@ -391,6 +393,7 @@ describe('agy stale and recovered error handling', () => {
       denials: tx.denials,
       sawAnyToolCall: tx.stepsWereTools(),
       errorIsStale: tx.errorIsStale(),
+      answer: tx.answer,
     });
 
     assert.equal(res.status, 'error');
@@ -406,7 +409,7 @@ describe('agy stale and recovered error handling', () => {
     const resultEvent = { status: 'ERROR', response: 'partial notes', error: 'API error: RESOURCE_EXHAUSTED (code 429)' };
     const res = buildResult({
       jobId: 'unrecovered', resultEvent: resultEvent as never, exit: { code: 0, signal: null, killReason: undefined, stderr: '' },
-      startedAtMs: Date.now() - 1, stateDir: '/tmp', denials: tx.denials, sawAnyToolCall: false, errorIsStale: tx.errorIsStale(),
+      startedAtMs: Date.now() - 1, stateDir: '/tmp', denials: tx.denials, sawAnyToolCall: false, errorIsStale: tx.errorIsStale(), answer: tx.answer,
     });
     assert.equal(res.status, 'error');
     assert.equal(recoveredNotice(res, resultEvent as never), undefined, 'no warning when the run failed');
@@ -417,7 +420,7 @@ describe('agy stale and recovered error handling', () => {
     for (const exit of [{ code: 1, signal: null, killReason: undefined, stderr: '' }, { code: null, signal: 'SIGTERM', killReason: 'cancelled', stderr: '' }]) {
       const res = buildResult({
         jobId: 'x', resultEvent: resultEvent as never, exit: exit as never, startedAtMs: Date.now() - 1, stateDir: '/tmp',
-        denials: [], sawAnyToolCall: false, errorIsStale: true,
+        denials: [], sawAnyToolCall: false, errorIsStale: true, answer: createAnswer(),
       });
       assert.notEqual(res.status, 'success');
       assert.equal(recoveredNotice(res, resultEvent as never), undefined);
@@ -444,7 +447,7 @@ describe('agy final message extraction', () => {
       denials: tx.denials,
       sawAnyToolCall: tx.stepsWereTools(),
       errorIsStale: tx.errorIsStale(),
-      finalText: tx.finalText(),
+      answer: tx.answer,
     });
 
     assert.equal(res.status, 'success');
@@ -465,7 +468,7 @@ describe('agy final message extraction', () => {
       denials: tx.denials,
       sawAnyToolCall: tx.stepsWereTools(),
       errorIsStale: tx.errorIsStale(),
-      finalText: tx.finalText(),
+      answer: tx.answer,
     });
 
     assert.equal(res.status, 'success');
@@ -487,7 +490,7 @@ describe('agy final message extraction', () => {
       denials: tx.denials,
       sawAnyToolCall: tx.stepsWereTools(),
       errorIsStale: tx.errorIsStale(),
-      finalText: tx.finalText(),
+      answer: tx.answer,
     });
 
     assert.equal(res.status, 'denied');
@@ -509,7 +512,7 @@ describe('agy final message extraction', () => {
       denials: tx.denials,
       sawAnyToolCall: tx.stepsWereTools(),
       errorIsStale: tx.errorIsStale(),
-      finalText: tx.finalText(),
+      answer: tx.answer,
     });
 
     assert.notEqual(res.status, 'success');
@@ -529,7 +532,7 @@ describe('agy final message extraction', () => {
       denials: tx.denials,
       sawAnyToolCall: tx.stepsWereTools(),
       errorIsStale: tx.errorIsStale(),
-      finalText: tx.finalText(),
+      answer: tx.answer,
     });
 
     assert.equal(res.status, 'error');

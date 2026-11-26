@@ -113,6 +113,7 @@ import type {
   WorkerHandle,
 } from './types.ts';
 import type { ListModelsOptions, ModelCatalog, ModelInfo, SandboxInfo } from './types.ts';
+import { createAnswer, emptyResponseVerdict, isBookkeepingTool, type Answer } from './answer.ts';
 import { DEFAULT_DISCOVERY_TIMEOUT_MS, configDir, errMessage, parseTomlTopLevel, readTextSafe, runCapture } from './discovery.ts';
 import type { RunFn } from './discovery.ts';
 import path from 'node:path';
@@ -368,7 +369,7 @@ interface CodexTranslator {
   threadId?: string;
   sawTurnCompleted: boolean;
   error?: string;
-  finalText: string;
+  answer: Answer;
   usage?: TokenUsage;
 }
 
@@ -381,15 +382,17 @@ interface CodexTranslator {
  */
 export function createCodexTranslator(maxChars: number): CodexTranslator {
   let step = 0;
+  const answer = createAnswer();
   const state: CodexTranslator = {
     sawTurnCompleted: false,
-    finalText: '',
+    answer,
     onEvent: () => [],
   };
   /** item.id -> stepIndex, so item.started/completed pair up. */
   const itemStep = new Map<string, number>();
   /** item.id -> tool label, for the DONE event (the START may be absent). */
   const itemTool = new Map<string, string>();
+  const completedToolIds = new Set<string>();
 
   state.onEvent = (raw: Record<string, unknown>): ProviderEvent[] => {
     const out: ProviderEvent[] = [];
@@ -439,10 +442,8 @@ export function createCodexTranslator(maxChars: number): CodexTranslator {
       if (itemType === 'agent_message') {
         const text = str(item, 'text');
         if (text !== undefined) {
-          if (text === '') {
-            state.finalText = '';
-          } else {
-            state.finalText = text;
+          answer.text(text);
+          if (text !== '') {
             out.push({ kind: 'text', at, text, stream: 'assistant' });
           }
         }
@@ -462,7 +463,9 @@ export function createCodexTranslator(maxChars: number): CodexTranslator {
 
       if (NON_TOOL_ITEM_TYPES.has(itemType)) return out;
 
-      state.finalText = '';
+      const isReplay = type === 'item.completed' && completedToolIds.has(itemId);
+      if (!isReplay && !isBookkeepingTool('codex', itemType)) answer.work();
+      if (type === 'item.completed') completedToolIds.add(itemId);
       // ---- tool-ish items ----------------------------------------------------
       const tool = itemTool.get(itemId) ?? toolLabelFor(itemType, item);
       if (!itemTool.has(itemId)) itemTool.set(itemId, tool);
@@ -593,6 +596,7 @@ export function buildResult(args: {
   let status: JobStatus;
   let error: string | undefined;
 
+  const response = tx.answer.value();
   const early = earlyVerdict(exit, durationMs);
   if (early !== undefined) {
     ({ status, error } = early);
@@ -607,14 +611,16 @@ export function buildResult(args: {
     // turn.completed arrived but the process still failed. Corroboration wins.
     status = 'error';
     error = tx.error ?? `exited ${exit.code}${stderrClause(exit.stderr)}`;
-  } else if (tx.finalText.trim() === '') {
-    status = 'malformed';
-    error = `no output${stderrClause(exit.stderr)}`;
   } else {
-    status = 'success';
+    const empty = emptyResponseVerdict(response, exit.stderr);
+    if (empty !== undefined) {
+      ({ status, error } = empty);
+    } else {
+      status = 'success';
+    }
   }
 
-  const out = jobResult({ provider: 'codex', jobId, status, error, exit, response: tx.finalText, startedAtMs, durationMs, stateDir });
+  const out = jobResult({ provider: 'codex', jobId, status, error, exit, response, startedAtMs, durationMs, stateDir });
   if (tx.usage !== undefined) out.usage = tx.usage;
   if (tx.threadId !== undefined) out.raw = { threadId: tx.threadId };
   return out;

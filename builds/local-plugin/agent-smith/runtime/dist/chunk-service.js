@@ -1,4 +1,4 @@
-import {o as readManifest,d as jobFile,F as FILES,q as ownerAlive,c as readPipeline,l as cancelPipeline,g as findProvider,p as providerNames,t as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,u as errMessage,P as PROVIDERS,w as probeAvailability,x as writeJsonAtomic,A as AgentSmithReader,y as normalize,z as writeAtomic,j as jobDir,B as SCHEMA_VERSION,C as validOwnerPid,n as isTerminalForgeStatus,E as reportFor,G as cwdFacts,H as normalizeDenials,I as deriveOrphan,J as deriveStatus,K as summaryHead,L as failureFields,R as REASONS,e as readAcceptance,N as writeAcceptance,O as createMarker,W as WORKERS_DIR,Q as jobsDir,T as parseWorkerIndex,U as normalizeContinuationKind,V as fileSig,X as JobWriter,i as isTerminalStatus,k as isMode,Y as effectiveUnrestricted,Z as newJobId,_ as newWorkerId,$ as markAcceptancePending,a0 as humanDuration,a1 as pipeEvents,a2 as checksAbortRequested,a3 as verdictBlock,a4 as runAcceptance,a5 as senderOf,a6 as taskTitle,a7 as markAcceptanceSuperseded,a8 as pickHead,h as isWorkerIdle,a9 as compareTurnPriority,aa as computeStaleReads,ab as SMITH_PAYLOAD,ac as isForgeStatus}from'./chunk-normalize.js';import {existsSync,readFileSync,mkdirSync,appendFileSync,openSync,writeSync,closeSync,unlinkSync,statSync,renameSync,linkSync,readdirSync,realpathSync,lstatSync,copyFileSync}from'node:fs';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import path from'node:path';import {createHash}from'node:crypto';const LAUNCH_ACK_MS = 15_000;
+import {o as readManifest,d as jobFile,F as FILES,q as ownerAlive,c as readPipeline,l as cancelPipeline,g as findProvider,p as providerNames,t as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,u as errMessage,P as PROVIDERS,w as probeAvailability,x as writeJsonAtomic,A as AgentSmithReader,y as normalize,z as writeAtomic,j as jobDir,B as SCHEMA_VERSION,C as validOwnerPid,n as isTerminalForgeStatus,E as reportFor,G as cwdFacts,H as normalizeDenials,I as deriveOrphan,J as deriveStatus,K as summaryHead,L as failureFields,R as REASONS,e as readAcceptance,N as writeAcceptance,O as createMarker,W as WORKERS_DIR,Q as jobsDir,T as parseWorkerIndex,U as normalizeContinuationKind,V as fileSig,X as JobWriter,i as isTerminalStatus,k as isMode,Y as effectiveUnrestricted,Z as newJobId,_ as newWorkerId,$ as markAcceptancePending,a0 as humanDuration,a1 as pipeEvents,a2 as checksAbortRequested,a3 as verdictBlock,a4 as runAcceptance,a5 as senderOf,a6 as taskTitle,a7 as markAcceptanceSuperseded,a8 as pickHead,f as isWorkerIdle,a9 as compareTurnPriority,aa as computeStaleReads,ab as SMITH_PAYLOAD,ac as isForgeStatus}from'./chunk-normalize.js';import {existsSync,readFileSync,mkdirSync,appendFileSync,openSync,writeSync,closeSync,unlinkSync,statSync,renameSync,linkSync,readdirSync,realpathSync,lstatSync,copyFileSync}from'node:fs';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import path from'node:path';import {createHash}from'node:crypto';const LAUNCH_ACK_MS = 15_000;
 async function launch(url, payload, onPrepared) {
     const child = fork(fileURLToPath(url), [], {
         detached: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
@@ -2620,8 +2620,9 @@ class ForgeService {
             }
         }
         const provider = this.providerSafe(head.provider);
+        const effectiveModel = entry.overrides?.model ?? head.model ?? undefined;
         if (provider !== null) {
-            const checked = await validateModelAndEffort(provider, entry.overrides?.model, entry.overrides?.effort, checkCatalog ? async () => catalog : undefined, entry.overrides?.unrestricted);
+            const checked = await validateModelAndEffort(provider, effectiveModel, entry.overrides?.effort, checkCatalog ? async () => catalog : undefined, entry.overrides?.unrestricted);
             warnings.push(...checked.warnings);
         }
         const checksRunning = !running && this.checksPending(headId);
@@ -2686,8 +2687,9 @@ class ForgeService {
         const workerId = head.workerId ?? head.jobId;
         const { ack: envAck, runEnv } = this.resolveFollowUpEnv(workerId, head.jobId, env, false, warnings);
         const provider = this.providerSafe(head.provider);
+        const effectiveModel = entry.overrides?.model ?? head.model ?? undefined;
         if (checkCatalog && (entry.overrides?.model !== undefined || (entry.overrides?.effort !== undefined && provider?.supportsEffort !== false))) {
-            warnings.push(...checkAgainstCatalog(head.provider, entry.overrides?.model, entry.overrides?.effort, catalog));
+            warnings.push(...checkAgainstCatalog(head.provider, effectiveModel, entry.overrides?.effort, catalog));
         }
         const acceptance = readAcceptance(this.repo, head.jobId);
         const onDisk = readSteerEntries(this.repo, head.jobId).length;
@@ -2910,11 +2912,15 @@ class ForgeService {
     async resolveWorkerHead(nameOrWorkerIdOrJobId) {
         return this.resolveStableDetail(this.resolveWorkerHeadId(nameOrWorkerIdOrJobId));
     }
-    async resolveWorker(nameOrId) {
+    async resolveWorkerTarget(nameOrId) {
         const trimmed = nameOrId.trim();
-        if (this.isJobId(trimmed))
-            return this.resolveStableDetail(this.resolveTurn(trimmed));
-        return this.resolveWorkerHead(trimmed);
+        if (this.isJobId(trimmed)) {
+            return { detail: await this.resolveStableDetail(this.resolveTurn(trimmed)), isWorker: false };
+        }
+        return { detail: await this.resolveWorkerHead(trimmed), isWorker: true };
+    }
+    async resolveWorker(nameOrId) {
+        return (await this.resolveWorkerTarget(nameOrId)).detail;
     }
     async resolveStableDetail(initialId) {
         const seen = new Set();

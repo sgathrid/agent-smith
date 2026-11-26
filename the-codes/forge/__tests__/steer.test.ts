@@ -741,3 +741,51 @@ test('follow_up with invalid model on running worker rejects without queuing or 
   assert.equal(finalManifest.jobId, ack.jobId);
   assert.equal(ctrl.turns.length, 1);
 });
+
+test('effort-only follow_up validates against the worker model, not the provider default model', async () => {
+  const ctrl = controlledProvider();
+  const catalogSource = async () => [{
+    provider: ctrl.provider.name,
+    models: [
+      { id: 'default-low-only', label: 'Low', efforts: ['low'] },
+      { id: 'worker-high-only', label: 'High', efforts: ['high'] },
+    ],
+    defaultModel: 'default-low-only',
+    defaultSource: 'harness-config' as const,
+    source: 'live' as const,
+    stale: false,
+    verified: true,
+  }];
+  const repo = mkdtempSync(path.join(tmpdir(), 'agent-smith-effort-'));
+  const service = withDefaultProvider(new ForgeService({
+    repo,
+    flushMs: 5,
+    providerSource: () => ctrl.provider,
+    catalogSource,
+  }));
+
+  const turn1Ready = ctrl.nextTurn();
+  const { ack, done } = await service.spawnTracked({
+    mode: 'implement',
+    name: 'Ada',
+    prompt: 'Do initial work.',
+    model: 'worker-high-only',
+    effort: 'high',
+  });
+  const turn1 = await turn1Ready;
+  turn1.emit({ kind: 'started', at: new Date().toISOString(), conversationId: 'thread-ada' });
+
+  await assert.rejects(
+    service.followUp({ worker: 'Ada', prompt: 'try low', effort: 'low' }),
+    /effort "low" is not valid for codex model "worker-high-only"/,
+  );
+
+  const goodAck = await service.followUp({ worker: 'Ada', prompt: 'try high', effort: 'high' });
+  assert.equal(goodAck.warnings?.some((w) => /effort "high"/.test(w)) ?? false, false);
+
+  const turn2Ready = ctrl.nextTurn();
+  turn1.finish({ status: 'success', response: 'Done.' });
+  const turn2 = await turn2Ready;
+  turn2.finish({ status: 'success', response: 'Done 2.' });
+  await done;
+});

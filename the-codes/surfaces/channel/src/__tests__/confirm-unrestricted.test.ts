@@ -396,3 +396,16 @@ test('every launching tool in TOOL_DEFS enforces the unrestricted gate on an esc
     if (prior === undefined) delete process.env.AGENT_SMITH_CONFIRM_UNRESTRICTED; else process.env.AGENT_SMITH_CONFIRM_UNRESTRICTED = prior;
   }
 });
+
+test('AGENT_SMITH_CODEX_SANDBOX=read-only suppresses unrestricted escalation prompt', async () => {
+  const prior = process.env.AGENT_SMITH_CODEX_SANDBOX;
+  process.env.AGENT_SMITH_CODEX_SANDBOX = 'read-only';
+  try {
+    const h = harness({ caps: FORM, action: 'decline' });
+    const r = await callTool(h.ctx, 'spawn_job', spawnArgs);
+    assert.equal(r.isError, undefined, text(r));
+    assert.equal(h.asked.length, 0);
+  } finally {
+    if (prior === undefined) delete process.env.AGENT_SMITH_CODEX_SANDBOX; else process.env.AGENT_SMITH_CODEX_SANDBOX = prior;
+  }
+});

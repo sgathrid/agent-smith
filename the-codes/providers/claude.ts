@@ -27,6 +27,7 @@ import { DEFAULT_DISCOVERY_TIMEOUT_MS, configDir, errMessage, readTextSafe, runC
 import type { RunFn } from './discovery.ts';
 import path from 'node:path';
 import { deniedText, noResultText, stderrClause } from './failure-text.ts';
+import { createAnswer, emptyResponseVerdict, isBookkeepingTool, type Answer } from './answer.ts';
 
 export function claudeBinary(): string {
   return process.env['AGENT_SMITH_CLAUDE_BIN'] ?? 'claude';
@@ -239,7 +240,7 @@ function isPermissionDenial(text: string | undefined): boolean {
 
 interface ClaudeTranslator {
   onEvent(raw: Record<string, unknown>): ProviderEvent[];
-  finalText: string;
+  answer: Answer;
   sessionId?: string;
   model?: string;
   sawResult: boolean;
@@ -255,8 +256,9 @@ export function createClaudeTranslator(
   maxChars: number,
   input?: Pick<ClaudeLiveInput, 'replayed' | 'end'>,
 ): ClaudeTranslator {
+  const answer = createAnswer();
   const tx: ClaudeTranslator = {
-    finalText: '',
+    answer,
     sawResult: false,
     sawErrorResult: false,
     deniedTools: [],
@@ -264,7 +266,10 @@ export function createClaudeTranslator(
   };
   const toolStep = new Map<string, number>();
   const deniedIds = new Set<string>();
+  const bookkeepingTools = new Set<string>();
+  const endedTools = new Set<string>();
   let step = 0;
+  let fallbackKeySeq = 0;
 
   const recordDenial = (id: string): boolean => {
     if (deniedIds.has(id)) return false;
@@ -344,7 +349,8 @@ export function createClaudeTranslator(
         out.push({ kind: 'usage', at, usage });
       }
 
-      let resetInMessage = false;
+      const envelopeParent = str(raw, 'parent_tool_use_id');
+      const msgKey = str(message, 'id') ?? `anon-${++fallbackKeySeq}`;
       for (const block of content) {
         if (block === null || typeof block !== 'object') continue;
         const b = block as Record<string, unknown>;
@@ -352,7 +358,7 @@ export function createClaudeTranslator(
 
         if (bType === 'text') {
           const text = str(b, 'text');
-          const parent = str(b, 'parent_tool_use_id');
+          const parent = str(b, 'parent_tool_use_id') ?? envelopeParent;
           if (parent !== undefined) {
             if (text !== undefined && text !== '') {
               out.push({
@@ -362,13 +368,9 @@ export function createClaudeTranslator(
                 stream: 'assistant',
               });
             }
-          } else {
-            if (!resetInMessage) {
-              tx.finalText = '';
-              resetInMessage = true;
-            }
-            if (text !== undefined && text !== '') {
-              tx.finalText += text;
+          } else if (text !== undefined) {
+            answer.text(text, msgKey);
+            if (text !== '') {
               out.push({ kind: 'text', at, text, stream: 'assistant' });
             }
           }
@@ -384,12 +386,14 @@ export function createClaudeTranslator(
         }
 
         if (bType === 'tool_use') {
-          if (str(b, 'parent_tool_use_id') === undefined && raw['parent_tool_use_id'] == null) {
-            tx.finalText = '';
-            resetInMessage = true;
-          }
           const toolUseId = str(b, 'id') ?? `toolu-${step}`;
           const toolName = str(b, 'name') ?? 'unknown';
+          const isSubagent = str(b, 'parent_tool_use_id') !== undefined || envelopeParent !== undefined;
+          if (isBookkeepingTool('claude', toolName)) {
+            bookkeepingTools.add(toolUseId);
+          } else if (!isSubagent) {
+            answer.work();
+          }
           const idx = step++;
           toolStep.set(toolUseId, idx);
           const input = preview(b['input'], maxChars);
@@ -418,9 +422,12 @@ export function createClaudeTranslator(
         if (block === null || typeof block !== 'object') continue;
         const b = block as Record<string, unknown>;
         if (str(b, 'type') !== 'tool_result') continue;
-        if (parentId === undefined || parentId === null) tx.finalText = '';
-
         const toolUseId = str(b, 'tool_use_id') ?? '';
+        const isSubagent = (parentId !== undefined && parentId !== null) || b['parent_tool_use_id'] != null;
+        const isReplay = toolUseId !== '' && endedTools.has(toolUseId);
+        if (!isSubagent && !isReplay && !bookkeepingTools.has(toolUseId)) answer.work();
+        if (toolUseId !== '') endedTools.add(toolUseId);
+
         const idx = toolStep.get(toolUseId) ?? step++;
         if (toolUseId !== '') toolStep.set(toolUseId, idx);
 
@@ -481,9 +488,7 @@ export function createClaudeTranslator(
       if (typeof turns === 'number') tx.numTurns = turns;
 
       const finalAnswer = str(raw, 'result');
-      if (finalAnswer !== undefined) {
-        tx.finalText = finalAnswer.trim() === '' ? '' : finalAnswer;
-      }
+      answer.providerFinal(finalAnswer, tx.deniedTools.length > 0 ? 'includes-streamed' : 'authoritative');
       return out;
     }
 
@@ -518,10 +523,11 @@ export function buildResult(args: {
   let status: JobStatus;
   let error: string | undefined;
 
+  const response = tx.answer.value();
   const early = earlyVerdict(exit, durationMs);
   if (early !== undefined) {
     ({ status, error } = early);
-  } else if (tx.deniedTools.length > 0 && !(tx.sawResult && !tx.sawErrorResult && exit.code === 0 && tx.finalText.trim() !== '')) {
+  } else if (tx.deniedTools.length > 0 && !(tx.sawResult && !tx.sawErrorResult && exit.code === 0 && response.trim() !== '')) {
     status = 'denied';
     error = deniedText(tx.deniedTools, exit.stderr);
   } else if (!tx.sawResult) {
@@ -533,14 +539,16 @@ export function buildResult(args: {
   } else if (exit.code !== 0) {
     status = 'error';
     error = `exited ${exit.code}${stderrClause(exit.stderr)}`;
-  } else if (tx.finalText.trim() === '') {
-    status = 'malformed';
-    error = `no output${stderrClause(exit.stderr)}`;
   } else {
-    status = 'success';
+    const empty = emptyResponseVerdict(response, exit.stderr);
+    if (empty !== undefined) {
+      ({ status, error } = empty);
+    } else {
+      status = 'success';
+    }
   }
 
-  const out = jobResult({ provider: 'claude', jobId, status, error, exit, response: tx.finalText, startedAtMs, durationMs, stateDir });
+  const out = jobResult({ provider: 'claude', jobId, status, error, exit, response, startedAtMs, durationMs, stateDir });
   if (tx.deniedTools.length > 0) {
     out.deniedActions = tx.deniedTools.map((id) => ({ action: 'tool', displayName: id, nonfatal: true }));
   }

@@ -68,7 +68,7 @@ DONE_WITH_CONCERNS or BLOCKED). Check it against `acceptance` (set by checks), t
 cleanly. `status` and `list_jobs` are concise by default; `response_format: "detailed"`
 returns the full record.
 
-When a job fails, status carries `reason` (classified cause), `error` (raw provider text), and `resumable` (whether the conversation can be continued).
+When a job fails, status carries `reason` (classified cause), `error` (bounded provider text), and `resumable` (whether the conversation can be continued).
 If a restricted worker was denied a tool, see Permissions. A running worker's `liveness` is
 `silent` after 15 minutes without an event (kimi reports a tool call only when it finishes,
 so that is often a long command) and `dead` when its process is gone.

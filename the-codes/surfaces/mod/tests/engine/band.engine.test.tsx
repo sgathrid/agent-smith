@@ -1055,6 +1055,102 @@ describe('completion notices', () => {
     await clock.advance(3000);
     expect(said.prompts).toHaveLength(1);
   });
+
+  test('turn.start firing while announce awaits file reads holds the notice without submitting or committing', async ($, on) => {
+    const files: Record<string, string> = {
+      ...ada('running'),
+      '/work/.agent-smith/pipelines/p1.json': JSON.stringify({ runId: 'p1', pipeline: 'pipe', startedAt: RUNNING_NOW, finishedAt: null, status: 'running', stageResults: {} }),
+    };
+    let releaseRead: (() => void) | null = null;
+    const readPaused = new Promise<void>((r) => { releaseRead = r; });
+    let holdReads = false;
+    const said = { prompts: [] as string[] };
+    const clock = mock.clock(on as never, { now: RUNNING_NOW });
+    on('session.start', (_$: unknown, e: any) => ({ sessionId: 's', cwd: e.cwd }));
+    on('command.register', () => ({ value: undefined }));
+    on('env.get', () => ({ value: undefined }));
+    on('fs.list', () => ({ value: [{ name: 'job-ada', kind: 'dir', size: 0 }] }));
+    on('fs.exists', (_$: unknown, e: any) => {
+      const p = String(e.path);
+      const name = p.slice(p.lastIndexOf('/') + 1);
+      return { value: p === '/work/.agent-smith/jobs' || Object.hasOwn(files, p) || Object.hasOwn(files, name) };
+    });
+    on('fs.read', async (_$: unknown, e: any) => {
+      const p = String(e.path);
+      const name = p.slice(p.lastIndexOf('/') + 1);
+      if (holdReads && p.endsWith('p1.json')) await readPaused;
+      const body = files[p] ?? files[name];
+      return body !== undefined ? { value: body } : { deny: `ENOENT: ${p}` };
+    });
+    on('fs.write', (_$: unknown, e: any) => { files[e.path] = e.text; return { value: undefined }; });
+    on('tool.call', (_$: unknown, e: any) => LAUNCH_TOOL.test(e.tool) ? launchAck(e) : { deny: 'unexpected' });
+    on('ui.render', ($: any, e: any) => $.ui.resolve(e).Text({ children: 'REST' }));
+    on('prompt.submit', (_$: unknown, e: any) => { said.prompts.push(e.text); return { text: e.text }; });
+    on('turn.start', (_$: unknown, e: any) => ({ turnId: e.turnId }));
+    on('turn.complete', (_$: unknown, e: any) => ({ text: e.answer ?? '' }));
+
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
+    await $.tool.call({ tool: 'mcp__plugin_agent-smith_agent-smith__run_pipeline', runId: 'p1', repo: '/work' });
+    Object.assign(files, ada('succeeded', { finishedAt: iso(RUNNING_NOW + 1000) }));
+    files['/work/.agent-smith/pipelines/p1.json'] = JSON.stringify({ runId: 'p1', pipeline: 'pipe', startedAt: RUNNING_NOW, finishedAt: RUNNING_NOW + 1000, status: 'passed', stageResults: {} });
+    holdReads = true;
+    const advanceP = clock.advance(1000);
+    await new Promise((r) => setTimeout(r, 20));
+    await ($ as any).turn.start({ turnId: 't-race', text: 'user prompt' });
+    releaseRead!();
+    await advanceP;
+    await new Promise((r) => setTimeout(r, 20));
+    expect(said.prompts).toEqual([]);
+    await ($ as any).turn.complete({ turnId: 't-race', reason: 'answer', answer: 'ok', durationMs: 50, isAborted: false });
+    expect(said.prompts).toHaveLength(1);
+  });
+
+  test('dropped or rejected prompt.submit leaves notice pending for the next poll without duplicate sends', async ($, on) => {
+    const files = ada('running');
+    const { clock } = forgeHost(on, files, ['job-ada']);
+    let mode: 'drop' | 'reject' | 'pending' | 'accept' = 'drop';
+    let releasePending: (() => void) | null = null;
+    const prompts: string[] = [];
+    on('fs.write', (_$: unknown, e: any) => { files[e.path] = e.text; return { value: undefined }; });
+    on('prompt.submit', async (_$: unknown, e: any) => {
+      prompts.push(e.text);
+      if (mode === 'drop') return { drop: 'session input held' };
+      if (mode === 'reject') throw new Error('host busy');
+      if (mode === 'pending') {
+        await new Promise<void>((r) => { releasePending = r; });
+        return { text: e.text };
+      }
+      return { text: e.text };
+    });
+    on('turn.start', (_$: unknown, e: any) => ({ turnId: e.turnId }));
+    on('turn.complete', (_$: unknown, e: any) => ({ text: e.answer ?? '' }));
+
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as never);
+    await launched($, 'job-ada');
+    await ($ as any).turn.start({ turnId: 't-1', text: 'work' });
+    Object.assign(files, ada('succeeded', { finishedAt: iso(RUNNING_NOW + 1000) }));
+    await ($ as any).turn.complete({ turnId: 't-1', reason: 'aborted', answer: '', durationMs: 100, isAborted: true });
+    expect(prompts).toHaveLength(1);
+
+    mode = 'reject';
+    await clock.advance(1000);
+    expect(prompts).toHaveLength(2);
+
+    mode = 'pending';
+    await clock.advance(1000);
+    expect(prompts).toHaveLength(3);
+
+    await clock.advance(1000);
+    await clock.advance(1000);
+    expect(prompts).toHaveLength(3);
+
+    releasePending!();
+    await new Promise((r) => setTimeout(r, 20));
+
+    mode = 'accept';
+    await clock.advance(1000);
+    expect(prompts).toHaveLength(3);
+  });
 });
 
 describe("a session cwd that is not the server's repo (#43)", () => {

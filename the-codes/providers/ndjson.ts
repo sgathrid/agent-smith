@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessByStdio } from 'node:child_process';
 import type { Readable, Writable } from 'node:stream';
 import { createWriteStream, mkdirSync, writeFileSync, type WriteStream } from 'node:fs';
-import { access, constants } from 'node:fs/promises';
+import { access, constants, stat } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import os from 'node:os';
@@ -15,7 +15,7 @@ const pathProbeCache = new Map<string, ProbeCacheEntry>();
 async function probeExecutable(target: string): Promise<boolean> {
   try {
     await access(target, constants.X_OK);
-    return true;
+    return (await stat(target)).isFile();
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === 'ENOENT' || code === 'ENOTDIR') return false;

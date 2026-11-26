@@ -43,12 +43,22 @@ interface EscalatingLaunch {
   label?: string | undefined;
   cwd: string;
 }
+function isEscalatingLaunch(l: EscalatingLaunch): boolean {
+  if (l.unrestricted !== true) return false;
+  const provider = findProvider(l.provider);
+  if (effectiveDefaultUnrestricted(provider)) return false;
+  if (provider?.describeSandbox) {
+    return provider.describeSandbox({ unrestricted: true }).sandbox !== provider.describeSandbox({ unrestricted: false }).sandbox;
+  }
+  return true;
+}
+
 async function confirmUnrestricted(
   ctx: HandlerContext,
   launches: readonly EscalatingLaunch[],
   kind: 'worker' | 'pipeline stage' = 'worker',
 ): Promise<{ refused?: ToolOutcome; warning?: string }> {
-  const escalating = launches.filter(l => l.unrestricted === true && !effectiveDefaultUnrestricted(findProvider(l.provider)));
+  const escalating = launches.filter(isEscalatingLaunch);
   if (escalating.length === 0 || process.env['AGENT_SMITH_CONFIRM_UNRESTRICTED'] !== '1') return {};
   if (ctx.unrestrictedGate) return ctx.unrestrictedGate;
   if (!ctx.server?.getClientCapabilities()?.elicitation?.form) return { warning: UNCONFIRMED_UNRESTRICTED };
@@ -94,12 +104,23 @@ const listCapabilitiesTool: Handler = async (ctx, args) => {
   return structured(await listCapabilities(ctx, boolean(args, 'refresh') ?? false, fmt, allowed(args, 'provider', PROVIDERS)), { compact: fmt === 'concise' });
 };
 
+function sandboxContradictsUnrestricted(ack: SpawnAck): boolean {
+  if (!ack.sandbox) return false;
+  const sandboxIsUnrestricted =
+    ack.sandbox.includes('danger-full-access') ||
+    ack.sandbox.includes('(unrestricted)') ||
+    ack.sandbox.includes('bypass') ||
+    ack.sandbox.includes('auto');
+  return sandboxIsUnrestricted !== ack.unrestricted;
+}
+
 export function slimAck(ack: SpawnAck) {
   const out = {
     jobId: ack.jobId, name: ack.name, workerId: ack.workerId,
     ...(ack.turn !== undefined ? { turn: ack.turn } : {}),
     provider: ack.provider, model: ack.modelResolved ?? null, status: ack.status,
     timeoutMs: ack.timeoutMs, repo: ack.repo, unrestricted: ack.unrestricted,
+    ...(sandboxContradictsUnrestricted(ack) ? { sandbox: ack.sandbox } : {}),
     ...(ack.readOnlyRequested || (isModeName(ack.role) && MODE_PRESETS[ack.role].readOnly) ? { readOnlyEnforced: ack.readOnlyEnforced ?? false } : {}),
     ...(ack.envKeys?.length ? { envKeys: ack.envKeys } : {}),
     ...(ack.warnings?.length ? { warnings: ack.warnings } : {}),
@@ -132,7 +153,7 @@ interface PreResolvedSpawn {
   rawEffort?: string | undefined;
 }
 
-async function spawnOne(ctx: HandlerContext, args: Args, preResolved?: PreResolvedSpawn): Promise<Record<string, unknown>> {
+async function spawnOne(ctx: HandlerContext, args: Args, preResolved?: PreResolvedSpawn, extraWarnings: readonly string[] = []): Promise<Record<string, unknown>> {
   const mode = allowed(args, 'mode', MODES); if (mode === undefined) throw new Error(`mode is required; one of ${MODES.join(', ')}.`);
   const rawProvider = preResolved ? preResolved.rawProvider : allowed(args, 'provider', PROVIDERS);
   const rawModel = preResolved ? preResolved.rawModel : text(args, 'model');
@@ -150,7 +171,7 @@ async function spawnOne(ctx: HandlerContext, args: Args, preResolved?: PreResolv
     cfgErrors = cfg.errors;
     provider = resolved.provider ?? await resolveDefaultProvider(ctx);
   }
-  const notes = [...resolved.warnings, ...cfgErrors.map(e => `models.json: ${e}`)];
+  const notes = [...extraWarnings, ...resolved.warnings, ...cfgErrors.map(e => `models.json: ${e}`)];
   const withNotes = (ack: SpawnAck) => ({ ...slimAck(ack), provider: ack.provider ?? provider, ...(resolved.appliedAlias ? { aliasApplied: resolved.appliedAlias, aliasSource: resolved.source } : {}), ...(notes.length ? { warnings: [...(ack.warnings ?? []), ...notes] } : {}) });
   const checks = parseChecks(args.checks);
   const request = { mode, prompt: text(args, 'prompt', true)!, context: contextText(args), files: filesList(args), checks, cwd: workingDirectory(args), name: text(args, 'name'), task: text(args, 'task'), provider, model: resolved.model, effort: resolved.effort, timeoutMs: number(args, 'timeoutMs'), conversation: text(args, 'conversation'), unrestricted: boolean(args, 'unrestricted'), env: validateEnv(args.env),
@@ -178,14 +199,17 @@ function saveRequest(ctx: HandlerContext, jobId: string, saved: Record<string, u
 export const MAX_VARIANTS = 8;
 const VARIANT_KEYS = ['name', 'provider', 'model', 'effort'] as const;
 
-function overlay(base: Args, over: Args, baseProvider?: string): Args {
+function overlay(base: Args, over: Args, baseProvider?: string): { args: Args; droppedUnrestricted?: string } {
   const defined = Object.fromEntries(Object.entries(over).filter(([, v]) => v !== undefined));
   const switched = defined.provider !== undefined && baseProvider !== defined.provider;
   const kept = switched ? Object.fromEntries(Object.entries(base).filter(([k]) => !['model', 'effort', 'unrestricted'].includes(k))) : base;
-  return { ...kept, ...defined };
+  const dropped = switched && base.unrestricted !== undefined && defined.unrestricted === undefined
+    ? `unrestricted: ${String(base.unrestricted)} was dropped because the provider changed or was not shared.`
+    : undefined;
+  return { args: { ...kept, ...defined }, ...(dropped ? { droppedUnrestricted: dropped } : {}) };
 }
 
-async function inheritFrom(ctx: HandlerContext, args: Args): Promise<Args> {
+async function inheritFrom(ctx: HandlerContext, args: Args): Promise<{ args: Args; droppedUnrestricted?: string }> {
   const from = text(args, 'from', true)!;
   const detail = await ctx.service.resolveWorkerHead(from);
   const root = (await ctx.service.earlierTurns(detail, Number.MAX_SAFE_INTEGER))[0]?.jobId ?? detail.jobId;
@@ -207,8 +231,11 @@ async function inheritFrom(ctx: HandlerContext, args: Args): Promise<Args> {
 }
 
 const spawnJob: Handler = async (ctx, args) => {
-  const base = args.from === undefined ? args : await inheritFrom(ctx, args);
-  if (args.variants === undefined) return structured(await spawnOne(ctx, base), { compact: true });
+  const inherited = args.from === undefined ? { args } : await inheritFrom(ctx, args);
+  const base = inherited.args;
+  if (args.variants === undefined) {
+    return structured(await spawnOne(ctx, base, undefined, inherited.droppedUnrestricted ? [inherited.droppedUnrestricted] : []), { compact: true });
+  }
   if (ctx.onJobPrepared) throw new Error('variants start several jobs, and a task-augmented call tracks one; call spawn_job once per variant.');
   if (!Array.isArray(args.variants) || args.variants.length === 0 || args.variants.length > MAX_VARIANTS) throw new Error(`variants must be an array of 1 to ${MAX_VARIANTS} entries.`);
   const { variants: _v, ...shared } = base;
@@ -245,7 +272,8 @@ const spawnJob: Handler = async (ctx, args) => {
     effort: allowed(shared, 'effort', EFFORTS),
     mode,
   }, cfg).provider;
-  const requests = variants.map((v, i) => overlay(shared, { ...v, name: names[i] }, baseProvider));
+  const overlaid = variants.map((v, i) => overlay(shared, { ...v, name: names[i] }, baseProvider));
+  const requests = overlaid.map(o => o.args);
   let fallbackProvider: string | undefined;
   const getFallbackProvider = async () => fallbackProvider ??= await resolveDefaultProvider(ctx);
   const preResolved: PreResolvedSpawn[] = [];
@@ -271,7 +299,8 @@ const spawnJob: Handler = async (ctx, args) => {
   const batchCtx: HandlerContext = { ...ctx, unrestrictedGate: gate.warning ? { warning: gate.warning } : {} };
   const jobs: Record<string, unknown>[] = [];
   for (const [i, r] of requests.entries()) {
-    try { jobs.push(await spawnOne(batchCtx, r, preResolved[i])); } catch (err) { jobs.push({ name: names[i], error: err instanceof Error ? err.message : String(err) }); }
+    const dropped = [inherited.droppedUnrestricted, overlaid[i]!.droppedUnrestricted].filter((w): w is string => w !== undefined);
+    try { jobs.push(await spawnOne(batchCtx, r, preResolved[i], dropped)); } catch (err) { jobs.push({ name: names[i], error: err instanceof Error ? err.message : String(err) }); }
   }
   return structured({ jobs }, { compact: true });
 };
@@ -296,8 +325,8 @@ const followUp: Handler = async (ctx, args) => {
     const provider = head.provider ?? '';
     if (request.model !== undefined || request.effort !== undefined) {
       const cfg = loadModelConfig({ repo: ctx.service.repo });
-      const resolved = resolveRequest({ provider: provider || undefined, model: request.model, effort: request.effort }, cfg);
-      Object.assign(request, { model: resolved.model, effort: resolved.effort });
+      const resolved = resolveRequest({ provider: provider || undefined, model: request.model ?? head.model ?? undefined, effort: request.effort }, cfg);
+      Object.assign(request, { ...(request.model !== undefined ? { model: resolved.model } : {}), effort: resolved.effort });
       notes.push(...resolved.warnings, ...cfg.errors.map(e => `models.json: ${e}`));
     }
     const gate = await confirmUnrestricted(ctx, [{
@@ -349,8 +378,9 @@ function unsettled(ctx: HandlerContext, d: JobDetail, worker: boolean): boolean 
 
 const jobStatus: Handler = async (ctx, args) => {
   const id = text(args, 'id', true)!.trim(); const waitMs = number(args, 'wait_ms', MAX_WAIT_MS); const fmt = format(args); const wantDiff = boolean(args, 'include_diff') ?? false;
-  let detail: JobDetail & { resolvedFrom?: string } = await ctx.service.resolveWorker(id); let waited = false;
-  let worker = ctx.service.resolveTurn(id) !== detail.jobId;
+  const { detail: resolvedDetail, isWorker: worker } = await ctx.service.resolveWorkerTarget(id);
+  let detail: JobDetail & { resolvedFrom?: string } = resolvedDetail;
+  let waited = false;
   const waitTarget = worker ? (detail.workerId ?? detail.jobId) : id;
   if (waitMs !== undefined) {
     waited = true; const deadline = Date.now() + waitMs; const fallbackMs = ctx.pollMs ?? WAIT_POLL_MS;
@@ -358,7 +388,6 @@ const jobStatus: Handler = async (ctx, args) => {
     while (unsettled(ctx, detail, worker) && Date.now() < deadline) {
       await waitForChange(jobDir(ctx.service.repo, detail.jobId), Math.min(maxSlice, deadline - Date.now()), { fallbackMs });
       detail = await ctx.service.resolveWorker(waitTarget);
-      if (!worker) worker = ctx.service.resolveTurn(waitTarget) !== detail.jobId;
     }
   }
   if (detail.jobId !== id) detail = { ...detail, resolvedFrom: id };

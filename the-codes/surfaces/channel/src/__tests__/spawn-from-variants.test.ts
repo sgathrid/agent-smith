@@ -364,3 +364,46 @@ test('cancel waits for supersededBy to settle and cancels the new head that appe
   assert.ok(existsSync(claimMarkerPath(f.repo, 'job', 'turn-1')));
   assert.ok(existsSync(claimMarkerPath(f.repo, 'job', 'turn-2')));
 });
+
+test('variants without a shared provider warn when dropping top-level unrestricted: true', async () => {
+  const f = fixture();
+  const r = await callTool(f.ctx, 'spawn_job', {
+    mode: 'review',
+    prompt: 'check',
+    unrestricted: true,
+    variants: [{ provider: 'codex' }, { provider: 'agy' }],
+  });
+  assert.equal(r.isError, undefined, errText(r));
+  const jobs = body(r).jobs as Array<{ warnings?: string[] }>;
+  assert.equal(f.seen.length, 2);
+  assert.equal(f.seen[0]!.unrestricted, undefined);
+  assert.equal(f.seen[1]!.unrestricted, undefined);
+  assert.ok(jobs[0]!.warnings?.some((w) => /unrestricted: true was dropped/.test(w)));
+  assert.ok(jobs[1]!.warnings?.some((w) => /unrestricted: true was dropped/.test(w)));
+});
+
+test('status on a job ID keeps exact-turn semantics even if a steer lands during wait', async () => {
+  const f = fixture({ cancelSettleMs: 10 });
+  mkdirSync(jobDir(f.repo, 'turn-1'), { recursive: true });
+  mkdirSync(jobDir(f.repo, 'turn-2'), { recursive: true });
+  mkdirSync(jobDir(f.repo, 'turn-3'), { recursive: true });
+  let steered = false;
+  const svc = f.ctx.service as unknown as {
+    resolveTurn: (id: string) => string;
+    detail: (id: string) => Promise<unknown>;
+  };
+  svc.resolveTurn = (id: string) => (id === 'turn-1' && steered ? 'turn-2' : id);
+  svc.detail = async (id: string) => {
+    if (id === 'turn-1') {
+      return { jobId: 'turn-1', name: 'w', workerId: 'turn-1', status: 'running', report: null, warnings: [] };
+    }
+    if (id === 'turn-2') {
+      return { jobId: 'turn-2', name: 'w', workerId: 'turn-1', status: 'succeeded', followedBy: 'turn-3', report: 'steered', warnings: [] };
+    }
+    return { jobId: 'turn-3', name: 'w', workerId: 'turn-1', status: 'succeeded', report: 'follow-up', warnings: [] };
+  };
+  setTimeout(() => { steered = true; }, 10);
+  const res = body(await callTool(f.ctx, 'status', { id: 'turn-1', wait_ms: 200 }));
+  assert.equal(res.jobId, 'turn-2');
+  assert.equal(res.report, 'steered');
+});
