@@ -1,3 +1,4 @@
+import { basename } from 'node:path';
 import type { ActivityEvent, RadarAcceptance, RadarJob } from '../types/index.d.ts';
 import { continuationLabel, countSummary, effectiveStart, elapsed, elapsedCell, failedChecks, failureWords, fitCell, isTerminal, jobLabel, livenessWords, oneLine, pendingSteersLabel, pickGlyph } from './format.ts';
 import { classify } from './progress.ts';
@@ -244,7 +245,8 @@ export function sessionBoard(jobs: readonly RadarJob[], scope: 'session' | 'all'
 export type TimelineItem =
   | { readonly kind: 'event'; readonly event: ActivityEvent }
   | { readonly kind: 'group'; readonly key: string; readonly events: readonly ActivityEvent[];
-      readonly reads: number; readonly searches: number; readonly commands: number };
+      readonly reads: number; readonly searches: number; readonly commands: number;
+      readonly edited?: { readonly file: string; readonly count: number } };
 
 const RUN_MIN = 3;
 
@@ -256,12 +258,30 @@ function condensableKind(event: ActivityEvent): Condensable | null {
   return kind === 'read' || kind === 'search' || kind === 'command' ? kind : null;
 }
 
+function editedPath(event: ActivityEvent): string | null {
+  if (event.kind !== 'tool' || event.state !== 'done') return null;
+  const found = classify(event.tool, event.input);
+  return found.kind === 'edit' && found.path ? found.path : null;
+}
+
 export function condenseTimeline(events: readonly ActivityEvent[]): TimelineItem[] {
   const items: TimelineItem[] = [];
   const limit = Math.max(0, events.length - 1);
   let i = 0;
   while (i < events.length) {
     const start = i;
+    const path = i < limit ? editedPath(events[i]!) : null;
+    if (path !== null) {
+      while (i < limit && editedPath(events[i]!) === path) i += 1;
+      const edits = events.slice(start, i);
+      if (edits.length >= 2) {
+        items.push({ kind: 'group', key: `group-${edits[0]!.sequence}`, events: edits,
+          reads: 0, searches: 0, commands: 0, edited: { file: basename(path), count: edits.length } });
+      } else {
+        items.push({ kind: 'event', event: edits[0]! });
+      }
+      continue;
+    }
     const kinds: Condensable[] = [];
     while (i < limit) {
       const kind = condensableKind(events[i]!);
@@ -286,8 +306,9 @@ export function condenseTimeline(events: readonly ActivityEvent[]): TimelineItem
   return items;
 }
 
-export function timelineGroupLabel(reads: number, searches: number, commands = 0): string {
+export function timelineGroupLabel(reads: number, searches: number, commands = 0, edited?: { readonly file: string; readonly count: number }): string {
   const parts: string[] = [];
+  if (edited) parts.push(`edited ${edited.file} ${edited.count}×`);
   if (reads > 0) parts.push(`read ${reads} ${reads === 1 ? 'file' : 'files'}`);
   if (searches > 0) parts.push(`${searches} ${searches === 1 ? 'search' : 'searches'}`);
   if (commands > 0) parts.push(`${commands} ${commands === 1 ? 'command' : 'commands'}`);
