@@ -103,7 +103,8 @@ test('a child row: glyph, name, activity or task, elapsed and tokens; settled me
   const [r1, r2] = entries.map((e) => childRow(e as never, NOW, cols, tw));
   assert.match(r1!.plain, /^├ ⏺ neon-core\s+git show note\.rs\s+ 1m00s ∙ ↓ 219k$/);
   assert.match(r2!.plain, /^└ ○ asked\s+port the ui\s+30s$/);
-  assert.equal(r1!.bold, true);
+  assert.ok(!('bold' in r1!), 'member rows are never bold');
+  assert.equal(r1!.dim, false);
   assert.equal(r2!.dim, true);
 });
 

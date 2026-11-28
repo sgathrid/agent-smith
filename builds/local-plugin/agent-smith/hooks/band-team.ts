@@ -95,7 +95,6 @@ export interface ChildRow {
   readonly detail: string;
   readonly right: string;
   readonly plain: string;
-  readonly bold: boolean;
   readonly dim: boolean;
   readonly memberId: string | null;
 }
@@ -108,7 +107,7 @@ export function childRow(
 ): ChildRow {
   if (entry.kind === 'fold') {
     const text = foldText(entry.hidden);
-    return { tree: '└', glyph: '', label: text, lead: '', model: '', detail: '', right: '', plain: `└ ${text}`, bold: false, dim: true, memberId: null };
+    return { tree: '└', glyph: '', label: text, lead: '', model: '', detail: '', right: '', plain: `└ ${text}`, dim: true, memberId: null };
   }
   const { member, last } = entry;
   const fit = treeColumns(columns, tokenWidth);
@@ -126,5 +125,5 @@ export function childRow(
   const suffix = fit.tokens ? tokensSuffix(member).padEnd(tokenWidth) : '';
   const right = `${memberClock(member, now)}${suffix}`.trimEnd();
   const plain = `${tree} ${glyph} ${label} ${detail} ${right}`.replace(/\s+$/, '');
-  return { tree, glyph, label, lead, model: modelPart, detail, right, plain, bold: member.state === 'working', dim: member.state !== 'working', memberId: member.id };
+  return { tree, glyph, label, lead, model: modelPart, detail, right, plain, dim: member.state !== 'working', memberId: member.id };
 }
