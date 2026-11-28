@@ -28,6 +28,7 @@ import type { RunFn } from './discovery.ts';
 import { exitReason } from '../surfaces/mod/hooks/reasons.ts';
 import { deniedText, noResultText, stderrClause } from './failure-text.ts';
 import { createAnswer, emptyResponseVerdict, type Answer } from './answer.ts';
+import { createAgyTeamReader } from './agy-team.ts';
 
 export function agyBinary(): string {
   return process.env['AGENT_SMITH_AGY_BIN'] ?? 'agy';
@@ -594,6 +595,109 @@ export async function listAgyModels(run: RunFn, options?: ListModelsOptions): Pr
   }
 }
 
+// ---------------------------------------------------------------------------
+// Team: the sub-agents the worker starts (a /swarm, or invoke_subagent helpers)
+// ---------------------------------------------------------------------------
+
+export const AGY_TEAM_POLL_MS = 2_000;
+
+export interface AgyTeamDeps {
+  readonly createReader: typeof createAgyTeamReader;
+  readonly pollMs: number;
+}
+
+export interface AgyTeamWatch {
+  /** Begins polling once agy names the conversation; later calls are ignored. */
+  start(conversationId: string): void;
+  tick(nowMs: number): void;
+  /** Stops polling after one last poll. */
+  stop(): void;
+}
+
+/**
+ * Polls agy's own record of the worker's team and emits a `team` event only
+ * when it changed (`updatedAt` aside). A reader failure is dropped: the team is
+ * a view of the job, never a reason for it to fail.
+ */
+export function createAgyTeamWatch(cwd: string, emit: (event: ProviderEvent) => void, deps: AgyTeamDeps): AgyTeamWatch {
+  let reader: ReturnType<typeof createAgyTeamReader> | undefined;
+  let timer: NodeJS.Timeout | undefined;
+  let stopped = false;
+  let last = '';
+  const tick = (nowMs: number): void => {
+    if (stopped || reader === undefined) return;
+    try {
+      const read = reader.poll(nowMs);
+      if (read === null) return;
+      const key = JSON.stringify([{ ...read.team, updatedAt: 0 }, read.views]);
+      if (key === last) return;
+      last = key;
+      emit({ kind: 'team', at: nowIso(nowMs), team: read.team, views: read.views });
+    } catch {}
+  };
+  return {
+    start(conversationId) {
+      if (stopped || reader !== undefined) return;
+      try { reader = deps.createReader({ conversationId, cwd }); } catch { return; }
+      timer = setInterval(() => tick(Date.now()), Math.max(1, deps.pollMs));
+      timer.unref?.();
+    },
+    tick,
+    stop() {
+      if (stopped) return;
+      if (timer !== undefined) clearInterval(timer);
+      timer = undefined;
+      tick(Date.now());
+      stopped = true;
+    },
+  };
+}
+
+/** `agyProvider.spawn`, with the team reader injectable for tests. */
+export function spawnAgy(spec: SpawnSpec, deps: AgyTeamDeps = { createReader: createAgyTeamReader, pollMs: AGY_TEAM_POLL_MS }): Promise<WorkerHandle> {
+  const translator = createAgyTranslator(spec.maxOutputChars ?? 2000);
+  let resultEvent: AgyResultEvent | undefined;
+  let team: AgyTeamWatch | undefined;
+
+  return runNdjsonWorker({
+    provider: 'agy',
+    binary: agyBinary(),
+    spec,
+    buildArgv,
+    translate(raw) {
+      const out = translator.onEvent(raw);
+      for (const e of out) if (e.kind === 'started' && e.conversationId !== undefined) team?.start(e.conversationId);
+      return out;
+    },
+    sidecar: (emit) => (team = createAgyTeamWatch(spec.cwd, emit, deps)),
+    // The result event is the verdict, not progress: hold it for buildResult
+    // instead of translating it into an activity.
+    intercept(raw) {
+      if (raw['event'] !== 'result') return false;
+      const r = obj(raw, 'result');
+      if (r !== undefined) resultEvent = r as AgyResultEvent;
+      return true;
+    },
+    // agy writes human-facing warnings to stderr, most importantly the
+    // auto-denial notice quoted at the top of this file. That notice is our
+    // earliest operator-facing hint that a job is going to come back empty.
+    stderrLevel: (text) => (text.includes('denied') || text.includes('permission') ? 'warn' : 'info'),
+    buildResult: (ctx) =>
+      buildResult({
+        ...ctx,
+        resultEvent,
+        denials: translator.denials,
+        sawAnyToolCall: translator.stepsWereTools(),
+        errorIsStale: translator.errorIsStale(),
+        answer: translator.answer,
+      }),
+    afterResult(final) {
+      const recovered = recoveredNotice(final, resultEvent);
+      return recovered === undefined ? [] : [recovered];
+    },
+  });
+}
+
 export const agyProvider: Provider = {
   name: 'agy',
   defaultUnrestricted: true,
@@ -604,41 +708,5 @@ export const agyProvider: Provider = {
 
   listModels: (options) => listAgyModels(runCapture, options),
 
-  spawn(spec: SpawnSpec): Promise<WorkerHandle> {
-    const translator = createAgyTranslator(spec.maxOutputChars ?? 2000);
-    let resultEvent: AgyResultEvent | undefined;
-
-    return runNdjsonWorker({
-      provider: 'agy',
-      binary: agyBinary(),
-      spec,
-      buildArgv,
-      translate: translator.onEvent,
-      // The result event is the verdict, not progress: hold it for buildResult
-      // instead of translating it into an activity.
-      intercept(raw) {
-        if (raw['event'] !== 'result') return false;
-        const r = obj(raw, 'result');
-        if (r !== undefined) resultEvent = r as AgyResultEvent;
-        return true;
-      },
-      // agy writes human-facing warnings to stderr, most importantly the
-      // auto-denial notice quoted at the top of this file. That notice is our
-      // earliest operator-facing hint that a job is going to come back empty.
-      stderrLevel: (text) => (text.includes('denied') || text.includes('permission') ? 'warn' : 'info'),
-      buildResult: (ctx) =>
-        buildResult({
-          ...ctx,
-          resultEvent,
-          denials: translator.denials,
-          sawAnyToolCall: translator.stepsWereTools(),
-          errorIsStale: translator.errorIsStale(),
-          answer: translator.answer,
-        }),
-      afterResult(final) {
-        const recovered = recoveredNotice(final, resultEvent);
-        return recovered === undefined ? [] : [recovered];
-      },
-    });
-  },
+  spawn: (spec: SpawnSpec) => spawnAgy(spec),
 };

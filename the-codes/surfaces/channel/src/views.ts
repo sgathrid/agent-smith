@@ -7,6 +7,7 @@ import type { Acceptance } from '../../../forge/checks.ts';
 import type { PipelineRecord } from '../../../forge/execute.ts';
 import { livenessOf, type Liveness } from '../../mod/hooks/stale.ts';
 import { isTerminalStatus } from '../../mod/hooks/turns.ts';
+import { hasTeam, teamCounts, type TeamCounts } from '../../mod/hooks/team.ts';
 
 export type ResponseFormat = 'concise' | 'detailed';
 export const CONCISE_LIST_LIMIT = 20;
@@ -58,7 +59,17 @@ const warningTexts = (ws: JobSummary['warnings'], error: string | null): string[
 
 export function jobLiveness(j: JobSummary, now = Date.now()): Liveness | null {
   return livenessOf({ status: j.status, updatedAt: j.updatedAt, lastEventAt: j.lastEventAt, lastAliveAt: j.lastAliveAt,
-    lastActivity: j.lastActivity, now });
+    lastActivity: j.lastActivity, team: j.team, now });
+}
+/** The worker's own sub-agents as counts by state; the members themselves stay out of Claude's results. */
+export function teamView(team: JobSummary['team']): TeamCounts | null {
+  return hasTeam(team) ? teamCounts(team) : null;
+}
+/** A summary or detail record without its team, with the team as counts when it has one. */
+export function withTeamCounts<T extends JobSummary>(j: T): Omit<T, 'team'> & { team?: TeamCounts } {
+  const { team, ...rest } = j;
+  const counts = teamView(team);
+  return counts === null ? rest : { ...rest, team: counts };
 }
 export function livenessView(l: Liveness | null) {
   return l === null ? null : { state: l.state, silentForMs: l.silentForMs, ...(l.tool ? { tool: l.tool } : {}) };
@@ -148,6 +159,7 @@ export function conciseStatus(d: JobDetail & { turn?: number; continuedFrom?: st
     supersededBy: d.supersededBy || null,
     resolvedFrom: d.resolvedFrom || null,
     liveness: live ? livenessView(live) : null,
+    team: teamView(d.team),
     lastActivity: running ? lastActivity(d.lastActivity) : null,
     durationMs: Number.isNaN(started) ? null : Math.max(0, ended - started),
     pendingMessages: d.pendingSteers ? d.pendingSteers : null,

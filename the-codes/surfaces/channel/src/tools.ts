@@ -28,7 +28,7 @@ import { getCatalogs, probeProviders } from '../../../providers/catalog.ts';
 import { effectiveDefaultUnrestricted, findProvider, providerNames } from '../../../providers/registry.ts';
 import type { ModelCatalog } from '../../../providers/types.ts';
 import { loadModelConfig, resolveRequest, describeAliases } from '../../../providers/aliases.ts';
-import { CONCISE_LIST_LIMIT, EARLIER_TURNS_CAP, conciseCapabilities, conciseRow, conciseStatus, concisePipeline, earlierTurn, jobDiff, jobLiveness, livenessView, parseSince, taskStatus, withWorkerBaseline, withWorkerFiles, type ResponseFormat } from './views.ts';
+import { CONCISE_LIST_LIMIT, EARLIER_TURNS_CAP, conciseCapabilities, conciseRow, conciseStatus, concisePipeline, earlierTurn, jobDiff, jobLiveness, livenessView, parseSince, taskStatus, withTeamCounts, withWorkerBaseline, withWorkerFiles, type ResponseFormat } from './views.ts';
 import { PROVIDERS, TOOL_DEFS, MAX_WAIT_MS } from './tool-defs.ts';
 import { allowed, boolean, contextText, filesList, format, keys, number, parseChecks, parseStages, record, text, workingDirectory } from './args.ts';
 import { catalogFailureText, defaultMixedPipeline, defaultProvider, discoverCatalogs, type CatalogSource } from './stage-defaults.ts';
@@ -102,7 +102,7 @@ export function failure(message: string, detail?: unknown): ToolOutcome { return
 
 export function fullStatus(detail: JobDetail, acceptance: ReturnType<typeof readAcceptance>, now = Date.now()) {
   const live = jobLiveness(detail, now);
-  const { reason: _r, ...rest } = detail;
+  const { reason: _r, ...rest } = withTeamCounts(detail);
   const reason = failedReason(detail);
   return { ...rest, ...(reason !== null ? { reason } : {}), resumable: Boolean(detail.conversation), ...(live === null ? {} : { liveness: livenessView(live) }), taskStatus: taskStatus(detail.status), report: detail.report?.slice(0, REPORT_HEAD_CHARS) ?? null, reportTruncated: (detail.report?.length ?? 0) > REPORT_HEAD_CHARS, acceptance };
 }
@@ -373,7 +373,7 @@ const listJobs: Handler = async (ctx, args) => {
     groupByWorker: true,
   };
   const workers = await ctx.service.list(listArgs);
-  if (fmt !== 'concise') return structured(workers.map(j => { const live = jobLiveness(j); return { ...j, taskStatus: taskStatus(j.status), ...(live === null ? {} : { liveness: livenessView(live) }) }; }));
+  if (fmt !== 'concise') return structured(workers.map(j => { const live = jobLiveness(j); return { ...withTeamCounts(j), taskStatus: taskStatus(j.status), ...(live === null ? {} : { liveness: livenessView(live) }) }; }));
   const rows = workers.slice(0, limit).map(j => conciseRow(j));
   return structured(workers.length > rows.length
     ? { items: rows, more: `More than ${rows.length} jobs match; ${rows.length} shown.` }

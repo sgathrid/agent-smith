@@ -13,6 +13,7 @@ import {
   type ForgeManifest,
 } from '../forge/format.ts';
 import type { JobStateReader, RawJobState } from './types.ts';
+import { parseTeam } from '../surfaces/mod/hooks/canonical.ts';
 
 export const SMITH_PAYLOAD = {
   provider: 'provider',
@@ -107,6 +108,8 @@ export class AgentSmithReader implements JobStateReader {
       digest?: unknown;
     }>(jobFile(cwd, jobId, FILES.progress));
 
+    const team = parseTeam(await readJsonSafe<unknown>(jobFile(cwd, jobId, FILES.team)));
+
     const anyEvidence = manifest !== null || canceled || report !== null;
     if (!anyEvidence) return null;
 
@@ -195,6 +198,7 @@ export class AgentSmithReader implements JobStateReader {
       ...(Array.isArray(manifest?.staleReads) && manifest.staleReads.length > 0
         ? { staleReads: manifest.staleReads }
         : {}),
+      ...(team !== null ? { team } : {}),
     };
 
     return {

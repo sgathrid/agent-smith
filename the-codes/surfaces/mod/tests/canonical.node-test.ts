@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { readForgeJobs, readForgeDetail } from '../hooks/canonical.ts';
+import { readForgeJobs, readForgeDetail, readMemberView } from '../hooks/canonical.ts';
 import type { FsLike } from '../hooks/fs.ts';
 
 function memoryFs(files: Record<string, string>, reads: string[] = []): FsLike {
@@ -231,4 +231,56 @@ test('canonical liveness: a long open command stays running, a stopped heartbeat
     [`${base}/progress.json`]: JSON.stringify({ ...quiet, lastAliveAt: at(later - 3 * 60_000) }) }), '/repo', later))[0];
   assert.equal(dead?.status, 'attention');
   assert.equal(dead?.liveness?.state, 'dead');
+});
+
+const teamMember = (id: string, state: string, lastEventAt: number) => ({ id, name: id, role: 'worker', model: null, modelLabel: null,
+  task: null, state, activity: null, toolCount: 2, tokensOut: null, startedAt: null, lastEventAt, lastPost: null });
+const teamFile = (members: unknown[]) => JSON.stringify({ schema: 1, source: 'agy-swarm', title: 'swarm', boardHead: 4, members, updatedAt: now });
+
+test('canonical reads team.json into the job; a working member keeps a quiet coordinator active', async () => {
+  const quiet = { ...manifest, updatedAt: new Date(now - 40 * 60_000).toISOString() };
+  const files = {
+    [`${base}/job.json`]: JSON.stringify(quiet),
+    [`${base}/progress.json`]: JSON.stringify({ lastEventAt: quiet.updatedAt, lastAliveAt: new Date(now - 5_000).toISOString() }),
+    [`${base}/team.json`]: teamFile([teamMember('a', 'working', now - 30_000), teamMember('b', 'waiting', now - 1_000), { id: 'bad', state: 'lost' }]),
+  };
+  const job = (await readForgeJobs(memoryFs(files), '/repo', now))[0]!;
+  assert.deepEqual(job.team?.members.map(m => m.id), ['a', 'b'], 'an invalid member is dropped');
+  assert.equal(job.liveness?.state, 'active');
+  assert.equal(job.liveness?.silentForMs, 30_000, 'from the newest working member, not a waiting one');
+  assert.equal(job.status, 'running');
+  assert.equal(job.lastEventAt, Date.parse(quiet.updatedAt), "members' times are not the worker's own");
+});
+
+test('canonical drops an absent, invalid or unreadable team.json without failing the job', async () => {
+  for (const team of [undefined, '{not json', JSON.stringify({ schema: 2, source: 'agy-swarm', members: [teamMember('a', 'working', now)] }),
+    JSON.stringify({ schema: 1, source: 'agy-swarm', members: [] })]) {
+    const jobs = await readForgeJobs(memoryFs({
+      [`${base}/job.json`]: JSON.stringify(manifest),
+      ...(team === undefined ? {} : { [`${base}/team.json`]: team }),
+    }), '/repo', now);
+    assert.equal(jobs.length, 1);
+    assert.equal(jobs[0]!.team, undefined);
+  }
+});
+
+test('readMemberView reads a member file by its sanitized name and rejects bad, mismatched or escaping ids', async () => {
+  const good = { schema: 1, id: 'agent/1', name: 'Ann', brief: 'look', report: null,
+    timeline: [{ sequence: 0, kind: 'assistant', at: 'x', text: 'hi' }, { sequence: 1, kind: 'bogus' }], truncated: false };
+  const fs = memoryFs({
+    [`${base}/members/agent_1.json`]: JSON.stringify(good),
+    [`${base}/members/old.json`]: JSON.stringify({ ...good, id: 'old', schema: 2 }),
+    [`${base}/members/__secret.json`]: JSON.stringify({ ...good, id: '../secret' }),
+    ['/repo/.agent-smith/jobs/secret.json']: JSON.stringify({ ...good, id: '../../secret' }),
+  });
+  const view = await readMemberView(fs, '/repo', 'job-a', 'agent/1');
+  assert.equal(view?.name, 'Ann');
+  assert.equal(view?.timeline.length, 1, 'an invalid timeline event is dropped');
+  assert.equal(await readMemberView(fs, '/repo', 'job-a', 'agent_1'), null, 'the file names another member');
+  assert.equal(await readMemberView(fs, '/repo', 'job-a', 'old'), null, 'unknown schema');
+  assert.equal(await readMemberView(fs, '/repo', 'job-a', 'missing'), null);
+  assert.equal(await readMemberView(fs, '/repo', 'job-a', '../../secret'), null, 'never leaves the members dir');
+  assert.equal((await readMemberView(fs, '/repo', 'job-a', '../secret'))?.id, '../secret', 'a hostile id maps inside it');
+  assert.equal(await readMemberView(fs, '/repo', '../job-a', 'agent/1'), null, 'a bad job id is null, not a throw');
+  assert.equal(await readMemberView(fs, '/repo', 'job-a', ''), null);
 });

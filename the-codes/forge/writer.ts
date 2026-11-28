@@ -34,12 +34,17 @@ import {
   type WatchedFileSigs,
 } from './format.ts';
 import type { JobResult, ProviderEvent, WorkerHandle } from '../providers/types.ts';
+import type { MemberView, Team } from '../surfaces/mod/types/index.d.ts';
+import { memberFileName } from '../surfaces/mod/hooks/team.ts';
 
 const RECENT_ACTIVITIES = 5;
 
 const LATEST_TEXT_CHARS = 4_000;
 
 const SUMMARY_CHARS = 1_000;
+
+/** The reader bounds each view; this bounds how many members a job dir holds. */
+export const TEAM_MEMBERS_CAP = 64;
 
 export interface JobWriterOptions {
   readonly repo: string;
@@ -116,6 +121,11 @@ export class JobWriter {
   private toolInputs = '';
   private editToolInputs = '';
   private readonly editStepsCompleted = new Set<number>();
+  private team: Team | null = null;
+  private teamDirty = false;
+  private readonly pendingViews = new Map<string, MemberView>();
+  private readonly writtenViews = new Map<string, string>();
+  private lastTeamFlushMs = 0;
 
   constructor(options: JobWriterOptions) {
     this.repo = options.repo;
@@ -308,12 +318,44 @@ export class JobWriter {
     if (!shouldFlush(this.lastHeartbeatFlushMs, Number.isNaN(nowMs) ? Date.now() : nowMs, this.flushMs)) return;
     this.lastHeartbeatFlushMs = Number.isNaN(nowMs) ? Date.now() : nowMs;
     writeJsonAtomic(jobFile(this.repo, this.jobId, FILES.progress), this.progress);
+    try { this.flushTeam(); } catch {}
+  }
+
+  /**
+   * The worker's own sub-agents. Not a worker event: it never moves lastEventAt,
+   * updatedAt or the timeline; liveness reads members' times from team.json.
+   */
+  onTeam(at: string, team: Team, views: readonly MemberView[]): void {
+    if (this.finished || this.manifest === null) return;
+    const members = team.members.slice(0, TEAM_MEMBERS_CAP);
+    const kept = new Set(members.map((m) => m.id));
+    this.team = { ...team, members };
+    for (const view of views) if (kept.has(view.id)) this.pendingViews.set(view.id, view);
+    this.teamDirty = true;
+    const nowMs = Date.parse(at);
+    const clock = Number.isNaN(nowMs) ? Date.now() : nowMs;
+    // The coordinator is silent while its team works, so nothing else would flush this soon.
+    if (shouldFlush(this.lastTeamFlushMs, clock, this.flushMs)) { this.lastTeamFlushMs = clock; this.flushTeam(); }
+  }
+
+  private flushTeam(): void {
+    if (!this.teamDirty || this.team === null) return;
+    this.teamDirty = false;
+    for (const [id, view] of this.pendingViews) {
+      const body = JSON.stringify(view);
+      if (this.writtenViews.get(id) === body) continue;
+      writeAtomic(jobFile(this.repo, this.jobId, path.join(FILES.members, memberFileName(id))), body);
+      this.writtenViews.set(id, body);
+    }
+    this.pendingViews.clear();
+    writeJsonAtomic(jobFile(this.repo, this.jobId, FILES.team), this.team);
   }
 
   onEvent(event: ProviderEvent): void {
     if (this.finished || this.manifest === null) return;
     switch (event.kind) {
       case 'heartbeat': this.heartbeat(event.at, event.pid); return;
+      case 'team': this.onTeam(event.at, event.team, event.views); return;
       case 'started': this.onStarted(event); return;
       case 'activity-start':
       case 'activity-update':
@@ -680,6 +722,7 @@ export class JobWriter {
     writeJsonAtomic(jobFile(this.repo, this.jobId, FILES.view), this.view);
     const ms = Date.parse(at);
     this.lastFlushMs = Number.isNaN(ms) ? Date.now() : ms;
+    try { this.flushTeam(); } catch {}
   }
 }
 

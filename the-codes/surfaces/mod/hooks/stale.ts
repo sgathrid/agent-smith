@@ -1,3 +1,4 @@
+import type { Team } from '../types/index.d.ts';
 import { toolLabel } from './progress.ts';
 
 export const STALL_GRACE_MS = 15 * 60 * 1000;
@@ -25,7 +26,21 @@ export interface LivenessInput {
   readonly lastEventAt?: Instant;
   readonly lastAliveAt?: Instant;
   readonly lastActivity?: { readonly tool?: unknown; readonly input?: unknown; readonly status?: unknown } | null;
+  /** The worker's own sub-agents (team.json). */
+  readonly team?: Team | null;
   readonly now: number;
+}
+
+/**
+ * The newest event of a team member still working. A coordinator waiting on
+ * its team emits nothing itself, so its members' events are its activity.
+ */
+export function workingTeamAt(team: Team | null | undefined): number | null {
+  let newest: number | null = null;
+  for (const m of team?.members ?? []) {
+    if (m.state === 'working' && typeof m.lastEventAt === 'number' && Number.isFinite(m.lastEventAt)) newest = Math.max(newest ?? m.lastEventAt, m.lastEventAt);
+  }
+  return newest;
 }
 
 function epoch(v: Instant): number | null {
@@ -37,7 +52,7 @@ function epoch(v: Instant): number | null {
 
 export function livenessOf(i: LivenessInput): Liveness | null {
   if (i.status !== 'running' && i.status !== 'attention') return null;
-  const times = [epoch(i.lastEventAt), epoch(i.updatedAt)].filter((t): t is number => t !== null);
+  const times = [epoch(i.lastEventAt), epoch(i.updatedAt), workingTeamAt(i.team)].filter((t): t is number => t !== null);
   const lastSeen = times.length > 0 ? Math.max(...times) : null;
   const silentForMs = lastSeen === null ? 0 : Math.max(0, i.now - lastSeen);
   const alive = epoch(i.lastAliveAt);
