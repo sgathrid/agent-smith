@@ -322,3 +322,25 @@ test('toNotice uses chainStartedAt for steered chains and per-turn startedAt on 
   }), 'finished', NOW);
   assert.equal(resumed.durationMs, 6_000);
 });
+
+test("a finished job's notice summary comes from its report, not its last running message", async () => {
+  const { mkdtempSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const path = await import('node:path');
+  const { JobWriter } = await import('../../../../forge/writer.ts');
+  const { readJob } = await import('../watch-source.ts');
+  const { toNotice } = await import('../policy.ts');
+  const repo = mkdtempSync(path.join(tmpdir(), 'smith-policy-'));
+  const w = new JobWriter({ repo, jobId: 'review-smith-abcd1234', flushMs: 0 });
+  w.start({ provider: 'codex', mode: 'review', model: null, effort: null, cwd: repo, prompt: 'Review it', unrestricted: false,
+    conversation: null, timeoutMs: 1000, pipeline: null, stage: null, attempt: null });
+  const at = new Date().toISOString();
+  w.onEvent({ kind: 'text', at, stream: 'assistant', text: 'Running the checks.', messageKey: 'm1' });
+  assert.equal((await readJob(repo, w.jobId))?.latestSummary, 'Running the checks.');
+  const report = 'Status: DONE\n\nNo defects found.';
+  w.onEvent({ kind: 'text', at, stream: 'assistant', text: report, messageKey: 'm2' });
+  w.finish({ jobId: w.jobId, provider: 'codex', ok: true, status: 'success', exitCode: 0, signal: null, response: report, answerKey: 'm2',
+    durationMs: 10, startedAt: at, finishedAt: at, stateDir: '' }, report);
+  const done = (await readJob(repo, w.jobId))!;
+  assert.equal(toNotice(done, 'finished', Date.now()).summary, 'No defects found.');
+});

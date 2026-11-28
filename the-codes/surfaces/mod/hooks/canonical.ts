@@ -7,6 +7,7 @@ import { isLiveStatus, isTerminal } from './format.ts';
 import { REASONS, STEER_NOT_APPLIED_RE } from './reasons.ts';
 import { normalizeContinuationKind } from './turns.ts';
 import { memberFileName, settleTeam } from './team.ts';
+import { jobSummary } from './text.ts';
 
 type RecordValue = Record<string, unknown>;
 const STATUSES = new Set(['running', 'attention', 'succeeded', 'failed', 'canceled']);
@@ -88,7 +89,10 @@ async function readForgeJob(fs: FsLike, repo: string, id: string, now: number): 
   const latestActivity = record(p?.lastActivity);
   const latest = latestActivity && typeof latestActivity.tool === 'string' ? latestActivity : recent;
   const resolved = record(m.resolved);
-  const latestSummary = firstText(p?.latestSummary, m.latestSummary);
+  const lastMessage = firstText(p?.latestSummary, m.latestSummary);
+  const latestSummary = isLiveStatus(status)
+    ? lastMessage
+    : jobSummary(await fs.exists(`${dir}/result.md`) ? await fs.read(`${dir}/result.md`) : null, lastMessage);
   const progress = digest(p?.digest);
   const now0 = latest ? classify(firstText(latest.tool) ?? '', firstText(latest.input)).label : '';
   const staleReads = (Array.isArray(m.staleReads) ? m.staleReads : []).filter((f): f is string => typeof f === 'string' && f.trim() !== '');
@@ -110,7 +114,7 @@ async function readForgeJob(fs: FsLike, repo: string, id: string, now: number): 
     activity: progress && isLiveStatus(status) ? progressPhrase(progress, now0) : now0,
     progress,
     task: firstText(m.task) ?? '', latestSummary,
-    summarySource: (p?.summarySource ?? m.summarySource) === 'worker' && latestSummary !== null ? 'worker' : null,
+    summarySource: latestSummary !== null && (!isLiveStatus(status) || (p?.summarySource ?? m.summarySource) === 'worker') ? 'worker' : null,
     changedFileCount: Array.isArray(m.changedFiles) && m.changedFilesTruncated !== true ? m.changedFiles.length : null,
     acceptance: a, failureReason: firstText(m.reason, m.failureReason, m.error, status === 'failed' ? warnings[0]?.message : null),
     failureDetail: firstText(m.error),
@@ -271,7 +275,7 @@ export async function readForgeDetail(fs: FsLike, repo: string, id: string, now:
   }) : [];
   return { job: { ...job, report, prompt: firstText(view?.prompt), preamble: firstText(view?.preamble),
     ...(messages.length > 0 ? { messages } : {}),
-    warnings: [...job.warnings, ...(view === null ? [{code:'detail_unavailable',message:'This older job has no detail snapshot; summary and report are shown.'}] : [])] }, timeline,
+    warnings: [...job.warnings, ...(view === null ? [{code:'detail_unavailable',message:'This older job has no detail snapshot.'}] : [])] }, timeline,
     truncated: view?.truncated === true };
 }
 

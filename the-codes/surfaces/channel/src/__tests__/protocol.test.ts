@@ -52,13 +52,14 @@ setTimeout(()=>{console.log(JSON.stringify({type:'item.completed',item:{id:'answ
     const ack = data(await client.callTool({ name: 'spawn_job', arguments: { provider: 'codex', mode: 'review', name: 'Ada', task: 'Review fixture', prompt: 'Review the fixture', model: 'fixture-model', effort: 'xhigh' } }));
     const detail = await until(async () => data(await client.callTool({ name: 'status', arguments: { id: ack.jobId, response_format: 'detailed' } })), r => r.status !== 'running');
     assert.equal(detail.status, 'succeeded'); assert.equal(detail.name, 'Ada'); assert.equal(detail.role, 'review');
-    assert.equal(detail.summarySource, 'worker'); assert.match(detail.latestSummary, /Worker findings/); assert.ok(!detail.latestSummary.includes('PRIVATE THINKING'));
+    assert.equal('latestSummary' in detail, false); assert.match(detail.report, /Worker findings/); assert.ok(!detail.report.includes('PRIVATE THINKING'));
     assert.equal(ack.status, 'running'); assert.equal(ack.repo, repo); assert.equal('taskHandle' in ack, false);
     assert.equal(detail.taskStatus, 'completed');
     const withDiff = data(await client.callTool({ name: 'status', arguments: { id: ack.jobId, include_diff: true } }));
     assert.equal(withDiff.status, 'succeeded'); assert.equal('taskStatus' in withDiff, false);
     const detailedList = await client.callTool({ name: 'list_jobs', arguments: { response_format: 'detailed' } });
     assert.equal((detailedList.structuredContent as { items: { taskStatus: string }[] }).items[0]!.taskStatus, 'completed');
+    assert.match((detailedList.structuredContent as { items: { latestSummary: string }[] }).items[0]!.latestSummary, /Worker findings/);
     const conciseList = await client.callTool({ name: 'list_jobs', arguments: {} });
     assert.equal((conciseList.structuredContent as { items: { status: string }[] }).items[0]!.status, 'succeeded');
     const followed = data(await client.callTool({ name: 'follow_up', arguments: { worker: 'Ada', prompt: 'Address the edge case' } }));

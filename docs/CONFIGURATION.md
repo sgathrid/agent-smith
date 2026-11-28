@@ -271,7 +271,7 @@ Detailed rows (`JobSummary`): `jobId, name, workerId, turn, role, latestSummary,
 source, status, taskStatus, provider, mode, model, task, toolCalls, currentActivity, lastActivity, startedAt,
 updatedAt, finishedAt, chainStartedAt?, continuedFrom?, continuationKind?, supersededBy?, followedBy?, pendingMessages?, warnings[], resumable?, unrestricted?`, `team` counts (only when the worker has sub-agents), the same evidence fields,
 `lastEventAt`, `lastAliveAt`, and for running jobs `liveness`. `latestSummary` is
-untrusted: the worker's current message while it runs, the head of its final response (after any leading `Status:` line) once done.
+untrusted: the worker's current message while it runs, the opening of its report (after any leading `Status:` line) once done. The concise `summary` is the same opening, trimmed.
 
 ### `status` (read-only, structured)
 Params: `id` (required; a worker name or `workerId` resolves to the worker's latest turn; a `jobId` resolves to that exact turn, following only `supersededBy` steer replacements, not `followedBy`), `wait_ms` 1-60000 (long-poll while running), `response_format`
@@ -283,9 +283,9 @@ Concise result: `jobId, workerId, name, turn` (only if `> 1`), `status, provider
 `team {total, working, waiting, stopped, done, failed, killed}` (only when the worker has sub-agents; counts only; `stopped`: the member was mid-work when the worker's run ended, or has not acted since this turn began),
 finish evidence fields (`toolErrors, failedEarly, changedFilesUnknown, cwdMissingAtFinish`), `staleReads?`,
 `resumable` (when not running and not succeeded), `reason`, `error` (<= 500 chars), `warnings` (deduped strings),
-`earlierTurns` (`[{turn, jobId, status, summary (<= 120 chars)}]`), `report`
+`earlierTurns` (`[{turn, jobId, status, summary (<= 120 chars, the opening of that turn's report)}]`), `report`
 (first 2 000 chars; a trailing note says it was cut and `reportTruncated` is true), `reportPath`,
-`summary` only when the report does not already contain it, and with `wait_ms`: `waited`, `stillRunning`. Null fields are omitted.
+`summary` (the worker's current message, while it runs), and with `wait_ms`: `waited`, `stillRunning`. Null fields are omitted.
 `include_diff` (either format) adds `diff`: a unified diff of `changedFiles` against the turn's spawn-time
 `gitBaseline.head` (for a worker name, the union across its turns against the earliest turn's), run in the job's `cwd`, capped at 40 000 chars on a line boundary. `diffNote` says how
 to see the rest (`git diff <head> -- <file>`), lists new untracked files (which a diff cannot show), or
@@ -307,7 +307,7 @@ unknown, not none), `cwdMissingAtFinish` (the cwd was gone at finish; a writing 
 with reason `working directory gone`).
 The diff is evidence, not attribution: parallel workers in one tree see each other's edits, and edits that
 were already uncommitted at spawn in a changed file are included.
-Detailed result (the full record): `JobSummary` fields plus `report` (first 8 000 chars), `reportPath`, `reportTruncated`, `error`,
+Detailed result (the full record): `JobSummary` fields (`latestSummary` and `summarySource` only while the job runs; a finished job's report is not repeated) plus `report` (first 8 000 chars), `reportPath`, `reportTruncated`, `error`,
 `exitCode`, `unrestricted`, `pipeline`, `stage`, `usage`, `conversation`, `effort`, `cwd`,
 `modelRequested/modelResolved/modelSource`, `preambleApplied`, `sandbox`, `sandboxFlags`,
 `readOnlyRequested/readOnlyEnforced`, `cancellable`, `gitBaseline?`, `changedFiles?`,

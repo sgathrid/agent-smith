@@ -1,4 +1,4 @@
-import path from'node:path';import {fileURLToPath}from'node:url';import {af as noticeReason,ag as readJsonSafe,ah as pipelineRecordPath,A as AgentSmithReader,u as normalize,d as readAcceptance,V as normalizeContinuationKind,n as isTerminalForgeStatus,W as WORKERS_DIR,f as isWorkerIdle,Q as jobsDir,j as jobDir,aa as pickHead,ai as workerIndexPath,T as parseWorkerIndex}from'./chunk-normalize.js';import {a as claudeText,d as droppedMessageQuote,b as pipelineOutcome,A as ACCEPTANCE_HOLD_MS,l as livenessOf,w as waitForChange}from'./chunk-stale.js';function pushKindFor(job) {
+import path from'node:path';import {fileURLToPath}from'node:url';import {ag as noticeReason,ah as readJsonSafe,ai as pipelineRecordPath,A as AgentSmithReader,w as normalize,e as readAcceptance,X as normalizeContinuationKind,o as isTerminalForgeStatus,j as jobSummary,W as WORKERS_DIR,g as isWorkerIdle,T as jobsDir,c as jobDir,ab as pickHead,aj as workerIndexPath,U as parseWorkerIndex}from'./chunk-normalize.js';import {a as claudeText,d as droppedMessageQuote,b as pipelineOutcome,A as ACCEPTANCE_HOLD_MS,l as livenessOf,w as waitForChange}from'./chunk-stale.js';function pushKindFor(job) {
     switch (job.status) {
         case 'succeeded':
             return 'finished';
@@ -133,6 +133,8 @@ async function readOne(cwd, jobId, now) {
     const droppedMessage = dropped ? droppedMessageQuote(dropped.message) : null;
     const pending = raw['pendingSteers'];
     const status = toWatchStatus(observed, now);
+    const lastMessage = typeof raw['latestSummary'] === 'string' ? raw['latestSummary'] : null;
+    const latestSummary = isTerminalForgeStatus(observed.status) ? jobSummary(observed.output, lastMessage) : lastMessage;
     const acceptancePending = isTerminalForgeStatus(status) && isAcceptancePending(observed.finishedAt, acceptance, now);
     return {
         id: observed.jobId,
@@ -144,14 +146,14 @@ async function readOne(cwd, jobId, now) {
         startedAt: observed.startedAt,
         chainStartedAt: typeof raw['chainStartedAt'] === 'string' && raw['chainStartedAt'] !== '' ? raw['chainStartedAt'] : observed.startedAt,
         changedFileCount: Array.isArray(observed.raw['changed_files']) ? observed.raw['changed_files'].length : undefined,
-        latestSummary: typeof raw['latestSummary'] === 'string' ? raw['latestSummary'] : null,
+        latestSummary,
         failureReason: [raw['reason'], raw['error']].find((v) => typeof v === 'string' && v !== '') ?? null,
         failureDetail: typeof raw['error'] === 'string' ? raw['error'] : null,
         checks,
         ...(observed.status === 'succeeded' && acceptance.pending === true
             ? { checksRunning: typeof acceptance.running === 'string' && acceptance.running !== '' ? acceptance.running : true } : {}),
         ...(acceptancePending ? { acceptancePending: true } : {}),
-        summarySource: observed.raw['summarySource'] === 'worker' ? 'worker' : null,
+        summarySource: latestSummary !== null && (isTerminalForgeStatus(observed.status) || raw['summarySource'] === 'worker') ? 'worker' : null,
         status,
         ...livenessField(watchLiveness(observed, now)),
         lastEventAt: observed.updatedAt,

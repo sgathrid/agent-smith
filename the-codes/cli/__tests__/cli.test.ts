@@ -113,7 +113,7 @@ test('CLI run uses the canonical forge, records a pipeline, and resumes a named 
     assert.match(out, /name\s+Ada/);
     assert.match(out, /role\s+implement/);
     assert.match(out, /task\s+Make a small change/);
-    assert.match(out, /summary\s+\[worker\]/);
+    assert.doesNotMatch(out, /summary\s+\[worker\]/, 'a finished worker shows its report, not a copy of its opening');
 
     out = '';
     const byNameCode = await cmdStatus('Ada', repo);

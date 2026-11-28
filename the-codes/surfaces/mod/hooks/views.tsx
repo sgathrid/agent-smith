@@ -123,7 +123,7 @@ export function renderWorker(W: UiComponents, d: ForgeDetail, o: ViewOptions, a:
     {hasTeam(job.team) && teamSection(W,job.team.members,o,a)}
     {visibleTimeline.length>0 && <Box key="transcript-gap"><Text> </Text></Box>}
     {timelineRows(W,visibleTimeline,o,a)}
-    {visibleTimeline.length===0 && <Text dimColor wrap="wrap">{sanitizeText(job.latestSummary??'No worker activity recorded yet.')}</Text>}
+    {visibleTimeline.length===0 && !isTerminal(job.status) && <Text dimColor wrap="wrap">{sanitizeText(job.latestSummary??'No worker activity recorded yet.')}</Text>}
     {isTerminal(job.status)
       ? <Box flexDirection="column">
         <Text bold wrap="truncate-end">Result</Text>

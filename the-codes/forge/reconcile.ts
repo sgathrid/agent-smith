@@ -1,10 +1,10 @@
 /** Service-owned recovery of abandoned jobs. Readers never write job records. */
 import { existsSync, readFileSync } from 'node:fs';
 import { REASONS } from '../surfaces/mod/hooks/reasons.ts';
-import { FILES, SCHEMA_VERSION, cwdFacts, deriveOrphan, failureFields, deriveStatus, isTerminalForgeStatus, jobFile, normalizeDenials, ownerAlive, validOwnerPid, type ForgeManifest } from './format.ts';
+import { FILES, SCHEMA_VERSION, cwdFacts, withoutAnswer, deriveOrphan, failureFields, deriveStatus, isTerminalForgeStatus, jobFile, normalizeDenials, ownerAlive, validOwnerPid, type ForgeManifest, type ForgeView } from './format.ts';
 import { createMarker, writeAtomic, writeJsonAtomic } from './atomic.ts';
 import { readAcceptance, writeAcceptance } from './checks.ts';
-import { reportFor, summaryHead } from './writer.ts';
+import { reportFor } from './writer.ts';
 import { notSentWarning, undeliveredEntries } from './steer-log.ts';
 import type { JobResult } from '../providers/types.ts';
 
@@ -56,6 +56,7 @@ export function reconcileOrphan(repo: string, jobId: string, now = Date.now()): 
       // anchor. Restore the same report/verdict, without replaying checks or
       // claiming that finish-time git attribution was captured.
       writeAtomic(jobFile(repo, jobId, FILES.report), report ?? '');
+      if (report !== null && report.trim() !== '') stripAnswer(repo, jobId, result.answerKey);
       if (readFileSync(file, 'utf8') !== before || ownerAlive(manifest)
           || readOptional(resultFile) !== resultBefore
           || (existsSync(cancelFile) || existsSync(cancelSteerFile)) !== canceled) return false;
@@ -72,8 +73,7 @@ export function reconcileOrphan(repo: string, jobId: string, now = Date.now()): 
         })),
         usage: result.usage === undefined ? null : Object.fromEntries(
           Object.entries(result.usage).filter((entry) => typeof entry[1] === 'number')),
-        latestSummary: summaryHead(result.response, 1_000) || manifest.latestSummary || null,
-        summarySource: result.response.trim() || manifest.latestSummary ? 'worker' : null,
+        ...(report?.trim() ? { latestSummary: null, summarySource: null } : {}),
         changedFilesUnknown: true,
         ...(facts.cwdMissing ? { cwdMissingAtFinish: true } : {}),
       });
@@ -138,6 +138,14 @@ function editedOnDisk(repo: string, jobId: string): boolean {
 }
 
 /** Missing or partially written provider output cannot keep a dead job running. */
+function stripAnswer(repo: string, jobId: string, answerKey: unknown): void {
+  if (typeof answerKey !== 'string') return;
+  const file = jobFile(repo, jobId, FILES.view);
+  const body = readOptional(file);
+  if (body === null) return;
+  try { writeJsonAtomic(file, withoutAnswer(JSON.parse(body) as ForgeView, answerKey)); } catch {}
+}
+
 function readOptional(file: string): string | null {
   try { return readFileSync(file, 'utf8'); } catch { return null; }
 }

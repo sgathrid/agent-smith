@@ -336,7 +336,7 @@ export function createAgyTranslator(maxChars: number) {
         if (delta !== undefined) {
           answer.text(delta, String(stepIndex));
           if (delta !== '') {
-            out.push({ kind: 'text', at, text: delta, stream: 'assistant', delta: true });
+            out.push({ kind: 'text', at, text: delta, stream: 'assistant', delta: true, messageKey: String(stepIndex) });
           }
         }
         return out;
@@ -537,7 +537,7 @@ export function buildResult(args: {
     error = exit.code === null ? `exited on ${exit.signal ?? 'a signal'}` : exitReason(exit.code);
   }
 
-  const out = jobResult({ provider: 'agy', jobId, status, error, exit, response, startedAtMs, durationMs, stateDir });
+  const out = jobResult({ provider: 'agy', jobId, status, error, exit, response, answerKey: args.answer.answerKey(), startedAtMs, durationMs, stateDir });
   if (distinctDenials.length > 0) out.deniedActions = distinctDenials;
   if (usage !== undefined) out.usage = usage;
   if (resultEvent !== undefined) out.raw = resultEvent;
