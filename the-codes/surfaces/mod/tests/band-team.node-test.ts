@@ -120,13 +120,14 @@ test('child rows share the job row right edge at every width, and never overflow
   }
 });
 
-test('the parent detail leads with the team phrase and turns a swarm wait into a count', () => {
+test('the parent detail leads with the team phrase, and a swarm wait replaces it with the count', () => {
   const t = team([member('a'), member('b', { state: 'waiting' }), member('c', { state: 'waiting' })]);
   assert.equal(jobDetail(job({ activity: 'editing x', team: t }), { tools: false }), '1/3 agents working ∙ editing x');
-  assert.equal(jobDetail(job({ activity: 'Swarm_Wait', team: t }), { tools: false }), '1/3 agents working ∙ waiting on 1 of 3 agents');
+  assert.equal(jobDetail(job({ activity: 'Swarm_Wait', team: t }), { tools: false }), 'waiting on 1 of 3 agents');
+  assert.equal(jobDetail(job({ activity: 'waiting on team', team: t }), { tools: false }), 'waiting on 1 of 3 agents');
   const inTool = job({ activity: 'running swarm_wait', liveness: { state: 'in-tool', tool: 'swarm_wait', silentForMs: 0, since: 0, forMs: 120_000 }, team: t });
-  assert.equal(jobDetail(inTool, { tools: false }), '1/3 agents working ∙ waiting on 1 of 3 agents');
+  assert.equal(jobDetail(inTool, { tools: false }), 'waiting on 1 of 3 agents');
   const silent = job({ activity: 'swarm_wait', liveness: { state: 'silent', silentForMs: 300_000, since: 0, forMs: 300_000 }, team: t });
-  assert.equal(jobDetail(silent, { tools: false }), '1/3 agents working ∙ no output 5m ∙ waiting on 1 of 3 agents');
+  assert.equal(jobDetail(silent, { tools: false }), 'waiting on 1 of 3 agents ∙ no output 5m');
   assert.equal(jobDetail(job({ activity: 'swarm_wait' }), { tools: false }), 'swarm_wait');
 });
