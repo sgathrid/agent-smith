@@ -204,7 +204,7 @@ test('consecutive completed read and search calls condense; active, errored and 
   ]);
   assert.deepEqual(shape(items),['group-0','event-3','event-4']);
   const group=items[0]!;
-  assert.equal(group.kind==='group'&&timelineGroupLabel(group.reads,group.searches),'read 2 files · 1 search');
+  assert.equal(group.kind==='group'&&timelineGroupLabel(group),'read 2 files · 1 search');
 
   assert.deepEqual(shape(condenseTimeline([tool(0,'Read','a.ts'),tool(1,'Read','b.ts')])),['event-0','event-1']);
   assert.deepEqual(shape(condenseTimeline([tool(0,'Read','a.ts'),tool(1,'Read','b.ts'),tool(2,'Read','c.ts')])),
@@ -217,7 +217,29 @@ test('consecutive completed read and search calls condense; active, errored and 
     tool(2,"/bin/zsh -lc 'cat a.ts'",''),tool(3,'Bash','{"command":"npm test"}'),tool(4,'Read','e.ts')]);
   assert.deepEqual(shape(shell),['group-0','event-3','event-4']);
   const run=shell[0]!;
-  assert.equal(run.kind==='group'&&timelineGroupLabel(run.reads,run.searches,run.commands),'read 1 file · 2 commands');
+  assert.equal(run.kind==='group'&&timelineGroupLabel(run),'read 1 file · 2 commands');
+});
+
+test('a run of done edits of one file folds; other files, errors and the last row do not',()=>{
+  const edit=(sequence:number,file:string,state='done')=>({kind:'tool' as const,sequence,
+    at:'2026-01-01T00:00:00Z',stepIndex:sequence,tool:'Edit',input:`{"file_path":"/src/${file}"}`,output:'',state});
+  const shape=(items:ReturnType<typeof condenseTimeline>)=>
+    items.map(item=>item.kind==='group'?item.key:`event-${item.event.sequence}`);
+
+  const items=condenseTimeline([edit(0,'relational.rs'),edit(1,'relational.rs'),edit(2,'relational.rs'),
+    edit(3,'relational.rs'),edit(4,'relational.rs'),edit(5,'other.rs')]);
+  assert.deepEqual(shape(items),['group-0','event-5']);
+  const group=items[0]!;
+  assert.equal(group.kind==='group'&&group.events.length,5);
+  assert.equal(group.kind==='group'&&timelineGroupLabel(group),'edited relational.rs 5×');
+
+  assert.deepEqual(shape(condenseTimeline([edit(0,'a.rs'),edit(1,'a.rs'),edit(2,'b.rs'),edit(3,'b.rs'),edit(4,'c.rs')])),
+    ['group-0','group-2','event-4']);
+  assert.deepEqual(shape(condenseTimeline([edit(0,'a.rs'),edit(1,'b.rs'),edit(2,'a.rs'),edit(3,'z.rs')])),
+    ['event-0','event-1','event-2','event-3']);
+  assert.deepEqual(shape(condenseTimeline([edit(0,'a.rs'),edit(1,'a.rs','error'),edit(2,'a.rs'),edit(3,'a.rs'),edit(4,'z.rs')])),
+    ['event-0','event-1','group-2','event-4']);
+  assert.deepEqual(shape(condenseTimeline([edit(0,'a.rs'),edit(1,'a.rs')])),['event-0','event-1']);
 });
 
 test('a settled row says when it started; a live row does not',()=>{

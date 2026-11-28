@@ -73,6 +73,6 @@ test('repeated team polls fold into one group row', () => {
   ]);
   assert.deepEqual(items.map((i) => i.kind), ['group', 'event']);
   const g = items[0]!;
-  assert.equal(g.kind === 'group' && timelineGroupLabel(g.reads, g.searches, g.commands, g.team), 'checked team 2× · board #10–#15 · waited 2×');
+  assert.equal(g.kind === 'group' && timelineGroupLabel(g), 'checked team 2× · board #10–#15 · waited 2×');
   assert.equal(condenseTimeline([tool('swarm', { action: 'add', name: 'x' }), tool('swarm', { action: 'add', name: 'y' }), tool('swarm', { action: 'add', name: 'z' }), tool('swarm', { action: 'add', name: 'w' })]).length, 4);
 });
