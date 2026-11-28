@@ -137,7 +137,7 @@ export function renderWorker(W: UiComponents, d: ForgeDetail, o: ViewOptions, a:
     </Box>)}
     <Box flexDirection="row" gap={2}>
       <Button key="task" plain label="Task" hotkey="t" onPress={a.task} />
-      {hasTeam(job.team) && <Button key="team" plain label="Team" hotkey="m" onPress={a.team} />}
+      {hasTeam(job.team) && job.team.members.length > TEAM_ROWS && <Button key="team" plain label="Team" hotkey="m" onPress={a.team} />}
       <Button key="back" plain label="Back" hotkey="b" onPress={a.back} />
       <Button key="close" plain label="Close" hotkey="x" onPress={a.close} />
     </Box>

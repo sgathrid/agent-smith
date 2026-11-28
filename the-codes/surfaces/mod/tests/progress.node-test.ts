@@ -207,3 +207,15 @@ test('edits outside the worker directory are not the worker\'s edits', () => {
   // no cwd known: nothing to judge against, so nothing is dropped
   assert.equal(t.digest().editedCount, 4);
 });
+
+test('an edit under the resolved cwd is inside, relative to the root it is under', () => {
+  const t = new ProgressTracker();
+  t.start(1, 'write_to_file', J({ TargetFile: '/private/tmp/w/a.ts' }));
+  t.start(2, 'write_to_file', J({ TargetFile: '/tmp/w/b.ts' }));
+  t.start(3, 'write_to_file', J({ TargetFile: '/private/tmp/other/c.ts' }));
+  assert.deepEqual(t.editedPaths('/tmp/w'), ['b.ts']);
+  assert.deepEqual(t.editedPaths('/tmp/w', '/private/tmp/w'), ['a.ts', 'b.ts']);
+  const d = t.digest('/tmp/w', '/private/tmp/w/');
+  assert.equal(d.editedCount, 2);
+  assert.deepEqual(d.edited, ['a.ts', 'b.ts']);
+});

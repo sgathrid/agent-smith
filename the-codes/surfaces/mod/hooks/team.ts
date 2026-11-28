@@ -8,13 +8,14 @@ export interface TeamCounts {
   readonly total: number;
   readonly working: number;
   readonly waiting: number;
+  readonly stopped: number;
   readonly done: number;
   readonly failed: number;
   readonly killed: number;
 }
 
 export function teamCounts(team: Team | null | undefined): TeamCounts {
-  const counts = { total: 0, working: 0, waiting: 0, done: 0, failed: 0, killed: 0 };
+  const counts = { total: 0, working: 0, waiting: 0, stopped: 0, done: 0, failed: 0, killed: 0 };
   for (const member of team?.members ?? []) {
     counts.total += 1;
     counts[member.state] += 1;
@@ -39,6 +40,7 @@ export function teamPhrase(team: Team | null | undefined): string {
   if (!hasTeam(team)) return '';
   const c = teamCounts(team);
   if (c.working > 0) return `${c.working}/${c.total} ${agentsWord(c.total)} working`;
+  if (c.stopped === c.total) return `${c.total} ${agentsWord(c.total)} stopped`;
   const settled = c.waiting + c.done;
   if (settled === c.total) return `${c.total} ${agentsWord(c.total)} ${c.done === c.total ? 'done' : 'waiting'}`;
   return `${c.total} ${agentsWord(c.total)}`;
@@ -49,14 +51,14 @@ export function teamHeaderLine(team: Team | null | undefined): string {
   if (!hasTeam(team)) return '';
   const c = teamCounts(team);
   const parts = [`Team ${c.total}`];
-  for (const state of ['working', 'waiting', 'done', 'failed', 'killed'] as const) {
+  for (const state of ['working', 'waiting', 'stopped', 'done', 'failed', 'killed'] as const) {
     if (c[state] > 0) parts.push(`${c[state]} ${state}`);
   }
   if (team.boardHead !== null && team.boardHead > 0) parts.push(`board #${team.boardHead}`);
   return parts.join(' · ');
 }
 
-const STATE_RANK: Record<TeamMemberState, number> = { working: 0, failed: 1, waiting: 2, done: 3, killed: 4 };
+const STATE_RANK: Record<TeamMemberState, number> = { working: 0, failed: 1, stopped: 2, waiting: 3, done: 4, killed: 5 };
 
 /** Working members first, then by newest event, then by name. */
 export function sortMembers(members: readonly TeamMember[]): TeamMember[] {
@@ -71,7 +73,9 @@ export function memberGlyph(state: TeamMemberState): string {
     case 'working': return '⏺';
     case 'failed':
     case 'killed': return '✗';
-    default: return '○';
+    case 'stopped':
+    case 'waiting':
+    case 'done': return '○';
   }
 }
 
@@ -83,8 +87,32 @@ export function tokensCell(n: number | null | undefined): string {
   return String(Math.round(n));
 }
 
-/** The file name for a member's view: its id with anything outside [A-Za-z0-9._-] replaced. */
+/** A member can be `working` only while its worker's run is live and it has acted since that run began. */
+export function settleTeam(team: Team, run: { readonly live: boolean; readonly startedAt: number | null }): Team {
+  const ended = (m: TeamMember): boolean => !run.live || (m.lastEventAt ?? 0) < (run.startedAt ?? 0);
+  if (!team.members.some((m) => m.state === 'working' && ended(m))) return team;
+  return { ...team, members: team.members.map((m): TeamMember => (m.state === 'working' && ended(m) ? { ...m, state: 'stopped' } : m)) };
+}
+
+const MEMBER_FILE_MAX = 100;
+
+function fnv1a(text: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i += 1) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16).padStart(8, '0');
+}
+
+/**
+ * The file name for a member's view: its id with anything outside [A-Za-z0-9._-]
+ * replaced, at most 100 characters; a cut name ends in a hash of the whole id.
+ */
 export function memberFileName(memberId: string): string {
-  const safe = memberId.replace(/[^A-Za-z0-9._-]/g, '_').replace(/^\.+/, '_');
-  return `${safe === '' ? '_' : safe}.json`;
+  const safe = memberId.replace(/[^A-Za-z0-9._-]/g, '_').replace(/^\.+/, '_') || '_';
+  const ext = '.json';
+  if (safe.length + ext.length <= MEMBER_FILE_MAX) return `${safe}${ext}`;
+  const hash = fnv1a(memberId);
+  return `${safe.slice(0, MEMBER_FILE_MAX - ext.length - hash.length - 1)}-${hash}${ext}`;
 }

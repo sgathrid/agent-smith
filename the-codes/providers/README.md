@@ -111,8 +111,9 @@ the files are missing or not in the expected shape.
 The reader is polled every `AGY_TEAM_POLL_MS` (2 s) while the worker runs, by a `sidecar` hook
 of `runNdjsonWorker` (see Event contract). `createAgyTeamWatch` in `agy.ts` emits a `team`
 event only when the snapshot changes. A `team` snapshot replaces an older one still waiting in the
-`events` queue, so a slow consumer never holds a whole team per poll. Member states are `working`, `waiting`,
-`done`, `failed` or `killed`, following agy's own swarm board rules.
+`events` queue, so a slow consumer never holds a whole team per poll. The reader reports `working`, `waiting`,
+`done` or `killed`, following agy's own swarm board rules. Readers of `team.json` turn `working` into
+`stopped` when the worker's run has ended or the member has not acted since the turn began (`settleTeam`).
 
 ### The denial trap
 

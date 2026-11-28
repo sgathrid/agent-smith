@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -9,6 +9,7 @@ import { normalize } from '../../harness/normalize.ts';
 import { FILES, jobFile } from '../format.ts';
 import { toSummary } from '../summary.ts';
 import { toWatchStatus, watchLiveness } from '../../surfaces/channel/src/watch-source.ts';
+import { withTeamCounts } from '../../surfaces/channel/src/views.ts';
 import { JobWriter, TEAM_MEMBERS_CAP } from '../writer.ts';
 import { memberFileName } from '../../surfaces/mod/hooks/team.ts';
 import type { MemberView, Team, TeamMember } from '../../surfaces/mod/types/index.d.ts';
@@ -77,7 +78,7 @@ test('team writes coalesce on the flush cadence and the latest snapshot lands by
 
 test('the harness reader carries a valid team into the summary and drops an invalid one', async () => {
   const { r, w } = start();
-  w.onEvent({ kind: 'team', at: new Date().toISOString(), team: team([member('a'), member('b', { state: 'waiting' })]), views: [] });
+  w.onEvent({ kind: 'team', at: new Date().toISOString(), team: team([member('a', { lastEventAt: Date.now() }), member('b', { state: 'waiting' })]), views: [] });
   const read = async () => toSummary(normalize((await new AgentSmithReader().read(r, w.jobId))!));
   assert.deepEqual((await read()).team?.members.map((m) => m.state), ['working', 'waiting']);
   writeFileSync(jobFile(r, w.jobId, FILES.team), JSON.stringify({ schema: 2, source: 'agy-swarm', members: [member('a')] }));
@@ -92,11 +93,49 @@ test('the hook watcher reads the same team rule: a quiet coordinator with a work
   const { r, w } = start();
   const old = new Date(Date.now() - 40 * 60_000).toISOString();
   w.onEvent({ kind: 'team', at: new Date().toISOString(), team: team([member('a', { lastEventAt: Date.now() - 10_000 })]), views: [] });
-  writeFileSync(jobFile(r, w.jobId, FILES.job), JSON.stringify({ ...readJson(jobFile(r, w.jobId, FILES.job)), updatedAt: old }));
+  writeFileSync(jobFile(r, w.jobId, FILES.job), JSON.stringify({ ...readJson(jobFile(r, w.jobId, FILES.job)), startedAt: old, updatedAt: old }));
   writeFileSync(jobFile(r, w.jobId, FILES.progress), JSON.stringify({ lastEventAt: old, lastAliveAt: new Date().toISOString(), warnings: [] }));
   const observed = normalize((await new AgentSmithReader().read(r, w.jobId))!);
   assert.equal(watchLiveness(observed, Date.now())?.state, 'active');
   assert.equal(toWatchStatus(observed, Date.now()), 'running');
   writeFileSync(jobFile(r, w.jobId, FILES.team), JSON.stringify(team([member('a', { state: 'waiting' })])));
   assert.equal(toWatchStatus(normalize((await new AgentSmithReader().read(r, w.jobId))!), Date.now()), 'attention');
+});
+
+test('a member file that cannot be written blocks neither team.json nor the other members, and is retried', () => {
+  const { r, w } = start();
+  const blocked = jobFile(r, w.jobId, path.join(FILES.members, memberFileName('a')));
+  mkdirSync(blocked, { recursive: true });
+  w.onEvent({ kind: 'team', at: new Date().toISOString(), team: team([member('a'), member('b')]), views: [view('a'), view('b')] });
+  assert.equal((readJson(jobFile(r, w.jobId, FILES.team))['members'] as unknown[]).length, 2);
+  assert.equal(readJson(jobFile(r, w.jobId, path.join(FILES.members, memberFileName('b'))))['id'], 'b');
+  rmSync(blocked, { recursive: true });
+  w.onEvent({ kind: 'heartbeat', at: new Date(Date.now() + 1_000).toISOString() });
+  assert.equal(readJson(blocked)['id'], 'a', 'the failed member file is written on the next flush');
+});
+
+test('a long member id gets a bounded file name that stays distinct', () => {
+  const long = 'seat-'.repeat(60);
+  const a = memberFileName(`${long}a`);
+  const b = memberFileName(`${long}b`);
+  assert.ok(a.length <= 100 && b.length <= 100);
+  assert.notEqual(a, b);
+  assert.match(a, /-[0-9a-f]{8}\.json$/);
+  assert.equal(memberFileName('short'), 'short.json');
+  const { r, w } = start();
+  w.onEvent({ kind: 'team', at: new Date().toISOString(), team: team([member(`${long}a`)]), views: [view(`${long}a`)] });
+  assert.equal(readJson(jobFile(r, w.jobId, path.join(FILES.members, a)))['id'], `${long}a`);
+});
+
+test('a finished job\'s team reads stopped where the snapshot said working, in the summary and the status counts', async () => {
+  const { r, w } = start();
+  const t = Date.now();
+  w.onEvent({ kind: 'team', at: new Date(t).toISOString(),
+    team: team([member('a', { lastEventAt: t }), member('b', { state: 'waiting', lastEventAt: t })]), views: [] });
+  w.finish({ jobId: w.jobId, provider: 'agy', ok: true, status: 'success', exitCode: 0, signal: null, response: 'done', durationMs: 5,
+    startedAt: new Date(t).toISOString(), finishedAt: new Date(t + 1_000).toISOString(), stateDir: r }, 'done');
+  assert.equal((readJson(jobFile(r, w.jobId, FILES.team))['members'] as TeamMember[])[0]!.state, 'working', 'the snapshot is stored as received');
+  const summary = toSummary(normalize((await new AgentSmithReader().read(r, w.jobId))!));
+  assert.deepEqual(summary.team?.members.map((m) => m.state), ['stopped', 'waiting']);
+  assert.deepEqual(withTeamCounts(summary).team, { total: 2, working: 0, waiting: 1, stopped: 1, done: 0, failed: 0, killed: 0 });
 });

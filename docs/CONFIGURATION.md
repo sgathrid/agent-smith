@@ -280,7 +280,7 @@ Concise result: `jobId, workerId, name, turn` (only if `> 1`), `status, provider
 (check names), pending?, running?, reason?}` (`running`: the checks running now, while `pending`),
 `supersededBy?` (only if set), `resolvedFrom?` (only if set), `liveness` and `lastActivity` (running jobs),
 `durationMs, pendingMessages?`, `changedFileCount`, `changedFiles` (first 20), `changedFilesNote?`,
-`team {total, working, waiting, done, failed, killed}` (only when the worker has sub-agents; counts only),
+`team {total, working, waiting, stopped, done, failed, killed}` (only when the worker has sub-agents; counts only; `stopped`: the member was mid-work when the worker's run ended, or has not acted since this turn began),
 finish evidence fields (`toolErrors, failedEarly, changedFilesUnknown, cwdMissingAtFinish`), `staleReads?`,
 `resumable` (when not running and not succeeded), `reason`, `error` (<= 500 chars), `warnings` (deduped strings),
 `earlierTurns` (`[{turn, jobId, status, summary (<= 120 chars)}]`), `report`

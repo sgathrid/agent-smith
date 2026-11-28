@@ -709,7 +709,7 @@ async function loadDetail($: EngineInterface, repo: string, id: string, t: numbe
 
 let memberCache: { key: string; at: number; view: MemberView | null; settled: boolean } | null = null;
 async function loadMember($: EngineInterface, repo: string, jobId: string, member: TeamMember, t: number): Promise<MemberView | null> {
-  const key = `${repo}\0${jobId}\0${member.id}`;
+  const key = `${repo}\0${jobId}\0${member.id}\0${member.state}`;
   if (memberCache?.key === key && (memberCache.settled || (t >= memberCache.at && t - memberCache.at < POLL_MS))) return memberCache.view;
   const view = await readMemberView(fsOf($), repo, jobId, member.id);
   memberCache = { key, at: t, view, settled: view !== null && member.state !== 'working' };

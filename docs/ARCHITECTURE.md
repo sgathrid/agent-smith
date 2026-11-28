@@ -231,8 +231,13 @@ Agent Smith does not run, steer or message them. It only observes them.
   `sidecar` of `runNdjsonWorker` (`providers/ndjson.ts`), set up by `createAgyTeamWatch`
   (`providers/agy.ts`). It emits a `team` event only when the snapshot changes. Team events go on
   the bus only, never into `events.jsonl`, like heartbeats.
-- `JobWriter` writes `team.json` and `members/`. Team events never move `lastEventAt`,
-  `updatedAt` or the timeline.
+- `JobWriter` writes `team.json` and `members/` as received. Team events never move `lastEventAt`,
+  `updatedAt` or the timeline. It writes `team.json` first; a member file that fails to write is
+  retried on the next flush. Member file names are capped at 100 characters (`memberFileName`).
+- Every reader settles the team on read (`settleTeam`, `hooks/team.ts`): a member reads `working`
+  only while the worker's run is live and the member has acted since that turn started. Otherwise
+  it reads `stopped`. agy leaves sub-agents mid-step when its process exits, so without this a
+  finished job, or a follow-up turn in the same conversation, would show them working forever.
 - Readers take the team as advisory. A missing or malformed `team.json` never stops a job from
   being read. Liveness uses it (see Liveness). The mod and the channel show it, and the MCP
   `status` and `list_jobs` report its counts (see CONFIGURATION.md). Member text never goes to
@@ -320,7 +325,7 @@ prompt, joined by a blank line:
 6. an evidence line: only claim what you can point to, and say what isn't verified.
 
 The brief also asks the worker to start its report with a `Status:` line and lists files already modified in the workspace.
-When a prompt starts with a slash command (for example `/swarm ...`), `joinBrief` (`forge/brief.ts`) puts the brief after the command, so the CLI still expands the command.
+When a prompt for agy or claude starts with a slash command (for example `/swarm ...`), `joinBrief` (`forge/brief.ts`) puts the brief after the command, so the CLI still expands the command. Other providers, and a first token that is an existing path (`/tmp is full`), get the brief in front as usual.
 
 A continuation (`follow_up` or `steer` with `conversation` set) already holds the brief, so it gets only the context,
 check lines (when supplied), and—when a `follow_up` waited on checks—the bounded check verdict block; otherwise nothing is prepended.

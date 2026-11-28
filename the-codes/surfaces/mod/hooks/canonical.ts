@@ -6,7 +6,7 @@ import { firstText, record } from './guards.ts';
 import { isLiveStatus, isTerminal } from './format.ts';
 import { REASONS, STEER_NOT_APPLIED_RE } from './reasons.ts';
 import { normalizeContinuationKind } from './turns.ts';
-import { memberFileName } from './team.ts';
+import { memberFileName, settleTeam } from './team.ts';
 
 type RecordValue = Record<string, unknown>;
 const STATUSES = new Set(['running', 'attention', 'succeeded', 'failed', 'canceled']);
@@ -62,7 +62,7 @@ async function readForgeJob(fs: FsLike, repo: string, id: string, now: number): 
   if (typeof m.schema === 'number' && m.schema > 1) throw new Error('Unsupported Forge job schema');
   if (!STATUSES.has(String(m.status))) throw new Error('Invalid Forge job status');
   const p = await json(fs, `${dir}/progress.json`);
-  const team = await readTeam(fs, dir);
+  const storedTeam = await readTeam(fs, dir);
   let a = acceptance(await json(fs, `${dir}/acceptance.json`));
   let status = m.status as RadarStatus;
   const live = isLiveStatus(status);
@@ -75,6 +75,8 @@ async function readForgeJob(fs: FsLike, repo: string, id: string, now: number): 
     a = { ...a, pending: false };
     if (!canceled) warnings.unshift({ code: 'orphaned', message: REASONS.serverStopped });
   }
+  const startedAt = toEpoch(firstText(m.startedAt, m.createdAt));
+  const team = storedTeam === null ? null : settleTeam(storedTeam, { live: isLiveStatus(status), startedAt });
   const liveness = live && status !== 'failed' && status !== 'canceled'
     ? livenessOf({ status: 'running', lastEventAt: lastSeen, lastAliveAt: firstText(p?.lastAliveAt), lastActivity: record(p?.lastActivity), team, now })
     : null;
@@ -90,7 +92,6 @@ async function readForgeJob(fs: FsLike, repo: string, id: string, now: number): 
   const progress = digest(p?.digest);
   const now0 = latest ? classify(firstText(latest.tool) ?? '', firstText(latest.input)).label : '';
   const staleReads = (Array.isArray(m.staleReads) ? m.staleReads : []).filter((f): f is string => typeof f === 'string' && f.trim() !== '');
-  const startedAt = toEpoch(firstText(m.startedAt, m.createdAt));
   const chainStartedAt = toEpoch(firstText(m.chainStartedAt)) ?? startedAt;
   const legacySteeredFrom = firstText(m['steeredFrom']);
   const continuedFrom = firstText(m.continuedFrom) ?? legacySteeredFrom;
@@ -128,7 +129,7 @@ async function readTeam(fs: FsLike, dir: string): Promise<Team | null> {
     return null;
   }
 }
-const MEMBER_STATES = new Set(['working', 'waiting', 'done', 'failed', 'killed']);
+const MEMBER_STATES = new Set(['working', 'waiting', 'stopped', 'done', 'failed', 'killed']);
 const textOrNull = (v: unknown): string | null => typeof v === 'string' ? v : null;
 const epochOrNull = (v: unknown): number | null => typeof v === 'number' && Number.isFinite(v) ? v : null;
 function member(v: unknown): TeamMember | null {

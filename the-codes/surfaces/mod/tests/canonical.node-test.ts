@@ -238,7 +238,7 @@ const teamMember = (id: string, state: string, lastEventAt: number) => ({ id, na
 const teamFile = (members: unknown[]) => JSON.stringify({ schema: 1, source: 'agy-swarm', title: 'swarm', boardHead: 4, members, updatedAt: now });
 
 test('canonical reads team.json into the job; a working member keeps a quiet coordinator active', async () => {
-  const quiet = { ...manifest, updatedAt: new Date(now - 40 * 60_000).toISOString() };
+  const quiet = { ...manifest, startedAt: new Date(now - 60 * 60_000).toISOString(), updatedAt: new Date(now - 40 * 60_000).toISOString() };
   const files = {
     [`${base}/job.json`]: JSON.stringify(quiet),
     [`${base}/progress.json`]: JSON.stringify({ lastEventAt: quiet.updatedAt, lastAliveAt: new Date(now - 5_000).toISOString() }),
@@ -250,6 +250,19 @@ test('canonical reads team.json into the job; a working member keeps a quiet coo
   assert.equal(job.liveness?.silentForMs, 30_000, 'from the newest working member, not a waiting one');
   assert.equal(job.status, 'running');
   assert.equal(job.lastEventAt, Date.parse(quiet.updatedAt), "members' times are not the worker's own");
+});
+
+test('canonical settles the team: working reads stopped once the run ended or for a member idle since the turn began', async () => {
+  const members = [teamMember('a', 'working', now - 30_000), teamMember('b', 'working', now - 100), teamMember('c', 'waiting', now - 30_000)];
+  const read = async (m: Record<string, unknown>) => (await readForgeJobs(memoryFs({
+    [`${base}/job.json`]: JSON.stringify(m), [`${base}/team.json`]: teamFile(members) }), '/repo', now))[0]!;
+  const finished = await read({ ...manifest, status: 'succeeded', finishedAt: new Date(now).toISOString() });
+  assert.deepEqual(finished.team?.members.map(m => m.state), ['stopped', 'stopped', 'waiting']);
+  const live = await read(manifest);
+  assert.deepEqual(live.team?.members.map(m => m.state), ['stopped', 'working', 'waiting'], 'a turn started at now-1s: a, last seen 30s ago, is from an earlier run');
+  assert.equal(live.liveness?.silentForMs, 0);
+  const stoppedOnly = await read({ ...manifest, updatedAt: new Date(now - 40 * 60_000).toISOString() });
+  assert.equal(stoppedOnly.liveness?.silentForMs, 100, 'only the member still working counts as the coordinator\'s activity');
 });
 
 test('canonical drops an absent, invalid or unreadable team.json without failing the job', async () => {

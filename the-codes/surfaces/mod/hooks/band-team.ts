@@ -50,7 +50,7 @@ export function planBand(shown: readonly RadarJob[], maxRows?: number): BandPlan
   return { entries, hidden: Math.max(0, shown.length - workers.length) };
 }
 
-const STATE_ORDER: readonly TeamMemberState[] = ['working', 'waiting', 'done', 'failed', 'killed'];
+const STATE_ORDER: readonly TeamMemberState[] = ['working', 'waiting', 'stopped', 'done', 'failed', 'killed'];
 
 function count(members: readonly TeamMember[], state: TeamMemberState): number {
   return members.filter((m) => m.state === state).length;

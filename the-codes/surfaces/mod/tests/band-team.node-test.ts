@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import { rowBudget } from '../hooks/band.ts';
 import { childRow, foldText, planBand, tokenColumn, type BandEntry } from '../hooks/band-team.ts';
 import { fitBandColumns, jobDetail } from '../hooks/format.ts';
+import { memberGlyph, settleTeam, sortMembers, teamHeaderLine, teamPhrase } from '../hooks/team.ts';
 import type { RadarJob, Team, TeamMember } from '../types/index.d.ts';
 
 const NOW = 1_000_000_000;
@@ -130,4 +131,32 @@ test('the parent detail leads with the team phrase, and a swarm wait replaces it
   const silent = job({ activity: 'swarm_wait', liveness: { state: 'silent', silentForMs: 300_000, since: 0, forMs: 300_000 }, team: t });
   assert.equal(jobDetail(silent, { tools: false }), 'waiting on 1 of 3 agents ∙ no output 5m');
   assert.equal(jobDetail(job({ activity: 'swarm_wait' }), { tools: false }), 'swarm_wait');
+});
+
+test('settleTeam: a member is working only while the run is live and it has acted since the run began', () => {
+  const t = team([
+    member('early', { lastEventAt: NOW - 10_000 }),
+    member('late', { lastEventAt: NOW + 5_000 }),
+    member('silent', { lastEventAt: null }),
+    member('idle', { state: 'waiting', lastEventAt: NOW - 10_000 }),
+    member('gone', { state: 'killed', lastEventAt: NOW - 10_000 }),
+    member('fin', { state: 'done', lastEventAt: NOW - 10_000 }),
+  ]);
+  const states = (x: Team) => x.members.map((m) => `${m.name}:${m.state}`);
+  assert.deepEqual(states(settleTeam(t, { live: false, startedAt: NOW })),
+    ['early:stopped', 'late:stopped', 'silent:stopped', 'idle:waiting', 'gone:killed', 'fin:done'], 'a finished run has no working member');
+  assert.deepEqual(states(settleTeam(t, { live: true, startedAt: NOW })),
+    ['early:stopped', 'late:working', 'silent:stopped', 'idle:waiting', 'gone:killed', 'fin:done'], 'a live run keeps only members that acted since it began');
+  const fresh = team([member('late', { lastEventAt: NOW + 5_000 }), member('idle', { state: 'waiting' })]);
+  assert.equal(settleTeam(fresh, { live: true, startedAt: NOW }), fresh, 'unchanged team is the same object');
+  assert.equal(settleTeam(t, { live: true, startedAt: null }).members[0]!.state, 'working', 'no known start: nothing predates it');
+});
+
+test('stopped members read stopped in the header, the phrase, the fold, the glyph and the order', () => {
+  const t = team([member('a', { state: 'stopped' }), member('b', { state: 'stopped' }), member('c', { state: 'waiting' })]);
+  assert.equal(teamHeaderLine(t), 'Team 3 · 1 waiting · 2 stopped');
+  assert.equal(teamPhrase(team([member('a', { state: 'stopped' })])), '1 agent stopped');
+  assert.equal(foldText(t.members), '2 stopped ∙ 1 waiting');
+  assert.equal(memberGlyph('stopped'), '○');
+  assert.deepEqual(sortMembers([member('w', { state: 'waiting' }), member('s', { state: 'stopped' }), member('x')]).map((m) => m.name), ['x', 's', 'w']);
 });

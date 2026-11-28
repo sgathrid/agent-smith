@@ -61,8 +61,12 @@ export interface RadarJob {
  */
 export type TeamSource = 'agy-swarm' | 'agy-subagents';
 
-/** The provider's own word for where a member stands. agy reports working | waiting | killed. */
-export type TeamMemberState = 'working' | 'waiting' | 'done' | 'failed' | 'killed';
+/**
+ * Where a member stands. agy reports working | waiting | killed. `stopped`: its
+ * run ended while it was mid-work, because the worker's run is over or the
+ * member has not acted since the current turn began.
+ */
+export type TeamMemberState = 'working' | 'waiting' | 'stopped' | 'done' | 'failed' | 'killed';
 
 export interface TeamMember {
   /** Stable within the team: the member's name (agy swarm) or its conversation id. */

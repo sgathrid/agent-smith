@@ -161,14 +161,11 @@ export function classify(tool: string, input: string | null | undefined, output?
  * worker's edit of the workspace. Relative paths count as inside; with no cwd
  * there is nothing to judge against.
  */
-function isInside(p: string, cwd: string): boolean {
-  const base = cwd.replace(/\/+$/, '');
-  return base === '' || !p.startsWith('/') || p.startsWith(`${base}/`);
-}
-
-function relativeTo(p: string, cwd: string): string {
-  const base = cwd.replace(/\/+$/, '');
-  return base !== '' && p.startsWith(`${base}/`) ? p.slice(base.length + 1) : p;
+function workspacePath(p: string, roots: readonly string[]): string | null {
+  const bases = roots.map((r) => r.replace(/\/+$/, '')).filter((b) => b !== '');
+  if (bases.length === 0 || !p.startsWith('/')) return p;
+  const base = bases.find((b) => p.startsWith(`${b}/`));
+  return base === undefined ? null : p.slice(base.length + 1);
 }
 
 const WINDOW = 8;
@@ -270,13 +267,14 @@ export class ProgressTracker {
     }
   }
 
-  digest(cwd = ''): ProgressDigest {
-    const inside = this.edited.filter((p) => isInside(p, cwd));
+  /** `realCwd` is the cwd with symlinks resolved; a path under either root is inside, relative to the one it is under. */
+  digest(cwd = '', realCwd = ''): ProgressDigest {
+    const inside = this.editedPaths(cwd, realCwd);
     return {
       phase: this.phase(),
       filesRead: this.read.size,
       searches: this.searches,
-      edited: inside.slice(-EDITED_CAP).map((p) => relativeTo(p, cwd)),
+      edited: inside.slice(-EDITED_CAP),
       editedCount: inside.length + this.unnamedEdits,
       commands: this.commands,
       testRuns: this.testRuns,
@@ -285,9 +283,9 @@ export class ProgressTracker {
     };
   }
 
-  /** File paths named by edit tool calls inside `cwd`, relative to it. */
-  editedPaths(cwd = ''): string[] {
-    return this.edited.filter((p) => isInside(p, cwd)).map((p) => relativeTo(p, cwd));
+  /** File paths named by edit tool calls inside `cwd` (or `realCwd`), relative to it. */
+  editedPaths(cwd = '', realCwd = ''): string[] {
+    return this.edited.map((p) => workspacePath(p, [cwd, realCwd])).filter((p): p is string => p !== null);
   }
 
   /** From a window of recent calls, not the last one alone, so the phase does not flicker. */

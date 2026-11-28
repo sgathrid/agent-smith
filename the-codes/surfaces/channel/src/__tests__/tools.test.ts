@@ -354,7 +354,7 @@ test('status gives a worker with a team its counts by state, never the members; 
     detail: async (id: string) => detail(id === 'solo' ? {} : { ...quiet, team }),
     list: async () => [summary(1, { ...quiet, team })],
   });
-  const counts = { total: 4, working: 2, waiting: 1, done: 0, failed: 1, killed: 0 };
+  const counts = { total: 4, working: 2, waiting: 1, stopped: 0, done: 0, failed: 1, killed: 0 };
   const concise = body(await callTool(ctx, 'status', { id: 'w1' }));
   assert.deepEqual(concise.team, counts);
   assert.equal(concise.liveness.state, 'active', 'a working member is activity for the quiet coordinator');

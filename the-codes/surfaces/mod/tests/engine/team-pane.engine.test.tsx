@@ -90,6 +90,15 @@ describe('the Team section (renderWorker)', () => {
     expect((await pane.find({ key: 'member-m09' }) as any).props.hotkey).toBeUndefined();
   });
 
+  test('a team that fits the collapsed rows has no Team button; a stopped member reads stopped with a frozen clock', async ($, on) => {
+    const small = [member('neon-681-core', { state: 'stopped', lastEventAt: NOW - 4 * 60_000 }), MEMBERS[2]!];
+    const pane = await draw($, on, (W) => renderWorker(W, detail(small), options(), actions));
+    expect(await pane.find({ key: 'team' })).toBeUndefined();
+    expect(await texts(pane)).toContain('Team 2 · 1 waiting · 1 stopped · board #15');
+    const rows = (await labels(pane)).filter((l) => /neon-/.test(l));
+    expect(rows[0]).toMatch(/^○ neon-681-core\s.*10m00s · ↓ 219k$/);
+  });
+
   test('a worker without a team shows none of it', async ($, on) => {
     const pane = await draw($, on, (W) => renderWorker(W, detail(null), options(), actions));
     expect(await pane.find({ key: 'team' })).toBeUndefined();

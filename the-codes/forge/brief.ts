@@ -101,21 +101,29 @@ export function buildBrief(input: BriefInput): string {
   ].join('\n');
 }
 
-/**
- * `/name` or `/plugin:name` as the prompt's first token. A further `/` makes it
- * a path (`/Users/x/file.md`), not a command.
- */
 const SLASH_COMMAND_RE = /^\s*(\/[A-Za-z0-9_:-]+)(?=\s|$)/;
 
+export interface JoinOptions {
+  /** The provider's CLI expands a slash command given as the prompt's first token. */
+  readonly slashCommands: boolean;
+  readonly isPath?: (token: string) => boolean;
+}
+
 /**
- * The text sent to a worker: the brief in front of the prompt. A provider only
- * expands a slash command when it is the very first token, so the command moves
- * ahead of the brief and the brief becomes its first argument text.
+ * The text sent to a worker: the brief in front of the prompt, except that a
+ * leading slash command stays first (when the provider expands one and the
+ * token is not an existing path), so the brief becomes its argument text.
  */
-export function joinBrief(brief: string, prompt: string): string {
+export function joinBrief(brief: string, prompt: string, options: JoinOptions): string {
   if (brief === '') return prompt;
-  const m = SLASH_COMMAND_RE.exec(prompt);
-  if (m === null) return `${brief}\n\n${prompt}`;
+  const m = options.slashCommands ? SLASH_COMMAND_RE.exec(prompt) : null;
+  if (m === null || options.isPath?.(m[1]!) === true) return `${brief}\n\n${prompt}`;
   const rest = prompt.slice(m[0].length).replace(/^\s+/, '');
   return `${m[1]} ${brief}${rest === '' ? '' : `\n\n${rest}`}`;
+}
+
+const SLASH_COMMAND_PROVIDERS: ReadonlySet<string> = new Set(['agy', 'claude']);
+
+export function expandsSlashCommands(provider: string): boolean {
+  return SLASH_COMMAND_PROVIDERS.has(provider);
 }

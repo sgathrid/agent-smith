@@ -81,7 +81,12 @@ mod only observes them. It cannot message or steer them. Their state comes from 
 - **`/forge`.** A worker with a team shows a header line (`Team 9 · 4 working · 5 waiting ·
   board #15`) and a Team section with its first four members. `m` shows all of them. Digits
   `1`–`9` open a member. The member view shows the member's task, its timeline, and its last
-  board post or final reply as Result. `b` returns to the worker.
+  board post or final reply as Result. `b` returns to the worker. The `m` button shows only when
+  there are more than four members.
+- **States.** Members read `working`, `waiting`, `stopped`, `done`, `failed` or `killed`.
+  `canonical.ts` settles the team on read (`settleTeam`): a member is `working` only while its
+  worker runs and it has acted since the turn began, otherwise `stopped` (`○`, clock frozen at its
+  last event). A finished job's team stays in `/forge` and never reads working.
 - **Liveness.** `livenessOf` (`hooks/stale.ts`) takes the team as an input. A working member's
   latest event counts as the worker's activity, so a coordinator waiting on its team reads
   `active`, not `silent`.
