@@ -1,10 +1,10 @@
 import { atom, read, update } from 'claude-code';
 import type { EngineInterface, Register, UiRenderEvent } from 'claude-code';
 
-import type { RadarJob } from '../types/index.d.ts';
+import type { MemberView, RadarJob, TeamMember } from '../types/index.d.ts';
 import { jobLabel, oneLine, sanitizeText } from './format.ts';
 import { commandTerminalColumns, findWorker, groupWorkers, isLive, measurePaneTerminalColumns, paneWidthRequest, recordLaunch, scopeLine, sessionBoard, sessionJobs, workerHead, workerTurns, type Launched } from './dashboard.ts';
-import { renderList, renderWorker, type ViewActions, type ViewOptions } from './views.tsx';
+import { renderList, renderMember, renderWorker, type ViewActions, type ViewOptions } from './views.tsx';
 import type { ForgeDetail } from './canonical.ts';
 import {
   buildLine,
@@ -15,7 +15,7 @@ import {
 } from './band.ts';
 import type { FsLike } from './fs.ts';
 import { sortForBand } from './format.ts';
-import { isSettledForCache, readForgeJobs, readForgeDetail } from './canonical.ts';
+import { isSettledForCache, readForgeJobs, readForgeDetail, readMemberView } from './canonical.ts';
 import {
   LAUNCH_TOOL,
   STATUS_TOOL,
@@ -621,6 +621,8 @@ export const register: Register = (on) => {
 
 async function show($: EngineInterface, workerId: string | null): Promise<void> {
   await update($, selected, () => workerId);
+  await update($, selectedMember, () => null);
+  await update($, teamOpen, () => false);
   await update($, pinnedTurnId, () => null);
   await update($, follow, () => true);
   await update($, taskOpen, () => false);
@@ -632,6 +634,14 @@ async function show($: EngineInterface, workerId: string | null): Promise<void> 
 async function pinTurn($: EngineInterface, turnJobId: string | null): Promise<void> {
   await update($, pinnedTurnId, () => turnJobId);
   await update($, follow, () => turnJobId === null);
+  await update($, taskOpen, () => false);
+  await update($, expandedTools, () => []);
+  followingSite = null;
+  await $.ui.scroll({ to: 'start', in: PANE }).catch(() => {});
+}
+
+async function showMember($: EngineInterface, memberId: string | null): Promise<void> {
+  await update($, selectedMember, () => memberId);
   await update($, taskOpen, () => false);
   await update($, expandedTools, () => []);
   followingSite = null;
@@ -666,6 +676,15 @@ async function loadDetail($: EngineInterface, repo: string, id: string, t: numbe
   return detail;
 }
 
+let memberCache: { key: string; at: number; view: MemberView | null; settled: boolean } | null = null;
+async function loadMember($: EngineInterface, repo: string, jobId: string, member: TeamMember, t: number): Promise<MemberView | null> {
+  const key = `${repo}\0${jobId}\0${member.id}`;
+  if (memberCache?.key === key && (memberCache.settled || (t >= memberCache.at && t - memberCache.at < POLL_MS))) return memberCache.view;
+  const view = await readMemberView(fsOf($), repo, jobId, member.id);
+  memberCache = { key, at: t, view, settled: view !== null && member.state !== 'working' };
+  return view;
+}
+
 async function renderForge($: EngineInterface, e: UiRenderEvent): Promise<JSX.Element> {
   const W = $.ui.resolve(e);
   const { Box, Text } = W;
@@ -676,10 +695,11 @@ async function renderForge($: EngineInterface, e: UiRenderEvent): Promise<JSX.El
   const scope = await read($, listScope);
   const pick = await read($, selected);
   const pinned = await read($, pinnedTurnId);
+  const picked = await read($, selectedMember);
   const error = await read($, readError);
   const o: ViewOptions = {
     width: e.props.bodyColumns, now: t, colour: cfg.colour, page: await read($, listPage), scope,
-    following: await read($, follow), taskOpen: await read($, taskOpen), tools: await read($, expandedTools),
+    teamOpen: await read($, teamOpen), following: await read($, follow), taskOpen: await read($, taskOpen), tools: await read($, expandedTools),
     pinnedTurnId: pinned,
   };
   const a: ViewActions = {
@@ -690,7 +710,10 @@ async function renderForge($: EngineInterface, e: UiRenderEvent): Promise<JSX.El
     back: () => show($, null),
     task: async () => { await update($, taskOpen, (open) => !open); },
     tool: async (key) => { await update($, expandedTools, (keys) => keys.includes(key) ? keys.filter((k) => k !== key) : [...keys, key]); },
-    close: async () => { lastPaneRequest = null; await update($, paneOpen, () => false); await $.ui.close({ id: PANE }); },
+    member: (id) => showMember($, id),
+    team: async () => { await update($, teamOpen, (open) => !open); },
+    memberBack: () => showMember($, null),
+    close: async () => { lastPaneRequest = null; await update($, selectedMember, () => null); await update($, paneOpen, () => false); await $.ui.close({ id: PANE }); },
   };
   let content = renderList(W, scope === 'all' ? jobs : mine, o, a);
   if (pick !== null) {
@@ -701,7 +724,10 @@ async function renderForge($: EngineInterface, e: UiRenderEvent): Promise<JSX.El
         ? pinned
         : (head?.id ?? pick);
       const detail = await loadDetail($, cfg.repo, targetId, t);
-      if (detail) {
+      const member = detail?.job.team?.members.find((m) => m.id === picked) ?? null;
+      if (detail && member) {
+        content = renderMember(W, detail.job, member, await loadMember($, cfg.repo, detail.job.id, member, t), o, a);
+      } else if (detail) {
         content = renderWorker(W, detail, o, a, turns);
         if (o.following && followingSite !== targetId) {
           try { await scrollEnd($); followingSite = targetId; }
