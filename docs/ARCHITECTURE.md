@@ -15,7 +15,7 @@ providers/  -> forge/ runtime -> surfaces/channel (MCP + hook watcher) -> surfac
 
 | Layer | Owns |
 |---|---|
-| `providers/` | `agy`, `codex`, `opencode`, `claude`, `kimi` adapters: argv, process groups, timeouts, NDJSON-to-`ProviderEvent` translation, sandbox description, model discovery (`listModels`) and harness-config defaults (`harnessDefaults`), `models.json` aliases (`aliases.ts`), the lazy catalog cache (`catalog.ts`). |
+| `providers/` | `agy`, `codex`, `opencode`, `claude`, `kimi` adapters: argv, process groups, timeouts, NDJSON-to-`ProviderEvent` translation, sandbox description, model discovery (`listModels`) and harness-config defaults (`harnessDefaults`), `models.json` aliases (`aliases.ts`), the lazy catalog cache (`catalog.ts`). `agy-team.ts` reads an agy worker's own sub-agents from agy's state, read-only (see Sub-agents). |
 | `forge/` | Job directory format and status rules (`format.ts`), the single-writer `JobWriter` (`writer.ts`), worker lock (`worker-lock.ts`), `ForgeService` (spawn/follow-up/steer/list/detail/cancel, `service.ts`), closed modes (`modes.ts`), executable acceptance (`checks.ts`), pipeline runner and persistence (`runner.ts`, `execute.ts`). |
 | `pipeline/` | DAG validation, bounded scheduling (1-32), failure propagation, routing/escalation. Does not interpret prose. |
 | `verify/` | Runs acceptance commands against the real working tree; exit codes decide, not worker text. |
@@ -33,8 +33,10 @@ State lives in `<repo>/.agent-smith/jobs/<jobId>/` (gitignored). `FILES` in `for
 | File | Writer | Meaning |
 |---|---|---|
 | `job.json` | `JobWriter`; service-owned orphan recovery; atomic whole-file rewrite | The anchor and only mandatory file. Schema v1 manifest: identity, provider/mode/model (requested, resolved, source), sandbox, status, timestamps, `ownerPid`, `exitCode`, `error`, `deniedActions`, `usage`, `gitBaseline`, `changedFiles`, and finish evidence when it applies: `toolErrors` (tool calls that ended in an error), `failedEarly`, `changedFilesUnknown`, `cwdMissingAtFinish` (see Status derivation). Never deleted. A reader refuses a manifest with a higher `schema`. Holds `task` (first prompt line, 200 chars; on continuations, the first message's label), not the full prompt. |
-| `progress.json` | `JobWriter`, coalesced to `PROGRESS_FLUSH_MS` = 250 ms | Advisory liveness: `lastEventAt` (last provider event), `lastAliveAt` and `workerPid` (the process owner's heartbeat, see Liveness), live `toolCalls` and `toolErrors`, recent activities, `lastActivity` (including completed tools), `latestText`, `latestSummary` (source `worker`: the current assistant message only, reset at each tool call; at finish the first 1 000 chars of the final response after any leading `Status:` line, cut at a paragraph or line boundary), warnings, and `digest`: what the worker has done so far, from its tool calls (`phase`, files read, searches, files edited through visible edit tools, commands, test runs and whether the last one explicitly failed, a repeated call). One classifier in `surfaces/mod/hooks/progress.ts` serves every provider and both the writer and the UI. It never reports a passing test or zero edits, because exit codes and shell edits are not always visible. |
-| `events.jsonl` | `providers/ndjson.ts` | Normalized `ProviderEvent` stream. Heartbeats are not written here. |
+| `progress.json` | `JobWriter`, coalesced to `PROGRESS_FLUSH_MS` = 250 ms | Advisory liveness: `lastEventAt` (last provider event), `lastAliveAt` and `workerPid` (the process owner's heartbeat, see Liveness), live `toolCalls` and `toolErrors`, recent activities, `lastActivity` (including completed tools), `latestText`, `latestSummary` (source `worker`: the current assistant message only, reset at each tool call; at finish the first 1 000 chars of the final response after any leading `Status:` line, cut at a paragraph or line boundary), warnings, and `digest`: what the worker has done so far, from its tool calls (`phase`, files read, searches, files edited inside its `cwd` through visible edit tools, commands, test runs and whether the last one explicitly failed, a repeated call). One classifier in `surfaces/mod/hooks/progress.ts` serves every provider and both the writer and the UI. It never reports a passing test or zero edits, because exit codes and shell edits are not always visible. |
+| `events.jsonl` | `providers/ndjson.ts` | Normalized `ProviderEvent` stream. Heartbeats and team snapshots are not written here. |
+| `team.json` | `JobWriter`; atomic rewrite | The latest `Team` (agy sub-agents and their states, see Sub-agents). Present only when the worker has sub-agents. Read by liveness, the band, the pane and the MCP `status`/`list_jobs` counts. |
+| `members/<memberFileName(id)>.json` | `JobWriter`; rewritten only when its content changes | One `MemberView` per member: the member's task, timeline, last board post or final reply. At most 64 members are kept. |
 | `argv.json` | `providers/ndjson.ts` | Exact argv and cwd. |
 | `stderr.log` | `providers/ndjson.ts` | Child stderr, verbatim. |
 | `result.json` | `providers/ndjson.ts` | Verbatim adapter `JobResult`, written once at completion. Its presence stops orphan derivation. |
@@ -189,8 +191,8 @@ every `HEARTBEAT_MS` = 30 s while the child runs; each adapter puts it on its bu
 `lastEventAt`, `updatedAt` or the timeline.
 
 `livenessOf` (`mod/hooks/stale.ts`) is the one rule; the channel (`views.ts`, `tools.ts`,
-`watch-source.ts`) and the mod (`canonical.ts`, `jobs.ts`) both call it. A job that is not
-running has none. Otherwise, in order:
+`watch-source.ts`) and the mod (`canonical.ts`) both call it. A job that is not
+running has none. Its inputs include the worker's `team` (`team.json`). Otherwise, in order:
 
 | State | When |
 |---|---|
@@ -199,7 +201,13 @@ running has none. Otherwise, in order:
 | `in-tool` | the latest activity is still open (`lastActivity.status === 'active'`: started, not ended); a long command is not a stall |
 | `active` | an event within 15 min |
 | `silent` | no event for 15 min, heartbeat fresh |
-| `waiting` | reserved for known live children (agy team members, Claude subagents); not produced |
+| `waiting` | reserved for known live children (Claude subagents); not produced |
+
+Team members count as activity. While a job runs, the newest `lastEventAt` of a team member
+in state `working` (`workingTeamAt`) is one of the times `livenessOf` takes the latest of. So
+`silentForMs` runs from the newer of the worker's own last event and that member event, and a
+coordinator waiting on a live team reads `active` rather than `silent`. `dead` still takes
+precedence. The member state `waiting` is a different thing from the liveness state `waiting`.
 
 The result carries `silentForMs` (since the last event), `since`, `forMs` and, for an open
 call, `tool` (the first command of a shell call, else the tool name). `attention` (channel
@@ -208,6 +216,32 @@ call, `tool` (the first command of a shell call, else the tool name). `attention
 only when it ends, so a kimi job in a long command reads `silent`, not `in-tool`.
 
 `classifyFailure` and `reasonFromText` (`surfaces/mod/hooks/reasons.ts`) classify failure text into a short `reason` on failed jobs (`server stopped`, `denied`, `not logged in`, `provider busy`, `out of credits`, `rate limited`, `bad flag or model`, `couldn't start`, `timed out`, `network error`, `no output`, `crashed`, `setup failed`, `checks failed`, or `exit N`). `resumable` reports whether a saved conversation handle exists. Both are surfaced in `status` and `list_jobs`.
+
+### Sub-agents
+
+An agy worker can start its own sub-agents: a `/swarm` team, or `invoke_subagent` helpers.
+Agent Smith does not run, steer or message them. It only observes them.
+
+- `providers/agy-team.ts` reads agy's state for the worker's conversation, read-only, under
+  `~/.gemini/antigravity-cli/brain/<conversation>/.system_generated/` (`AGENT_SMITH_AGY_BRAIN`
+  replaces the brain root): `swarm/members.json`, `swarm/board.jsonl`, `swarm/plan.json`,
+  `subagents/*.json`, and each member's `logs/chunks/transcript/*.jsonl`. It returns null,
+  so nothing is shown, when the files are missing or not in the expected shape.
+- The agy adapter polls it every 2 s (`AGY_TEAM_POLL_MS`) while the worker runs. The poll is a
+  `sidecar` of `runNdjsonWorker` (`providers/ndjson.ts`), set up by `createAgyTeamWatch`
+  (`providers/agy.ts`). It emits a `team` event only when the snapshot changes. Team events go on
+  the bus only, never into `events.jsonl`, like heartbeats.
+- `JobWriter` writes `team.json` and `members/` as received. Team events never move `lastEventAt`,
+  `updatedAt` or the timeline. It writes `team.json` first; a member file that fails to write is
+  retried on the next flush. Member file names are capped at 100 characters (`memberFileName`).
+- Every reader settles the team on read (`settleTeam`, `hooks/team.ts`): a member reads `working`
+  only while the worker's run is live and the member has acted since that turn started. Otherwise
+  it reads `stopped`. agy leaves sub-agents mid-step when its process exits, so without this a
+  finished job, or a follow-up turn in the same conversation, would show them working forever.
+- Readers take the team as advisory. A missing or malformed `team.json` never stops a job from
+  being read. Liveness uses it (see Liveness). The mod and the channel show it, and the MCP
+  `status` and `list_jobs` report its counts (see CONFIGURATION.md). Member text never goes to
+  Claude's tool results. It is shown in the band and `/forge` only.
 
 ## MCP Tasks (`io.modelcontextprotocol/tasks`)
 
@@ -291,6 +325,7 @@ prompt, joined by a blank line:
 6. an evidence line: only claim what you can point to, and say what isn't verified.
 
 The brief also asks the worker to start its report with a `Status:` line and lists files already modified in the workspace.
+When a prompt for agy or claude starts with a slash command (for example `/swarm ...`), `joinBrief` (`forge/brief.ts`) puts the brief after the command, so the CLI still expands the command. Other providers, and a first token that is an existing path (`/tmp is full`), get the brief in front as usual.
 
 A continuation (`follow_up` or `steer` with `conversation` set) already holds the brief, so it gets only the context,
 check lines (when supplied), and—when a `follow_up` waited on checks—the bounded check verdict block; otherwise nothing is prepended.

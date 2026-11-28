@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { ALIVE_GRACE_MS, STALL_GRACE_MS, livenessOf } from '../hooks/stale.ts';
+import type { Team, TeamMember } from '../types/index.d.ts';
 
 const NOW = Date.parse('2026-10-27T12:00:00Z');
 const iso = (ms: number) => new Date(ms).toISOString();
@@ -54,6 +55,20 @@ test('no event time at all is silent, never healthy; waiting is reserved and nev
     states.add(livenessOf({ status: 'running', lastEventAt: NOW - ev, lastAliveAt: alive === null ? null : NOW - alive, lastActivity: a, now: NOW })!.state);
   }
   assert.ok(!states.has('waiting'));
+});
+
+test('a working team member counts as activity for a quiet coordinator; waiting members and a dead process do not', () => {
+  const m = (state: TeamMember['state'], lastEventAt: number | null): TeamMember => ({ id: state, name: state, role: 'worker', model: null,
+    modelLabel: null, task: null, state, activity: null, toolCount: 0, tokensOut: null, startedAt: null, lastEventAt, lastPost: null });
+  const team = (...members: TeamMember[]): Team => ({ schema: 1, source: 'agy-swarm', title: null, boardHead: null, members, updatedAt: NOW });
+  const quiet = { status: 'running', lastEventAt: NOW - 40 * 60_000, lastAliveAt: NOW - 5_000, now: NOW };
+  const working = livenessOf({ ...quiet, team: team(m('working', NOW - 90_000), m('waiting', NOW - 1_000), m('working', null)) });
+  assert.equal(working?.state, 'active');
+  assert.equal(working?.silentForMs, 90_000);
+  assert.equal(livenessOf({ ...quiet, team: team(m('waiting', NOW - 1_000), m('done', NOW)) })?.state, 'silent');
+  assert.equal(livenessOf({ ...quiet, team: team(m('working', NOW - STALL_GRACE_MS - 1)) })?.state, 'silent', 'a stale team decays too');
+  assert.equal(livenessOf({ ...quiet, lastAliveAt: NOW - ALIVE_GRACE_MS - 1, team: team(m('working', NOW)) })?.state, 'dead');
+  assert.equal(livenessOf({ ...quiet, lastEventAt: NOW - 10_000, team: team(m('working', NOW - 60_000)) })?.silentForMs, 10_000, 'the newer of the two');
 });
 
 test('ISO strings and epoch ms give the same answer', () => {

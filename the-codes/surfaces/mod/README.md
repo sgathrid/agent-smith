@@ -66,6 +66,33 @@ number:
 - **The 1 Hz clock is gated on visibility.** Idle costs one comparison a second
   and never a redraw. A 1 Hz repaint of nothing is a laptop fan (L161).
 
+### Sub-agents
+
+An agy worker can run its own sub-agents (a `/swarm` team or `invoke_subagent` helpers). The
+mod only observes them. It cannot message or steer them. Their state comes from `team.json`
+(see ARCHITECTURE.md, Sub-agents).
+
+- **Band.** Under a live worker, one child row per working member, marked `├` or `└`, with its
+  current activity, time and output tokens. Working members come first. Extra members fold into
+  one row, such as `5 waiting · 2 working · hydro-681 posted #13`. The band's row cap still
+  applies. The worker's own row leads with the team (`4/9 agents working`) and reads
+  `waiting on 3 of 9 agents` while the coordinator waits on its team. Member rows have no digit.
+  Pressing one opens that member in `/forge`.
+- **`/forge`.** A worker with a team shows a header line (`Team 9 · 4 working · 5 waiting ·
+  board #15`) and a Team section with its first four members. `m` shows all of them. Digits
+  `1`–`9` open a member. The member view shows the member's task, its timeline, and its last
+  board post or final reply as Result. `b` returns to the worker. The `m` button shows only when
+  there are more than four members.
+- **States.** Members read `working`, `waiting`, `stopped`, `done`, `failed` or `killed`.
+  `canonical.ts` settles the team on read (`settleTeam`): a member is `working` only while its
+  worker runs and it has acted since the turn began, otherwise `stopped` (`○`, clock frozen at its
+  last event). A finished job's team stays in `/forge` and never reads working.
+- **Liveness.** `livenessOf` (`hooks/stale.ts`) takes the team as an input. A working member's
+  latest event counts as the worker's activity, so a coordinator waiting on its team reads
+  `active`, not `silent`.
+- **Transcript.** Swarm tool calls read plainly (`added <name> (<model>)`, `waiting on team`).
+  Repeated team polls fold into one row.
+
 ## Install
 
 Install the full plugin in Claude Code:
@@ -118,8 +145,8 @@ else's repo, and the band would confidently draw their jobs. It is empty now, an
 ## Canonical tracking
 
 `hooks/canonical.ts` supplies the same worker/turn projection to the band, pane and
-native task bridge. Lists read `job.json`, optional `progress.json` and
-`acceptance.json`, plus an orphan marker, caching immutable settled jobs in memory
+native task bridge. Lists read `job.json`, optional `progress.json`, `acceptance.json` and `team.json`
+(advisory: a missing or malformed file is ignored), plus an orphan marker, caching immutable settled jobs in memory
 (O(active) reads on each 1 s active poll; when nothing is live and `/forge` is
 closed, an idle tick does one `readdir` of `.agent-smith/jobs` with no parsing,
 and a new entry wakes active polling). They never scan event logs or reports.
@@ -165,7 +192,9 @@ pauses that; scrolling back to the bottom resumes it.
 | `a` / `s` in the list | Show the repository's workers / this session's again |
 | `t` in a worker | Expand the task to the prompt as sent, preamble included |
 | Enter on a tool row | Show its input and output |
-| `b` | Back to the list |
+| `1`–`9` in a worker with a team | Open a member (the first nine) |
+| `m` in a worker with a team | Show all members, or the first four again |
+| `b` | Back to the list; in a member view, back to the worker |
 | `x` | Close the sidebar |
 | Escape | Return keyboard focus to the prompt (host behaviour) |
 
@@ -196,6 +225,9 @@ hooks/canonical.ts          THE READER — over `.agent-smith/jobs`, via an inje
 hooks/fs.ts                 `FsLike` and `toEpoch`, shared by the readers
 hooks/format.ts             pure formatting, shared by band and pane
 hooks/stale.ts              livenessOf and its thresholds, shared by band and channel
+hooks/team.ts               a worker's team: counts, phrases, member order (pure)
+hooks/band-team.ts          the band's child rows under a team (pure)
+hooks/team-view.ts          the pane's team rows and member headers (pure)
 hooks/turns.ts              turn/head/idle rules and WorkerIndex parser, shared by forge, channel and mod
 hooks/notice.ts             completion notice words and who may announce
 types/index.d.ts            RadarJob + the PluginState declaration

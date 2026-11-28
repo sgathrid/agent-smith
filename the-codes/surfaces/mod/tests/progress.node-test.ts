@@ -190,3 +190,33 @@ test('shell setup steps do not stand in for the command', () => {
   assert.equal(classify('Bash', J({ command: 'cd pkg && rg needle' })).kind, 'search');
   assert.equal(classify('Bash', J({ command: 'export A=1 && cat README.md' })).kind, 'read');
 });
+
+test('edits outside the worker directory are not the worker\'s edits', () => {
+  const t = new ProgressTracker();
+  t.start(1, 'write_to_file', J({ TargetFile: '/home/u/.gemini/tmp/x/plan.json' }));
+  assert.equal(t.digest('/w').editedCount, 0);
+  assert.deepEqual(t.digest('/w').edited, []);
+  assert.deepEqual(t.editedPaths('/w'), []);
+  t.start(2, 'write_to_file', J({ TargetFile: '/w/src/a.ts' }));
+  t.start(3, 'write_to_file', J({ TargetFile: 'rel/b.ts' }));
+  t.start(4, 'write_to_file', J({ TargetFile: '/work2/c.ts' }));
+  const d = t.digest('/w/');
+  assert.equal(d.editedCount, 2);
+  assert.deepEqual(d.edited, ['src/a.ts', 'rel/b.ts']);
+  assert.deepEqual(t.editedPaths('/w'), ['src/a.ts', 'rel/b.ts']);
+  assert.equal(t.digest().editedCount, 4);
+});
+
+test('an edit under the resolved cwd is inside, relative to the root it is under', () => {
+  const t = new ProgressTracker();
+  t.start(1, 'write_to_file', J({ TargetFile: '/private/tmp/w/a.ts' }));
+  t.start(2, 'write_to_file', J({ TargetFile: '/tmp/w/b.ts' }));
+  t.start(3, 'write_to_file', J({ TargetFile: '/private/tmp/other/c.ts' }));
+  assert.deepEqual(t.editedPaths('/tmp/w'), ['b.ts']);
+  assert.deepEqual(t.editedPaths('/tmp/w', '/private/tmp/w'), ['a.ts', 'b.ts']);
+  const d = t.digest('/tmp/w', '/private/tmp/w/');
+  assert.equal(d.editedCount, 2);
+  assert.deepEqual(d.edited, ['a.ts', 'b.ts']);
+  t.start(4, 'write_to_file', J({ TargetFile: '/tmp/w/a.ts' }));
+  assert.deepEqual(t.editedPaths('/tmp/w', '/private/tmp/w'), ['b.ts', 'a.ts'], 'one file under both roots is listed once, at its latest edit');
+});

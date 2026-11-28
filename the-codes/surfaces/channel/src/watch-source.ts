@@ -9,6 +9,7 @@ import { livenessOf, type Liveness } from '../../mod/hooks/stale.ts';
 import { ACCEPTANCE_HOLD_MS, droppedMessageQuote, pipelineOutcome } from '../../mod/hooks/notice.ts';
 import { normalizeContinuationKind, type ContinuationKind } from '../../mod/hooks/turns.ts';
 import type { WatchableJob, WatchStatus } from './policy.ts';
+import type { Team } from '../../mod/types/index.d.ts';
 
 const reader = new AgentSmithReader();
 
@@ -123,6 +124,7 @@ export function watchLiveness(observed: ObservedJob, now: number): Liveness | nu
     lastEventAt: typeof raw['last_event_at'] === 'string' ? raw['last_event_at'] : null,
     lastAliveAt: typeof raw['last_alive_at'] === 'string' ? raw['last_alive_at'] : null,
     lastActivity: activity !== null && typeof activity === 'object' ? activity as { tool?: unknown; input?: unknown; status?: unknown } : null,
+    team: (raw['team'] ?? null) as Team | null,
   });
 }
 

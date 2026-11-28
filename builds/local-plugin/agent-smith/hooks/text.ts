@@ -72,3 +72,12 @@ export function oneLine(s: string, max = 400): string {
   const t = sanitizeText(s).replace(/\s+/g, ' ').trim();
   return clip(t, Math.max(0, max));
 }
+
+export function prettyJson(s: string): string {
+  try {
+    const v: unknown = JSON.parse(s);
+    return typeof v === 'object' && v !== null ? JSON.stringify(v, null, 2) : s;
+  } catch {
+    return s;
+  }
+}

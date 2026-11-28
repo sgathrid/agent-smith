@@ -1,5 +1,6 @@
 import type { ObservedJob } from '../harness/types.ts';
 import type { ProgressDigest } from '../surfaces/mod/hooks/progress.ts';
+import type { Team } from '../surfaces/mod/types/index.d.ts';
 import { reasonFromText } from '../surfaces/mod/hooks/reasons.ts';
 import { normalizeContinuationKind, type ContinuationKind, type ForgeActivity, type ForgeStatus, type WatchedFileSigs } from './format.ts';
 import type { Acceptance } from './checks.ts';
@@ -50,6 +51,7 @@ export interface JobSummary {
   readonly cwdMissingAtFinish?: boolean;
   readonly lastEventAt?: string | null;
   readonly lastAliveAt?: string | null;
+  readonly team?: Team;
 }
 
 export interface JobDetail extends JobSummary {
@@ -150,6 +152,7 @@ export function toSummary(observed: ObservedJob): JobSummary {
     ...(raw['cwdMissingAtFinish'] === true ? { cwdMissingAtFinish: true } : {}),
     ...(typeof raw['last_event_at'] === 'string' ? { lastEventAt: raw['last_event_at'] } : {}),
     ...(typeof raw['last_alive_at'] === 'string' ? { lastAliveAt: raw['last_alive_at'] } : {}),
+    ...(raw['team'] !== undefined && raw['team'] !== null ? { team: raw['team'] as Team } : {}),
   };
 }
 

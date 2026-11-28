@@ -1,4 +1,4 @@
-import path from'node:path';import {fileURLToPath}from'node:url';import {ad as noticeReason,ae as readJsonSafe,af as pipelineRecordPath,A as AgentSmithReader,q as normalize,d as readAcceptance,T as normalizeContinuationKind,l as isTerminalForgeStatus,W as WORKERS_DIR,f as isWorkerIdle,N as jobsDir,j as jobDir,a8 as pickHead,ag as workerIndexPath,O as parseWorkerIndex}from'./chunk-normalize.js';import {a as claudeText,d as droppedMessageQuote,b as pipelineOutcome,A as ACCEPTANCE_HOLD_MS,l as livenessOf,w as waitForChange}from'./chunk-stale.js';function pushKindFor(job) {
+import path from'node:path';import {fileURLToPath}from'node:url';import {af as noticeReason,ag as readJsonSafe,ah as pipelineRecordPath,A as AgentSmithReader,u as normalize,d as readAcceptance,V as normalizeContinuationKind,n as isTerminalForgeStatus,W as WORKERS_DIR,f as isWorkerIdle,Q as jobsDir,j as jobDir,aa as pickHead,ai as workerIndexPath,T as parseWorkerIndex}from'./chunk-normalize.js';import {a as claudeText,d as droppedMessageQuote,b as pipelineOutcome,A as ACCEPTANCE_HOLD_MS,l as livenessOf,w as waitForChange}from'./chunk-stale.js';function pushKindFor(job) {
     switch (job.status) {
         case 'succeeded':
             return 'finished';
@@ -177,6 +177,7 @@ function watchLiveness(observed, now) {
         lastEventAt: typeof raw['last_event_at'] === 'string' ? raw['last_event_at'] : null,
         lastAliveAt: typeof raw['last_alive_at'] === 'string' ? raw['last_alive_at'] : null,
         lastActivity: activity !== null && typeof activity === 'object' ? activity : null,
+        team: (raw['team'] ?? null),
     });
 }
 function livenessField(l) {

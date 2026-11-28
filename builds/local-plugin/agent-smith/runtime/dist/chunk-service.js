@@ -1,4 +1,4 @@
-import {n as readManifest,c as jobFile,F as FILES,o as ownerAlive,r as readPipeline,e as cancelPipeline,A as AgentSmithReader,q as normalize,t as errMessage,P as PROVIDERS,g as findProvider,u as probeAvailability,w as writeJsonAtomic,x as writeAtomic,j as jobDir,y as SCHEMA_VERSION,z as validOwnerPid,l as isTerminalForgeStatus,B as reportFor,C as cwdFacts,E as normalizeDenials,G as deriveOrphan,H as deriveStatus,I as summaryHead,J as failureFields,R as REASONS,d as readAcceptance,K as writeAcceptance,L as createMarker,W as WORKERS_DIR,N as jobsDir,O as parseWorkerIndex,p as providerNames,Q as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,T as normalizeContinuationKind,U as reasonFromText,V as fileSig,X as JobWriter,i as isTerminalStatus,k as isMode,Y as effectiveUnrestricted,Z as newJobId,_ as newWorkerId,$ as markAcceptancePending,a0 as humanDuration,a1 as pipeEvents,a2 as checksAbortRequested,a3 as verdictBlock,a4 as runAcceptance,a5 as senderOf,a6 as taskTitle,a7 as markAcceptanceSuperseded,a8 as pickHead,f as isWorkerIdle,a9 as compareTurnPriority,aa as computeStaleReads,ab as SMITH_PAYLOAD,ac as isForgeStatus}from'./chunk-normalize.js';import {existsSync,readFileSync,mkdirSync,appendFileSync,openSync,writeSync,closeSync,unlinkSync,statSync,renameSync,linkSync,readdirSync,realpathSync,lstatSync,copyFileSync}from'node:fs';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import path from'node:path';import {createHash}from'node:crypto';const LAUNCH_ACK_MS = 15_000;
+import {o as readManifest,c as jobFile,F as FILES,q as ownerAlive,r as readPipeline,e as cancelPipeline,A as AgentSmithReader,u as normalize,w as errMessage,P as PROVIDERS,g as findProvider,x as probeAvailability,y as writeJsonAtomic,z as writeAtomic,j as jobDir,B as SCHEMA_VERSION,C as validOwnerPid,n as isTerminalForgeStatus,E as reportFor,G as cwdFacts,H as normalizeDenials,I as deriveOrphan,J as deriveStatus,K as summaryHead,L as failureFields,R as REASONS,d as readAcceptance,N as writeAcceptance,O as createMarker,W as WORKERS_DIR,Q as jobsDir,T as parseWorkerIndex,p as providerNames,U as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,V as normalizeContinuationKind,X as reasonFromText,Y as fileSig,Z as JobWriter,i as isTerminalStatus,l as isMode,_ as effectiveUnrestricted,$ as newJobId,a0 as newWorkerId,a1 as markAcceptancePending,a2 as humanDuration,a3 as pipeEvents,a4 as checksAbortRequested,a5 as verdictBlock,a6 as runAcceptance,a7 as senderOf,a8 as taskTitle,a9 as markAcceptanceSuperseded,aa as pickHead,f as isWorkerIdle,ab as compareTurnPriority,ac as computeStaleReads,ad as SMITH_PAYLOAD,ae as isForgeStatus}from'./chunk-normalize.js';import {existsSync,readFileSync,mkdirSync,appendFileSync,openSync,writeSync,closeSync,unlinkSync,statSync,renameSync,linkSync,readdirSync,realpathSync,lstatSync,copyFileSync}from'node:fs';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import path from'node:path';import {createHash}from'node:crypto';const LAUNCH_ACK_MS = 15_000;
 async function launch(url, payload, onPrepared) {
     const child = fork(fileURLToPath(url), [], {
         detached: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
@@ -343,6 +343,25 @@ function buildBrief(input) {
             "Only claim what you can point to (command output, file contents, a diff); say what you couldn't verify. " +
             'If the task conflicts with what you find, say so rather than guess.',
     ].join('\n');
+}
+const SLASH_COMMAND_RE = /^\s*(\/[A-Za-z0-9_:-]+)(?=\s|$)/;
+/**
+ * The text sent to a worker: the brief in front of the prompt, except that a
+ * leading slash command stays first (when the provider expands one and the
+ * token is not an existing path), so the brief becomes its argument text.
+ */
+function joinBrief(brief, prompt, options) {
+    if (brief === '')
+        return prompt;
+    const m = options.slashCommands ? SLASH_COMMAND_RE.exec(prompt) : null;
+    if (m === null || options.isPath?.(m[1]) === true)
+        return `${brief}\n\n${prompt}`;
+    const rest = prompt.slice(m[0].length).replace(/^\s+/, '');
+    return `${m[1]} ${brief}${rest === '' ? '' : `\n\n${rest}`}`;
+}
+const SLASH_COMMAND_PROVIDERS = new Set(['agy', 'claude']);
+function expandsSlashCommands(provider) {
+    return SLASH_COMMAND_PROVIDERS.has(provider);
 }function appendSteerEntry(repo, jobId, entry) {
     const dir = jobDir(repo, jobId);
     mkdirSync(dir, { recursive: true });
@@ -1220,6 +1239,7 @@ function toSummary(observed) {
         ...(raw['cwdMissingAtFinish'] === true ? { cwdMissingAtFinish: true } : {}),
         ...(typeof raw['last_event_at'] === 'string' ? { lastEventAt: raw['last_event_at'] } : {}),
         ...(typeof raw['last_alive_at'] === 'string' ? { lastAliveAt: raw['last_alive_at'] } : {}),
+        ...(raw['team'] !== undefined && raw['team'] !== null ? { team: raw['team'] } : {}),
     };
 }
 function readDigest(v) {
@@ -1517,6 +1537,9 @@ function continuationModelAndEffort(head, entries, spec, defaultModel) {
     const effort = o.effort === 'default' ? undefined : (o.effort ?? spec?.effort ?? head.effort ?? undefined);
     return { modelRequested, modelExpected, effort };
 }
+function joinOptions(provider) {
+    return { slashCommands: expandsSlashCommands(provider), isPath: existsSync };
+}
 function applyOverrides(spec, o, provider, defaultModel) {
     if (Object.keys(o).length === 0)
         return spec;
@@ -1743,7 +1766,7 @@ class ForgeService {
         });
         const prependBrief = brief !== '' && !prompt.startsWith(brief);
         const preambleApplied = brief !== '';
-        const sentPrompt = prependBrief ? `${brief}\n\n${prompt}` : prompt;
+        const sentPrompt = prependBrief ? joinBrief(brief, prompt, joinOptions(provider.name)) : prompt;
         const jobId = newJobId(mode);
         const name = request.name?.trim() || `${mode}-${jobId.slice(-8)}`;
         if (name.length > 80)
@@ -1916,7 +1939,7 @@ class ForgeService {
                         resuming: false,
                         dirtyFiles: dirty,
                     });
-                    currentPrompt = `${fullBrief}\n\n${currentTurn.rawPrompt}`;
+                    currentPrompt = joinBrief(fullBrief, currentTurn.rawPrompt, joinOptions(provider.name));
                     currentWriter.updatePreamble(fullBrief);
                 }
             }

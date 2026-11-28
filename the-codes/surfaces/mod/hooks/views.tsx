@@ -1,9 +1,11 @@
 import type { UiComponents } from 'claude-code';
-import type { RadarJob } from '../types/index.d.ts';
+import type { ActivityEvent, MemberView, RadarJob, TeamMember, TeamMemberState } from '../types/index.d.ts';
 import type { ForgeDetail } from './canonical.ts';
 import { changedFilesPhrase, condenseTimeline, forgeList, isLive, needsAttention, paneChecksLabel, priorTurnSummary, scopeLine, statusLine, timelineGroupLabel, workerHead, workerHeading, workerLivenessLine, workerStatus, type TimelineItem } from './dashboard.ts';
-import { effectiveStart, elapsed, failureWords, isTerminal, oneLine, pendingSteersLabel, pickColor, pickGlyph, sanitizeText } from './format.ts';
+import { effectiveStart, elapsed, failureWords, isTerminal, oneLine, pendingSteersLabel, pickColor, pickGlyph, prettyJson, sanitizeText } from './format.ts';
 import { classify, progressSummaryLine } from './progress.ts';
+import { hasTeam, sortMembers, teamHeaderLine } from './team.ts';
+import { memberDetailLine, memberHeading, memberRow, nameWidth, TEAM_KEYS, TEAM_ROWS } from './team-view.ts';
 
 export interface ViewActions {
   pick(job: RadarJob): Promise<void>;
@@ -13,12 +15,15 @@ export interface ViewActions {
   task(): Promise<void>;
   tool(key: string): Promise<void>;
   close(): Promise<void>;
+  member(id: string): Promise<void>;
+  team(): Promise<void>;
+  memberBack(): Promise<void>;
   scope?(next: 'session' | 'all'): Promise<void>;
 }
 export interface ViewOptions {
   width: number; now: number; colour: boolean; page: number; scope: 'session' | 'all';
   following: boolean; taskOpen: boolean; tools: readonly string[];
-  pinnedTurnId: string | null;
+  pinnedTurnId: string | null; teamOpen: boolean;
 }
 
 const PAGE_SIZE = 9;
@@ -36,6 +41,7 @@ export function renderList(W: UiComponents, jobs: readonly RadarJob[], o: ViewOp
       ? 'Workers you start here appear in this list. /forge all shows the repository\'s history.'
       : 'No workers yet.'}</Text>}
     {all.slice(start,start+PAGE_SIZE).map((job,i) => <Box key={`worker-${job.workerId}`} flexDirection="column">
+      {start+i===live && i>0 && <Box key="recent-gap"><Text> </Text></Box>}
       {start+i===live && <Text bold wrap="truncate-end">Recent</Text>}
       <Button key={`job-${job.workerId}`} plain hotkey={String(i+1)} label={workerHeading(job)} onPress={() => a.pick(job)}>
         <Text color={o.colour&&(isLive(job)||needsAttention(job,o.now))?pickColor(job.status):undefined} wrap="truncate-end">{pickGlyph(job.status)}</Text>
@@ -98,6 +104,7 @@ export function renderWorker(W: UiComponents, d: ForgeDetail, o: ViewOptions, a:
   return <Box flexDirection="column">
     <Text bold color={o.colour?pickColor(job.status):undefined} wrap="truncate-end">{line1}</Text>
     {line2!=='' && <Text dimColor wrap="truncate-end">{line2}</Text>}
+    {hasTeam(job.team) && <Text dimColor wrap="truncate-end">{teamHeaderLine(job.team)}</Text>}
     {line3!=='' && <Text wrap="truncate-end">{sanitizeText(line3)}</Text>}
     {note!=='' && <Text dimColor wrap="truncate-end">{`Note: ${note}`}</Text>}
     {livenessLine!==null && <Text dimColor={livenessLine.tone==='dim'} color={o.colour&&livenessLine.tone!=='dim'?livenessLine.tone:undefined} wrap="truncate-end">{livenessLine.text}</Text>}
@@ -113,19 +120,9 @@ export function renderWorker(W: UiComponents, d: ForgeDetail, o: ViewOptions, a:
       : <Text dimColor wrap="truncate-end">{`Task: ${oneLine(taskMessage,Math.max(1,o.width-8))}`}</Text>}
     {o.taskOpen && <Markdown text={sanitizeText(job.preamble?`${job.preamble}\n\n${prompt}`:prompt)} />}
     {o.taskOpen && <Text dimColor wrap="wrap">{sanitizeText(`${oneLine(job.id)}\nWorker: ${oneLine(job.workerId)}${job.pipeline?`\nPipeline: ${oneLine(job.pipeline)} · ${oneLine(job.stage??'stage unknown')}`:''}${job.attempt!=null?`\nAttempt: ${job.attempt}`:''}`)}</Text>}
+    {hasTeam(job.team) && teamSection(W,job.team.members,o,a)}
     {visibleTimeline.length>0 && <Box key="transcript-gap"><Text> </Text></Box>}
-    {condenseTimeline(visibleTimeline).flatMap((item,i,items) => {
-      const followedByProse=i+1<items.length&&isProse(items[i+1]!)!==isProse(item);
-      const row=item.kind==='group'
-        ? timelineGroup(W,item,o,a,!followedByProse)
-        : item.event.kind==='assistant'
-          ? <Markdown key={`event-${item.event.sequence}`} text={proseText(item.event.text)} />
-          : item.event.kind==='message'
-          ? <Text key={`event-${item.event.sequence}`} color={o.colour?'cyan':undefined} wrap="truncate-end">{messageLine(item.event.sender,item.event.text,o.width)}</Text>
-          : toolRow(W,`event-${item.event.sequence}`,item.event.tool,item.event.input,item.event.output,item.event.state,o,a,!followedByProse);
-      return i>0&&isProse(items[i-1]!)!==isProse(item)
-        ? [<Box key={`gap-${timelineKey(item)}`}><Text> </Text></Box>,row] : [row];
-    })}
+    {timelineRows(W,visibleTimeline,o,a)}
     {visibleTimeline.length===0 && <Text dimColor wrap="wrap">{sanitizeText(job.latestSummary??'No worker activity recorded yet.')}</Text>}
     {isTerminal(job.status)
       ? <Box flexDirection="column">
@@ -140,17 +137,86 @@ export function renderWorker(W: UiComponents, d: ForgeDetail, o: ViewOptions, a:
     </Box>)}
     <Box flexDirection="row" gap={2}>
       <Button key="task" plain label="Task" hotkey="t" onPress={a.task} />
+      {hasTeam(job.team) && job.team.members.length > TEAM_ROWS && <Button key="team" plain label="Team" hotkey="m" onPress={a.team} />}
       <Button key="back" plain label="Back" hotkey="b" onPress={a.back} />
       <Button key="close" plain label="Close" hotkey="x" onPress={a.close} />
     </Box>
   </Box>;
 }
 
+function teamSection(W: UiComponents, all: readonly TeamMember[], o: ViewOptions, a: ViewActions): JSX.Element {
+  const {Box,Text,Button}=W;
+  const members=sortMembers(all);
+  const shown=o.teamOpen?members:members.slice(0,TEAM_ROWS);
+  const hidden=members.length-shown.length;
+  const cw=Math.max(1,o.width-4);
+  const names=nameWidth(shown,24);
+  return <Box key="team-section" flexDirection="column">
+    <Box key="team-gap"><Text> </Text></Box>
+    <Text bold wrap="truncate-end">Team</Text>
+    {shown.map((m,i) => {
+      const line=memberRow(m,o.now,cw,names);
+      const glyph=line.slice(0,1);
+      return <Button key={`member-${m.id}`} plain {...(i<TEAM_KEYS?{hotkey:String(i+1)}:{})} label={line} onPress={() => a.member(m.id)}>
+        <Text color={o.colour?memberColor(m.state):undefined} wrap="truncate-end">{glyph}</Text>
+        {line.slice(1)}
+      </Button>;
+    })}
+    {hidden>0 && <Text dimColor wrap="truncate-end">{`  + ${hidden} more · m: all`}</Text>}
+  </Box>;
+}
+
+const memberColor=(state: TeamMemberState): 'blue' | 'green' | 'red' | undefined =>
+  state==='working'?'blue':state==='done'?'green':state==='failed'?'red':undefined;
+
+export function renderMember(W: UiComponents, job: RadarJob, member: TeamMember, view: MemberView | null, o: ViewOptions, a: ViewActions): JSX.Element {
+  const {Box,Text,Button,Markdown}=W;
+  const task=oneLine(member.task??'');
+  const timeline=view?.timeline??[];
+  return <Box flexDirection="column">
+    <Text bold color={o.colour?memberColor(member.state):undefined} wrap="truncate-end">{memberHeading(member,workerHeading(job),o.now)}</Text>
+    <Text dimColor wrap="truncate-end">{memberDetailLine(member)}</Text>
+    <Box key="header-gap"><Text> </Text></Box>
+    {task!=='' && <Text dimColor wrap="truncate-end">{`Task: ${oneLine(task,Math.max(1,o.width-8))}`}</Text>}
+    {view===null
+      ? <Text dimColor wrap="wrap">No detail recorded yet.</Text>
+      : <Box flexDirection="column">
+        {o.taskOpen && (view.brief?.trim() ?? '')!=='' && <Markdown text={sanitizeText(view.brief!)} />}
+        {timeline.length>0 && <Box key="transcript-gap"><Text> </Text></Box>}
+        {timelineRows(W,timeline,o,a)}
+        <Text bold wrap="truncate-end">Result</Text>
+        {view.report?.trim()?<Markdown text={sanitizeText(view.report)}/>
+          :<Text dimColor wrap="wrap">{member.state==='working'?'No post yet.':'No report recorded.'}</Text>}
+      </Box>}
+    <Box flexDirection="row" gap={2}>
+      <Button key="task" plain label="Task" hotkey="t" onPress={a.task} />
+      <Button key="back" plain label="Back" hotkey="b" onPress={a.memberBack} />
+      <Button key="close" plain label="Close" hotkey="x" onPress={a.close} />
+    </Box>
+  </Box>;
+}
+
+function timelineRows(W: UiComponents, timeline: readonly ActivityEvent[], o: ViewOptions, a: ViewActions): JSX.Element[] {
+  const {Box,Text,Markdown}=W;
+  return condenseTimeline(timeline).flatMap((item,i,items) => {
+    const followedByProse=i+1<items.length&&isProse(items[i+1]!)!==isProse(item);
+    const row=item.kind==='group'
+      ? timelineGroup(W,item,o,a,!followedByProse)
+      : item.event.kind==='assistant'
+        ? <Markdown key={`event-${item.event.sequence}`} text={proseText(item.event.text)} />
+        : item.event.kind==='message'
+        ? <Text key={`event-${item.event.sequence}`} color={o.colour?'cyan':undefined} wrap="truncate-end">{messageLine(item.event.sender,item.event.text,o.width)}</Text>
+        : toolRow(W,`event-${item.event.sequence}`,item.event.tool,item.event.input,item.event.output,item.event.state,o,a,!followedByProse);
+    return i>0&&isProse(items[i-1]!)!==isProse(item)
+      ? [<Box key={`gap-${timelineKey(item)}`}><Text> </Text></Box>,row] : [row];
+  });
+}
+
 function toolRow(W: UiComponents,key:string,tool:string,input:string,output:string,state:string,o:ViewOptions,a:ViewActions,trailingGap=true): JSX.Element {
   const {Box,Text,Button}=W;
   const expanded=o.tools.includes(key);
   const glyph=state==='active'?activeGlyph(o.now):state==='error'?'✗':expanded?'▾':'✓';
-  const label=`${glyph} ${oneLine(classify(tool,input).label,Math.max(1,o.width-3))}`;
+  const label=`${glyph} ${oneLine(classify(tool,input,output).label,Math.max(1,o.width-3))}`;
   return <Box key={`row-${key}`} flexDirection="column">
     {state==='error'
       ? <Button key={key} plain dimColor={false} label={label} onPress={() => a.tool(key)}>
@@ -160,7 +226,7 @@ function toolRow(W: UiComponents,key:string,tool:string,input:string,output:stri
     {expanded&&<Box key={`body-${key}`} flexDirection="row">
       <Text>{'  '}</Text>
       <Box flexDirection="column">
-        <Text dimColor wrap="wrap">{sanitizeText(`${oneLine(tool)} ${input}${output?`\n${output}`:''}`)}</Text>
+        <Text dimColor wrap="wrap">{sanitizeText(`${oneLine(tool)} ${input}${output?`\n${prettyJson(output)}`:''}`)}</Text>
       </Box>
     </Box>}
     {expanded&&trailingGap&&<Box key={`end-${key}`}><Text> </Text></Box>}
@@ -172,7 +238,7 @@ function timelineGroup(W: UiComponents, item: Extract<TimelineItem,{kind:'group'
   const expanded=o.tools.includes(item.key);
   const childOpts={...o,width:Math.max(1,o.width-2)};
   return <Box key={`row-${item.key}`} flexDirection="column">
-    <Button key={item.key} plain dimColor={!expanded} label={`${expanded?'▾':'✓'} ${oneLine(timelineGroupLabel(item.reads,item.searches,item.commands),Math.max(1,o.width-3))}`} onPress={() => a.tool(item.key)} />
+    <Button key={item.key} plain dimColor={!expanded} label={`${expanded?'▾':'✓'} ${oneLine(timelineGroupLabel(item.reads,item.searches,item.commands,item.team),Math.max(1,o.width-3))}`} onPress={() => a.tool(item.key)} />
     {expanded && <Box key={`body-${item.key}`} flexDirection="row">
       <Text>{'  '}</Text>
       <Box flexDirection="column">

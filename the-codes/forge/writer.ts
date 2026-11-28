@@ -2,7 +2,7 @@
 import { classify, ProgressTracker } from '../surfaces/mod/hooks/progress.ts';
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 
 import { createMarker, writeAtomic, writeJsonAtomic } from './atomic.ts';
@@ -34,12 +34,16 @@ import {
   type WatchedFileSigs,
 } from './format.ts';
 import type { JobResult, ProviderEvent, WorkerHandle } from '../providers/types.ts';
+import type { MemberView, Team } from '../surfaces/mod/types/index.d.ts';
+import { memberFileName } from '../surfaces/mod/hooks/team.ts';
 
 const RECENT_ACTIVITIES = 5;
 
 const LATEST_TEXT_CHARS = 4_000;
 
 const SUMMARY_CHARS = 1_000;
+
+export const TEAM_MEMBERS_CAP = 64;
 
 export interface JobWriterOptions {
   readonly repo: string;
@@ -108,6 +112,7 @@ export class JobWriter {
   private finished = false;
   private cancelRequestedAt: string | null = null;
   private cwd = '';
+  private realCwd = '';
   private baselinePending: Promise<void> | null = null;
   private baselineSigs = new Map<string, string>();
   private changed: { files: string[]; truncated: boolean } | null = null;
@@ -116,6 +121,11 @@ export class JobWriter {
   private toolInputs = '';
   private editToolInputs = '';
   private readonly editStepsCompleted = new Set<number>();
+  private team: Team | null = null;
+  private teamDirty = false;
+  private readonly pendingViews = new Map<string, MemberView>();
+  private readonly writtenViews = new Map<string, string>();
+  private lastTeamFlushMs = 0;
 
   constructor(options: JobWriterOptions) {
     this.repo = options.repo;
@@ -201,6 +211,7 @@ export class JobWriter {
     this.writeManifest();
     this.flushProgress(this.manifest.createdAt);
     this.cwd = input.cwd;
+    this.realCwd = realPathOr(input.cwd);
     this.baselinePending = isInsideGitRepo(input.cwd) ? this.captureBaseline(input.cwd) : null;
     return manifest;
   }
@@ -236,7 +247,7 @@ export class JobWriter {
   }
 
   editedFiles(candidates?: readonly string[]): string[] {
-    const fromTracker = this.tracker.editedPaths(this.cwd);
+    const fromTracker = this.tracker.editedPaths(this.cwd, this.realCwd);
     if (candidates === undefined) return fromTracker;
     const fromEditInputs =
       this.editToolInputs !== '' ? attributeChanged(candidates, this.editToolInputs).mine : [];
@@ -308,12 +319,44 @@ export class JobWriter {
     if (!shouldFlush(this.lastHeartbeatFlushMs, Number.isNaN(nowMs) ? Date.now() : nowMs, this.flushMs)) return;
     this.lastHeartbeatFlushMs = Number.isNaN(nowMs) ? Date.now() : nowMs;
     writeJsonAtomic(jobFile(this.repo, this.jobId, FILES.progress), this.progress);
+    try { this.flushTeam(); } catch {}
+  }
+
+  onTeam(at: string, team: Team, views: readonly MemberView[]): void {
+    if (this.finished || this.manifest === null) return;
+    const members = team.members.slice(0, TEAM_MEMBERS_CAP);
+    const kept = new Set(members.map((m) => m.id));
+    this.team = { ...team, members };
+    for (const view of views) if (kept.has(view.id)) this.pendingViews.set(view.id, view);
+    this.teamDirty = true;
+    const nowMs = Date.parse(at);
+    const clock = Number.isNaN(nowMs) ? Date.now() : nowMs;
+    if (shouldFlush(this.lastTeamFlushMs, clock, this.flushMs)) { this.lastTeamFlushMs = clock; try { this.flushTeam(); } catch {} }
+  }
+
+  private flushTeam(): void {
+    if (!this.teamDirty || this.team === null) return;
+    writeJsonAtomic(jobFile(this.repo, this.jobId, FILES.team), this.team);
+    for (const [id, view] of this.pendingViews) {
+      const body = JSON.stringify(view);
+      if (this.writtenViews.get(id) !== body) {
+        try {
+          writeAtomic(jobFile(this.repo, this.jobId, path.join(FILES.members, memberFileName(id))), body);
+        } catch {
+          continue;
+        }
+        this.writtenViews.set(id, body);
+      }
+      this.pendingViews.delete(id);
+    }
+    this.teamDirty = this.pendingViews.size > 0;
   }
 
   onEvent(event: ProviderEvent): void {
     if (this.finished || this.manifest === null) return;
     switch (event.kind) {
       case 'heartbeat': this.heartbeat(event.at, event.pid); return;
+      case 'team': this.onTeam(event.at, event.team, event.views); return;
       case 'started': this.onStarted(event); return;
       case 'activity-start':
       case 'activity-update':
@@ -644,7 +687,7 @@ export class JobWriter {
       ...(this.lastAliveAt === null ? {} : { lastAliveAt: this.lastAliveAt }),
       ...(this.workerPid === undefined ? {} : { workerPid: this.workerPid }),
       warnings: this.progress?.warnings ?? [],
-      digest: this.tracker.digest(this.cwd),
+      digest: this.tracker.digest(this.cwd, this.realCwd),
       ...(this.progress?.pendingSteers !== undefined ? { pendingSteers: this.progress.pendingSteers } : {}),
     };
     const nowMs = Date.parse(at);
@@ -680,6 +723,7 @@ export class JobWriter {
     writeJsonAtomic(jobFile(this.repo, this.jobId, FILES.view), this.view);
     const ms = Date.parse(at);
     this.lastFlushMs = Number.isNaN(ms) ? Date.now() : ms;
+    try { this.flushTeam(); } catch {}
   }
 }
 
@@ -689,6 +733,10 @@ function gitCapMs(): number {
 }
 const TOOL_INPUTS_CAP = 200_000;
 const CHANGED_FILES_SIG_CAP = 500;
+
+function realPathOr(dir: string): string {
+  try { return realpathSync(dir); } catch { return dir; }
+}
 
 function isInsideGitRepo(cwd: string): boolean {
   let dir = path.resolve(cwd);
