@@ -819,6 +819,14 @@ test('latestSummary shows only the current message while running, and is null on
   assert.equal(progress.latestSummary, null);
 });
 
+test('a job that ends with no report keeps its last message as the summary', () => {
+  const r = repo();
+  const w = startIn(r, r, 'review');
+  w.onEvent({ kind: 'text', at: now(), stream: 'assistant', text: 'Running cargo test; waiting.' });
+  const m = w.finish(result({ ok: false, status: 'timeout', response: '' }), null);
+  assert.deepEqual([m.latestSummary, m.summarySource], ['Running cargo test; waiting.', 'worker']);
+});
+
 function viewOf(r: string, w: JobWriter): { timeline: { kind: string; text?: string; tool?: string; messageKey?: string }[]; transcript: string[] } {
   return JSON.parse(readFileSync(jobFile(r, w.jobId, FILES.view), 'utf8'));
 }

@@ -2459,6 +2459,10 @@ function oneLine(s, max = 400) {
 const SUMMARY_CHARS = 1_000;
 /** A short summary of a worker's report or current message: its opening, without a leading
  * `Status:` line, cut at a paragraph or line boundary within `max`. */
+/** A job's short summary: its report's opening once it has a report, else the worker's last message. */
+function jobSummary(report, lastMessage) {
+    return reportSummary(report ?? '') || lastMessage?.trim() || null;
+}
 function reportSummary(text, max = SUMMARY_CHARS) {
     const t = text.trim().replace(/^Status:[^\n]*(?:\n|$)/, '').trim();
     if (t.length <= max)
@@ -7471,8 +7475,8 @@ class JobWriter {
             ...(this.toolErrorSteps.size === 0 ? {} : { toolErrors: this.toolErrorSteps.size }),
             ...(failedEarly ? { failedEarly: true } : {}),
             conversation: this.conversation,
-            latestSummary: null,
-            summarySource: null,
+            latestSummary: report?.trim() ? null : this.manifest.latestSummary ?? null,
+            summarySource: report?.trim() ? null : this.manifest.summarySource ?? null,
             ...(this.changed === null
                 ? { changedFilesUnknown: true }
                 : { changedFiles: this.changed.files, changedFilesTruncated: this.changed.truncated }),
@@ -7508,8 +7512,6 @@ class JobWriter {
             error: reason,
             reason: status === 'failed' ? reason.split(' · ')[0] : null,
             jobStatus: status === 'canceled' ? 'cancelled' : 'malformed',
-            latestSummary: null,
-            summarySource: null,
             ...(this.manifest.pendingSteers !== undefined ? { pendingSteers: 0 } : {}),
         };
         this.manifest = manifest;
@@ -9567,4 +9569,4 @@ function asUsage(v) {
 /** Normalize a raw agent-smith job snapshot. */
 function normalize(raw) {
     return smithNormalizer(raw);
-}export{effectiveUnrestricted as $,AgentSmithReader as A,writeAtomic as B,SCHEMA_VERSION as C,DEFAULT_TIMEOUT_MS as D,validOwnerPid as E,FILES as F,reportFor as G,cwdFacts as H,normalizeDenials as I,deriveOrphan as J,deriveStatus as K,failureFields as L,MODES as M,writeAcceptance as N,createMarker as O,PROVIDERS as P,withoutAnswer as Q,REASONS as R,STAGE_PROMPTS as S,jobsDir as T,parseWorkerIndex as U,getProvider as V,WORKERS_DIR as W,normalizeContinuationKind as X,reasonFromText as Y,fileSig as Z,JobWriter as _,MODE_PRESETS as a,newJobId$1 as a0,newWorkerId as a1,markAcceptancePending as a2,humanDuration as a3,pipeEvents as a4,checksAbortRequested as a5,verdictBlock as a6,runAcceptance as a7,senderOf as a8,taskTitle as a9,markAcceptanceSuperseded as aa,pickHead as ab,compareTurnPriority as ac,computeStaleReads as ad,SMITH_PAYLOAD as ae,isForgeStatus as af,noticeReason as ag,readJsonSafe as ah,pipelineRecordPath as ai,workerIndexPath as aj,checksReason as ak,toolLabel as al,inheritContinuedProviders as b,readPipeline as c,jobFile as d,readAcceptance as e,cancelPipeline as f,isWorkerIdle as g,hasTeam as h,isTerminalStatus as i,jobDir as j,findProvider as k,effectiveDefaultUnrestricted as l,missingPipelineError as m,isMode as n,isTerminalForgeStatus as o,providerNames as p,readManifest as q,reportSummary as r,startPipeline as s,teamCounts as t,ownerAlive as u,validateSpec as v,normalize as w,errMessage as x,probeAvailability as y,writeJsonAtomic as z};
+}export{effectiveUnrestricted as $,AgentSmithReader as A,writeAtomic as B,SCHEMA_VERSION as C,DEFAULT_TIMEOUT_MS as D,validOwnerPid as E,FILES as F,reportFor as G,cwdFacts as H,normalizeDenials as I,deriveOrphan as J,deriveStatus as K,failureFields as L,MODES as M,writeAcceptance as N,createMarker as O,PROVIDERS as P,withoutAnswer as Q,REASONS as R,STAGE_PROMPTS as S,jobsDir as T,parseWorkerIndex as U,getProvider as V,WORKERS_DIR as W,normalizeContinuationKind as X,reasonFromText as Y,fileSig as Z,JobWriter as _,MODE_PRESETS as a,newJobId$1 as a0,newWorkerId as a1,markAcceptancePending as a2,humanDuration as a3,pipeEvents as a4,checksAbortRequested as a5,verdictBlock as a6,runAcceptance as a7,senderOf as a8,taskTitle as a9,markAcceptanceSuperseded as aa,pickHead as ab,compareTurnPriority as ac,computeStaleReads as ad,SMITH_PAYLOAD as ae,isForgeStatus as af,noticeReason as ag,readJsonSafe as ah,pipelineRecordPath as ai,workerIndexPath as aj,checksReason as ak,toolLabel as al,inheritContinuedProviders as b,jobDir as c,jobFile as d,readAcceptance as e,cancelPipeline as f,isWorkerIdle as g,hasTeam as h,isTerminalStatus as i,jobSummary as j,findProvider as k,effectiveDefaultUnrestricted as l,missingPipelineError as m,isMode as n,isTerminalForgeStatus as o,providerNames as p,readManifest as q,readPipeline as r,startPipeline as s,teamCounts as t,ownerAlive as u,validateSpec as v,normalize as w,errMessage as x,probeAvailability as y,writeJsonAtomic as z};

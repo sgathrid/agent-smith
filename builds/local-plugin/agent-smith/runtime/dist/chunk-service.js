@@ -1,4 +1,4 @@
-import {q as readManifest,d as jobFile,F as FILES,u as ownerAlive,c as readPipeline,f as cancelPipeline,A as AgentSmithReader,w as normalize,x as errMessage,P as PROVIDERS,k as findProvider,y as probeAvailability,z as writeJsonAtomic,B as writeAtomic,j as jobDir,C as SCHEMA_VERSION,E as validOwnerPid,o as isTerminalForgeStatus,G as reportFor,H as cwdFacts,I as normalizeDenials,J as deriveOrphan,K as deriveStatus,L as failureFields,R as REASONS,e as readAcceptance,N as writeAcceptance,O as createMarker,Q as withoutAnswer,W as WORKERS_DIR,T as jobsDir,U as parseWorkerIndex,p as providerNames,V as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,X as normalizeContinuationKind,i as isTerminalStatus,r as reportSummary,Y as reasonFromText,Z as fileSig,_ as JobWriter,n as isMode,$ as effectiveUnrestricted,a0 as newJobId,a1 as newWorkerId,a2 as markAcceptancePending,a3 as humanDuration,a4 as pipeEvents,a5 as checksAbortRequested,a6 as verdictBlock,a7 as runAcceptance,a8 as senderOf,a9 as taskTitle,aa as markAcceptanceSuperseded,ab as pickHead,g as isWorkerIdle,ac as compareTurnPriority,ad as computeStaleReads,ae as SMITH_PAYLOAD,af as isForgeStatus}from'./chunk-normalize.js';import {existsSync,readFileSync,mkdirSync,appendFileSync,openSync,writeSync,closeSync,unlinkSync,statSync,renameSync,linkSync,readdirSync,realpathSync,lstatSync,copyFileSync}from'node:fs';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import path from'node:path';import {createHash}from'node:crypto';const LAUNCH_ACK_MS = 15_000;
+import {q as readManifest,d as jobFile,F as FILES,u as ownerAlive,r as readPipeline,f as cancelPipeline,A as AgentSmithReader,w as normalize,x as errMessage,P as PROVIDERS,k as findProvider,y as probeAvailability,z as writeJsonAtomic,B as writeAtomic,c as jobDir,C as SCHEMA_VERSION,E as validOwnerPid,o as isTerminalForgeStatus,G as reportFor,H as cwdFacts,I as normalizeDenials,J as deriveOrphan,K as deriveStatus,L as failureFields,R as REASONS,e as readAcceptance,N as writeAcceptance,O as createMarker,Q as withoutAnswer,W as WORKERS_DIR,T as jobsDir,U as parseWorkerIndex,p as providerNames,V as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,X as normalizeContinuationKind,i as isTerminalStatus,j as jobSummary,Y as reasonFromText,Z as fileSig,_ as JobWriter,n as isMode,$ as effectiveUnrestricted,a0 as newJobId,a1 as newWorkerId,a2 as markAcceptancePending,a3 as humanDuration,a4 as pipeEvents,a5 as checksAbortRequested,a6 as verdictBlock,a7 as runAcceptance,a8 as senderOf,a9 as taskTitle,aa as markAcceptanceSuperseded,ab as pickHead,g as isWorkerIdle,ac as compareTurnPriority,ad as computeStaleReads,ae as SMITH_PAYLOAD,af as isForgeStatus}from'./chunk-normalize.js';import {existsSync,readFileSync,mkdirSync,appendFileSync,openSync,writeSync,closeSync,unlinkSync,statSync,renameSync,linkSync,readdirSync,realpathSync,lstatSync,copyFileSync}from'node:fs';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import path from'node:path';import {createHash}from'node:crypto';const LAUNCH_ACK_MS = 15_000;
 async function launch(url, payload, onPrepared) {
     const child = fork(fileURLToPath(url), [], {
         detached: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
@@ -547,8 +547,7 @@ function reconcileOrphan(repo, jobId, now = Date.now()) {
                     ...(nonfatal === true ? { nonfatal: true } : {}),
                 })),
                 usage: result.usage === undefined ? null : Object.fromEntries(Object.entries(result.usage).filter((entry) => typeof entry[1] === 'number')),
-                latestSummary: null,
-                summarySource: null,
+                ...(report?.trim() ? { latestSummary: null, summarySource: null } : {}),
                 changedFilesUnknown: true,
                 ...(facts.cwdMissing ? { cwdMissingAtFinish: true } : {}),
             });
@@ -1211,9 +1210,8 @@ function toSummary(observed) {
         reason: typeof raw['reason'] === 'string' && raw['reason'] !== '' ? raw['reason'] : null,
         error: typeof raw['error'] === 'string' ? raw['error'] : null,
     });
-    const latestSummary = isTerminalStatus(observed.status)
-        ? reportSummary(observed.output ?? '') || null
-        : raw['summarySource'] === 'worker' && typeof raw['latestSummary'] === 'string' ? raw['latestSummary'] : null;
+    const lastMessage = raw['summarySource'] === 'worker' && typeof raw['latestSummary'] === 'string' ? raw['latestSummary'] : null;
+    const latestSummary = isTerminalStatus(observed.status) ? jobSummary(observed.output, lastMessage) : lastMessage;
     return {
         jobId: observed.jobId,
         name: typeof raw['name'] === 'string' && raw['name'] ? raw['name'] : observed.jobId,

@@ -2,7 +2,7 @@ import type { ObservedJob } from '../harness/types.ts';
 import type { ProgressDigest } from '../surfaces/mod/hooks/progress.ts';
 import type { Team } from '../surfaces/mod/types/index.d.ts';
 import { reasonFromText } from '../surfaces/mod/hooks/reasons.ts';
-import { reportSummary } from '../surfaces/mod/hooks/text.ts';
+import { jobSummary } from '../surfaces/mod/hooks/text.ts';
 import { isTerminalStatus } from '../surfaces/mod/hooks/turns.ts';
 import { normalizeContinuationKind, type ContinuationKind, type ForgeActivity, type ForgeStatus, type WatchedFileSigs } from './format.ts';
 import type { Acceptance } from './checks.ts';
@@ -112,9 +112,8 @@ export function toSummary(observed: ObservedJob): JobSummary {
     reason: typeof raw['reason'] === 'string' && raw['reason'] !== '' ? raw['reason'] : null,
     error: typeof raw['error'] === 'string' ? raw['error'] : null,
   });
-  const latestSummary = isTerminalStatus(observed.status)
-    ? reportSummary(observed.output ?? '') || null
-    : raw['summarySource'] === 'worker' && typeof raw['latestSummary'] === 'string' ? raw['latestSummary'] : null;
+  const lastMessage = raw['summarySource'] === 'worker' && typeof raw['latestSummary'] === 'string' ? raw['latestSummary'] : null;
+  const latestSummary = isTerminalStatus(observed.status) ? jobSummary(observed.output, lastMessage) : lastMessage;
   return {
     jobId: observed.jobId,
     name: typeof raw['name'] === 'string' && raw['name'] ? raw['name'] : observed.jobId,

@@ -7,7 +7,7 @@ import type { Acceptance } from '../../../forge/checks.ts';
 import type { PipelineRecord } from '../../../forge/execute.ts';
 import { livenessOf, type Liveness } from '../../mod/hooks/stale.ts';
 import { isTerminalStatus } from '../../mod/hooks/turns.ts';
-import { reportSummary } from '../../mod/hooks/text.ts';
+import { jobSummary } from '../../mod/hooks/text.ts';
 import { hasTeam, teamCounts, type TeamCounts } from '../../mod/hooks/team.ts';
 
 export type ResponseFormat = 'concise' | 'detailed';
@@ -180,7 +180,7 @@ export function conciseStatus(d: JobDetail & { turn?: number; continuedFrom?: st
 
 export function earlierTurn(d: JobDetail & { turn?: number; continuedFrom?: string; continuationKind?: ContinuationKind }, reportPath: string, fmt: ResponseFormat) {
   const report = d.report ?? '';
-  const rawSummary = reportSummary(report);
+  const rawSummary = jobSummary(report, d.latestSummary);
   const summary = rawSummary ? trimWords(rawSummary, EARLIER_SUMMARY_CHARS) : null;
   const base = {
     turn: d.turn ?? 1,

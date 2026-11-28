@@ -73,8 +73,7 @@ export function reconcileOrphan(repo: string, jobId: string, now = Date.now()): 
         })),
         usage: result.usage === undefined ? null : Object.fromEntries(
           Object.entries(result.usage).filter((entry) => typeof entry[1] === 'number')),
-        latestSummary: null,
-        summarySource: null,
+        ...(report?.trim() ? { latestSummary: null, summarySource: null } : {}),
         changedFilesUnknown: true,
         ...(facts.cwdMissing ? { cwdMissingAtFinish: true } : {}),
       });

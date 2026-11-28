@@ -1,4 +1,4 @@
-import path from'node:path';import {fileURLToPath}from'node:url';import {ag as noticeReason,ah as readJsonSafe,ai as pipelineRecordPath,A as AgentSmithReader,w as normalize,e as readAcceptance,X as normalizeContinuationKind,o as isTerminalForgeStatus,r as reportSummary,W as WORKERS_DIR,g as isWorkerIdle,T as jobsDir,j as jobDir,ab as pickHead,aj as workerIndexPath,U as parseWorkerIndex}from'./chunk-normalize.js';import {a as claudeText,d as droppedMessageQuote,b as pipelineOutcome,A as ACCEPTANCE_HOLD_MS,l as livenessOf,w as waitForChange}from'./chunk-stale.js';function pushKindFor(job) {
+import path from'node:path';import {fileURLToPath}from'node:url';import {ag as noticeReason,ah as readJsonSafe,ai as pipelineRecordPath,A as AgentSmithReader,w as normalize,e as readAcceptance,X as normalizeContinuationKind,o as isTerminalForgeStatus,j as jobSummary,W as WORKERS_DIR,g as isWorkerIdle,T as jobsDir,c as jobDir,ab as pickHead,aj as workerIndexPath,U as parseWorkerIndex}from'./chunk-normalize.js';import {a as claudeText,d as droppedMessageQuote,b as pipelineOutcome,A as ACCEPTANCE_HOLD_MS,l as livenessOf,w as waitForChange}from'./chunk-stale.js';function pushKindFor(job) {
     switch (job.status) {
         case 'succeeded':
             return 'finished';
@@ -133,9 +133,8 @@ async function readOne(cwd, jobId, now) {
     const droppedMessage = dropped ? droppedMessageQuote(dropped.message) : null;
     const pending = raw['pendingSteers'];
     const status = toWatchStatus(observed, now);
-    const latestSummary = isTerminalForgeStatus(observed.status)
-        ? reportSummary(observed.output ?? '') || null
-        : typeof raw['latestSummary'] === 'string' ? raw['latestSummary'] : null;
+    const lastMessage = typeof raw['latestSummary'] === 'string' ? raw['latestSummary'] : null;
+    const latestSummary = isTerminalForgeStatus(observed.status) ? jobSummary(observed.output, lastMessage) : lastMessage;
     const acceptancePending = isTerminalForgeStatus(status) && isAcceptancePending(observed.finishedAt, acceptance, now);
     return {
         id: observed.jobId,

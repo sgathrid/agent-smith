@@ -558,8 +558,8 @@ export class JobWriter {
       ...(this.toolErrorSteps.size === 0 ? {} : { toolErrors: this.toolErrorSteps.size }),
       ...(failedEarly ? { failedEarly: true } : {}),
       conversation: this.conversation,
-      latestSummary: null,
-      summarySource: null,
+      latestSummary: report?.trim() ? null : this.manifest.latestSummary ?? null,
+      summarySource: report?.trim() ? null : this.manifest.summarySource ?? null,
       ...(this.changed === null
         ? { changedFilesUnknown: true }
         : { changedFiles: this.changed.files, changedFilesTruncated: this.changed.truncated }),
@@ -595,8 +595,6 @@ export class JobWriter {
       error: reason,
       reason: status === 'failed' ? reason.split(' · ')[0]! : null,
       jobStatus: status === 'canceled' ? 'cancelled' : 'malformed',
-      latestSummary: null,
-      summarySource: null,
       ...(this.manifest.pendingSteers !== undefined ? { pendingSteers: 0 } : {}),
     };
     this.manifest = manifest;

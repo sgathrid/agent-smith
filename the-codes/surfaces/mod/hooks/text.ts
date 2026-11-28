@@ -77,6 +77,11 @@ export const SUMMARY_CHARS = 1_000;
 
 /** A short summary of a worker's report or current message: its opening, without a leading
  * `Status:` line, cut at a paragraph or line boundary within `max`. */
+/** A job's short summary: its report's opening once it has a report, else the worker's last message. */
+export function jobSummary(report: string | null | undefined, lastMessage: string | null | undefined): string | null {
+  return reportSummary(report ?? '') || lastMessage?.trim() || null;
+}
+
 export function reportSummary(text: string, max = SUMMARY_CHARS): string {
   const t = text.trim().replace(/^Status:[^\n]*(?:\n|$)/, '').trim();
   if (t.length <= max) return t;

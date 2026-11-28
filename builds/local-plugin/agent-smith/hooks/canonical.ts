@@ -7,7 +7,7 @@ import { isLiveStatus, isTerminal } from './format.ts';
 import { REASONS, STEER_NOT_APPLIED_RE } from './reasons.ts';
 import { normalizeContinuationKind } from './turns.ts';
 import { memberFileName, settleTeam } from './team.ts';
-import { reportSummary } from './text.ts';
+import { jobSummary } from './text.ts';
 
 type RecordValue = Record<string, unknown>;
 const STATUSES = new Set(['running', 'attention', 'succeeded', 'failed', 'canceled']);
@@ -89,9 +89,10 @@ async function readForgeJob(fs: FsLike, repo: string, id: string, now: number): 
   const latestActivity = record(p?.lastActivity);
   const latest = latestActivity && typeof latestActivity.tool === 'string' ? latestActivity : recent;
   const resolved = record(m.resolved);
+  const lastMessage = firstText(p?.latestSummary, m.latestSummary);
   const latestSummary = isLiveStatus(status)
-    ? firstText(p?.latestSummary, m.latestSummary)
-    : (await fs.exists(`${dir}/result.md`) ? reportSummary(await fs.read(`${dir}/result.md`)) : '') || null;
+    ? lastMessage
+    : jobSummary(await fs.exists(`${dir}/result.md`) ? await fs.read(`${dir}/result.md`) : null, lastMessage);
   const progress = digest(p?.digest);
   const now0 = latest ? classify(firstText(latest.tool) ?? '', firstText(latest.input)).label : '';
   const staleReads = (Array.isArray(m.staleReads) ? m.staleReads : []).filter((f): f is string => typeof f === 'string' && f.trim() !== '');

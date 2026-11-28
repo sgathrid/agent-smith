@@ -8,7 +8,7 @@ import { readAcceptance } from '../../../forge/checks.ts';
 import { livenessOf, type Liveness } from '../../mod/hooks/stale.ts';
 import { ACCEPTANCE_HOLD_MS, droppedMessageQuote, pipelineOutcome } from '../../mod/hooks/notice.ts';
 import { normalizeContinuationKind, type ContinuationKind } from '../../mod/hooks/turns.ts';
-import { reportSummary } from '../../mod/hooks/text.ts';
+import { jobSummary } from '../../mod/hooks/text.ts';
 import type { WatchableJob, WatchStatus } from './policy.ts';
 import type { Team } from '../../mod/types/index.d.ts';
 
@@ -79,9 +79,8 @@ async function readOne(cwd: string, jobId: string, now: number): Promise<Watchab
   const pending = raw['pendingSteers'];
 
   const status = toWatchStatus(observed, now);
-  const latestSummary = isTerminalForgeStatus(observed.status)
-    ? reportSummary(observed.output ?? '') || null
-    : typeof raw['latestSummary'] === 'string' ? raw['latestSummary'] : null;
+  const lastMessage = typeof raw['latestSummary'] === 'string' ? raw['latestSummary'] : null;
+  const latestSummary = isTerminalForgeStatus(observed.status) ? jobSummary(observed.output, lastMessage) : lastMessage;
   const acceptancePending = isTerminalForgeStatus(status) && isAcceptancePending(observed.finishedAt, acceptance, now);
 
   return {
