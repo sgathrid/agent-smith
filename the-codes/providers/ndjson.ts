@@ -149,6 +149,16 @@ export interface EventBus {
   close(): void;
 }
 
+function replaceQueuedTeam(queue: ProviderEvent[], event: ProviderEvent): void {
+  if (event.kind !== 'team') return;
+  const prior = queue.findIndex((e) => e.kind === 'team');
+  if (prior >= 0) queue.splice(prior, 1);
+}
+
+function stopSidecarSafely(sidecar: { stop(): void } | undefined): void {
+  try { sidecar?.stop(); } catch {}
+}
+
 export function createEventBus(maxQueue = 4096): EventBus {
   const listeners = new Set<(e: ProviderEvent) => void>();
   const queue: ProviderEvent[] = [];
@@ -167,10 +177,7 @@ export function createEventBus(maxQueue = 4096): EventBus {
       w({ value: event, done: false });
       return;
     }
-    if (event.kind === 'team') {
-      const prior = queue.findIndex((e) => e.kind === 'team');
-      if (prior >= 0) queue.splice(prior, 1);
-    }
+    replaceQueuedTeam(queue, event);
     if (queue.length >= maxQueue) queue.shift();
     queue.push(event);
   }
@@ -609,7 +616,7 @@ export async function runNdjsonWorker(cfg: NdjsonWorkerConfig): Promise<WorkerHa
   });
 
   void proc.exited.then(({ code, signal }) => {
-    try { sidecar?.stop(); } catch {}
+    stopSidecarSafely(sidecar);
     proc.closeLog();
     const exit: ExitInfo = { code, signal, killReason: proc.killReason, stderr: proc.stderrTail() };
     if (proc.spawnError !== undefined) exit.spawnError = proc.spawnError;

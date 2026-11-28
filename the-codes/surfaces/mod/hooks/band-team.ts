@@ -19,6 +19,8 @@ export function showsTeam(job: RadarJob): boolean {
   return (isLiveStatus(job.status) || job.acceptance?.pending === true) && hasTeam(job.team);
 }
 
+const MIN_FOLD_MEMBERS = 2;
+
 export function planBand(shown: readonly RadarJob[], maxRows?: number): BandPlan {
   const cap = rowCap(maxRows);
   const workers = shown.slice(0, cap);
@@ -26,7 +28,7 @@ export function planBand(shown: readonly RadarJob[], maxRows?: number): BandPlan
   const entries: BandEntry[] = [];
   workers.forEach((job, index) => {
     entries.push({ kind: 'job', job, index });
-    if (spare < 2 || !showsTeam(job)) return;
+    if (spare < MIN_FOLD_MEMBERS || !showsTeam(job)) return;
     const members = sortMembers(job.team!.members);
     if (members.length <= spare) {
       members.forEach((member, i) => entries.push({ kind: 'member', job, member, last: i === members.length - 1 }));

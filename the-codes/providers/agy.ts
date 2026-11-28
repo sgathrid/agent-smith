@@ -28,7 +28,7 @@ import type { RunFn } from './discovery.ts';
 import { exitReason } from '../surfaces/mod/hooks/reasons.ts';
 import { deniedText, noResultText, stderrClause } from './failure-text.ts';
 import { createAnswer, emptyResponseVerdict, type Answer } from './answer.ts';
-import { createAgyTeamReader } from './agy-team.ts';
+import { createAgyTeamReader, type AgyTeamRead } from './agy-team.ts';
 
 export function agyBinary(): string {
   return process.env['AGENT_SMITH_AGY_BIN'] ?? 'agy';
@@ -608,19 +608,23 @@ export interface AgyTeamWatch {
   stop(): void;
 }
 
+function teamChanged(prev: AgyTeamRead | null, next: AgyTeamRead): boolean {
+  const key = (read: AgyTeamRead): string => JSON.stringify([{ ...read.team, updatedAt: 0 }, read.views]);
+  return prev === null || key(prev) !== key(next);
+}
+
 export function createAgyTeamWatch(cwd: string, emit: (event: ProviderEvent) => void, deps: AgyTeamDeps): AgyTeamWatch {
   let reader: ReturnType<typeof createAgyTeamReader> | undefined;
   let timer: NodeJS.Timeout | undefined;
   let stopped = false;
-  let last = '';
+  let last: AgyTeamRead | null = null;
   const tick = (nowMs: number): void => {
     if (stopped || reader === undefined) return;
     try {
       const read = reader.poll(nowMs);
       if (read === null) return;
-      const key = JSON.stringify([{ ...read.team, updatedAt: 0 }, read.views]);
-      if (key === last) return;
-      last = key;
+      if (!teamChanged(last, read)) return;
+      last = read;
       emit({ kind: 'team', at: nowIso(nowMs), team: read.team, views: read.views });
     } catch {}
   };

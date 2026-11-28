@@ -17,7 +17,7 @@
  *     shows, so an absent edit count means "not visible", not zero.
  */
 import type { ProgressDigest, ProgressPhase } from '../types/index.d.ts';
-import { basename, describeSwarm, describeTool, humanCommand, parseInputPreview, SWARM_TOOLS } from './tools-describe.ts';
+import { basename, labelSwarmCall, describeTool, humanCommand, parseInputPreview, SWARM_TOOLS } from './tools-describe.ts';
 import { oneLine } from './text.ts';
 
 export type { ProgressDigest, ProgressPhase };
@@ -150,13 +150,13 @@ export function classify(tool: string, input: string | null | undefined, output?
     const short = query.length > 24 ? `${oneLine(query, 23)}…` : query;
     return { kind: 'search', label: short ? `searching ${short}` : 'searching' };
   }
-  if (SWARM_TOOLS.has(name)) return { kind: 'other', label: describeSwarm(name, params, input ?? '', output ?? '') };
+  if (SWARM_TOOLS.has(name)) return { kind: 'other', label: labelSwarmCall(name, params, input ?? '', output ?? '') };
   // codex: the tool IS the command line.
   if (/\s/.test(name) || /^(?:\S*\/)?(?:ba|z)?sh$/.test(name)) return classifyCommand(name);
   return { kind: 'other', label: describeTool(name, params) };
 }
 
-function workspacePath(p: string, roots: readonly string[]): string | null {
+function relativeToWorkspace(p: string, roots: readonly string[]): string | null {
   const bases = roots.map((r) => r.replace(/\/+$/, '')).filter((b) => b !== '');
   if (bases.length === 0 || !p.startsWith('/')) return p;
   const base = bases.find((b) => p.startsWith(`${b}/`));
@@ -278,7 +278,7 @@ export class ProgressTracker {
   }
 
   editedPaths(cwd = '', realCwd = ''): string[] {
-    const inside = this.edited.map((p) => workspacePath(p, [cwd, realCwd])).filter((p): p is string => p !== null);
+    const inside = this.edited.map((p) => relativeToWorkspace(p, [cwd, realCwd])).filter((p): p is string => p !== null);
     return inside.filter((p, i) => inside.lastIndexOf(p) === i);
   }
 

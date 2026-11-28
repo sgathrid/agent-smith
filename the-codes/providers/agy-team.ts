@@ -51,13 +51,13 @@ export interface AgyTeamReader {
   poll(nowMs: number): AgyTeamRead | null;
 }
 
-const ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+const SAFE_SEGMENT_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const CHUNK_RE = /^\d{1,12}\.jsonl$/;
 const TEXT_CAP = 2_000;
 const EVENT_CAP = 200;
 const POLL_BUDGET = 8 << 20;
 const STREAM_BUDGET = 2 << 20;
-const SIG_BYTES = 256;
+const REWRITE_SIGNATURE_BYTES = 256;
 const NL = 0x0a;
 
 type Json = Record<string, unknown>;
@@ -103,7 +103,7 @@ function sameStart(file: string, sig: Buffer | null): boolean {
 class JsonFiles {
   private readonly cache = new Map<string, { mtimeMs: number; size: number; value: unknown }>();
 
-  read(file: string): unknown {
+  readKeepingLastGood(file: string): unknown {
     let st;
     try { st = statSync(file); } catch { this.cache.delete(file); return undefined; }
     const hit = this.cache.get(file);
@@ -122,14 +122,14 @@ class JsonFiles {
   }
 }
 
-class LineCarry {
-  carry: Buffer = Buffer.alloc(0);
+class Utf8LineBuffer {
+  partialLine: Buffer = Buffer.alloc(0);
 
   feed(chunk: Buffer, onLine: (line: string) => boolean): boolean {
-    const data = this.carry.length === 0 ? chunk : Buffer.concat([this.carry, chunk]);
+    const data = this.partialLine.length === 0 ? chunk : Buffer.concat([this.partialLine, chunk]);
     const end = data.lastIndexOf(NL);
-    if (end === -1) { this.carry = Buffer.from(data); return true; }
-    this.carry = Buffer.from(data.subarray(end + 1));
+    if (end === -1) { this.partialLine = Buffer.from(data); return true; }
+    this.partialLine = Buffer.from(data.subarray(end + 1));
     for (const line of data.subarray(0, end).toString('utf8').split('\n')) {
       if (line.trim() !== '' && !onLine(line)) return false;
     }
@@ -189,7 +189,7 @@ interface Planner {
   onlyResults: boolean;
 }
 
-class MemberLog {
+class MemberAggregate {
   startedAt: number | null = null;
   lastEventAt: number | null = null;
   model: string | null = null;
@@ -298,30 +298,30 @@ class MemberLog {
 }
 
 class Transcript {
-  log: MemberLog;
+  log: MemberAggregate;
   private files: string[] = [];
   private sig: Buffer | null = null;
   private index = 0;
   private offset = 0;
-  private lines = new LineCarry();
+  private lines = new Utf8LineBuffer();
   private readonly logsDir: string;
   private readonly parentConv: string;
 
   constructor(logsDir: string, parentConv: string) {
     this.logsDir = logsDir;
     this.parentConv = parentConv;
-    this.log = new MemberLog(parentConv);
+    this.log = new MemberAggregate(parentConv);
   }
 
-  get partial(): boolean { return this.lines.carry.length > 0; }
+  get partial(): boolean { return this.lines.partialLine.length > 0; }
 
   private reset(): void {
-    this.log = new MemberLog(this.parentConv);
+    this.log = new MemberAggregate(this.parentConv);
     this.files = [];
     this.sig = null;
     this.index = 0;
     this.offset = 0;
-    this.lines = new LineCarry();
+    this.lines = new Utf8LineBuffer();
   }
 
   private listFiles(): string[] {
@@ -348,7 +348,7 @@ class Transcript {
     if (this.files.length > 0 && files[this.index] !== this.files[this.index]) return null;
     this.files = files;
     if (files.length > 0 && !sameStart(files[0]!, this.sig)) return null;
-    if (files.length > 0 && (this.sig === null || this.sig.length < SIG_BYTES)) this.sig = readRange(files[0]!, 0, Math.min(sizeOf(files[0]!) ?? 0, SIG_BYTES));
+    if (files.length > 0 && (this.sig === null || this.sig.length < REWRITE_SIGNATURE_BYTES)) this.sig = readRange(files[0]!, 0, Math.min(sizeOf(files[0]!) ?? 0, REWRITE_SIGNATURE_BYTES));
     let used = 0;
     while (this.index < files.length && used < budget) {
       const size = sizeOf(files[this.index]!);
@@ -378,7 +378,7 @@ class Board {
   readonly briefs = new Map<string, string>();
   private offset = 0;
   private sig: Buffer | null = null;
-  private lines = new LineCarry();
+  private lines = new Utf8LineBuffer();
   private readonly file: string;
 
   constructor(file: string) { this.file = file; }
@@ -389,7 +389,7 @@ class Board {
     this.briefs.clear();
     this.offset = 0;
     this.sig = null;
-    this.lines = new LineCarry();
+    this.lines = new Utf8LineBuffer();
   }
 
   read(budget: number, coordinator: string | null): number {
@@ -406,10 +406,10 @@ class Board {
     if (size === null) return this.offset === 0 ? 0 : null;
     if (size < this.offset) return null;
     if (!sameStart(this.file, this.sig)) return null;
-    if (this.sig === null || this.sig.length < SIG_BYTES) this.sig = readRange(this.file, 0, Math.min(size, SIG_BYTES));
+    if (this.sig === null || this.sig.length < REWRITE_SIGNATURE_BYTES) this.sig = readRange(this.file, 0, Math.min(size, REWRITE_SIGNATURE_BYTES));
     const n = Math.min(size - this.offset, budget);
     if (n <= 0) return 0;
-    const fresh = this.offset === 0;
+    const firstPass = this.offset === 0;
     const chunk = readRange(this.file, this.offset, n);
     this.offset += chunk.length;
     const ok = this.lines.feed(chunk, (line) => {
@@ -417,18 +417,18 @@ class Board {
       if (!post) return true;
       const seq = Number(post['seq']);
       if (!Number.isFinite(seq)) return true;
-      if (this.head !== null && seq <= this.head) return fresh;
+      if (this.head !== null && seq <= this.head) return firstPass;
       this.head = seq;
       const agent = String(post['agent'] ?? '');
       const text = String(post['text'] ?? '');
       this.lastPosts.set(agent, { seq, text });
-      if (post['kind'] === 'brief' || agent === coordinator) this.noteBrief(text);
+      if (post['kind'] === 'brief' || agent === coordinator) this.recordMentionBrief(text);
       return true;
     });
     return ok ? chunk.length : null;
   }
 
-  private noteBrief(text: string): void {
+  private recordMentionBrief(text: string): void {
     const names: string[] = [];
     let rest = text;
     for (let m = /^\s*@([A-Za-z0-9_.-]+)\s+/.exec(rest); m; m = /^\s*@([A-Za-z0-9_.-]+)\s+/.exec(rest)) {
@@ -447,7 +447,7 @@ export function agyModelLabel(model: string | null): string | null {
   return effort ? `${words.join(' ')} (${effort})` : words.join(' ');
 }
 
-function shortName(role: string | null, id: string): string {
+function nameFromRoleLine(role: string | null, id: string): string {
   if (role === null) return id.slice(0, 8);
   const m = /^Swarm Worker \(([^)]+)\)$/.exec(role);
   return m ? m[1]! : fitCell(oneLine(role), 28).trimEnd();
@@ -477,7 +477,7 @@ export function createAgyTeamReader(options: AgyTeamReaderOptions): AgyTeamReade
   const isDir = (p: string): boolean => { try { return statSync(p).isDirectory(); } catch { return false; } };
 
   function swarmSeats(): { seats: Seat[]; title: string | null; coordinator: string | null } | null {
-    const roster = json.read(path.join(swarmDir, 'members.json'));
+    const roster = json.readKeepingLastGood(path.join(swarmDir, 'members.json'));
     if (!isObj(roster) || !isObj(roster['members'])) return null;
     const seats: Seat[] = [];
     let coordinator: string | null = null;
@@ -488,7 +488,7 @@ export function createAgyTeamReader(options: AgyTeamReaderOptions): AgyTeamReade
       if (memberConv === conv || m['role'] === 'coordinator') { coordinator = name; continue; }
       const model = str(m['applied_model']) ?? str(m['model']) ?? str(m['desired_model']);
       seats.push({
-        id: name, name, role: str(m['role']) ?? 'worker', conv: memberConv && ID_RE.test(memberConv) ? memberConv : null,
+        id: name, name, role: str(m['role']) ?? 'worker', conv: memberConv && SAFE_SEGMENT_RE.test(memberConv) ? memberConv : null,
         model, killed: m['killed'] === true, wakeMode: str(m['wake_mode']), order: order++,
       });
     }
@@ -501,15 +501,15 @@ export function createAgyTeamReader(options: AgyTeamReaderOptions): AgyTeamReade
     const seats: Seat[] = [];
     for (const n of names) {
       const file = path.join(subDir, n);
-      const j = json.read(file);
+      const j = json.readKeepingLastGood(file);
       if (!isObj(j)) continue;
       const child = str(j['conversationId']);
-      if (child === null || !ID_RE.test(child)) continue;
+      if (child === null || !SAFE_SEGMENT_RE.test(child)) continue;
       const desc = isObj(j['subagentDescriptor']) ? j['subagentDescriptor'] : {};
       const role = str(desc['role']) ?? str(desc['typeName']);
       const spawn = Number(j['spawnStepIndex']);
       seats.push({
-        id: child, name: shortName(role, child), role: role ?? 'sub-agent', conv: child, model: null,
+        id: child, name: nameFromRoleLine(role, child), role: role ?? 'sub-agent', conv: child, model: null,
         killed: j['state'] === 'SUBAGENT_STATE_KILLED', wakeMode: null,
         order: Number.isFinite(spawn) ? spawn : Number.MAX_SAFE_INTEGER,
       });
@@ -543,7 +543,7 @@ export function createAgyTeamReader(options: AgyTeamReaderOptions): AgyTeamReade
   }
 
   function poll(nowMs: number): AgyTeamRead | null {
-    if (!ID_RE.test(conv)) return null;
+    if (!SAFE_SEGMENT_RE.test(conv)) return null;
     const swarm = isDir(swarmDir);
     if (!swarm && !isDir(subDir)) return null;
     let seats: Seat[];
@@ -563,7 +563,7 @@ export function createAgyTeamReader(options: AgyTeamReaderOptions): AgyTeamReade
       board ??= new Board(path.join(swarmDir, 'board.jsonl'));
       budget -= board.read(budget, coordinator);
     }
-    const plan = swarm ? json.read(path.join(swarmDir, 'plan.json')) : undefined;
+    const plan = swarm ? json.readKeepingLastGood(path.join(swarmDir, 'plan.json')) : undefined;
     const tasks = isObj(plan) && isObj(plan['tasks']) ? plan['tasks'] : {};
 
     const live = new Set(seats.map((s) => s.conv).filter((c): c is string => c !== null));

@@ -105,6 +105,8 @@ async function sessionRows($: EngineInterface): Promise<RadarJob[]> {
 }
 
 const BAND_TICK_MS = 1000;
+const HOTKEY_PREFIX_COLS = 3;
+const CHILD_INDENT = '   ';
 
 const POLL_MS = 1000;
 
@@ -533,7 +535,7 @@ function registerBand(on: Parameters<Register>[0]): void {
 
     const plan = planBand(shown, Math.max(1, (e.props.maxRows ?? 10) - 1));
     const { Box, Text, Button } = $.ui.resolve(e);
-    const width = Math.max(1, e.props.bodyColumns - 3);
+    const width = Math.max(1, e.props.bodyColumns - HOTKEY_PREFIX_COLS);
     const longestLabel = Math.max(0, ...plan.entries.map((en) => en.kind === 'job' ? jobLabel(en.job).length : en.kind === 'member' ? en.member.name.length + 2 : 0));
     const columns = fitBandColumns(width, longestLabel);
     const tokenWidth = tokenColumn(plan.entries);
@@ -545,9 +547,9 @@ function registerBand(on: Parameters<Register>[0]): void {
             const row = childRow(entry, at, columns, tokenWidth);
             const press = () => openForge($, entry.job.workerId, row.memberId);
             return (
-              <Button key={`band-${entry.job.workerId}-${row.memberId ?? 'fold'}`} plain label={`   ${row.plain}`} onPress={press}>
+              <Button key={`band-${entry.job.workerId}-${row.memberId ?? 'fold'}`} plain label={`${CHILD_INDENT}${row.plain}`} onPress={press}>
                 <Text dimColor={row.dim} bold={row.bold} wrap="truncate-end">
-                  {`   ${row.tree} ${row.glyph} ${row.label}${row.detail === '' ? '' : ` ${row.detail}`}${row.right === '' ? '' : ` ${row.right}`}`}
+                  {`${CHILD_INDENT}${row.tree} ${row.glyph} ${row.label}${row.detail === '' ? '' : ` ${row.detail}`}${row.right === '' ? '' : ` ${row.right}`}`}
                 </Text>
               </Button>
             );

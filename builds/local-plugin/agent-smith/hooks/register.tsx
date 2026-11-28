@@ -1,21 +1,21 @@
 import { atom, read, update } from 'claude-code';
 import type { EngineInterface, Register, UiRenderEvent } from 'claude-code';
 
-import type { RadarJob } from '../types/index.d.ts';
+import type { MemberView, RadarJob, TeamMember } from '../types/index.d.ts';
 import { jobLabel, oneLine, sanitizeText } from './format.ts';
 import { commandTerminalColumns, findWorker, groupWorkers, isLive, measurePaneTerminalColumns, paneWidthRequest, recordLaunch, scopeLine, sessionBoard, sessionJobs, workerHead, workerTurns, type Launched } from './dashboard.ts';
-import { renderList, renderWorker, type ViewActions, type ViewOptions } from './views.tsx';
+import { renderList, renderMember, renderWorker, type ViewActions, type ViewOptions } from './views.tsx';
 import type { ForgeDetail } from './canonical.ts';
 import {
   buildLine,
   isShown,
   noColor,
   overflowLine,
-  rowBudget,
 } from './band.ts';
 import type { FsLike } from './fs.ts';
-import { sortForBand } from './format.ts';
-import { isSettledForCache, readForgeJobs, readForgeDetail } from './canonical.ts';
+import { fitBandColumns, sortForBand } from './format.ts';
+import { childRow, planBand, tokenColumn } from './band-team.ts';
+import { isSettledForCache, readForgeJobs, readForgeDetail, readMemberView } from './canonical.ts';
 import {
   LAUNCH_TOOL,
   STATUS_TOOL,
@@ -68,6 +68,8 @@ async function requestPane($: EngineInterface, force = false): Promise<void> {
 
 const selected = atom({ plugin: 'agent-smith', key: 'selected' } as const, null as string | null);
 const pinnedTurnId = atom({ plugin: 'agent-smith', key: 'pinnedTurnId' } as const, null as string | null);
+const selectedMember = atom({ plugin: 'agent-smith', key: 'selectedMember' } as const, null as string | null);
+const teamOpen = atom({ plugin: 'agent-smith', key: 'teamOpen' } as const, false as boolean);
 const now = atom({ plugin: 'agent-smith', key: 'now' } as const, 0);
 
 const follow = atom({ plugin: 'agent-smith', key: 'follow' } as const, true as boolean);
@@ -103,6 +105,8 @@ async function sessionRows($: EngineInterface): Promise<RadarJob[]> {
 }
 
 const BAND_TICK_MS = 1000;
+const HOTKEY_PREFIX_COLS = 3;
+const CHILD_INDENT = '   ';
 
 const POLL_MS = 1000;
 
@@ -529,18 +533,31 @@ function registerBand(on: Parameters<Register>[0]): void {
     const shown = sortForBand(groupWorkers(all)).filter((j) => isShown(j, at));
     if (shown.length === 0) return rest;
 
-    const budget = rowBudget(shown, Math.max(1, (e.props.maxRows ?? 10) - 1));
+    const plan = planBand(shown, Math.max(1, (e.props.maxRows ?? 10) - 1));
     const { Box, Text, Button } = $.ui.resolve(e);
-    // A plain Button draws `1: ` before its children, so the row is sized to the rest.
-    const width = Math.max(1, e.props.bodyColumns - 3);
-    const longestLabel = Math.max(0, ...budget.rows.map((job) => jobLabel(job).length));
+    const width = Math.max(1, e.props.bodyColumns - HOTKEY_PREFIX_COLS);
+    const longestLabel = Math.max(0, ...plan.entries.map((en) => en.kind === 'job' ? jobLabel(en.job).length : en.kind === 'member' ? en.member.name.length + 2 : 0));
+    const columns = fitBandColumns(width, longestLabel);
+    const tokenWidth = tokenColumn(plan.entries);
 
     return (
       <Box flexDirection="column">
-        {budget.rows.map((job, i) => {
+        {plan.entries.map((entry) => {
+          if (entry.kind !== 'job') {
+            const row = childRow(entry, at, columns, tokenWidth);
+            const press = () => openForge($, entry.job.workerId, row.memberId);
+            return (
+              <Button key={`band-${entry.job.workerId}-${row.memberId ?? 'fold'}`} plain label={`${CHILD_INDENT}${row.plain}`} onPress={press}>
+                <Text dimColor={row.dim} bold={row.bold} wrap="truncate-end">
+                  {`${CHILD_INDENT}${row.tree} ${row.glyph} ${row.label}${row.detail === '' ? '' : ` ${row.detail}`}${row.right === '' ? '' : ` ${row.right}`}`}
+                </Text>
+              </Button>
+            );
+          }
+          const job = entry.job;
           const line = buildLine(job, at, { colour: cfg.colour, width, longestLabel });
           return (
-            <Button key={`band-${job.workerId}`} plain hotkey={String(i + 1)} label={line.plain.trim()} onPress={() => openForge($, job.workerId)}>
+            <Button key={`band-${job.workerId}`} plain hotkey={String(entry.index + 1)} label={line.plain.trim()} onPress={() => openForge($, job.workerId)}>
             <Text dimColor={line.recessive} wrap="truncate-end">
               <Text color={line.accent} bold={line.bold} wrap="truncate-end">
                 {line.glyph}
@@ -553,9 +570,9 @@ function registerBand(on: Parameters<Register>[0]): void {
             </Button>
           );
         })}
-        {budget.hidden > 0 && (
+        {plan.hidden > 0 && (
           <Text dimColor wrap="truncate-end">
-            {overflowLine(budget.hidden)}
+            {overflowLine(plan.hidden)}
           </Text>
         )}
         {rest}
@@ -633,8 +650,10 @@ export const register: Register = (on) => {
   });
 };
 
-async function show($: EngineInterface, workerId: string | null): Promise<void> {
+async function show($: EngineInterface, workerId: string | null, memberId: string | null = null): Promise<void> {
   await update($, selected, () => workerId);
+  await update($, selectedMember, () => memberId);
+  await update($, teamOpen, () => false);
   await update($, pinnedTurnId, () => null);
   await update($, follow, () => true);
   await update($, taskOpen, () => false);
@@ -652,9 +671,17 @@ async function pinTurn($: EngineInterface, turnJobId: string | null): Promise<vo
   await $.ui.scroll({ to: 'start', in: PANE }).catch(() => {});
 }
 
-async function openForge($: EngineInterface, workerId: string | null): Promise<void> {
+async function showMember($: EngineInterface, memberId: string | null): Promise<void> {
+  await update($, selectedMember, () => memberId);
+  await update($, taskOpen, () => false);
+  await update($, expandedTools, () => []);
+  followingSite = null;
+  await $.ui.scroll({ to: 'start', in: PANE }).catch(() => {});
+}
+
+async function openForge($: EngineInterface, workerId: string | null, memberId: string | null = null): Promise<void> {
   detailCache = null;
-  await show($, workerId);
+  await show($, workerId, memberId);
   if (workerId === null) await update($, listPage, () => 0);
   await update($, paneOpen, () => true);
   const at = await $.clock.now();
@@ -680,6 +707,15 @@ async function loadDetail($: EngineInterface, repo: string, id: string, t: numbe
   return detail;
 }
 
+let memberCache: { key: string; at: number; view: MemberView | null; settled: boolean } | null = null;
+async function loadMember($: EngineInterface, repo: string, jobId: string, member: TeamMember, t: number): Promise<MemberView | null> {
+  const key = `${repo}\0${jobId}\0${member.id}\0${member.state}`;
+  if (memberCache?.key === key && (memberCache.settled || (t >= memberCache.at && t - memberCache.at < POLL_MS))) return memberCache.view;
+  const view = await readMemberView(fsOf($), repo, jobId, member.id);
+  memberCache = { key, at: t, view, settled: view !== null && member.state !== 'working' };
+  return view;
+}
+
 async function renderForge($: EngineInterface, e: UiRenderEvent): Promise<JSX.Element> {
   const W = $.ui.resolve(e);
   const { Box, Text } = W;
@@ -690,10 +726,11 @@ async function renderForge($: EngineInterface, e: UiRenderEvent): Promise<JSX.El
   const scope = await read($, listScope);
   const pick = await read($, selected);
   const pinned = await read($, pinnedTurnId);
+  const picked = await read($, selectedMember);
   const error = await read($, readError);
   const o: ViewOptions = {
     width: e.props.bodyColumns, now: t, colour: cfg.colour, page: await read($, listPage), scope,
-    following: await read($, follow), taskOpen: await read($, taskOpen), tools: await read($, expandedTools),
+    teamOpen: await read($, teamOpen), following: await read($, follow), taskOpen: await read($, taskOpen), tools: await read($, expandedTools),
     pinnedTurnId: pinned,
   };
   const a: ViewActions = {
@@ -704,7 +741,10 @@ async function renderForge($: EngineInterface, e: UiRenderEvent): Promise<JSX.El
     back: () => show($, null),
     task: async () => { await update($, taskOpen, (open) => !open); },
     tool: async (key) => { await update($, expandedTools, (keys) => keys.includes(key) ? keys.filter((k) => k !== key) : [...keys, key]); },
-    close: async () => { lastPaneRequest = null; await update($, paneOpen, () => false); await $.ui.close({ id: PANE }); },
+    member: (id) => showMember($, id),
+    team: async () => { await update($, teamOpen, (open) => !open); },
+    memberBack: () => showMember($, null),
+    close: async () => { lastPaneRequest = null; await update($, selectedMember, () => null); await update($, paneOpen, () => false); await $.ui.close({ id: PANE }); },
   };
   let content = renderList(W, scope === 'all' ? jobs : mine, o, a);
   if (pick !== null) {
@@ -715,7 +755,10 @@ async function renderForge($: EngineInterface, e: UiRenderEvent): Promise<JSX.El
         ? pinned
         : (head?.id ?? pick);
       const detail = await loadDetail($, cfg.repo, targetId, t);
-      if (detail) {
+      const member = detail?.job.team?.members.find((m) => m.id === picked) ?? null;
+      if (detail && member) {
+        content = renderMember(W, detail.job, member, await loadMember($, cfg.repo, detail.job.id, member, t), o, a);
+      } else if (detail) {
         content = renderWorker(W, detail, o, a, turns);
         if (o.following && followingSite !== targetId) {
           try { await scrollEnd($); followingSite = targetId; }

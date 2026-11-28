@@ -75,14 +75,16 @@ export function tokensCell(n: number | null | undefined): string {
   return String(Math.round(n));
 }
 
+export function stillWorking(member: TeamMember, run: { readonly live: boolean; readonly startedAt: number | null }): boolean {
+  if (member.state !== 'working' || !run.live) return false;
+  const acted = member.lastEventAt ?? member.startedAt;
+  return !(acted !== null && run.startedAt !== null && acted < run.startedAt);
+}
+
 export function settleTeam(team: Team, run: { readonly live: boolean; readonly startedAt: number | null }): Team {
-  const ended = (m: TeamMember): boolean => {
-    if (!run.live) return true;
-    const acted = m.lastEventAt ?? m.startedAt;
-    return acted !== null && run.startedAt !== null && acted < run.startedAt;
-  };
-  if (!team.members.some((m) => m.state === 'working' && ended(m))) return team;
-  return { ...team, members: team.members.map((m): TeamMember => (m.state === 'working' && ended(m) ? { ...m, state: 'stopped' } : m)) };
+  const stops = (m: TeamMember): boolean => m.state === 'working' && !stillWorking(m, run);
+  if (!team.members.some(stops)) return team;
+  return { ...team, members: team.members.map((m): TeamMember => (stops(m) ? { ...m, state: 'stopped' } : m)) };
 }
 
 const MEMBER_FILE_MAX = 100;

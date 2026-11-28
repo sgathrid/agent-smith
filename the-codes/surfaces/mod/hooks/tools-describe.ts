@@ -50,7 +50,7 @@ export function describeTool(tool: string, params: Record<string, unknown>): str
     case 'schedule':
       return `waiting ${str('DurationSeconds') || '?'}s`;
     default:
-      return SWARM_TOOLS.has(tool) ? describeSwarm(tool, params) : `using ${oneLine(tool)}`;
+      return SWARM_TOOLS.has(tool) ? labelSwarmCall(tool, params) : `using ${oneLine(tool)}`;
   }
 }
 
@@ -266,7 +266,7 @@ function teamSummary(states: readonly string[]): string {
   return keys.map((k) => `${counts.get(k)} ${k}`).join(' · ');
 }
 
-export function describeSwarm(tool: string, params: Record<string, unknown>, raw = '', output = ''): string {
+export function labelSwarmCall(tool: string, params: Record<string, unknown>, raw = '', output = ''): string {
   const body = outputBody(output);
   const json = parsed(body);
   const inp = (k: string): string => inField(params, raw, k);

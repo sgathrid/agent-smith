@@ -61,11 +61,13 @@ export interface BandBudget {
   readonly hidden: number;
 }
 
+export function rowCap(maxRows?: number): number {
+  if (typeof maxRows !== 'number' || !Number.isFinite(maxRows)) return BAND_ROWS;
+  return Math.max(1, Math.min(BAND_ROWS, Math.floor(maxRows) - 1));
+}
+
 export function rowBudget(shown: readonly RadarJob[], maxRows?: number): BandBudget {
-  let cap = BAND_ROWS;
-  if (typeof maxRows === 'number' && Number.isFinite(maxRows)) {
-    cap = Math.max(1, Math.min(cap, Math.floor(maxRows) - 1));
-  }
+  const cap = rowCap(maxRows);
   return { rows: shown.slice(0, cap), hidden: Math.max(0, shown.length - cap) };
 }
 

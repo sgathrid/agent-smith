@@ -62,7 +62,7 @@ async function readForgeJob(fs: FsLike, repo: string, id: string, now: number): 
   if (typeof m.schema === 'number' && m.schema > 1) throw new Error('Unsupported Forge job schema');
   if (!STATUSES.has(String(m.status))) throw new Error('Invalid Forge job status');
   const p = await json(fs, `${dir}/progress.json`);
-  const storedTeam = await readTeam(fs, dir);
+  const storedTeam = await readTeamIfValid(fs, dir);
   let a = acceptance(await json(fs, `${dir}/acceptance.json`));
   let status = m.status as RadarStatus;
   const live = isLiveStatus(status);
@@ -121,7 +121,7 @@ async function readForgeJob(fs: FsLike, repo: string, id: string, now: number): 
     warnings, report: null, reasoning: firstText(p?.latestText), raw: {},
   };
 }
-async function readTeam(fs: FsLike, dir: string): Promise<Team | null> {
+async function readTeamIfValid(fs: FsLike, dir: string): Promise<Team | null> {
   try {
     return await fs.exists(`${dir}/team.json`) ? parseTeam(JSON.parse(await fs.read(`${dir}/team.json`))) : null;
   } catch {
@@ -275,11 +275,15 @@ export async function readForgeDetail(fs: FsLike, repo: string, id: string, now:
     truncated: view?.truncated === true };
 }
 
+function viewNamesMember(view: MemberView, memberId: string): boolean {
+  return view.id === memberId;
+}
+
 export async function readMemberView(fs: FsLike, repo: string, jobId: string, memberId: string): Promise<MemberView | null> {
   if (typeof memberId !== 'string' || memberId === '') return null;
   try {
     const view = parseMemberView(JSON.parse(await fs.read(`${forgeJobDir(repo, jobId)}/members/${memberFileName(memberId)}`)));
-    return view !== null && view.id === memberId ? view : null;
+    return view !== null && viewNamesMember(view, memberId) ? view : null;
   } catch {
     return null;
   }

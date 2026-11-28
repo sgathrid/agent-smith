@@ -1,4 +1,4 @@
-import type { ActivityEvent, ContinuationKind, ProgressDigest, RadarAcceptance, RadarJob, RadarStatus } from '../types/index.d.ts';
+import type { ActivityEvent, ContinuationKind, MemberView, ProgressDigest, RadarAcceptance, RadarJob, RadarStatus, Team, TeamMember } from '../types/index.d.ts';
 import { toEpoch, type FsLike } from './fs.ts';
 import { classify, progressPhrase } from './progress.ts';
 import { livenessOf } from './stale.ts';
@@ -6,6 +6,7 @@ import { firstText, record } from './guards.ts';
 import { isLiveStatus, isTerminal } from './format.ts';
 import { REASONS, STEER_NOT_APPLIED_RE } from './reasons.ts';
 import { normalizeContinuationKind } from './turns.ts';
+import { memberFileName, settleTeam } from './team.ts';
 
 type RecordValue = Record<string, unknown>;
 const STATUSES = new Set(['running', 'attention', 'succeeded', 'failed', 'canceled']);
@@ -61,6 +62,7 @@ async function readForgeJob(fs: FsLike, repo: string, id: string, now: number): 
   if (typeof m.schema === 'number' && m.schema > 1) throw new Error('Unsupported Forge job schema');
   if (!STATUSES.has(String(m.status))) throw new Error('Invalid Forge job status');
   const p = await json(fs, `${dir}/progress.json`);
+  const storedTeam = await readTeamIfValid(fs, dir);
   let a = acceptance(await json(fs, `${dir}/acceptance.json`));
   let status = m.status as RadarStatus;
   const live = isLiveStatus(status);
@@ -73,8 +75,10 @@ async function readForgeJob(fs: FsLike, repo: string, id: string, now: number): 
     a = { ...a, pending: false };
     if (!canceled) warnings.unshift({ code: 'orphaned', message: REASONS.serverStopped });
   }
+  const startedAt = toEpoch(firstText(m.startedAt, m.createdAt));
+  const team = storedTeam === null ? null : settleTeam(storedTeam, { live: isLiveStatus(status), startedAt });
   const liveness = live && status !== 'failed' && status !== 'canceled'
-    ? livenessOf({ status: 'running', lastEventAt: lastSeen, lastAliveAt: firstText(p?.lastAliveAt), lastActivity: record(p?.lastActivity), now })
+    ? livenessOf({ status: 'running', lastEventAt: lastSeen, lastAliveAt: firstText(p?.lastAliveAt), lastActivity: record(p?.lastActivity), team, now })
     : null;
   if (liveness !== null) status = (liveness.state === 'silent' || liveness.state === 'dead') ? 'attention' : 'running';
   if (typeof m.error === 'string' && m.error !== '') warnings.unshift({ code: 'tool_error', message: m.error });
@@ -88,7 +92,6 @@ async function readForgeJob(fs: FsLike, repo: string, id: string, now: number): 
   const progress = digest(p?.digest);
   const now0 = latest ? classify(firstText(latest.tool) ?? '', firstText(latest.input)).label : '';
   const staleReads = (Array.isArray(m.staleReads) ? m.staleReads : []).filter((f): f is string => typeof f === 'string' && f.trim() !== '');
-  const startedAt = toEpoch(firstText(m.startedAt, m.createdAt));
   const chainStartedAt = toEpoch(firstText(m.chainStartedAt)) ?? startedAt;
   const legacySteeredFrom = firstText(m['steeredFrom']);
   const continuedFrom = firstText(m.continuedFrom) ?? legacySteeredFrom;
@@ -114,9 +117,55 @@ async function readForgeJob(fs: FsLike, repo: string, id: string, now: number): 
     supersededBy: firstText(m.supersededBy), followedBy: firstText(m.followedBy), continuedFrom, continuationKind,
     pendingSteers, pendingMessages,
     ...(staleReads.length > 0 ? { staleReads } : {}),
+    ...(team !== null ? { team } : {}),
     warnings, report: null, reasoning: firstText(p?.latestText), raw: {},
   };
 }
+async function readTeamIfValid(fs: FsLike, dir: string): Promise<Team | null> {
+  try {
+    return await fs.exists(`${dir}/team.json`) ? parseTeam(JSON.parse(await fs.read(`${dir}/team.json`))) : null;
+  } catch {
+    return null;
+  }
+}
+const MEMBER_STATES = new Set(['working', 'waiting', 'stopped', 'done', 'failed', 'killed']);
+const textOrNull = (v: unknown): string | null => typeof v === 'string' ? v : null;
+const epochOrNull = (v: unknown): number | null => typeof v === 'number' && Number.isFinite(v) ? v : null;
+function member(v: unknown): TeamMember | null {
+  const m = record(v);
+  if (m === null || typeof m.id !== 'string' || m.id === '' || typeof m.name !== 'string' || !MEMBER_STATES.has(String(m.state))) return null;
+  const post = record(m.lastPost);
+  return { id: m.id, name: m.name, role: typeof m.role === 'string' ? m.role : '',
+    model: textOrNull(m.model), modelLabel: textOrNull(m.modelLabel), task: textOrNull(m.task),
+    state: m.state as TeamMember['state'], activity: textOrNull(m.activity), toolCount: number(m.toolCount) ?? 0,
+    tokensOut: number(m.tokensOut), startedAt: epochOrNull(m.startedAt), lastEventAt: epochOrNull(m.lastEventAt),
+    lastPost: post && number(post.seq) !== null && typeof post.text === 'string' ? { seq: number(post.seq)!, text: post.text } : null };
+}
+/** A `Team` (schema 1) or null; members that are not valid are dropped, an empty team is none. */
+export function parseTeam(value: unknown): Team | null {
+  const t = record(value);
+  if (t === null || t.schema !== 1 || (t.source !== 'agy-swarm' && t.source !== 'agy-subagents') || !Array.isArray(t.members)) return null;
+  const members = t.members.map(member).filter((m): m is TeamMember => m !== null);
+  if (members.length === 0) return null;
+  return { schema: 1, source: t.source, title: textOrNull(t.title), boardHead: number(t.boardHead), members,
+    updatedAt: epochOrNull(t.updatedAt) ?? 0 };
+}
+function viewEvent(value: unknown): ActivityEvent | null {
+  const item = record(value);
+  if (!item || typeof item.sequence !== 'number' || typeof item.at !== 'string') return null;
+  if (item.kind === 'assistant' && typeof item.text === 'string') return item as ActivityEvent;
+  if (item.kind === 'tool' && typeof item.tool === 'string' && typeof item.stepIndex === 'number' &&
+    typeof item.input === 'string' && typeof item.output === 'string' && typeof item.state === 'string') return item as ActivityEvent;
+  return null;
+}
+export function parseMemberView(value: unknown): MemberView | null {
+  const v = record(value);
+  if (v === null || v.schema !== 1 || typeof v.id !== 'string' || typeof v.name !== 'string') return null;
+  return { schema: 1, id: v.id, name: v.name, brief: textOrNull(v.brief), report: textOrNull(v.report),
+    timeline: (Array.isArray(v.timeline) ? v.timeline : []).map(viewEvent).filter((e): e is ActivityEvent => e !== null),
+    truncated: v.truncated === true };
+}
+
 function digest(v: unknown): ProgressDigest | null {
   const d = record(v);
   if (d === null || typeof d.phase !== 'string' || !Array.isArray(d.edited)) return null;
@@ -224,4 +273,18 @@ export async function readForgeDetail(fs: FsLike, repo: string, id: string, now:
     ...(messages.length > 0 ? { messages } : {}),
     warnings: [...job.warnings, ...(view === null ? [{code:'detail_unavailable',message:'This older job has no detail snapshot; summary and report are shown.'}] : [])] }, timeline,
     truncated: view?.truncated === true };
+}
+
+function viewNamesMember(view: MemberView, memberId: string): boolean {
+  return view.id === memberId;
+}
+
+export async function readMemberView(fs: FsLike, repo: string, jobId: string, memberId: string): Promise<MemberView | null> {
+  if (typeof memberId !== 'string' || memberId === '') return null;
+  try {
+    const view = parseMemberView(JSON.parse(await fs.read(`${forgeJobDir(repo, jobId)}/members/${memberFileName(memberId)}`)));
+    return view !== null && viewNamesMember(view, memberId) ? view : null;
+  } catch {
+    return null;
+  }
 }

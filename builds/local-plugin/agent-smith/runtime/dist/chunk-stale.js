@@ -1,4 +1,4 @@
-import {watch}from'node:fs';import {U as reasonFromText,ah as checksReason,ai as toolLabel}from'./chunk-normalize.js';/**
+import {watch}from'node:fs';import {X as reasonFromText,aj as checksReason,ak as toolLabel}from'./chunk-normalize.js';/**
  * forge/watch.ts — wake when a job's files change, instead of re-reading them on a timer.
  *
  * A worker runs in another process (the detached supervisor) and reports only through
@@ -319,6 +319,14 @@ function stageReason(s) {
 }const STALL_GRACE_MS = 15 * 60 * 1000;
 const ALIVE_GRACE_MS = 2 * 60_000;
 const LIVENESS_STATES = ['active', 'in-tool', 'waiting', 'silent', 'dead'];
+function newestWorkingMemberEventAt(team) {
+    let newest = null;
+    for (const m of team?.members ?? []) {
+        if (m.state === 'working' && typeof m.lastEventAt === 'number' && Number.isFinite(m.lastEventAt))
+            newest = Math.max(newest ?? m.lastEventAt, m.lastEventAt);
+    }
+    return newest;
+}
 function epoch(v) {
     if (typeof v === 'number')
         return Number.isFinite(v) ? v : null;
@@ -330,7 +338,7 @@ function epoch(v) {
 function livenessOf(i) {
     if (i.status !== 'running' && i.status !== 'attention')
         return null;
-    const times = [epoch(i.lastEventAt), epoch(i.updatedAt)].filter((t) => t !== null);
+    const times = [epoch(i.lastEventAt), epoch(i.updatedAt), newestWorkingMemberEventAt(i.team)].filter((t) => t !== null);
     const lastSeen = times.length > 0 ? Math.max(...times) : null;
     const silentForMs = lastSeen === null ? 0 : Math.max(0, i.now - lastSeen);
     const alive = epoch(i.lastAliveAt);

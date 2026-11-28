@@ -50,7 +50,7 @@ export function describeTool(tool: string, params: Record<string, unknown>): str
     case 'schedule':
       return `waiting ${str('DurationSeconds') || '?'}s`;
     default:
-      return `using ${oneLine(tool)}`;
+      return SWARM_TOOLS.has(tool) ? labelSwarmCall(tool, params) : `using ${oneLine(tool)}`;
   }
 }
 
@@ -171,4 +171,145 @@ export function parseInputPreview(preview: string | null | undefined): Record<st
 export function describeActivity(tool: string | null, inputPreview: string | null): string {
   if (!tool) return '';
   return describeTool(tool, parseInputPreview(inputPreview));
+}
+
+export const SWARM_TOOLS: ReadonlySet<string> = new Set(['swarm', 'read_board', 'post_message', 'swarm_wait', 'update_steps']);
+
+export function teamPoll(tool: string, input: string | null | undefined): 'status' | 'board' | 'wait' | null {
+  if (tool === 'read_board') return 'board';
+  if (tool === 'swarm_wait') return 'wait';
+  return tool === 'swarm' && rawString(input ?? '', 'action') === 'status' ? 'status' : null;
+}
+
+function rawString(raw: string, key: string): string {
+  const m = new RegExp(`"${key}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`).exec(raw);
+  if (!m) return '';
+  try { return oneLine(JSON.parse(`"${m[1]}"`) as string); } catch { return oneLine(m[1]!); }
+}
+
+/** Agy prefixes tool output with `Created At:` / `Completed At:` lines before the JSON; a stored preview may cut the JSON short. */
+function outputBody(output: string | null | undefined): string {
+  return (output ?? '').replace(/^\s*(?:(?:Created|Completed) At:[^\n]*\n)+/, '').trim();
+}
+
+function parsed(body: string): Record<string, unknown> | null {
+  try {
+    const v: unknown = JSON.parse(body);
+    return typeof v === 'object' && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+function inField(params: Record<string, unknown>, raw: string, key: string): string {
+  const v = params[key];
+  return typeof v === 'string' && v.trim() !== '' ? oneLine(v) : rawString(raw, key);
+}
+
+function outField(body: string, json: Record<string, unknown> | null, key: string): string {
+  const v = json?.[key];
+  return typeof v === 'string' && v.trim() !== '' ? oneLine(v) : rawString(body, key);
+}
+
+function boardEntries(body: string): { seqs: number[]; agents: string[]; empty: boolean } {
+  const json = parsed(body);
+  const messages = json?.['messages'];
+  const pairs: Array<[number, string]> = [];
+  if (Array.isArray(messages)) {
+    for (const m of messages) {
+      if (m && typeof m === 'object') {
+        const { seq, agent } = m as Record<string, unknown>;
+        if (typeof seq === 'number') pairs.push([seq, typeof agent === 'string' ? oneLine(agent) : '']);
+      }
+    }
+    return { seqs: pairs.map((p) => p[0]), agents: unique(pairs.map((p) => p[1])), empty: messages.length === 0 };
+  }
+  for (const m of body.matchAll(/"seq"\s*:\s*(\d+)\s*,\s*"agent"\s*:\s*"([^"]*)"/g)) pairs.push([Number(m[1]), m[2]!]);
+  return { seqs: pairs.map((p) => p[0]), agents: unique(pairs.map((p) => p[1])), empty: /"messages"\s*:\s*\[\s*\]/.test(body) };
+}
+
+const unique = (xs: readonly string[]): string[] => [...new Set(xs.filter((x) => x !== ''))];
+
+export function boardRange(output: string | null | undefined): string | null {
+  const { seqs } = boardEntries(outputBody(output));
+  if (seqs.length === 0) return null;
+  const lo = Math.min(...seqs);
+  const hi = Math.max(...seqs);
+  return lo === hi ? `#${lo}` : `#${lo}–#${hi}`;
+}
+
+function memberStates(body: string): string[] | null {
+  const json = parsed(body);
+  const members = json?.['members'];
+  const states: string[] = [];
+  if (Array.isArray(members)) {
+    for (const m of members) {
+      if (!m || typeof m !== 'object') continue;
+      const { role, state } = m as Record<string, unknown>;
+      if (role !== 'coordinator' && typeof state === 'string') states.push(state);
+    }
+  } else {
+    for (const m of body.matchAll(/\{[^{}]*\}/g)) {
+      if (/"role"\s*:\s*"coordinator"/.test(m[0])) continue;
+      const s = /"state"\s*:\s*"([^"]*)"/.exec(m[0]);
+      if (s) states.push(s[1]!);
+    }
+  }
+  return states.length === 0 ? null : states;
+}
+
+function teamSummary(states: readonly string[]): string {
+  const counts = new Map<string, number>();
+  for (const s of states) counts.set(s, (counts.get(s) ?? 0) + 1);
+  const order = ['working', 'waiting'];
+  const keys = [...order.filter((k) => counts.has(k)), ...[...counts.keys()].filter((k) => !order.includes(k))];
+  return keys.map((k) => `${counts.get(k)} ${k}`).join(' · ');
+}
+
+export function labelSwarmCall(tool: string, params: Record<string, unknown>, raw = '', output = ''): string {
+  const body = outputBody(output);
+  const json = parsed(body);
+  const inp = (k: string): string => inField(params, raw, k);
+  switch (tool) {
+    case 'swarm': {
+      const action = inp('action');
+      const name = inp('name');
+      switch (action) {
+        case 'add': {
+          const made = outField(body, json, 'name');
+          if (made === '') return name === '' ? 'adding agent' : `adding ${name}`;
+          const model = outField(body, json, 'model_display_name');
+          return `added ${made}${model === '' ? '' : ` (${model})`}`;
+        }
+        case 'status': {
+          const states = memberStates(body);
+          return states === null ? 'checking team' : `checked team (${teamSummary(states)})`;
+        }
+        case 'models': return 'listed models';
+        case 'title': { const t = inp('title'); return t === '' ? 'named team' : `named team "${t}"`; }
+        case 'kill': return name === '' ? 'stopped an agent' : `stopped ${name}`;
+        case 'model': {
+          const model = inp('model');
+          return `switched ${name === '' ? 'an agent' : name}${model === '' ? '' : ` to ${model}`}`;
+        }
+        default: return action === '' ? 'using swarm' : `swarm ${action}`;
+      }
+    }
+    case 'read_board': {
+      if (body === '') return 'reading board';
+      const { seqs, agents, empty } = boardEntries(body);
+      if (seqs.length === 0) return empty ? 'board: nothing new' : 'reading board';
+      const shown = agents.slice(0, 3).join(', ');
+      return `board ${boardRange(output)}${shown === '' ? '' : ` · ${shown}${agents.length > 3 ? ` +${agents.length - 3}` : ''}`}`;
+    }
+    case 'post_message': {
+      const seq = json?.['seq'] ?? /"seq"\s*:\s*(\d+)/.exec(body)?.[1];
+      return seq === undefined ? 'posting to board' : `posted #${String(seq)}`;
+    }
+    case 'swarm_wait': return 'waiting on team';
+    default: {
+      const statuses = [...raw.matchAll(/"status"\s*:\s*"(done|in_progress|pending)"/g)].map((m) => m[1]);
+      return statuses.length === 0 ? 'updating plan' : `plan ${statuses.filter((s) => s === 'done').length}/${statuses.length} done`;
+    }
+  }
 }
