@@ -74,11 +74,6 @@ export function tokenColumn(entries: readonly BandEntry[]): number {
 
 export const CHILD_INDENT = '   ';
 
-export function childLabel(m: TeamMember): string {
-  const model = shortModel(m);
-  return oneLine(m.name) + (model === '' ? '' : ` ${SEP} ${oneLine(model)}`);
-}
-
 export interface TreeColumns {
   readonly worker: number;
   readonly child: number;
@@ -94,9 +89,9 @@ export function treeColumns(columns: { readonly detail: number }, tokenWidth: nu
 export interface ChildRow {
   readonly tree: string;
   readonly glyph: string;
-  readonly name: string;
-  readonly model: string;
   readonly label: string;
+  readonly lead: string;
+  readonly model: string;
   readonly detail: string;
   readonly right: string;
   readonly plain: string;
@@ -113,7 +108,7 @@ export function childRow(
 ): ChildRow {
   if (entry.kind === 'fold') {
     const text = foldText(entry.hidden);
-    return { tree: '└', glyph: '', name: text, model: '', label: text, detail: '', right: '', plain: `└ ${text}`, bold: false, dim: true, memberId: null };
+    return { tree: '└', glyph: '', label: text, lead: '', model: '', detail: '', right: '', plain: `└ ${text}`, bold: false, dim: true, memberId: null };
   }
   const { member, last } = entry;
   const fit = treeColumns(columns, tokenWidth);
@@ -121,14 +116,15 @@ export function childRow(
   const mark = memberMark(member);
   const glyph = memberGlyph(mark);
   const name = oneLine(member.name);
-  const room = Math.max(0, columns.label - 2);
-  const full = childLabel(member);
-  const label = fitCell(full.length <= room ? full : name, room);
-  const nameCell = label.slice(0, name.length);
-  const modelCell = label.slice(nameCell.length);
-  const detail = fitCell(oneLine(member.activity ?? member.task ?? ''), fit.child);
+  const label = fitCell(oneLine(member.name), Math.max(0, columns.label - 2));
+  const activity = oneLine(member.activity ?? member.task ?? '');
+  const model = oneLine(shortModel(member));
+  const text = model === '' ? activity : activity === '' ? model : `${activity} ${SEP} ${model}`;
+  const detail = fitCell(text, fit.child);
+  const lead = detail.slice(0, activity.length);
+  const modelPart = detail.slice(lead.length);
   const suffix = fit.tokens ? tokensSuffix(member).padEnd(tokenWidth) : '';
   const right = `${memberClock(member, now)}${suffix}`.trimEnd();
   const plain = `${tree} ${glyph} ${label} ${detail} ${right}`.replace(/\s+$/, '');
-  return { tree, glyph, name: nameCell, model: modelCell, label, detail, right, plain, bold: member.state === 'working', dim: member.state !== 'working', memberId: member.id };
+  return { tree, glyph, label, lead, model: modelPart, detail, right, plain, bold: member.state === 'working', dim: member.state !== 'working', memberId: member.id };
 }

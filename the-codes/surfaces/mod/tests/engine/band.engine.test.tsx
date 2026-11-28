@@ -1993,8 +1993,8 @@ describe('the band team rows', () => {
     const labels = await bandTexts(band);
     expect(labels).toHaveLength(4);
     expect(labels[0]).toMatch(/swarm/);
-    expect(labels[1]).toMatch(/^\s+├ ⏺ alpha\s+reading alpha\.rs/);
-    expect(labels[2]).toMatch(/^\s+├ ⏺ bravo\s+reading bravo\.rs/);
+    expect(labels[1]).toMatch(/^\s+├ ⏺ alpha\s+reading alpha\.rs ∙ Neon\s+1m00s$/);
+    expect(labels[2]).toMatch(/^\s+├ ⏺ bravo\s+reading bravo\.rs ∙ Neon\s+1m00s$/);
     const edge = (l: string) => l.trimEnd().length;
     expect(edge(labels[1]!)).toBe(edge(labels[0]!));
     expect(edge(labels[2]!)).toBe(edge(labels[0]!));

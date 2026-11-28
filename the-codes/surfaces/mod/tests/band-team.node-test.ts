@@ -197,16 +197,17 @@ test('shortModel takes the family word of the label, else the model id', () => {
   assert.equal(shortModel(m(null, null)), '');
 });
 
-test('a band member row names its model after the name, cut from the end', () => {
+test('a band member row ends its detail with the short model, which narrow widths drop first', () => {
   const e = (m: TeamMember): BandEntry => ({ kind: 'member', job: job(), member: m, last: true });
-  const hydro = { modelLabel: 'Gemini 4 Hydrogen (High)', model: 'g' };
-  const r = childRow(e(member('codex', hydro)) as never, NOW, { label: 22, detail: 30 }, 0);
-  assert.equal(r.name, 'codex');
-  assert.match(r.model, /^ ∙ Hydrogen\s*$/);
-  assert.equal(r.label.length, 20);
-  const cut = childRow(e(member('codex', hydro)) as never, NOW, { label: 18, detail: 30 }, 0);
-  assert.equal(cut.label, 'codex ∙ Hydrogen '.slice(0, 16));
-  assert.equal(childRow(e(member('plain')) as never, NOW, { label: 22, detail: 30 }, 0).model.trim(), '');
+  const hydro = { modelLabel: 'Gemini 4 Hydrogen (High)', model: 'g', activity: 'posted #11' };
+  const wide = childRow(e(member('kimi', hydro)) as never, NOW, { label: 12, detail: 33 }, 0);
+  assert.equal(wide.label.trimEnd(), 'kimi');
+  assert.equal(wide.lead, 'posted #11');
+  assert.equal(wide.model.trimEnd(), ' ∙ Hydrogen');
+  const tight = childRow(e(member('kimi', hydro)) as never, NOW, { label: 12, detail: 19 }, 0);
+  assert.equal(tight.detail.trimEnd(), 'posted #11');
+  assert.equal(tight.model.trim(), '');
+  assert.equal(childRow(e(member('plain', { activity: 'x' })) as never, NOW, { label: 12, detail: 30 }, 0).model.trim(), '');
 });
 
 test('the worker row and its member rows put the clock in one column', () => {
@@ -269,13 +270,6 @@ test('a worker row keeps at least the detail room it had, at every width', () =>
     assert.ok(treeColumns(columns, tw).worker >= before(width) - tw, `${width}`);
     assert.equal(treeColumns(columns, 0).worker, columns.detail, `${width}`);
   }
-});
-
-test('a member label drops its model first, then truncates the name', () => {
-  const e = (m: TeamMember): BandEntry => ({ kind: 'member', job: job(), member: m, last: true });
-  const m = member('codex', { modelLabel: 'Gemini 4 Hydrogen (High)', model: 'g' });
-  assert.equal(childRow(e(m) as never, NOW, { label: 12, detail: 30 }, 0).label, 'codex     ');
-  assert.equal(childRow(e(m) as never, NOW, { label: 5, detail: 30 }, 0).label, 'cod');
 });
 
 test('a cut cell never ends in a dangling separator', () => {

@@ -550,9 +550,9 @@ function registerBand(on: Parameters<Register>[0]): void {
             return (
               <Button key={`band-${entry.job.workerId}-${row.memberId ?? 'fold'}`} plain label={`${CHILD_INDENT}${row.plain}`} onPress={press}>
                 <Text dimColor={row.dim} bold={row.bold} wrap="truncate-end">
-                  {`${CHILD_INDENT}${row.tree} ${row.glyph === '' ? '' : `${row.glyph} `}${row.name}`}
+                  {`${CHILD_INDENT}${row.tree} ${row.glyph === '' ? '' : `${row.glyph} `}${row.label}${row.lead === '' && row.model === '' ? '' : ` ${row.lead}`}`}
                   <Text dimColor wrap="truncate-end">{row.model}</Text>
-                  {`${row.detail === '' ? '' : ` ${row.detail}`}${row.right === '' ? '' : ` ${row.right}`}`.replace(/\s+$/, '')}
+                  {`${row.right === '' ? '' : ` ${row.right}`}`}
                 </Text>
               </Button>
             );

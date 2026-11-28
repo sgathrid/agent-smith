@@ -73,9 +73,9 @@ mod only observes them. It cannot message or steer them. Their state comes from 
 (see ARCHITECTURE.md, Sub-agents).
 
 - **Band.** Under a live worker, one child row per working member, marked `├` or `└`, with its
-  current activity, time and output tokens. The name is followed by the member's short model
-  (`codex ∙ Hydrogen`), because a coordinator may name members after harnesses. Working members
-  come first. Extra members fold into one row, such as `5 reported ∙ 2 working ∙ hydro-681
+  current activity, time and output tokens. The activity ends with the member's short model
+  (`posted #11 ∙ Hydrogen`; a narrow band drops it first), because a coordinator may name members after harnesses. Working members
+  come first. Extra members fold into one row, such as `✓ 5 reported ∙ ⏺ 2 working ∙ hydro-681
   posted #13`. The band's row cap still applies. The worker's row and its member rows share one
   clock column, and a band row uses `∙` throughout. The worker's own row leads with the team (`4/9 agents working`) and reads
   `waiting on 3 of 9 agents` while the coordinator waits on its team. Member rows have no digit.
