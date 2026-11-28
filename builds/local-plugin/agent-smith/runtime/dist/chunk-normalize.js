@@ -271,6 +271,12 @@ function diffChangedFiles(baseline, nowDirty, modifiedBaseline = [], committed =
     const all = [...out].filter((p) => !isForgeStatePath(p)).sort();
     return { files: all.slice(0, CHANGED_FILES_CAP), truncated: all.length > CHANGED_FILES_CAP };
 }
+/** The view without the answer's message: a finished job's answer lives in result.md alone. */
+function withoutAnswer(view, answerKey) {
+    if (answerKey === undefined)
+        return view;
+    return { ...view, timeline: (view.timeline ?? []).filter((e) => !(e.kind === 'assistant' && e.messageKey === answerKey)) };
+}
 function jobsDir(repo) {
     return path.join(repo, ...JOBS_DIR_SEGMENTS);
 }
@@ -2154,6 +2160,8 @@ function jobResult(args) {
         finishedAt: nowIso(),
         stateDir: args.stateDir,
     };
+    if (args.answerKey !== undefined)
+        out.answerKey = args.answerKey;
     if (error !== undefined)
         out.error = error;
     return out;
@@ -2370,12 +2378,14 @@ function createAnswer(provider) {
                 return;
             if (current.trim() !== '' && kind === 'final-message') {
                 current = text;
-                lastKey = undefined;
                 hasMessage = true;
             }
         },
         value() {
             return current.trim() === '' ? '' : current;
+        },
+        answerKey() {
+            return current.trim() === '' ? undefined : lastKey;
         },
     };
 }/** Text sanitising and fixed-width fitting. Dependency-free: everything that puts
@@ -2446,6 +2456,23 @@ function fitCell(s, width) {
 function oneLine(s, max = 400) {
     const t = sanitizeText(s).replace(/\s+/g, ' ').trim();
     return clip(t, Math.max(0, max));
+}
+const SUMMARY_CHARS = 1_000;
+/** A short summary of a worker's report or current message: its opening, without a leading
+ * `Status:` line, cut at a paragraph or line boundary within `max`. */
+function reportSummary(text, max = SUMMARY_CHARS) {
+    const t = text.trim().replace(/^Status:[^\n]*(?:\n|$)/, '').trim();
+    if (t.length <= max)
+        return t;
+    const head = t.slice(0, max);
+    if (t[max] === '\n')
+        return head.trim();
+    for (const sep of ['\n\n', '\n']) {
+        const i = head.lastIndexOf(sep);
+        if (i >= 0 && head.slice(0, i).trim() !== '')
+            return head.slice(0, i).trim();
+    }
+    return head.trim();
 }/** Tool name + parameters → a short human phrase. Shared by the legacy reader
  * (jobs.ts) and the progress digest (progress.ts); never raw tool output.
  */
@@ -3212,6 +3239,7 @@ class MemberAggregate {
     planner = null;
     lastType = '';
     lastReply = null;
+    lastReplySequence = null;
     brief = null;
     parentConv;
     constructor(parentConv) { this.parentConv = parentConv; }
@@ -3250,8 +3278,10 @@ class MemberAggregate {
         const content = str(step['content']);
         if (content !== null && content.trim() !== '')
             this.push({ sequence: index, kind: 'assistant', at, text: cap(content) });
-        if (calls.length === 0)
+        if (calls.length === 0) {
             this.lastReply = content ?? '';
+            this.lastReplySequence = index;
+        }
         const tools = calls.map((c, i) => ({
             sequence: index + 1 + i, kind: 'tool', at, stepIndex: index + 1 + i, tool: c.name, input: cap(c.input), output: '', state: 'active',
         }));
@@ -3302,6 +3332,10 @@ class MemberAggregate {
     }
     finalReply() {
         return this.lastType === 'PLANNER_RESPONSE' && this.planner?.calls.length === 0 ? this.lastReply : null;
+    }
+    timeline(withoutFinalReply) {
+        const reply = withoutFinalReply ? this.lastReplySequence : null;
+        return this.events.filter((e) => !(e.kind === 'assistant' && e.sequence === reply)).map((e) => ({ ...e }));
     }
     activity() {
         const p = this.planner;
@@ -3629,10 +3663,11 @@ function createAgyTeamReader(options) {
                 lastEventAt: log?.lastEventAt ?? null,
                 lastPost: post ? { seq: post.seq, text: firstLine(post.text) } : null,
             });
+            const reply = post === null ? log?.finalReply() ?? null : null;
             views.push({
                 schema: 1, id: seat.id, name: seat.name, brief,
-                report: post?.text ?? log?.finalReply() ?? null,
-                timeline: (log?.events ?? []).map((e) => ({ ...e })),
+                report: post?.text ?? reply,
+                timeline: log?.timeline(reply !== null) ?? [],
                 truncated: log?.truncated ?? false,
             });
         }
@@ -3881,7 +3916,7 @@ function createAgyTranslator(maxChars) {
                 if (delta !== undefined) {
                     answer.text(delta, String(stepIndex));
                     if (delta !== '') {
-                        out.push({ kind: 'text', at, text: delta, stream: 'assistant', delta: true });
+                        out.push({ kind: 'text', at, text: delta, stream: 'assistant', delta: true, messageKey: String(stepIndex) });
                     }
                 }
                 return out;
@@ -4069,7 +4104,7 @@ function buildResult$4(args) {
         status = 'error';
         error = exit.code === null ? `exited on ${exit.signal ?? 'a signal'}` : exitReason(exit.code);
     }
-    const out = jobResult({ provider: 'agy', jobId, status, error, exit, response, startedAtMs, durationMs, stateDir });
+    const out = jobResult({ provider: 'agy', jobId, status, error, exit, response, answerKey: args.answer.answerKey(), startedAtMs, durationMs, stateDir });
     if (distinctDenials.length > 0)
         out.deniedActions = distinctDenials;
     if (usage !== undefined)
@@ -4558,7 +4593,7 @@ function createClaudeTranslator(maxChars, input) {
                         else {
                             sawNonEmptyText = true;
                             answer.text(text, msgKey);
-                            out.push({ kind: 'text', at, text, stream: 'assistant' });
+                            out.push({ kind: 'text', at, text, stream: 'assistant', messageKey: msgKey });
                         }
                     }
                     continue;
@@ -4736,7 +4771,7 @@ function buildResult$3(args) {
             status = 'success';
         }
     }
-    const out = jobResult({ provider: 'claude', jobId, status, error, exit, response, startedAtMs, durationMs, stateDir });
+    const out = jobResult({ provider: 'claude', jobId, status, error, exit, response, answerKey: tx.answer.answerKey(), startedAtMs, durationMs, stateDir });
     if (tx.deniedTools.length > 0) {
         out.deniedActions = tx.deniedTools.map((id) => ({ action: 'tool', displayName: id, nonfatal: true }));
     }
@@ -5198,14 +5233,14 @@ function createCodexTranslator(maxChars) {
             }
             // Assistant prose.
             if (itemType === 'agent_message') {
-                const text = str$1(item, 'text');
+                const text = type === 'item.completed' ? str$1(item, 'text') : undefined;
                 if (text !== undefined) {
                     if (text === '') {
                         answer.emptyMessage();
                     }
                     else {
-                        answer.text(text);
-                        out.push({ kind: 'text', at, text, stream: 'assistant' });
+                        answer.text(text, itemId);
+                        out.push({ kind: 'text', at, text, stream: 'assistant', messageKey: itemId });
                     }
                 }
                 return out;
@@ -5373,7 +5408,7 @@ function buildResult$2(args) {
             status = 'success';
         }
     }
-    const out = jobResult({ provider: 'codex', jobId, status, error, exit, response, startedAtMs, durationMs, stateDir });
+    const out = jobResult({ provider: 'codex', jobId, status, error, exit, response, answerKey: tx.answer.answerKey(), startedAtMs, durationMs, stateDir });
     if (tx.usage !== undefined)
         out.usage = tx.usage;
     if (tx.threadId !== undefined)
@@ -5630,6 +5665,7 @@ function createKimiTranslator(maxChars) {
         onEvent: () => [],
     };
     let step = 0;
+    let messages = 0;
     const toolSteps = new Map();
     const toolNames = new Map();
     const started = new Set();
@@ -5715,8 +5751,9 @@ function createKimiTranslator(maxChars) {
                         answer.emptyMessage();
                 }
                 else {
-                    answer.text(content);
-                    out.push({ kind: 'text', at, text: content, stream: 'assistant' });
+                    const messageKey = `m${++messages}`;
+                    answer.text(content, messageKey);
+                    out.push({ kind: 'text', at, text: content, stream: 'assistant', messageKey });
                 }
             }
             if (calls !== undefined) {
@@ -5854,7 +5891,7 @@ function buildResult$1(args) {
             status = 'success';
         }
     }
-    const out = jobResult({ provider: 'kimi', jobId, status, error, exit, response, startedAtMs, durationMs, stateDir });
+    const out = jobResult({ provider: 'kimi', jobId, status, error, exit, response, answerKey: tx.answer.answerKey(), startedAtMs, durationMs, stateDir });
     if (tx.usage !== undefined)
         out.usage = tx.usage;
     const raw = {};
@@ -6475,7 +6512,7 @@ function createOpencodeTranslator(maxChars) {
         if (text !== undefined && text !== '') {
             if (!isThinking)
                 answer.text(text, msgId);
-            out.push({ kind: 'text', at, text, stream: isThinking ? 'thinking' : 'assistant' });
+            out.push({ kind: 'text', at, text, stream: isThinking ? 'thinking' : 'assistant', ...(msgId === undefined ? {} : { messageKey: msgId }) });
             // A text event is also our best evidence the run is producing output, so
             // it doubles as a terminal marker candidate below.
             return out;
@@ -6609,7 +6646,7 @@ function buildResult(args) {
             status = 'success';
         }
     }
-    const out = jobResult({ provider: 'opencode', jobId, status, error, exit, response, startedAtMs, durationMs, stateDir });
+    const out = jobResult({ provider: 'opencode', jobId, status, error, exit, response, answerKey: tx.answer.answerKey(), startedAtMs, durationMs, stateDir });
     if (tx.usage !== undefined)
         out.usage = tx.usage;
     if (tx.unrecognised.size > 0)
@@ -6926,7 +6963,6 @@ function memberFileName(memberId) {
 }// Shared with the mod, which renders the digest; the mod loader cannot import forge, so it lives there.
 const RECENT_ACTIVITIES = 5;
 const LATEST_TEXT_CHARS = 4_000;
-const SUMMARY_CHARS = 1_000;
 const TEAM_MEMBERS_CAP = 64;
 class JobWriter {
     jobId;
@@ -6950,6 +6986,7 @@ class JobWriter {
     tracker = new ProgressTracker();
     view = { schema: 1, prompt: '', preamble: null, transcript: [], tools: [], timeline: [], truncated: false };
     deltaOpen = false;
+    textKey;
     viewSequence = 0;
     conversation = null;
     finished = false;
@@ -7349,13 +7386,18 @@ class JobWriter {
         const at = event.at;
         if (event.stream !== 'assistant')
             return;
-        const joinDelta = event.delta === true && this.deltaOpen;
+        const key = event.messageKey;
+        const sameMessage = key === this.textKey;
+        const joinDelta = event.delta === true && this.deltaOpen && sameMessage;
         const transcript = [...this.view.transcript];
-        if (event.delta && this.deltaOpen && transcript.length > 0)
+        if (joinDelta && transcript.length > 0)
             transcript[transcript.length - 1] += event.text;
         else
             transcript.push(event.text);
         this.deltaOpen = event.delta === true;
+        this.textKey = key;
+        if (!sameMessage)
+            this.currentMessage = '';
         let truncated = this.view.truncated;
         let chars = transcript.reduce((n, t) => n + t.length, 0);
         while (transcript.length > 1 && (chars > 64_000 || transcript.length > 200)) {
@@ -7372,13 +7414,13 @@ class JobWriter {
         if (joinDelta && last?.kind === 'assistant')
             timeline[timeline.length - 1] = { ...last, text: last.text + event.text };
         else
-            timeline.push({ kind: 'assistant', sequence: this.viewSequence++, at, text: event.text });
+            timeline.push({ kind: 'assistant', sequence: this.viewSequence++, at, text: event.text, ...(key === undefined ? {} : { messageKey: key }) });
         const bounded = boundTimeline(timeline);
         this.view = { ...this.view, timeline: bounded.events, truncated: this.view.truncated || bounded.truncated };
         this.latestText = appendBounded(this.latestText ?? '', event.text, LATEST_TEXT_CHARS);
         this.currentMessage = appendBounded(this.currentMessage, event.text, LATEST_TEXT_CHARS);
         this.noteFirstEvent(false);
-        this.manifest = { ...this.manifest, latestSummary: summaryHead(this.currentMessage, SUMMARY_CHARS) || this.manifest.latestSummary || null, summarySource: 'worker' };
+        this.manifest = { ...this.manifest, latestSummary: reportSummary(this.currentMessage) || this.manifest.latestSummary || null, summarySource: 'worker' };
         this.touch(at);
     }
     verdictFacts() {
@@ -7407,7 +7449,6 @@ class JobWriter {
         const failure = failureFields(verdict, result);
         const failedEarly = verdict.status === 'failed' && !result.ok && result.status !== 'timeout' && result.status !== 'cancelled' &&
             this.toolCalls === 0 && (result.durationMs <= FAILED_EARLY_MS || this.firstEventWasError);
-        const response = result.response.trim();
         const usage = result.usage === undefined
             ? null
             : Object.fromEntries(Object.entries(result.usage).filter((e) => typeof e[1] === 'number'));
@@ -7431,8 +7472,8 @@ class JobWriter {
             ...(this.toolErrorSteps.size === 0 ? {} : { toolErrors: this.toolErrorSteps.size }),
             ...(failedEarly ? { failedEarly: true } : {}),
             conversation: this.conversation,
-            latestSummary: summaryHead(response, SUMMARY_CHARS) || this.manifest.latestSummary || null,
-            summarySource: response || this.manifest.latestSummary ? 'worker' : null,
+            latestSummary: null,
+            summarySource: null,
             ...(this.changed === null
                 ? { changedFilesUnknown: true }
                 : { changedFiles: this.changed.files, changedFilesTruncated: this.changed.truncated }),
@@ -7447,6 +7488,8 @@ class JobWriter {
         }
         const body = report ?? '';
         writeAtomic(jobFile(this.repo, this.jobId, FILES.report), body);
+        if (body.trim() !== '')
+            this.view = withoutAnswer(this.view, result.answerKey);
         this.writeManifest();
         this.flushProgress(finishedAt);
         if (verdict.suspicious)
@@ -7466,6 +7509,8 @@ class JobWriter {
             error: reason,
             reason: status === 'failed' ? reason.split(' · ')[0] : null,
             jobStatus: status === 'canceled' ? 'cancelled' : 'malformed',
+            latestSummary: null,
+            summarySource: null,
             ...(this.manifest.pendingSteers !== undefined ? { pendingSteers: 0 } : {}),
         };
         this.manifest = manifest;
@@ -7718,20 +7763,6 @@ function appendBounded(base, add, max) {
     if (joined.length <= max)
         return joined;
     return joined.slice(joined.length - max);
-}
-function summaryHead(text, max) {
-    const t = text.trim().replace(/^Status:[^\n]*(?:\n|$)/, '').trim();
-    if (t.length <= max)
-        return t;
-    const head = t.slice(0, max);
-    if (t[max] === '\n')
-        return head.trim();
-    for (const sep of ['\n\n', '\n']) {
-        const i = head.lastIndexOf(sep);
-        if (i >= 0 && head.slice(0, i).trim() !== '')
-            return head.slice(0, i).trim();
-    }
-    return head.trim();
 }
 function emptyManifest(jobId) {
     const now = new Date().toISOString();
@@ -9537,4 +9568,4 @@ function asUsage(v) {
 /** Normalize a raw agent-smith job snapshot. */
 function normalize(raw) {
     return smithNormalizer(raw);
-}export{newJobId$1 as $,AgentSmithReader as A,SCHEMA_VERSION as B,validOwnerPid as C,DEFAULT_TIMEOUT_MS as D,reportFor as E,FILES as F,cwdFacts as G,normalizeDenials as H,deriveOrphan as I,deriveStatus as J,summaryHead as K,failureFields as L,MODES as M,writeAcceptance as N,createMarker as O,PROVIDERS as P,jobsDir as Q,REASONS as R,STAGE_PROMPTS as S,parseWorkerIndex as T,getProvider as U,normalizeContinuationKind as V,WORKERS_DIR as W,reasonFromText as X,fileSig as Y,JobWriter as Z,effectiveUnrestricted as _,MODE_PRESETS as a,newWorkerId as a0,markAcceptancePending as a1,humanDuration as a2,pipeEvents as a3,checksAbortRequested as a4,verdictBlock as a5,runAcceptance as a6,senderOf as a7,taskTitle as a8,markAcceptanceSuperseded as a9,pickHead as aa,compareTurnPriority as ab,computeStaleReads as ac,SMITH_PAYLOAD as ad,isForgeStatus as ae,noticeReason as af,readJsonSafe as ag,pipelineRecordPath as ah,workerIndexPath as ai,checksReason as aj,toolLabel as ak,inheritContinuedProviders as b,jobFile as c,readAcceptance as d,cancelPipeline as e,isWorkerIdle as f,findProvider as g,hasTeam as h,isTerminalStatus as i,jobDir as j,effectiveDefaultUnrestricted as k,isMode as l,missingPipelineError as m,isTerminalForgeStatus as n,readManifest as o,providerNames as p,ownerAlive as q,readPipeline as r,startPipeline as s,teamCounts as t,normalize as u,validateSpec as v,errMessage as w,probeAvailability as x,writeJsonAtomic as y,writeAtomic as z};
+}export{effectiveUnrestricted as $,AgentSmithReader as A,writeAtomic as B,SCHEMA_VERSION as C,DEFAULT_TIMEOUT_MS as D,validOwnerPid as E,FILES as F,reportFor as G,cwdFacts as H,normalizeDenials as I,deriveOrphan as J,deriveStatus as K,failureFields as L,MODES as M,writeAcceptance as N,createMarker as O,PROVIDERS as P,withoutAnswer as Q,REASONS as R,STAGE_PROMPTS as S,jobsDir as T,parseWorkerIndex as U,getProvider as V,WORKERS_DIR as W,normalizeContinuationKind as X,reasonFromText as Y,fileSig as Z,JobWriter as _,MODE_PRESETS as a,newJobId$1 as a0,newWorkerId as a1,markAcceptancePending as a2,humanDuration as a3,pipeEvents as a4,checksAbortRequested as a5,verdictBlock as a6,runAcceptance as a7,senderOf as a8,taskTitle as a9,markAcceptanceSuperseded as aa,pickHead as ab,compareTurnPriority as ac,computeStaleReads as ad,SMITH_PAYLOAD as ae,isForgeStatus as af,noticeReason as ag,readJsonSafe as ah,pipelineRecordPath as ai,workerIndexPath as aj,checksReason as ak,toolLabel as al,inheritContinuedProviders as b,readPipeline as c,jobFile as d,readAcceptance as e,cancelPipeline as f,isWorkerIdle as g,hasTeam as h,isTerminalStatus as i,jobDir as j,findProvider as k,effectiveDefaultUnrestricted as l,missingPipelineError as m,isMode as n,isTerminalForgeStatus as o,providerNames as p,readManifest as q,reportSummary as r,startPipeline as s,teamCounts as t,ownerAlive as u,validateSpec as v,normalize as w,errMessage as x,probeAvailability as y,writeJsonAtomic as z};

@@ -116,7 +116,7 @@ export interface MemberView {
 }
 
 export type ActivityEvent =
-  | { sequence: number; kind: 'assistant'; at: string; text: string }
+  | { sequence: number; kind: 'assistant'; at: string; text: string; messageKey?: string }
   | { sequence: number; kind: 'tool'; at: string; stepIndex: number; tool: string; input: string; output: string; state: string }
   | { sequence: number; kind: 'message'; at: string; text: string; delivery: 'next-step' | 'turn-start'; sender: 'follow_up' | 'steer' };
 
