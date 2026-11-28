@@ -11,10 +11,10 @@ import {
   isShown,
   noColor,
   overflowLine,
-  rowBudget,
 } from './band.ts';
 import type { FsLike } from './fs.ts';
-import { sortForBand } from './format.ts';
+import { fitBandColumns, sortForBand } from './format.ts';
+import { childRow, planBand, tokenColumn } from './band-team.ts';
 import { isSettledForCache, readForgeJobs, readForgeDetail } from './canonical.ts';
 import {
   LAUNCH_TOOL,
@@ -531,18 +531,33 @@ function registerBand(on: Parameters<Register>[0]): void {
     const shown = sortForBand(groupWorkers(all)).filter((j) => isShown(j, at));
     if (shown.length === 0) return rest;
 
-    const budget = rowBudget(shown, Math.max(1, (e.props.maxRows ?? 10) - 1));
+    const plan = planBand(shown, Math.max(1, (e.props.maxRows ?? 10) - 1));
     const { Box, Text, Button } = $.ui.resolve(e);
-    // A plain Button draws `1: ` before its children, so the row is sized to the rest.
+    // A plain Button draws `1: ` before its children, so the row is sized to the rest;
+    // a child row has no hotkey and carries its own three-column indent.
     const width = Math.max(1, e.props.bodyColumns - 3);
-    const longestLabel = Math.max(0, ...budget.rows.map((job) => jobLabel(job).length));
+    const longestLabel = Math.max(0, ...plan.entries.map((en) => en.kind === 'job' ? jobLabel(en.job).length : en.kind === 'member' ? en.member.name.length + 2 : 0));
+    const columns = fitBandColumns(width, longestLabel);
+    const tokenWidth = tokenColumn(plan.entries);
 
     return (
       <Box flexDirection="column">
-        {budget.rows.map((job, i) => {
+        {plan.entries.map((entry) => {
+          if (entry.kind !== 'job') {
+            const row = childRow(entry, at, columns, tokenWidth);
+            const press = () => openForge($, entry.job.workerId, row.memberId);
+            return (
+              <Button key={`band-${entry.job.workerId}-${row.memberId ?? 'fold'}`} plain label={`   ${row.plain}`} onPress={press}>
+                <Text dimColor={row.dim} bold={row.bold} wrap="truncate-end">
+                  {`   ${row.tree} ${row.glyph} ${row.label}${row.detail === '' ? '' : ` ${row.detail}`}${row.right === '' ? '' : ` ${row.right}`}`}
+                </Text>
+              </Button>
+            );
+          }
+          const job = entry.job;
           const line = buildLine(job, at, { colour: cfg.colour, width, longestLabel });
           return (
-            <Button key={`band-${job.workerId}`} plain hotkey={String(i + 1)} label={line.plain.trim()} onPress={() => openForge($, job.workerId)}>
+            <Button key={`band-${job.workerId}`} plain hotkey={String(entry.index + 1)} label={line.plain.trim()} onPress={() => openForge($, job.workerId)}>
             <Text dimColor={line.recessive} wrap="truncate-end">
               <Text color={line.accent} bold={line.bold} wrap="truncate-end">
                 {line.glyph}
@@ -555,9 +570,9 @@ function registerBand(on: Parameters<Register>[0]): void {
             </Button>
           );
         })}
-        {budget.hidden > 0 && (
+        {plan.hidden > 0 && (
           <Text dimColor wrap="truncate-end">
-            {overflowLine(budget.hidden)}
+            {overflowLine(plan.hidden)}
           </Text>
         )}
         {rest}
@@ -635,8 +650,9 @@ export const register: Register = (on) => {
   });
 };
 
-async function show($: EngineInterface, workerId: string | null): Promise<void> {
+async function show($: EngineInterface, workerId: string | null, memberId: string | null = null): Promise<void> {
   await update($, selected, () => workerId);
+  await update($, selectedMember, () => memberId);
   await update($, pinnedTurnId, () => null);
   await update($, follow, () => true);
   await update($, taskOpen, () => false);
@@ -654,9 +670,9 @@ async function pinTurn($: EngineInterface, turnJobId: string | null): Promise<vo
   await $.ui.scroll({ to: 'start', in: PANE }).catch(() => {});
 }
 
-async function openForge($: EngineInterface, workerId: string | null): Promise<void> {
+async function openForge($: EngineInterface, workerId: string | null, memberId: string | null = null): Promise<void> {
   detailCache = null;
-  await show($, workerId);
+  await show($, workerId, memberId);
   if (workerId === null) await update($, listPage, () => 0);
   await update($, paneOpen, () => true);
   const at = await $.clock.now();
