@@ -185,10 +185,11 @@ export function renderMember(W: UiComponents, job: RadarJob, member: TeamMember,
         {o.taskOpen && (view.brief?.trim() ?? '')!=='' && <Markdown text={sanitizeText(view.brief!)} />}
         {timeline.length>0 && <Box key="transcript-gap"><Text> </Text></Box>}
         {timelineRows(W,timeline,o,a)}
-        {resultGap(W,timeline,o)}
-        <Text bold wrap="truncate-end">● Result</Text>
-        {view.report?.trim()?<Markdown text={sanitizeText(view.report)}/>
-          :<Text dimColor wrap="wrap">{member.state==='working'?'No post yet.':'No report recorded.'}</Text>}
+        {(view.report?.trim() || member.state!=='working') && <Box flexDirection="column">
+          {resultGap(W,timeline,o)}
+          <Text bold wrap="truncate-end">● Result</Text>
+          {view.report?.trim()?<Markdown text={sanitizeText(view.report)}/>:<Text dimColor wrap="wrap">No report recorded.</Text>}
+        </Box>}
       </Box>}
     <Box flexDirection="row" gap={2}>
       <Button key="task" plain label="Task" hotkey="t" onPress={a.task} />

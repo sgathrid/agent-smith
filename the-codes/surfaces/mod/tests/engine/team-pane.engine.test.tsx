@@ -129,10 +129,14 @@ describe('the member view (renderMember)', () => {
     expect(await pane.find({ type: 'Markdown', text: 'Full brief for the member' })).toBeDefined();
   });
 
-  test('a working member without a post says so; a missing view says no detail', async ($, on) => {
+  test('a working member without a post shows no Result yet; a missing view says no detail', async ($, on) => {
     const noPost = { ...view, report: null };
     const a = await draw($, on, (W) => renderMember(W, job(MEMBERS), MEMBERS[0]!, noPost, options(), actions));
-    expect(await texts(a)).toContain('No post yet.');
+    const working = await texts(a);
+    expect(working).not.toContain('● Result');
+    expect(working).not.toContain('No post yet.');
+    const settled = await draw($, on, (W) => renderMember(W, job(MEMBERS), { ...MEMBERS[0]!, state: 'stopped' }, noPost, options(), actions));
+    expect(await texts(settled)).toContain('No report recorded.');
     const b = await draw($, on, (W) => renderMember(W, job(MEMBERS), MEMBERS[2]!, null, options(), actions));
     const t = await texts(b);
     expect(t[0]).toMatch(/^✓ neon-707 · member of stack-swarm · agy/);
