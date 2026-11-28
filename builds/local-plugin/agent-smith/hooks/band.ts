@@ -36,12 +36,13 @@ export type BandLine = import('./format.ts').JobRow;
 export function buildLine(
   job: RadarJob,
   now: number,
-  options: { readonly colour?: boolean; readonly width?: number; readonly longestLabel?: number } = {},
+  options: { readonly colour?: boolean; readonly width?: number; readonly longestLabel?: number; readonly detail?: number } = {},
 ): BandLine {
   const columns = options.width === undefined ? bandColumns()
     : options.longestLabel === undefined ? { ...paneColumns(options.width), tools: false }
     : { ...fitBandColumns(options.width, options.longestLabel), tools: false };
-  const row = formatJobRow(job, { now, ...columns } satisfies RowOptions);
+  const aligned = options.detail === undefined ? {} : { detail: options.detail, padDetail: true };
+  const row = formatJobRow(job, { now, ...columns, ...aligned } satisfies RowOptions);
   const colour = options.colour !== false;
   return {
     ...row,

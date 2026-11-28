@@ -1,4 +1,4 @@
-import {watch}from'node:fs';import {Y as reasonFromText,ak as checksReason,al as toolLabel}from'./chunk-normalize.js';/**
+import {watch}from'node:fs';import {Z as reasonFromText,al as checksReason,am as toolLabel}from'./chunk-normalize.js';/**
  * forge/watch.ts — wake when a job's files change, instead of re-reading them on a timer.
  *
  * A worker runs in another process (the detached supervisor) and reports only through

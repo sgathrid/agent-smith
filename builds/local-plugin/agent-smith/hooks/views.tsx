@@ -4,8 +4,8 @@ import type { ForgeDetail } from './canonical.ts';
 import { changedFilesPhrase, condenseTimeline, forgeList, isLive, needsAttention, paneChecksLabel, priorTurnSummary, scopeLine, statusLine, timelineGroupLabel, workerHead, workerHeading, workerLivenessLine, workerStatus, type TimelineItem } from './dashboard.ts';
 import { effectiveStart, elapsed, failureWords, isTerminal, oneLine, pendingSteersLabel, pickColor, pickGlyph, prettyJson, sanitizeText } from './format.ts';
 import { classify, progressSummaryLine } from './progress.ts';
-import { hasTeam, sortMembers, teamHeaderLine } from './team.ts';
-import { memberDetailLine, memberHeading, memberRow, nameWidth, TEAM_KEYS, TEAM_ROWS } from './team-view.ts';
+import { hasTeam, memberMark, sortMembers, teamHeaderLine, type MemberMark } from './team.ts';
+import { memberDetailLine, memberHeading, memberRow, teamColumns, TEAM_KEYS, TEAM_ROWS } from './team-view.ts';
 
 export interface ViewActions {
   pick(job: RadarJob): Promise<void>;
@@ -126,7 +126,8 @@ export function renderWorker(W: UiComponents, d: ForgeDetail, o: ViewOptions, a:
     {visibleTimeline.length===0 && !isTerminal(job.status) && <Text dimColor wrap="wrap">{sanitizeText(job.latestSummary??'No worker activity recorded yet.')}</Text>}
     {isTerminal(job.status)
       ? <Box flexDirection="column">
-        <Text bold wrap="truncate-end">Result</Text>
+        {resultGap(W,visibleTimeline,o)}
+        <Text bold wrap="truncate-end">● Result</Text>
         {job.report?.trim()?<Markdown text={sanitizeText(job.report)}/>:<Text dimColor wrap="wrap">No report was written.</Text>}
       </Box>
       : !o.following && <Text dimColor wrap="truncate-end">Paused. Scroll to the bottom to follow again.</Text>}
@@ -150,15 +151,15 @@ function teamSection(W: UiComponents, all: readonly TeamMember[], o: ViewOptions
   const shown=o.teamOpen?members:members.slice(0,TEAM_ROWS);
   const hidden=members.length-shown.length;
   const cw=Math.max(1,o.width-4);
-  const names=nameWidth(shown,24);
+  const columns=teamColumns(shown,o.now,cw);
   return <Box key="team-section" flexDirection="column">
     <Box key="team-gap"><Text> </Text></Box>
     <Text bold wrap="truncate-end">Team</Text>
     {shown.map((m,i) => {
-      const line=memberRow(m,o.now,cw,names);
+      const line=memberRow(m,o.now,cw,columns);
       const glyph=line.slice(0,1);
       return <Button key={`member-${m.id}`} plain {...(i<TEAM_KEYS?{hotkey:String(i+1)}:{})} label={line} onPress={() => a.member(m.id)}>
-        <Text color={o.colour?memberColor(m.state):undefined} wrap="truncate-end">{glyph}</Text>
+        <Text color={o.colour?memberColor(memberMark(m)):undefined} wrap="truncate-end">{glyph}</Text>
         {line.slice(1)}
       </Button>;
     })}
@@ -166,15 +167,15 @@ function teamSection(W: UiComponents, all: readonly TeamMember[], o: ViewOptions
   </Box>;
 }
 
-const memberColor=(state: TeamMemberState): 'blue' | 'green' | 'red' | undefined =>
-  state==='working'?'blue':state==='done'?'green':state==='failed'?'red':undefined;
+const memberColor=(mark: MemberMark): 'blue' | 'green' | 'red' | undefined =>
+  mark==='working'?'blue':mark==='done'||mark==='reported'?'green':mark==='failed'?'red':undefined;
 
 export function renderMember(W: UiComponents, job: RadarJob, member: TeamMember, view: MemberView | null, o: ViewOptions, a: ViewActions): JSX.Element {
   const {Box,Text,Button,Markdown}=W;
   const task=oneLine(member.task??'');
   const timeline=view?.timeline??[];
   return <Box flexDirection="column">
-    <Text bold color={o.colour?memberColor(member.state):undefined} wrap="truncate-end">{memberHeading(member,workerHeading(job),o.now)}</Text>
+    <Text bold color={o.colour?memberColor(memberMark(member)):undefined} wrap="truncate-end">{memberHeading(member,workerHeading(job),o.now)}</Text>
     <Text dimColor wrap="truncate-end">{memberDetailLine(member)}</Text>
     <Box key="header-gap"><Text> </Text></Box>
     {task!=='' && <Text dimColor wrap="truncate-end">{`Task: ${oneLine(task,Math.max(1,o.width-8))}`}</Text>}
@@ -184,7 +185,8 @@ export function renderMember(W: UiComponents, job: RadarJob, member: TeamMember,
         {o.taskOpen && (view.brief?.trim() ?? '')!=='' && <Markdown text={sanitizeText(view.brief!)} />}
         {timeline.length>0 && <Box key="transcript-gap"><Text> </Text></Box>}
         {timelineRows(W,timeline,o,a)}
-        <Text bold wrap="truncate-end">Result</Text>
+        {resultGap(W,timeline,o)}
+        <Text bold wrap="truncate-end">● Result</Text>
         {view.report?.trim()?<Markdown text={sanitizeText(view.report)}/>
           :<Text dimColor wrap="wrap">{member.state==='working'?'No post yet.':'No report recorded.'}</Text>}
       </Box>}
@@ -194,6 +196,14 @@ export function renderMember(W: UiComponents, job: RadarJob, member: TeamMember,
       <Button key="close" plain label="Close" hotkey="x" onPress={a.close} />
     </Box>
   </Box>;
+}
+
+function resultGap(W: UiComponents, timeline: readonly ActivityEvent[], o: ViewOptions): JSX.Element | null {
+  const {Box,Text}=W;
+  const items=condenseTimeline(timeline);
+  const last=items[items.length-1];
+  if (last===undefined || o.tools.includes(timelineKey(last))) return null;
+  return <Box key="result-gap"><Text> </Text></Box>;
 }
 
 function timelineRows(W: UiComponents, timeline: readonly ActivityEvent[], o: ViewOptions, a: ViewActions): JSX.Element[] {
