@@ -91,3 +91,12 @@ test('toSummary projects unified turn-chain fields and defaults turn/chainStarte
   assert.equal(bare.chainStartedAt, '2026-11-23T09:00:00.000Z');
   assert.equal('steeredFrom' in bare, false);
 });
+
+test('latestSummary is the running message, and the opening of the report once finished', () => {
+  const raw = { latestSummary: 'Running the checks.', summarySource: 'worker' };
+  assert.equal(toSummary(observed(raw)).latestSummary, 'Running the checks.');
+  const done = toSummary({ ...observed(raw, 'succeeded'), output: 'Status: DONE\n\nShipped the fix.' });
+  assert.deepEqual([done.latestSummary, done.summarySource], ['Shipped the fix.', 'worker']);
+  const empty = toSummary({ ...observed(raw, 'failed'), output: null });
+  assert.deepEqual([empty.latestSummary, empty.summarySource], [null, null]);
+});

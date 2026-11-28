@@ -8,6 +8,7 @@ import { readAcceptance } from '../../../forge/checks.ts';
 import { livenessOf, type Liveness } from '../../mod/hooks/stale.ts';
 import { ACCEPTANCE_HOLD_MS, droppedMessageQuote, pipelineOutcome } from '../../mod/hooks/notice.ts';
 import { normalizeContinuationKind, type ContinuationKind } from '../../mod/hooks/turns.ts';
+import { reportSummary } from '../../mod/hooks/text.ts';
 import type { WatchableJob, WatchStatus } from './policy.ts';
 import type { Team } from '../../mod/types/index.d.ts';
 
@@ -78,6 +79,9 @@ async function readOne(cwd: string, jobId: string, now: number): Promise<Watchab
   const pending = raw['pendingSteers'];
 
   const status = toWatchStatus(observed, now);
+  const latestSummary = isTerminalForgeStatus(observed.status)
+    ? reportSummary(observed.output ?? '') || null
+    : typeof raw['latestSummary'] === 'string' ? raw['latestSummary'] : null;
   const acceptancePending = isTerminalForgeStatus(status) && isAcceptancePending(observed.finishedAt, acceptance, now);
 
   return {
@@ -90,14 +94,14 @@ async function readOne(cwd: string, jobId: string, now: number): Promise<Watchab
     startedAt: observed.startedAt,
     chainStartedAt: typeof raw['chainStartedAt'] === 'string' && raw['chainStartedAt'] !== '' ? raw['chainStartedAt'] : observed.startedAt,
     changedFileCount: Array.isArray(observed.raw['changed_files']) ? observed.raw['changed_files'].length : undefined,
-    latestSummary: typeof raw['latestSummary'] === 'string' ? raw['latestSummary'] : null,
+    latestSummary,
     failureReason: [raw['reason'], raw['error']].find((v): v is string => typeof v === 'string' && v !== '') ?? null,
     failureDetail: typeof raw['error'] === 'string' ? raw['error'] : null,
     checks,
     ...(observed.status === 'succeeded' && acceptance.pending === true
       ? { checksRunning: typeof acceptance.running === 'string' && acceptance.running !== '' ? acceptance.running : true as const } : {}),
     ...(acceptancePending ? { acceptancePending: true } : {}),
-    summarySource: observed.raw['summarySource'] === 'worker' ? 'worker' : null,
+    summarySource: latestSummary !== null && (isTerminalForgeStatus(observed.status) || raw['summarySource'] === 'worker') ? 'worker' : null,
     status,
     ...livenessField(watchLiveness(observed, now)),
     lastEventAt: observed.updatedAt,

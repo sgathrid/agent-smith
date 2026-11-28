@@ -19,7 +19,7 @@ import { FILES, jobDir, jobFile } from '../../../forge/format.ts';
 import { waitForChange } from '../../../forge/watch.ts';
 import { startPipeline, readPipeline, cancelPipeline, missingPipelineError } from '../../../forge/execute.ts';
 import { readAcceptance } from '../../../forge/checks.ts';
-import { isWorkerIdle } from '../../mod/hooks/turns.ts';
+import { isTerminalStatus, isWorkerIdle } from '../../mod/hooks/turns.ts';
 import { validateSpec } from '../../../pipeline/pipeline.ts';
 import { EFFORTS, validateEnv, type Stage } from '../../../pipeline/types.ts';
 import { MODES, MODE_PRESETS, isMode as isModeName } from '../../../forge/modes.ts';
@@ -102,9 +102,9 @@ export function failure(message: string, detail?: unknown): ToolOutcome { return
 
 export function fullStatus(detail: JobDetail, acceptance: ReturnType<typeof readAcceptance>, now = Date.now()) {
   const live = jobLiveness(detail, now);
-  const { reason: _r, ...rest } = withTeamCounts(detail);
+  const { reason: _r, latestSummary, summarySource, ...rest } = withTeamCounts(detail);
   const reason = failedReason(detail);
-  return { ...rest, ...(reason !== null ? { reason } : {}), resumable: Boolean(detail.conversation), ...(live === null ? {} : { liveness: livenessView(live) }), taskStatus: taskStatus(detail.status), report: detail.report?.slice(0, REPORT_HEAD_CHARS) ?? null, reportTruncated: (detail.report?.length ?? 0) > REPORT_HEAD_CHARS, acceptance };
+  return { ...rest, ...(isTerminalStatus(detail.status) ? {} : { latestSummary, summarySource }), ...(reason !== null ? { reason } : {}), resumable: Boolean(detail.conversation), ...(live === null ? {} : { liveness: livenessView(live) }), taskStatus: taskStatus(detail.status), report: detail.report?.slice(0, REPORT_HEAD_CHARS) ?? null, reportTruncated: (detail.report?.length ?? 0) > REPORT_HEAD_CHARS, acceptance };
 }
 
 type Args = Record<string, unknown>;

@@ -505,18 +505,21 @@ test('status: concise merges identity, verdicts, timing and one report; detailed
   assert.deepEqual(r.structuredContent, b, 'structuredContent matches the text');
   console.log('concise status:', JSON.stringify(b, null, 2));
   const full = body(await callTool(ctx, 'status', { id: 'implement-smith-1', response_format: 'detailed' }));
-  assert.equal(full.usage.input, 1); assert.equal(full.latestSummary, 'All done.'); assert.equal(full.reportTruncated, false); assert.equal(full.cwd, '/x');
+  assert.equal(full.usage.input, 1); assert.equal(full.report, 'All done.'); assert.equal('latestSummary' in full, false, 'the report is carried once'); assert.equal(full.reportTruncated, false); assert.equal(full.cwd, '/x');
 });
 
-test('status: concise report and changedFiles are bounded with factual truncation notes; a distinct summary is kept', async () => {
+test('status: concise report and changedFiles are bounded with factual truncation notes; summary is the running message only', async () => {
   const many = Array.from({ length: 25 }, (_, i) => `f${i}.ts`);
   const ctx = withService({ detail: async () => detail({ report: 'x'.repeat(5_000), latestSummary: 'Different summary.', changedFiles: many }) });
   const b = body(await callTool(ctx, 'status', { id: 'j' }));
   assert.equal(b.reportTruncated, true);
   assert.match(b.report, /\[truncated: 2000 of 5000 chars shown\]$/);
   assert.equal(b.changedFilesNote, 'First 20 of 25 shown.');
-  assert.ok(b.report.length < 2_150); assert.equal(b.summary, 'Different summary.');
+  assert.ok(b.report.length < 2_150); assert.equal('summary' in b, false);
   assert.equal(body(await callTool(ctx, 'status', { id: 'j', response_format: 'detailed' })).report.length, 5_000);
+  const running = withService({ detail: async () => detail({ status: 'running', finishedAt: null, report: null, latestSummary: 'Running the checks.' }) });
+  assert.equal(body(await callTool(running, 'status', { id: 'j' })).summary, 'Running the checks.');
+  assert.equal(body(await callTool(running, 'status', { id: 'j', response_format: 'detailed' })).latestSummary, 'Running the checks.');
 });
 
 test('pipeline_status: concise drops observations and repeats; detailed is the raw record', async () => {

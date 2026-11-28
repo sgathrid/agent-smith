@@ -510,6 +510,29 @@ test('the worker view is one scroll: header, task, transcript, then result and f
   expect(await pane.find({type:'Text',text:'src/a.ts: unused import'})).toBeDefined();
 });
 
+test("a finished worker's final message shows once, under Result, even when it was the only message", async ($, on) => {
+  const done = {status:'succeeded',name:'Ada',workerId:'ada',role:'reviewer',provider:'agy',finishedAt:iso(RUNNING_NOW),latestSummary:null,summarySource:null};
+  const view = (timeline: unknown[]) => JSON.stringify({schema:1,prompt:'Review it',preamble:null,truncated:false,tools:[],transcript:[],timeline});
+  const files = {
+    ...canonicalJob('job-ada', done, {'result.md':'All green: no defects.','view.json':view([
+      {kind:'assistant',sequence:0,at:iso(RUNNING_NOW),text:'Running the checks; waiting.',messageKey:'3'},
+      {kind:'tool',sequence:1,at:iso(RUNNING_NOW),stepIndex:4,tool:'run_command',input:'npm test',output:'ok',state:'done'}])}),
+    ...canonicalJob('job-bo', {...done,name:'Bo',workerId:'bo'}, {'result.md':'Only answer.','view.json':view([])}),
+  };
+  forgeHost(on, files, ['job-ada','job-bo']);
+  await start($);
+  await $.command.run({command:'forge',args:'Ada'});
+  let pane = await $.ui.mount(PANE_TARGET);
+  expect(await pane.find({type:'Markdown',text:/Running the checks; waiting\./})).toBeDefined();
+  expect((await pane.findAll({type:'Markdown',text:/All green: no defects/})).length).toBe(1);
+  expect(await pane.find({type:'Text',text:/All green: no defects/})).toBeUndefined();
+  await (pane as unknown as { unmount(): Promise<void> }).unmount();
+  await $.command.run({command:'forge',args:'Bo'});
+  pane = await $.ui.mount(PANE_TARGET);
+  expect((await pane.findAll({type:'Markdown',text:/Only answer/})).length).toBe(1);
+  expect(await pane.find({type:'Text',text:/Only answer/})).toBeUndefined();
+});
+
 test('b returns to the list; x closes the sidebar', async ($, on) => {
   const { host } = forgeHost(on, ada(), ['job-ada']);
   await start($);

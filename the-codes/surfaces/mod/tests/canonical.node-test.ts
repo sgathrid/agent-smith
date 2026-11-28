@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { readForgeJobs, readForgeDetail, readMemberView } from '../hooks/canonical.ts';
+import { noticeFromRadar } from '../hooks/notice.ts';
 import type { FsLike } from '../hooks/fs.ts';
 
 function memoryFs(files: Record<string, string>, reads: string[] = []): FsLike {
@@ -18,7 +19,7 @@ const now = Date.parse('2026-10-08T10:00:00Z');
 const manifest = { schema: 1, jobId: 'job-a', name: 'Ada', workerId: 'ada', status: 'running', task: 'Review dashboard',
   provider: 'codex', model: null, updatedAt: new Date(now).toISOString(), startedAt: new Date(now - 1000).toISOString(), toolCalls: 1 };
 
-test('canonical list never reads report, view or event logs', async () => {
+test('canonical list of a running job never reads report, view or event logs', async () => {
   const reads: string[] = [];
   const jobs = await readForgeJobs(memoryFs({
     [`${base}/job.json`]: JSON.stringify(manifest),
@@ -30,6 +31,20 @@ test('canonical list never reads report, view or event logs', async () => {
   assert.equal(jobs[0]?.status, 'running');
   assert.deepEqual(reads, [`${base}/job.json`, `${base}/progress.json`]);
 });
+test('a finished job\'s summary comes from its report, and its notice carries it', async () => {
+  const done = { ...manifest, status: 'succeeded', finishedAt: new Date(now).toISOString(), latestSummary: null, summarySource: null };
+  const reads: string[] = [];
+  const [job] = await readForgeJobs(memoryFs({
+    [`${base}/job.json`]: JSON.stringify(done),
+    [`${base}/progress.json`]: JSON.stringify({ lastEventAt: done.updatedAt, latestSummary: 'Running the checks.', summarySource: 'worker' }),
+    [`${base}/result.md`]: 'Status: DONE\n\nShipped the parser fix.\n\nDetails follow.', [`${base}/view.json`]: 'not for list',
+  }, reads), '/repo', now);
+  assert.equal(job?.latestSummary, 'Shipped the parser fix.\n\nDetails follow.');
+  assert.equal(job?.summarySource, 'worker');
+  assert.equal(reads.includes(`${base}/view.json`), false);
+  assert.equal(noticeFromRadar(job!, 'finished', now).summary, 'Shipped the parser fix.\n\nDetails follow.');
+});
+
 test('canonical reads followedBy, normalizes legacy continuation kinds, and keeps the raw queued count for the idle rule', async () => {
   const done = { ...manifest, status: 'succeeded', finishedAt: new Date(now).toISOString() };
   const read = async (m: Record<string, unknown>, progress?: Record<string, unknown>) => (await readForgeJobs(memoryFs({
