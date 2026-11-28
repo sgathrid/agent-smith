@@ -271,7 +271,6 @@ function diffChangedFiles(baseline, nowDirty, modifiedBaseline = [], committed =
     const all = [...out].filter((p) => !isForgeStatePath(p)).sort();
     return { files: all.slice(0, CHANGED_FILES_CAP), truncated: all.length > CHANGED_FILES_CAP };
 }
-/** The view without the answer's message: a finished job's answer lives in result.md alone. */
 function withoutAnswer(view, answerKey) {
     if (answerKey === undefined)
         return view;

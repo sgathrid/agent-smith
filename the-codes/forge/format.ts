@@ -258,7 +258,6 @@ export interface ForgeView {
   }[];
 }
 
-/** The view without the answer's message: a finished job's answer lives in result.md alone. */
 export function withoutAnswer(view: ForgeView, answerKey: string | undefined): ForgeView {
   if (answerKey === undefined) return view;
   return { ...view, timeline: (view.timeline ?? []).filter((e) => !(e.kind === 'assistant' && e.messageKey === answerKey)) };

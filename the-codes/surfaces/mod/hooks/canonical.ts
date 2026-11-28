@@ -274,7 +274,7 @@ export async function readForgeDetail(fs: FsLike, repo: string, id: string, now:
   }) : [];
   return { job: { ...job, report, prompt: firstText(view?.prompt), preamble: firstText(view?.preamble),
     ...(messages.length > 0 ? { messages } : {}),
-    warnings: [...job.warnings, ...(view === null ? [{code:'detail_unavailable',message:'This older job has no detail snapshot; summary and report are shown.'}] : [])] }, timeline,
+    warnings: [...job.warnings, ...(view === null ? [{code:'detail_unavailable',message:'This older job has no detail snapshot.'}] : [])] }, timeline,
     truncated: view?.truncated === true };
 }
 
