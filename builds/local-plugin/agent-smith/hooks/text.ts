@@ -60,7 +60,7 @@ export function fitCell(s: string, width: number): string {
   const space = cut.lastIndexOf(' ');
   // Only break on a space in the last third: breaking early would throw away a
   // third of the cell to save two characters of raggedness.
-  const body = space >= Math.floor(width * 0.6) ? cut.slice(0, space) : cut;
+  const body = (space >= Math.floor(width * 0.6) ? cut.slice(0, space) : cut).replace(/\s*[∙·]\s*$/, '');
   return body.padEnd(width);
 }
 

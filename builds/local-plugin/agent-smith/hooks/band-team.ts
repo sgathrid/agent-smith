@@ -46,7 +46,7 @@ export function foldText(hidden: readonly TeamMember[]): string {
   const parts: string[] = [];
   const counts = markCounts(hidden);
   const order = [...MARK_ORDER].sort((a: MemberMark, b: MemberMark) => counts[b] - counts[a]);
-  for (const mark of order) if (counts[mark] > 0) parts.push(`${counts[mark]} ${mark}`);
+  for (const mark of order) if (counts[mark] > 0) parts.push(`${memberGlyph(mark)} ${counts[mark]} ${mark}`);
   let post: { name: string; seq: number } | null = null;
   for (const m of hidden) if (m.lastPost !== null && (post === null || m.lastPost.seq > post.seq)) post = { name: m.name, seq: m.lastPost.seq };
   if (post !== null) parts.push(`${oneLine(post.name)} posted #${post.seq}`);
@@ -113,7 +113,7 @@ export function childRow(
 ): ChildRow {
   if (entry.kind === 'fold') {
     const text = foldText(entry.hidden);
-    return { tree: '└', glyph: '○', name: text, model: '', label: text, detail: '', right: '', plain: `└ ○ ${text}`, bold: false, dim: true, memberId: null };
+    return { tree: '└', glyph: '', name: text, model: '', label: text, detail: '', right: '', plain: `└ ${text}`, bold: false, dim: true, memberId: null };
   }
   const { member, last } = entry;
   const fit = treeColumns(columns, tokenWidth);
@@ -121,7 +121,9 @@ export function childRow(
   const mark = memberMark(member);
   const glyph = memberGlyph(mark);
   const name = oneLine(member.name);
-  const label = fitCell(childLabel(member), Math.max(0, columns.label - 2));
+  const room = Math.max(0, columns.label - 2);
+  const full = childLabel(member);
+  const label = fitCell(full.length <= room ? full : name, room);
   const nameCell = label.slice(0, name.length);
   const modelCell = label.slice(nameCell.length);
   const detail = fitCell(oneLine(member.activity ?? member.task ?? ''), fit.child);

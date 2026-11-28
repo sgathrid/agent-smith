@@ -14,7 +14,7 @@ import {
 } from './band.ts';
 import type { FsLike } from './fs.ts';
 import { fitBandColumns, sortForBand } from './format.ts';
-import { CHILD_INDENT, childLabel, childRow, planBand, tokenColumn, treeColumns } from './band-team.ts';
+import { CHILD_INDENT, childRow, planBand, tokenColumn, treeColumns } from './band-team.ts';
 import { isSettledForCache, readForgeJobs, readForgeDetail, readMemberView } from './canonical.ts';
 import {
   LAUNCH_TOOL,
@@ -535,7 +535,7 @@ function registerBand(on: Parameters<Register>[0]): void {
     const plan = planBand(shown, Math.max(1, (e.props.maxRows ?? 10) - 1));
     const { Box, Text, Button } = $.ui.resolve(e);
     const width = Math.max(1, e.props.bodyColumns - HOTKEY_PREFIX_COLS);
-    const longestLabel = Math.max(0, ...plan.entries.map((en) => en.kind === 'job' ? jobLabel(en.job).length : en.kind === 'member' ? childLabel(en.member).length + 2 : 0));
+    const longestLabel = Math.max(0, ...plan.entries.map((en) => en.kind === 'job' ? jobLabel(en.job).length : 0));
     const columns = fitBandColumns(width, longestLabel);
     const tokenWidth = tokenColumn(plan.entries);
     const treeDetail = treeColumns(columns, tokenWidth).worker;
@@ -550,7 +550,7 @@ function registerBand(on: Parameters<Register>[0]): void {
             return (
               <Button key={`band-${entry.job.workerId}-${row.memberId ?? 'fold'}`} plain label={`${CHILD_INDENT}${row.plain}`} onPress={press}>
                 <Text dimColor={row.dim} bold={row.bold} wrap="truncate-end">
-                  {`${CHILD_INDENT}${row.tree} ${row.glyph} ${row.name}`}
+                  {`${CHILD_INDENT}${row.tree} ${row.glyph === '' ? '' : `${row.glyph} `}${row.name}`}
                   <Text dimColor wrap="truncate-end">{row.model}</Text>
                   {`${row.detail === '' ? '' : ` ${row.detail}`}${row.right === '' ? '' : ` ${row.right}`}`.replace(/\s+$/, '')}
                 </Text>

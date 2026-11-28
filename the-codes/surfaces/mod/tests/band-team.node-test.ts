@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import { rowBudget } from '../hooks/band.ts';
 import { CHILD_INDENT, childRow, foldText, planBand, tokenColumn, treeColumns, type BandEntry } from '../hooks/band-team.ts';
 import { buildLine } from '../hooks/band.ts';
-import { fitBandColumns, jobDetail } from '../hooks/format.ts';
+import { fitBandColumns, fitCell, jobDetail, jobLabel } from '../hooks/format.ts';
 import { memberRow, teamColumns } from '../hooks/team-view.ts';
 import { memberGlyph, memberMark, settleTeam, shortModel, sortMembers, teamCounts, teamHeaderLine, teamPhrase } from '../hooks/team.ts';
 import type { RadarJob, Team, TeamMember } from '../types/index.d.ts';
@@ -88,8 +88,8 @@ test('the fold names counts by state, biggest first, and the newest post among t
     member('c', { state: 'working' }),
     member('d', { state: 'waiting' }),
   ];
-  assert.equal(foldText(hidden), '2 reported ∙ 1 working ∙ 1 waiting ∙ hydro-681 posted #13');
-  assert.equal(foldText([member('p'), member('q', { state: 'done' })]), '1 working ∙ 1 done');
+  assert.equal(foldText(hidden), '✓ 2 reported ∙ ⏺ 1 working ∙ ○ 1 waiting ∙ hydro-681 posted #13');
+  assert.equal(foldText([member('p'), member('q', { state: 'done' })]), '⏺ 1 working ∙ ○ 1 done');
 });
 
 test('a child row: glyph, name, activity or task, elapsed and tokens; settled members stop their clock', () => {
@@ -159,7 +159,7 @@ test('stopped members read stopped in the header, the phrase, the fold, the glyp
   const t = team([member('a', { state: 'stopped' }), member('b', { state: 'stopped' }), member('c', { state: 'waiting' })]);
   assert.equal(teamHeaderLine(t), 'Team 3 · 1 waiting · 2 stopped');
   assert.equal(teamPhrase(team([member('a', { state: 'stopped' })])), '1 agent stopped');
-  assert.equal(foldText(t.members), '2 stopped ∙ 1 waiting');
+  assert.equal(foldText(t.members), '○ 2 stopped ∙ ○ 1 waiting');
   assert.equal(memberGlyph('stopped'), '○');
   assert.deepEqual(sortMembers([member('w', { state: 'waiting' }), member('s', { state: 'stopped' }), member('x')]).map((m) => m.name), ['x', 's', 'w']);
 });
@@ -184,7 +184,7 @@ test('reported shows in the header, the phrase, the fold and the order', () => {
   assert.equal(teamPhrase(team([posted('a'), member('mon', { state: 'waiting' })])), '1/2 agents reported');
   assert.equal(teamPhrase(team([posted('a'), posted('b')])), '2 agents reported');
   assert.equal(teamPhrase(team([member('mon', { state: 'waiting' })])), '1 agent waiting');
-  assert.equal(foldText([posted('a'), posted('b'), member('mon', { state: 'waiting' })]), '2 reported ∙ 1 waiting ∙ a posted #3');
+  assert.equal(foldText([posted('a'), posted('b'), member('mon', { state: 'waiting' })]), '✓ 2 reported ∙ ○ 1 waiting ∙ a posted #3');
   assert.deepEqual(sortMembers(t.members).map((m) => m.name), ['w', 'a', 'b', 'mon']);
 });
 
@@ -255,4 +255,37 @@ test('pane member rows share model and activity columns', () => {
   assert.equal(teamColumns([a], NOW, 56).model, 'short');
   assert.equal(teamColumns([a], NOW, 116).model, 'full');
   assert.equal(teamColumns([a], NOW, 40).model, 'none');
+});
+
+test('a worker row keeps at least the detail room it had, at every width', () => {
+  const t = team([member('opencode', { modelLabel: 'Gemini 4 Hydrogen (High)', tokensOut: 12_000 }), posted('kimi')]);
+  const j = job({ name: 'review-smith', team: t });
+  const entries = planBand([j]).entries;
+  const tw = tokenColumn(entries);
+  const before = (width: number) => fitBandColumns(width, Math.max(jobLabel(j).length, ...t.members.map((m) => m.name.length + 2))).detail;
+  for (const width of [40, 60, 120]) {
+    const columns = fitBandColumns(width, jobLabel(j).length);
+    assert.ok(columns.detail >= before(width), `${width}`);
+    assert.ok(treeColumns(columns, tw).worker >= before(width) - tw, `${width}`);
+    assert.equal(treeColumns(columns, 0).worker, columns.detail, `${width}`);
+  }
+});
+
+test('a member label drops its model first, then truncates the name', () => {
+  const e = (m: TeamMember): BandEntry => ({ kind: 'member', job: job(), member: m, last: true });
+  const m = member('codex', { modelLabel: 'Gemini 4 Hydrogen (High)', model: 'g' });
+  assert.equal(childRow(e(m) as never, NOW, { label: 12, detail: 30 }, 0).label, 'codex     ');
+  assert.equal(childRow(e(m) as never, NOW, { label: 5, detail: 30 }, 0).label, 'cod');
+});
+
+test('a cut cell never ends in a dangling separator', () => {
+  assert.equal(fitCell('5/6 agents reported ∙ checking team', 22).trimEnd(), '5/6 agents reported');
+  assert.equal(fitCell('alpha beta · gamma delta', 12).trimEnd(), 'alpha beta');
+  assert.equal(fitCell('abc ∙ def', 5).trimEnd(), 'abc');
+});
+
+test('the fold marks each count with its own member glyph and carries none of its own', () => {
+  const row = childRow({ kind: 'fold', job: job(), hidden: [posted('a'), posted('b'), member('mon', { state: 'waiting' }), member('w'), member('f', { state: 'failed' })] }, NOW, { label: 20, detail: 30 }, 0);
+  assert.equal(row.glyph, '');
+  assert.equal(row.plain, '└ ✓ 2 reported ∙ ⏺ 1 working ∙ ○ 1 waiting ∙ ✗ 1 failed ∙ a posted #3');
 });
