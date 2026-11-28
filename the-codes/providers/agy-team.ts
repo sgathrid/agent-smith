@@ -153,12 +153,15 @@ function parseLine(line: string): Json | null {
   }
 }
 
-/** The compact transcript JSON-quotes each argument value (`"since":"9"`), and may cut a long one short. */
+/** The compact transcript JSON-quotes each argument value (`"since":"9"`), and cuts a long one short, closing quote and all. */
 function unquote(v: unknown): unknown {
   if (typeof v !== 'string') return v;
   const s = v.trim();
-  if (s.length >= 2 && s.startsWith('"') && s.endsWith('"')) {
-    try { return JSON.parse(s); } catch { return s.slice(1, -1); }
+  if (s.startsWith('"')) {
+    try { return JSON.parse(s); } catch { /* cut short: close it ourselves */ }
+    const body = s.length >= 2 && s.endsWith('"') ? s.slice(1, -1) : s.slice(1);
+    const closed = body.replace(/\\+$/, (m) => (m.length % 2 === 1 ? m.slice(1) : m));
+    try { return JSON.parse(`"${closed}"`); } catch { return body; }
   }
   if (/^-?\d+(?:\.\d+)?$/.test(s)) return Number(s);
   if (s === 'true' || s === 'false') return s === 'true';
@@ -419,6 +422,8 @@ class Board {
     if (this.sig === null || this.sig.length < SIG_BYTES) this.sig = readRange(this.file, 0, Math.min(size, SIG_BYTES));
     const n = Math.min(size - this.offset, budget);
     if (n <= 0) return 0;
+    // From the start, the file's own order stands: a rewrite is only a seq going back after what we already hold.
+    const fresh = this.offset === 0;
     const chunk = readRange(this.file, this.offset, n);
     this.offset += chunk.length;
     const ok = this.lines.feed(chunk, (line) => {
@@ -426,7 +431,7 @@ class Board {
       if (!post) return true;
       const seq = Number(post['seq']);
       if (!Number.isFinite(seq)) return true;
-      if (this.head !== null && seq <= this.head) return false;
+      if (this.head !== null && seq <= this.head) return fresh;
       this.head = seq;
       const agent = String(post['agent'] ?? '');
       const text = String(post['text'] ?? '');
@@ -471,7 +476,6 @@ interface Seat {
   readonly conv: string | null;
   readonly model: string | null;
   readonly killed: boolean;
-  readonly alive: boolean | null;
   readonly wakeMode: string | null;
   readonly order: number;
 }
@@ -501,7 +505,7 @@ export function createAgyTeamReader(options: AgyTeamReaderOptions): AgyTeamReade
       const model = str(m['applied_model']) ?? str(m['model']) ?? str(m['desired_model']);
       seats.push({
         id: name, name, role: str(m['role']) ?? 'worker', conv: memberConv && ID_RE.test(memberConv) ? memberConv : null,
-        model, killed: m['killed'] === true, alive: null, wakeMode: str(m['wake_mode']), order: order++,
+        model, killed: m['killed'] === true, wakeMode: str(m['wake_mode']), order: order++,
       });
     }
     return { seats, title: str(roster['title']), coordinator };
@@ -522,7 +526,7 @@ export function createAgyTeamReader(options: AgyTeamReaderOptions): AgyTeamReade
       const spawn = Number(j['spawnStepIndex']);
       seats.push({
         id: child, name: shortName(role, child), role: role ?? 'sub-agent', conv: child, model: null,
-        killed: j['state'] === 'SUBAGENT_STATE_KILLED', alive: j['state'] === 'SUBAGENT_STATE_ALIVE', wakeMode: null,
+        killed: j['state'] === 'SUBAGENT_STATE_KILLED', wakeMode: null,
         order: Number.isFinite(spawn) ? spawn : Number.MAX_SAFE_INTEGER,
       });
     }

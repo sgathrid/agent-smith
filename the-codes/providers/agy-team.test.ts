@@ -201,17 +201,17 @@ describe('agy swarm', () => {
     const steps = jsonl([
       planner(0, [call('read_file', { Path: '/work/repo/naïve.ts' })]),
       result(1, 'données'),
-      planner(2, [call('swarm_wait', { since: 0 })]),
+      planner(2, [], { content: 'First reply.' }),
     ]);
-    const full = Buffer.from(steps + JSON.stringify(result(3, 'woken')) + '\n');
+    const full = Buffer.from(steps + JSON.stringify(planner(3, [], { content: 'Second reply.' })) + '\n');
     const naive = full.indexOf(Buffer.from('ï'));
     const head = Buffer.from(steps).length + 20;
     // Cut inside the first line, inside a two-byte character, and leave step 3 unfinished.
     chunks(ALPHA, full.subarray(0, head), [30, naive + 1, Buffer.from(steps).length - 5]);
     let r = read();
     let alpha = byName(r, 'alpha');
-    assert.equal(alpha.toolCount, 2);
-    assert.equal(alpha.state, 'working', 'a torn last line is mid-turn');
+    assert.equal(alpha.toolCount, 1);
+    assert.equal(alpha.state, 'working', 'a torn last line is mid-turn, though the complete steps end on a reply');
     assert.deepEqual(JSON.parse((r.views[0]!.timeline[0] as { input: string }).input), { Path: '/work/repo/naïve.ts' });
     assert.equal((r.views[0]!.timeline[0] as { output: string }).output, 'données');
     writeFileSync(sg(ALPHA, 'logs', 'chunks', 'transcript', '00000004.jsonl'), full.subarray(head));
@@ -219,7 +219,8 @@ describe('agy swarm', () => {
     alpha = byName(r, 'alpha');
     assert.equal(alpha.state, 'waiting');
     assert.equal(alpha.lastEventAt, Date.parse(at(3)));
-    assert.equal(alpha.toolCount, 2);
+    assert.equal(alpha.toolCount, 1);
+    assert.equal(r.views[0]!.report, 'Second reply.');
   });
 
   it('starts over when agy rewrites a transcript', () => {
@@ -270,6 +271,23 @@ describe('agy swarm', () => {
     assert.equal(byName(read(), 'alpha').toolCount, 150);
     const last = view.timeline[view.timeline.length - 1]!;
     assert.ok(last.kind === 'tool' && last.sequence === 299 && last.output.length === 2_000);
+  });
+});
+
+describe('agy transcript details', () => {
+  it('decodes an argument value the compact transcript cut short', () => {
+    swarm({ alpha: member(ALPHA) }, []);
+    chunks(ALPHA, jsonl([planner(0, [{ name: 'run_command', args: { CommandLine: '"git log --oneline \\"src/a', Cwd: '"/work/repo"' } }])]));
+    const r = read();
+    assert.deepEqual(JSON.parse((r.views[0]!.timeline[0] as { input: string }).input), { CommandLine: 'git log --oneline "src/a', Cwd: '/work/repo' });
+    assert.equal(byName(r, 'alpha').activity, 'checking git');
+  });
+
+  it('takes a board as written when it is read from the start', () => {
+    swarm({ alpha: member(ALPHA) }, [post(2, 'alpha', 'two'), post(2, 'alpha', 'dup'), post(3, 'alpha', 'three')]);
+    const r = read();
+    assert.equal(r.team.boardHead, 3);
+    assert.equal(byName(r, 'alpha').lastPost?.text, 'three');
   });
 });
 
