@@ -2,7 +2,7 @@ import type { UiComponents } from 'claude-code';
 import type { ActivityEvent, MemberView, RadarJob, TeamMember, TeamMemberState } from '../types/index.d.ts';
 import type { ForgeDetail } from './canonical.ts';
 import { changedFilesPhrase, condenseTimeline, forgeList, isLive, needsAttention, paneChecksLabel, priorTurnSummary, scopeLine, statusLine, timelineGroupLabel, workerHead, workerHeading, workerLivenessLine, workerStatus, type TimelineItem } from './dashboard.ts';
-import { effectiveStart, elapsed, failureWords, isTerminal, oneLine, pendingSteersLabel, pickColor, pickGlyph, sanitizeText } from './format.ts';
+import { effectiveStart, elapsed, failureWords, isTerminal, oneLine, pendingSteersLabel, pickColor, pickGlyph, prettyJson, sanitizeText } from './format.ts';
 import { classify, progressSummaryLine } from './progress.ts';
 import { hasTeam, sortMembers, teamHeaderLine } from './team.ts';
 import { memberDetailLine, memberHeading, memberRow, nameWidth, TEAM_KEYS, TEAM_ROWS } from './team-view.ts';
@@ -226,7 +226,7 @@ function toolRow(W: UiComponents,key:string,tool:string,input:string,output:stri
     {expanded&&<Box key={`body-${key}`} flexDirection="row">
       <Text>{'  '}</Text>
       <Box flexDirection="column">
-        <Text dimColor wrap="wrap">{sanitizeText(`${oneLine(tool)} ${input}${output?`\n${output}`:''}`)}</Text>
+        <Text dimColor wrap="wrap">{sanitizeText(`${oneLine(tool)} ${input}${output?`\n${prettyJson(output)}`:''}`)}</Text>
       </Box>
     </Box>}
     {expanded&&trailingGap&&<Box key={`end-${key}`}><Text> </Text></Box>}

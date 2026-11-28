@@ -406,6 +406,22 @@ test('a long run of completed read calls folds into one expandable row, leaving 
   expect(await pane.find({key:'event-3'})).toBeDefined();
 });
 
+test('an expanded tool row pretty-prints JSON output and leaves other output as stored', async ($, on) => {
+  const view = JSON.stringify({schema:1,prompt:'Review',preamble:'',truncated:false,tools:[],transcript:[],timeline:[
+    {kind:'tool',sequence:1,at:iso(RUNNING_NOW),stepIndex:0,tool:'swarm',input:'{"action":"status"}',output:'{"title":"t","members":[{"name":"a"}]}',state:'done'},
+    {kind:'tool',sequence:2,at:iso(RUNNING_NOW),stepIndex:1,tool:'run_command',input:'ls',output:'a\nb',state:'done'},
+  ]});
+  forgeHost(on, canonicalJob('job-rev', {status:'running',name:'Rev',workerId:'rev'}, {'view.json':view}), ['job-rev']);
+  await start($);
+  await launch($, 'job-rev');
+  await $.command.run({command:'forge',args:'rev'});
+  const pane = await $.ui.mount(PANE_TARGET);
+  await pane.press({key:'event-1'});
+  await pane.press({key:'event-2'});
+  expect(await pane.find({type:'Text',text:'swarm {"action":"status"}\n{\n  "title": "t",\n  "members": [\n    {\n      "name": "a"\n    }\n  ]\n}'})).toBeDefined();
+  expect(await pane.find({type:'Text',text:'run_command ls\na\nb'})).toBeDefined();
+});
+
 test('prose and tool rows read apart: a blank row at each turn, dimmed tools, no repeated note or status', async ($, on) => {
   const view = JSON.stringify({schema:1,prompt:'Review',preamble:'',truncated:false,tools:[],transcript:[],timeline:[
     {kind:'assistant',sequence:0,at:iso(RUNNING_NOW),text:'Reviewing the range.'},

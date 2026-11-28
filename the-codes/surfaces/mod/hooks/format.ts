@@ -1,11 +1,11 @@
 import type { ContinuationKind, RadarJob, RadarStatus } from '../types/index.d.ts';
 import { REASONS, checksReason, reasonFromText } from './reasons.ts';
 import { ELAPSED_WIDTH, clockCell, effectiveStart, elapsed, elapsedCell } from './clock.ts';
-import { fitCell, oneLine, sanitizeText } from './text.ts';
+import { fitCell, oneLine, prettyJson, sanitizeText } from './text.ts';
 import { durationWords } from './notice.ts';
 import { agentsWord, hasTeam, teamCounts, teamPhrase } from './team.ts';
 
-export { ELAPSED_WIDTH, clockCell, effectiveStart, elapsed, elapsedCell, fitCell, oneLine, sanitizeText };
+export { ELAPSED_WIDTH, clockCell, effectiveStart, elapsed, elapsedCell, fitCell, oneLine, prettyJson, sanitizeText };
 
 export function pickGlyph(status: RadarStatus): string {
   switch (status) {

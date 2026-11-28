@@ -187,9 +187,8 @@ function rawString(raw: string, key: string): string {
   try { return oneLine(JSON.parse(`"${m[1]}"`) as string); } catch { return oneLine(m[1]!); }
 }
 
-/** Agy prefixes tool output with `Created At:` / `Completed At:` lines before the JSON; a stored preview may cut the JSON short. */
 function outputBody(output: string | null | undefined): string {
-  return (output ?? '').replace(/^\s*(?:(?:Created|Completed) At:[^\n]*\n)+/, '').trim();
+  return (output ?? '').trim();
 }
 
 function parsed(body: string): Record<string, unknown> | null {

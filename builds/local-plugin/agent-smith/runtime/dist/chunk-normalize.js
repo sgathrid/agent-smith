@@ -2617,9 +2617,8 @@ function rawString(raw, key) {
         return oneLine(m[1]);
     }
 }
-/** Agy prefixes tool output with `Created At:` / `Completed At:` lines before the JSON; a stored preview may cut the JSON short. */
 function outputBody(output) {
-    return (output ?? '').replace(/^\s*(?:(?:Created|Completed) At:[^\n]*\n)+/, '').trim();
+    return (output ?? '').trim();
 }
 function parsed(body) {
     try {
@@ -3651,7 +3650,10 @@ function createAgyTeamReader(options) {
             }
         },
     };
-}function agyBinary() {
+}function withoutStamps(output) {
+    return typeof output === 'string' ? output.replace(/^(?:Created|Completed) At:[^\n]*\n?/gm, '') : output;
+}
+function agyBinary() {
     return process.env['AGENT_SMITH_AGY_BIN'] ?? 'agy';
 }
 // ---------------------------------------------------------------------------
@@ -3917,7 +3919,7 @@ function createAgyTranslator(maxChars) {
                         raw: { stepIndex, error: info?.error },
                     });
                 }
-                const output = preview(info?.output ?? info?.error?.message, maxChars);
+                const output = preview(withoutStamps(info?.output) ?? info?.error?.message, maxChars);
                 const ref = { stepIndex, tool: toolName };
                 if (mem.input !== undefined)
                     ref.input = mem.input;
