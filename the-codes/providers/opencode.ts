@@ -563,7 +563,7 @@ export function createOpencodeTranslator(maxChars: number): OpencodeTranslator {
     const isThinking = type.includes('thinking') || type.includes('reasoning') || partType === 'thinking' || partType === 'reasoning';
     if (text !== undefined && text !== '') {
       if (!isThinking) answer.text(text, msgId);
-      out.push({ kind: 'text', at, text, stream: isThinking ? 'thinking' : 'assistant' });
+      out.push({ kind: 'text', at, text, stream: isThinking ? 'thinking' : 'assistant', ...(msgId === undefined ? {} : { messageKey: msgId }) });
       // A text event is also our best evidence the run is producing output, so
       // it doubles as a terminal marker candidate below.
       return out;
@@ -704,7 +704,7 @@ export function buildResult(args: {
     }
   }
 
-  const out = jobResult({ provider: 'opencode', jobId, status, error, exit, response, startedAtMs, durationMs, stateDir });
+  const out = jobResult({ provider: 'opencode', jobId, status, error, exit, response, answerKey: tx.answer.answerKey(), startedAtMs, durationMs, stateDir });
   if (tx.usage !== undefined) out.usage = tx.usage;
   if (tx.unrecognised.size > 0) out.raw = { unrecognisedEventTypes: [...tx.unrecognised] };
   if (tx.sessionId !== undefined) {

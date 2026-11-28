@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { readForgeJobs, readForgeDetail } from '../hooks/canonical.ts';
+import { readForgeJobs, readForgeDetail, readMemberView } from '../hooks/canonical.ts';
+import { noticeFromRadar } from '../hooks/notice.ts';
 import type { FsLike } from '../hooks/fs.ts';
 
 function memoryFs(files: Record<string, string>, reads: string[] = []): FsLike {
@@ -18,7 +19,7 @@ const now = Date.parse('2026-10-08T10:00:00Z');
 const manifest = { schema: 1, jobId: 'job-a', name: 'Ada', workerId: 'ada', status: 'running', task: 'Review dashboard',
   provider: 'codex', model: null, updatedAt: new Date(now).toISOString(), startedAt: new Date(now - 1000).toISOString(), toolCalls: 1 };
 
-test('canonical list never reads report, view or event logs', async () => {
+test('canonical list of a running job never reads report, view or event logs', async () => {
   const reads: string[] = [];
   const jobs = await readForgeJobs(memoryFs({
     [`${base}/job.json`]: JSON.stringify(manifest),
@@ -30,6 +31,20 @@ test('canonical list never reads report, view or event logs', async () => {
   assert.equal(jobs[0]?.status, 'running');
   assert.deepEqual(reads, [`${base}/job.json`, `${base}/progress.json`]);
 });
+test('a finished job\'s summary comes from its report, and its notice carries it', async () => {
+  const done = { ...manifest, status: 'succeeded', finishedAt: new Date(now).toISOString(), latestSummary: null, summarySource: null };
+  const reads: string[] = [];
+  const [job] = await readForgeJobs(memoryFs({
+    [`${base}/job.json`]: JSON.stringify(done),
+    [`${base}/progress.json`]: JSON.stringify({ lastEventAt: done.updatedAt, latestSummary: 'Running the checks.', summarySource: 'worker' }),
+    [`${base}/result.md`]: 'Status: DONE\n\nShipped the parser fix.\n\nDetails follow.', [`${base}/view.json`]: 'not for list',
+  }, reads), '/repo', now);
+  assert.equal(job?.latestSummary, 'Shipped the parser fix.\n\nDetails follow.');
+  assert.equal(job?.summarySource, 'worker');
+  assert.equal(reads.includes(`${base}/view.json`), false);
+  assert.equal(noticeFromRadar(job!, 'finished', now).summary, 'Shipped the parser fix.\n\nDetails follow.');
+});
+
 test('canonical reads followedBy, normalizes legacy continuation kinds, and keeps the raw queued count for the idle rule', async () => {
   const done = { ...manifest, status: 'succeeded', finishedAt: new Date(now).toISOString() };
   const read = async (m: Record<string, unknown>, progress?: Record<string, unknown>) => (await readForgeJobs(memoryFs({
@@ -231,4 +246,69 @@ test('canonical liveness: a long open command stays running, a stopped heartbeat
     [`${base}/progress.json`]: JSON.stringify({ ...quiet, lastAliveAt: at(later - 3 * 60_000) }) }), '/repo', later))[0];
   assert.equal(dead?.status, 'attention');
   assert.equal(dead?.liveness?.state, 'dead');
+});
+
+const teamMember = (id: string, state: string, lastEventAt: number) => ({ id, name: id, role: 'worker', model: null, modelLabel: null,
+  task: null, state, activity: null, toolCount: 2, tokensOut: null, startedAt: null, lastEventAt, lastPost: null });
+const teamFile = (members: unknown[]) => JSON.stringify({ schema: 1, source: 'agy-swarm', title: 'swarm', boardHead: 4, members, updatedAt: now });
+
+test('canonical reads team.json into the job; a working member keeps a quiet coordinator active', async () => {
+  const quiet = { ...manifest, startedAt: new Date(now - 60 * 60_000).toISOString(), updatedAt: new Date(now - 40 * 60_000).toISOString() };
+  const files = {
+    [`${base}/job.json`]: JSON.stringify(quiet),
+    [`${base}/progress.json`]: JSON.stringify({ lastEventAt: quiet.updatedAt, lastAliveAt: new Date(now - 5_000).toISOString() }),
+    [`${base}/team.json`]: teamFile([teamMember('a', 'working', now - 30_000), teamMember('b', 'waiting', now - 1_000), { id: 'bad', state: 'lost' }]),
+  };
+  const job = (await readForgeJobs(memoryFs(files), '/repo', now))[0]!;
+  assert.deepEqual(job.team?.members.map(m => m.id), ['a', 'b'], 'an invalid member is dropped');
+  assert.equal(job.liveness?.state, 'active');
+  assert.equal(job.liveness?.silentForMs, 30_000, 'from the newest working member, not a waiting one');
+  assert.equal(job.status, 'running');
+  assert.equal(job.lastEventAt, Date.parse(quiet.updatedAt), "members' times are not the worker's own");
+});
+
+test('canonical settles the team: working reads stopped once the run ended or for a member idle since the turn began', async () => {
+  const members = [teamMember('a', 'working', now - 30_000), teamMember('b', 'working', now - 100), teamMember('c', 'waiting', now - 30_000)];
+  const read = async (m: Record<string, unknown>) => (await readForgeJobs(memoryFs({
+    [`${base}/job.json`]: JSON.stringify(m), [`${base}/team.json`]: teamFile(members) }), '/repo', now))[0]!;
+  const finished = await read({ ...manifest, status: 'succeeded', finishedAt: new Date(now).toISOString() });
+  assert.deepEqual(finished.team?.members.map(m => m.state), ['stopped', 'stopped', 'waiting']);
+  const live = await read(manifest);
+  assert.deepEqual(live.team?.members.map(m => m.state), ['stopped', 'working', 'waiting'], 'a turn started at now-1s: a, last seen 30s ago, is from an earlier run');
+  assert.equal(live.liveness?.silentForMs, 0);
+  const stoppedOnly = await read({ ...manifest, updatedAt: new Date(now - 40 * 60_000).toISOString() });
+  assert.equal(stoppedOnly.liveness?.silentForMs, 100, 'only the member still working counts as the coordinator\'s activity');
+});
+
+test('canonical drops an absent, invalid or unreadable team.json without failing the job', async () => {
+  for (const team of [undefined, '{not json', JSON.stringify({ schema: 2, source: 'agy-swarm', members: [teamMember('a', 'working', now)] }),
+    JSON.stringify({ schema: 1, source: 'agy-swarm', members: [] })]) {
+    const jobs = await readForgeJobs(memoryFs({
+      [`${base}/job.json`]: JSON.stringify(manifest),
+      ...(team === undefined ? {} : { [`${base}/team.json`]: team }),
+    }), '/repo', now);
+    assert.equal(jobs.length, 1);
+    assert.equal(jobs[0]!.team, undefined);
+  }
+});
+
+test('readMemberView reads a member file by its sanitized name and rejects bad, mismatched or escaping ids', async () => {
+  const good = { schema: 1, id: 'agent/1', name: 'Ann', brief: 'look', report: null,
+    timeline: [{ sequence: 0, kind: 'assistant', at: 'x', text: 'hi' }, { sequence: 1, kind: 'bogus' }], truncated: false };
+  const fs = memoryFs({
+    [`${base}/members/agent_1.json`]: JSON.stringify(good),
+    [`${base}/members/old.json`]: JSON.stringify({ ...good, id: 'old', schema: 2 }),
+    [`${base}/members/__secret.json`]: JSON.stringify({ ...good, id: '../secret' }),
+    ['/repo/.agent-smith/jobs/secret.json']: JSON.stringify({ ...good, id: '../../secret' }),
+  });
+  const view = await readMemberView(fs, '/repo', 'job-a', 'agent/1');
+  assert.equal(view?.name, 'Ann');
+  assert.equal(view?.timeline.length, 1, 'an invalid timeline event is dropped');
+  assert.equal(await readMemberView(fs, '/repo', 'job-a', 'agent_1'), null, 'the file names another member');
+  assert.equal(await readMemberView(fs, '/repo', 'job-a', 'old'), null, 'unknown schema');
+  assert.equal(await readMemberView(fs, '/repo', 'job-a', 'missing'), null);
+  assert.equal(await readMemberView(fs, '/repo', 'job-a', '../../secret'), null, 'never leaves the members dir');
+  assert.equal((await readMemberView(fs, '/repo', 'job-a', '../secret'))?.id, '../secret', 'a hostile id maps inside it');
+  assert.equal(await readMemberView(fs, '/repo', '../job-a', 'agent/1'), null, 'a bad job id is null, not a throw');
+  assert.equal(await readMemberView(fs, '/repo', 'job-a', ''), null);
 });

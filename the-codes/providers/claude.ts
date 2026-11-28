@@ -379,7 +379,7 @@ export function createClaudeTranslator(
             } else {
               sawNonEmptyText = true;
               answer.text(text, msgKey);
-              out.push({ kind: 'text', at, text, stream: 'assistant' });
+              out.push({ kind: 'text', at, text, stream: 'assistant', messageKey: msgKey });
             }
           }
           continue;
@@ -554,7 +554,7 @@ export function buildResult(args: {
     }
   }
 
-  const out = jobResult({ provider: 'claude', jobId, status, error, exit, response, startedAtMs, durationMs, stateDir });
+  const out = jobResult({ provider: 'claude', jobId, status, error, exit, response, answerKey: tx.answer.answerKey(), startedAtMs, durationMs, stateDir });
   if (tx.deniedTools.length > 0) {
     out.deniedActions = tx.deniedTools.map((id) => ({ action: 'tool', displayName: id, nonfatal: true }));
   }

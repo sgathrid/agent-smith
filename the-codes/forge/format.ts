@@ -32,6 +32,10 @@ export const FILES = {
   checksAbort: 'checks.abort',
   steerConsumed: 'steer.consumed',
   steerDiscard: 'steer.discard',
+  /** Latest `Team` snapshot (atomic rewrite), present only when the worker has sub-agents. */
+  team: 'team.json',
+  /** Directory of `MemberView` files, `<memberId>.json`. */
+  members: 'members',
 } as const;
 
 export type SteerDelivery = 'queue' | 'interrupt';
@@ -236,7 +240,7 @@ export interface ForgeProgress {
 }
 
 export type ForgeViewEvent =
-  | { sequence: number; kind: 'assistant'; at: string; text: string }
+  | { sequence: number; kind: 'assistant'; at: string; text: string; messageKey?: string }
   | { sequence: number; kind: 'tool'; at: string; stepIndex: number; tool: string; input: string; output: string; state: 'active' | 'done' | 'error' }
   | { sequence: number; kind: 'message'; at: string; text: string; delivery: 'next-step' | 'turn-start'; sender: MessageSender };
 
@@ -252,6 +256,11 @@ export interface ForgeView {
     stepIndex: number; at: string; tool: string; input: string; output: string;
     state: 'active' | 'done' | 'error';
   }[];
+}
+
+export function withoutAnswer(view: ForgeView, answerKey: string | undefined): ForgeView {
+  if (answerKey === undefined) return view;
+  return { ...view, timeline: (view.timeline ?? []).filter((e) => !(e.kind === 'assistant' && e.messageKey === answerKey)) };
 }
 
 export function jobsDir(repo: string): string {

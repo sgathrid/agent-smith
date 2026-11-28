@@ -1,4 +1,4 @@
-import {n as readManifest,c as jobFile,F as FILES,o as ownerAlive,r as readPipeline,e as cancelPipeline,A as AgentSmithReader,q as normalize,t as errMessage,P as PROVIDERS,g as findProvider,u as probeAvailability,w as writeJsonAtomic,x as writeAtomic,j as jobDir,y as SCHEMA_VERSION,z as validOwnerPid,l as isTerminalForgeStatus,B as reportFor,C as cwdFacts,E as normalizeDenials,G as deriveOrphan,H as deriveStatus,I as summaryHead,J as failureFields,R as REASONS,d as readAcceptance,K as writeAcceptance,L as createMarker,W as WORKERS_DIR,N as jobsDir,O as parseWorkerIndex,p as providerNames,Q as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,T as normalizeContinuationKind,U as reasonFromText,V as fileSig,X as JobWriter,i as isTerminalStatus,k as isMode,Y as effectiveUnrestricted,Z as newJobId,_ as newWorkerId,$ as markAcceptancePending,a0 as humanDuration,a1 as pipeEvents,a2 as checksAbortRequested,a3 as verdictBlock,a4 as runAcceptance,a5 as senderOf,a6 as taskTitle,a7 as markAcceptanceSuperseded,a8 as pickHead,f as isWorkerIdle,a9 as compareTurnPriority,aa as computeStaleReads,ab as SMITH_PAYLOAD,ac as isForgeStatus}from'./chunk-normalize.js';import {existsSync,readFileSync,mkdirSync,appendFileSync,openSync,writeSync,closeSync,unlinkSync,statSync,renameSync,linkSync,readdirSync,realpathSync,lstatSync,copyFileSync}from'node:fs';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import path from'node:path';import {createHash}from'node:crypto';const LAUNCH_ACK_MS = 15_000;
+import {q as readManifest,d as jobFile,F as FILES,u as ownerAlive,r as readPipeline,f as cancelPipeline,A as AgentSmithReader,w as normalize,x as errMessage,P as PROVIDERS,k as findProvider,y as probeAvailability,z as writeJsonAtomic,B as writeAtomic,c as jobDir,C as SCHEMA_VERSION,E as validOwnerPid,o as isTerminalForgeStatus,G as reportFor,H as cwdFacts,I as normalizeDenials,J as deriveOrphan,K as deriveStatus,L as failureFields,R as REASONS,e as readAcceptance,N as writeAcceptance,O as createMarker,Q as withoutAnswer,W as WORKERS_DIR,T as jobsDir,U as parseWorkerIndex,p as providerNames,V as getProvider,M as MODES,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS$1,X as normalizeContinuationKind,i as isTerminalStatus,j as jobSummary,Y as reasonFromText,Z as fileSig,_ as JobWriter,n as isMode,$ as effectiveUnrestricted,a0 as newJobId,a1 as newWorkerId,a2 as markAcceptancePending,a3 as humanDuration,a4 as pipeEvents,a5 as checksAbortRequested,a6 as verdictBlock,a7 as runAcceptance,a8 as senderOf,a9 as taskTitle,aa as markAcceptanceSuperseded,ab as pickHead,g as isWorkerIdle,ac as compareTurnPriority,ad as computeStaleReads,ae as SMITH_PAYLOAD,af as isForgeStatus}from'./chunk-normalize.js';import {existsSync,readFileSync,mkdirSync,appendFileSync,openSync,writeSync,closeSync,unlinkSync,statSync,renameSync,linkSync,readdirSync,realpathSync,lstatSync,copyFileSync}from'node:fs';import {fork}from'node:child_process';import {fileURLToPath}from'node:url';import {setTimeout as setTimeout$1}from'node:timers/promises';import path from'node:path';import {createHash}from'node:crypto';const LAUNCH_ACK_MS = 15_000;
 async function launch(url, payload, onPrepared) {
     const child = fork(fileURLToPath(url), [], {
         detached: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
@@ -343,6 +343,25 @@ function buildBrief(input) {
             "Only claim what you can point to (command output, file contents, a diff); say what you couldn't verify. " +
             'If the task conflicts with what you find, say so rather than guess.',
     ].join('\n');
+}
+const SLASH_COMMAND_RE = /^\s*(\/[A-Za-z0-9_:-]+)(?=\s|$)/;
+/**
+ * The text sent to a worker: the brief in front of the prompt, except that a
+ * leading slash command stays first (when the provider expands one and the
+ * token is not an existing path), so the brief becomes its argument text.
+ */
+function joinBrief(brief, prompt, options) {
+    if (brief === '')
+        return prompt;
+    const m = options.slashCommands ? SLASH_COMMAND_RE.exec(prompt) : null;
+    if (m === null || options.isPath?.(m[1]) === true)
+        return `${brief}\n\n${prompt}`;
+    const rest = prompt.slice(m[0].length).replace(/^\s+/, '');
+    return `${m[1]} ${brief}${rest === '' ? '' : `\n\n${rest}`}`;
+}
+const SLASH_COMMAND_PROVIDERS = new Set(['agy', 'claude']);
+function expandsSlashCommands(provider) {
+    return SLASH_COMMAND_PROVIDERS.has(provider);
 }function appendSteerEntry(repo, jobId, entry) {
     const dir = jobDir(repo, jobId);
     mkdirSync(dir, { recursive: true });
@@ -510,6 +529,8 @@ function reconcileOrphan(repo, jobId, now = Date.now()) {
             // anchor. Restore the same report/verdict, without replaying checks or
             // claiming that finish-time git attribution was captured.
             writeAtomic(jobFile(repo, jobId, FILES.report), report ?? '');
+            if (report !== null && report.trim() !== '')
+                stripAnswer(repo, jobId, result.answerKey);
             if (readFileSync(file, 'utf8') !== before || ownerAlive(manifest)
                 || readOptional(resultFile) !== resultBefore
                 || (existsSync(cancelFile) || existsSync(cancelSteerFile)) !== canceled)
@@ -526,8 +547,7 @@ function reconcileOrphan(repo, jobId, now = Date.now()) {
                     ...(nonfatal === true ? { nonfatal: true } : {}),
                 })),
                 usage: result.usage === undefined ? null : Object.fromEntries(Object.entries(result.usage).filter((entry) => typeof entry[1] === 'number')),
-                latestSummary: summaryHead(result.response, 1_000) || manifest.latestSummary || null,
-                summarySource: result.response.trim() || manifest.latestSummary ? 'worker' : null,
+                ...(report?.trim() ? { latestSummary: null, summarySource: null } : {}),
                 changedFilesUnknown: true,
                 ...(facts.cwdMissing ? { cwdMissingAtFinish: true } : {}),
             });
@@ -603,6 +623,18 @@ function editedOnDisk(repo, jobId) {
     }
 }
 /** Missing or partially written provider output cannot keep a dead job running. */
+function stripAnswer(repo, jobId, answerKey) {
+    if (typeof answerKey !== 'string')
+        return;
+    const file = jobFile(repo, jobId, FILES.view);
+    const body = readOptional(file);
+    if (body === null)
+        return;
+    try {
+        writeJsonAtomic(file, withoutAnswer(JSON.parse(body), answerKey));
+    }
+    catch { }
+}
 function readOptional(file) {
     try {
         return readFileSync(file, 'utf8');
@@ -1178,14 +1210,16 @@ function toSummary(observed) {
         reason: typeof raw['reason'] === 'string' && raw['reason'] !== '' ? raw['reason'] : null,
         error: typeof raw['error'] === 'string' ? raw['error'] : null,
     });
+    const lastMessage = raw['summarySource'] === 'worker' && typeof raw['latestSummary'] === 'string' ? raw['latestSummary'] : null;
+    const latestSummary = isTerminalStatus(observed.status) ? jobSummary(observed.output, lastMessage) : lastMessage;
     return {
         jobId: observed.jobId,
         name: typeof raw['name'] === 'string' && raw['name'] ? raw['name'] : observed.jobId,
         workerId: typeof raw['workerId'] === 'string' && raw['workerId'] !== '' ? raw['workerId'] : observed.jobId,
         turn,
         role: typeof raw['role'] === 'string' ? raw['role'] : observed.mode,
-        latestSummary: raw['summarySource'] === 'worker' && typeof raw['latestSummary'] === 'string' ? raw['latestSummary'] : null,
-        summarySource: raw['summarySource'] === 'worker' ? 'worker' : null,
+        latestSummary,
+        summarySource: latestSummary === null ? null : 'worker',
         status: observed.status,
         provider: typeof raw['provider'] === 'string' ? raw['provider'] : observed.label,
         unrestricted: raw['unrestricted'] === true,
@@ -1220,6 +1254,7 @@ function toSummary(observed) {
         ...(raw['cwdMissingAtFinish'] === true ? { cwdMissingAtFinish: true } : {}),
         ...(typeof raw['last_event_at'] === 'string' ? { lastEventAt: raw['last_event_at'] } : {}),
         ...(typeof raw['last_alive_at'] === 'string' ? { lastAliveAt: raw['last_alive_at'] } : {}),
+        ...(raw['team'] !== undefined && raw['team'] !== null ? { team: raw['team'] } : {}),
     };
 }
 function readDigest(v) {
@@ -1517,6 +1552,9 @@ function continuationModelAndEffort(head, entries, spec, defaultModel) {
     const effort = o.effort === 'default' ? undefined : (o.effort ?? spec?.effort ?? head.effort ?? undefined);
     return { modelRequested, modelExpected, effort };
 }
+function joinOptions(provider) {
+    return { slashCommands: expandsSlashCommands(provider), isPath: existsSync };
+}
 function applyOverrides(spec, o, provider, defaultModel) {
     if (Object.keys(o).length === 0)
         return spec;
@@ -1743,7 +1781,7 @@ class ForgeService {
         });
         const prependBrief = brief !== '' && !prompt.startsWith(brief);
         const preambleApplied = brief !== '';
-        const sentPrompt = prependBrief ? `${brief}\n\n${prompt}` : prompt;
+        const sentPrompt = prependBrief ? joinBrief(brief, prompt, joinOptions(provider.name)) : prompt;
         const jobId = newJobId(mode);
         const name = request.name?.trim() || `${mode}-${jobId.slice(-8)}`;
         if (name.length > 80)
@@ -1916,7 +1954,7 @@ class ForgeService {
                         resuming: false,
                         dirtyFiles: dirty,
                     });
-                    currentPrompt = `${fullBrief}\n\n${currentTurn.rawPrompt}`;
+                    currentPrompt = joinBrief(fullBrief, currentTurn.rawPrompt, joinOptions(provider.name));
                     currentWriter.updatePreamble(fullBrief);
                 }
             }

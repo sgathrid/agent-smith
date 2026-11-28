@@ -1,6 +1,9 @@
 import type { ObservedJob } from '../harness/types.ts';
 import type { ProgressDigest } from '../surfaces/mod/hooks/progress.ts';
+import type { Team } from '../surfaces/mod/types/index.d.ts';
 import { reasonFromText } from '../surfaces/mod/hooks/reasons.ts';
+import { jobSummary } from '../surfaces/mod/hooks/text.ts';
+import { isTerminalStatus } from '../surfaces/mod/hooks/turns.ts';
 import { normalizeContinuationKind, type ContinuationKind, type ForgeActivity, type ForgeStatus, type WatchedFileSigs } from './format.ts';
 import type { Acceptance } from './checks.ts';
 
@@ -50,6 +53,7 @@ export interface JobSummary {
   readonly cwdMissingAtFinish?: boolean;
   readonly lastEventAt?: string | null;
   readonly lastAliveAt?: string | null;
+  readonly team?: Team;
 }
 
 export interface JobDetail extends JobSummary {
@@ -108,14 +112,16 @@ export function toSummary(observed: ObservedJob): JobSummary {
     reason: typeof raw['reason'] === 'string' && raw['reason'] !== '' ? raw['reason'] : null,
     error: typeof raw['error'] === 'string' ? raw['error'] : null,
   });
+  const lastMessage = raw['summarySource'] === 'worker' && typeof raw['latestSummary'] === 'string' ? raw['latestSummary'] : null;
+  const latestSummary = isTerminalStatus(observed.status) ? jobSummary(observed.output, lastMessage) : lastMessage;
   return {
     jobId: observed.jobId,
     name: typeof raw['name'] === 'string' && raw['name'] ? raw['name'] : observed.jobId,
     workerId: typeof raw['workerId'] === 'string' && raw['workerId'] !== '' ? raw['workerId'] : observed.jobId,
     turn,
     role: typeof raw['role'] === 'string' ? raw['role'] : observed.mode,
-    latestSummary: raw['summarySource'] === 'worker' && typeof raw['latestSummary'] === 'string' ? raw['latestSummary'] : null,
-    summarySource: raw['summarySource'] === 'worker' ? 'worker' : null,
+    latestSummary,
+    summarySource: latestSummary === null ? null : 'worker',
     status: observed.status,
     provider: typeof raw['provider'] === 'string' ? raw['provider'] : observed.label,
     unrestricted: raw['unrestricted'] === true,
@@ -150,6 +156,7 @@ export function toSummary(observed: ObservedJob): JobSummary {
     ...(raw['cwdMissingAtFinish'] === true ? { cwdMissingAtFinish: true } : {}),
     ...(typeof raw['last_event_at'] === 'string' ? { lastEventAt: raw['last_event_at'] } : {}),
     ...(typeof raw['last_alive_at'] === 'string' ? { lastAliveAt: raw['last_alive_at'] } : {}),
+    ...(raw['team'] !== undefined && raw['team'] !== null ? { team: raw['team'] as Team } : {}),
   };
 }
 

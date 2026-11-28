@@ -1215,6 +1215,21 @@ test('opencode: explicit session completion corroborates a recovered report', ()
   assert.equal(buildOc(tx, failedExit).status, 'success');
 });
 
+test('agy: a tool output loses the Created At / Completed At envelope, once per batched call', () => {
+  const stamp = (n: number) => `Created At: 2026-01-01T10:00:0${n}-08:00\nCompleted At: 2026-01-01T10:00:0${n + 1}-08:00\n`;
+  const done = (index: number, output: string) => {
+    const tx = createAgyTranslator(2000);
+    tx.onEvent({ event: 'step_update', step_update: { step_index: index, step_type: 'tool', state: 'ACTIVE', tool_name: 'swarm', tool_info: {} } });
+    const out = tx.onEvent({ event: 'step_update', step_update: { step_index: index, step_type: 'tool', state: 'DONE', tool_name: 'swarm', tool_info: { output } } });
+    const end = out.find((e) => e.kind === 'activity-end');
+    assert.ok(end?.kind === 'activity-end');
+    return end.activity.output;
+  };
+  assert.equal(done(1, `${stamp(0)}{"status":"added"}`), '{"status":"added"}');
+  assert.equal(done(2, `${stamp(0)}{"a":1}\n${stamp(2)}{"b":2}`), '{"a":1}\n{"b":2}');
+  assert.equal(done(3, 'plain output'), 'plain output');
+});
+
 test('all provider adapters: prose, tool call, final prose returns only final prose', async (t) => {
   const exit = { code: 0, signal: null, killReason: undefined, stderr: '' };
 
@@ -1279,6 +1294,82 @@ test('all provider adapters: prose, tool call, final prose returns only final pr
     tx.onEvent({ role: 'assistant', content: 'final prose' });
     const res = buildKimiResult({ jobId: 'j', startedAtMs: Date.now() - 10, stateDir: '/tmp', exit, tx });
     assert.equal(res.response, 'final prose');
+  });
+});
+
+test('all provider adapters: text events carry their message key and answerKey names the final message', async (t) => {
+  const exit = { code: 0, signal: null, killReason: undefined, stderr: '' };
+  const keys = (events: ProviderEvent[][]): (string | undefined)[] =>
+    events.flat().flatMap((e) => (e.kind === 'text' && e.stream === 'assistant' ? [e.messageKey] : []));
+
+  await t.test('agy', () => {
+    const tx = createAgyTranslator(2000);
+    const events = [
+      tx.onEvent({ event: 'step_update', step_update: { step_index: 1, step_type: 'agent_response', state: 'ACTIVE', text_delta: 'Running the checks; ' } }),
+      tx.onEvent({ event: 'step_update', step_update: { step_index: 2, step_type: 'agent_response', state: 'ACTIVE', text_delta: 'All ' } }),
+      tx.onEvent({ event: 'step_update', step_update: { step_index: 2, step_type: 'agent_response', state: 'DONE', text_delta: 'green.' } }),
+    ];
+    const res = buildAgyResult({
+      jobId: 'j', resultEvent: { status: 'SUCCESS', response: 'Running the checks; All green.' }, exit, startedAtMs: Date.now() - 10, stateDir: '/tmp',
+      denials: tx.denials, sawAnyToolCall: tx.stepsWereTools(), errorIsStale: tx.errorIsStale(), answer: tx.answer,
+    });
+    assert.deepEqual(keys(events), ['1', '2', '2']);
+    assert.equal(res.response, 'All green.');
+    assert.equal(res.answerKey, '2');
+  });
+
+  await t.test('claude', () => {
+    const tx = createClaudeTranslator(2000);
+    const events = [
+      tx.onEvent({ type: 'assistant', message: { id: 'msg_a', content: [{ type: 'text', text: 'earlier prose' }] } }),
+      tx.onEvent({ type: 'assistant', message: { id: 'msg_b', content: [{ type: 'text', text: 'final ' }] } }),
+      tx.onEvent({ type: 'assistant', message: { id: 'msg_b', content: [{ type: 'text', text: 'prose' }] } }),
+      tx.onEvent({ type: 'result', subtype: 'success', result: 'final prose' }),
+    ];
+    const res = buildClaudeResult({ jobId: 'j', startedAtMs: Date.now() - 10, stateDir: '/tmp', exit, tx });
+    assert.deepEqual(keys(events), ['msg_a', 'msg_b', 'msg_b']);
+    assert.equal(res.response, 'final prose');
+    assert.equal(res.answerKey, 'msg_b');
+  });
+
+  await t.test('codex', () => {
+    const tx = createCodexTranslator(2000);
+    const events = [
+      tx.onEvent({ type: 'item.completed', item: { id: 'm1', type: 'agent_message', text: 'earlier prose' } }),
+      tx.onEvent({ type: 'item.updated', item: { id: 'm2', type: 'agent_message', text: 'final' } }),
+      tx.onEvent({ type: 'item.completed', item: { id: 'm2', type: 'agent_message', text: 'final prose' } }),
+      tx.onEvent({ type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } }),
+    ];
+    const res = buildCodexResult({ jobId: 'j', startedAtMs: Date.now() - 10, stateDir: '/tmp', exit, tx });
+    assert.deepEqual(keys(events), ['m1', 'm2']);
+    assert.equal(res.response, 'final prose');
+    assert.equal(res.answerKey, 'm2');
+  });
+
+  await t.test('opencode', () => {
+    const tx = createOpencodeTranslator(2000);
+    const events = [
+      tx.onEvent({ type: 'step_start' }),
+      tx.onEvent({ type: 'text', part: { type: 'text', messageID: 'm1', text: 'Earlier answer' } }),
+      tx.onEvent({ type: 'text', part: { type: 'text', messageID: 'm2', text: 'Real answer' } }),
+      tx.onEvent({ type: 'step_finish', part: { reason: 'stop' } }),
+    ];
+    const res = buildOpencodeResult({ jobId: 'j', startedAtMs: Date.now() - 10, stateDir: '/tmp', exit, tx });
+    assert.deepEqual(keys(events), ['m1', 'm2']);
+    assert.equal(res.answerKey, 'm2');
+  });
+
+  await t.test('kimi', () => {
+    const tx = createKimiTranslator(2000);
+    const events = [
+      tx.onEvent({ role: 'assistant', content: 'earlier prose' }),
+      tx.onEvent({ role: 'assistant', content: 'final prose' }),
+    ];
+    const res = buildKimiResult({ jobId: 'j', startedAtMs: Date.now() - 10, stateDir: '/tmp', exit, tx });
+    const [first, second] = keys(events);
+    assert.ok(first !== undefined && second !== undefined && first !== second);
+    assert.equal(res.response, 'final prose');
+    assert.equal(res.answerKey, second);
   });
 });
 

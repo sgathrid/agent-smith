@@ -1,4 +1,4 @@
-import {randomBytes,randomUUID,createHash}from'node:crypto';import {readFileSync,existsSync,mkdirSync,writeFileSync,createWriteStream,openSync,fsyncSync,closeSync,renameSync,unlinkSync,statSync,copyFileSync,constants as constants$1}from'node:fs';import path from'node:path';import {spawn,execFile}from'node:child_process';import {access,constants,stat,open,readdir}from'node:fs/promises';import os from'node:os';import readline from'node:readline';const NETWORK_RE = /network issue|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|fetch failed|connection (?:reset|refused|closed|error)|temporarily unavailable/i;
+import {randomBytes,randomUUID,createHash}from'node:crypto';import {readFileSync,existsSync,mkdirSync,writeFileSync,createWriteStream,statSync,readdirSync,openSync,readSync,closeSync,fsyncSync,renameSync,unlinkSync,realpathSync,copyFileSync,constants as constants$1}from'node:fs';import path from'node:path';import {spawn,execFile}from'node:child_process';import {access,constants,stat,open,readdir}from'node:fs/promises';import os from'node:os';import readline from'node:readline';const NETWORK_RE = /network issue|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|fetch failed|connection (?:reset|refused|closed|error)|temporarily unavailable/i;
 const TIMEOUT_RE = /timed? ?out|exceeded the .*budget|\btimeout\b/i;
 const AUTH_RE = /\b(?:unauthorized|unauthenticated)\b|authentication (?:failed|required)|invalid (?:api[ _-]?key|access token)|(?:access |auth |refresh )token (?:has )?expired|not (?:logged|signed) in|please (?:log|sign) in/i;
 const BUSY_RE = /resource[_ ]exhausted(?!.*(?:insufficient|balance|credits|funds|billing|recharge|\b402\b))|no spare capacity|\b503\b|\bservice unavailable\b|\boverloaded\b|provider busy/i;
@@ -224,6 +224,10 @@ const FILES = {
     checksAbort: 'checks.abort',
     steerConsumed: 'steer.consumed',
     steerDiscard: 'steer.discard',
+    /** Latest `Team` snapshot (atomic rewrite), present only when the worker has sub-agents. */
+    team: 'team.json',
+    /** Directory of `MemberView` files, `<memberId>.json`. */
+    members: 'members',
 };
 function senderOf(e) {
     return e.sender ?? (e.delivery === 'interrupt' ? 'steer' : 'follow_up');
@@ -266,6 +270,11 @@ function diffChangedFiles(baseline, nowDirty, modifiedBaseline = [], committed =
         out.add(p);
     const all = [...out].filter((p) => !isForgeStatePath(p)).sort();
     return { files: all.slice(0, CHANGED_FILES_CAP), truncated: all.length > CHANGED_FILES_CAP };
+}
+function withoutAnswer(view, answerKey) {
+    if (answerKey === undefined)
+        return view;
+    return { ...view, timeline: (view.timeline ?? []).filter((e) => !(e.kind === 'assistant' && e.messageKey === answerKey)) };
 }
 function jobsDir(repo) {
     return path.join(repo, ...JOBS_DIR_SEGMENTS);
@@ -1801,7 +1810,7 @@ function tryParseObject(line) {
         return undefined;
     }
 }
-function str(o, key) {
+function str$1(o, key) {
     const v = o?.[key];
     return typeof v === 'string' ? v : undefined;
 }
@@ -1825,6 +1834,19 @@ function num(o, key) {
 function nowIso(at = Date.now()) {
     return new Date(at).toISOString();
 }
+function replaceQueuedTeam(queue, event) {
+    if (event.kind !== 'team')
+        return;
+    const prior = queue.findIndex((e) => e.kind === 'team');
+    if (prior >= 0)
+        queue.splice(prior, 1);
+}
+function stopSidecarSafely(sidecar) {
+    try {
+        sidecar?.stop();
+    }
+    catch { }
+}
 function createEventBus(maxQueue = 4096) {
     const listeners = new Set();
     const queue = [];
@@ -1843,6 +1865,7 @@ function createEventBus(maxQueue = 4096) {
             w({ value: event, done: false });
             return;
         }
+        replaceQueuedTeam(queue, event);
         if (queue.length >= maxQueue)
             queue.shift();
         queue.push(event);
@@ -2136,6 +2159,8 @@ function jobResult(args) {
         finishedAt: nowIso(),
         stateDir: args.stateDir,
     };
+    if (args.answerKey !== undefined)
+        out.answerKey = args.answerKey;
     if (error !== undefined)
         out.error = error;
     return out;
@@ -2156,6 +2181,7 @@ async function runNdjsonWorker(cfg) {
     const notice = (level, message) => publish([{ kind: 'notice', at: nowIso(), level, message }]);
     if (cfg.preamble !== undefined)
         publish(cfg.preamble);
+    const sidecar = cfg.sidecar?.((e) => bus.emit(e));
     const startedAtMs = Date.now();
     const proc = await spawnWorker({
         provider,
@@ -2194,6 +2220,7 @@ async function runNdjsonWorker(cfg) {
         resolveResult = resolve;
     });
     void proc.exited.then(({ code, signal }) => {
+        stopSidecarSafely(sidecar);
         proc.closeLog();
         const exit = { code, signal, killReason: proc.killReason, stderr: proc.stderrTail() };
         if (proc.spawnError !== undefined)
@@ -2350,15 +2377,1321 @@ function createAnswer(provider) {
                 return;
             if (current.trim() !== '' && kind === 'final-message') {
                 current = text;
-                lastKey = undefined;
                 hasMessage = true;
             }
         },
         value() {
             return current.trim() === '' ? '' : current;
         },
+        answerKey() {
+            return current.trim() === '' ? undefined : lastKey;
+        },
     };
-}function agyBinary() {
+}/** Text sanitising and fixed-width fitting. Dependency-free: everything that puts
+ * worker or user prose into a cell goes through here first.
+ */
+/**
+ * Strip complete ANSI escape sequences (CSI, OSC, DCS/PM/APC/SOS, 2-byte ESC,
+ * C1 controls) and remaining forbidden control characters, unpaired surrogates,
+ * and noncharacters (`U+FDD0..U+FDEF`), while preserving `\n` and valid UTF-16
+ * surrogate pairs.
+ *
+ * Why this exists: Claude Code's JSX element validator rejects any `<Text>`,
+ * `<Button label>`, or `<Markdown text>` containing C0/C1 controls (except `\t`
+ * and `\n`), lone surrogates, or `U+FDD0..U+FDEF`. Worker tool output, shell
+ * commands, check output, and prompt text routinely contain ANSI colour codes or
+ * `\r` progress lines; stripping them at the UI boundary keeps the stored job
+ * files intact while preventing a single control byte from aborting the pane.
+ */
+const ANSI_ESCAPE = /(?:\x1b\][\s\S]*?(?:\x07|\x1b\\|\x9c)|\x9d[\s\S]*?(?:\x07|\x1b\\|\x9c)|\x1b[PX^_][\s\S]*?(?:\x1b\\|\x9c)|(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]|\x1b[ -/]*[@-~])/gu;
+const FORBIDDEN_CONTROLS = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ud800-\udfff\ufdd0-\ufdef]/gu;
+function sanitizeText(s) {
+    return s
+        .replace(ANSI_ESCAPE, '')
+        .replace(/\r\n?/g, '\n')
+        .replace(/\t/g, '  ')
+        .replace(FORBIDDEN_CONTROLS, '');
+}
+/**
+ * Cut to at most `max` UTF-16 units without splitting a surrogate pair.
+ *
+ * `slice` can leave a high surrogate with no low half. `sanitizeText` removes
+ * such halves, so a cut made AFTER sanitizing must not create one: the host
+ * draws an unpaired half as U+FFFD, or refuses the tree a Text's string is
+ * checked in. `max` stays in UTF-16 units because every caller sizes cells in
+ * terminal columns, where a pair already counts as two.
+ */
+function clip(s, max) {
+    if (s.length <= max)
+        return s;
+    const cut = s.slice(0, Math.max(0, max));
+    return /[\ud800-\udbff]$/.test(cut) ? cut.slice(0, -1) : cut;
+}
+/**
+ * Fit a string into a fixed-width cell, cutting at a word boundary.
+ *
+ * NO ELLIPSIS CHARACTER, and that is the point. `…` (U+2026) is EAW=Ambiguous —
+ * one column in a Western terminal, two in a CJK-locale one — so a truncation
+ * marker is exactly the character that would make a fixed-width column drift in
+ * the locales the fixed width exists to protect. The cell's right edge is the
+ * marker: a label that stops mid-clause at column 44 is visibly a clipped label,
+ * because every other row's label starts at the same place and ends at the same
+ * place. `cell()` therefore slices to exactly `width` columns, always.
+ */
+function fitCell(s, width) {
+    if (s.length <= width)
+        return s.padEnd(width);
+    const cut = clip(s, width);
+    const space = cut.lastIndexOf(' ');
+    // Only break on a space in the last third: breaking early would throw away a
+    // third of the cell to save two characters of raggedness.
+    const body = space >= Math.floor(width * 0.6) ? cut.slice(0, space) : cut;
+    return body.padEnd(width);
+}
+/** Collapse all whitespace runs to single spaces and cap the length. A hard
+ * bound on what one string can cost, for prose with no cell to sit in (a report
+ * excerpt, a warning message); the renderer's `wrap="truncate-end"` is the
+ * mechanism, this is belt and braces. */
+function oneLine(s, max = 400) {
+    const t = sanitizeText(s).replace(/\s+/g, ' ').trim();
+    return clip(t, Math.max(0, max));
+}
+const SUMMARY_CHARS = 1_000;
+/** A job's short summary: its report's opening once it has a report, else the worker's last message. */
+function jobSummary(report, lastMessage) {
+    return reportSummary(report ?? '') || lastMessage?.trim() || null;
+}
+/** A short summary of a worker's report or current message: its opening, without a leading
+ * `Status:` line, cut at a paragraph or line boundary within `max`. */
+function reportSummary(text, max = SUMMARY_CHARS) {
+    const t = text.trim().replace(/^Status:[^\n]*(?:\n|$)/, '').trim();
+    if (t.length <= max)
+        return t;
+    const head = t.slice(0, max);
+    if (t[max] === '\n')
+        return head.trim();
+    for (const sep of ['\n\n', '\n']) {
+        const i = head.lastIndexOf(sep);
+        if (i >= 0 && head.slice(0, i).trim() !== '')
+            return head.slice(0, i).trim();
+    }
+    return head.trim();
+}/** Tool name + parameters → a short human phrase. Shared by the legacy reader
+ * (jobs.ts) and the progress digest (progress.ts); never raw tool output.
+ */
+/**
+ * agy tool name + parameters → a short "what is it doing" phrase.
+ *
+ * Measured against real agy tool calls:
+ *   run_command           { CommandLine }
+ *   view_file             { AbsolutePath }
+ *   write_to_file         { TargetFile }
+ *   replace_file_content  { TargetFile }
+ *   grep_search           { Query | Pattern }
+ *   list_dir              { AbsolutePath }
+ *   call_mcp_tool         { ServerName, ToolName, Arguments }
+ *   manage_task           { Action, TaskId }
+ *   schedule              { DurationSeconds, Prompt }
+ *
+ * TERMINAL-UI.md §Motion: "terse tool descriptions, never raw output". Every
+ * branch truncates at the source; there is no code path that hands raw tool
+ * output to a list row.
+ */
+function describeTool(tool, params) {
+    const str = (k) => {
+        const v = params[k];
+        return typeof v === 'string' ? oneLine(v) : '';
+    };
+    switch (tool) {
+        case 'run_command':
+            return humanCommand(str('CommandLine'));
+        case 'view_file':
+            return `reading ${basename(str('AbsolutePath'))}`;
+        case 'write_to_file':
+        // Same verb as replace_file_content, deliberately: from the reader's side
+        // there is no difference between "created" and "changed" a file, and the
+        // tool name is an implementation detail of agy, not of the work.
+        case 'replace_file_content':
+            return `editing ${basename(str('TargetFile'))}`;
+        case 'grep_search':
+            return `searching ${basename(str('Query') || str('Pattern'))}`;
+        case 'list_dir':
+            return `listing ${basename(str('AbsolutePath'))}`;
+        case 'call_mcp_tool':
+            return `${str('ToolName') || str('ServerName') || 'an mcp tool'}`;
+        case 'manage_task':
+            return `task ${str('Action') || 'update'}`;
+        case 'schedule':
+            return `waiting ${str('DurationSeconds') || '?'}s`;
+        default:
+            return SWARM_TOOLS.has(tool) ? labelSwarmCall(tool, params) : `using ${oneLine(tool)}`;
+    }
+}
+/**
+ * A shell command → what a person would say they are doing.
+ *
+ * The corpus is 76 run_command records and the raw line is what put
+ * `cargo tree -p renyi-mcp -e features -i` on a status row: real, precise, and
+ * unreadable at a glance. So the COMMON commands get a verb, and anything else
+ * gets a TRIMMED form rather than an invented one.
+ *
+ * The fallback rule is the important half. When there is no mapping this shows
+ * the command's first two words and stops — `git rebase --onto main feature/x`
+ * becomes `git rebase`, not `preparing the branch`. Inventing a plausible verb
+ * for an arbitrary command would be a lie the user cannot check, and it would be
+ * a lie in the one field the band exists to be trustworthy about. `cargo tree`
+ * is in the table because it appears in the corpus four times, not because it
+ * is universally understood.
+ */
+function humanCommand(cmd) {
+    const line = oneLine(cmd);
+    if (line === '')
+        return 'running a command';
+    // A pipeline or a `&&` chain is several actions; the first is what the job is
+    // doing now, and the rest are what it will do after. `cargo test 2>&1 | tail`
+    // is "running tests", not "running a shell pipeline".
+    const first = line.split(/\s*(?:&&|\|\||;|\||&&)\s*/)[0] ?? line;
+    const words = first.split(' ').filter((w) => !w.startsWith('-'));
+    const prog = basename(words[0] ?? '');
+    const sub = words[1] ?? '';
+    switch (prog) {
+        case 'cargo':
+        case 'rustup':
+            switch (sub) {
+                case 'test':
+                case 'nextest':
+                    return 'running tests';
+                case 'clippy':
+                    return 'linting';
+                case 'fmt':
+                    return 'formatting';
+                case 'build':
+                    return 'building';
+                case 'check':
+                    return 'checking the build';
+                case 'tree':
+                    return 'inspecting dependencies';
+                case 'doc':
+                    return 'reading the docs';
+                case 'run':
+                    return `running ${basename(words[2] ?? 'the binary')}`;
+            }
+            break;
+        case 'npm':
+        case 'pnpm':
+        case 'yarn':
+        case 'bun':
+            // `npm test` and `npm run test` are the same intent; `npm run build` is
+            // building. Anything else under `npm run` is somebody's script and we do
+            // not know what it does.
+            if (sub === 'test')
+                return 'running tests';
+            if (sub === 'run' && (words[2] === 'build'))
+                return 'building';
+            if (sub === 'run' && (words[2] === 'test'))
+                return 'running tests';
+            return `running ${prog} scripts`;
+        case 'python':
+        case 'python3':
+            return 'running a script';
+        case 'git':
+            if (sub === 'status' || sub === 'diff' || sub === 'log' || sub === 'show')
+                return 'checking git';
+            if (sub === 'commit')
+                return 'committing';
+            if (sub === 'push')
+                return 'pushing';
+            return `git ${sub}`.trim();
+        case 'grep':
+        case 'rg':
+        case 'ag':
+            return 'searching';
+        case 'graft':
+            return `navigating the graph`;
+    }
+    // The honest fallback: the command's name, and at most one argument.
+    // `/Library/Developer/CommandLineTools/usr/bin/git` reads as `git`.
+    const trimmed = [prog, ...words.slice(1, 2)].join(' ');
+    return trimmed === '' ? 'running a command' : trimmed;
+}
+/** Last path segment only. */
+function basename(p) {
+    const i = p.lastIndexOf('/');
+    return i === -1 ? p : p.slice(i + 1);
+}
+/**
+ * `input_preview` is a JSON STRING of the tool parameters, possibly truncated.
+ * A truncated JSON string does not parse, so this never throws — a failure just
+ * means we have no parameters and the caller falls back to the bare tool name.
+ */
+function parseInputPreview(preview) {
+    if (!preview)
+        return {};
+    try {
+        const v = JSON.parse(preview);
+        return typeof v === 'object' && v !== null ? v : {};
+    }
+    catch {
+        return {};
+    }
+}
+const SWARM_TOOLS = new Set(['swarm', 'read_board', 'post_message', 'swarm_wait', 'update_steps']);
+function rawString(raw, key) {
+    const m = new RegExp(`"${key}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`).exec(raw);
+    if (!m)
+        return '';
+    try {
+        return oneLine(JSON.parse(`"${m[1]}"`));
+    }
+    catch {
+        return oneLine(m[1]);
+    }
+}
+function outputBody(output) {
+    return (output ?? '').trim();
+}
+function parsed(body) {
+    try {
+        const v = JSON.parse(body);
+        return typeof v === 'object' && v !== null && !Array.isArray(v) ? v : null;
+    }
+    catch {
+        return null;
+    }
+}
+function inField(params, raw, key) {
+    const v = params[key];
+    return typeof v === 'string' && v.trim() !== '' ? oneLine(v) : rawString(raw, key);
+}
+function outField(body, json, key) {
+    const v = json?.[key];
+    return typeof v === 'string' && v.trim() !== '' ? oneLine(v) : rawString(body, key);
+}
+function boardEntries(body) {
+    const json = parsed(body);
+    const messages = json?.['messages'];
+    const pairs = [];
+    if (Array.isArray(messages)) {
+        for (const m of messages) {
+            if (m && typeof m === 'object') {
+                const { seq, agent } = m;
+                if (typeof seq === 'number')
+                    pairs.push([seq, typeof agent === 'string' ? oneLine(agent) : '']);
+            }
+        }
+        return { seqs: pairs.map((p) => p[0]), agents: unique(pairs.map((p) => p[1])), empty: messages.length === 0 };
+    }
+    for (const m of body.matchAll(/"seq"\s*:\s*(\d+)\s*,\s*"agent"\s*:\s*"([^"]*)"/g))
+        pairs.push([Number(m[1]), m[2]]);
+    return { seqs: pairs.map((p) => p[0]), agents: unique(pairs.map((p) => p[1])), empty: /"messages"\s*:\s*\[\s*\]/.test(body) };
+}
+const unique = (xs) => [...new Set(xs.filter((x) => x !== ''))];
+function boardRange(output) {
+    const { seqs } = boardEntries(outputBody(output));
+    if (seqs.length === 0)
+        return null;
+    const lo = Math.min(...seqs);
+    const hi = Math.max(...seqs);
+    return lo === hi ? `#${lo}` : `#${lo}–#${hi}`;
+}
+function memberStates(body) {
+    const json = parsed(body);
+    const members = json?.['members'];
+    const states = [];
+    if (Array.isArray(members)) {
+        for (const m of members) {
+            if (!m || typeof m !== 'object')
+                continue;
+            const { role, state } = m;
+            if (role !== 'coordinator' && typeof state === 'string')
+                states.push(state);
+        }
+    }
+    else {
+        for (const m of body.matchAll(/\{[^{}]*\}/g)) {
+            if (/"role"\s*:\s*"coordinator"/.test(m[0]))
+                continue;
+            const s = /"state"\s*:\s*"([^"]*)"/.exec(m[0]);
+            if (s)
+                states.push(s[1]);
+        }
+    }
+    return states.length === 0 ? null : states;
+}
+function teamSummary(states) {
+    const counts = new Map();
+    for (const s of states)
+        counts.set(s, (counts.get(s) ?? 0) + 1);
+    const order = ['working', 'waiting'];
+    const keys = [...order.filter((k) => counts.has(k)), ...[...counts.keys()].filter((k) => !order.includes(k))];
+    return keys.map((k) => `${counts.get(k)} ${k}`).join(' · ');
+}
+function labelSwarmCall(tool, params, raw = '', output = '') {
+    const body = outputBody(output);
+    const json = parsed(body);
+    const inp = (k) => inField(params, raw, k);
+    switch (tool) {
+        case 'swarm': {
+            const action = inp('action');
+            const name = inp('name');
+            switch (action) {
+                case 'add': {
+                    const made = outField(body, json, 'name');
+                    if (made === '')
+                        return name === '' ? 'adding agent' : `adding ${name}`;
+                    const model = outField(body, json, 'model_display_name');
+                    return `added ${made}${model === '' ? '' : ` (${model})`}`;
+                }
+                case 'status': {
+                    const states = memberStates(body);
+                    return states === null ? 'checking team' : `checked team (${teamSummary(states)})`;
+                }
+                case 'models': return 'listed models';
+                case 'title': {
+                    const t = inp('title');
+                    return t === '' ? 'named team' : `named team "${t}"`;
+                }
+                case 'kill': return name === '' ? 'stopped an agent' : `stopped ${name}`;
+                case 'model': {
+                    const model = inp('model');
+                    return `switched ${name === '' ? 'an agent' : name}${model === '' ? '' : ` to ${model}`}`;
+                }
+                default: return action === '' ? 'using swarm' : `swarm ${action}`;
+            }
+        }
+        case 'read_board': {
+            if (body === '')
+                return 'reading board';
+            const { seqs, agents, empty } = boardEntries(body);
+            if (seqs.length === 0)
+                return empty ? 'board: nothing new' : 'reading board';
+            const shown = agents.slice(0, 3).join(', ');
+            return `board ${boardRange(output)}${shown === '' ? '' : ` · ${shown}${agents.length > 3 ? ` +${agents.length - 3}` : ''}`}`;
+        }
+        case 'post_message': {
+            const seq = json?.['seq'] ?? /"seq"\s*:\s*(\d+)/.exec(body)?.[1];
+            return seq === undefined ? 'posting to board' : `posted #${String(seq)}`;
+        }
+        case 'swarm_wait': return 'waiting on team';
+        default: {
+            const statuses = [...raw.matchAll(/"status"\s*:\s*"(done|in_progress|pending)"/g)].map((m) => m[1]);
+            return statuses.length === 0 ? 'updating plan' : `plan ${statuses.filter((s) => s === 'done').length}/${statuses.length} done`;
+        }
+    }
+}const READ_TOOLS = new Set(['view_file', 'read', 'read_file', 'list_dir', 'ls', 'list', 'notebookread', 'readmediafile']);
+const SEARCH_TOOLS = new Set(['grep_search', 'grep', 'glob', 'find_by_name', 'search_files', 'find_files', 'codebase_search', 'search_web', 'web_search', 'websearch', 'webfetch', 'fetchurl']);
+const EDIT_TOOLS = new Set(['write_to_file', 'replace_file_content', 'edit', 'edit_file', 'write', 'write_file', 'create_file', 'str_replace_editor', 'multiedit', 'notebookedit', 'patch', 'file_change', 'apply_patch']);
+const COMMAND_TOOLS = new Set(['run_command', 'bash', 'shell', 'command_execution', 'exec']);
+const PATH_KEYS = ['AbsolutePath', 'TargetFile', 'Path', 'file_path', 'filePath', 'notebook_path', 'path'];
+const COMMAND_KEYS = ['CommandLine', 'command', 'cmd'];
+/**
+ * `/bin/zsh -lc 'cat x'` and `bash -lc "…"` → the command inside. codex names a shell call by its command line.
+ * A stored preview is cut short and loses its closing quote; the command is still the inside.
+ */
+function unwrapShell(command) {
+    const m = /^\s*(?:\S*\/)?(?:ba|z|)sh\s+-l?c\s+(['"])([\s\S]*)$/.exec(command);
+    if (!m)
+        return command;
+    const inner = m[2].trimEnd();
+    return inner.endsWith(m[1]) ? inner.slice(0, -1) : inner;
+}
+const TEST_RE = /\b(?:pytest|jest|vitest|mocha|tox|nox|rspec|phpunit|ctest|unittest)\b|\b(?:cargo|go|npm|pnpm|yarn|bun|deno|dotnet|mvn|gradle|swift|mix)\s+(?:run\s+)?(?:test|nextest|verify)\b|\bmake\s+(?:test|check)\b|\bnode\s+--test\b/;
+const SEARCH_PROGS = new Set(['grep', 'rg', 'ag', 'ack', 'find', 'fd']);
+/** Steps that prepare a shell rather than do the work. */
+const SETUP_PROGS = new Set(['cd', 'pushd', 'popd', 'export', 'unset', 'source', '.', 'set', 'ulimit']);
+const READ_PROGS = new Set(['cat', 'sed', 'head', 'tail', 'nl', 'less', 'ls', 'tree', 'wc']);
+function classifyCommand(raw) {
+    // A leading `!` negates the exit status; it is not the program.
+    const command = unwrapShell(raw).replace(/\s+/g, ' ').trim().replace(/^!\s*/, '');
+    const segments = command.split(/\s*(?:&&|\|\||;|\|)\s*/).filter((s) => s !== '');
+    const program = (segment) => segment.split(' ').filter((w) => w !== '' && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(w));
+    // `unset VIRTUAL_ENV; uv run pytest`: the setup step is not what the command does.
+    const first = segments.find((s) => !SETUP_PROGS.has(basename(program(s)[0] ?? ''))) ?? segments[0] ?? command;
+    const words = program(first);
+    const prog = basename(words[0] ?? '');
+    const sub = subcommand(words);
+    if (prog === 'git' && sub === 'grep')
+        return { kind: 'search', label: 'git grep' };
+    if (SEARCH_PROGS.has(prog))
+        return { kind: 'search', label: humanCommand(first) };
+    if (READ_PROGS.has(prog))
+        return { kind: 'read', label: humanCommand(first) };
+    if (TEST_RE.test(command))
+        return { kind: 'test', label: 'running tests' };
+    return { kind: 'command', label: humanCommand(first) };
+}
+/** Global options that take a value, so `git -C dir grep` finds `grep`, not `dir`. */
+const VALUE_OPTIONS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace']);
+function subcommand(words) {
+    for (let i = 1; i < words.length; i += 1) {
+        const w = words[i];
+        if (VALUE_OPTIONS.has(w)) {
+            i += 1;
+            continue;
+        }
+        if (!w.startsWith('-'))
+            return w;
+    }
+    return '';
+}
+function firstString(params, keys, raw = '') {
+    for (const k of keys) {
+        const v = params[k];
+        if (typeof v === 'string' && v.trim() !== '')
+            return v;
+    }
+    // A long input (a Write's file body) arrives truncated and no longer parses;
+    // its leading keys are still readable.
+    for (const k of keys) {
+        const m = new RegExp(`"${k}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`).exec(raw);
+        if (m) {
+            try {
+                return JSON.parse(`"${m[1]}"`);
+            }
+            catch {
+                return m[1];
+            }
+        }
+    }
+    return '';
+}
+/**
+ * A short name for an in-flight tool call, as a reader would type it: the
+ * command line's first step for a shell tool (`cargo test`), else the tool
+ * name. Used for liveness text ("in `cargo test` 16m").
+ */
+function toolLabel(tool, input, max = 40) {
+    const lower = tool.trim().toLowerCase();
+    if (COMMAND_TOOLS.has(lower)) {
+        const command = unwrapShell(firstString(parseInputPreview(input), COMMAND_KEYS, input ?? '')).replace(/\s+/g, ' ').trim();
+        const first = command.split(/\s*(?:&&|\|\||;|\|)\s*/).find((s) => s !== '') ?? '';
+        if (first !== '')
+            return oneLine(first, max);
+    }
+    return oneLine(tool, max);
+}
+/**
+ * One tool call → its kind and a phrase. Every provider's tool vocabulary:
+ * agy (view_file, run_command, …), claude (Read, Edit, Bash, …), opencode (read,
+ * edit, bash, …), codex (a shell command line as the tool, or file_change) and
+ * kimi (Read, Write, Edit, Grep, Glob, Bash, … — PascalCase, matched lowercased).
+ * Input may be truncated JSON; a parse failure falls back to the bare tool name.
+ */
+function classify(tool, input, output) {
+    const params = parseInputPreview(input);
+    const name = tool.trim();
+    const lower = name.toLowerCase();
+    const path = firstString(params, PATH_KEYS, input ?? '');
+    const file = path === '' ? '' : basename(path);
+    if (COMMAND_TOOLS.has(lower))
+        return classifyCommand(firstString(params, COMMAND_KEYS, input ?? ''));
+    if (EDIT_TOOLS.has(lower)) {
+        if (lower === 'file_change') {
+            const changes = Array.isArray(params['changes']) ? params['changes'] : [];
+            const first = changes.map((c) => (c && typeof c === 'object' ? c['path'] : undefined))
+                .find((p) => typeof p === 'string');
+            return { kind: 'edit', label: first ? `editing ${oneLine(basename(first))}` : 'editing files', ...(first ? { path: first } : {}) };
+        }
+        return { kind: 'edit', label: file ? `editing ${oneLine(file)}` : 'editing', ...(path ? { path } : {}) };
+    }
+    if (READ_TOOLS.has(lower)) {
+        const listing = lower === 'list_dir' || lower === 'ls' || lower === 'list';
+        return { kind: 'read', label: file ? `${listing ? 'listing' : 'reading'} ${oneLine(file)}` : 'reading', ...(path && !listing ? { path } : {}) };
+    }
+    if (SEARCH_TOOLS.has(lower)) {
+        const query = oneLine(firstString(params, ['Query', 'Pattern', 'pattern', 'query', 'url'], input ?? ''));
+        const short = query.length > 24 ? `${oneLine(query, 23)}…` : query;
+        return { kind: 'search', label: short ? `searching ${short}` : 'searching' };
+    }
+    if (SWARM_TOOLS.has(name))
+        return { kind: 'other', label: labelSwarmCall(name, params, input ?? '', '') };
+    // codex: the tool IS the command line.
+    if (/\s/.test(name) || /^(?:\S*\/)?(?:ba|z)?sh$/.test(name))
+        return classifyCommand(name);
+    return { kind: 'other', label: describeTool(name, params) };
+}
+function relativeToWorkspace(p, roots) {
+    const bases = roots.map((r) => r.replace(/\/+$/, '')).filter((b) => b !== '');
+    if (bases.length === 0 || !p.startsWith('/'))
+        return p;
+    const base = bases.find((b) => p.startsWith(`${b}/`));
+    return base === undefined ? null : p.slice(base.length + 1);
+}
+const REPEAT_MIN = 4;
+/** Accumulates one job's tool calls into a ProgressDigest. Feed it every activity start and end. */
+class ProgressTracker {
+    steps = new Map();
+    /**
+     * Steps whose first ACTIVITY event carried no input. A provider can split the
+     * call into "started, parameters not yet known" and "updated, here they are";
+     * such a step is classified but not counted until the input arrives, so a
+     * later update can upgrade it without double-counting.
+     */
+    provisional = new Set();
+    read = new Set();
+    editedSet = new Set();
+    edited = [];
+    /** Edits whose file the tool did not name (codex file_change's shape is unverified): still edits. */
+    unnamedEdits = 0;
+    searches = 0;
+    commands = 0;
+    testRuns = 0;
+    lastTestFailed = false;
+    recent = [];
+    repeatKey = '';
+    repeatLabel = '';
+    repeatCount = 0;
+    activeTest = false;
+    /** A tool call began. Repeated starts of one step (ACTIVE then DONE) are counted once. */
+    start(stepIndex, tool, input) {
+        // Codex passes the shell command line as `tool` with no separate `input`.
+        const effectiveInput = (input ?? '').trim() !== '' ? input : (/\s/.test(tool.trim()) ? tool.trim() : '');
+        const hasInput = effectiveInput !== '';
+        const seen = this.steps.get(stepIndex);
+        if (seen !== undefined) {
+            // The parameters arrived after the step was first seen: classify for real.
+            if (!this.provisional.has(stepIndex) || !hasInput)
+                return;
+            this.provisional.delete(stepIndex);
+            const upgraded = classify(tool, input);
+            this.steps.set(stepIndex, upgraded);
+            this.apply(upgraded, effectiveInput);
+            return;
+        }
+        const c = classify(tool, input);
+        this.steps.set(stepIndex, c);
+        if (!hasInput) {
+            // No input means we do not know what ran. Remember the step so `end()`
+            // keeps its verdict, but do not count a likely-misleading call.
+            this.provisional.add(stepIndex);
+            this.resetRepeat();
+            return;
+        }
+        this.apply(c, effectiveInput);
+    }
+    apply(c, input) {
+        switch (c.kind) {
+            case 'read':
+                if (c.path)
+                    this.read.add(c.path);
+                break;
+            case 'search':
+                this.searches += 1;
+                break;
+            case 'edit':
+                if (c.path) {
+                    if (this.editedSet.has(c.path))
+                        this.edited = this.edited.filter((p) => p !== c.path);
+                    this.editedSet.add(c.path);
+                    this.edited.push(c.path);
+                }
+                else
+                    this.unnamedEdits += 1;
+                break;
+            case 'test':
+                this.testRuns += 1;
+                this.activeTest = true;
+                break;
+            case 'command':
+                this.commands += 1;
+                break;
+        }
+        if (c.kind !== 'other')
+            this.recent = [...this.recent, c].slice(-8);
+        // An unclassified call is not a repeat of anything: "repeating editing ×17"
+        // is not a fact about the worker, it is a fact about a missing input.
+        if (c.kind === 'other') {
+            this.resetRepeat();
+            return;
+        }
+        const key = `${c.kind}\u0000${c.label}\u0000${input ?? ''}`;
+        if (key === this.repeatKey)
+            this.repeatCount += 1;
+        else {
+            this.repeatKey = key;
+            this.repeatLabel = c.label;
+            this.repeatCount = 1;
+        }
+    }
+    resetRepeat() {
+        this.repeatKey = '';
+        this.repeatLabel = '';
+        this.repeatCount = 0;
+    }
+    /** A tool call ended. Only an explicit error marks a test run failed. */
+    end(stepIndex, tool, input, status) {
+        this.start(stepIndex, tool, input);
+        const c = this.steps.get(stepIndex);
+        if (c.kind === 'test') {
+            this.lastTestFailed = status === 'error';
+            this.activeTest = false;
+        }
+    }
+    digest(cwd = '', realCwd = '') {
+        const inside = this.editedPaths(cwd, realCwd);
+        return {
+            phase: this.phase(),
+            filesRead: this.read.size,
+            searches: this.searches,
+            edited: inside.slice(-8),
+            editedCount: inside.length + this.unnamedEdits,
+            commands: this.commands,
+            testRuns: this.testRuns,
+            lastTestFailed: this.lastTestFailed,
+            repeat: this.repeatCount >= REPEAT_MIN ? { label: this.repeatLabel, count: this.repeatCount } : null,
+        };
+    }
+    editedPaths(cwd = '', realCwd = '') {
+        const inside = this.edited.map((p) => relativeToWorkspace(p, [cwd, realCwd])).filter((p) => p !== null);
+        return inside.filter((p, i) => inside.lastIndexOf(p) === i);
+    }
+    /** From a window of recent calls, not the last one alone, so the phase does not flicker. */
+    phase() {
+        const last = this.recent.at(-1);
+        if (last === undefined)
+            return 'starting';
+        if (this.activeTest || last.kind === 'test')
+            return 'testing';
+        if (this.recent.some((c) => c.kind === 'edit'))
+            return 'editing';
+        if (last.kind === 'command')
+            return 'running';
+        return 'exploring';
+    }
+}/**
+ * agy-team.ts — observes the sub-agents an agy worker starts (a /swarm, or
+ * invoke_subagent helpers) from agy's own on-disk state, read-only.
+ *
+ * CONTRACT (implemented by the reader; callers rely only on this):
+ *   - `createAgyTeamReader({ conversationId, cwd })` is cheap and never throws.
+ *   - `poll(nowMs)` reads what changed since the last poll and returns the full
+ *     current snapshot, or `null` when the conversation has no sub-agents or
+ *     agy's files are missing or not in the expected shape. Never throws.
+ *   - It never writes, never opens a network connection, and reads only under
+ *     `agyBrainRoot()`.
+ *
+ * WHAT AGY WRITES, under `<brain>/<conv>/.system_generated/`:
+ *   - `swarm/` only when the conversation coordinates a swarm: `members.json`
+ *     (roster, rewritten in place), `board.jsonl` (append-only posts; a rewrite
+ *     restarts it), `plan.json` (optional task lines).
+ *   - `subagents/<child>.json` per invoke_subagent child (and per swarm worker).
+ *   - Each member's own `logs/chunks/transcript/NNNNNNNN.jsonl`: one step per
+ *     line, cut into fixed-size slices of ONE byte stream, so a line can span
+ *     two chunk files. The reader tails the stream by (chunk, offset) and holds
+ *     the unfinished line's bytes until its newline lands.
+ *
+ * Member state follows agy's own swarm board (`board.StateOf`): killed if the
+ * roster says so; waiting when the member's run has stopped (its newest step is
+ * a reply with no tool calls, or the results of a batch including `swarm_wait`
+ * whose own result is DONE); else working.
+ */
+function agyBrainRoot() {
+    return process.env['AGENT_SMITH_AGY_BRAIN'] ?? path.join(os.homedir(), '.gemini', 'antigravity-cli', 'brain');
+}
+const SAFE_SEGMENT_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+const CHUNK_RE = /^\d{1,12}\.jsonl$/;
+const TEXT_CAP = 2_000;
+const EVENT_CAP = 200;
+const POLL_BUDGET = 8 << 20;
+const STREAM_BUDGET = 2 << 20;
+const REWRITE_SIGNATURE_BYTES = 256;
+const NL = 0x0a;
+const isObj = (v) => typeof v === 'object' && v !== null && !Array.isArray(v);
+const str = (v) => (typeof v === 'string' && v !== '' ? v : null);
+const cap = (s) => (s.length > TEXT_CAP ? s.slice(0, TEXT_CAP) : s);
+const firstLine = (s) => oneLine(s.split('\n').find((l) => l.trim() !== '') ?? '', 200);
+const timeMs = (v) => {
+    const ms = typeof v === 'string' ? Date.parse(v) : NaN;
+    return Number.isFinite(ms) ? ms : null;
+};
+function readRange(file, start, length) {
+    const buf = Buffer.alloc(length);
+    const fd = openSync(file, 'r');
+    try {
+        let got = 0;
+        while (got < length) {
+            const n = readSync(fd, buf, got, length - got, start + got);
+            if (n === 0)
+                break;
+            got += n;
+        }
+        return got === length ? buf : buf.subarray(0, got);
+    }
+    finally {
+        closeSync(fd);
+    }
+}
+function sizeOf(file) {
+    try {
+        const st = statSync(file);
+        return st.isFile() ? st.size : null;
+    }
+    catch {
+        return null;
+    }
+}
+function sameStart(file, sig) {
+    return sig === null || readRange(file, 0, sig.length).equals(sig);
+}
+class JsonFiles {
+    cache = new Map();
+    readKeepingLastGood(file) {
+        let st;
+        try {
+            st = statSync(file);
+        }
+        catch {
+            this.cache.delete(file);
+            return undefined;
+        }
+        const hit = this.cache.get(file);
+        if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size)
+            return hit.value;
+        try {
+            const value = JSON.parse(readRange(file, 0, st.size).toString('utf8'));
+            this.cache.set(file, { mtimeMs: st.mtimeMs, size: st.size, value });
+            return value;
+        }
+        catch {
+            return hit?.value;
+        }
+    }
+    forget(keep) {
+        for (const file of this.cache.keys())
+            if (!keep(file))
+                this.cache.delete(file);
+    }
+}
+class Utf8LineBuffer {
+    partialLine = Buffer.alloc(0);
+    feed(chunk, onLine) {
+        const data = this.partialLine.length === 0 ? chunk : Buffer.concat([this.partialLine, chunk]);
+        const end = data.lastIndexOf(NL);
+        if (end === -1) {
+            this.partialLine = Buffer.from(data);
+            return true;
+        }
+        this.partialLine = Buffer.from(data.subarray(end + 1));
+        for (const line of data.subarray(0, end).toString('utf8').split('\n')) {
+            if (line.trim() !== '' && !onLine(line))
+                return false;
+        }
+        return true;
+    }
+}
+function parseLine(line) {
+    try {
+        const v = JSON.parse(line);
+        return isObj(v) ? v : null;
+    }
+    catch {
+        return null;
+    }
+}
+/** The compact transcript JSON-quotes each argument value (`"since":"9"`), and cuts a long one short, closing quote and all. */
+function unquote(v) {
+    if (typeof v !== 'string')
+        return v;
+    const s = v.trim();
+    if (s.startsWith('"')) {
+        try {
+            return JSON.parse(s);
+        }
+        catch { }
+        const body = s.length >= 2 && s.endsWith('"') ? s.slice(1, -1) : s.slice(1);
+        const closed = body.replace(/\\+$/, (m) => (m.length % 2 === 1 ? m.slice(1) : m));
+        try {
+            return JSON.parse(`"${closed}"`);
+        }
+        catch {
+            return body;
+        }
+    }
+    if (/^-?\d+(?:\.\d+)?$/.test(s))
+        return Number(s);
+    if (s === 'true' || s === 'false')
+        return s === 'true';
+    return v;
+}
+function decodeArgs(args) {
+    if (!isObj(args))
+        return {};
+    const out = {};
+    for (const [k, v] of Object.entries(args))
+        out[k] = unquote(v);
+    return out;
+}
+/** A tool result's content opens with `Created At:` / `Completed At:` lines (once per call in a batch). */
+function stripStamps(content) {
+    return content.replace(/^(?:(?:Created|Completed) At:[^\n]*\n?)+/, '');
+}
+const BOARD_TOOLS = { swarm_wait: 'waiting for posts', read_board: 'reading the board', post_message: 'posting' };
+function postedSeq(content) {
+    const m = /"status"\s*:\s*"posted"\s*,\s*"seq"\s*:\s*(\d+)/.exec(content);
+    return m ? Number(m[1]) : null;
+}
+class MemberAggregate {
+    startedAt = null;
+    lastEventAt = null;
+    model = null;
+    tokensOut = null;
+    toolCount = 0;
+    events = [];
+    truncated = false;
+    planner = null;
+    lastType = '';
+    lastReply = null;
+    lastReplySequence = null;
+    brief = null;
+    parentConv;
+    constructor(parentConv) { this.parentConv = parentConv; }
+    // agy logs a few steps out of order (a planner step after the input that followed it), so step_index is not a rewrite signal.
+    add(step) {
+        const index = Number(step['step_index']);
+        if (!Number.isFinite(index))
+            return;
+        const type = String(step['type'] ?? '');
+        const at = str(step['created_at']) ?? '';
+        const ms = timeMs(at);
+        if (ms !== null) {
+            this.startedAt ??= ms;
+            this.lastEventAt = Math.max(this.lastEventAt ?? ms, ms);
+        }
+        this.lastType = type;
+        if (type === 'PLANNER_RESPONSE')
+            this.addPlanner(step, index, at);
+        else if (type === 'GENERIC')
+            this.addResult(step, index);
+        else {
+            if (this.planner)
+                this.planner.onlyResults = false;
+            if (this.brief === null)
+                this.brief = this.briefFrom(type, str(step['content']));
+        }
+    }
+    addPlanner(step, index, at) {
+        const out = step['output_tokens'];
+        if (typeof out === 'number' && Number.isFinite(out))
+            this.tokensOut = (this.tokensOut ?? 0) + out;
+        this.model = str(step['model']) ?? this.model;
+        const raw = Array.isArray(step['tool_calls']) ? step['tool_calls'] : [];
+        const calls = raw.filter(isObj).map((c) => ({ name: String(c['name'] ?? ''), input: JSON.stringify(decodeArgs(c['args'])) }));
+        this.toolCount += calls.length;
+        const content = str(step['content']);
+        if (content !== null && content.trim() !== '')
+            this.push({ sequence: index, kind: 'assistant', at, text: cap(content) });
+        if (calls.length === 0) {
+            this.lastReply = content ?? '';
+            this.lastReplySequence = index;
+        }
+        const tools = calls.map((c, i) => ({
+            sequence: index + 1 + i, kind: 'tool', at, stepIndex: index + 1 + i, tool: c.name, input: cap(c.input), output: '', state: 'active',
+        }));
+        for (const t of tools)
+            this.push(t);
+        this.planner = { calls, tools, results: [], onlyResults: true };
+    }
+    addResult(step, index) {
+        const p = this.planner;
+        if (!p || p.results.length >= p.calls.length)
+            return;
+        const status = String(step['status'] ?? '');
+        const content = stripStamps(String(step['content'] ?? ''));
+        const ev = p.tools[p.results.length];
+        ev.sequence = index;
+        ev.stepIndex = index;
+        ev.output = cap(content);
+        ev.state = status === 'DONE' ? 'done' : status === 'ERROR' ? 'error' : 'active';
+        p.results.push({ status, content });
+    }
+    /** A sub-agent's brief is the first message its parent sent: `[Message] … sender=<parent> … content=<brief>`. */
+    briefFrom(type, content) {
+        if (content === null)
+            return null;
+        if (type === 'USER_INPUT')
+            return content.trim();
+        if (type !== 'SYSTEM_MESSAGE')
+            return null;
+        const m = /\[Message\][^\n]*?\bsender=(\S+)[^\n]*?\bcontent=([\s\S]*?)\s*<\/SYSTEM_MESSAGE>/.exec(content);
+        return m && m[1] === this.parentConv ? m[2].trim() : null;
+    }
+    push(ev) {
+        this.events.push(ev);
+        if (this.events.length > EVENT_CAP) {
+            this.events.splice(0, this.events.length - EVENT_CAP);
+            this.truncated = true;
+        }
+    }
+    /** agy's turnEnded: a reply with no tool calls, or a batch with swarm_wait whose own result is DONE. */
+    runStopped() {
+        if (this.lastType === 'PLANNER_RESPONSE')
+            return this.planner?.calls.length === 0;
+        const p = this.planner;
+        if (this.lastType !== 'GENERIC' || !p || !p.onlyResults)
+            return false;
+        const wait = p.calls.findIndex((c) => c.name === 'swarm_wait');
+        return wait >= 0 && p.results.length >= p.calls.length && p.results[wait].status === 'DONE';
+    }
+    finalReply() {
+        return this.lastType === 'PLANNER_RESPONSE' && this.planner?.calls.length === 0 ? this.lastReply : null;
+    }
+    timeline(withoutFinalReply) {
+        const reply = withoutFinalReply ? this.lastReplySequence : null;
+        return this.events.filter((e) => !(e.kind === 'assistant' && e.sequence === reply)).map((e) => ({ ...e }));
+    }
+    activity() {
+        const p = this.planner;
+        if (!p)
+            return null;
+        if (p.calls.length === 0)
+            return 'replied';
+        const post = p.calls.findIndex((c) => c.name === 'post_message');
+        const seq = post >= 0 && p.results[post] ? postedSeq(p.results[post].content) : null;
+        if (seq !== null)
+            return `posted #${seq}`;
+        const last = p.calls[p.calls.length - 1];
+        return BOARD_TOOLS[last.name] ?? classify(last.name, last.input).label;
+    }
+}
+class Transcript {
+    log;
+    files = [];
+    sig = null;
+    index = 0;
+    offset = 0;
+    lines = new Utf8LineBuffer();
+    logsDir;
+    parentConv;
+    constructor(logsDir, parentConv) {
+        this.logsDir = logsDir;
+        this.parentConv = parentConv;
+        this.log = new MemberAggregate(parentConv);
+    }
+    get partial() { return this.lines.partialLine.length > 0; }
+    reset() {
+        this.log = new MemberAggregate(this.parentConv);
+        this.files = [];
+        this.sig = null;
+        this.index = 0;
+        this.offset = 0;
+        this.lines = new Utf8LineBuffer();
+    }
+    listFiles() {
+        const dir = path.join(this.logsDir, 'chunks', 'transcript');
+        try {
+            return readdirSync(dir).filter((n) => CHUNK_RE.test(n)).sort().map((n) => path.join(dir, n));
+        }
+        catch {
+            const single = path.join(this.logsDir, 'transcript.jsonl');
+            return sizeOf(single) === null ? [] : [single];
+        }
+    }
+    read(budget) {
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+            const used = this.readOnce(budget);
+            if (used !== null)
+                return used;
+            this.reset();
+        }
+        return 0;
+    }
+    readOnce(budget) {
+        const files = this.listFiles();
+        if (this.files.length > 0 && files[this.index] !== this.files[this.index])
+            return null;
+        this.files = files;
+        if (files.length > 0 && !sameStart(files[0], this.sig))
+            return null;
+        if (files.length > 0 && (this.sig === null || this.sig.length < REWRITE_SIGNATURE_BYTES))
+            this.sig = readRange(files[0], 0, Math.min(sizeOf(files[0]) ?? 0, REWRITE_SIGNATURE_BYTES));
+        let used = 0;
+        while (this.index < files.length && used < budget) {
+            const size = sizeOf(files[this.index]);
+            if (size === null || size < this.offset)
+                return null;
+            const n = Math.min(size - this.offset, budget - used, STREAM_BUDGET);
+            if (n > 0) {
+                const chunk = readRange(files[this.index], this.offset, n);
+                this.offset += chunk.length;
+                used += chunk.length;
+                this.lines.feed(chunk, (line) => { const step = parseLine(line); if (step)
+                    this.log.add(step); return true; });
+                if (chunk.length < n)
+                    break;
+            }
+            if (this.offset < size)
+                break;
+            if (this.index + 1 >= files.length)
+                break;
+            this.index += 1;
+            this.offset = 0;
+        }
+        return used;
+    }
+}
+class Board {
+    head = null;
+    lastPosts = new Map();
+    briefs = new Map();
+    offset = 0;
+    sig = null;
+    lines = new Utf8LineBuffer();
+    file;
+    constructor(file) { this.file = file; }
+    reset() {
+        this.head = null;
+        this.lastPosts.clear();
+        this.briefs.clear();
+        this.offset = 0;
+        this.sig = null;
+        this.lines = new Utf8LineBuffer();
+    }
+    read(budget, coordinator) {
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+            const used = this.readOnce(budget, coordinator);
+            if (used !== null)
+                return used;
+            this.reset();
+        }
+        return 0;
+    }
+    readOnce(budget, coordinator) {
+        const size = sizeOf(this.file);
+        if (size === null)
+            return this.offset === 0 ? 0 : null;
+        if (size < this.offset)
+            return null;
+        if (!sameStart(this.file, this.sig))
+            return null;
+        if (this.sig === null || this.sig.length < REWRITE_SIGNATURE_BYTES)
+            this.sig = readRange(this.file, 0, Math.min(size, REWRITE_SIGNATURE_BYTES));
+        const n = Math.min(size - this.offset, budget);
+        if (n <= 0)
+            return 0;
+        const firstPass = this.offset === 0;
+        const chunk = readRange(this.file, this.offset, n);
+        this.offset += chunk.length;
+        const ok = this.lines.feed(chunk, (line) => {
+            const post = parseLine(line);
+            if (!post)
+                return true;
+            const seq = Number(post['seq']);
+            if (!Number.isFinite(seq))
+                return true;
+            if (this.head !== null && seq <= this.head)
+                return firstPass;
+            this.head = seq;
+            const agent = String(post['agent'] ?? '');
+            const text = String(post['text'] ?? '');
+            this.lastPosts.set(agent, { seq, text });
+            if (post['kind'] === 'brief' || agent === coordinator)
+                this.recordMentionBrief(text);
+            return true;
+        });
+        return ok ? chunk.length : null;
+    }
+    recordMentionBrief(text) {
+        const names = [];
+        let rest = text;
+        for (let m = /^\s*@([A-Za-z0-9_.-]+)\s+/.exec(rest); m; m = /^\s*@([A-Za-z0-9_.-]+)\s+/.exec(rest)) {
+            names.push(m[1]);
+            rest = rest.slice(m[0].length);
+        }
+        for (const name of names)
+            if (name !== 'all' && !this.briefs.has(name))
+                this.briefs.set(name, rest.trim());
+    }
+}
+/** `gemini-4-neon-high` → `Gemini 4 Neon (High)`. */
+function agyModelLabel(model) {
+    if (model === null || !/^[a-z0-9]+(?:-[a-z0-9]+)+$/.test(model))
+        return null;
+    const words = model.split('-').map((w) => w[0].toUpperCase() + w.slice(1));
+    const effort = /^(?:minimal|low|medium|high|xhigh|max)$/i.test(words[words.length - 1]) ? words.pop() : null;
+    return effort ? `${words.join(' ')} (${effort})` : words.join(' ');
+}
+function nameFromRoleLine(role, id) {
+    if (role === null)
+        return id.slice(0, 8);
+    const m = /^Swarm Worker \(([^)]+)\)$/.exec(role);
+    return m ? m[1] : fitCell(oneLine(role), 28).trimEnd();
+}
+function createAgyTeamReader(options) {
+    const root = path.resolve(options.brainRoot ?? agyBrainRoot());
+    const conv = options.conversationId;
+    const base = path.join(root, conv, '.system_generated');
+    const swarmDir = path.join(base, 'swarm');
+    const subDir = path.join(base, 'subagents');
+    const json = new JsonFiles();
+    const transcripts = new Map();
+    let board = null;
+    const isDir = (p) => { try {
+        return statSync(p).isDirectory();
+    }
+    catch {
+        return false;
+    } };
+    function swarmSeats() {
+        const roster = json.readKeepingLastGood(path.join(swarmDir, 'members.json'));
+        if (!isObj(roster) || !isObj(roster['members']))
+            return null;
+        const seats = [];
+        let coordinator = null;
+        let order = 0;
+        for (const [name, m] of Object.entries(roster['members'])) {
+            if (!isObj(m))
+                continue;
+            const memberConv = str(m['conversation_id']);
+            if (memberConv === conv || m['role'] === 'coordinator') {
+                coordinator = name;
+                continue;
+            }
+            const model = str(m['applied_model']) ?? str(m['model']) ?? str(m['desired_model']);
+            seats.push({
+                id: name, name, role: str(m['role']) ?? 'worker', conv: memberConv && SAFE_SEGMENT_RE.test(memberConv) ? memberConv : null,
+                model, killed: m['killed'] === true, wakeMode: str(m['wake_mode']), order: order++,
+            });
+        }
+        return { seats, title: str(roster['title']), coordinator };
+    }
+    function subagentSeats() {
+        let names;
+        try {
+            names = readdirSync(subDir).filter((n) => n.endsWith('.json')).sort();
+        }
+        catch {
+            return [];
+        }
+        const seats = [];
+        for (const n of names) {
+            const file = path.join(subDir, n);
+            const j = json.readKeepingLastGood(file);
+            if (!isObj(j))
+                continue;
+            const child = str(j['conversationId']);
+            if (child === null || !SAFE_SEGMENT_RE.test(child))
+                continue;
+            const desc = isObj(j['subagentDescriptor']) ? j['subagentDescriptor'] : {};
+            const role = str(desc['role']) ?? str(desc['typeName']);
+            const spawn = Number(j['spawnStepIndex']);
+            seats.push({
+                id: child, name: nameFromRoleLine(role, child), role: role ?? 'sub-agent', conv: child, model: null,
+                killed: j['state'] === 'SUBAGENT_STATE_KILLED', wakeMode: null,
+                order: Number.isFinite(spawn) ? spawn : Number.MAX_SAFE_INTEGER,
+            });
+        }
+        json.forget((f) => path.dirname(f) !== subDir || names.includes(path.basename(f)));
+        return seats.sort((a, b) => a.order - b.order);
+    }
+    function transcriptFor(memberConv) {
+        let t = transcripts.get(memberConv);
+        if (!t) {
+            t = new Transcript(path.join(root, memberConv, '.system_generated', 'logs'), conv);
+            transcripts.set(memberConv, t);
+        }
+        return t;
+    }
+    function stateOf(seat, t, swarm) {
+        const log = t?.log ?? null;
+        const hasSteps = log !== null && log.lastType !== '';
+        const stopped = hasSteps && !t.partial && log.runStopped();
+        if (swarm) {
+            if (seat.killed)
+                return 'killed';
+            if (hasSteps)
+                return stopped ? 'waiting' : 'working';
+            return seat.wakeMode === 'mentions' || seat.wakeMode === 'anything' ? 'waiting' : 'working';
+        }
+        // A sub-agent's final reply is its result; agy marks it KILLED once reaped, which is not a failure.
+        if (stopped && log.finalReply() !== null)
+            return 'done';
+        if (seat.killed)
+            return 'killed';
+        return stopped ? 'waiting' : 'working';
+    }
+    function poll(nowMs) {
+        if (!SAFE_SEGMENT_RE.test(conv))
+            return null;
+        const swarm = isDir(swarmDir);
+        if (!swarm && !isDir(subDir))
+            return null;
+        let seats;
+        let title = null;
+        let coordinator = null;
+        if (swarm) {
+            const s = swarmSeats();
+            if (s === null)
+                return null;
+            ({ seats, title, coordinator } = s);
+        }
+        else {
+            seats = subagentSeats();
+        }
+        if (seats.length === 0)
+            return null;
+        let budget = POLL_BUDGET;
+        if (swarm) {
+            board ??= new Board(path.join(swarmDir, 'board.jsonl'));
+            budget -= board.read(budget, coordinator);
+        }
+        const plan = swarm ? json.readKeepingLastGood(path.join(swarmDir, 'plan.json')) : undefined;
+        const tasks = isObj(plan) && isObj(plan['tasks']) ? plan['tasks'] : {};
+        const live = new Set(seats.map((s) => s.conv).filter((c) => c !== null));
+        for (const c of transcripts.keys())
+            if (!live.has(c))
+                transcripts.delete(c);
+        for (const seat of seats) {
+            if (seat.conv === null)
+                continue;
+            budget -= transcriptFor(seat.conv).read(Math.max(0, budget));
+        }
+        const members = [];
+        const views = [];
+        for (const seat of seats) {
+            const t = seat.conv ? transcripts.get(seat.conv) ?? null : null;
+            const log = t?.log ?? null;
+            const brief = (swarm ? board?.briefs.get(seat.name) : undefined) ?? log?.brief ?? null;
+            const post = swarm ? board?.lastPosts.get(seat.name) ?? null : null;
+            const taskLine = str(tasks[seat.name]);
+            const model = seat.model ?? log?.model ?? null;
+            members.push({
+                id: seat.id, name: seat.name, role: seat.role, model, modelLabel: agyModelLabel(model),
+                task: taskLine !== null ? firstLine(taskLine) : brief !== null ? firstLine(brief) || null : null,
+                state: stateOf(seat, t, swarm),
+                activity: log?.activity() ?? null,
+                toolCount: log?.toolCount ?? 0,
+                tokensOut: log?.tokensOut ?? null,
+                startedAt: log?.startedAt ?? null,
+                lastEventAt: log?.lastEventAt ?? null,
+                lastPost: post ? { seq: post.seq, text: firstLine(post.text) } : null,
+            });
+            const reply = post === null ? log?.finalReply() ?? null : null;
+            views.push({
+                schema: 1, id: seat.id, name: seat.name, brief,
+                report: post?.text ?? reply,
+                timeline: log?.timeline(reply !== null) ?? [],
+                truncated: log?.truncated ?? false,
+            });
+        }
+        return {
+            team: { schema: 1, source: swarm ? 'agy-swarm' : 'agy-subagents', title, boardHead: board?.head ?? null, members, updatedAt: nowMs },
+            views,
+        };
+    }
+    return {
+        poll(nowMs) {
+            try {
+                return poll(nowMs);
+            }
+            catch {
+                return null;
+            }
+        },
+    };
+}function withoutStamps(output) {
+    return typeof output === 'string' ? output.replace(/^(?:Created|Completed) At:[^\n]*\n?/gm, '') : output;
+}
+function agyBinary() {
     return process.env['AGENT_SMITH_AGY_BIN'] ?? 'agy';
 }
 // ---------------------------------------------------------------------------
@@ -2550,7 +3883,7 @@ function createAgyTranslator(maxChars) {
     }
     function onEvent(raw) {
         const out = [];
-        const event = str(raw, 'event');
+        const event = str$1(raw, 'event');
         const at = nowIso();
         if (event === 'init') {
             const init = obj(raw, 'init');
@@ -2559,10 +3892,10 @@ function createAgyTranslator(maxChars) {
                 at,
                 raw,
             };
-            const conv = str(raw, 'conversation_id') ?? str(init, 'conversation_id');
+            const conv = str$1(raw, 'conversation_id') ?? str$1(init, 'conversation_id');
             if (conv !== undefined)
                 ev.conversationId = conv;
-            const model = str(init, 'model');
+            const model = str$1(init, 'model');
             if (model !== undefined)
                 ev.model = model;
             out.push(ev);
@@ -2588,7 +3921,7 @@ function createAgyTranslator(maxChars) {
                 if (delta !== undefined) {
                     answer.text(delta, String(stepIndex));
                     if (delta !== '') {
-                        out.push({ kind: 'text', at, text: delta, stream: 'assistant', delta: true });
+                        out.push({ kind: 'text', at, text: delta, stream: 'assistant', delta: true, messageKey: String(stepIndex) });
                     }
                 }
                 return out;
@@ -2624,7 +3957,7 @@ function createAgyTranslator(maxChars) {
                         raw: { stepIndex, error: info?.error },
                     });
                 }
-                const output = preview(info?.output ?? info?.error?.message, maxChars);
+                const output = preview(withoutStamps(info?.output) ?? info?.error?.message, maxChars);
                 const ref = { stepIndex, tool: toolName };
                 if (mem.input !== undefined)
                     ref.input = mem.input;
@@ -2654,10 +3987,10 @@ function createAgyTranslator(maxChars) {
                 sawErrorStep = true;
                 progressedAfterError = false;
                 const suObj = obj(raw, 'step_update');
-                const detail = (str(suObj, 'text_delta') ??
-                    str(suObj, 'error') ??
-                    str(obj(suObj, 'error'), 'message') ??
-                    str(suObj, 'message') ??
+                const detail = (str$1(suObj, 'text_delta') ??
+                    str$1(suObj, 'error') ??
+                    str$1(obj(suObj, 'error'), 'message') ??
+                    str$1(suObj, 'message') ??
                     su.tool_info?.error?.message ??
                     '').replace(/\s+/g, ' ').trim();
                 const message = detail === '' ? 'agy error' : truncate(`agy error: ${detail}`, 200).text;
@@ -2776,7 +4109,7 @@ function buildResult$4(args) {
         status = 'error';
         error = exit.code === null ? `exited on ${exit.signal ?? 'a signal'}` : exitReason(exit.code);
     }
-    const out = jobResult({ provider: 'agy', jobId, status, error, exit, response, startedAtMs, durationMs, stateDir });
+    const out = jobResult({ provider: 'agy', jobId, status, error, exit, response, answerKey: args.answer.answerKey(), startedAtMs, durationMs, stateDir });
     if (distinctDenials.length > 0)
         out.deniedActions = distinctDenials;
     if (usage !== undefined)
@@ -2844,49 +4177,107 @@ async function listAgyModels(run, options) {
         return { ...base, error: errMessage(e) };
     }
 }
+const AGY_TEAM_POLL_MS = 2_000;
+function teamChanged(prev, next) {
+    const key = (read) => JSON.stringify([{ ...read.team, updatedAt: 0 }, read.views]);
+    return prev === null || key(prev) !== key(next);
+}
+function createAgyTeamWatch(cwd, emit, deps) {
+    let reader;
+    let timer;
+    let stopped = false;
+    let last = null;
+    const tick = (nowMs) => {
+        if (stopped || reader === undefined)
+            return;
+        try {
+            const read = reader.poll(nowMs);
+            if (read === null)
+                return;
+            if (!teamChanged(last, read))
+                return;
+            last = read;
+            emit({ kind: 'team', at: nowIso(nowMs), team: read.team, views: read.views });
+        }
+        catch { }
+    };
+    return {
+        start(conversationId) {
+            if (stopped || reader !== undefined)
+                return;
+            try {
+                reader = deps.createReader({ conversationId, cwd });
+            }
+            catch {
+                return;
+            }
+            timer = setInterval(() => tick(Date.now()), Math.max(1, deps.pollMs));
+            timer.unref?.();
+        },
+        tick,
+        stop() {
+            if (stopped)
+                return;
+            if (timer !== undefined)
+                clearInterval(timer);
+            timer = undefined;
+            tick(Date.now());
+            stopped = true;
+        },
+    };
+}
+function spawnAgy(spec, deps = { createReader: createAgyTeamReader, pollMs: AGY_TEAM_POLL_MS }) {
+    const translator = createAgyTranslator(spec.maxOutputChars ?? 2000);
+    let resultEvent;
+    let team;
+    return runNdjsonWorker({
+        provider: 'agy',
+        binary: agyBinary(),
+        spec,
+        buildArgv: buildArgv$4,
+        translate(raw) {
+            const out = translator.onEvent(raw);
+            for (const e of out)
+                if (e.kind === 'started' && e.conversationId !== undefined)
+                    team?.start(e.conversationId);
+            return out;
+        },
+        sidecar: (emit) => (team = createAgyTeamWatch(spec.cwd, emit, deps)),
+        // The result event is the verdict, not progress: hold it for buildResult
+        // instead of translating it into an activity.
+        intercept(raw) {
+            if (raw['event'] !== 'result')
+                return false;
+            const r = obj(raw, 'result');
+            if (r !== undefined)
+                resultEvent = r;
+            return true;
+        },
+        // agy writes human-facing warnings to stderr, most importantly the
+        // auto-denial notice quoted at the top of this file. That notice is our
+        // earliest operator-facing hint that a job is going to come back empty.
+        stderrLevel: (text) => (text.includes('denied') || text.includes('permission') ? 'warn' : 'info'),
+        buildResult: (ctx) => buildResult$4({
+            ...ctx,
+            resultEvent,
+            denials: translator.denials,
+            sawAnyToolCall: translator.stepsWereTools(),
+            errorIsStale: translator.errorIsStale(),
+            answer: translator.answer,
+        }),
+        afterResult(final) {
+            const recovered = recoveredNotice(final, resultEvent);
+            return recovered === undefined ? [] : [recovered];
+        },
+    });
+}
 const agyProvider = {
     name: 'agy',
     defaultUnrestricted: true,
     available: () => binaryAvailable(agyBinary()),
     describeSandbox: sandboxPlan$4,
     listModels: (options) => listAgyModels(runCapture, options),
-    spawn(spec) {
-        const translator = createAgyTranslator(spec.maxOutputChars ?? 2000);
-        let resultEvent;
-        return runNdjsonWorker({
-            provider: 'agy',
-            binary: agyBinary(),
-            spec,
-            buildArgv: buildArgv$4,
-            translate: translator.onEvent,
-            // The result event is the verdict, not progress: hold it for buildResult
-            // instead of translating it into an activity.
-            intercept(raw) {
-                if (raw['event'] !== 'result')
-                    return false;
-                const r = obj(raw, 'result');
-                if (r !== undefined)
-                    resultEvent = r;
-                return true;
-            },
-            // agy writes human-facing warnings to stderr, most importantly the
-            // auto-denial notice quoted at the top of this file. That notice is our
-            // earliest operator-facing hint that a job is going to come back empty.
-            stderrLevel: (text) => (text.includes('denied') || text.includes('permission') ? 'warn' : 'info'),
-            buildResult: (ctx) => buildResult$4({
-                ...ctx,
-                resultEvent,
-                denials: translator.denials,
-                sawAnyToolCall: translator.stepsWereTools(),
-                errorIsStale: translator.errorIsStale(),
-                answer: translator.answer,
-            }),
-            afterResult(final) {
-                const recovered = recoveredNotice(final, resultEvent);
-                return recovered === undefined ? [] : [recovered];
-            },
-        });
-    },
+    spawn: (spec) => spawnAgy(spec),
 };function claudeBinary() {
     return process.env['AGENT_SMITH_CLAUDE_BIN'] ?? 'claude';
 }
@@ -3052,9 +4443,9 @@ function userText(content) {
         if (block === null || typeof block !== 'object')
             return undefined;
         const b = block;
-        if (str(b, 'type') !== 'text')
+        if (str$1(b, 'type') !== 'text')
             return undefined;
-        parts.push(str(b, 'text') ?? '');
+        parts.push(str$1(b, 'text') ?? '');
     }
     return parts.join('\n');
 }
@@ -3119,16 +4510,16 @@ function createClaudeTranslator(maxChars, input) {
     };
     tx.onEvent = (raw) => {
         const out = [];
-        const type = str(raw, 'type');
+        const type = str$1(raw, 'type');
         const at = nowIso();
-        const sessionId = str(raw, 'session_id');
+        const sessionId = str$1(raw, 'session_id');
         if (sessionId !== undefined)
             tx.sessionId = sessionId;
         if (type === 'system') {
-            const subtype = str(raw, 'subtype');
+            const subtype = str$1(raw, 'subtype');
             if (subtype === 'permission_denied') {
-                const toolUseId = str(raw, 'tool_use_id') ?? str(raw, 'id');
-                const toolName = str(raw, 'tool_name') ?? str(raw, 'tool') ?? 'unknown';
+                const toolUseId = str$1(raw, 'tool_use_id') ?? str$1(raw, 'id');
+                const toolName = str$1(raw, 'tool_name') ?? str$1(raw, 'tool') ?? 'unknown';
                 const key = toolUseId ?? `tool:${toolName}`;
                 const evidence = denialActivity(key, toolName, at);
                 if (evidence !== undefined)
@@ -3139,7 +4530,7 @@ function createClaudeTranslator(maxChars, input) {
                 const ev = { kind: 'started', at, raw };
                 if (sessionId !== undefined)
                     ev.conversationId = sessionId;
-                const model = str(raw, 'model');
+                const model = str$1(raw, 'model');
                 if (model !== undefined) {
                     ev.model = model;
                     tx.model = model;
@@ -3162,7 +4553,7 @@ function createClaudeTranslator(maxChars, input) {
                     kind: 'notice',
                     at,
                     level: 'info',
-                    message: `claude hook ${str(raw, 'hook_name') ?? subtype}`,
+                    message: `claude hook ${str$1(raw, 'hook_name') ?? subtype}`,
                     raw,
                 });
                 return out;
@@ -3178,18 +4569,18 @@ function createClaudeTranslator(maxChars, input) {
                 tx.usage = usage;
                 out.push({ kind: 'usage', at, usage });
             }
-            const envelopeParent = str(raw, 'parent_tool_use_id');
-            const msgKey = str(message, 'id') ?? `anon-${++fallbackKeySeq}`;
+            const envelopeParent = str$1(raw, 'parent_tool_use_id');
+            const msgKey = str$1(message, 'id') ?? `anon-${++fallbackKeySeq}`;
             let sawEmptyText = false;
             let sawNonEmptyText = false;
             for (const block of content) {
                 if (block === null || typeof block !== 'object')
                     continue;
                 const b = block;
-                const bType = str(b, 'type');
+                const bType = str$1(b, 'type');
                 if (bType === 'text') {
-                    const text = str(b, 'text');
-                    const parent = str(b, 'parent_tool_use_id') ?? envelopeParent;
+                    const text = str$1(b, 'text');
+                    const parent = str$1(b, 'parent_tool_use_id') ?? envelopeParent;
                     if (parent !== undefined) {
                         if (text !== undefined && text !== '') {
                             out.push({
@@ -3207,22 +4598,22 @@ function createClaudeTranslator(maxChars, input) {
                         else {
                             sawNonEmptyText = true;
                             answer.text(text, msgKey);
-                            out.push({ kind: 'text', at, text, stream: 'assistant' });
+                            out.push({ kind: 'text', at, text, stream: 'assistant', messageKey: msgKey });
                         }
                     }
                     continue;
                 }
                 if (bType === 'thinking') {
-                    const thinking = str(b, 'thinking');
+                    const thinking = str$1(b, 'thinking');
                     if (thinking !== undefined && thinking !== '') {
                         out.push({ kind: 'text', at, text: thinking, stream: 'thinking' });
                     }
                     continue;
                 }
                 if (bType === 'tool_use') {
-                    const toolUseId = str(b, 'id') ?? `toolu-${step}`;
-                    const toolName = str(b, 'name') ?? 'unknown';
-                    const isSubagent = str(b, 'parent_tool_use_id') !== undefined || envelopeParent !== undefined;
+                    const toolUseId = str$1(b, 'id') ?? `toolu-${step}`;
+                    const toolName = str$1(b, 'name') ?? 'unknown';
+                    const isSubagent = str$1(b, 'parent_tool_use_id') !== undefined || envelopeParent !== undefined;
                     toolNames.set(toolUseId, toolName);
                     if (!isSubagent)
                         answer.tool(toolName);
@@ -3258,9 +4649,9 @@ function createClaudeTranslator(maxChars, input) {
                 if (block === null || typeof block !== 'object')
                     continue;
                 const b = block;
-                if (str(b, 'type') !== 'tool_result')
+                if (str$1(b, 'type') !== 'tool_result')
                     continue;
-                const toolUseId = str(b, 'tool_use_id') ?? '';
+                const toolUseId = str$1(b, 'tool_use_id') ?? '';
                 const isSubagent = (parentId !== undefined && parentId !== null) || b['parent_tool_use_id'] != null;
                 const isReplay = toolUseId !== '' && endedTools.has(toolUseId);
                 if (!isSubagent && !isReplay)
@@ -3290,7 +4681,7 @@ function createClaudeTranslator(maxChars, input) {
                     ref.denied = true;
                 out.push({ kind: 'activity-end', at, activity: ref, status });
                 if (denied) {
-                    const key = toolUseId !== '' ? toolUseId : `tool:${str(b, 'name') ?? 'unknown'}`;
+                    const key = toolUseId !== '' ? toolUseId : `tool:${str$1(b, 'name') ?? 'unknown'}`;
                     recordDenial(key);
                 }
             }
@@ -3305,19 +4696,19 @@ function createClaudeTranslator(maxChars, input) {
                 if (denial === null || typeof denial !== 'object')
                     continue;
                 const d = denial;
-                const toolName = str(d, 'tool_name') ?? str(d, 'tool') ?? 'unknown';
-                const id = str(d, 'tool_use_id') ?? str(d, 'id') ?? `tool:${toolName}`;
+                const toolName = str$1(d, 'tool_name') ?? str$1(d, 'tool') ?? 'unknown';
+                const id = str$1(d, 'tool_use_id') ?? str$1(d, 'id') ?? `tool:${toolName}`;
                 const evidence = denialActivity(id, toolName, at);
                 if (evidence !== undefined)
                     out.push(evidence);
             }
-            const subtype = str(raw, 'subtype');
+            const subtype = str$1(raw, 'subtype');
             const isError = raw['is_error'] === true || (subtype !== undefined && subtype !== 'success');
             if (isError)
                 tx.sawErrorResult = true;
             // On success, `result` IS the answer (handled below), so it is only an
             // "error" when it came back on a non-success result event.
-            const errText = str(raw, 'error') ?? (isError ? str(raw, 'result') : undefined);
+            const errText = str$1(raw, 'error') ?? (isError ? str$1(raw, 'result') : undefined);
             if (errText !== undefined)
                 tx.resultError = errText;
             const usage = toTokenUsage$3(obj(raw, 'usage'));
@@ -3331,7 +4722,7 @@ function createClaudeTranslator(maxChars, input) {
             const turns = raw['num_turns'];
             if (typeof turns === 'number')
                 tx.numTurns = turns;
-            const finalAnswer = str(raw, 'result');
+            const finalAnswer = str$1(raw, 'result');
             answer.providerFinal(finalAnswer, 'final-message');
             return out;
         }
@@ -3341,7 +4732,7 @@ function createClaudeTranslator(maxChars, input) {
                 kind: 'notice',
                 at,
                 level: 'error',
-                message: str(obj(raw, 'error'), 'message') ?? str(raw, 'message') ?? 'claude error',
+                message: str$1(obj(raw, 'error'), 'message') ?? str$1(raw, 'message') ?? 'claude error',
                 raw,
             });
             return out;
@@ -3385,7 +4776,7 @@ function buildResult$3(args) {
             status = 'success';
         }
     }
-    const out = jobResult({ provider: 'claude', jobId, status, error, exit, response, startedAtMs, durationMs, stateDir });
+    const out = jobResult({ provider: 'claude', jobId, status, error, exit, response, answerKey: tx.answer.answerKey(), startedAtMs, durationMs, stateDir });
     if (tx.deniedTools.length > 0) {
         out.deniedActions = tx.deniedTools.map((id) => ({ action: 'tool', displayName: id, nonfatal: true }));
     }
@@ -3739,23 +5130,23 @@ const KNOWN_ITEM_TYPES = new Set([
 const NON_TOOL_ITEM_TYPES = new Set(['agent_message', 'reasoning']);
 function formatCollabInput(item) {
     const receivers = Array.isArray(item['receiver_thread_ids']) ? item['receiver_thread_ids'].join(', ') : '';
-    return [receivers, str(item, 'prompt') ?? ''].filter((s) => s !== '').join(': ') || undefined;
+    return [receivers, str$1(item, 'prompt') ?? ''].filter((s) => s !== '').join(': ') || undefined;
 }
 function formatCollabOutput(states) {
     const parts = Object.keys(states ?? {}).map((id) => {
-        const status = str(obj(states, id), 'status');
-        const message = str(obj(states, id), 'message');
+        const status = str$1(obj(states, id), 'status');
+        const message = str$1(obj(states, id), 'message');
         return message ? `${id}: ${status} (${message})` : `${id}: ${status}`;
     });
     return parts.length > 0 ? parts.join('; ') : undefined;
 }
 function toolLabelFor(itemType, item) {
     if (itemType === 'command_execution')
-        return str(item, 'command') ?? itemType;
+        return str$1(item, 'command') ?? itemType;
     if (itemType === 'mcp_tool_call')
-        return `${str(item, 'server')}/${str(item, 'tool')}`;
+        return `${str$1(item, 'server')}/${str$1(item, 'tool')}`;
     if (itemType === 'collab_tool_call')
-        return `collab/${str(item, 'tool')}`;
+        return `collab/${str$1(item, 'tool')}`;
     return itemType;
 }
 function inputPreviewFor(itemType, item, maxChars) {
@@ -3773,7 +5164,7 @@ function inputPreviewFor(itemType, item, maxChars) {
 }
 function outputPreviewFor(itemType, item, maxChars) {
     if (itemType === 'mcp_tool_call')
-        return preview(item['result'] ?? str(obj(item, 'error'), 'message'), maxChars);
+        return preview(item['result'] ?? str$1(obj(item, 'error'), 'message'), maxChars);
     if (itemType === 'collab_tool_call')
         return preview(formatCollabOutput(obj(item, 'agents_states')), maxChars);
     if (itemType === 'web_search')
@@ -3804,19 +5195,19 @@ function createCodexTranslator(maxChars) {
     const completedToolIds = new Set();
     state.onEvent = (raw) => {
         const out = [];
-        const type = str(raw, 'type');
+        const type = str$1(raw, 'type');
         const at = nowIso();
         if (type === 'thread.started') {
             // thread_id is codex's resume handle — the SpawnSpec.conversation value for
             // a follow-up run. Recorded on the event AND on the translator so it can
             // end up in JobResult.raw.
-            const threadId = str(raw, 'thread_id');
+            const threadId = str$1(raw, 'thread_id');
             if (threadId !== undefined)
                 state.threadId = threadId;
             const ev = { kind: 'started', at, raw };
             if (threadId !== undefined)
                 ev.conversationId = threadId;
-            const m = str(raw, 'model');
+            const m = str$1(raw, 'model');
             if (m !== undefined)
                 ev.model = m;
             out.push(ev);
@@ -3830,8 +5221,8 @@ function createCodexTranslator(maxChars) {
             const item = obj(raw, 'item');
             if (item === undefined)
                 return out;
-            const itemId = str(item, 'id') ?? `anon-${step}`;
-            const itemType = str(item, 'type') ?? 'unknown';
+            const itemId = str$1(item, 'id') ?? `anon-${step}`;
+            const itemType = str$1(item, 'type') ?? 'unknown';
             // An item type we have never heard of. Not an error: surface it, do not
             // silently drop it. This is the whole reason the translation is a
             // whitelist-of-behaviour rather than a whitelist-of-types.
@@ -3847,20 +5238,20 @@ function createCodexTranslator(maxChars) {
             }
             // Assistant prose.
             if (itemType === 'agent_message') {
-                const text = str(item, 'text');
+                const text = type === 'item.completed' ? str$1(item, 'text') : undefined;
                 if (text !== undefined) {
                     if (text === '') {
                         answer.emptyMessage();
                     }
                     else {
-                        answer.text(text);
-                        out.push({ kind: 'text', at, text, stream: 'assistant' });
+                        answer.text(text, itemId);
+                        out.push({ kind: 'text', at, text, stream: 'assistant', messageKey: itemId });
                     }
                 }
                 return out;
             }
             if (itemType === 'reasoning') {
-                const text = str(item, 'text');
+                const text = str$1(item, 'text');
                 if (text)
                     out.push({ kind: 'text', at, text: truncate(text, maxChars).text, stream: 'thinking' });
                 return out;
@@ -3915,7 +5306,7 @@ function createCodexTranslator(maxChars) {
             itemStep.set(itemId, idx);
             // Status enums in exec_events.rs: in_progress | completed | failed
             // (command_execution also has declined).
-            const itemStatus = str(item, 'status') ?? str(item, 'state');
+            const itemStatus = str$1(item, 'status') ?? str$1(item, 'state');
             const exitCode = itemType === 'command_execution' ? num(item, 'exit_code') : undefined;
             const itemResult = obj(item, 'result');
             const explicitError = itemType === 'error' || itemStatus === 'failed' || itemStatus === 'error' ||
@@ -3924,8 +5315,8 @@ function createCodexTranslator(maxChars) {
                 (exitCode !== undefined && exitCode !== 0);
             let status = explicitError ? 'error' : 'done';
             const error = obj(item, 'error');
-            const denialReason = str(item, 'decision') ?? str(item, 'approval_status') ?? str(error, 'type');
-            const messages = [str(error, 'message'), str(item, 'message')].filter((m) => m !== undefined).map((m) => m.toLowerCase());
+            const denialReason = str$1(item, 'decision') ?? str$1(item, 'approval_status') ?? str$1(error, 'type');
+            const messages = [str$1(error, 'message'), str$1(item, 'message')].filter((m) => m !== undefined).map((m) => m.toLowerCase());
             const denied = item['permission_denied'] === true || item['denied'] === true ||
                 itemStatus === 'denied' || itemStatus === 'rejected' || itemStatus === 'declined' ||
                 (denialReason !== undefined && /^(?:denied|rejected|declined|approval_denied|permission_denied)$/i.test(denialReason)) ||
@@ -3960,7 +5351,7 @@ function createCodexTranslator(maxChars) {
             return out;
         }
         if (type === 'turn.failed') {
-            state.error = str(obj(raw, 'error'), 'message') ?? 'codex turn failed';
+            state.error = str$1(obj(raw, 'error'), 'message') ?? 'codex turn failed';
             out.push({
                 kind: 'notice',
                 at,
@@ -3975,7 +5366,7 @@ function createCodexTranslator(maxChars) {
             // depending on the event. Try both rather than assume one shape.
             const e = obj(raw, 'error');
             const eString = typeof raw['error'] === 'string' ? raw['error'] : undefined;
-            const message = str(e, 'message') ?? eString ?? str(raw, 'message') ?? 'codex reported an error';
+            const message = str$1(e, 'message') ?? eString ?? str$1(raw, 'message') ?? 'codex reported an error';
             state.error = message;
             out.push({
                 kind: 'notice',
@@ -4022,7 +5413,7 @@ function buildResult$2(args) {
             status = 'success';
         }
     }
-    const out = jobResult({ provider: 'codex', jobId, status, error, exit, response, startedAtMs, durationMs, stateDir });
+    const out = jobResult({ provider: 'codex', jobId, status, error, exit, response, answerKey: tx.answer.answerKey(), startedAtMs, durationMs, stateDir });
     if (tx.usage !== undefined)
         out.usage = tx.usage;
     if (tx.threadId !== undefined)
@@ -4247,7 +5638,7 @@ function toolOutputIsError(content) {
         return false;
     if (parsed['isError'] === true || parsed['is_error'] === true)
         return true;
-    const status = str(parsed, 'status');
+    const status = str$1(parsed, 'status');
     if (status !== undefined && status.toLowerCase() === 'error')
         return true;
     return parsed['error'] !== undefined && parsed['error'] !== null && parsed['error'] !== false;
@@ -4279,6 +5670,7 @@ function createKimiTranslator(maxChars) {
         onEvent: () => [],
     };
     let step = 0;
+    let messages = 0;
     const toolSteps = new Map();
     const toolNames = new Map();
     const started = new Set();
@@ -4294,8 +5686,8 @@ function createKimiTranslator(maxChars) {
     const translate = (raw) => {
         const out = [];
         const at = nowIso();
-        const role = str(raw, 'role');
-        const type = str(raw, 'type') ?? '';
+        const role = str$1(raw, 'role');
+        const type = str$1(raw, 'type') ?? '';
         const usage = toTokenUsage$1(obj(raw, 'usage') ?? obj(raw, 'tokens') ?? {});
         if (usage !== undefined) {
             tx.usage = usage;
@@ -4306,7 +5698,7 @@ function createKimiTranslator(maxChars) {
                 return out;
             }
             if (type === 'session.resume_hint') {
-                const id = str(raw, 'session_id') ?? str(raw, 'sessionId');
+                const id = str$1(raw, 'session_id') ?? str$1(raw, 'sessionId');
                 if (id === undefined || id === '') {
                     out.push({ kind: 'notice', at, level: 'warn', message: 'kimi resume hint without a session_id', raw });
                 }
@@ -4329,8 +5721,8 @@ function createKimiTranslator(maxChars) {
                 const failed = num(raw, 'failed_attempt');
                 const next = num(raw, 'next_attempt');
                 const max = num(raw, 'max_attempts');
-                const name = str(raw, 'error_name') ?? 'error';
-                const message = str(raw, 'error_message') ?? '';
+                const name = str$1(raw, 'error_name') ?? 'error';
+                const message = str$1(raw, 'error_message') ?? '';
                 const attempt = failed !== undefined && max !== undefined ? ` (attempt ${failed} of ${max})` : '';
                 const retrying = next !== undefined ? `; retrying as ${next}` : '';
                 out.push({ kind: 'notice', at, level: 'warn', message: `kimi ${name}${attempt}${retrying}: ${message}`.trim(), raw });
@@ -4338,7 +5730,7 @@ function createKimiTranslator(maxChars) {
             }
             if (type === 'error') {
                 tx.sawError = true;
-                tx.error = str(obj(raw, 'error'), 'message') ?? str(raw, 'message') ?? str(raw, 'error_message') ?? 'kimi error';
+                tx.error = str$1(obj(raw, 'error'), 'message') ?? str$1(raw, 'message') ?? str$1(raw, 'error_message') ?? 'kimi error';
                 tx.recovery.noteError('a worker error', tx.error, at);
                 out.push({ kind: 'notice', at, level: 'error', message: tx.error, raw });
                 return out;
@@ -4355,7 +5747,7 @@ function createKimiTranslator(maxChars) {
             return out;
         }
         if (role === 'assistant') {
-            const content = str(raw, 'content');
+            const content = str$1(raw, 'content');
             const calls = raw['tool_calls'];
             const hasAnyCall = Array.isArray(calls) && calls.length > 0;
             if (content !== undefined) {
@@ -4364,8 +5756,9 @@ function createKimiTranslator(maxChars) {
                         answer.emptyMessage();
                 }
                 else {
-                    answer.text(content);
-                    out.push({ kind: 'text', at, text: content, stream: 'assistant' });
+                    const messageKey = `m${++messages}`;
+                    answer.text(content, messageKey);
+                    out.push({ kind: 'text', at, text: content, stream: 'assistant', messageKey });
                 }
             }
             if (calls !== undefined) {
@@ -4385,9 +5778,9 @@ function createKimiTranslator(maxChars) {
                             continue;
                         const call = rawCall;
                         const fn = obj(call, 'function');
-                        const name = str(fn, 'name') ?? str(call, 'name') ?? 'tool';
+                        const name = str$1(fn, 'name') ?? str$1(call, 'name') ?? 'tool';
                         answer.tool(name);
-                        const id = str(call, 'id') ?? str(call, 'tool_call_id') ?? `call-${step}`;
+                        const id = str$1(call, 'id') ?? str$1(call, 'tool_call_id') ?? `call-${step}`;
                         let args = fn?.['arguments'] ?? call['arguments'];
                         if (typeof args === 'string') {
                             try {
@@ -4414,7 +5807,7 @@ function createKimiTranslator(maxChars) {
             return out;
         }
         if (role === 'tool') {
-            const id = str(raw, 'tool_call_id') ?? str(raw, 'id') ?? `tool-${step}`;
+            const id = str$1(raw, 'tool_call_id') ?? str$1(raw, 'id') ?? `tool-${step}`;
             if (ended.has(id)) {
                 out.push({
                     kind: 'notice',
@@ -4445,7 +5838,7 @@ function createKimiTranslator(maxChars) {
         }
         if (type === 'error' || obj(raw, 'error') !== undefined) {
             tx.sawError = true;
-            tx.error = str(obj(raw, 'error'), 'message') ?? str(raw, 'message') ?? 'kimi error';
+            tx.error = str$1(obj(raw, 'error'), 'message') ?? str$1(raw, 'message') ?? 'kimi error';
             tx.recovery.noteError('a worker error', tx.error, at);
             out.push({ kind: 'notice', at, level: 'error', message: tx.error, raw });
             return out;
@@ -4503,7 +5896,7 @@ function buildResult$1(args) {
             status = 'success';
         }
     }
-    const out = jobResult({ provider: 'kimi', jobId, status, error, exit, response, startedAtMs, durationMs, stateDir });
+    const out = jobResult({ provider: 'kimi', jobId, status, error, exit, response, answerKey: tx.answer.answerKey(), startedAtMs, durationMs, stateDir });
     if (tx.usage !== undefined)
         out.usage = tx.usage;
     const raw = {};
@@ -4534,11 +5927,11 @@ function parseKimiModels(stdout) {
             continue;
         const entry = raw;
         const overrides = obj(entry, 'overrides') ?? {};
-        const label = str(overrides, 'display_name') ??
-            str(overrides, 'displayName') ??
-            str(entry, 'display_name') ??
-            str(entry, 'displayName') ??
-            str(entry, 'model') ??
+        const label = str$1(overrides, 'display_name') ??
+            str$1(overrides, 'displayName') ??
+            str$1(entry, 'display_name') ??
+            str$1(entry, 'displayName') ??
+            str$1(entry, 'model') ??
             alias;
         out.push({ id: alias, label, efforts: [] });
     }
@@ -4785,7 +6178,7 @@ function withEffortVariant(model, effort) {
  */
 function deepString(o, keys) {
     for (const k of keys) {
-        const v = str(o, k);
+        const v = str$1(o, k);
         if (v !== undefined && v !== '')
             return v;
     }
@@ -4794,7 +6187,7 @@ function deepString(o, keys) {
         if (inner === undefined)
             continue;
         for (const k of keys) {
-            const v = str(inner, k);
+            const v = str$1(inner, k);
             if (v !== undefined && v !== '')
                 return v;
         }
@@ -4803,7 +6196,7 @@ function deepString(o, keys) {
 }
 function hasEmptyText(o, keys) {
     for (const k of keys) {
-        if (str(o, k) === '')
+        if (str$1(o, k) === '')
             return true;
     }
     for (const nest of ['part', 'message', 'properties', 'data', 'info']) {
@@ -4811,7 +6204,7 @@ function hasEmptyText(o, keys) {
         if (inner === undefined)
             continue;
         for (const k of keys) {
-            if (str(inner, k) === '')
+            if (str$1(inner, k) === '')
                 return true;
         }
     }
@@ -4943,8 +6336,8 @@ function createOpencodeTranslator(maxChars) {
     const translate = (raw) => {
         const out = [];
         const at = nowIso();
-        const type = str(raw, 'type') ?? 'unknown';
-        const sessionId = str(raw, 'sessionID') ?? str(raw, 'session_id');
+        const type = str$1(raw, 'type') ?? 'unknown';
+        const sessionId = str$1(raw, 'sessionID') ?? str$1(raw, 'session_id');
         if (sessionId !== undefined) {
             if (tx.sessionId === undefined) {
                 out.push({ kind: 'started', at, conversationId: sessionId, raw });
@@ -4956,10 +6349,10 @@ function createOpencodeTranslator(maxChars) {
             tx.sawError = true;
             const e = obj(raw, 'error');
             const data = obj(e ?? {}, 'data');
-            const message = str(e, 'message') ?? str(data, 'message') ?? str(raw, 'message') ?? 'opencode error';
+            const message = str$1(e, 'message') ?? str$1(data, 'message') ?? str$1(raw, 'message') ?? 'opencode error';
             const statusCode = data?.['statusCode'] ?? e?.['status'] ?? e?.['statusCode'];
             tx.error = typeof statusCode === 'number' ? `HTTP ${statusCode}: ${message}` : message;
-            const errorType = str(e, 'type');
+            const errorType = str$1(e, 'type');
             // Quota / no-route failures are the two I actually hit. They are
             // environment failures (no money, no route) rather than the worker doing
             // something wrong, so we label them distinctly: the operator's fix is
@@ -4986,7 +6379,7 @@ function createOpencodeTranslator(maxChars) {
         // under `properties`. Both carry the same Part object, so find it once.
         const part = obj(raw, 'part') ?? obj(obj(raw, 'properties') ?? {}, 'part');
         const partState = obj(part ?? {}, 'state') ?? obj(raw, 'state');
-        const partType = str(part, 'type') ?? '';
+        const partType = str$1(part, 'type') ?? '';
         const isStepStart = type === 'step_start' || type === 'step-start' || partType === 'step-start';
         const isStepFinish = type === 'step_finish' || type === 'step-finish' || partType === 'step-finish';
         // ---- usage, wherever it hides -------------------------------------------
@@ -5010,20 +6403,20 @@ function createOpencodeTranslator(maxChars) {
         // tool-shaped `part`. `part.state` is an OBJECT, so its state word has to be
         // read off it — a plain string search never sees it.
         const isToolType = type.includes('tool') || partType === 'tool' || partType === 'tool_use';
-        const toolName = str(part, 'tool') ??
-            str(part, 'toolName') ??
+        const toolName = str$1(part, 'tool') ??
+            str$1(part, 'toolName') ??
             deepString(raw, ['tool', 'toolName', 'tool_name', 'name']);
-        const stateWord = (str(partState, 'status') ??
-            str(partState, 'state') ??
+        const stateWord = (str$1(partState, 'status') ??
+            str$1(partState, 'state') ??
             deepString(raw, ['state', 'status']) ??
             '').toLowerCase();
         // Prefer the CALL id over the part id: the part id can differ between a
         // streaming update and the completed record for the same call, and splitting
         // those into two steps double-counts the tool.
-        const partId = str(part, 'callID') ??
-            str(part, 'callId') ??
-            str(partState, 'callID') ??
-            str(partState, 'callId') ??
+        const partId = str$1(part, 'callID') ??
+            str$1(part, 'callId') ??
+            str$1(partState, 'callID') ??
+            str$1(partState, 'callId') ??
             deepString(raw, ['callID', 'callId', 'id', 'partID', 'partId']) ??
             `anon-${step}`;
         if (toolName !== undefined && (stateWord !== '' || isToolType)) {
@@ -5040,8 +6433,8 @@ function createOpencodeTranslator(maxChars) {
             if (isDone || isErr)
                 endedParts.add(partId);
             const errorTexts = [
-                str(partState, 'error'),
-                str(obj(partState, 'error'), 'message'),
+                str$1(partState, 'error'),
+                str$1(obj(partState, 'error'), 'message'),
                 deepString(raw, ['error', 'message']),
                 deepString(raw, ['error']),
             ];
@@ -5055,7 +6448,7 @@ function createOpencodeTranslator(maxChars) {
             // An error-state part often reports its only detail under `state.error`,
             // sometimes as a string and sometimes as `{ message }`.
             const stateError = partState?.['error'];
-            const stateErrorText = typeof stateError === 'string' ? stateError : str(obj(partState, 'error'), 'message');
+            const stateErrorText = typeof stateError === 'string' ? stateError : str$1(obj(partState, 'error'), 'message');
             const outputValue = partState?.['output'] ?? stateErrorText ?? part?.['output'] ?? raw['output'] ?? raw['result'];
             const output = preview(outputValue, maxChars);
             if (!partStep.has(partId)) {
@@ -5119,12 +6512,12 @@ function createOpencodeTranslator(maxChars) {
         }
         // ---- text ---------------------------------------------------------------
         const text = deepString(raw, ['text', 'content', 'delta', 'textDelta']);
-        const msgId = str(part, 'messageID') ?? str(part, 'messageId') ?? deepString(raw, ['messageID', 'messageId']);
+        const msgId = str$1(part, 'messageID') ?? str$1(part, 'messageId') ?? deepString(raw, ['messageID', 'messageId']);
         const isThinking = type.includes('thinking') || type.includes('reasoning') || partType === 'thinking' || partType === 'reasoning';
         if (text !== undefined && text !== '') {
             if (!isThinking)
                 answer.text(text, msgId);
-            out.push({ kind: 'text', at, text, stream: isThinking ? 'thinking' : 'assistant' });
+            out.push({ kind: 'text', at, text, stream: isThinking ? 'thinking' : 'assistant', ...(msgId === undefined ? {} : { messageKey: msgId }) });
             // A text event is also our best evidence the run is producing output, so
             // it doubles as a terminal marker candidate below.
             return out;
@@ -5141,7 +6534,7 @@ function createOpencodeTranslator(maxChars) {
             // Verified in the installed OpenCode CLI: session.step.ended emits
             // step_finish with part.reason = data.finish. Tool-call/length finishes
             // end only a step; "stop" confirms the assistant finished normally.
-            if (isStepFinish && str(part, 'reason') === 'stop')
+            if (isStepFinish && str$1(part, 'reason') === 'stop')
                 tx.recovery.noteCompletion();
             else
                 tx.recovery.invalidateCompletion();
@@ -5158,7 +6551,7 @@ function createOpencodeTranslator(maxChars) {
         }
         if (type === 'session.error') {
             tx.sawError = true;
-            tx.error = str(obj(raw, 'error'), 'message') ?? str(raw, 'message') ?? 'opencode session.error';
+            tx.error = str$1(obj(raw, 'error'), 'message') ?? str$1(raw, 'message') ?? 'opencode session.error';
             tx.recovery.noteError('a worker error', tx.error, at);
             out.push({ kind: 'notice', at, level: 'error', message: tx.error, raw });
             return out;
@@ -5258,7 +6651,7 @@ function buildResult(args) {
             status = 'success';
         }
     }
-    const out = jobResult({ provider: 'opencode', jobId, status, error, exit, response, startedAtMs, durationMs, stateDir });
+    const out = jobResult({ provider: 'opencode', jobId, status, error, exit, response, answerKey: tx.answer.answerKey(), startedAtMs, durationMs, stateDir });
     if (tx.usage !== undefined)
         out.usage = tx.usage;
     if (tx.unrecognised.size > 0)
@@ -5529,490 +6922,53 @@ function createMarker(filePath, body) {
         closeSync(fd);
     }
     return true;
-}/** Text sanitising and fixed-width fitting. Dependency-free: everything that puts
- * worker or user prose into a cell goes through here first.
- */
-/**
- * Strip complete ANSI escape sequences (CSI, OSC, DCS/PM/APC/SOS, 2-byte ESC,
- * C1 controls) and remaining forbidden control characters, unpaired surrogates,
- * and noncharacters (`U+FDD0..U+FDEF`), while preserving `\n` and valid UTF-16
- * surrogate pairs.
- *
- * Why this exists: Claude Code's JSX element validator rejects any `<Text>`,
- * `<Button label>`, or `<Markdown text>` containing C0/C1 controls (except `\t`
- * and `\n`), lone surrogates, or `U+FDD0..U+FDEF`. Worker tool output, shell
- * commands, check output, and prompt text routinely contain ANSI colour codes or
- * `\r` progress lines; stripping them at the UI boundary keeps the stored job
- * files intact while preventing a single control byte from aborting the pane.
- */
-const ANSI_ESCAPE = /(?:\x1b\][\s\S]*?(?:\x07|\x1b\\|\x9c)|\x9d[\s\S]*?(?:\x07|\x1b\\|\x9c)|\x1b[PX^_][\s\S]*?(?:\x1b\\|\x9c)|(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]|\x1b[ -/]*[@-~])/gu;
-const FORBIDDEN_CONTROLS = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ud800-\udfff\ufdd0-\ufdef]/gu;
-function sanitizeText(s) {
-    return s
-        .replace(ANSI_ESCAPE, '')
-        .replace(/\r\n?/g, '\n')
-        .replace(/\t/g, '  ')
-        .replace(FORBIDDEN_CONTROLS, '');
+}function teamCounts(team) {
+    const counts = { total: 0, working: 0, waiting: 0, stopped: 0, done: 0, failed: 0, killed: 0 };
+    for (const member of team?.members ?? []) {
+        counts.total += 1;
+        counts[member.state] += 1;
+    }
+    return counts;
+}
+function hasTeam(team) {
+    return team != null && team.members.length > 0;
+}
+function stillWorking(member, run) {
+    if (member.state !== 'working' || !run.live)
+        return false;
+    const acted = member.lastEventAt ?? member.startedAt;
+    return !(acted !== null && run.startedAt !== null && acted < run.startedAt);
+}
+function settleTeam(team, run) {
+    const stops = (m) => m.state === 'working' && !stillWorking(m, run);
+    if (!team.members.some(stops))
+        return team;
+    return { ...team, members: team.members.map((m) => (stops(m) ? { ...m, state: 'stopped' } : m)) };
+}
+const MEMBER_FILE_MAX = 100;
+function fnv1a(text) {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < text.length; i += 1) {
+        h ^= text.charCodeAt(i);
+        h = Math.imul(h, 0x01000193);
+    }
+    return (h >>> 0).toString(16).padStart(8, '0');
 }
 /**
- * Cut to at most `max` UTF-16 units without splitting a surrogate pair.
- *
- * `slice` can leave a high surrogate with no low half. `sanitizeText` removes
- * such halves, so a cut made AFTER sanitizing must not create one: the host
- * draws an unpaired half as U+FFFD, or refuses the tree a Text's string is
- * checked in. `max` stays in UTF-16 units because every caller sizes cells in
- * terminal columns, where a pair already counts as two.
+ * The file name for a member's view: its id with anything outside [A-Za-z0-9._-]
+ * replaced, at most 100 characters; a cut name ends in a hash of the whole id.
  */
-function clip(s, max) {
-    if (s.length <= max)
-        return s;
-    const cut = s.slice(0, Math.max(0, max));
-    return /[\ud800-\udbff]$/.test(cut) ? cut.slice(0, -1) : cut;
-}
-/** Collapse all whitespace runs to single spaces and cap the length. A hard
- * bound on what one string can cost, for prose with no cell to sit in (a report
- * excerpt, a warning message); the renderer's `wrap="truncate-end"` is the
- * mechanism, this is belt and braces. */
-function oneLine(s, max = 400) {
-    const t = sanitizeText(s).replace(/\s+/g, ' ').trim();
-    return clip(t, Math.max(0, max));
-}/** Tool name + parameters → a short human phrase. Shared by the legacy reader
- * (jobs.ts) and the progress digest (progress.ts); never raw tool output.
- */
-/**
- * agy tool name + parameters → a short "what is it doing" phrase.
- *
- * Measured against real agy tool calls:
- *   run_command           { CommandLine }
- *   view_file             { AbsolutePath }
- *   write_to_file         { TargetFile }
- *   replace_file_content  { TargetFile }
- *   grep_search           { Query | Pattern }
- *   list_dir              { AbsolutePath }
- *   call_mcp_tool         { ServerName, ToolName, Arguments }
- *   manage_task           { Action, TaskId }
- *   schedule              { DurationSeconds, Prompt }
- *
- * TERMINAL-UI.md §Motion: "terse tool descriptions, never raw output". Every
- * branch truncates at the source; there is no code path that hands raw tool
- * output to a list row.
- */
-function describeTool(tool, params) {
-    const str = (k) => {
-        const v = params[k];
-        return typeof v === 'string' ? oneLine(v) : '';
-    };
-    switch (tool) {
-        case 'run_command':
-            return humanCommand(str('CommandLine'));
-        case 'view_file':
-            return `reading ${basename(str('AbsolutePath'))}`;
-        case 'write_to_file':
-        // Same verb as replace_file_content, deliberately: from the reader's side
-        // there is no difference between "created" and "changed" a file, and the
-        // tool name is an implementation detail of agy, not of the work.
-        case 'replace_file_content':
-            return `editing ${basename(str('TargetFile'))}`;
-        case 'grep_search':
-            return `searching ${basename(str('Query') || str('Pattern'))}`;
-        case 'list_dir':
-            return `listing ${basename(str('AbsolutePath'))}`;
-        case 'call_mcp_tool':
-            return `${str('ToolName') || str('ServerName') || 'an mcp tool'}`;
-        case 'manage_task':
-            return `task ${str('Action') || 'update'}`;
-        case 'schedule':
-            return `waiting ${str('DurationSeconds') || '?'}s`;
-        default:
-            return `using ${oneLine(tool)}`;
-    }
-}
-/**
- * A shell command → what a person would say they are doing.
- *
- * The corpus is 76 run_command records and the raw line is what put
- * `cargo tree -p renyi-mcp -e features -i` on a status row: real, precise, and
- * unreadable at a glance. So the COMMON commands get a verb, and anything else
- * gets a TRIMMED form rather than an invented one.
- *
- * The fallback rule is the important half. When there is no mapping this shows
- * the command's first two words and stops — `git rebase --onto main feature/x`
- * becomes `git rebase`, not `preparing the branch`. Inventing a plausible verb
- * for an arbitrary command would be a lie the user cannot check, and it would be
- * a lie in the one field the band exists to be trustworthy about. `cargo tree`
- * is in the table because it appears in the corpus four times, not because it
- * is universally understood.
- */
-function humanCommand(cmd) {
-    const line = oneLine(cmd);
-    if (line === '')
-        return 'running a command';
-    // A pipeline or a `&&` chain is several actions; the first is what the job is
-    // doing now, and the rest are what it will do after. `cargo test 2>&1 | tail`
-    // is "running tests", not "running a shell pipeline".
-    const first = line.split(/\s*(?:&&|\|\||;|\||&&)\s*/)[0] ?? line;
-    const words = first.split(' ').filter((w) => !w.startsWith('-'));
-    const prog = basename(words[0] ?? '');
-    const sub = words[1] ?? '';
-    switch (prog) {
-        case 'cargo':
-        case 'rustup':
-            switch (sub) {
-                case 'test':
-                case 'nextest':
-                    return 'running tests';
-                case 'clippy':
-                    return 'linting';
-                case 'fmt':
-                    return 'formatting';
-                case 'build':
-                    return 'building';
-                case 'check':
-                    return 'checking the build';
-                case 'tree':
-                    return 'inspecting dependencies';
-                case 'doc':
-                    return 'reading the docs';
-                case 'run':
-                    return `running ${basename(words[2] ?? 'the binary')}`;
-            }
-            break;
-        case 'npm':
-        case 'pnpm':
-        case 'yarn':
-        case 'bun':
-            // `npm test` and `npm run test` are the same intent; `npm run build` is
-            // building. Anything else under `npm run` is somebody's script and we do
-            // not know what it does.
-            if (sub === 'test')
-                return 'running tests';
-            if (sub === 'run' && (words[2] === 'build'))
-                return 'building';
-            if (sub === 'run' && (words[2] === 'test'))
-                return 'running tests';
-            return `running ${prog} scripts`;
-        case 'python':
-        case 'python3':
-            return 'running a script';
-        case 'git':
-            if (sub === 'status' || sub === 'diff' || sub === 'log' || sub === 'show')
-                return 'checking git';
-            if (sub === 'commit')
-                return 'committing';
-            if (sub === 'push')
-                return 'pushing';
-            return `git ${sub}`.trim();
-        case 'grep':
-        case 'rg':
-        case 'ag':
-            return 'searching';
-        case 'graft':
-            return `navigating the graph`;
-    }
-    // The honest fallback: the command's name, and at most one argument.
-    // `/Library/Developer/CommandLineTools/usr/bin/git` reads as `git`.
-    const trimmed = [prog, ...words.slice(1, 2)].join(' ');
-    return trimmed === '' ? 'running a command' : trimmed;
-}
-/** Last path segment only. */
-function basename(p) {
-    const i = p.lastIndexOf('/');
-    return i === -1 ? p : p.slice(i + 1);
-}
-/**
- * `input_preview` is a JSON STRING of the tool parameters, possibly truncated.
- * A truncated JSON string does not parse, so this never throws — a failure just
- * means we have no parameters and the caller falls back to the bare tool name.
- */
-function parseInputPreview(preview) {
-    if (!preview)
-        return {};
-    try {
-        const v = JSON.parse(preview);
-        return typeof v === 'object' && v !== null ? v : {};
-    }
-    catch {
-        return {};
-    }
-}const READ_TOOLS = new Set(['view_file', 'read', 'read_file', 'list_dir', 'ls', 'list', 'notebookread', 'readmediafile']);
-const SEARCH_TOOLS = new Set(['grep_search', 'grep', 'glob', 'find_by_name', 'search_files', 'find_files', 'codebase_search', 'search_web', 'web_search', 'websearch', 'webfetch', 'fetchurl']);
-const EDIT_TOOLS = new Set(['write_to_file', 'replace_file_content', 'edit', 'edit_file', 'write', 'write_file', 'create_file', 'str_replace_editor', 'multiedit', 'notebookedit', 'patch', 'file_change', 'apply_patch']);
-const COMMAND_TOOLS = new Set(['run_command', 'bash', 'shell', 'command_execution', 'exec']);
-const PATH_KEYS = ['AbsolutePath', 'TargetFile', 'Path', 'file_path', 'filePath', 'notebook_path', 'path'];
-const COMMAND_KEYS = ['CommandLine', 'command', 'cmd'];
-/**
- * `/bin/zsh -lc 'cat x'` and `bash -lc "…"` → the command inside. codex names a shell call by its command line.
- * A stored preview is cut short and loses its closing quote; the command is still the inside.
- */
-function unwrapShell(command) {
-    const m = /^\s*(?:\S*\/)?(?:ba|z|)sh\s+-l?c\s+(['"])([\s\S]*)$/.exec(command);
-    if (!m)
-        return command;
-    const inner = m[2].trimEnd();
-    return inner.endsWith(m[1]) ? inner.slice(0, -1) : inner;
-}
-const TEST_RE = /\b(?:pytest|jest|vitest|mocha|tox|nox|rspec|phpunit|ctest|unittest)\b|\b(?:cargo|go|npm|pnpm|yarn|bun|deno|dotnet|mvn|gradle|swift|mix)\s+(?:run\s+)?(?:test|nextest|verify)\b|\bmake\s+(?:test|check)\b|\bnode\s+--test\b/;
-const SEARCH_PROGS = new Set(['grep', 'rg', 'ag', 'ack', 'find', 'fd']);
-/** Steps that prepare a shell rather than do the work. */
-const SETUP_PROGS = new Set(['cd', 'pushd', 'popd', 'export', 'unset', 'source', '.', 'set', 'ulimit']);
-const READ_PROGS = new Set(['cat', 'sed', 'head', 'tail', 'nl', 'less', 'ls', 'tree', 'wc']);
-function classifyCommand(raw) {
-    // A leading `!` negates the exit status; it is not the program.
-    const command = unwrapShell(raw).replace(/\s+/g, ' ').trim().replace(/^!\s*/, '');
-    const segments = command.split(/\s*(?:&&|\|\||;|\|)\s*/).filter((s) => s !== '');
-    const program = (segment) => segment.split(' ').filter((w) => w !== '' && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(w));
-    // `unset VIRTUAL_ENV; uv run pytest`: the setup step is not what the command does.
-    const first = segments.find((s) => !SETUP_PROGS.has(basename(program(s)[0] ?? ''))) ?? segments[0] ?? command;
-    const words = program(first);
-    const prog = basename(words[0] ?? '');
-    const sub = subcommand(words);
-    if (prog === 'git' && sub === 'grep')
-        return { kind: 'search', label: 'git grep' };
-    if (SEARCH_PROGS.has(prog))
-        return { kind: 'search', label: humanCommand(first) };
-    if (READ_PROGS.has(prog))
-        return { kind: 'read', label: humanCommand(first) };
-    if (TEST_RE.test(command))
-        return { kind: 'test', label: 'running tests' };
-    return { kind: 'command', label: humanCommand(first) };
-}
-/** Global options that take a value, so `git -C dir grep` finds `grep`, not `dir`. */
-const VALUE_OPTIONS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace']);
-function subcommand(words) {
-    for (let i = 1; i < words.length; i += 1) {
-        const w = words[i];
-        if (VALUE_OPTIONS.has(w)) {
-            i += 1;
-            continue;
-        }
-        if (!w.startsWith('-'))
-            return w;
-    }
-    return '';
-}
-function firstString(params, keys, raw = '') {
-    for (const k of keys) {
-        const v = params[k];
-        if (typeof v === 'string' && v.trim() !== '')
-            return v;
-    }
-    // A long input (a Write's file body) arrives truncated and no longer parses;
-    // its leading keys are still readable.
-    for (const k of keys) {
-        const m = new RegExp(`"${k}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`).exec(raw);
-        if (m) {
-            try {
-                return JSON.parse(`"${m[1]}"`);
-            }
-            catch {
-                return m[1];
-            }
-        }
-    }
-    return '';
-}
-/**
- * A short name for an in-flight tool call, as a reader would type it: the
- * command line's first step for a shell tool (`cargo test`), else the tool
- * name. Used for liveness text ("in `cargo test` 16m").
- */
-function toolLabel(tool, input, max = 40) {
-    const lower = tool.trim().toLowerCase();
-    if (COMMAND_TOOLS.has(lower)) {
-        const command = unwrapShell(firstString(parseInputPreview(input), COMMAND_KEYS, input ?? '')).replace(/\s+/g, ' ').trim();
-        const first = command.split(/\s*(?:&&|\|\||;|\|)\s*/).find((s) => s !== '') ?? '';
-        if (first !== '')
-            return oneLine(first, max);
-    }
-    return oneLine(tool, max);
-}
-/**
- * One tool call → its kind and a phrase. Every provider's tool vocabulary:
- * agy (view_file, run_command, …), claude (Read, Edit, Bash, …), opencode (read,
- * edit, bash, …), codex (a shell command line as the tool, or file_change) and
- * kimi (Read, Write, Edit, Grep, Glob, Bash, … — PascalCase, matched lowercased).
- * Input may be truncated JSON; a parse failure falls back to the bare tool name.
- */
-function classify(tool, input) {
-    const params = parseInputPreview(input);
-    const name = tool.trim();
-    const lower = name.toLowerCase();
-    const path = firstString(params, PATH_KEYS, input ?? '');
-    const file = path === '' ? '' : basename(path);
-    if (COMMAND_TOOLS.has(lower))
-        return classifyCommand(firstString(params, COMMAND_KEYS, input ?? ''));
-    if (EDIT_TOOLS.has(lower)) {
-        if (lower === 'file_change') {
-            const changes = Array.isArray(params['changes']) ? params['changes'] : [];
-            const first = changes.map((c) => (c && typeof c === 'object' ? c['path'] : undefined))
-                .find((p) => typeof p === 'string');
-            return { kind: 'edit', label: first ? `editing ${oneLine(basename(first))}` : 'editing files', ...(first ? { path: first } : {}) };
-        }
-        return { kind: 'edit', label: file ? `editing ${oneLine(file)}` : 'editing', ...(path ? { path } : {}) };
-    }
-    if (READ_TOOLS.has(lower)) {
-        const listing = lower === 'list_dir' || lower === 'ls' || lower === 'list';
-        return { kind: 'read', label: file ? `${listing ? 'listing' : 'reading'} ${oneLine(file)}` : 'reading', ...(path && !listing ? { path } : {}) };
-    }
-    if (SEARCH_TOOLS.has(lower)) {
-        const query = oneLine(firstString(params, ['Query', 'Pattern', 'pattern', 'query', 'url'], input ?? ''));
-        const short = query.length > 24 ? `${oneLine(query, 23)}…` : query;
-        return { kind: 'search', label: short ? `searching ${short}` : 'searching' };
-    }
-    // codex: the tool IS the command line.
-    if (/\s/.test(name) || /^(?:\S*\/)?(?:ba|z)?sh$/.test(name))
-        return classifyCommand(name);
-    return { kind: 'other', label: describeTool(name, params) };
-}
-const REPEAT_MIN = 4;
-/** Accumulates one job's tool calls into a ProgressDigest. Feed it every activity start and end. */
-class ProgressTracker {
-    steps = new Map();
-    /**
-     * Steps whose first ACTIVITY event carried no input. A provider can split the
-     * call into "started, parameters not yet known" and "updated, here they are";
-     * such a step is classified but not counted until the input arrives, so a
-     * later update can upgrade it without double-counting.
-     */
-    provisional = new Set();
-    read = new Set();
-    editedSet = new Set();
-    edited = [];
-    /** Edits whose file the tool did not name (codex file_change's shape is unverified): still edits. */
-    unnamedEdits = 0;
-    searches = 0;
-    commands = 0;
-    testRuns = 0;
-    lastTestFailed = false;
-    recent = [];
-    repeatKey = '';
-    repeatLabel = '';
-    repeatCount = 0;
-    activeTest = false;
-    /** A tool call began. Repeated starts of one step (ACTIVE then DONE) are counted once. */
-    start(stepIndex, tool, input) {
-        // Codex passes the shell command line as `tool` with no separate `input`.
-        const effectiveInput = (input ?? '').trim() !== '' ? input : (/\s/.test(tool.trim()) ? tool.trim() : '');
-        const hasInput = effectiveInput !== '';
-        const seen = this.steps.get(stepIndex);
-        if (seen !== undefined) {
-            // The parameters arrived after the step was first seen: classify for real.
-            if (!this.provisional.has(stepIndex) || !hasInput)
-                return;
-            this.provisional.delete(stepIndex);
-            const upgraded = classify(tool, input);
-            this.steps.set(stepIndex, upgraded);
-            this.apply(upgraded, effectiveInput);
-            return;
-        }
-        const c = classify(tool, input);
-        this.steps.set(stepIndex, c);
-        if (!hasInput) {
-            // No input means we do not know what ran. Remember the step so `end()`
-            // keeps its verdict, but do not count a likely-misleading call.
-            this.provisional.add(stepIndex);
-            this.resetRepeat();
-            return;
-        }
-        this.apply(c, effectiveInput);
-    }
-    apply(c, input) {
-        switch (c.kind) {
-            case 'read':
-                if (c.path)
-                    this.read.add(c.path);
-                break;
-            case 'search':
-                this.searches += 1;
-                break;
-            case 'edit':
-                if (c.path) {
-                    if (this.editedSet.has(c.path))
-                        this.edited = this.edited.filter((p) => p !== c.path);
-                    this.editedSet.add(c.path);
-                    this.edited.push(c.path);
-                }
-                else
-                    this.unnamedEdits += 1;
-                break;
-            case 'test':
-                this.testRuns += 1;
-                this.activeTest = true;
-                break;
-            case 'command':
-                this.commands += 1;
-                break;
-        }
-        if (c.kind !== 'other')
-            this.recent = [...this.recent, c].slice(-8);
-        // An unclassified call is not a repeat of anything: "repeating editing ×17"
-        // is not a fact about the worker, it is a fact about a missing input.
-        if (c.kind === 'other') {
-            this.resetRepeat();
-            return;
-        }
-        const key = `${c.kind}\u0000${c.label}\u0000${input ?? ''}`;
-        if (key === this.repeatKey)
-            this.repeatCount += 1;
-        else {
-            this.repeatKey = key;
-            this.repeatLabel = c.label;
-            this.repeatCount = 1;
-        }
-    }
-    resetRepeat() {
-        this.repeatKey = '';
-        this.repeatLabel = '';
-        this.repeatCount = 0;
-    }
-    /** A tool call ended. Only an explicit error marks a test run failed. */
-    end(stepIndex, tool, input, status) {
-        this.start(stepIndex, tool, input);
-        const c = this.steps.get(stepIndex);
-        if (c.kind === 'test') {
-            this.lastTestFailed = status === 'error';
-            this.activeTest = false;
-        }
-    }
-    digest(cwd = '') {
-        const relative = (p) => {
-            const base = cwd.replace(/\/+$/, '');
-            return base !== '' && p.startsWith(`${base}/`) ? p.slice(base.length + 1) : p;
-        };
-        return {
-            phase: this.phase(),
-            filesRead: this.read.size,
-            searches: this.searches,
-            edited: this.edited.slice(-8).map(relative),
-            editedCount: this.editedSet.size + this.unnamedEdits,
-            commands: this.commands,
-            testRuns: this.testRuns,
-            lastTestFailed: this.lastTestFailed,
-            repeat: this.repeatCount >= REPEAT_MIN ? { label: this.repeatLabel, count: this.repeatCount } : null,
-        };
-    }
-    /** All file paths named by edit tool calls so far, relative to `cwd` when inside it. */
-    editedPaths(cwd = '') {
-        const base = cwd.replace(/\/+$/, '');
-        return this.edited.map((p) => (base !== '' && p.startsWith(`${base}/`) ? p.slice(base.length + 1) : p));
-    }
-    /** From a window of recent calls, not the last one alone, so the phase does not flicker. */
-    phase() {
-        const last = this.recent.at(-1);
-        if (last === undefined)
-            return 'starting';
-        if (this.activeTest || last.kind === 'test')
-            return 'testing';
-        if (this.recent.some((c) => c.kind === 'edit'))
-            return 'editing';
-        if (last.kind === 'command')
-            return 'running';
-        return 'exploring';
-    }
+function memberFileName(memberId) {
+    const safe = memberId.replace(/[^A-Za-z0-9._-]/g, '_').replace(/^\.+/, '_') || '_';
+    const ext = '.json';
+    if (safe.length + ext.length <= MEMBER_FILE_MAX)
+        return `${safe}${ext}`;
+    const hash = fnv1a(memberId);
+    return `${safe.slice(0, MEMBER_FILE_MAX - ext.length - hash.length - 1)}-${hash}${ext}`;
 }// Shared with the mod, which renders the digest; the mod loader cannot import forge, so it lives there.
 const RECENT_ACTIVITIES = 5;
 const LATEST_TEXT_CHARS = 4_000;
-const SUMMARY_CHARS = 1_000;
+const TEAM_MEMBERS_CAP = 64;
 class JobWriter {
     jobId;
     repo;
@@ -6035,11 +6991,13 @@ class JobWriter {
     tracker = new ProgressTracker();
     view = { schema: 1, prompt: '', preamble: null, transcript: [], tools: [], timeline: [], truncated: false };
     deltaOpen = false;
+    textKey;
     viewSequence = 0;
     conversation = null;
     finished = false;
     cancelRequestedAt = null;
     cwd = '';
+    realCwd = '';
     baselinePending = null;
     baselineSigs = new Map();
     changed = null;
@@ -6048,6 +7006,11 @@ class JobWriter {
     toolInputs = '';
     editToolInputs = '';
     editStepsCompleted = new Set();
+    team = null;
+    teamDirty = false;
+    pendingViews = new Map();
+    writtenViews = new Map();
+    lastTeamFlushMs = 0;
     constructor(options) {
         this.repo = options.repo;
         this.jobId = options.jobId;
@@ -6130,6 +7093,7 @@ class JobWriter {
         this.writeManifest();
         this.flushProgress(this.manifest.createdAt);
         this.cwd = input.cwd;
+        this.realCwd = realPathOr(input.cwd);
         this.baselinePending = isInsideGitRepo(input.cwd) ? this.captureBaseline(input.cwd) : null;
         return manifest;
     }
@@ -6165,7 +7129,7 @@ class JobWriter {
         writeJsonAtomic(jobFile(this.repo, this.jobId, FILES.view), this.view);
     }
     editedFiles(candidates) {
-        const fromTracker = this.tracker.editedPaths(this.cwd);
+        const fromTracker = this.tracker.editedPaths(this.cwd, this.realCwd);
         if (candidates === undefined)
             return fromTracker;
         const fromEditInputs = this.editToolInputs !== '' ? attributeChanged(candidates, this.editToolInputs).mine : [];
@@ -6243,6 +7207,49 @@ class JobWriter {
             return;
         this.lastHeartbeatFlushMs = Number.isNaN(nowMs) ? Date.now() : nowMs;
         writeJsonAtomic(jobFile(this.repo, this.jobId, FILES.progress), this.progress);
+        try {
+            this.flushTeam();
+        }
+        catch { }
+    }
+    onTeam(at, team, views) {
+        if (this.finished || this.manifest === null)
+            return;
+        const members = team.members.slice(0, TEAM_MEMBERS_CAP);
+        const kept = new Set(members.map((m) => m.id));
+        this.team = { ...team, members };
+        for (const view of views)
+            if (kept.has(view.id))
+                this.pendingViews.set(view.id, view);
+        this.teamDirty = true;
+        const nowMs = Date.parse(at);
+        const clock = Number.isNaN(nowMs) ? Date.now() : nowMs;
+        if (shouldFlush(this.lastTeamFlushMs, clock, this.flushMs)) {
+            this.lastTeamFlushMs = clock;
+            try {
+                this.flushTeam();
+            }
+            catch { }
+        }
+    }
+    flushTeam() {
+        if (!this.teamDirty || this.team === null)
+            return;
+        writeJsonAtomic(jobFile(this.repo, this.jobId, FILES.team), this.team);
+        for (const [id, view] of this.pendingViews) {
+            const body = JSON.stringify(view);
+            if (this.writtenViews.get(id) !== body) {
+                try {
+                    writeAtomic(jobFile(this.repo, this.jobId, path.join(FILES.members, memberFileName(id))), body);
+                }
+                catch {
+                    continue;
+                }
+                this.writtenViews.set(id, body);
+            }
+            this.pendingViews.delete(id);
+        }
+        this.teamDirty = this.pendingViews.size > 0;
     }
     onEvent(event) {
         if (this.finished || this.manifest === null)
@@ -6250,6 +7257,9 @@ class JobWriter {
         switch (event.kind) {
             case 'heartbeat':
                 this.heartbeat(event.at, event.pid);
+                return;
+            case 'team':
+                this.onTeam(event.at, event.team, event.views);
                 return;
             case 'started':
                 this.onStarted(event);
@@ -6381,13 +7391,18 @@ class JobWriter {
         const at = event.at;
         if (event.stream !== 'assistant')
             return;
-        const joinDelta = event.delta === true && this.deltaOpen;
+        const key = event.messageKey;
+        const sameMessage = key === this.textKey;
+        const joinDelta = event.delta === true && this.deltaOpen && sameMessage;
         const transcript = [...this.view.transcript];
-        if (event.delta && this.deltaOpen && transcript.length > 0)
+        if (joinDelta && transcript.length > 0)
             transcript[transcript.length - 1] += event.text;
         else
             transcript.push(event.text);
         this.deltaOpen = event.delta === true;
+        this.textKey = key;
+        if (!sameMessage)
+            this.currentMessage = '';
         let truncated = this.view.truncated;
         let chars = transcript.reduce((n, t) => n + t.length, 0);
         while (transcript.length > 1 && (chars > 64_000 || transcript.length > 200)) {
@@ -6404,13 +7419,13 @@ class JobWriter {
         if (joinDelta && last?.kind === 'assistant')
             timeline[timeline.length - 1] = { ...last, text: last.text + event.text };
         else
-            timeline.push({ kind: 'assistant', sequence: this.viewSequence++, at, text: event.text });
+            timeline.push({ kind: 'assistant', sequence: this.viewSequence++, at, text: event.text, ...(key === undefined ? {} : { messageKey: key }) });
         const bounded = boundTimeline(timeline);
         this.view = { ...this.view, timeline: bounded.events, truncated: this.view.truncated || bounded.truncated };
         this.latestText = appendBounded(this.latestText ?? '', event.text, LATEST_TEXT_CHARS);
         this.currentMessage = appendBounded(this.currentMessage, event.text, LATEST_TEXT_CHARS);
         this.noteFirstEvent(false);
-        this.manifest = { ...this.manifest, latestSummary: summaryHead(this.currentMessage, SUMMARY_CHARS) || this.manifest.latestSummary || null, summarySource: 'worker' };
+        this.manifest = { ...this.manifest, latestSummary: reportSummary(this.currentMessage) || this.manifest.latestSummary || null, summarySource: 'worker' };
         this.touch(at);
     }
     verdictFacts() {
@@ -6439,7 +7454,6 @@ class JobWriter {
         const failure = failureFields(verdict, result);
         const failedEarly = verdict.status === 'failed' && !result.ok && result.status !== 'timeout' && result.status !== 'cancelled' &&
             this.toolCalls === 0 && (result.durationMs <= FAILED_EARLY_MS || this.firstEventWasError);
-        const response = result.response.trim();
         const usage = result.usage === undefined
             ? null
             : Object.fromEntries(Object.entries(result.usage).filter((e) => typeof e[1] === 'number'));
@@ -6463,8 +7477,8 @@ class JobWriter {
             ...(this.toolErrorSteps.size === 0 ? {} : { toolErrors: this.toolErrorSteps.size }),
             ...(failedEarly ? { failedEarly: true } : {}),
             conversation: this.conversation,
-            latestSummary: summaryHead(response, SUMMARY_CHARS) || this.manifest.latestSummary || null,
-            summarySource: response || this.manifest.latestSummary ? 'worker' : null,
+            latestSummary: report?.trim() ? null : this.manifest.latestSummary ?? null,
+            summarySource: report?.trim() ? null : this.manifest.summarySource ?? null,
             ...(this.changed === null
                 ? { changedFilesUnknown: true }
                 : { changedFiles: this.changed.files, changedFilesTruncated: this.changed.truncated }),
@@ -6479,6 +7493,8 @@ class JobWriter {
         }
         const body = report ?? '';
         writeAtomic(jobFile(this.repo, this.jobId, FILES.report), body);
+        if (body.trim() !== '')
+            this.view = withoutAnswer(this.view, result.answerKey);
         this.writeManifest();
         this.flushProgress(finishedAt);
         if (verdict.suspicious)
@@ -6591,7 +7607,7 @@ class JobWriter {
             ...(this.lastAliveAt === null ? {} : { lastAliveAt: this.lastAliveAt }),
             ...(this.workerPid === undefined ? {} : { workerPid: this.workerPid }),
             warnings: this.progress?.warnings ?? [],
-            digest: this.tracker.digest(this.cwd),
+            digest: this.tracker.digest(this.cwd, this.realCwd),
             ...(this.progress?.pendingSteers !== undefined ? { pendingSteers: this.progress.pendingSteers } : {}),
         };
         const nowMs = Date.parse(at);
@@ -6629,6 +7645,10 @@ class JobWriter {
         writeJsonAtomic(jobFile(this.repo, this.jobId, FILES.view), this.view);
         const ms = Date.parse(at);
         this.lastFlushMs = Number.isNaN(ms) ? Date.now() : ms;
+        try {
+            this.flushTeam();
+        }
+        catch { }
     }
 }
 function gitCapMs() {
@@ -6637,6 +7657,14 @@ function gitCapMs() {
 }
 const TOOL_INPUTS_CAP = 200_000;
 const CHANGED_FILES_SIG_CAP = 500;
+function realPathOr(dir) {
+    try {
+        return realpathSync(dir);
+    }
+    catch {
+        return dir;
+    }
+}
 function isInsideGitRepo(cwd) {
     let dir = path.resolve(cwd);
     while (true) {
@@ -6738,20 +7766,6 @@ function appendBounded(base, add, max) {
     if (joined.length <= max)
         return joined;
     return joined.slice(joined.length - max);
-}
-function summaryHead(text, max) {
-    const t = text.trim().replace(/^Status:[^\n]*(?:\n|$)/, '').trim();
-    if (t.length <= max)
-        return t;
-    const head = t.slice(0, max);
-    if (t[max] === '\n')
-        return head.trim();
-    for (const sep of ['\n\n', '\n']) {
-        const i = head.lastIndexOf(sep);
-        if (i >= 0 && head.slice(0, i).trim() !== '')
-            return head.slice(0, i).trim();
-    }
-    return head.trim();
 }
 function emptyManifest(jobId) {
     const now = new Date().toISOString();
@@ -8157,6 +9171,39 @@ async function readdirSafe(path) {
             throw err;
         return [];
     }
+}/** Shape guards shared by the canonical reader and the native-task bridge.
+ * Dependency-free: the mod loader allows only sibling files.
+ */
+/** A plain object, or null for anything else (arrays included). */
+function record(v) {
+    return v !== null && typeof v === 'object' && !Array.isArray(v) ? v : null;
+}function number(v) {
+    return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null;
+}
+const MEMBER_STATES = new Set(['working', 'waiting', 'stopped', 'done', 'failed', 'killed']);
+const textOrNull = (v) => typeof v === 'string' ? v : null;
+const epochOrNull = (v) => typeof v === 'number' && Number.isFinite(v) ? v : null;
+function member(v) {
+    const m = record(v);
+    if (m === null || typeof m.id !== 'string' || m.id === '' || typeof m.name !== 'string' || !MEMBER_STATES.has(String(m.state)))
+        return null;
+    const post = record(m.lastPost);
+    return { id: m.id, name: m.name, role: typeof m.role === 'string' ? m.role : '',
+        model: textOrNull(m.model), modelLabel: textOrNull(m.modelLabel), task: textOrNull(m.task),
+        state: m.state, activity: textOrNull(m.activity), toolCount: number(m.toolCount) ?? 0,
+        tokensOut: number(m.tokensOut), startedAt: epochOrNull(m.startedAt), lastEventAt: epochOrNull(m.lastEventAt),
+        lastPost: post && number(post.seq) !== null && typeof post.text === 'string' ? { seq: number(post.seq), text: post.text } : null };
+}
+/** A `Team` (schema 1) or null; members that are not valid are dropped, an empty team is none. */
+function parseTeam(value) {
+    const t = record(value);
+    if (t === null || t.schema !== 1 || (t.source !== 'agy-swarm' && t.source !== 'agy-subagents') || !Array.isArray(t.members))
+        return null;
+    const members = t.members.map(member).filter((m) => m !== null);
+    if (members.length === 0)
+        return null;
+    return { schema: 1, source: t.source, title: textOrNull(t.title), boardHead: number(t.boardHead), members,
+        updatedAt: epochOrNull(t.updatedAt) ?? 0 };
 }const SMITH_PAYLOAD = {
     provider: 'provider',
     mode: 'mode',
@@ -8229,6 +9276,7 @@ class AgentSmithReader {
         }
         const report = await readTextSafe(jobFile(cwd, jobId, FILES.report));
         const progress = await readJsonSafe(jobFile(cwd, jobId, FILES.progress));
+        const storedTeam = parseTeam(await readJsonSafe(jobFile(cwd, jobId, FILES.team)));
         const anyEvidence = manifest !== null || canceled || report !== null;
         if (!anyEvidence)
             return null;
@@ -8242,6 +9290,11 @@ class AgentSmithReader {
             if (orphan === null && cancelRequested && cancelAgeMs > 60_000 && !ownerIsAlive)
                 orphan = CANCELED_ORPHAN;
         }
+        const runStartedAt = Date.parse(manifest?.startedAt ?? manifest?.createdAt ?? '');
+        const team = storedTeam === null ? null : settleTeam(storedTeam, {
+            live: (orphan?.status ?? manifest?.status) === 'running',
+            startedAt: Number.isFinite(runStartedAt) ? runStartedAt : null,
+        });
         const legacySteeredFrom = manifest?.steeredFrom;
         const turn = typeof manifest?.turn === 'number' && Number.isInteger(manifest.turn) && manifest.turn >= 1 ? manifest.turn : 1;
         const continuedFrom = typeof manifest?.continuedFrom === 'string' && manifest.continuedFrom !== ''
@@ -8312,6 +9365,7 @@ class AgentSmithReader {
             ...(Array.isArray(manifest?.staleReads) && manifest.staleReads.length > 0
                 ? { staleReads: manifest.staleReads }
                 : {}),
+            ...(team !== null ? { team } : {}),
         };
         return {
             provider: this.provider,
@@ -8517,4 +9571,4 @@ function asUsage(v) {
 /** Normalize a raw agent-smith job snapshot. */
 function normalize(raw) {
     return smithNormalizer(raw);
-}export{markAcceptancePending as $,AgentSmithReader as A,reportFor as B,cwdFacts as C,DEFAULT_TIMEOUT_MS as D,normalizeDenials as E,FILES as F,deriveOrphan as G,deriveStatus as H,summaryHead as I,failureFields as J,writeAcceptance as K,createMarker as L,MODES as M,jobsDir as N,parseWorkerIndex as O,PROVIDERS as P,getProvider as Q,REASONS as R,STAGE_PROMPTS as S,normalizeContinuationKind as T,reasonFromText as U,fileSig as V,WORKERS_DIR as W,JobWriter as X,effectiveUnrestricted as Y,newJobId$1 as Z,newWorkerId as _,MODE_PRESETS as a,humanDuration as a0,pipeEvents as a1,checksAbortRequested as a2,verdictBlock as a3,runAcceptance as a4,senderOf as a5,taskTitle as a6,markAcceptanceSuperseded as a7,pickHead as a8,compareTurnPriority as a9,computeStaleReads as aa,SMITH_PAYLOAD as ab,isForgeStatus as ac,noticeReason as ad,readJsonSafe as ae,pipelineRecordPath as af,workerIndexPath as ag,checksReason as ah,toolLabel as ai,inheritContinuedProviders as b,jobFile as c,readAcceptance as d,cancelPipeline as e,isWorkerIdle as f,findProvider as g,effectiveDefaultUnrestricted as h,isTerminalStatus as i,jobDir as j,isMode as k,isTerminalForgeStatus as l,missingPipelineError as m,readManifest as n,ownerAlive as o,providerNames as p,normalize as q,readPipeline as r,startPipeline as s,errMessage as t,probeAvailability as u,validateSpec as v,writeJsonAtomic as w,writeAtomic as x,SCHEMA_VERSION as y,validOwnerPid as z};
+}export{effectiveUnrestricted as $,AgentSmithReader as A,writeAtomic as B,SCHEMA_VERSION as C,DEFAULT_TIMEOUT_MS as D,validOwnerPid as E,FILES as F,reportFor as G,cwdFacts as H,normalizeDenials as I,deriveOrphan as J,deriveStatus as K,failureFields as L,MODES as M,writeAcceptance as N,createMarker as O,PROVIDERS as P,withoutAnswer as Q,REASONS as R,STAGE_PROMPTS as S,jobsDir as T,parseWorkerIndex as U,getProvider as V,WORKERS_DIR as W,normalizeContinuationKind as X,reasonFromText as Y,fileSig as Z,JobWriter as _,MODE_PRESETS as a,newJobId$1 as a0,newWorkerId as a1,markAcceptancePending as a2,humanDuration as a3,pipeEvents as a4,checksAbortRequested as a5,verdictBlock as a6,runAcceptance as a7,senderOf as a8,taskTitle as a9,markAcceptanceSuperseded as aa,pickHead as ab,compareTurnPriority as ac,computeStaleReads as ad,SMITH_PAYLOAD as ae,isForgeStatus as af,noticeReason as ag,readJsonSafe as ah,pipelineRecordPath as ai,workerIndexPath as aj,checksReason as ak,toolLabel as al,inheritContinuedProviders as b,jobDir as c,jobFile as d,readAcceptance as e,cancelPipeline as f,isWorkerIdle as g,hasTeam as h,isTerminalStatus as i,jobSummary as j,findProvider as k,effectiveDefaultUnrestricted as l,missingPipelineError as m,isMode as n,isTerminalForgeStatus as o,providerNames as p,readManifest as q,readPipeline as r,startPipeline as s,teamCounts as t,ownerAlive as u,validateSpec as v,normalize as w,errMessage as x,probeAvailability as y,writeJsonAtomic as z};

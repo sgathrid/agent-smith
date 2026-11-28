@@ -98,6 +98,23 @@ ACTIVE and DONE arrive as separate records for the same `step_index`, and only
 ACTIVE carries `tool_info.parameters` — the adapter remembers per-step state so
 the DONE record is not useless on its own.
 
+### agy team observation — `agy-team.ts`
+
+An agy worker can start its own sub-agents (a `/swarm` team, or `invoke_subagent` helpers).
+Agent Smith observes them and never runs or steers them. `agy-team.ts` reads agy's own state,
+read-only, under `~/.gemini/antigravity-cli/brain/<conversation>/.system_generated/` (the root
+is `AGENT_SMITH_AGY_BRAIN`): `swarm/members.json`, `swarm/board.jsonl`, `swarm/plan.json`,
+`subagents/*.json`, and each member's `logs/chunks/transcript/*.jsonl`. It reads only under that
+root, opens no network connection and never throws. It returns null, so nothing is shown, when
+the files are missing or not in the expected shape.
+
+The reader is polled every `AGY_TEAM_POLL_MS` (2 s) while the worker runs, by a `sidecar` hook
+of `runNdjsonWorker` (see Event contract). `createAgyTeamWatch` in `agy.ts` emits a `team`
+event only when the snapshot changes. A `team` snapshot replaces an older one still waiting in the
+`events` queue, so a slow consumer never holds a whole team per poll. The reader reports `working`, `waiting`,
+`done` or `killed`, following agy's own swarm board rules. Readers of `team.json` turn `working` into
+`stopped` when the worker's run has ended or the member has not acted since the turn began (`settleTeam`).
+
 ### The denial trap
 
 agy runs headless and **cannot prompt for tool permission**, so a tool needing
@@ -162,8 +179,8 @@ after 5 s) because `codex exec` only traps `SIGINT` to send `turn/interrupt` and
 record the abort in thread history; other providers use `SIGTERM`→`SIGKILL`.
 
 Events observed live: `thread.started` (`thread_id`), `turn.started`,
-`item.completed` (`item:{id,type:'agent_message',text}`),
-`turn.completed` (`usage:{input_tokens,cached_input_tokens,cache_write_input_tokens,
+`item.completed` (`item:{id,type:'agent_message',text}`; an `agent_message`'s text is read
+from `item.completed` only, so one item is one message), `turn.completed` (`usage:{input_tokens,cached_input_tokens,cache_write_input_tokens,
 output_tokens,reasoning_output_tokens}`). `cached_input_tokens` maps to
 `cacheReadTokens` so consumers can sum across providers. No `total_tokens` — left
 undefined rather than invented.
@@ -363,6 +380,7 @@ looked for.
 |---|---|
 | `AGENT_SMITH_STATE_DIR` | Root for provider-written state. Default `~/.agent-smith/state`. |
 | `AGENT_SMITH_AGY_BIN` / `_CODEX_BIN` / `_OPENCODE_BIN` / `_CLAUDE_BIN` / `_KIMI_BIN` | Binary name or absolute path. |
+| `AGENT_SMITH_AGY_BRAIN` | Root of agy's conversation state that `agy-team.ts` reads. Default `~/.gemini/antigravity-cli/brain`. |
 | `AGENT_SMITH_CODEX_MODEL` / `_CODEX_SANDBOX` | codex `-c model=` / `-s` override. |
 | `AGENT_SMITH_HOME` | Root for alias resolution (`aliases.ts`). Falls back to `~`. Not used by `stateRoot()`. |
 | `AGENT_SMITH_CLAUDE_HOME` / `CLAUDE_CONFIG_DIR` | Claude config dir. Falls back to `~/.claude`. |
@@ -386,14 +404,22 @@ consumer can tail immediately:
 ## Event contract
 
 `providers/types.ts` defines a **self-contained** `ProviderEvent`, `TokenUsage`,
-`JobStatus` and `JobResult`. `ProviderEvent` is a union of nine variants
+`JobStatus` and `JobResult`. `ProviderEvent` is a union of ten variants
 (`started` / `text` / `activity-start` / `activity-update` / `activity-end` /
-`usage` / `notice` / `heartbeat` / `user-message`) with tool input and output
+`usage` / `notice` / `heartbeat` / `user-message` / `team`) with tool input and output
 already truncated to `SpawnSpec.maxOutputChars`, so the store never receives a
 multi-megabyte cargo-clip dump. `heartbeat` is emitted on the live bus every
 `HEARTBEAT_MS` (30 s) and never written to `events.jsonl`. `user-message` is
 emitted when a `liveInput` provider replays a message sent through
-`WorkerHandle.send()`.
+`WorkerHandle.send()`. `team` carries the agy worker's sub-agents (`Team` and
+`MemberView`s) and is emitted only on change, also never written to `events.jsonl`.
+
+### Sidecar hook
+
+`runNdjsonWorker` takes an optional `sidecar(emit)` (in `ndjson.ts`). It runs for the life of
+the child and can observe something beside the stream. Its `emit` puts events on the bus only,
+never in `events.jsonl`, like heartbeats. Its `stop()` runs once at exit, before `buildResult`,
+and may emit one last time. Only agy uses it, for the team observation above.
 
 Two deliberate choices:
 
@@ -411,3 +437,11 @@ Anthropic reports `cache_creation_input_tokens`. Inventing a total in any one
 adapter would make cross-provider totals wrong in a way that is hard to notice.
 
 `JobResult.response` is the final assistant message for every provider, not all prose from the run.
+
+An assistant `text` event carries `messageKey`, naming the provider message it belongs to: the
+agy step index, the claude and opencode message id, the codex `agent_message` item id, a
+per-message counter for kimi. All texts of one message share it. `JobResult.answerKey` is the
+key of the message `response` came from. It is absent when the response came from a provider's
+result field with no streamed text, or from text with no key. When claude's result field
+replaces the last streamed message, the key stays that message's. The forge writer uses the pair to
+keep the answer in `result.md` alone (see docs/ARCHITECTURE.md).

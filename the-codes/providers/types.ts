@@ -1,3 +1,4 @@
+import type { MemberView, Team } from '../surfaces/mod/types/index.d.ts';
 export interface TokenUsage {
   inputTokens?: number;
   outputTokens?: number;
@@ -39,14 +40,17 @@ export interface ActivityRef {
 
 export type ProviderEvent =
   | { kind: 'started'; at: string; conversationId?: string; model?: string; raw?: unknown }
-  | { kind: 'text'; at: string; text: string; stream: 'assistant' | 'thinking'; delta?: boolean }
+  /** `messageKey` names the provider message the text belongs to; texts of one message share it. */
+  | { kind: 'text'; at: string; text: string; stream: 'assistant' | 'thinking'; delta?: boolean; messageKey?: string }
   | { kind: 'activity-start'; at: string; activity: ActivityRef }
   | { kind: 'activity-update'; at: string; activity: ActivityRef }
   | { kind: 'activity-end'; at: string; activity: ActivityRef; status: ActivityStatus; durationSeconds?: number }
   | { kind: 'usage'; at: string; usage: TokenUsage }
   | { kind: 'notice'; at: string; level: 'info' | 'warn' | 'error'; message: string; raw?: unknown }
   | { kind: 'heartbeat'; at: string; pid?: number }
-  | { kind: 'user-message'; at: string; text: string };
+  | { kind: 'user-message'; at: string; text: string }
+  /** The latest snapshot of the worker's own sub-agents, with a bounded detail view per member. Never written to events.jsonl. */
+  | { kind: 'team'; at: string; team: Team; views: readonly MemberView[] };
 
 export type JobStatus =
   | 'success'
@@ -72,6 +76,8 @@ export interface JobResult {
   exitCode: number | null;
   signal: NodeJS.Signals | null;
   response: string;
+  /** The `messageKey` of the text events `response` came from; absent when it came from no keyed message. */
+  answerKey?: string;
   error?: string;
   deniedActions?: DeniedAction[];
   usage?: TokenUsage;

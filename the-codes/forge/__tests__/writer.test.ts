@@ -18,7 +18,7 @@ import { normalize } from '../../harness/normalize.ts';
 import { readAllObservedJobs } from './observe.ts';
 import { writeAtomic, writeJsonAtomic, appendLine, createMarker } from '../atomic.ts';
 import { FILES, SCHEMA_VERSION, jobDir, jobFile, type ForgeManifest } from '../format.ts';
-import { JobWriter, appendBounded, summaryHead } from '../writer.ts';
+import { JobWriter, appendBounded } from '../writer.ts';
 import type { JobResult, ProviderEvent } from '../../providers/types.js';
 
 function repo(): string {
@@ -65,7 +65,7 @@ function result(over: Partial<JobResult> = {}): JobResult {
   };
 }
 
-test('fragmented assistant output stays coherent and final summary reaches every reader', async () => {
+test('fragmented assistant output stays coherent, and a finished job has no latestSummary', async () => {
   const r = repo(); const id = 'implement-smith-abcd1234'; const w = start(r);
   w.onEvent({ kind: 'text', at: now(), stream: 'assistant', text: 'Found the ' });
   w.onEvent({ kind: 'text', at: now(), stream: 'assistant', text: 'edge case.' });
@@ -74,8 +74,8 @@ test('fragmented assistant output stays coherent and final summary reaches every
   assert.equal(raw?.payload.latestSummary, 'Found the edge case.');
   w.finish(result({ response: 'Final findings from the worker.' }), 'Final findings from the worker.');
   raw = await new AgentSmithReader().read(r, id);
-  assert.equal(raw?.payload.latestSummary, 'Final findings from the worker.');
-  assert.equal(raw?.payload.summarySource, 'worker');
+  assert.equal(raw?.payload.latestSummary, null);
+  assert.equal(raw?.payload.summarySource, null);
 });
 
 test('writeAtomic leaves no temp file behind on success', () => {
@@ -799,7 +799,7 @@ test('tool errors are counted in progress and the manifest, and do not fail the 
   assert.equal(m.toolCalls, 3);
 });
 
-test('latestSummary shows only the current message while running, and the HEAD of the final response', () => {
+test('latestSummary shows only the current message while running, and is null once finished', () => {
   const r = repo();
   const w = startIn(r, r, 'review');
   w.onEvent({ kind: 'text', at: now(), stream: 'assistant', text: 'I am waiting for npm test to finish.' });
@@ -808,27 +808,59 @@ test('latestSummary shows only the current message while running, and the HEAD o
   w.onEvent({ kind: 'text', at: now(), stream: 'assistant', text: 'Tests pass. ' });
   w.onEvent({ kind: 'text', at: now(), stream: 'assistant', text: 'Writing the report.' });
   assert.equal(w.snapshot()?.latestSummary, 'Tests pass. Writing the report.');
+  w.onEvent({ kind: 'text', at: now(), stream: 'assistant', text: 'Status: DONE\n\nShip it.', messageKey: 'm9' });
+  assert.equal(w.snapshot()?.latestSummary, 'Ship it.', 'a new message replaces the old one');
 
-  const response = `Status: DONE\n\nShip it: no defects found.\n\n${'Detail line. '.repeat(80)}\n\n## Verification\n\nAll checks passed.`;
-  const m = w.finish(result({ response }), response);
-  assert.ok((m.latestSummary ?? '').length <= 1_000);
-  assert.equal(m.latestSummary, 'Ship it: no defects found.');
-  assert.equal(m.summarySource, 'worker');
+  const response = 'Status: DONE\n\nShip it.';
+  const m = w.finish(result({ response, answerKey: 'm9' }), response);
+  assert.equal(m.latestSummary, null);
+  assert.equal(m.summarySource, null);
+  const progress = JSON.parse(readFileSync(jobFile(r, w.jobId, FILES.progress), 'utf8'));
+  assert.equal(progress.latestSummary, null);
 });
 
-test('summaryHead cuts at a paragraph, else a line, else raw', () => {
-  assert.equal(summaryHead('short', 10), 'short');
-  assert.equal(summaryHead('aaaa\n\nbbbb\n\ncc', 9), 'aaaa');
-  assert.equal(summaryHead('aaaa\nbbbb', 7), 'aaaa');
-  assert.equal(summaryHead('aaaa\nbbbb\ncccc', 9), 'aaaa\nbbbb');
-  assert.equal(summaryHead('abcdefghij', 4), 'abcd');
+test('a job that ends with no report keeps its last message as the summary', () => {
+  const r = repo();
+  const w = startIn(r, r, 'review');
+  w.onEvent({ kind: 'text', at: now(), stream: 'assistant', text: 'Running cargo test; waiting.' });
+  const m = w.finish(result({ ok: false, status: 'timeout', response: '' }), null);
+  assert.deepEqual([m.latestSummary, m.summarySource], ['Running cargo test; waiting.', 'worker']);
 });
 
-test('summaryHead skips a leading Status line', () => {
-  assert.equal(summaryHead('Status: DONE\n\nFixed the bug in parser.ts.', 100), 'Fixed the bug in parser.ts.');
-  assert.equal(summaryHead('Status: DONE_WITH_CONCERNS\nPartial fix.', 100), 'Partial fix.');
-  assert.equal(summaryHead('Status: BLOCKED', 100), '');
-  assert.equal(summaryHead('Report body\nStatus: DONE', 100), 'Report body\nStatus: DONE');
+function viewOf(r: string, w: JobWriter): { timeline: { kind: string; text?: string; tool?: string; messageKey?: string }[]; transcript: string[] } {
+  return JSON.parse(readFileSync(jobFile(r, w.jobId, FILES.view), 'utf8'));
+}
+
+test('a finished answer lives in result.md alone, not in the timeline', () => {
+  const r = repo(); const w = start(r); const at = now();
+  w.onEvent({ kind: 'text', at, stream: 'assistant', text: 'Reading ', delta: true, messageKey: '1' });
+  w.onEvent({ kind: 'text', at, stream: 'assistant', text: 'the parser.', delta: true, messageKey: '1' });
+  w.onEvent({ kind: 'activity-start', at, activity: { stepIndex: 2, tool: 'run_command', input: 'npm test' } });
+  w.onEvent({ kind: 'activity-end', at, activity: { stepIndex: 2, tool: 'run_command', output: 'ok' }, status: 'done' });
+  w.onEvent({ kind: 'text', at, stream: 'assistant', text: 'Running the checks; waiting.', delta: true, messageKey: '3' });
+  w.onEvent({ kind: 'text', at, stream: 'assistant', text: '# Report\n\n', delta: true, messageKey: '4' });
+  w.onEvent({ kind: 'text', at, stream: 'assistant', text: 'All green.', delta: true, messageKey: '4' });
+  const report = '# Report\n\nAll green.';
+  const running = viewOf(r, w).timeline.filter((e) => e.kind === 'assistant').map((e) => e.text);
+  assert.deepEqual(running, ['Reading the parser.', 'Running the checks; waiting.', '# Report\n\nAll green.'], 'deltas join within a message, never across');
+  w.finish(result({ response: report, answerKey: '4' }), report);
+  const view = viewOf(r, w);
+  assert.deepEqual(view.timeline.map((e) => e.kind === 'tool' ? e.tool : e.text), ['Reading the parser.', 'run_command', 'Running the checks; waiting.']);
+  assert.equal(readFileSync(jobFile(r, w.jobId, FILES.report), 'utf8'), report);
+});
+
+test('without an answerKey, or without a report, the timeline keeps every message', () => {
+  const r = repo(); const at = now();
+  const a = start(r, 'implement-smith-aaaa1111');
+  a.onEvent({ kind: 'text', at, stream: 'assistant', text: 'Part one, ', delta: true });
+  a.onEvent({ kind: 'text', at, stream: 'assistant', text: 'part two.', delta: true });
+  a.finish(result({ jobId: a.jobId, response: 'Part one, part two.' }), 'Part one, part two.');
+  assert.deepEqual(viewOf(r, a).timeline.map((e) => e.text), ['Part one, part two.'], 'unkeyed deltas still join');
+
+  const b = start(r, 'implement-smith-bbbb2222');
+  b.onEvent({ kind: 'text', at, stream: 'assistant', text: 'ok', messageKey: 'm1' });
+  b.finish(result({ jobId: b.jobId, response: 'ok', answerKey: 'm1' }), null);
+  assert.deepEqual(viewOf(r, b).timeline.map((e) => e.text), ['ok'], 'an answer result.md did not receive stays in the timeline');
 });
 
 test('a fast failure with no tool calls is marked failedEarly; a slow or busy one is not', () => {

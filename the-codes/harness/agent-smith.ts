@@ -13,6 +13,8 @@ import {
   type ForgeManifest,
 } from '../forge/format.ts';
 import type { JobStateReader, RawJobState } from './types.ts';
+import { parseTeam } from '../surfaces/mod/hooks/canonical.ts';
+import { settleTeam } from '../surfaces/mod/hooks/team.ts';
 
 export const SMITH_PAYLOAD = {
   provider: 'provider',
@@ -107,6 +109,8 @@ export class AgentSmithReader implements JobStateReader {
       digest?: unknown;
     }>(jobFile(cwd, jobId, FILES.progress));
 
+    const storedTeam = parseTeam(await readJsonSafe<unknown>(jobFile(cwd, jobId, FILES.team)));
+
     const anyEvidence = manifest !== null || canceled || report !== null;
     if (!anyEvidence) return null;
 
@@ -121,6 +125,12 @@ export class AgentSmithReader implements JobStateReader {
       const ownerIsAlive = ownerAlive(manifest);
       if (orphan === null && cancelRequested && cancelAgeMs > 60_000 && !ownerIsAlive) orphan = CANCELED_ORPHAN;
     }
+
+    const runStartedAt = Date.parse(manifest?.startedAt ?? manifest?.createdAt ?? '');
+    const team = storedTeam === null ? null : settleTeam(storedTeam, {
+      live: (orphan?.status ?? manifest?.status) === 'running',
+      startedAt: Number.isFinite(runStartedAt) ? runStartedAt : null,
+    });
 
     const legacySteeredFrom = (manifest as (ForgeManifest & { steeredFrom?: unknown }) | null)?.steeredFrom;
     const turn = typeof manifest?.turn === 'number' && Number.isInteger(manifest.turn) && manifest.turn >= 1 ? manifest.turn : 1;
@@ -195,6 +205,7 @@ export class AgentSmithReader implements JobStateReader {
       ...(Array.isArray(manifest?.staleReads) && manifest.staleReads.length > 0
         ? { staleReads: manifest.staleReads }
         : {}),
+      ...(team !== null ? { team } : {}),
     };
 
     return {

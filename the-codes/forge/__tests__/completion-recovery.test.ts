@@ -132,21 +132,34 @@ test('invalid recovered identity retains the existing conversation', () => {
   assert.equal(JSON.parse(readFileSync(file, 'utf8')).conversation, 'existing-session');
 });
 
-test('recovery fails a writing job whose cwd is gone, keeps a review, and summarises from the head', () => {
+test('recovery fails a writing job whose cwd is gone and keeps a review', () => {
   for (const [mode, expected] of [['implement', 'failed'], ['review', 'succeeded']] as const) {
     const { repo, jobId, file, result } = fixture();
     const gone = mkdtempSync(path.join(tmpdir(), 'completion-recovery-cwd-'));
     rmSync(gone, { recursive: true, force: true });
     writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, 'utf8')), mode, cwd: gone }));
-    const head = 'Verdict: merge.';
-    writeResultFile(result.stateDir, { ...result, response: `Status: DONE\n\n${head}\n\n${'Long detail. '.repeat(120)}` });
+    writeResultFile(result.stateDir, { ...result, response: `Status: DONE\n\nVerdict: merge.\n\n${'Long detail. '.repeat(120)}` });
     assert.equal(reconcileOrphan(repo, jobId), true);
     const recovered = JSON.parse(readFileSync(file, 'utf8'));
     assert.equal(recovered.status, expected, mode);
     assert.equal(recovered.cwdMissingAtFinish, true);
     assert.equal(recovered.changedFilesUnknown, true);
-    assert.equal(recovered.latestSummary, head);
   }
+});
+
+test('recovery keeps the answer in result.md alone and leaves no summary', () => {
+  const { repo, jobId, file, result } = fixture();
+  const view = jobFile(repo, jobId, FILES.view);
+  const at = new Date().toISOString();
+  writeFileSync(view, JSON.stringify({ ...JSON.parse(readFileSync(view, 'utf8')), timeline: [
+    { sequence: 0, kind: 'assistant', at, text: 'Running the checks.', messageKey: '1' },
+    { sequence: 1, kind: 'assistant', at, text: 'Verdict: merge.', messageKey: '2' },
+  ] }));
+  writeResultFile(result.stateDir, { ...result, response: 'Verdict: merge.', answerKey: '2' });
+  assert.equal(reconcileOrphan(repo, jobId), true);
+  assert.equal(JSON.parse(readFileSync(file, 'utf8')).latestSummary, null);
+  assert.deepEqual(JSON.parse(readFileSync(view, 'utf8')).timeline.map((e: { text: string }) => e.text), ['Running the checks.']);
+  assert.equal(readFileSync(jobFile(repo, jobId, FILES.report), 'utf8'), 'Verdict: merge.');
 });
 
 test('recovery counts only completed edits as writing; the digest is a fallback for old files', () => {

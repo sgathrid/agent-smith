@@ -77,6 +77,8 @@ Start with a review in a repository that has changes:
 
 Ada appears in Claude Code's task list and the live worker band above your prompt. You can keep talking to Claude while the review runs.
 
+When an agy worker starts sub-agents of its own, such as a `/swarm` team, the band lists them under its row and `/forge` shows them. You can open one to read what it did, but you cannot message or steer it.
+
 | To… | Do this |
 |---|---|
 | See this session's workers | Run `/forge` |

@@ -165,7 +165,7 @@ test('conciseStatus + earlierTurn: 4-turn status overhead (report text excluded)
   const earlier = [1, 2, 3].map(t => makeDetail(t, {
     turn: t,
     latestSummary: t < 3 ? `Turn ${t} completed its piece of the work. `.repeat(4) : null,
-    report: t === 3 ? '\nFirst line of turn 3 report should become summary.\nSecond line ignored.' : `Full report for turn ${t}.`,
+    report: t === 3 ? '\nStatus: DONE\nTurn 3 opened with this.\nThen this.' : `Full report for turn ${t}.`,
   }));
   const head = makeDetail(4, {
     turn: 4,
@@ -197,7 +197,7 @@ test('conciseStatus + earlierTurn: 4-turn status overhead (report text excluded)
     assert.equal('report' in et, false);
     assert.equal('reportPath' in et, false);
   }
-  assert.equal(payload.earlierTurns[2]!.summary, 'First line of turn 3 report should become summary.');
+  assert.equal(payload.earlierTurns[2]!.summary, 'Turn 3 opened with this. Then this.');
 
   const detailedEarlier = earlierTurn(earlier[2]!, '/repo/.agent-smith/jobs/implement-smith-3/result.md', 'detailed') as Record<string, unknown>;
   assert.equal(detailedEarlier.report, earlier[2]!.report);

@@ -72,3 +72,33 @@ export function oneLine(s: string, max = 400): string {
   const t = sanitizeText(s).replace(/\s+/g, ' ').trim();
   return clip(t, Math.max(0, max));
 }
+
+export const SUMMARY_CHARS = 1_000;
+
+/** A job's short summary: its report's opening once it has a report, else the worker's last message. */
+export function jobSummary(report: string | null | undefined, lastMessage: string | null | undefined): string | null {
+  return reportSummary(report ?? '') || lastMessage?.trim() || null;
+}
+
+/** A short summary of a worker's report or current message: its opening, without a leading
+ * `Status:` line, cut at a paragraph or line boundary within `max`. */
+export function reportSummary(text: string, max = SUMMARY_CHARS): string {
+  const t = text.trim().replace(/^Status:[^\n]*(?:\n|$)/, '').trim();
+  if (t.length <= max) return t;
+  const head = t.slice(0, max);
+  if (t[max] === '\n') return head.trim();
+  for (const sep of ['\n\n', '\n']) {
+    const i = head.lastIndexOf(sep);
+    if (i >= 0 && head.slice(0, i).trim() !== '') return head.slice(0, i).trim();
+  }
+  return head.trim();
+}
+
+export function prettyJson(s: string): string {
+  try {
+    const v: unknown = JSON.parse(s);
+    return typeof v === 'object' && v !== null ? JSON.stringify(v, null, 2) : s;
+  } catch {
+    return s;
+  }
+}

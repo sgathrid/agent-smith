@@ -52,6 +52,7 @@ Only variables the code reads.
 | Variable | Read by | Default | Effect |
 |---|---|---|---|
 | `AGENT_SMITH_AGY_BIN` | `providers/agy.ts` | `agy` | Binary to exec/probe. A value containing `/` is checked directly for executability instead of searched on `PATH`. |
+| `AGENT_SMITH_AGY_BRAIN` | `providers/agy-team.ts` | `~/.gemini/antigravity-cli/brain` | Root of agy's conversation state. The team observer reads each worker's sub-agents from `<root>/<conversation>/.system_generated/` (read-only). |
 | `AGENT_SMITH_CODEX_BIN` | `providers/codex.ts` | `codex` | Same, for codex. |
 | `AGENT_SMITH_OPENCODE_BIN` | `providers/opencode.ts` | `opencode` | Same, for opencode. |
 | `AGENT_SMITH_CLAUDE_BIN` | `providers/claude.ts` | `claude` | Same, for the claude worker. |
@@ -125,6 +126,8 @@ not the Kimi CLI.
 | Legacy orphan rule | 2 x default = 90 min silence (no `ownerPid`) | `format.ts` |
 | Stale cancel | marker older than 60 s with no live owner | `harness/agent-smith.ts` |
 | `HEARTBEAT_MS` | 30 000; the process owner records `progress.json` `lastAliveAt` while the worker CLI runs | `providers/ndjson.ts`, `mod/hooks/stale.ts` |
+| Team poll (agy) | `AGY_TEAM_POLL_MS` = 2 000 while the worker runs; emits only on change | `providers/agy.ts` |
+| Team members kept | `TEAM_MEMBERS_CAP` = 64 member views per job | `forge/writer.ts` |
 | Liveness `silent` (`attention`) | `STALL_GRACE_MS` = 15 min without a provider event, unless a tool call is open (`in-tool`) | `mod/hooks/stale.ts` |
 | Liveness `dead` (`attention`) | `ALIVE_GRACE_MS` = 2 min without a heartbeat while running | `mod/hooks/stale.ts` |
 | `FAILED_EARLY_MS` | 20 000; a failure this soon with no tool call is `failedEarly` | `forge/format.ts` |
@@ -263,12 +266,12 @@ then newest.
 Concise rows (compact JSON):
 - Settled: `name, jobId, turn` (only if `> 1`), `status, provider, model, mode, summary` (<= 160 chars), `durationMs, finishedAt, acceptance` (verdict), `changedFileCount` (only if `> 0`), `warningCount?`, `resumable` (on `failed` rows), and finish evidence fields when they apply (`toolErrors, failedEarly, changedFilesUnknown, cwdMissingAtFinish`).
 - Running: `name, jobId, turn` (only if `> 1`), `status, provider, model, mode, liveness, lastActivity, digest, elapsedMs, toolCalls, pendingMessages?`.
-Concise rows omit `workerId`, `taskStatus`, `chainStartedAt`, `startedAt` (settled), `continuedFrom`, `continuationKind`, `supersededBy`, and `followedBy`.
+Concise rows omit `workerId`, `taskStatus`, `chainStartedAt`, `startedAt` (settled), `continuedFrom`, `continuationKind`, `supersededBy`, `followedBy` and `team`.
 Detailed rows (`JobSummary`): `jobId, name, workerId, turn, role, latestSummary, summarySource,
 source, status, taskStatus, provider, mode, model, task, toolCalls, currentActivity, lastActivity, startedAt,
-updatedAt, finishedAt, chainStartedAt?, continuedFrom?, continuationKind?, supersededBy?, followedBy?, pendingMessages?, warnings[], resumable?, unrestricted?`, the same evidence fields,
+updatedAt, finishedAt, chainStartedAt?, continuedFrom?, continuationKind?, supersededBy?, followedBy?, pendingMessages?, warnings[], resumable?, unrestricted?`, `team` counts (only when the worker has sub-agents), the same evidence fields,
 `lastEventAt`, `lastAliveAt`, and for running jobs `liveness`. `latestSummary` is
-untrusted: the worker's current message while it runs, the head of its final response (after any leading `Status:` line) once done.
+untrusted: the worker's current message while it runs, the opening of its report (after any leading `Status:` line) once done. The concise `summary` is the same opening, trimmed.
 
 ### `status` (read-only, structured)
 Params: `id` (required; a worker name or `workerId` resolves to the worker's latest turn; a `jobId` resolves to that exact turn, following only `supersededBy` steer replacements, not `followedBy`), `wait_ms` 1-60000 (long-poll while running), `response_format`
@@ -277,18 +280,19 @@ Concise result: `jobId, workerId, name, turn` (only if `> 1`), `status, provider
 (check names), pending?, running?, reason?}` (`running`: the checks running now, while `pending`),
 `supersededBy?` (only if set), `resolvedFrom?` (only if set), `liveness` and `lastActivity` (running jobs),
 `durationMs, pendingMessages?`, `changedFileCount`, `changedFiles` (first 20), `changedFilesNote?`,
+`team {total, working, waiting, stopped, done, failed, killed}` (only when the worker has sub-agents; counts only; `stopped`: the member was mid-work when the worker's run ended, or has not acted since this turn began),
 finish evidence fields (`toolErrors, failedEarly, changedFilesUnknown, cwdMissingAtFinish`), `staleReads?`,
 `resumable` (when not running and not succeeded), `reason`, `error` (<= 500 chars), `warnings` (deduped strings),
-`earlierTurns` (`[{turn, jobId, status, summary (<= 120 chars)}]`), `report`
+`earlierTurns` (`[{turn, jobId, status, summary (<= 120 chars, the opening of that turn's report)}]`), `report`
 (first 2 000 chars; a trailing note says it was cut and `reportTruncated` is true), `reportPath`,
-`summary` only when the report does not already contain it, and with `wait_ms`: `waited`, `stillRunning`. Null fields are omitted.
+`summary` (the worker's current message, while it runs), and with `wait_ms`: `waited`, `stillRunning`. Null fields are omitted.
 `include_diff` (either format) adds `diff`: a unified diff of `changedFiles` against the turn's spawn-time
 `gitBaseline.head` (for a worker name, the union across its turns against the earliest turn's), run in the job's `cwd`, capped at 40 000 chars on a line boundary. `diffNote` says how
 to see the rest (`git diff <head> -- <file>`), lists new untracked files (which a diff cannot show), or
 explains why there is no diff (no git baseline, job still running, no changes; `diff` is then null or empty).
 
 Liveness, for running jobs (`mod/hooks/stale.ts` `livenessOf`, the rule the band uses too):
-`liveness {state, silentForMs, tool?}` with `state` one of `active` (an event in the last 15 min),
+`liveness {state, silentForMs, tool?}` with `state` one of `active` (an event in the last 15 min; a working team member's event counts too),
 `in-tool` (a tool call started and not ended; `tool` names it, e.g. `cargo test`), `silent` (no
 event for 15 min while the worker process runs, or, for a job from an older version without a
 heartbeat, no event for 15 min), `dead` (no heartbeat for 2 min though the job still reads
@@ -303,13 +307,13 @@ unknown, not none), `cwdMissingAtFinish` (the cwd was gone at finish; a writing 
 with reason `working directory gone`).
 The diff is evidence, not attribution: parallel workers in one tree see each other's edits, and edits that
 were already uncommitted at spawn in a changed file are included.
-Detailed result (the full record): `JobSummary` fields plus `report` (first 8 000 chars), `reportPath`, `reportTruncated`, `error`,
+Detailed result (the full record): `JobSummary` fields (`latestSummary` and `summarySource` only while the job runs; a finished job's report is not repeated) plus `report` (first 8 000 chars), `reportPath`, `reportTruncated`, `error`,
 `exitCode`, `unrestricted`, `pipeline`, `stage`, `usage`, `conversation`, `effort`, `cwd`,
 `modelRequested/modelResolved/modelSource`, `preambleApplied`, `sandbox`, `sandboxFlags`,
 `readOnlyRequested/readOnlyEnforced`, `cancellable`, `gitBaseline?`, `changedFiles?`,
 `changedFilesTruncated?`, the evidence fields above, `liveness?`, `earlierTurns?` (concise fields plus `report`, `reportPath`), `acceptance
 {state:'accepted|rejected|unchecked', checks[], at?, pending?, budgetMs?, running?, startedAt?,
-reason?}`, and with `wait_ms`: `waited:true`, `stillRunning`.
+reason?}`, `team` counts (only when the worker has sub-agents), and with `wait_ms`: `waited:true`, `stillRunning`.
 
 ### `cancel` (destructive, idempotent)
 Params: `id` (a worker name, job ID, or pipeline run ID; a run record is tried first; a worker name resolves to the worker's latest turn, while a `jobId` resolves to that turn, following only `supersededBy`). Waits up to 5 s for the job or run to

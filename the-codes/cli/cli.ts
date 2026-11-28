@@ -259,7 +259,7 @@ export async function cmdStatus(jobId: string, repo = process.cwd()): Promise<nu
     const detail = await service.resolveWorker(jobId);
     process.stdout.write(`id        ${detail.jobId}\nstatus    ${detail.status}\nname      ${detail.name || '-'}\nrole      ${detail.role ?? detail.mode ?? '-'}\ntask      ${detail.task ?? '-'}\nprovider  ${detail.provider ?? '-'}\nmode      ${detail.mode ?? '-'}\nrepo      ${root}\n`);
     if (detail.currentActivity !== null) process.stdout.write(`activity  ${detail.currentActivity.tool} (${detail.currentActivity.status})\n`);
-    if (detail.latestSummary !== null && detail.summarySource === 'worker') process.stdout.write(`summary   [worker] ${detail.latestSummary}\n`);
+    if (detail.status === 'running' && detail.latestSummary !== null) process.stdout.write(`summary   [worker] ${detail.latestSummary}\n`);
     if (detail.report !== null) process.stdout.write(`\n${detail.report}\n`);
     if (detail.error !== null) process.stdout.write(`error     ${detail.error}\n`);
     return EXIT.ok;

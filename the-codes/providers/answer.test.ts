@@ -141,3 +141,31 @@ test('answer rule table', async (t) => {
     assert.equal(explicitEmptyBlocks.value(), '');
   });
 });
+
+test('answerKey names the message the answer came from', () => {
+  const streamed = createAnswer('agy');
+  streamed.text('Running the checks; ', '3');
+  streamed.tool('run_command');
+  streamed.text('All ', '7');
+  streamed.text('green.', '7');
+  assert.equal(streamed.answerKey(), '7');
+
+  const replaced = createAnswer('claude');
+  replaced.text('Short final', 'msg_1');
+  replaced.providerFinal('Full authoritative report', 'final-message');
+  assert.equal(replaced.value(), 'Full authoritative report');
+  assert.equal(replaced.answerKey(), 'msg_1');
+
+  const fieldOnly = createAnswer('agy');
+  fieldOnly.providerFinal('only in field', 'run-prose');
+  assert.equal(fieldOnly.answerKey(), undefined);
+
+  const unkeyed = createAnswer('claude');
+  unkeyed.text('final');
+  assert.equal(unkeyed.answerKey(), undefined);
+
+  const cleared = createAnswer('claude');
+  cleared.text('answer', 'm1');
+  cleared.tool('Bash');
+  assert.equal(cleared.answerKey(), undefined);
+});

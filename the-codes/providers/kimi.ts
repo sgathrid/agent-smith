@@ -154,6 +154,7 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
     onEvent: () => [],
   };
   let step = 0;
+  let messages = 0;
   const toolSteps = new Map<string, number>();
   const toolNames = new Map<string, string>();
   const started = new Set<string>();
@@ -239,8 +240,9 @@ export function createKimiTranslator(maxChars: number): KimiTranslator {
         if (content.trim() === '') {
           if (!hasAnyCall) answer.emptyMessage();
         } else {
-          answer.text(content);
-          out.push({ kind: 'text', at, text: content, stream: 'assistant' });
+          const messageKey = `m${++messages}`;
+          answer.text(content, messageKey);
+          out.push({ kind: 'text', at, text: content, stream: 'assistant', messageKey });
         }
       }
 
@@ -384,7 +386,7 @@ export function buildResult(args: {
     }
   }
 
-  const out = jobResult({ provider: 'kimi', jobId, status, error, exit, response, startedAtMs, durationMs, stateDir });
+  const out = jobResult({ provider: 'kimi', jobId, status, error, exit, response, answerKey: tx.answer.answerKey(), startedAtMs, durationMs, stateDir });
   if (tx.usage !== undefined) out.usage = tx.usage;
   const raw: Record<string, unknown> = {};
   if (tx.sessionId !== undefined) raw['sessionId'] = tx.sessionId;

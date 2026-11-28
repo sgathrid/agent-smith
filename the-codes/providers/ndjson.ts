@@ -149,6 +149,16 @@ export interface EventBus {
   close(): void;
 }
 
+function replaceQueuedTeam(queue: ProviderEvent[], event: ProviderEvent): void {
+  if (event.kind !== 'team') return;
+  const prior = queue.findIndex((e) => e.kind === 'team');
+  if (prior >= 0) queue.splice(prior, 1);
+}
+
+function stopSidecarSafely(sidecar: { stop(): void } | undefined): void {
+  try { sidecar?.stop(); } catch {}
+}
+
 export function createEventBus(maxQueue = 4096): EventBus {
   const listeners = new Set<(e: ProviderEvent) => void>();
   const queue: ProviderEvent[] = [];
@@ -167,6 +177,7 @@ export function createEventBus(maxQueue = 4096): EventBus {
       w({ value: event, done: false });
       return;
     }
+    replaceQueuedTeam(queue, event);
     if (queue.length >= maxQueue) queue.shift();
     queue.push(event);
   }
@@ -496,6 +507,7 @@ export function jobResult(args: {
   error: string | undefined;
   exit: ExitInfo;
   response: string;
+  answerKey?: string | undefined;
   startedAtMs: number;
   durationMs: number;
   stateDir: string;
@@ -514,6 +526,7 @@ export function jobResult(args: {
     finishedAt: nowIso(),
     stateDir: args.stateDir,
   };
+  if (args.answerKey !== undefined) out.answerKey = args.answerKey;
   if (error !== undefined) out.error = error;
   return out;
 }
@@ -531,6 +544,12 @@ export interface NdjsonWorkerConfig {
   buildResult(ctx: { jobId: string; startedAtMs: number; stateDir: string; exit: ExitInfo }): JobResult;
   afterResult?(result: JobResult): ProviderEvent[];
   input?: LiveInput;
+  /**
+   * Observes something beside the stream for the life of the child. `emit` puts
+   * an event on the bus only, never in events.jsonl (like heartbeats); `stop`
+   * runs once at exit, before buildResult, and may emit a last time.
+   */
+  sidecar?(emit: (event: ProviderEvent) => void): { stop(): void };
 }
 
 export interface LiveInput {
@@ -558,6 +577,7 @@ export async function runNdjsonWorker(cfg: NdjsonWorkerConfig): Promise<WorkerHa
     publish([{ kind: 'notice', at: nowIso(), level, message }]);
 
   if (cfg.preamble !== undefined) publish(cfg.preamble);
+  const sidecar = cfg.sidecar?.((e) => bus.emit(e));
 
   const startedAtMs = Date.now();
   const proc = await spawnWorker({
@@ -598,6 +618,7 @@ export async function runNdjsonWorker(cfg: NdjsonWorkerConfig): Promise<WorkerHa
   });
 
   void proc.exited.then(({ code, signal }) => {
+    stopSidecarSafely(sidecar);
     proc.closeLog();
     const exit: ExitInfo = { code, signal, killReason: proc.killReason, stderr: proc.stderrTail() };
     if (proc.spawnError !== undefined) exit.spawnError = proc.spawnError;

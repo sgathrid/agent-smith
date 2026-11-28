@@ -28,6 +28,11 @@ import type { RunFn } from './discovery.ts';
 import { exitReason } from '../surfaces/mod/hooks/reasons.ts';
 import { deniedText, noResultText, stderrClause } from './failure-text.ts';
 import { createAnswer, emptyResponseVerdict, type Answer } from './answer.ts';
+import { createAgyTeamReader, type AgyTeamRead } from './agy-team.ts';
+
+function withoutStamps(output: unknown): unknown {
+  return typeof output === 'string' ? output.replace(/^(?:Created|Completed) At:[^\n]*\n?/gm, '') : output;
+}
 
 export function agyBinary(): string {
   return process.env['AGENT_SMITH_AGY_BIN'] ?? 'agy';
@@ -331,7 +336,7 @@ export function createAgyTranslator(maxChars: number) {
         if (delta !== undefined) {
           answer.text(delta, String(stepIndex));
           if (delta !== '') {
-            out.push({ kind: 'text', at, text: delta, stream: 'assistant', delta: true });
+            out.push({ kind: 'text', at, text: delta, stream: 'assistant', delta: true, messageKey: String(stepIndex) });
           }
         }
         return out;
@@ -368,7 +373,7 @@ export function createAgyTranslator(maxChars: number) {
             raw: { stepIndex, error: info?.error },
           });
         }
-        const output = preview(info?.output ?? info?.error?.message, maxChars);
+        const output = preview(withoutStamps(info?.output) ?? info?.error?.message, maxChars);
         const ref: ActivityRef = { stepIndex, tool: toolName };
         if (mem.input !== undefined) ref.input = mem.input;
         if (output !== undefined) ref.output = output.text;
@@ -532,7 +537,7 @@ export function buildResult(args: {
     error = exit.code === null ? `exited on ${exit.signal ?? 'a signal'}` : exitReason(exit.code);
   }
 
-  const out = jobResult({ provider: 'agy', jobId, status, error, exit, response, startedAtMs, durationMs, stateDir });
+  const out = jobResult({ provider: 'agy', jobId, status, error, exit, response, answerKey: args.answer.answerKey(), startedAtMs, durationMs, stateDir });
   if (distinctDenials.length > 0) out.deniedActions = distinctDenials;
   if (usage !== undefined) out.usage = usage;
   if (resultEvent !== undefined) out.raw = resultEvent;
@@ -594,6 +599,101 @@ export async function listAgyModels(run: RunFn, options?: ListModelsOptions): Pr
   }
 }
 
+export const AGY_TEAM_POLL_MS = 2_000;
+
+export interface AgyTeamDeps {
+  readonly createReader: typeof createAgyTeamReader;
+  readonly pollMs: number;
+}
+
+export interface AgyTeamWatch {
+  start(conversationId: string): void;
+  tick(nowMs: number): void;
+  stop(): void;
+}
+
+function teamChanged(prev: AgyTeamRead | null, next: AgyTeamRead): boolean {
+  const key = (read: AgyTeamRead): string => JSON.stringify([{ ...read.team, updatedAt: 0 }, read.views]);
+  return prev === null || key(prev) !== key(next);
+}
+
+export function createAgyTeamWatch(cwd: string, emit: (event: ProviderEvent) => void, deps: AgyTeamDeps): AgyTeamWatch {
+  let reader: ReturnType<typeof createAgyTeamReader> | undefined;
+  let timer: NodeJS.Timeout | undefined;
+  let stopped = false;
+  let last: AgyTeamRead | null = null;
+  const tick = (nowMs: number): void => {
+    if (stopped || reader === undefined) return;
+    try {
+      const read = reader.poll(nowMs);
+      if (read === null) return;
+      if (!teamChanged(last, read)) return;
+      last = read;
+      emit({ kind: 'team', at: nowIso(nowMs), team: read.team, views: read.views });
+    } catch {}
+  };
+  return {
+    start(conversationId) {
+      if (stopped || reader !== undefined) return;
+      try { reader = deps.createReader({ conversationId, cwd }); } catch { return; }
+      timer = setInterval(() => tick(Date.now()), Math.max(1, deps.pollMs));
+      timer.unref?.();
+    },
+    tick,
+    stop() {
+      if (stopped) return;
+      if (timer !== undefined) clearInterval(timer);
+      timer = undefined;
+      tick(Date.now());
+      stopped = true;
+    },
+  };
+}
+
+export function spawnAgy(spec: SpawnSpec, deps: AgyTeamDeps = { createReader: createAgyTeamReader, pollMs: AGY_TEAM_POLL_MS }): Promise<WorkerHandle> {
+  const translator = createAgyTranslator(spec.maxOutputChars ?? 2000);
+  let resultEvent: AgyResultEvent | undefined;
+  let team: AgyTeamWatch | undefined;
+
+  return runNdjsonWorker({
+    provider: 'agy',
+    binary: agyBinary(),
+    spec,
+    buildArgv,
+    translate(raw) {
+      const out = translator.onEvent(raw);
+      for (const e of out) if (e.kind === 'started' && e.conversationId !== undefined) team?.start(e.conversationId);
+      return out;
+    },
+    sidecar: (emit) => (team = createAgyTeamWatch(spec.cwd, emit, deps)),
+    // The result event is the verdict, not progress: hold it for buildResult
+    // instead of translating it into an activity.
+    intercept(raw) {
+      if (raw['event'] !== 'result') return false;
+      const r = obj(raw, 'result');
+      if (r !== undefined) resultEvent = r as AgyResultEvent;
+      return true;
+    },
+    // agy writes human-facing warnings to stderr, most importantly the
+    // auto-denial notice quoted at the top of this file. That notice is our
+    // earliest operator-facing hint that a job is going to come back empty.
+    stderrLevel: (text) => (text.includes('denied') || text.includes('permission') ? 'warn' : 'info'),
+    buildResult: (ctx) =>
+      buildResult({
+        ...ctx,
+        resultEvent,
+        denials: translator.denials,
+        sawAnyToolCall: translator.stepsWereTools(),
+        errorIsStale: translator.errorIsStale(),
+        answer: translator.answer,
+      }),
+    afterResult(final) {
+      const recovered = recoveredNotice(final, resultEvent);
+      return recovered === undefined ? [] : [recovered];
+    },
+  });
+}
+
 export const agyProvider: Provider = {
   name: 'agy',
   defaultUnrestricted: true,
@@ -604,41 +704,5 @@ export const agyProvider: Provider = {
 
   listModels: (options) => listAgyModels(runCapture, options),
 
-  spawn(spec: SpawnSpec): Promise<WorkerHandle> {
-    const translator = createAgyTranslator(spec.maxOutputChars ?? 2000);
-    let resultEvent: AgyResultEvent | undefined;
-
-    return runNdjsonWorker({
-      provider: 'agy',
-      binary: agyBinary(),
-      spec,
-      buildArgv,
-      translate: translator.onEvent,
-      // The result event is the verdict, not progress: hold it for buildResult
-      // instead of translating it into an activity.
-      intercept(raw) {
-        if (raw['event'] !== 'result') return false;
-        const r = obj(raw, 'result');
-        if (r !== undefined) resultEvent = r as AgyResultEvent;
-        return true;
-      },
-      // agy writes human-facing warnings to stderr, most importantly the
-      // auto-denial notice quoted at the top of this file. That notice is our
-      // earliest operator-facing hint that a job is going to come back empty.
-      stderrLevel: (text) => (text.includes('denied') || text.includes('permission') ? 'warn' : 'info'),
-      buildResult: (ctx) =>
-        buildResult({
-          ...ctx,
-          resultEvent,
-          denials: translator.denials,
-          sawAnyToolCall: translator.stepsWereTools(),
-          errorIsStale: translator.errorIsStale(),
-          answer: translator.answer,
-        }),
-      afterResult(final) {
-        const recovered = recoveredNotice(final, resultEvent);
-        return recovered === undefined ? [] : [recovered];
-      },
-    });
-  },
+  spawn: (spec: SpawnSpec) => spawnAgy(spec),
 };
