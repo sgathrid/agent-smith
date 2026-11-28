@@ -1,7 +1,7 @@
-import { basename } from 'node:path';
 import type { ActivityEvent, RadarAcceptance, RadarJob } from '../types/index.d.ts';
 import { continuationLabel, countSummary, effectiveStart, elapsed, elapsedCell, failedChecks, failureWords, fitCell, isTerminal, jobLabel, livenessWords, oneLine, pendingSteersLabel, pickGlyph } from './format.ts';
 import { classify } from './progress.ts';
+import { basename } from './tools-describe.ts';
 import { compareTurnPriority, type TurnLike } from './turns.ts';
 
 export const ATTENTION_TTL_MS = 24 * 60 * 60 * 1000;
