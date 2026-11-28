@@ -1215,6 +1215,21 @@ test('opencode: explicit session completion corroborates a recovered report', ()
   assert.equal(buildOc(tx, failedExit).status, 'success');
 });
 
+test('agy: a tool output loses the Created At / Completed At envelope, once per batched call', () => {
+  const stamp = (n: number) => `Created At: 2026-01-01T10:00:0${n}-08:00\nCompleted At: 2026-01-01T10:00:0${n + 1}-08:00\n`;
+  const done = (index: number, output: string) => {
+    const tx = createAgyTranslator(2000);
+    tx.onEvent({ event: 'step_update', step_update: { step_index: index, step_type: 'tool', state: 'ACTIVE', tool_name: 'swarm', tool_info: {} } });
+    const out = tx.onEvent({ event: 'step_update', step_update: { step_index: index, step_type: 'tool', state: 'DONE', tool_name: 'swarm', tool_info: { output } } });
+    const end = out.find((e) => e.kind === 'activity-end');
+    assert.ok(end?.kind === 'activity-end');
+    return end.activity.output;
+  };
+  assert.equal(done(1, `${stamp(0)}{"status":"added"}`), '{"status":"added"}');
+  assert.equal(done(2, `${stamp(0)}{"a":1}\n${stamp(2)}{"b":2}`), '{"a":1}\n{"b":2}');
+  assert.equal(done(3, 'plain output'), 'plain output');
+});
+
 test('all provider adapters: prose, tool call, final prose returns only final prose', async (t) => {
   const exit = { code: 0, signal: null, killReason: undefined, stderr: '' };
 

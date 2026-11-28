@@ -2457,12 +2457,12 @@ function oneLine(s, max = 400) {
     return clip(t, Math.max(0, max));
 }
 const SUMMARY_CHARS = 1_000;
-/** A short summary of a worker's report or current message: its opening, without a leading
- * `Status:` line, cut at a paragraph or line boundary within `max`. */
 /** A job's short summary: its report's opening once it has a report, else the worker's last message. */
 function jobSummary(report, lastMessage) {
     return reportSummary(report ?? '') || lastMessage?.trim() || null;
 }
+/** A short summary of a worker's report or current message: its opening, without a leading
+ * `Status:` line, cut at a paragraph or line boundary within `max`. */
 function reportSummary(text, max = SUMMARY_CHARS) {
     const t = text.trim().replace(/^Status:[^\n]*(?:\n|$)/, '').trim();
     if (t.length <= max)
@@ -2647,9 +2647,8 @@ function rawString(raw, key) {
         return oneLine(m[1]);
     }
 }
-/** Agy prefixes tool output with `Created At:` / `Completed At:` lines before the JSON; a stored preview may cut the JSON short. */
 function outputBody(output) {
-    return (output ?? '').replace(/^\s*(?:(?:Created|Completed) At:[^\n]*\n)+/, '').trim();
+    return (output ?? '').trim();
 }
 function parsed(body) {
     try {
@@ -3689,7 +3688,10 @@ function createAgyTeamReader(options) {
             }
         },
     };
-}function agyBinary() {
+}function withoutStamps(output) {
+    return typeof output === 'string' ? output.replace(/^(?:Created|Completed) At:[^\n]*\n?/gm, '') : output;
+}
+function agyBinary() {
     return process.env['AGENT_SMITH_AGY_BIN'] ?? 'agy';
 }
 // ---------------------------------------------------------------------------
@@ -3955,7 +3957,7 @@ function createAgyTranslator(maxChars) {
                         raw: { stepIndex, error: info?.error },
                     });
                 }
-                const output = preview(info?.output ?? info?.error?.message, maxChars);
+                const output = preview(withoutStamps(info?.output) ?? info?.error?.message, maxChars);
                 const ref = { stepIndex, tool: toolName };
                 if (mem.input !== undefined)
                     ref.input = mem.input;

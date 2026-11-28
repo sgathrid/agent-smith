@@ -10,6 +10,7 @@ import {
   elapsedCell,
   fallbackLabel,
   fitCell,
+  prettyJson,
   formatHeaderLine,
   formatJobLine,
   formatJobRow,
@@ -386,4 +387,10 @@ test('truncation never splits a surrogate pair the sanitizer would then strip', 
   assert.equal(cell, 'a'.repeat(43) + ' ');
   assert.equal(cell.length, 44);
   assert.equal(oneLine('a'.repeat(43) + '🚀zz', 44), 'a'.repeat(43));
+});
+
+test('prettyJson indents objects and arrays and leaves everything else alone', () => {
+  assert.equal(prettyJson('{"a":[1,{"b":2}]}'), '{\n  "a": [\n    1,\n    {\n      "b": 2\n    }\n  ]\n}');
+  assert.equal(prettyJson('[1]'), '[\n  1\n]');
+  for (const raw of ['ok', '42', 'null', '"x"', '{"a":1', 'line one\nline two', '']) assert.equal(prettyJson(raw), raw);
 });

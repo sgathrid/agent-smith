@@ -30,6 +30,10 @@ import { deniedText, noResultText, stderrClause } from './failure-text.ts';
 import { createAnswer, emptyResponseVerdict, type Answer } from './answer.ts';
 import { createAgyTeamReader, type AgyTeamRead } from './agy-team.ts';
 
+function withoutStamps(output: unknown): unknown {
+  return typeof output === 'string' ? output.replace(/^(?:Created|Completed) At:[^\n]*\n?/gm, '') : output;
+}
+
 export function agyBinary(): string {
   return process.env['AGENT_SMITH_AGY_BIN'] ?? 'agy';
 }
@@ -369,7 +373,7 @@ export function createAgyTranslator(maxChars: number) {
             raw: { stepIndex, error: info?.error },
           });
         }
-        const output = preview(info?.output ?? info?.error?.message, maxChars);
+        const output = preview(withoutStamps(info?.output) ?? info?.error?.message, maxChars);
         const ref: ActivityRef = { stepIndex, tool: toolName };
         if (mem.input !== undefined) ref.input = mem.input;
         if (output !== undefined) ref.output = output.text;
