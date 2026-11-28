@@ -100,3 +100,22 @@ export function buildBrief(input: BriefInput): string {
       'If the task conflicts with what you find, say so rather than guess.',
   ].join('\n');
 }
+
+/**
+ * `/name` or `/plugin:name` as the prompt's first token. A further `/` makes it
+ * a path (`/Users/x/file.md`), not a command.
+ */
+const SLASH_COMMAND_RE = /^\s*(\/[A-Za-z0-9_:-]+)(?=\s|$)/;
+
+/**
+ * The text sent to a worker: the brief in front of the prompt. A provider only
+ * expands a slash command when it is the very first token, so the command moves
+ * ahead of the brief and the brief becomes its first argument text.
+ */
+export function joinBrief(brief: string, prompt: string): string {
+  if (brief === '') return prompt;
+  const m = SLASH_COMMAND_RE.exec(prompt);
+  if (m === null) return `${brief}\n\n${prompt}`;
+  const rest = prompt.slice(m[0].length).replace(/^\s+/, '');
+  return `${m[1]} ${brief}${rest === '' ? '' : `\n\n${rest}`}`;
+}

@@ -18,7 +18,7 @@ import type {
   WorkerHandle,
 } from '../providers/types.js';
 import { isMode, MODE_PRESETS, type ModePreset } from './modes.ts';
-import { buildBrief } from './brief.ts';
+import { buildBrief, joinBrief } from './brief.ts';
 import {
   DEFAULT_TIMEOUT_MS,
   deriveStatus,
@@ -412,7 +412,7 @@ export class ForgeService {
     });
     const prependBrief = brief !== '' && !prompt.startsWith(brief);
     const preambleApplied = brief !== '';
-    const sentPrompt = prependBrief ? `${brief}\n\n${prompt}` : prompt;
+    const sentPrompt = prependBrief ? joinBrief(brief, prompt) : prompt;
     const jobId = newJobId(mode);
     const name = request.name?.trim() || `${mode}-${jobId.slice(-8)}`;
     if (name.length > 80) throw new Error('worker name must be at most 80 characters');
@@ -593,7 +593,7 @@ export class ForgeService {
             resuming: false,
             dirtyFiles: dirty,
           });
-          currentPrompt = `${fullBrief}\n\n${currentTurn.rawPrompt}`;
+          currentPrompt = joinBrief(fullBrief, currentTurn.rawPrompt);
           currentWriter.updatePreamble(fullBrief);
         }
       }

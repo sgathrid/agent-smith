@@ -1,6 +1,7 @@
 import type { ActivityEvent, RadarAcceptance, RadarJob } from '../types/index.d.ts';
 import { continuationLabel, countSummary, effectiveStart, elapsed, elapsedCell, failedChecks, failureWords, fitCell, isTerminal, jobLabel, livenessWords, oneLine, pendingSteersLabel, pickGlyph } from './format.ts';
 import { classify } from './progress.ts';
+import { boardRange, teamPoll } from './tools-describe.ts';
 import { compareTurnPriority, type TurnLike } from './turns.ts';
 
 export const ATTENTION_TTL_MS = 24 * 60 * 60 * 1000;
@@ -244,14 +245,19 @@ export function sessionBoard(jobs: readonly RadarJob[], scope: 'session' | 'all'
 export type TimelineItem =
   | { readonly kind: 'event'; readonly event: ActivityEvent }
   | { readonly kind: 'group'; readonly key: string; readonly events: readonly ActivityEvent[];
-      readonly reads: number; readonly searches: number; readonly commands: number };
+      readonly reads: number; readonly searches: number; readonly commands: number; readonly team?: TeamRun };
+
+/** Repeated team polls folded into a group: status checks, board reads (with the seqs they covered), waits. */
+export interface TeamRun { readonly checks: number; readonly boards: number; readonly range: string | null; readonly waits: number }
 
 const RUN_MIN = 3;
 
-type Condensable = 'read' | 'search' | 'command';
+type Condensable = 'read' | 'search' | 'command' | 'status' | 'board' | 'wait';
 
 function condensableKind(event: ActivityEvent): Condensable | null {
   if (event.kind !== 'tool' || event.state !== 'done') return null;
+  const poll = teamPoll(event.tool, event.input);
+  if (poll !== null) return poll;
   const kind = classify(event.tool, event.input).kind;
   return kind === 'read' || kind === 'search' || kind === 'command' ? kind : null;
 }
@@ -277,8 +283,11 @@ export function condenseTimeline(events: readonly ActivityEvent[]): TimelineItem
     const run = events.slice(start, i);
     if (kinds.length >= RUN_MIN) {
       const count = (k: Condensable) => kinds.filter((kind) => kind === k).length;
+      const seqs = run.filter((e) => e.kind === 'tool' && teamPoll(e.tool, e.input) === 'board').map((e) => e.kind === 'tool' ? e.output : '');
       items.push({ kind: 'group', key: `group-${run[0]!.sequence}`, events: run,
-        reads: count('read'), searches: count('search'), commands: count('command') });
+        reads: count('read'), searches: count('search'), commands: count('command'),
+        ...(count('status') + count('board') + count('wait') === 0 ? {} : {
+          team: { checks: count('status'), boards: count('board'), range: seqRange(seqs), waits: count('wait') } }) });
     } else {
       for (const event of run) items.push({ kind: 'event', event });
     }
@@ -286,11 +295,25 @@ export function condenseTimeline(events: readonly ActivityEvent[]): TimelineItem
   return items;
 }
 
-export function timelineGroupLabel(reads: number, searches: number, commands = 0): string {
+/** `#10–#15` across several board reads; null when none of them named a message. */
+function seqRange(outputs: readonly string[]): string | null {
+  const nums = outputs.flatMap((o) => [...(boardRange(o)?.matchAll(/#(\d+)/g) ?? [])].map((m) => Number(m[1])));
+  if (nums.length === 0) return null;
+  const lo = Math.min(...nums);
+  const hi = Math.max(...nums);
+  return lo === hi ? `#${lo}` : `#${lo}–#${hi}`;
+}
+
+export function timelineGroupLabel(reads: number, searches: number, commands = 0, team?: TeamRun): string {
   const parts: string[] = [];
   if (reads > 0) parts.push(`read ${reads} ${reads === 1 ? 'file' : 'files'}`);
   if (searches > 0) parts.push(`${searches} ${searches === 1 ? 'search' : 'searches'}`);
   if (commands > 0) parts.push(`${commands} ${commands === 1 ? 'command' : 'commands'}`);
+  if (team !== undefined) {
+    if (team.checks > 0) parts.push(`checked team ${team.checks}×`);
+    if (team.boards > 0) parts.push(team.range === null ? `read board ${team.boards}×` : `board ${team.range}`);
+    if (team.waits > 0) parts.push(`waited ${team.waits}×`);
+  }
   return parts.join(' · ');
 }
 
