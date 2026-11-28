@@ -1,3 +1,4 @@
+import type { MemberView, Team } from '../surfaces/mod/types/index.d.ts';
 export interface TokenUsage {
   inputTokens?: number;
   outputTokens?: number;
@@ -46,7 +47,9 @@ export type ProviderEvent =
   | { kind: 'usage'; at: string; usage: TokenUsage }
   | { kind: 'notice'; at: string; level: 'info' | 'warn' | 'error'; message: string; raw?: unknown }
   | { kind: 'heartbeat'; at: string; pid?: number }
-  | { kind: 'user-message'; at: string; text: string };
+  | { kind: 'user-message'; at: string; text: string }
+  /** The latest snapshot of the worker's own sub-agents, with a bounded detail view per member. Never written to events.jsonl. */
+  | { kind: 'team'; at: string; team: Team; views: readonly MemberView[] };
 
 export type JobStatus =
   | 'success'

@@ -48,7 +48,68 @@ export interface RadarJob {
   readonly pendingSteers?: number | null;
   readonly pendingMessages?: number | null;
   readonly staleReads?: readonly string[] | null;
+  /** The worker's own sub-agents (an agy swarm or agy sub-agents), from team.json; absent when it has none. */
+  readonly team?: Team | null;
   readonly raw: Record<string, unknown>;
+}
+
+/**
+ * Sub-agents a worker started inside its own harness. Agent Smith does not run
+ * or steer them; the provider adapter observes them and the writer stores the
+ * latest snapshot in the job's team.json. Every field is what the provider
+ * itself reported; nothing is guessed.
+ */
+export type TeamSource = 'agy-swarm' | 'agy-subagents';
+
+/** The provider's own word for where a member stands. agy reports working | waiting | killed. */
+export type TeamMemberState = 'working' | 'waiting' | 'done' | 'failed' | 'killed';
+
+export interface TeamMember {
+  /** Stable within the team: the member's name (agy swarm) or its conversation id. */
+  readonly id: string;
+  readonly name: string;
+  /** `coordinator`, `worker`, or the sub-agent's role line. */
+  readonly role: string;
+  readonly model: string | null;
+  /** The model as the provider shows it (`Gemini 4 Neon (High)`). */
+  readonly modelLabel: string | null;
+  /** One line: what the member was asked to do (plan task line, else first line of its brief). */
+  readonly task: string | null;
+  readonly state: TeamMemberState;
+  /** A short phrase for what it is doing now (`git show …/trace.rs`), or its last step. */
+  readonly activity: string | null;
+  readonly toolCount: number;
+  readonly tokensOut: number | null;
+  /** Epoch ms. */
+  readonly startedAt: number | null;
+  readonly lastEventAt: number | null;
+  /** Its newest board post: sequence number and first line. */
+  readonly lastPost: { readonly seq: number; readonly text: string } | null;
+}
+
+export interface Team {
+  readonly schema: 1;
+  readonly source: TeamSource;
+  readonly title: string | null;
+  /** Newest board sequence number (agy swarm). */
+  readonly boardHead: number | null;
+  /** Members other than the worker itself (the coordinator is the worker and is never listed). */
+  readonly members: readonly TeamMember[];
+  /** Epoch ms of the snapshot. */
+  readonly updatedAt: number;
+}
+
+/** members/<memberId>.json: a bounded detail snapshot for one member, like view.json for a worker. */
+export interface MemberView {
+  readonly schema: 1;
+  readonly id: string;
+  readonly name: string;
+  /** Its full brief, when the provider shows it. */
+  readonly brief: string | null;
+  /** Its newest board post in full, or its final reply. */
+  readonly report: string | null;
+  readonly timeline: readonly ActivityEvent[];
+  readonly truncated: boolean;
 }
 
 export type ActivityEvent =

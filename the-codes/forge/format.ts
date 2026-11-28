@@ -32,6 +32,10 @@ export const FILES = {
   checksAbort: 'checks.abort',
   steerConsumed: 'steer.consumed',
   steerDiscard: 'steer.discard',
+  /** Latest `Team` snapshot (atomic rewrite), present only when the worker has sub-agents. */
+  team: 'team.json',
+  /** Directory of `MemberView` files, `<memberId>.json`. */
+  members: 'members',
 } as const;
 
 export type SteerDelivery = 'queue' | 'interrupt';
