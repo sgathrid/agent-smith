@@ -75,18 +75,22 @@ export function oneLine(s: string, max = 400): string {
 
 export const SUMMARY_CHARS = 1_000;
 
-/** A job's short summary: its report's opening once it has a report, else the worker's last message. */
 export function jobSummary(report: string | null | undefined, lastMessage: string | null | undefined): string | null {
   return reportSummary(report ?? '') || lastMessage?.trim() || null;
 }
 
-/** A short summary of a worker's report or current message: its opening, without a leading
- * `Status:` line, cut at a paragraph or line boundary within `max`. */
 export function reportSummary(text: string, max = SUMMARY_CHARS): string {
-  const t = text.trim().replace(/^Status:[^\n]*(?:\n|$)/, '').trim();
-  if (t.length <= max) return t;
-  const head = t.slice(0, max);
-  if (t[max] === '\n') return head.trim();
+  return clipAtBoundary(stripStatusLine(text), max);
+}
+
+function stripStatusLine(text: string): string {
+  return text.trim().replace(/^Status:[^\n]*(?:\n|$)/, '').trim();
+}
+
+function clipAtBoundary(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const head = text.slice(0, max);
+  if (text[max] === '\n') return head.trim();
   for (const sep of ['\n\n', '\n']) {
     const i = head.lastIndexOf(sep);
     if (i >= 0 && head.slice(0, i).trim() !== '') return head.slice(0, i).trim();
