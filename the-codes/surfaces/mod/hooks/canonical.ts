@@ -1,4 +1,4 @@
-import type { ActivityEvent, ContinuationKind, ProgressDigest, RadarAcceptance, RadarJob, RadarStatus } from '../types/index.d.ts';
+import type { ActivityEvent, ContinuationKind, MemberView, ProgressDigest, RadarAcceptance, RadarJob, RadarStatus } from '../types/index.d.ts';
 import { toEpoch, type FsLike } from './fs.ts';
 import { classify, progressPhrase } from './progress.ts';
 import { livenessOf } from './stale.ts';
@@ -224,4 +224,12 @@ export async function readForgeDetail(fs: FsLike, repo: string, id: string, now:
     ...(messages.length > 0 ? { messages } : {}),
     warnings: [...job.warnings, ...(view === null ? [{code:'detail_unavailable',message:'This older job has no detail snapshot; summary and report are shown.'}] : [])] }, timeline,
     truncated: view?.truncated === true };
+}
+
+/**
+ * One team member's bounded detail (`members/<memberFileName(id)>.json` in the job dir), or null when absent or invalid.
+ * Stub: implemented with the team plumbing.
+ */
+export async function readMemberView(_fs: FsLike, _repo: string, _jobId: string, _memberId: string): Promise<MemberView | null> {
+  return null;
 }

@@ -47,6 +47,7 @@ test('every file name in the format is one the writer and the reader share', () 
     'checks.abort',
     'events.jsonl',
     'job.json',
+    'members',
     'owner.done',
     'progress.json',
     'request.json',
@@ -57,6 +58,7 @@ test('every file name in the format is one the writer and the reader share', () 
     'steer.discard',
     'steer.head',
     'steer.jsonl',
+    'team.json',
     'view.json',
   ]);
 });

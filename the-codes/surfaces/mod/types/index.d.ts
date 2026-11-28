@@ -141,6 +141,10 @@ declare module 'claude-code' {
     'agent-smith': {
       selected: string | null;
       pinnedTurnId: string | null;
+      /** A member of the selected worker's team shown in the pane, by `TeamMember.id`; null shows the worker. */
+      selectedMember: string | null;
+      /** The pane's Team section shows every member, not just the first few. */
+      teamOpen: boolean;
       now: number;
       follow: boolean;
       taskOpen: boolean;

@@ -36,6 +36,7 @@ export function renderList(W: UiComponents, jobs: readonly RadarJob[], o: ViewOp
       ? 'Workers you start here appear in this list. /forge all shows the repository\'s history.'
       : 'No workers yet.'}</Text>}
     {all.slice(start,start+PAGE_SIZE).map((job,i) => <Box key={`worker-${job.workerId}`} flexDirection="column">
+      {start+i===live && i>0 && <Box key="recent-gap"><Text> </Text></Box>}
       {start+i===live && <Text bold wrap="truncate-end">Recent</Text>}
       <Button key={`job-${job.workerId}`} plain hotkey={String(i+1)} label={workerHeading(job)} onPress={() => a.pick(job)}>
         <Text color={o.colour&&(isLive(job)||needsAttention(job,o.now))?pickColor(job.status):undefined} wrap="truncate-end">{pickGlyph(job.status)}</Text>

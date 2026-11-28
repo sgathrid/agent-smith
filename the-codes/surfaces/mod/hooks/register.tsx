@@ -68,6 +68,8 @@ async function requestPane($: EngineInterface, force = false): Promise<void> {
 
 const selected = atom({ plugin: 'agent-smith', key: 'selected' } as const, null as string | null);
 const pinnedTurnId = atom({ plugin: 'agent-smith', key: 'pinnedTurnId' } as const, null as string | null);
+const selectedMember = atom({ plugin: 'agent-smith', key: 'selectedMember' } as const, null as string | null);
+const teamOpen = atom({ plugin: 'agent-smith', key: 'teamOpen' } as const, false as boolean);
 const now = atom({ plugin: 'agent-smith', key: 'now' } as const, 0);
 
 const follow = atom({ plugin: 'agent-smith', key: 'follow' } as const, true as boolean);
