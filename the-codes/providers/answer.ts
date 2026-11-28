@@ -13,10 +13,10 @@ export interface Answer {
 
 const BOOKKEEPING_TOOLS: Readonly<Record<string, ReadonlySet<string>>> = {
   opencode: new Set(['todowrite']),
-  kimi: new Set(['SetTodoList']),
-  claude: new Set(['TodoWrite']),
+  kimi: new Set(['TodoList']),
+  claude: new Set(['TodoWrite', 'TaskCreate', 'TaskUpdate', 'TaskList', 'TaskGet']),
   codex: new Set(['todo_list']),
-  agy: new Set(),
+  agy: new Set(['update_steps']),
 };
 
 function isBookkeepingTool(provider: string, toolName: string): boolean {

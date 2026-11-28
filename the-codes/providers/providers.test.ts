@@ -1738,6 +1738,18 @@ test('all provider adapters: response rule table', async (t) => {
   });
 
   await t.test('5. answer, then only todo/plan tool -> answer; success', async (st) => {
+    await st.test('agy', () => {
+      const res = runAgy(
+        [
+          { event: 'step_update', step_update: { step_index: 1, step_type: 'agent_response', state: 'DONE', text_delta: 'answer' } },
+          { event: 'step_update', step_update: { step_index: 2, step_type: 'tool', state: 'ACTIVE', tool_name: 'update_steps', tool_info: {} } },
+          { event: 'step_update', step_update: { step_index: 2, step_type: 'tool', state: 'DONE', tool_name: 'update_steps', tool_info: { output: 'ok' } } },
+        ],
+        { status: 'SUCCESS', response: 'answer' },
+      );
+      assert.equal(res.status, 'success');
+      assert.equal(res.response, 'answer');
+    });
     await st.test('claude', () => {
       const res = runClaude([
         { type: 'assistant', message: { content: [{ type: 'text', text: 'answer' }] } },
@@ -1771,7 +1783,7 @@ test('all provider adapters: response rule table', async (t) => {
     await st.test('kimi', () => {
       const res = runKimi([
         { role: 'assistant', content: 'answer' },
-        { role: 'assistant', content: '', tool_calls: [{ id: 'tc1', type: 'function', function: { name: 'SetTodoList', arguments: '{}' } }] },
+        { role: 'assistant', content: '', tool_calls: [{ id: 'tc1', type: 'function', function: { name: 'TodoList', arguments: '{}' } }] },
         { role: 'tool', tool_call_id: 'tc1', content: 'ok' },
         { role: 'tool', tool_call_id: 'tc1', content: 'ok' },
       ]);
@@ -2004,10 +2016,10 @@ test('reviewers: agy/claude final field and opencode/kimi mapping regressions', 
     assert.equal(res.response, 'Final report');
   });
 
-  await t.test('kimi: whitespace-only content on SetTodoList-only assistant record keeps prior answer', () => {
+  await t.test('kimi: whitespace-only content on TodoList-only assistant record keeps prior answer', () => {
     const tx = createKimiTranslator(2000);
     tx.onEvent({ role: 'assistant', content: 'All done.' });
-    tx.onEvent({ role: 'assistant', content: '   ', tool_calls: [{ id: 'tc1', type: 'function', function: { name: 'SetTodoList', arguments: '{}' } }] });
+    tx.onEvent({ role: 'assistant', content: '   ', tool_calls: [{ id: 'tc1', type: 'function', function: { name: 'TodoList', arguments: '{}' } }] });
     tx.onEvent({ role: 'tool', tool_call_id: 'tc1', content: 'ok' });
     const res = buildKimiResult({ ...base, tx });
     assert.equal(res.status, 'success');

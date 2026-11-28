@@ -45,9 +45,14 @@ test('answer rule table', async (t) => {
   await t.test('5. answer, then only bookkeeping tool -> answer; real tool clears it', () => {
     for (const [provider, toolName] of [
       ['opencode', 'todowrite'],
-      ['kimi', 'SetTodoList'],
+      ['kimi', 'TodoList'],
       ['claude', 'TodoWrite'],
+      ['claude', 'TaskCreate'],
+      ['claude', 'TaskUpdate'],
+      ['claude', 'TaskList'],
+      ['claude', 'TaskGet'],
       ['codex', 'todo_list'],
+      ['agy', 'update_steps'],
     ] as const) {
       const a = createAnswer(provider);
       a.text('answer');
@@ -56,11 +61,13 @@ test('answer rule table', async (t) => {
       assert.equal(emptyResponseVerdict(a.value(), ''), undefined);
     }
 
-    const real = createAnswer('claude');
-    real.text('answer');
-    real.tool('Bash');
-    assert.equal(real.value(), '');
-    assert.equal(emptyResponseVerdict(real.value(), '')?.status, 'malformed');
+    for (const provider of ['opencode', 'kimi', 'claude', 'codex', 'agy'] as const) {
+      const real = createAnswer(provider);
+      real.text('answer');
+      real.tool('Bash');
+      assert.equal(real.value(), '', `${provider}: a real tool clears the answer`);
+      assert.equal(emptyResponseVerdict(real.value(), '')?.status, 'malformed');
+    }
 
     const agyTodo = createAnswer('agy');
     agyTodo.text('answer');
