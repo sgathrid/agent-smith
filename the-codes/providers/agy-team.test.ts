@@ -322,6 +322,25 @@ describe('agy sub-agents', () => {
     assert.equal(r.team.members[3]!.role, 'sub-agent');
   });
 
+  it("a sub-agent's final reply is its report and not also in its timeline", () => {
+    sub(ALPHA, 'SUBAGENT_STATE_KILLED', { role: 'Researcher' }, 3);
+    const steps = [
+      system(0, message(C, 'Survey the lexer.')),
+      planner(1, [call('read_file', { Path: '/work/repo/lexer.ts' })], { content: 'Reading the lexer.' }),
+      result(2, 'code'),
+      planner(3, [], { content: 'Found two issues.' }),
+    ];
+    chunks(ALPHA, jsonl(steps));
+    let view = read().views[0]!;
+    const prose = (v: typeof view) => v.timeline.flatMap((e) => (e.kind === 'assistant' ? [e.text] : []));
+    assert.equal(view.report, 'Found two issues.');
+    assert.deepEqual(prose(view), ['Reading the lexer.']);
+    chunks(ALPHA, jsonl([...steps, system(4, message(C, 'One more thing.')), planner(5, [call('read_file', { Path: '/b' })])]));
+    view = read().views[0]!;
+    assert.equal(view.report, null);
+    assert.deepEqual(prose(view), ['Reading the lexer.', 'Found two issues.'], 'a reply that is no longer final is back in the timeline');
+  });
+
   it('ignores a brief from another sender', () => {
     sub(ALPHA, 'SUBAGENT_STATE_ALIVE', { role: 'Helper' }, 1);
     chunks(ALPHA, jsonl([system(0, message('someone-else', 'not the brief')), system(1, message(C, 'the brief'))]));

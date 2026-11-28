@@ -240,7 +240,7 @@ export interface ForgeProgress {
 }
 
 export type ForgeViewEvent =
-  | { sequence: number; kind: 'assistant'; at: string; text: string }
+  | { sequence: number; kind: 'assistant'; at: string; text: string; messageKey?: string }
   | { sequence: number; kind: 'tool'; at: string; stepIndex: number; tool: string; input: string; output: string; state: 'active' | 'done' | 'error' }
   | { sequence: number; kind: 'message'; at: string; text: string; delivery: 'next-step' | 'turn-start'; sender: MessageSender };
 
@@ -256,6 +256,12 @@ export interface ForgeView {
     stepIndex: number; at: string; tool: string; input: string; output: string;
     state: 'active' | 'done' | 'error';
   }[];
+}
+
+/** The view without the answer's message: a finished job's answer lives in result.md alone. */
+export function withoutAnswer(view: ForgeView, answerKey: string | undefined): ForgeView {
+  if (answerKey === undefined) return view;
+  return { ...view, timeline: (view.timeline ?? []).filter((e) => !(e.kind === 'assistant' && e.messageKey === answerKey)) };
 }
 
 export function jobsDir(repo: string): string {

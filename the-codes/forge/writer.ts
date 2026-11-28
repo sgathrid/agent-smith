@@ -21,6 +21,7 @@ import {
   looksEmpty,
   shouldFlush,
   taskTitle,
+  withoutAnswer,
   type ContinuationKind,
   type ForgeActivity,
   type GitBaseline,
@@ -36,12 +37,11 @@ import {
 import type { JobResult, ProviderEvent, WorkerHandle } from '../providers/types.ts';
 import type { MemberView, Team } from '../surfaces/mod/types/index.d.ts';
 import { memberFileName } from '../surfaces/mod/hooks/team.ts';
+import { reportSummary } from '../surfaces/mod/hooks/text.ts';
 
 const RECENT_ACTIVITIES = 5;
 
 const LATEST_TEXT_CHARS = 4_000;
-
-const SUMMARY_CHARS = 1_000;
 
 export const TEAM_MEMBERS_CAP = 64;
 
@@ -107,6 +107,7 @@ export class JobWriter {
   private readonly tracker = new ProgressTracker();
   private view: ForgeView = { schema: 1, prompt: '', preamble: null, transcript: [], tools: [], timeline: [], truncated: false };
   private deltaOpen = false;
+  private textKey: string | undefined;
   private viewSequence = 0;
   private conversation: string | null = null;
   private finished = false;
@@ -470,11 +471,15 @@ export class JobWriter {
     if (this.manifest === null) return;
     const at = event.at;
     if (event.stream !== 'assistant') return;
-    const joinDelta = event.delta === true && this.deltaOpen;
+    const key = event.messageKey;
+    const sameMessage = key === this.textKey;
+    const joinDelta = event.delta === true && this.deltaOpen && sameMessage;
     const transcript = [...this.view.transcript];
-    if (event.delta && this.deltaOpen && transcript.length > 0) transcript[transcript.length - 1] += event.text;
+    if (joinDelta && transcript.length > 0) transcript[transcript.length - 1] += event.text;
     else transcript.push(event.text);
     this.deltaOpen = event.delta === true;
+    this.textKey = key;
+    if (!sameMessage) this.currentMessage = '';
     let truncated = this.view.truncated;
     let chars = transcript.reduce((n, t) => n + t.length, 0);
     while (transcript.length > 1 && (chars > 64_000 || transcript.length > 200)) {
@@ -486,13 +491,13 @@ export class JobWriter {
     const timeline = [...this.view.timeline ?? []];
     const last = timeline.at(-1);
     if (joinDelta && last?.kind === 'assistant') timeline[timeline.length - 1] = { ...last, text: last.text + event.text };
-    else timeline.push({ kind: 'assistant', sequence: this.viewSequence++, at, text: event.text });
+    else timeline.push({ kind: 'assistant', sequence: this.viewSequence++, at, text: event.text, ...(key === undefined ? {} : { messageKey: key }) });
     const bounded = boundTimeline(timeline);
     this.view = { ...this.view, timeline: bounded.events, truncated: this.view.truncated || bounded.truncated };
     this.latestText = appendBounded(this.latestText ?? '', event.text, LATEST_TEXT_CHARS);
     this.currentMessage = appendBounded(this.currentMessage, event.text, LATEST_TEXT_CHARS);
     this.noteFirstEvent(false);
-    this.manifest = { ...this.manifest, latestSummary: summaryHead(this.currentMessage, SUMMARY_CHARS) || this.manifest.latestSummary || null, summarySource: 'worker' };
+    this.manifest = { ...this.manifest, latestSummary: reportSummary(this.currentMessage) || this.manifest.latestSummary || null, summarySource: 'worker' };
     this.touch(at);  }
 
   verdictFacts(): { cwdMissing: boolean; writing: boolean } {
@@ -526,8 +531,6 @@ export class JobWriter {
     const failedEarly =
       verdict.status === 'failed' && !result.ok && result.status !== 'timeout' && result.status !== 'cancelled' &&
       this.toolCalls === 0 && (result.durationMs <= FAILED_EARLY_MS || this.firstEventWasError);
-    const response = result.response.trim();
-
     const usage =
       result.usage === undefined
         ? null
@@ -555,8 +558,8 @@ export class JobWriter {
       ...(this.toolErrorSteps.size === 0 ? {} : { toolErrors: this.toolErrorSteps.size }),
       ...(failedEarly ? { failedEarly: true } : {}),
       conversation: this.conversation,
-      latestSummary: summaryHead(response, SUMMARY_CHARS) || this.manifest.latestSummary || null,
-      summarySource: response || this.manifest.latestSummary ? 'worker' : null,
+      latestSummary: null,
+      summarySource: null,
       ...(this.changed === null
         ? { changedFilesUnknown: true }
         : { changedFiles: this.changed.files, changedFilesTruncated: this.changed.truncated }),
@@ -572,6 +575,7 @@ export class JobWriter {
 
     const body = report ?? '';
     writeAtomic(jobFile(this.repo, this.jobId, FILES.report), body);
+    if (body.trim() !== '') this.view = withoutAnswer(this.view, result.answerKey);
     this.writeManifest();
     this.flushProgress(finishedAt);
 
@@ -591,6 +595,8 @@ export class JobWriter {
       error: reason,
       reason: status === 'failed' ? reason.split(' · ')[0]! : null,
       jobStatus: status === 'canceled' ? 'cancelled' : 'malformed',
+      latestSummary: null,
+      summarySource: null,
       ...(this.manifest.pendingSteers !== undefined ? { pendingSteers: 0 } : {}),
     };
     this.manifest = manifest;
@@ -845,18 +851,6 @@ export function appendBounded(base: string, add: string, max: number): string {
   const joined = base === '' ? add : `${base}${add}`;
   if (joined.length <= max) return joined;
   return joined.slice(joined.length - max);
-}
-
-export function summaryHead(text: string, max: number): string {
-  const t = text.trim().replace(/^Status:[^\n]*(?:\n|$)/, '').trim();
-  if (t.length <= max) return t;
-  const head = t.slice(0, max);
-  if (t[max] === '\n') return head.trim();
-  for (const sep of ['\n\n', '\n']) {
-    const i = head.lastIndexOf(sep);
-    if (i >= 0 && head.slice(0, i).trim() !== '') return head.slice(0, i).trim();
-  }
-  return head.trim();
 }
 
 function reportText(repo: string, jobId: string): string {

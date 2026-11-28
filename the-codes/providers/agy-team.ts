@@ -200,6 +200,7 @@ class MemberAggregate {
   planner: Planner | null = null;
   lastType = '';
   lastReply: string | null = null;
+  private lastReplySequence: number | null = null;
   brief: string | null = null;
   private readonly parentConv: string;
 
@@ -234,7 +235,10 @@ class MemberAggregate {
     this.toolCount += calls.length;
     const content = str(step['content']);
     if (content !== null && content.trim() !== '') this.push({ sequence: index, kind: 'assistant', at, text: cap(content) });
-    if (calls.length === 0) this.lastReply = content ?? '';
+    if (calls.length === 0) {
+      this.lastReply = content ?? '';
+      this.lastReplySequence = index;
+    }
     const tools = calls.map((c, i): ToolEvent => ({
       sequence: index + 1 + i, kind: 'tool', at, stepIndex: index + 1 + i, tool: c.name, input: cap(c.input), output: '', state: 'active',
     }));
@@ -283,6 +287,11 @@ class MemberAggregate {
 
   finalReply(): string | null {
     return this.lastType === 'PLANNER_RESPONSE' && this.planner?.calls.length === 0 ? this.lastReply : null;
+  }
+
+  timeline(withoutFinalReply: boolean): ActivityEvent[] {
+    const reply = withoutFinalReply ? this.lastReplySequence : null;
+    return this.events.filter((e) => !(e.kind === 'assistant' && e.sequence === reply)).map((e) => ({ ...e }));
   }
 
   activity(): string | null {
@@ -593,10 +602,11 @@ export function createAgyTeamReader(options: AgyTeamReaderOptions): AgyTeamReade
         lastEventAt: log?.lastEventAt ?? null,
         lastPost: post ? { seq: post.seq, text: firstLine(post.text) } : null,
       });
+      const reply = post === null ? log?.finalReply() ?? null : null;
       views.push({
         schema: 1, id: seat.id, name: seat.name, brief,
-        report: post?.text ?? log?.finalReply() ?? null,
-        timeline: (log?.events ?? []).map((e) => ({ ...e })),
+        report: post?.text ?? reply,
+        timeline: log?.timeline(reply !== null) ?? [],
         truncated: log?.truncated ?? false,
       });
     }
