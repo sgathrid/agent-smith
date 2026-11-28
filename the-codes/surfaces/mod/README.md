@@ -73,17 +73,22 @@ mod only observes them. It cannot message or steer them. Their state comes from 
 (see ARCHITECTURE.md, Sub-agents).
 
 - **Band.** Under a live worker, one child row per working member, marked `├` or `└`, with its
-  current activity, time and output tokens. Working members come first. Extra members fold into
-  one row, such as `5 waiting · 2 working · hydro-681 posted #13`. The band's row cap still
-  applies. The worker's own row leads with the team (`4/9 agents working`) and reads
+  current activity, time and output tokens. The activity ends with the member's short model
+  (`posted #11 ∙ Hydrogen`; a narrow band drops it first), because a coordinator may name members after harnesses. Working members
+  come first. Extra members fold into one row, such as `✓ 5 reported ∙ ⏺ 2 working ∙ hydro-681
+  posted #13`. The band's row cap still applies. The worker's row and its member rows share one
+  clock column, and a band row uses `∙` throughout. The worker's own row leads with the team (`4/9 agents working`) and reads
   `waiting on 3 of 9 agents` while the coordinator waits on its team. Member rows have no digit.
   Pressing one opens that member in `/forge`.
-- **`/forge`.** A worker with a team shows a header line (`Team 9 · 4 working · 5 waiting ·
-  board #15`) and a Team section with its first four members. `m` shows all of them. Digits
+- **`/forge`.** A worker with a team shows a header line (`Team 9 · 4 working · 5 reported ·
+  board #15`) and a Team section with its first four members, model and activity in fixed columns. `m` shows all of them. Digits
   `1`–`9` open a member. The member view shows the member's task, its timeline, and its last
-  board post or final reply as Result. `b` returns to the worker. The `m` button shows only when
+  board post or final reply under `● Result`, one blank row below the timeline. `b` returns to the worker. The `m` button shows only when
   there are more than four members.
-- **States.** Members read `working`, `waiting`, `stopped`, `done`, `failed` or `killed`.
+- **States.** Members read `working`, `waiting`, `stopped`, `done`, `failed` or `killed`. The
+  display shows a `waiting` member that has posted as `reported` (`✓`), so it does not read as
+  unfinished; `team.json` and the `status` counts keep agy's state, and a `waiting` member with
+  no post (a monitor) stays `○ waiting`.
   `canonical.ts` settles the team on read (`settleTeam`): a member is `working` only while its
   worker runs and it has acted since the turn began, otherwise `stopped` (`○`, clock frozen at its
   last event). A finished job's team stays in `/forge` and never reads working.

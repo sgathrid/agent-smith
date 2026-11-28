@@ -298,7 +298,7 @@ test('a running worker with a progress digest shows what it is doing and what it
   await launch($, 'job-ada');
   const band = await $.ui.mount({plugin:'agent-smith',surface:'terminal',...BAND} as never);
   const row = await band.find({key:'band-ada'}) as { props?: Record<string,unknown> } | undefined;
-  expect(String(row?.props?.label)).toMatch(/pp-engine\s+editing loader\.py · 3 files edited · last test run failed/);
+  expect(String(row?.props?.label)).toMatch(/pp-engine\s+editing loader\.py ∙ 3 files edited ∙ last test run failed/);
   await band.press({key:'band-ada'});
   const pane = await $.ui.mount(PANE_TARGET);
   expect(await pane.find({type:'Text',text:/^Editing · 21 files read · 14 searches · 2 commands · tests ran 2× · last run failed$/})).toBeDefined();
@@ -1993,8 +1993,11 @@ describe('the band team rows', () => {
     const labels = await bandTexts(band);
     expect(labels).toHaveLength(4);
     expect(labels[0]).toMatch(/swarm/);
-    expect(labels[1]).toMatch(/^\s+├ ⏺ alpha\s+reading alpha\.rs/);
-    expect(labels[2]).toMatch(/^\s+├ ⏺ bravo\s+reading bravo\.rs/);
+    expect(labels[1]).toMatch(/^\s+├ ⏺ alpha\s+reading alpha\.rs ∙ Neon\s+1m00s$/);
+    expect(labels[2]).toMatch(/^\s+├ ⏺ bravo\s+reading bravo\.rs ∙ Neon\s+1m00s$/);
+    const edge = (l: string) => l.trimEnd().length;
+    expect(edge(labels[1]!)).toBe(edge(labels[0]!));
+    expect(edge(labels[2]!)).toBe(edge(labels[0]!));
     expect(labels[3]).toMatch(/^\s+└ ○ charlie/);
   });
 
@@ -2007,8 +2010,17 @@ describe('the band team rows', () => {
     expect(labels).toHaveLength(BAND_ROWS);
     expect(labels.filter((l) => /[├└] ⏺/.test(l))).toHaveLength(2);
     const fold = labels[labels.length - 1]!;
-    expect(fold).toMatch(/└ ○ 3 waiting ∙ 2 done/);
+    expect(fold).toMatch(/└ ○ 3 waiting ∙ ○ 2 done/);
     expect(fold).not.toMatch(/working/);
+  });
+
+  test('a fold marks each count with its own glyph', async ($, on) => {
+    const members = ['alpha', 'bravo', 'c3', 'c4', 'c5', 'c6'].map((id, i) => tm(id, i < 2 ? {} : i < 4 ? { state: 'waiting', activity: null, lastPost: { seq: 2, text: 'x' } } : { state: 'done' }));
+    forgeHost(on, swarm(members), ['job-swarm']);
+    await start($);
+    await launch($, 'job-swarm');
+    const labels = await bandTexts(await mountBand($));
+    expect(labels[labels.length - 1]).toMatch(/└ ✓ 2 reported ∙ ○ 2 done/);
   });
 
   test('pressing a member row opens the pane on that member, and Back returns to the worker', async ($, on) => {
@@ -2038,7 +2050,7 @@ describe('the band team rows', () => {
     const children = labels.filter((l) => /^\s+[├└]/.test(l));
     expect(children).toHaveLength(2);
     expect(children[0]).toMatch(/├ ⏺ /);
-    expect(children[1]).toMatch(/└ ○ 1 working ∙ 1 waiting/);
+    expect(children[1]).toMatch(/└ ⏺ 1 working ∙ ○ 1 waiting/);
   });
 
   test('a worker without a team draws no child rows', async ($, on) => {

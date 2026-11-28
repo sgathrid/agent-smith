@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import path from'node:path';import {fileURLToPath}from'node:url';import {existsSync,realpathSync}from'node:fs';import {e as readAcceptance}from'./chunk-normalize.js';import {u as unwrapResponse,p as parseLaunches,c as claimMarkerPath}from'./chunk-stale.js';import {r as runJobWatch}from'./chunk-monitor.js';import'node:crypto';import'node:child_process';import'node:fs/promises';import'node:os';import'node:readline';const MAX_WATCH_JOB_MS = 6 * 60 * 60_000;
+import path from'node:path';import {fileURLToPath}from'node:url';import {existsSync,realpathSync}from'node:fs';import {f as readAcceptance}from'./chunk-normalize.js';import {u as unwrapResponse,p as parseLaunches,c as claimMarkerPath}from'./chunk-stale.js';import {r as runJobWatch}from'./chunk-monitor.js';import'node:crypto';import'node:child_process';import'node:fs/promises';import'node:os';import'node:readline';const MAX_WATCH_JOB_MS = 6 * 60 * 60_000;
 const HOOK_TIMEOUT_MS = 21_900_000;
 const WATCH_CAP_MS = HOOK_TIMEOUT_MS - 60_000;
 const WATCH_GRACE_MS = 60_000;

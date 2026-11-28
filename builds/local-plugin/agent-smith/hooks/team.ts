@@ -27,45 +27,72 @@ export function agentsWord(n: number): string {
   return n === 1 ? 'agent' : 'agents';
 }
 
+export type MemberMark = 'reported' | TeamMemberState;
+
+export function memberMark(member: TeamMember): MemberMark {
+  return member.state === 'waiting' && member.lastPost !== null ? 'reported' : member.state;
+}
+
+export type MarkCounts = Readonly<Record<MemberMark, number>>;
+
+export function markCounts(members: readonly TeamMember[]): MarkCounts {
+  const counts: Record<MemberMark, number> = { working: 0, reported: 0, waiting: 0, stopped: 0, done: 0, failed: 0, killed: 0 };
+  for (const member of members) counts[memberMark(member)] += 1;
+  return counts;
+}
+
+export const MARK_ORDER: readonly MemberMark[] = ['working', 'reported', 'waiting', 'stopped', 'done', 'failed', 'killed'];
+
 export function teamPhrase(team: Team | null | undefined): string {
   if (!hasTeam(team)) return '';
   const c = teamCounts(team);
+  const noun = `${c.total} ${agentsWord(c.total)}`;
   if (c.working > 0) return `${c.working}/${c.total} ${agentsWord(c.total)} working`;
-  if (c.stopped === c.total) return `${c.total} ${agentsWord(c.total)} stopped`;
-  const settled = c.waiting + c.done;
-  if (settled === c.total) return `${c.total} ${agentsWord(c.total)} ${c.done === c.total ? 'done' : 'waiting'}`;
-  return `${c.total} ${agentsWord(c.total)}`;
+  if (c.stopped === c.total) return `${noun} stopped`;
+  if (c.waiting + c.done !== c.total) return noun;
+  if (c.done === c.total) return `${noun} done`;
+  const reported = markCounts(team.members).reported + c.done;
+  if (reported === c.total) return `${noun} reported`;
+  return reported > 0 ? `${reported}/${c.total} ${agentsWord(c.total)} reported` : `${noun} waiting`;
 }
 
 export function teamHeaderLine(team: Team | null | undefined): string {
   if (!hasTeam(team)) return '';
-  const c = teamCounts(team);
-  const parts = [`Team ${c.total}`];
-  for (const state of ['working', 'waiting', 'stopped', 'done', 'failed', 'killed'] as const) {
-    if (c[state] > 0) parts.push(`${c[state]} ${state}`);
-  }
+  const c = markCounts(team.members);
+  const parts = [`Team ${team.members.length}`];
+  for (const mark of MARK_ORDER) if (c[mark] > 0) parts.push(`${c[mark]} ${mark}`);
   if (team.boardHead !== null && team.boardHead > 0) parts.push(`board #${team.boardHead}`);
   return parts.join(' · ');
 }
 
-const STATE_RANK: Record<TeamMemberState, number> = { working: 0, failed: 1, stopped: 2, waiting: 3, done: 4, killed: 5 };
+const MARK_RANK: Record<MemberMark, number> = { working: 0, failed: 1, stopped: 2, reported: 3, waiting: 4, done: 5, killed: 6 };
 
 export function sortMembers(members: readonly TeamMember[]): TeamMember[] {
   return [...members].sort((a, b) =>
-    STATE_RANK[a.state] - STATE_RANK[b.state] ||
+    MARK_RANK[memberMark(a)] - MARK_RANK[memberMark(b)] ||
     (b.lastEventAt ?? 0) - (a.lastEventAt ?? 0) ||
     a.name.localeCompare(b.name));
 }
 
-export function memberGlyph(state: TeamMemberState): string {
-  switch (state) {
+export function memberGlyph(mark: MemberMark): string {
+  switch (mark) {
     case 'working': return '⏺';
     case 'failed':
     case 'killed': return '✗';
+    case 'reported': return '✓';
     case 'stopped':
     case 'waiting':
     case 'done': return '○';
   }
+}
+
+export function shortModel(member: TeamMember): string {
+  const label = (member.modelLabel ?? '').replace(/\s*\([^)]*\)/g, '').trim();
+  if (label !== '') {
+    const words = label.split(/\s+/).filter((w) => /[a-z]/i.test(w));
+    return words[words.length - 1] ?? label;
+  }
+  return member.model ?? '';
 }
 
 export function tokensCell(n: number | null | undefined): string {

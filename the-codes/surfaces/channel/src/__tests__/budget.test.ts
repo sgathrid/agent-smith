@@ -210,9 +210,11 @@ test('conciseStatus: a failed turn keeps why it failed; a running turn keeps liv
   assert.equal(failed.reason, 'exit 1');
   assert.equal(failed.resumable, true);
   assert.equal(failed.provider, 'codex');
-  const running = conciseStatus(makeDetail(10, { status: 'running', finishedAt: null, lastEventAt: isoAgo(5_000), lastAliveAt: isoAgo(2_000), lastActivity: { stepIndex: 3, tool: 'Edit', input: 'a.ts', status: 'active' } }), null, {}, NOW) as Record<string, unknown>;
+  const running = conciseStatus(makeDetail(10, { status: 'running', finishedAt: null, lastEventAt: isoAgo(5_000), lastAliveAt: isoAgo(2_000), lastActivity: { stepIndex: 3, tool: 'Edit', input: '{"file_path":"a.ts"}', status: 'active' } }), null, {}, NOW) as Record<string, unknown>;
   assert.ok(running.liveness, 'running status carries liveness');
-  assert.ok(running.lastActivity, 'running status carries lastActivity');
+  assert.equal(running.lastActivity, 'step 3: editing a.ts (active)');
+  const shell = conciseStatus(makeDetail(12, { status: 'running', finishedAt: null, lastEventAt: isoAgo(5_000), lastAliveAt: isoAgo(2_000), lastActivity: { stepIndex: 14, tool: 'run_command', input: '{"CommandLine":"git grep -n foo"}', status: 'done' } }), null, {}, NOW) as Record<string, unknown>;
+  assert.equal(shell.lastActivity, 'step 14: git grep (done)');
   const long = conciseStatus(makeDetail(11, { report: 'x'.repeat(5_000) }), null) as Record<string, unknown>;
   assert.ok((long.report as string).startsWith('x'.repeat(2_000)));
 });

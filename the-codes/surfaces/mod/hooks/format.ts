@@ -200,7 +200,7 @@ export function jobDetail(job: RadarJob, options: { tools?: boolean } = {}): str
   const activity = swarmWait || (job.liveness?.state === 'in-tool' && quiet !== '') ? '' : oneLine(job.activity);
   if (activity !== '') parts.push(activity);
   if (withTools && job.toolCount !== null) parts.push(`${job.toolCount} tools`);
-  return parts.join(` ${SEP} `);
+  return parts.join(` ${SEP} `).replace(/ · /g, ` ${SEP} `);
 }
 
 export function outcome(job: RadarJob): string {
@@ -238,6 +238,7 @@ export interface RowOptions {
   readonly label?: number;
   readonly detail?: number;
   readonly tools?: boolean;
+  readonly padDetail?: boolean;
 }
 
 export function formatJobLine(job: RadarJob, options: RowOptions = {}): string {
@@ -246,10 +247,12 @@ export function formatJobLine(job: RadarJob, options: RowOptions = {}): string {
     label: labelWidth = BAND_LABEL_WIDTH,
     detail: detailWidth = BAND_DETAIL_WIDTH,
     tools = true,
+    padDetail = false,
   } = options;
   const clock = clockCell(job, now);
   const label = fitCell(jobLabel(job), labelWidth);
-  const detail = fitCell(jobDetail(job, { tools }), detailWidth).trimEnd();
+  const padded = fitCell(jobDetail(job, { tools }), detailWidth);
+  const detail = padDetail ? padded : padded.trimEnd();
   return `${LEAD}${pickGlyph(job.status)}${GUTTER}${label}${GUTTER}${detail}${GUTTER}${clock}`.replace(
     /\s+$/,
     '',
@@ -273,10 +276,12 @@ export function formatJobRow(job: RadarJob, options: RowOptions = {}): JobRow {
     label: labelWidth = BAND_LABEL_WIDTH,
     detail: detailWidth = BAND_DETAIL_WIDTH,
     tools = true,
+    padDetail = false,
   } = options;
   const glyph = pickGlyph(job.status);
   const label = fitCell(jobLabel(job), labelWidth);
-  const detail = fitCell(jobDetail(job, { tools }), detailWidth).trimEnd();
+  const padded = fitCell(jobDetail(job, { tools }), detailWidth);
+  const detail = padDetail ? padded : padded.trimEnd();
   const clock = clockCell(job, now);
   const plain = formatJobLine(job, options);
   return {
