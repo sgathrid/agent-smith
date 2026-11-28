@@ -8,6 +8,7 @@ import type { PipelineRecord } from '../../../forge/execute.ts';
 import { livenessOf, type Liveness } from '../../mod/hooks/stale.ts';
 import { isTerminalStatus } from '../../mod/hooks/turns.ts';
 import { jobSummary } from '../../mod/hooks/text.ts';
+import { classify } from '../../mod/hooks/progress.ts';
 import { hasTeam, teamCounts, type TeamCounts } from '../../mod/hooks/team.ts';
 
 export type ResponseFormat = 'concise' | 'detailed';
@@ -48,7 +49,7 @@ export function parseSince(value: string, now = Date.now()): number {
 }
 
 function lastActivity(a: JobSummary['lastActivity']): string | undefined {
-  return a ? `step ${a.stepIndex}: ${a.tool}${a.input ? ` ${trimWords(a.input, 80)}` : ''} (${a.status})` : undefined;
+  return a ? `step ${a.stepIndex}: ${trimWords(classify(a.tool, a.input).label, 100)} (${a.status})` : undefined;
 }
 function compact<T extends Record<string, unknown>>(o: T): Partial<T> {
   return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== null && v !== undefined)) as Partial<T>;
