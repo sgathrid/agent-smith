@@ -218,4 +218,6 @@ test('an edit under the resolved cwd is inside, relative to the root it is under
   const d = t.digest('/tmp/w', '/private/tmp/w/');
   assert.equal(d.editedCount, 2);
   assert.deepEqual(d.edited, ['a.ts', 'b.ts']);
+  t.start(4, 'write_to_file', J({ TargetFile: '/tmp/w/a.ts' }));
+  assert.deepEqual(t.editedPaths('/tmp/w', '/private/tmp/w'), ['b.ts', 'a.ts'], 'one file under both roots is listed once, at its latest edit');
 });

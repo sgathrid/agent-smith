@@ -285,7 +285,8 @@ export class ProgressTracker {
 
   /** File paths named by edit tool calls inside `cwd` (or `realCwd`), relative to it. */
   editedPaths(cwd = '', realCwd = ''): string[] {
-    return this.edited.map((p) => workspacePath(p, [cwd, realCwd])).filter((p): p is string => p !== null);
+    const inside = this.edited.map((p) => workspacePath(p, [cwd, realCwd])).filter((p): p is string => p !== null);
+    return inside.filter((p, i) => inside.lastIndexOf(p) === i);
   }
 
   /** From a window of recent calls, not the last one alone, so the phase does not flicker. */
