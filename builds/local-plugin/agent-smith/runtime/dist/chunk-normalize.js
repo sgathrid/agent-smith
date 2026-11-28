@@ -2276,10 +2276,10 @@ function parseTomlTopLevel(text) {
     return out;
 }const BOOKKEEPING_TOOLS = {
     opencode: new Set(['todowrite']),
-    kimi: new Set(['SetTodoList']),
-    claude: new Set(['TodoWrite']),
+    kimi: new Set(['TodoList']),
+    claude: new Set(['TodoWrite', 'TaskCreate', 'TaskUpdate', 'TaskList', 'TaskGet']),
     codex: new Set(['todo_list']),
-    agy: new Set(),
+    agy: new Set(['update_steps']),
 };
 function isBookkeepingTool(provider, toolName) {
     return BOOKKEEPING_TOOLS[provider]?.has(toolName) ?? false;

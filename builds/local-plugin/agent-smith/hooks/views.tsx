@@ -172,7 +172,7 @@ function timelineGroup(W: UiComponents, item: Extract<TimelineItem,{kind:'group'
   const expanded=o.tools.includes(item.key);
   const childOpts={...o,width:Math.max(1,o.width-2)};
   return <Box key={`row-${item.key}`} flexDirection="column">
-    <Button key={item.key} plain dimColor={!expanded} label={`${expanded?'▾':'✓'} ${oneLine(timelineGroupLabel(item.reads,item.searches,item.commands),Math.max(1,o.width-3))}`} onPress={() => a.tool(item.key)} />
+    <Button key={item.key} plain dimColor={!expanded} label={`${expanded?'▾':'✓'} ${oneLine(timelineGroupLabel(item.reads,item.searches,item.commands,item.edited),Math.max(1,o.width-3))}`} onPress={() => a.tool(item.key)} />
     {expanded && <Box key={`body-${item.key}`} flexDirection="row">
       <Text>{'  '}</Text>
       <Box flexDirection="column">
