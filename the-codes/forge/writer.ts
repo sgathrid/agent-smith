@@ -43,7 +43,6 @@ const LATEST_TEXT_CHARS = 4_000;
 
 const SUMMARY_CHARS = 1_000;
 
-/** The reader bounds each view; this bounds how many members a job dir holds. */
 export const TEAM_MEMBERS_CAP = 64;
 
 export interface JobWriterOptions {
@@ -323,10 +322,6 @@ export class JobWriter {
     try { this.flushTeam(); } catch {}
   }
 
-  /**
-   * The worker's own sub-agents. Not a worker event: it never moves lastEventAt,
-   * updatedAt or the timeline; liveness reads members' times from team.json.
-   */
   onTeam(at: string, team: Team, views: readonly MemberView[]): void {
     if (this.finished || this.manifest === null) return;
     const members = team.members.slice(0, TEAM_MEMBERS_CAP);
@@ -336,7 +331,6 @@ export class JobWriter {
     this.teamDirty = true;
     const nowMs = Date.parse(at);
     const clock = Number.isNaN(nowMs) ? Date.now() : nowMs;
-    // The coordinator is silent while its team works, so nothing else would flush this soon.
     if (shouldFlush(this.lastTeamFlushMs, clock, this.flushMs)) { this.lastTeamFlushMs = clock; try { this.flushTeam(); } catch {} }
   }
 

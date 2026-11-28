@@ -26,15 +26,10 @@ export interface LivenessInput {
   readonly lastEventAt?: Instant;
   readonly lastAliveAt?: Instant;
   readonly lastActivity?: { readonly tool?: unknown; readonly input?: unknown; readonly status?: unknown } | null;
-  /** The worker's own sub-agents (team.json). */
   readonly team?: Team | null;
   readonly now: number;
 }
 
-/**
- * The newest event of a team member still working. A coordinator waiting on
- * its team emits nothing itself, so its members' events are its activity.
- */
 export function workingTeamAt(team: Team | null | undefined): number | null {
   let newest: number | null = null;
   for (const m of team?.members ?? []) {

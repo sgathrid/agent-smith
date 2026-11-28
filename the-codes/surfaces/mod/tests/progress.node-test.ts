@@ -204,7 +204,6 @@ test('edits outside the worker directory are not the worker\'s edits', () => {
   assert.equal(d.editedCount, 2);
   assert.deepEqual(d.edited, ['src/a.ts', 'rel/b.ts']);
   assert.deepEqual(t.editedPaths('/w'), ['src/a.ts', 'rel/b.ts']);
-  // no cwd known: nothing to judge against, so nothing is dropped
   assert.equal(t.digest().editedCount, 4);
 });
 

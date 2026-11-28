@@ -595,10 +595,6 @@ export async function listAgyModels(run: RunFn, options?: ListModelsOptions): Pr
   }
 }
 
-// ---------------------------------------------------------------------------
-// Team: the sub-agents the worker starts (a /swarm, or invoke_subagent helpers)
-// ---------------------------------------------------------------------------
-
 export const AGY_TEAM_POLL_MS = 2_000;
 
 export interface AgyTeamDeps {
@@ -607,18 +603,11 @@ export interface AgyTeamDeps {
 }
 
 export interface AgyTeamWatch {
-  /** Begins polling once agy names the conversation; later calls are ignored. */
   start(conversationId: string): void;
   tick(nowMs: number): void;
-  /** Stops polling after one last poll. */
   stop(): void;
 }
 
-/**
- * Polls agy's own record of the worker's team and emits a `team` event only
- * when it changed (`updatedAt` aside). A reader failure is dropped: the team is
- * a view of the job, never a reason for it to fail.
- */
 export function createAgyTeamWatch(cwd: string, emit: (event: ProviderEvent) => void, deps: AgyTeamDeps): AgyTeamWatch {
   let reader: ReturnType<typeof createAgyTeamReader> | undefined;
   let timer: NodeJS.Timeout | undefined;
@@ -653,7 +642,6 @@ export function createAgyTeamWatch(cwd: string, emit: (event: ProviderEvent) => 
   };
 }
 
-/** `agyProvider.spawn`, with the team reader injectable for tests. */
 export function spawnAgy(spec: SpawnSpec, deps: AgyTeamDeps = { createReader: createAgyTeamReader, pollMs: AGY_TEAM_POLL_MS }): Promise<WorkerHandle> {
   const translator = createAgyTranslator(spec.maxOutputChars ?? 2000);
   let resultEvent: AgyResultEvent | undefined;

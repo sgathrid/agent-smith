@@ -75,7 +75,6 @@ export interface TeamMember {
   /** `coordinator`, `worker`, or the sub-agent's role line. */
   readonly role: string;
   readonly model: string | null;
-  /** The model as the provider shows it (`Gemini 4 Neon (High)`). */
   readonly modelLabel: string | null;
   /** One line: what the member was asked to do (plan task line, else first line of its brief). */
   readonly task: string | null;
@@ -147,7 +146,6 @@ declare module 'claude-code' {
       pinnedTurnId: string | null;
       /** A member of the selected worker's team shown in the pane, by `TeamMember.id`; null shows the worker. */
       selectedMember: string | null;
-      /** The pane's Team section shows every member, not just the first few. */
       teamOpen: boolean;
       now: number;
       follow: boolean;

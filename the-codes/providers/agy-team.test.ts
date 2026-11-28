@@ -1,8 +1,3 @@
-/**
- * agy-team reader against synthetic brain trees shaped like agy 1.5.18's files
- * (invented content). Chunk files are byte slices of one stream, so the
- * fixtures cut lines (and a UTF-8 character) across chunk boundaries.
- */
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -37,7 +32,6 @@ const jsonl = (steps: Step[]) => steps.map((s) => JSON.stringify(s) + '\n').join
 const message = (sender: string, content: string) =>
   `The following is a <SYSTEM_MESSAGE> not actually sent by the user.\n\n<SYSTEM_MESSAGE>\n[Message] timestamp=2026-01-01T10:00:00Z sender=${sender} priority=MESSAGE_PRIORITY_HIGH content=${content}\n</SYSTEM_MESSAGE>`;
 
-/** Writes a transcript as chunk files cut at the given byte offsets. */
 function chunks(conv: string, body: string | Buffer, cuts: number[] = []) {
   const buf = Buffer.isBuffer(body) ? body : Buffer.from(body);
   const edges = [0, ...cuts, buf.length];
@@ -206,7 +200,6 @@ describe('agy swarm', () => {
     const full = Buffer.from(steps + JSON.stringify(planner(3, [], { content: 'Second reply.' })) + '\n');
     const naive = full.indexOf(Buffer.from('ï'));
     const head = Buffer.from(steps).length + 20;
-    // Cut inside the first line, inside a two-byte character, and leave step 3 unfinished.
     chunks(ALPHA, full.subarray(0, head), [30, naive + 1, Buffer.from(steps).length - 5]);
     let r = read();
     let alpha = byName(r, 'alpha');
@@ -229,7 +222,6 @@ describe('agy swarm', () => {
     assert.equal(byName(read(), 'alpha').toolCount, 2);
     chunks(ALPHA, jsonl([planner(0, [call('read_file', { Path: '/c' })]), result(1, 'c')]));
     assert.equal(byName(read(), 'alpha').toolCount, 1);
-    // Larger, with a different first step: the first bytes no longer match.
     chunks(ALPHA, jsonl([system(0, 'restarted'), planner(1, [call('read_file', { Path: '/d' })]), result(2, 'd'), planner(3, [call('read_file', { Path: '/e' })]), result(4, 'e')]));
     assert.equal(byName(read(), 'alpha').toolCount, 2);
   });
@@ -252,7 +244,6 @@ describe('agy swarm', () => {
     assert.equal(r.team.boardHead, 1);
     assert.equal(r.views[0]!.brief, 'New brief.');
     assert.equal(byName(r, 'alpha').lastPost, null);
-    // Same size or larger, different content: the first line no longer matches.
     write(sg(C, 'swarm', 'board.jsonl'), jsonl([post(1, 'coordinator', '@alpha Other brief.', { kind: 'brief' }), post(2, 'alpha', 'fresh')]));
     r = read();
     assert.equal(r.team.boardHead, 2);

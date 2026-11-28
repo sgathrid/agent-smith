@@ -1,4 +1,3 @@
-/** Swarm coordinator tools: readable rows, tolerant of the real output envelope and of cut previews. */
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { classify, ProgressTracker } from '../hooks/progress.ts';
@@ -14,7 +13,6 @@ test('swarm add reads the result, and the plan before it', () => {
   assert.equal(label('swarm', { action: 'add', name: 'neon-1', brief: 'b' }, out), 'added neon-1 (Model A (High))');
   assert.equal(label('swarm', { action: 'add', name: 'neon-1' }), 'adding neon-1');
   assert.equal(label('swarm', { action: 'add', brief: 'b' }), 'adding agent');
-  // cut input: the name is after a long brief and lost; the output still names it
   assert.equal(label('swarm', '{"action":"add","brief":"long long lo', env('{"status":"added","name":"neon-2","model_display_name":"Model B"')), 'added neon-2 (Model B)');
   assert.equal(label('swarm', '{"action":"add","name":"neon-3","brief":"long long lo'), 'adding neon-3');
 });
@@ -77,6 +75,5 @@ test('repeated team polls fold into one group row', () => {
   assert.deepEqual(items.map((i) => i.kind), ['group', 'event']);
   const g = items[0]!;
   assert.equal(g.kind === 'group' && timelineGroupLabel(g.reads, g.searches, g.commands, g.team), 'checked team 2× · board #10–#15 · waited 2×');
-  // adds are not polls
   assert.equal(condenseTimeline([tool('swarm', { action: 'add', name: 'x' }), tool('swarm', { action: 'add', name: 'y' }), tool('swarm', { action: 'add', name: 'z' }), tool('swarm', { action: 'add', name: 'w' })]).length, 4);
 });

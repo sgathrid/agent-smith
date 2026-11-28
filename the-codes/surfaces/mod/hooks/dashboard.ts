@@ -247,7 +247,6 @@ export type TimelineItem =
   | { readonly kind: 'group'; readonly key: string; readonly events: readonly ActivityEvent[];
       readonly reads: number; readonly searches: number; readonly commands: number; readonly team?: TeamRun };
 
-/** Repeated team polls folded into a group: status checks, board reads (with the seqs they covered), waits. */
 export interface TeamRun { readonly checks: number; readonly boards: number; readonly range: string | null; readonly waits: number }
 
 const RUN_MIN = 3;
@@ -295,7 +294,6 @@ export function condenseTimeline(events: readonly ActivityEvent[]): TimelineItem
   return items;
 }
 
-/** `#10–#15` across several board reads; null when none of them named a message. */
 function seqRange(outputs: readonly string[]): string | null {
   const nums = outputs.flatMap((o) => [...(boardRange(o)?.matchAll(/#(\d+)/g) ?? [])].map((m) => Number(m[1])));
   if (nums.length === 0) return null;

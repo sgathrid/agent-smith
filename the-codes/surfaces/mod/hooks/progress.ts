@@ -156,11 +156,6 @@ export function classify(tool: string, input: string | null | undefined, output?
   return { kind: 'other', label: describeTool(name, params) };
 }
 
-/**
- * An agent's own bookkeeping (agy's swarm plan under ~/.gemini) is not the
- * worker's edit of the workspace. Relative paths count as inside; with no cwd
- * there is nothing to judge against.
- */
 function workspacePath(p: string, roots: readonly string[]): string | null {
   const bases = roots.map((r) => r.replace(/\/+$/, '')).filter((b) => b !== '');
   if (bases.length === 0 || !p.startsWith('/')) return p;
@@ -267,7 +262,6 @@ export class ProgressTracker {
     }
   }
 
-  /** `realCwd` is the cwd with symlinks resolved; a path under either root is inside, relative to the one it is under. */
   digest(cwd = '', realCwd = ''): ProgressDigest {
     const inside = this.editedPaths(cwd, realCwd);
     return {
@@ -283,7 +277,6 @@ export class ProgressTracker {
     };
   }
 
-  /** File paths named by edit tool calls inside `cwd` (or `realCwd`), relative to it. */
   editedPaths(cwd = '', realCwd = ''): string[] {
     const inside = this.edited.map((p) => workspacePath(p, [cwd, realCwd])).filter((p): p is string => p !== null);
     return inside.filter((p, i) => inside.lastIndexOf(p) === i);

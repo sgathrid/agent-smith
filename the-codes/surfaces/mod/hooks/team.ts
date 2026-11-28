@@ -1,7 +1,3 @@
-/**
- * team.ts — the shared words for a worker's own sub-agents, so the band, the
- * pane and the channel say the same thing. Pure: no filesystem, no clock.
- */
 import type { Team, TeamMember, TeamMemberState } from '../types/index.d.ts';
 
 export interface TeamCounts {
@@ -27,15 +23,10 @@ export function hasTeam(team: Team | null | undefined): team is Team {
   return team != null && team.members.length > 0;
 }
 
-/** `agents` for a swarm or sub-agents alike; one word keeps the band narrow. */
 export function agentsWord(n: number): string {
   return n === 1 ? 'agent' : 'agents';
 }
 
-/**
- * The team in a few words, count first because the band cuts from the end:
- * `4/9 agents working`, or `9 agents waiting` when none is working.
- */
 export function teamPhrase(team: Team | null | undefined): string {
   if (!hasTeam(team)) return '';
   const c = teamCounts(team);
@@ -46,7 +37,6 @@ export function teamPhrase(team: Team | null | undefined): string {
   return `${c.total} ${agentsWord(c.total)}`;
 }
 
-/** The header line for the pane: `Team 9 · 4 working · 5 waiting · board #15`. */
 export function teamHeaderLine(team: Team | null | undefined): string {
   if (!hasTeam(team)) return '';
   const c = teamCounts(team);
@@ -60,7 +50,6 @@ export function teamHeaderLine(team: Team | null | undefined): string {
 
 const STATE_RANK: Record<TeamMemberState, number> = { working: 0, failed: 1, stopped: 2, waiting: 3, done: 4, killed: 5 };
 
-/** Working members first, then by newest event, then by name. */
 export function sortMembers(members: readonly TeamMember[]): TeamMember[] {
   return [...members].sort((a, b) =>
     STATE_RANK[a.state] - STATE_RANK[b.state] ||
@@ -79,7 +68,6 @@ export function memberGlyph(state: TeamMemberState): string {
   }
 }
 
-/** Compact token count: `219k`, `1.2M`. */
 export function tokensCell(n: number | null | undefined): string {
   if (typeof n !== 'number' || !Number.isFinite(n) || n <= 0) return '';
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`;
@@ -87,7 +75,6 @@ export function tokensCell(n: number | null | undefined): string {
   return String(Math.round(n));
 }
 
-/** A member can be `working` only while its worker's run is live and it has acted since that run began. */
 export function settleTeam(team: Team, run: { readonly live: boolean; readonly startedAt: number | null }): Team {
   const ended = (m: TeamMember): boolean => {
     if (!run.live) return true;

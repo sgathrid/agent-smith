@@ -169,7 +169,6 @@ function teamSection(W: UiComponents, all: readonly TeamMember[], o: ViewOptions
 const memberColor=(state: TeamMemberState): 'blue' | 'green' | 'red' | undefined =>
   state==='working'?'blue':state==='done'?'green':state==='failed'?'red':undefined;
 
-/** A member of the worker's team: its header, brief, own timeline, and what it posted. */
 export function renderMember(W: UiComponents, job: RadarJob, member: TeamMember, view: MemberView | null, o: ViewOptions, a: ViewActions): JSX.Element {
   const {Box,Text,Button,Markdown}=W;
   const task=oneLine(member.task??'');

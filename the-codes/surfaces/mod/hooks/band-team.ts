@@ -1,7 +1,3 @@
-/**
- * band-team.ts — the band's agent tree: which child rows a live worker's team
- * gets, and the text of each. Pure: the caller supplies `now` and the widths.
- */
 import type { RadarJob, TeamMember, TeamMemberState } from '../types/index.d.ts';
 import { rowCap } from './band.ts';
 import { SEP, elapsedCell, fitCell, isLiveStatus, oneLine } from './format.ts';
@@ -16,7 +12,6 @@ export type ChildEntry = Exclude<BandEntry, { kind: 'job' }>;
 
 export interface BandPlan {
   readonly entries: readonly BandEntry[];
-  /** Workers that did not fit; the same count `rowBudget` reports. */
   readonly hidden: number;
 }
 
@@ -24,11 +19,6 @@ export function showsTeam(job: RadarJob): boolean {
   return (isLiveStatus(job.status) || job.acceptance?.pending === true) && hasTeam(job.team);
 }
 
-/**
- * Every shown worker gets its row first; leftover rows go to children, workers
- * in band order. A fold row stands for at least two members, so a team gets
- * either one row per member or two or more rows ending in a fold.
- */
 export function planBand(shown: readonly RadarJob[], maxRows?: number): BandPlan {
   const cap = rowCap(maxRows);
   const workers = shown.slice(0, cap);
@@ -56,7 +46,6 @@ function count(members: readonly TeamMember[], state: TeamMemberState): number {
   return members.filter((m) => m.state === state).length;
 }
 
-/** `5 waiting · 2 working · hydro-681 posted #13`: the members that have no row of their own. */
 export function foldText(hidden: readonly TeamMember[]): string {
   const parts: string[] = [];
   const order = [...STATE_ORDER].sort((a, b) => count(hidden, b) - count(hidden, a));
@@ -78,7 +67,6 @@ function tokensSuffix(m: TeamMember): string {
   return t === '' ? '' : ` ${SEP} ↓ ${t}`;
 }
 
-/** Width of the widest ` · ↓ 219k` among the shown members, 0 when none has tokens. */
 export function tokenColumn(entries: readonly BandEntry[]): number {
   let w = 0;
   for (const e of entries) if (e.kind === 'member') w = Math.max(w, tokensSuffix(e.member).length);
@@ -97,13 +85,8 @@ export interface ChildRow {
   readonly memberId: string | null;
 }
 
-/** The tokens column is dropped when it would squeeze the activity below this. */
 const MIN_ACTIVITY = 10;
 
-/**
- * One child row at the same columns as a job row. The name cell is two
- * narrower than a job's label (the tree glyph and its gap), so the cells meet.
- */
 export function childRow(
   entry: ChildEntry,
   now: number,

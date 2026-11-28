@@ -42,7 +42,6 @@ const options = (over: Partial<ViewOptions> = {}): ViewOptions => ({
   width: 60, now: NOW, colour: false, page: 0, scope: 'session', following: true, taskOpen: false, tools: [], pinnedTurnId: null, teamOpen: false, ...over,
 });
 
-/** Mounts a one-off Pane whose content is `build(W)`, so view functions run against the real components. */
 const builders = new WeakMap<object, Map<string, (W: any) => JSX.Element>>();
 let drawn = 0;
 async function draw($: any, on: any, build: (W: any) => JSX.Element) {
@@ -142,7 +141,6 @@ describe('the member view (renderMember)', () => {
   });
 });
 
-// These drive the real pane and need the team reader (team.json and readMemberView) to be implemented.
 describe('the pane with a real job directory (needs the team reader)', () => {
   const dir = '/work/.agent-smith/jobs/job-swarm';
   const memberView: MemberView = { schema: 1, id: 'neon-681-core', name: 'neon-681-core', brief: 'Full brief', report: 'Posted findings', truncated: false,

@@ -51,7 +51,6 @@ export interface JobSummary {
   readonly cwdMissingAtFinish?: boolean;
   readonly lastEventAt?: string | null;
   readonly lastAliveAt?: string | null;
-  /** The worker's own sub-agents, validated by the reader; for liveness and counts, never shown whole. */
   readonly team?: Team;
 }
 

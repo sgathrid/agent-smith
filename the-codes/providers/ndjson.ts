@@ -167,7 +167,6 @@ export function createEventBus(maxQueue = 4096): EventBus {
       w({ value: event, done: false });
       return;
     }
-    // A team snapshot replaces the last: an undrained queue would hold one whole team per poll.
     if (event.kind === 'team') {
       const prior = queue.findIndex((e) => e.kind === 'team');
       if (prior >= 0) queue.splice(prior, 1);
@@ -610,7 +609,6 @@ export async function runNdjsonWorker(cfg: NdjsonWorkerConfig): Promise<WorkerHa
   });
 
   void proc.exited.then(({ code, signal }) => {
-    // A throw here would leave waitForResult pending forever.
     try { sidecar?.stop(); } catch {}
     proc.closeLog();
     const exit: ExitInfo = { code, signal, killReason: proc.killReason, stderr: proc.stderrTail() };

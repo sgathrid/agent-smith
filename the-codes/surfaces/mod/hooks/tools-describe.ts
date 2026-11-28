@@ -173,10 +173,8 @@ export function describeActivity(tool: string | null, inputPreview: string | nul
   return describeTool(tool, parseInputPreview(inputPreview));
 }
 
-/** An agy swarm coordinator's team tools. They steer a team; they never touch files. */
 export const SWARM_TOOLS: ReadonlySet<string> = new Set(['swarm', 'read_board', 'post_message', 'swarm_wait', 'update_steps']);
 
-/** Which team-watching call this is, for folding repeats in the timeline. */
 export function teamPoll(tool: string, input: string | null | undefined): 'status' | 'board' | 'wait' | null {
   if (tool === 'read_board') return 'board';
   if (tool === 'swarm_wait') return 'wait';
@@ -203,7 +201,6 @@ function parsed(body: string): Record<string, unknown> | null {
   }
 }
 
-/** Input parameter, from the parsed JSON or, for a truncated input, its readable leading keys. */
 function inField(params: Record<string, unknown>, raw: string, key: string): string {
   const v = params[key];
   return typeof v === 'string' && v.trim() !== '' ? oneLine(v) : rawString(raw, key);
@@ -214,7 +211,6 @@ function outField(body: string, json: Record<string, unknown> | null, key: strin
   return typeof v === 'string' && v.trim() !== '' ? oneLine(v) : rawString(body, key);
 }
 
-/** Message seqs and authors on the board, in order; empty array means the board said it has nothing new. */
 function boardEntries(body: string): { seqs: number[]; agents: string[]; empty: boolean } {
   const json = parsed(body);
   const messages = json?.['messages'];
@@ -234,7 +230,6 @@ function boardEntries(body: string): { seqs: number[]; agents: string[]; empty: 
 
 const unique = (xs: readonly string[]): string[] => [...new Set(xs.filter((x) => x !== ''))];
 
-/** `#10–#13`, or `#10` when the board held one message. Null when the output names no seq. */
 export function boardRange(output: string | null | undefined): string | null {
   const { seqs } = boardEntries(outputBody(output));
   if (seqs.length === 0) return null;
@@ -243,7 +238,6 @@ export function boardRange(output: string | null | undefined): string | null {
   return lo === hi ? `#${lo}` : `#${lo}–#${hi}`;
 }
 
-/** Non-coordinator member states from a `swarm status` body; null when none are readable. */
 function memberStates(body: string): string[] | null {
   const json = parsed(body);
   const members = json?.['members'];
@@ -272,10 +266,6 @@ function teamSummary(states: readonly string[]): string {
   return keys.map((k) => `${counts.get(k)} ${k}`).join(' · ');
 }
 
-/**
- * A swarm tool call → a phrase. `raw` is the stored input string (maybe cut off),
- * `output` the stored output (maybe cut off); either may be empty while the call runs.
- */
 export function describeSwarm(tool: string, params: Record<string, unknown>, raw = '', output = ''): string {
   const body = outputBody(output);
   const json = parsed(body);

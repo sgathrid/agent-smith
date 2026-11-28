@@ -121,7 +121,6 @@ async function readForgeJob(fs: FsLike, repo: string, id: string, now: number): 
     warnings, report: null, reasoning: firstText(p?.latestText), raw: {},
   };
 }
-/** team.json is advisory: a missing or malformed one never breaks reading the job. */
 async function readTeam(fs: FsLike, dir: string): Promise<Team | null> {
   try {
     return await fs.exists(`${dir}/team.json`) ? parseTeam(JSON.parse(await fs.read(`${dir}/team.json`))) : null;
@@ -159,7 +158,6 @@ function viewEvent(value: unknown): ActivityEvent | null {
     typeof item.input === 'string' && typeof item.output === 'string' && typeof item.state === 'string') return item as ActivityEvent;
   return null;
 }
-/** A `MemberView` (schema 1) or null. */
 export function parseMemberView(value: unknown): MemberView | null {
   const v = record(value);
   if (v === null || v.schema !== 1 || typeof v.id !== 'string' || typeof v.name !== 'string') return null;
@@ -277,12 +275,10 @@ export async function readForgeDetail(fs: FsLike, repo: string, id: string, now:
     truncated: view?.truncated === true };
 }
 
-/** One team member's bounded detail (`members/<memberFileName(id)>.json` in the job dir), or null when absent or invalid. */
 export async function readMemberView(fs: FsLike, repo: string, jobId: string, memberId: string): Promise<MemberView | null> {
   if (typeof memberId !== 'string' || memberId === '') return null;
   try {
     const view = parseMemberView(JSON.parse(await fs.read(`${forgeJobDir(repo, jobId)}/members/${memberFileName(memberId)}`)));
-    // Two ids can share a file name once sanitized; the file names its own member.
     return view !== null && view.id === memberId ? view : null;
   } catch {
     return null;

@@ -37,11 +37,8 @@ export function agyBrainRoot(): string {
 }
 
 export interface AgyTeamReaderOptions {
-  /** The worker's (coordinator's) agy conversation id, from the `init` event. */
   readonly conversationId: string;
-  /** The worker's cwd. */
   readonly cwd: string;
-  /** Defaults to `agyBrainRoot()`. */
   readonly brainRoot?: string;
 }
 
@@ -54,14 +51,12 @@ export interface AgyTeamReader {
   poll(nowMs: number): AgyTeamRead | null;
 }
 
-/** Ids from agy's files are joined into paths, so nothing with a separator or dot gets through. */
 const ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const CHUNK_RE = /^\d{1,12}\.jsonl$/;
 const TEXT_CAP = 2_000;
 const EVENT_CAP = 200;
 const POLL_BUDGET = 8 << 20;
 const STREAM_BUDGET = 2 << 20;
-/** An append-only file whose first bytes changed was rewritten, whatever its size. */
 const SIG_BYTES = 256;
 const NL = 0x0a;
 
@@ -105,7 +100,6 @@ function sameStart(file: string, sig: Buffer | null): boolean {
   return sig === null || readRange(file, 0, sig.length).equals(sig);
 }
 
-/** Small JSON files, re-read only when their mtime or size moves. A torn read mid-rewrite keeps the last good parse. */
 class JsonFiles {
   private readonly cache = new Map<string, { mtimeMs: number; size: number; value: unknown }>();
 
@@ -128,7 +122,6 @@ class JsonFiles {
   }
 }
 
-/** Complete lines out of an append-only byte stream; the unfinished tail waits in `carry` as bytes (a UTF-8 character can split too). */
 class LineCarry {
   carry: Buffer = Buffer.alloc(0);
 
@@ -158,7 +151,7 @@ function unquote(v: unknown): unknown {
   if (typeof v !== 'string') return v;
   const s = v.trim();
   if (s.startsWith('"')) {
-    try { return JSON.parse(s); } catch { /* cut short: close it ourselves */ }
+    try { return JSON.parse(s); } catch {}
     const body = s.length >= 2 && s.endsWith('"') ? s.slice(1, -1) : s.slice(1);
     const closed = body.replace(/\\+$/, (m) => (m.length % 2 === 1 ? m.slice(1) : m));
     try { return JSON.parse(`"${closed}"`); } catch { return body; }
@@ -193,11 +186,9 @@ interface Planner {
   readonly calls: readonly { name: string; input: string }[];
   readonly tools: ToolEvent[];
   readonly results: { status: string; content: string }[];
-  /** False once anything but a tool result lands after this planner step. */
   onlyResults: boolean;
 }
 
-/** One member's transcript folded into aggregates and a bounded timeline; never holds the steps themselves. */
 class MemberLog {
   startedAt: number | null = null;
   lastEventAt: number | null = null;
@@ -306,7 +297,6 @@ class MemberLog {
   }
 }
 
-/** A member's transcript stream: chunk files in order, or the single transcript.jsonl when agy wrote no chunks. A shrink or a changed first chunk starts it over. */
 class Transcript {
   log: MemberLog;
   private files: string[] = [];
@@ -344,7 +334,6 @@ class Transcript {
     }
   }
 
-  /** Reads up to `budget` new bytes; returns the bytes read. */
   read(budget: number): number {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const used = this.readOnce(budget);
@@ -354,7 +343,6 @@ class Transcript {
     return 0;
   }
 
-  /** null when the stream was rewritten under us. */
   private readOnce(budget: number): number | null {
     const files = this.listFiles();
     if (this.files.length > 0 && files[this.index] !== this.files[this.index]) return null;
@@ -384,7 +372,6 @@ class Transcript {
 
 interface Post { readonly seq: number; readonly text: string }
 
-/** board.jsonl tailed by byte offset; a shrink, a changed first line or a seq that does not follow restarts it. */
 class Board {
   head: number | null = null;
   readonly lastPosts = new Map<string, Post>();
@@ -422,7 +409,6 @@ class Board {
     if (this.sig === null || this.sig.length < SIG_BYTES) this.sig = readRange(this.file, 0, Math.min(size, SIG_BYTES));
     const n = Math.min(size - this.offset, budget);
     if (n <= 0) return 0;
-    // From the start, the file's own order stands: a rewrite is only a seq going back after what we already hold.
     const fresh = this.offset === 0;
     const chunk = readRange(this.file, this.offset, n);
     this.offset += chunk.length;
@@ -442,7 +428,6 @@ class Board {
     return ok ? chunk.length : null;
   }
 
-  /** `@alpha @beta <brief>`: the first such post for a name is its brief. */
   private noteBrief(text: string): void {
     const names: string[] = [];
     let rest = text;
@@ -462,7 +447,6 @@ export function agyModelLabel(model: string | null): string | null {
   return effort ? `${words.join(' ')} (${effort})` : words.join(' ');
 }
 
-/** A role line as a name: `Swarm Worker (alpha)` → `alpha`; otherwise the line cut to a cell. */
 function shortName(role: string | null, id: string): string {
   if (role === null) return id.slice(0, 8);
   const m = /^Swarm Worker \(([^)]+)\)$/.exec(role);

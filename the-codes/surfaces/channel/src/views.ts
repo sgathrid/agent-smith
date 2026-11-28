@@ -61,11 +61,9 @@ export function jobLiveness(j: JobSummary, now = Date.now()): Liveness | null {
   return livenessOf({ status: j.status, updatedAt: j.updatedAt, lastEventAt: j.lastEventAt, lastAliveAt: j.lastAliveAt,
     lastActivity: j.lastActivity, team: j.team, now });
 }
-/** The worker's own sub-agents as counts by state; the members themselves stay out of Claude's results. */
 export function teamView(team: JobSummary['team']): TeamCounts | null {
   return hasTeam(team) ? teamCounts(team) : null;
 }
-/** A summary or detail record without its team, with the team as counts when it has one. */
 export function withTeamCounts<T extends JobSummary>(j: T): Omit<T, 'team'> & { team?: TeamCounts } {
   const { team, ...rest } = j;
   const counts = teamView(team);

@@ -533,8 +533,6 @@ function registerBand(on: Parameters<Register>[0]): void {
 
     const plan = planBand(shown, Math.max(1, (e.props.maxRows ?? 10) - 1));
     const { Box, Text, Button } = $.ui.resolve(e);
-    // A plain Button draws `1: ` before its children, so the row is sized to the rest;
-    // a child row has no hotkey and carries its own three-column indent.
     const width = Math.max(1, e.props.bodyColumns - 3);
     const longestLabel = Math.max(0, ...plan.entries.map((en) => en.kind === 'job' ? jobLabel(en.job).length : en.kind === 'member' ? en.member.name.length + 2 : 0));
     const columns = fitBandColumns(width, longestLabel);
