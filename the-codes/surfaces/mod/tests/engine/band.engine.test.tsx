@@ -3,6 +3,7 @@ import { describe, expect, mock, test } from 'claude-code/testing';
 import type { BandLine, BandBudget } from '../../hooks/band.ts';
 import { BAND_ROWS, buildLine, isShown, noColor, rowBudget } from '../../hooks/band.ts';
 import type { RadarJob } from '../../../types/index.d.ts';
+import { memberFileName } from '../../hooks/team.ts';
 import { proseText } from '../../hooks/views.tsx';
 import { updateLine } from '../../hooks/update.ts';
 import { register as registerMod } from '../../hooks/register.tsx';
@@ -1926,5 +1927,87 @@ describe('worker-first UI, inline prior turns, auto-follow, and O(active) idle p
     await $.command.run({ command: 'forge', args: 'links2' });
     expect(await pane.find({ type: 'Text', text: '✓ links2 · implement · turn 3 · 4m' })).toBeDefined();
     expect(await pane.find({ type: 'Text', text: 'codex gpt-6.2-sol · checks running' })).toBeDefined();
+  });
+});
+
+describe('the band team rows', () => {
+  const tm = (id: string, over: Record<string, unknown> = {}) => ({
+    id, name: id, role: 'worker', model: 'gemini-4-neon-high', modelLabel: 'Gemini 4 Neon (High)', task: `Review ${id}`,
+    state: 'working', activity: `reading ${id}.rs`, toolCount: 3, tokensOut: null,
+    startedAt: RUNNING_NOW - 60_000, lastEventAt: RUNNING_NOW - 1000, lastPost: null, ...over,
+  });
+  const teamFile = (members: unknown[]) => JSON.stringify({ schema: 1, source: 'agy-swarm', title: null, boardHead: 0, members, updatedAt: RUNNING_NOW });
+  const swarm = (members: unknown[]) => canonicalJob('job-swarm', { status: 'running', name: 'swarm', workerId: 'swarm', provider: 'agy', model: 'gemini-4-neon-high' }, {
+    'view.json': ADA_VIEW,
+    'team.json': teamFile(members),
+    [`members/${memberFileName('alpha')}`]: JSON.stringify({ schema: 1, id: 'alpha', name: 'alpha', brief: 'Brief', report: 'Alpha findings', truncated: false, timeline: [] }),
+  });
+  const bandTexts = async (band: any): Promise<string[]> => (await band.findAll({ type: 'Button' })).map((b: any) => String(b.props?.label));
+  const mountBand = ($: any) => $.ui.mount({ plugin: 'agent-smith', surface: 'terminal', ...BAND } as never);
+  const three = () => [tm('alpha'), tm('bravo'), tm('charlie', { state: 'waiting', activity: null })];
+
+  test('a running worker with a 3-member team draws its row and one child row per member', async ($, on) => {
+    forgeHost(on, swarm(three()), ['job-swarm']);
+    await start($);
+    await launch($, 'job-swarm');
+    const band = await mountBand($);
+    const labels = await bandTexts(band);
+    expect(labels).toHaveLength(4);
+    expect(labels[0]).toMatch(/swarm/);
+    expect(labels[1]).toMatch(/^\s+├ ⏺ alpha\s+reading alpha\.rs/);
+    expect(labels[2]).toMatch(/^\s+├ ⏺ bravo\s+reading bravo\.rs/);
+    expect(labels[3]).toMatch(/^\s+└ ○ charlie/);
+  });
+
+  test('a 7-member team at the default cap folds the rest into one counted row', async ($, on) => {
+    const members = ['alpha', 'bravo', 'c3', 'c4', 'c5', 'c6', 'c7'].map((id, i) => tm(id, i < 2 ? {} : i < 5 ? { state: 'waiting', activity: null } : { state: 'done' }));
+    forgeHost(on, swarm(members), ['job-swarm']);
+    await start($);
+    await launch($, 'job-swarm');
+    const labels = await bandTexts(await mountBand($));
+    expect(labels).toHaveLength(BAND_ROWS);
+    expect(labels.filter((l) => /[├└] ⏺/.test(l))).toHaveLength(2);
+    const fold = labels[labels.length - 1]!;
+    expect(fold).toMatch(/└ ○ 3 waiting ∙ 2 done/);
+    expect(fold).not.toMatch(/working/);
+  });
+
+  test('pressing a member row opens the pane on that member, and Back returns to the worker', async ($, on) => {
+    forgeHost(on, swarm(three()), ['job-swarm']);
+    await start($);
+    await launch($, 'job-swarm');
+    const band = await mountBand($);
+    await band.press({ key: 'band-swarm-alpha' });
+    const pane = await $.ui.mount(PANE_TARGET);
+    expect(await pane.find({ type: 'Text', text: /^⏺ alpha · member of swarm · agy/ })).toBeDefined();
+    expect(await pane.find({ type: 'Markdown', text: 'Alpha findings' })).toBeDefined();
+    await pane.press({ key: 'back' });
+    expect(await pane.find({ key: 'member-alpha' })).toBeDefined();
+    expect(await pane.find({ type: 'Text', text: /member of swarm/ })).toBeUndefined();
+  });
+
+  test('two running workers: both keep their rows and the team gets only the spare rows', async ($, on) => {
+    const files = { ...swarm(three()), ...canonicalJob('job-ada', { status: 'running', name: 'Ada', workerId: 'ada', provider: 'codex', model: 'gpt-6-sol' }, { 'view.json': ADA_VIEW }) };
+    forgeHost(on, files, ['job-swarm', 'job-ada']);
+    await start($);
+    await launch($, 'job-swarm');
+    await launch($, 'job-ada');
+    const labels = await bandTexts(await mountBand($));
+    expect(labels.filter((l) => !/^\s+[├└]/.test(l))).toHaveLength(2);
+    expect(labels.some((l) => /swarm/.test(l))).toBe(true);
+    expect(labels.some((l) => /Ada/.test(l))).toBe(true);
+    const children = labels.filter((l) => /^\s+[├└]/.test(l));
+    expect(children).toHaveLength(2);
+    expect(children[0]).toMatch(/├ ⏺ /);
+    expect(children[1]).toMatch(/└ ○ 1 working ∙ 1 waiting/);
+  });
+
+  test('a worker without a team draws no child rows', async ($, on) => {
+    forgeHost(on, ada(), ['job-ada']);
+    await start($);
+    await launch($, 'job-ada');
+    const labels = await bandTexts(await mountBand($));
+    expect(labels).toHaveLength(1);
+    expect(labels.some((l) => /[├└]/.test(l))).toBe(false);
   });
 });
