@@ -17,7 +17,7 @@
  *     shows, so an absent edit count means "not visible", not zero.
  */
 import type { ProgressDigest, ProgressPhase } from '../types/index.d.ts';
-import { basename, describeTool, humanCommand, parseInputPreview } from './tools-describe.ts';
+import { basename, describeSwarm, describeTool, humanCommand, parseInputPreview, SWARM_TOOLS } from './tools-describe.ts';
 import { oneLine } from './text.ts';
 
 export type { ProgressDigest, ProgressPhase };
@@ -124,7 +124,7 @@ export function toolLabel(tool: string, input: string | null | undefined, max = 
  * kimi (Read, Write, Edit, Grep, Glob, Bash, … — PascalCase, matched lowercased).
  * Input may be truncated JSON; a parse failure falls back to the bare tool name.
  */
-export function classify(tool: string, input: string | null | undefined): Classified {
+export function classify(tool: string, input: string | null | undefined, output?: string | null): Classified {
   const params = parseInputPreview(input);
   const name = tool.trim();
   const lower = name.toLowerCase();
@@ -150,9 +150,25 @@ export function classify(tool: string, input: string | null | undefined): Classi
     const short = query.length > 24 ? `${oneLine(query, 23)}…` : query;
     return { kind: 'search', label: short ? `searching ${short}` : 'searching' };
   }
+  if (SWARM_TOOLS.has(name)) return { kind: 'other', label: describeSwarm(name, params, input ?? '', output ?? '') };
   // codex: the tool IS the command line.
   if (/\s/.test(name) || /^(?:\S*\/)?(?:ba|z)?sh$/.test(name)) return classifyCommand(name);
   return { kind: 'other', label: describeTool(name, params) };
+}
+
+/**
+ * An agent's own bookkeeping (agy's swarm plan under ~/.gemini) is not the
+ * worker's edit of the workspace. Relative paths count as inside; with no cwd
+ * there is nothing to judge against.
+ */
+function isInside(p: string, cwd: string): boolean {
+  const base = cwd.replace(/\/+$/, '');
+  return base === '' || !p.startsWith('/') || p.startsWith(`${base}/`);
+}
+
+function relativeTo(p: string, cwd: string): string {
+  const base = cwd.replace(/\/+$/, '');
+  return base !== '' && p.startsWith(`${base}/`) ? p.slice(base.length + 1) : p;
 }
 
 const WINDOW = 8;
@@ -255,16 +271,13 @@ export class ProgressTracker {
   }
 
   digest(cwd = ''): ProgressDigest {
-    const relative = (p: string): string => {
-      const base = cwd.replace(/\/+$/, '');
-      return base !== '' && p.startsWith(`${base}/`) ? p.slice(base.length + 1) : p;
-    };
+    const inside = this.edited.filter((p) => isInside(p, cwd));
     return {
       phase: this.phase(),
       filesRead: this.read.size,
       searches: this.searches,
-      edited: this.edited.slice(-EDITED_CAP).map(relative),
-      editedCount: this.editedSet.size + this.unnamedEdits,
+      edited: inside.slice(-EDITED_CAP).map((p) => relativeTo(p, cwd)),
+      editedCount: inside.length + this.unnamedEdits,
       commands: this.commands,
       testRuns: this.testRuns,
       lastTestFailed: this.lastTestFailed,
@@ -272,10 +285,9 @@ export class ProgressTracker {
     };
   }
 
-  /** All file paths named by edit tool calls so far, relative to `cwd` when inside it. */
+  /** File paths named by edit tool calls inside `cwd`, relative to it. */
   editedPaths(cwd = ''): string[] {
-    const base = cwd.replace(/\/+$/, '');
-    return this.edited.map((p) => (base !== '' && p.startsWith(`${base}/`) ? p.slice(base.length + 1) : p));
+    return this.edited.filter((p) => isInside(p, cwd)).map((p) => relativeTo(p, cwd));
   }
 
   /** From a window of recent calls, not the last one alone, so the phase does not flicker. */

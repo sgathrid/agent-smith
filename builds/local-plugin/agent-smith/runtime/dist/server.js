@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import process$1 from'node:process';import {randomUUID,randomBytes}from'node:crypto';import {readFileSync,existsSync,statSync,rmSync,writeFileSync,mkdirSync,linkSync,unlinkSync,renameSync,readdirSync}from'node:fs';import path from'node:path';import {l as livenessOf,L as LIVENESS_STATES,w as waitForChange,c as claimMarkerPath}from'./chunk-stale.js';import {E as EFFORTS$1,M as MAX_WATCHED_FILES,v as validateEnv,g as getCatalogs,l as launchPipeline,r as requireProvider,a as validateModelAndEffort,p as probeProviders,F as ForgeService}from'./chunk-service.js';import {i as isTerminalStatus,r as reasonFromText,M as MODES$1,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS,b as inheritContinuedProviders,S as STAGE_PROMPTS,v as validateSpec,s as startPipeline,c as readPipeline,m as missingPipelineError,j as jobDir,d as jobFile,F as FILES,e as readAcceptance,f as isWorkerIdle,p as providerNames,g as findProvider,h as effectiveDefaultUnrestricted,k as isMode,l as cancelPipeline,n as isTerminalForgeStatus}from'./chunk-normalize.js';import os from'node:os';import {execFile}from'node:child_process';import'node:url';import'node:timers/promises';import'node:fs/promises';import'node:readline';//#region rolldown:runtime
+import process$1 from'node:process';import {randomUUID,randomBytes}from'node:crypto';import {readFileSync,existsSync,statSync,rmSync,writeFileSync,mkdirSync,linkSync,unlinkSync,renameSync,readdirSync}from'node:fs';import path from'node:path';import {l as livenessOf,L as LIVENESS_STATES,w as waitForChange,c as claimMarkerPath}from'./chunk-stale.js';import {f as failedReason,E as EFFORTS$1,M as MAX_WATCHED_FILES,v as validateEnv,g as getCatalogs,l as launchPipeline,c as continuationModelAndEffort,r as requireProvider,a as validateModelAndEffort,p as probeProviders,F as ForgeService}from'./chunk-service.js';import {i as isTerminalStatus,M as MODES$1,a as MODE_PRESETS,D as DEFAULT_TIMEOUT_MS,b as inheritContinuedProviders,S as STAGE_PROMPTS,v as validateSpec,s as startPipeline,r as readPipeline,m as missingPipelineError,j as jobDir,c as jobFile,F as FILES,d as readAcceptance,e as cancelPipeline,f as isWorkerIdle,p as providerNames,g as findProvider,h as effectiveDefaultUnrestricted,k as isMode,l as isTerminalForgeStatus}from'./chunk-normalize.js';import os from'node:os';import {execFile}from'node:child_process';import'node:url';import'node:timers/promises';import'node:fs/promises';import'node:readline';//#region rolldown:runtime
 var __create = Object.create;
 var __defProp = Object.defineProperty;
 var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
@@ -25264,12 +25264,6 @@ const warningTexts = (ws, error) => {
     const e = error ? flat(error) : '';
     return [...new Set(ws.map(w => flat(w.message)).filter(m => e === '' || !(e.includes(m) || m.includes(e))).map(m => trimWords(m, 200)))];
 };
-function failedReason(d) {
-    if (d.status !== 'failed')
-        return null;
-    const stored = d.reason;
-    return stored ? stored : reasonFromText(d.error);
-}
 function jobLiveness(j, now = Date.now()) {
     return livenessOf({ status: j.status, updatedAt: j.updatedAt, lastEventAt: j.lastEventAt, lastAliveAt: j.lastAliveAt,
         lastActivity: j.lastActivity, now });
@@ -25308,6 +25302,7 @@ function conciseRow(j, now = Date.now()) {
                 ? checkVerdicts(j.acceptance) : null,
             changedFileCount: typeof j.changedFileCount === 'number' && j.changedFileCount > 0 ? j.changedFileCount : null,
             warningCount: j.warnings.length || null,
+            reason: failedReason(j),
             resumable: j.status === 'failed' ? (j.resumable ?? Boolean(j.conversation)) : null,
             ...evidence(j),
         });
@@ -25584,6 +25579,7 @@ const jobFields = {
     }, ['state', 'silentForMs']),
     toolErrors: typed('integer', 'Tool calls that ended in an error. Evidence, not a verdict: a worker can recover and succeed.'),
     failedEarly: typed('boolean', 'Failed before any tool call (model, region or account); error carries the provider text.'),
+    reason: typed(['string', 'null'], 'Short classification of a failure (e.g. "timed out", "denied command", "no output").'),
     changedFilesUnknown: typed('boolean', 'Changed files could not be computed at finish; a missing changedFiles then means unknown, not none.'),
     cwdMissingAtFinish: typed('boolean', 'The working directory was gone when the job finished; nothing in it could be checked.'),
 };
@@ -25676,6 +25672,8 @@ const MESSAGE_OUTPUT = open({
     delivery: { type: 'string', enum: ['next-step', 'turn-end', 'now'], description: 'next-step: read inside the running turn; turn-end: starts the next turn when this one ends; now: a new turn started.' },
     status: { type: 'string', enum: ['running'] },
     provider: typed(['string', 'null']),
+    model: typed('string'),
+    effort: typed('string'),
     repo: typed('string'),
     timeoutMs: typed('integer'),
     pendingMessages: typed('integer', 'Messages accepted but not yet read, this one included.'),
@@ -25704,7 +25702,10 @@ const RAW_TOOL_DEFS = [
         }) },
     { name: 'follow_up', annotations: { title: 'Follow up', ...LAUNCHES }, description: 'Send a worker its next message ("do this next"); never cuts the current turn. A running worker reads it at its next step when its provider supports that, else when the turn ends; an idle worker starts a new turn in the same conversation. Queued messages are delivered whatever the turn\'s outcome; cancel discards them. Settings, checks, watched files and env carry over; arguments here apply from the next turn. env: "dropped" in the ack means the env values were lost.', inputSchema: schema({
             worker: { ...string, description: "Worker name, workerId, or any turn's job ID." }, prompt: string, context: messageContext, files: moreFiles,
-            checks: { ...checksSchema, description: 'Replaces the inherited checks; [] clears them.' }, model: string, effort: { type: 'string', enum: EFFORTS }, timeoutMs: { type: 'integer', minimum: 1 }, env: envAgain,
+            checks: { ...checksSchema, description: 'Replaces the inherited checks; [] clears them.' },
+            model: { ...string, description: 'Replaces the inherited model; "default" clears it.' },
+            effort: { type: 'string', enum: [...EFFORTS, 'default'], description: 'Replaces the inherited effort; "default" clears it.' },
+            timeoutMs: { type: 'integer', minimum: 1 }, env: envAgain,
             unrestricted: { type: 'boolean', description: 'Skip worker approval prompts.' },
         }, ['worker', 'prompt']) },
     { name: 'steer', annotations: { title: 'Steer', ...LAUNCHES, destructiveHint: true }, description: 'Redirect a worker now ("stop and do this instead"): cuts its running turn (the tool call in flight is lost) or running checks and continues the same conversation with this message; an idle worker starts a new turn. Before the provider reports a conversation handle this fails unless allowFresh is true. To let the current work finish, use follow_up.', inputSchema: schema({
@@ -25933,7 +25934,9 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 function failure(message, detail) { return { isError: true, content: [{ type: 'text', text: message + ('' ) }] }; }
 function fullStatus(detail, acceptance, now = Date.now()) {
     const live = jobLiveness(detail, now);
-    return { ...detail, resumable: Boolean(detail.conversation), ...(live === null ? {} : { liveness: livenessView(live) }), taskStatus: taskStatus(detail.status), report: detail.report?.slice(0, REPORT_HEAD_CHARS) ?? null, reportTruncated: (detail.report?.length ?? 0) > REPORT_HEAD_CHARS, acceptance };
+    const { reason: _r, ...rest } = detail;
+    const reason = failedReason(detail);
+    return { ...rest, ...(reason !== null ? { reason } : {}), resumable: Boolean(detail.conversation), ...(live === null ? {} : { liveness: livenessView(live) }), taskStatus: taskStatus(detail.status), report: detail.report?.slice(0, REPORT_HEAD_CHARS) ?? null, reportTruncated: (detail.report?.length ?? 0) > REPORT_HEAD_CHARS, acceptance };
 }
 const listCapabilitiesTool = async (ctx, args) => {
     const fmt = format(args);
@@ -26143,7 +26146,7 @@ function messageAck(ack, notes = []) {
 const followUp = async (ctx, args) => {
     const request = {
         worker: text(args, 'worker', true), prompt: text(args, 'prompt', true), context: contextText(args), files: filesList(args),
-        checks: parseChecks(args.checks), model: text(args, 'model'), effort: allowed(args, 'effort', EFFORTS$1), timeoutMs: number(args, 'timeoutMs'),
+        checks: parseChecks(args.checks), model: text(args, 'model'), effort: allowed(args, 'effort', [...EFFORTS$1, 'default']), timeoutMs: number(args, 'timeoutMs'),
         env: validateEnv(args.env), unrestricted: boolean(args, 'unrestricted'),
     };
     let targetWorker = request.worker;
@@ -26153,10 +26156,18 @@ const followUp = async (ctx, args) => {
         targetWorker = head.workerId ?? head.jobId;
         const provider = head.provider ?? '';
         if (request.model !== undefined || request.effort !== undefined) {
-            const cfg = loadModelConfig({ repo: ctx.service.repo });
-            const resolved = resolveRequest({ provider: provider || undefined, model: request.model ?? head.model ?? head.modelResolved ?? undefined, effort: request.effort }, cfg);
-            Object.assign(request, { ...(request.model !== undefined ? { model: resolved.model } : {}), effort: resolved.effort });
-            notes.push(...resolved.warnings, ...cfg.errors.map(e => `models.json: ${e}`));
+            const inherited = continuationModelAndEffort(head, []);
+            const modelArg = request.model === 'default' ? undefined : (request.model ?? inherited.modelExpected);
+            const effortArg = request.effort === 'default' ? undefined : request.effort;
+            if (modelArg !== undefined || effortArg !== undefined) {
+                const cfg = loadModelConfig({ repo: ctx.service.repo });
+                const resolved = resolveRequest({ provider: provider || undefined, model: modelArg, effort: effortArg }, cfg);
+                Object.assign(request, {
+                    ...(request.model !== undefined && request.model !== 'default' ? { model: resolved.model } : {}),
+                    ...(request.effort !== 'default' ? { effort: resolved.effort } : {}),
+                });
+                notes.push(...resolved.warnings, ...cfg.errors.map(e => `models.json: ${e}`));
+            }
         }
         const gate = await confirmUnrestricted(ctx, [{
                 unrestricted: request.unrestricted,
@@ -26250,7 +26261,7 @@ const pipelineStatus = async (ctx, args) => {
     const r = readPipeline(ctx.service.repo, runId);
     if (!r)
         throw missingPipelineError(runId);
-    return json(format(args) === 'concise' ? concisePipeline(r) : r);
+    return structured(format(args) === 'concise' ? concisePipeline(r) : r, { compact: true });
 };
 function quietNotice(repo, kind, id) {
     const marker = claimMarkerPath(repo, kind, id);
@@ -26304,7 +26315,7 @@ const cancelJob = async (ctx, args) => {
             const settled = status === 'passed' || status === 'partial' || status === 'failed';
             return { runId: id, status, settled };
         });
-        return json(out);
+        return structured(out, { compact: true });
     }
     const checksRunning = (jobId) => {
         const a = readAcceptance(ctx.service.repo, jobId);
@@ -26352,7 +26363,7 @@ const cancelJob = async (ctx, args) => {
             ? { ...body, checksCanceled: false, checksNote: 'The process running the acceptance checks will stop them; status shows acceptance.' }
             : { ...body, checksCanceled: true };
     });
-    return json(out);
+    return structured(out, { compact: true });
 };
 async function validatePipelineStages(ctx, stages) {
     let stubbed;
@@ -26401,7 +26412,7 @@ const runPipeline = async (ctx, args) => {
         ? await launchPipeline(ctx.service, spec, { unrestricted })
         : startPipeline(ctx.service, spec, { unrestricted });
     void run.done.catch(err => process.stderr.write(`agent-smith pipeline ${run.runId}: ${String(err)}\n`));
-    return json({ runId: run.runId, repo: ctx.service.repo, stages: spec.stages.map(s => ({ name: s.name, provider: s.provider, ...(s.dependsOn?.length ? { dependsOn: s.dependsOn } : {}) })), ...(warnings.length ? { warnings } : {}) });
+    return structured({ runId: run.runId, repo: ctx.service.repo, stages: spec.stages.map(s => ({ name: s.name, provider: s.provider, ...(s.dependsOn?.length ? { dependsOn: s.dependsOn } : {}) })), ...(warnings.length ? { warnings } : {}) }, { compact: true });
 };
 const HANDLERS = {
     list_capabilities: listCapabilitiesTool, spawn_job: spawnJob, follow_up: followUp, steer,

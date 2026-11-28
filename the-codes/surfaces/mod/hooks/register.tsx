@@ -195,6 +195,13 @@ const trimSlashes = (p: string): string => p.replace(/\/+$/, '') || p;
 let announcing = false;
 let submittingNotice = false;
 let inMainTurn = false;
+let interactive = false;
+let turnHooksRegistered = false;
+
+function setMainTurn(active: boolean): void {
+  if (active && (!interactive || !turnHooksRegistered)) return;
+  inMainTurn = active;
+}
 
 function isPromptDropped(result: unknown): boolean {
   return result !== null && typeof result === 'object' && typeof (result as { drop?: unknown }).drop === 'string';
@@ -336,7 +343,7 @@ export async function startBand($: EngineInterface, cwd?: string): Promise<void>
   followingSite = null;
   detailCache = null;
   polling = false;
-  inMainTurn = false;
+  setMainTurn(false);
   idleEntries = null;
   settledJobCache.clear();
 
@@ -425,8 +432,6 @@ async function pollNativeTasks($: EngineInterface, rows: readonly RadarJob[]): P
   }
 }
 
-let interactive = false;
-
 async function flushTurnNotices($: EngineInterface): Promise<void> {
   const cfg = await read($, bandConfig);
   if (cfg.repo === '' || await read($, readError) !== null) return;
@@ -436,10 +441,16 @@ async function flushTurnNotices($: EngineInterface): Promise<void> {
   await announce($, cfg.repo, await read($, bandJobs), await $.clock.now());
 }
 
+function isMainLoopCall(e: { agentId?: unknown }, next: unknown): boolean {
+  if (e.agentId !== undefined) return false;
+  const origin = (next as { origin?: { plugin?: string } }).origin;
+  return origin === undefined || origin.plugin === 'engine';
+}
+
 function registerBand(on: Parameters<Register>[0]): void {
   try {
     on('turn.start', async (_$, e, next) => {
-      if (e.agentId === undefined) inMainTurn = true;
+      if (e.agentId === undefined) setMainTurn(true);
       return next(e);
     });
 
@@ -448,13 +459,17 @@ function registerBand(on: Parameters<Register>[0]): void {
         return await next(e);
       } finally {
         if (e.agentId === undefined) {
-          inMainTurn = false;
+          setMainTurn(false);
           await flushTurnNotices($).catch(() => {});
         }
       }
     });
-  } catch {}
+    turnHooksRegistered = true;
+  } catch {
+    turnHooksRegistered = false;
+  }
   on('tool.call', { tool: LAUNCH_TOOL }, async ($, e, next) => {
+    if (isMainLoopCall(e, next)) setMainTurn(true);
     const r = await next(e) as { result?: unknown; text?: unknown; deny?: string; isError?: boolean } | undefined;
     if (r && r.deny === undefined && r.isError !== true) {
       let launches = parseLaunches(e.tool, r.result);
@@ -465,6 +480,7 @@ function registerBand(on: Parameters<Register>[0]): void {
   });
 
   on('tool.call', { tool: STATUS_TOOL }, async ($, e, next) => {
+    if (isMainLoopCall(e, next)) setMainTurn(true);
     if (
       interactive && e.agentId === undefined && typeof e.tool === 'string' && e.tool.endsWith('__status') && e.wait_ms !== undefined && typeof e.id === 'string' &&
       await read($, readError) === null && refusesStatusWait(await read($, notices), await read($, bandJobs), e.id)

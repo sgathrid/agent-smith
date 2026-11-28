@@ -13,6 +13,7 @@ import {
   SCHEMA_VERSION,
   attributeChanged,
   deriveStatus,
+  failureFields,
   isForgeStatus,
   isTerminalForgeStatus,
   normalizeDenials,
@@ -333,4 +334,30 @@ test('resolveTimeoutMs accepts undefined or positive finite numbers and rejects 
   for (const bad of [0, -1, -1000, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
     assert.throws(() => resolveTimeoutMs(bad), RangeError);
   }
+});
+
+test('deriveStatus and failureFields: timeout/cancel outrank earlier denial; denial status keeps denied reason', () => {
+  const denials = [{ action: 'run_command' }];
+  const timedOutVerdict = deriveStatus({ ok: false, jobStatus: 'timeout', deniedActions: denials, report: '' });
+  assert.equal(timedOutVerdict.status, 'failed');
+  assert.equal(timedOutVerdict.reason, REASONS.timedOut);
+  assert.equal(failureFields(timedOutVerdict, { status: 'timeout', error: 'timed out after 2m', deniedActions: denials }).reason, REASONS.timedOut);
+  assert.equal(failureFields({ status: 'failed', suspicious: true, reason: 'denied run_command' }, { status: 'timeout', error: 'timed out after 2m', deniedActions: denials }).reason, REASONS.timedOut);
+
+  const canceledVerdict = deriveStatus({ ok: false, jobStatus: 'cancelled', deniedActions: denials, report: '' });
+  assert.equal(canceledVerdict.status, 'failed');
+  assert.equal(canceledVerdict.reason, 'canceled');
+  assert.equal(failureFields(canceledVerdict, { status: 'cancelled', error: 'cancelled', deniedActions: denials }).reason, 'canceled');
+  assert.equal(failureFields({ status: 'failed', suspicious: true, reason: 'denied run_command' }, { status: 'cancelled', error: 'cancelled', deniedActions: denials }).reason, 'canceled');
+
+  const deniedVerdict = deriveStatus({ ok: false, jobStatus: 'denied', deniedActions: denials, report: '' });
+  assert.equal(deniedVerdict.status, 'failed');
+  assert.equal(deniedVerdict.reason, 'denied run_command');
+  assert.equal(failureFields(deniedVerdict, { status: 'denied', error: 'denied run_command', deniedActions: denials }).reason, 'denied run_command');
+  assert.equal(failureFields({ status: 'failed', suspicious: false, reason: 'worker error' }, { status: 'denied', error: 'worker error', deniedActions: denials }).reason, 'denied run_command');
+
+  const bareDeniedVerdict = deriveStatus({ ok: false, jobStatus: 'denied', deniedActions: [], report: '' });
+  assert.equal(bareDeniedVerdict.status, 'failed');
+  assert.equal(failureFields(bareDeniedVerdict, { status: 'denied', error: 'denied bash' }).reason, 'denied bash');
+  assert.equal(failureFields(bareDeniedVerdict, { status: 'denied', error: 'no output' }).reason, 'no output');
 });

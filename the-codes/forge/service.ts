@@ -18,7 +18,7 @@ import type {
   WorkerHandle,
 } from '../providers/types.js';
 import { isMode, MODE_PRESETS, type ModePreset } from './modes.ts';
-import { buildBrief } from './brief.ts';
+import { buildBrief, joinBrief } from './brief.ts';
 import {
   DEFAULT_TIMEOUT_MS,
   deriveStatus,
@@ -138,25 +138,41 @@ function mergeOverrides(entries: readonly SteerEntry[]): MessageOverrides {
   return out;
 }
 
-function continuationModelAndEffort(
-  head: Pick<ForgeManifest, 'model' | 'modelResolved' | 'effort'>,
+export function continuationModelAndEffort(
+  head: Partial<Pick<ForgeManifest, 'model' | 'modelRequested' | 'modelResolved' | 'modelSource' | 'effort'>>,
   entries: readonly SteerEntry[],
   spec?: Pick<TurnSpec, 'model' | 'effort'>,
-): { model: string | undefined; effort: string | undefined } {
+  defaultModel?: string,
+): { modelRequested: string | undefined; modelExpected: string | undefined; effort: string | undefined } {
   const o = mergeOverrides(entries);
-  return {
-    model: o.model ?? spec?.model ?? head.model ?? head.modelResolved ?? undefined,
-    effort: o.effort ?? spec?.effort ?? head.effort ?? undefined,
-  };
+  const inheritedRequested = head.modelRequested !== undefined
+    ? (head.modelRequested ?? undefined)
+    : (head.modelSource === 'reported' || head.modelSource === 'harness-config' ? undefined : (head.model ?? undefined));
+  const modelRequested = o.model === 'default' ? undefined : (o.model ?? spec?.model ?? inheritedRequested);
+  const modelExpected = modelRequested ?? defaultModel ?? (
+    o.model === 'default' || head.modelSource === 'reported'
+      ? undefined
+      : (head.model ?? head.modelResolved ?? undefined)
+  );
+  const effort = o.effort === 'default' ? undefined : (o.effort ?? spec?.effort ?? head.effort ?? undefined);
+  return { modelRequested, modelExpected, effort };
 }
 
-function applyOverrides(spec: TurnSpec, o: MessageOverrides, provider: Provider): TurnSpec {
+function applyOverrides(spec: TurnSpec, o: MessageOverrides, provider: Provider, defaultModel?: string): TurnSpec {
   if (Object.keys(o).length === 0) return spec;
   const unrestricted = effectiveUnrestricted(provider, o.unrestricted === undefined ? spec.unrestricted : o.unrestricted);
+  const { model: _m, effort: _e, ...rest } = spec;
+  const baseSpec: TurnSpec = {
+    ...rest,
+    model: o.model === 'default' ? undefined : spec.model,
+    effort: o.effort === 'default' ? undefined : spec.effort,
+  };
   return {
-    ...spec,
-    ...(o.model === undefined ? {} : { model: o.model, modelRequested: o.model, modelResolved: o.model, modelSource: 'requested' as const }),
-    ...(o.effort === undefined || provider.supportsEffort === false ? {} : { effort: o.effort }),
+    ...baseSpec,
+    ...(o.model === undefined ? {} : o.model === 'default'
+      ? { modelRequested: null, modelResolved: defaultModel ?? null, modelSource: defaultModel ? 'harness-config' as const : 'unknown' as const }
+      : { model: o.model, modelRequested: o.model, modelResolved: o.model, modelSource: 'requested' as const }),
+    ...(o.effort === undefined || o.effort === 'default' || provider.supportsEffort === false ? {} : { effort: o.effort }),
     ...(o.timeoutMs === undefined ? {} : { timeoutMs: resolveTimeoutMs(o.timeoutMs) }),
     ...(o.checks === undefined ? {} : { checks: o.checks }),
     unrestricted,
@@ -382,7 +398,7 @@ export class ForgeService {
     const readOnlyEnforced = sandboxInfo?.readOnlyEnforced ?? false;
     if (provider.name === 'agy' && preset?.runsCommands === true && !unrestricted) {
       warnings.push(
-        'agy cannot prompt for permission headless; commands will be denied and the job will return an empty result. Retry with unrestricted:true if this job needs shell access.',
+        'agy cannot prompt for permission headless; commands will be denied and the job will return an empty result.',
       );
     }
     const brief = buildBrief({
@@ -396,7 +412,7 @@ export class ForgeService {
     });
     const prependBrief = brief !== '' && !prompt.startsWith(brief);
     const preambleApplied = brief !== '';
-    const sentPrompt = prependBrief ? `${brief}\n\n${prompt}` : prompt;
+    const sentPrompt = prependBrief ? joinBrief(brief, prompt) : prompt;
     const jobId = newJobId(mode);
     const name = request.name?.trim() || `${mode}-${jobId.slice(-8)}`;
     if (name.length > 80) throw new Error('worker name must be at most 80 characters');
@@ -577,7 +593,7 @@ export class ForgeService {
             resuming: false,
             dirtyFiles: dirty,
           });
-          currentPrompt = `${fullBrief}\n\n${currentTurn.rawPrompt}`;
+          currentPrompt = joinBrief(fullBrief, currentTurn.rawPrompt);
           currentWriter.updatePreamble(fullBrief);
         }
       }
@@ -918,7 +934,7 @@ export class ForgeService {
     const context = [...entries].reverse().find((e) => e.context !== undefined)?.context ?? spec?.context;
     const checks = o.checks ?? spec?.checks ?? input.headChecks;
     const env = input.env !== undefined && Object.keys(input.env).length > 0 ? input.env : undefined;
-    const { model, effort } = continuationModelAndEffort(head, entries, spec);
+    const { modelRequested: model, effort } = continuationModelAndEffort(head, entries, spec);
     return {
       mode: spec?.mode ?? head.mode ?? 'task',
       prompt: rawPrompt,
@@ -1009,7 +1025,15 @@ export class ForgeService {
     turn: { rawPrompt: string; prependBrief: boolean; resuming: boolean; context: string | undefined };
   }> {
     const { provider, parent, result, report, entries, unconsumed, verdictStatus } = input;
-    const spec = this.withSandbox(applyOverrides(input.spec, mergeOverrides(unconsumed), provider), input.spec, provider);
+    const parentSnap = parent.writer.snapshot();
+    const defaultModel = this.harnessDefaults(provider.name).model;
+    const { modelRequested: nextModel, effort: nextEffort } = continuationModelAndEffort(parentSnap ?? {}, unconsumed, input.spec, defaultModel);
+    const overrides = {
+      ...mergeOverrides(unconsumed),
+      ...(nextModel === undefined && input.spec.model !== undefined ? { model: 'default' } : {}),
+      ...(nextEffort === undefined && input.spec.effort !== undefined ? { effort: 'default' } : {}),
+    };
+    const spec = this.withSandbox(applyOverrides(input.spec, overrides, provider, defaultModel), input.spec, provider);
     const conversation = parent.writer.currentConversation();
     const wasInterrupted = parent.live.interruptRequested && verdictStatus !== 'succeeded';
     if (conversation === null && !wasInterrupted) {
@@ -1045,7 +1069,6 @@ export class ForgeService {
       brief: nextBrief,
     });
     const nextLiveEntry = newLiveJob(nextWriter, spec.timeoutMs);
-    const parentSnap = parent.writer.snapshot();
     const nextTurn = (parentSnap?.turn ?? 1) + 1;
     const continuationKind: ContinuationKind = parent.live.interruptRequested ? 'steer' : 'follow-up';
     const chainStartedAt = continuationKind === 'steer'
@@ -1325,11 +1348,16 @@ export class ForgeService {
       }
     }
     const provider = this.providerSafe(head.provider);
-    const { model: effectiveModel, effort: effectiveEffort } = continuationModelAndEffort(head, [...undeliveredEntries(this.repo, headId), entry]);
+    const { modelExpected: ackModel, effort: effectiveEffort } = continuationModelAndEffort(
+      head,
+      [...undeliveredEntries(this.repo, headId), entry],
+      undefined,
+      this.harnessDefaults(head.provider).model,
+    );
     if (provider !== null) {
       const checked = await validateModelAndEffort(
         provider,
-        effectiveModel,
+        ackModel,
         effectiveEffort,
         checkCatalog ? async () => catalog : undefined,
         entry.overrides?.unrestricted,
@@ -1382,6 +1410,8 @@ export class ForgeService {
       jobId: headId, name, workerId, turn,
       action: sender === 'steer' && (running || checksRunning) ? 'interrupting' : 'queued',
       delivery, status: 'running', provider: head.provider, repo: this.repo,
+      ...(ackModel === undefined ? {} : { model: ackModel }),
+      ...(effectiveEffort === undefined || provider?.supportsEffort === false ? {} : { effort: effectiveEffort }),
       timeoutMs: entry.overrides?.timeoutMs ?? head.timeoutMs ?? DEFAULT_TIMEOUT_MS,
       pendingMessages: pending,
       ...envAck,
@@ -1401,7 +1431,12 @@ export class ForgeService {
     const { ack: envAck, runEnv } = this.resolveFollowUpEnv(workerId, head.jobId, env, false, warnings);
     const provider = this.providerSafe(head.provider);
     const pendingEntries = undeliveredEntries(this.repo, head.jobId);
-    const { model: effectiveModel, effort: effectiveEffort } = continuationModelAndEffort(head, [...pendingEntries, entry]);
+    const { modelExpected: effectiveModel, effort: effectiveEffort } = continuationModelAndEffort(
+      head,
+      [...pendingEntries, entry],
+      undefined,
+      this.harnessDefaults(head.provider).model,
+    );
     if (checkCatalog && (effectiveModel !== undefined || (effectiveEffort !== undefined && provider?.supportsEffort !== false))) {
       warnings.push(...checkAgainstCatalog(head.provider, effectiveModel, effectiveEffort, catalog));
     }
@@ -1414,9 +1449,12 @@ export class ForgeService {
     const { ack } = await this.spawnTracked({ ...request, ownerChecks: true, lockHeldByCaller: true });
     writeConsumedCount(this.repo, head.jobId, onDisk);
     const checks = request.checks?.map((c) => c.name);
+    const ackModel = effectiveModel ?? ack.modelResolved ?? undefined;
     return {
       jobId: ack.jobId, name: ack.name, workerId: ack.workerId, turn: ack.turn,
       action: 'started', delivery: 'now', status: 'running', provider: ack.provider, repo: this.repo,
+      ...(ackModel === undefined ? {} : { model: ackModel }),
+      ...(effectiveEffort === undefined || provider?.supportsEffort === false ? {} : { effort: effectiveEffort }),
       timeoutMs: ack.timeoutMs,
       ...envAck,
       ...(checks !== undefined && checks.length > 0 ? { checks } : {}),
@@ -1810,7 +1848,6 @@ export class ForgeService {
       conversation: typeof raw['conversation'] === 'string' ? raw['conversation'] : null,
       effort: typeof raw['effort'] === 'string' ? raw['effort'] : null,
       cwd: manifest?.cwd ?? null,
-      ...(manifest?.reason ? { reason: manifest.reason } : {}),
       ...(manifest === null
         ? {}
         : {

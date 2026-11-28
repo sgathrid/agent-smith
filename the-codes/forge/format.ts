@@ -369,11 +369,12 @@ export function failureFields(
   const error = adapterError !== '' ? elide(adapterError, maxError) : verdict.reason;
   if (verdict.status !== 'failed') return { error, reason: null };
   const denials = result.deniedActions ?? [];
-  const fatal = denials.length > 0 && verdict.reason !== null && DENIED_RE.test(verdict.reason);
   let reason: string;
-  if (fatal) reason = deniedReason(denialNames(denials));
-  else if (result.status === 'timeout') reason = REASONS.timedOut;
-  else if (verdict.reason === REASONS.noOutput) reason = REASONS.noOutput;
+  if (result.status === 'timeout') reason = REASONS.timedOut;
+  else if (result.status === 'cancelled') reason = 'canceled';
+  else if (denials.length > 0 && (result.status === 'denied' || (verdict.reason !== null && DENIED_RE.test(verdict.reason)))) {
+    reason = deniedReason(denialNames(denials));
+  } else if (verdict.reason === REASONS.noOutput) reason = REASONS.noOutput;
   else if (verdict.reason === CWD_GONE_REASON && adapterError === '') reason = 'working directory gone';
   else reason = reasonFromText(adapterError !== '' ? adapterError : verdict.reason);
   return { error, reason };
@@ -392,17 +393,18 @@ export function deriveStatus(d: StatusDerivation): StatusVerdict {
   }
 
   const denials = d.deniedActions ?? [];
-  const nonfatalOnly = denials.length > 0 && d.ok === true && !looksEmpty(d.report) && denials.every((x) => x.nonfatal === true);
-  if (denials.length > 0 && !nonfatalOnly) {
-    return { status: 'failed', suspicious: true, reason: deniedReason(denialNames(denials)) };
+  if (d.ok === false) {
+    if (d.jobStatus === 'timeout') return { status: 'failed', suspicious: false, reason: REASONS.timedOut };
+    if (d.jobStatus === 'cancelled') return { status: 'failed', suspicious: false, reason: 'canceled' };
+    if (d.jobStatus === 'denied') {
+      return { status: 'failed', suspicious: true, reason: denials.length > 0 ? deniedReason(denialNames(denials)) : REASONS.workerError };
+    }
+    return { status: 'failed', suspicious: false, reason: REASONS.workerError };
   }
 
-  if (d.ok === false) {
-    return {
-      status: 'failed',
-      suspicious: false,
-      reason: d.jobStatus === 'timeout' ? REASONS.timedOut : REASONS.workerError,
-    };
+  const nonfatalOnly = denials.length > 0 && !looksEmpty(d.report) && denials.every((x) => x.nonfatal === true);
+  if (denials.length > 0 && !nonfatalOnly) {
+    return { status: 'failed', suspicious: true, reason: deniedReason(denialNames(denials)) };
   }
 
   if (d.cwdMissing === true && d.writing === true) {

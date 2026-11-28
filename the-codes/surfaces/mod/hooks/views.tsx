@@ -151,7 +151,7 @@ function toolRow(W: UiComponents,key:string,tool:string,input:string,output:stri
   const {Box,Text,Button}=W;
   const expanded=o.tools.includes(key);
   const glyph=state==='active'?activeGlyph(o.now):state==='error'?'✗':expanded?'▾':'✓';
-  const label=`${glyph} ${oneLine(classify(tool,input).label,Math.max(1,o.width-3))}`;
+  const label=`${glyph} ${oneLine(classify(tool,input,output).label,Math.max(1,o.width-3))}`;
   return <Box key={`row-${key}`} flexDirection="column">
     {state==='error'
       ? <Button key={key} plain dimColor={false} label={label} onPress={() => a.tool(key)}>
@@ -173,7 +173,7 @@ function timelineGroup(W: UiComponents, item: Extract<TimelineItem,{kind:'group'
   const expanded=o.tools.includes(item.key);
   const childOpts={...o,width:Math.max(1,o.width-2)};
   return <Box key={`row-${item.key}`} flexDirection="column">
-    <Button key={item.key} plain dimColor={!expanded} label={`${expanded?'▾':'✓'} ${oneLine(timelineGroupLabel(item.reads,item.searches,item.commands),Math.max(1,o.width-3))}`} onPress={() => a.tool(item.key)} />
+    <Button key={item.key} plain dimColor={!expanded} label={`${expanded?'▾':'✓'} ${oneLine(timelineGroupLabel(item.reads,item.searches,item.commands,item.team),Math.max(1,o.width-3))}`} onPress={() => a.tool(item.key)} />
     {expanded && <Box key={`body-${item.key}`} flexDirection="row">
       <Text>{'  '}</Text>
       <Box flexDirection="column">

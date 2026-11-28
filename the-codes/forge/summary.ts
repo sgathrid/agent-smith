@@ -1,5 +1,6 @@
 import type { ObservedJob } from '../harness/types.ts';
 import type { ProgressDigest } from '../surfaces/mod/hooks/progress.ts';
+import { reasonFromText } from '../surfaces/mod/hooks/reasons.ts';
 import { normalizeContinuationKind, type ContinuationKind, type ForgeActivity, type ForgeStatus, type WatchedFileSigs } from './format.ts';
 import type { Acceptance } from './checks.ts';
 
@@ -31,6 +32,7 @@ export interface JobSummary {
   readonly updatedAt: string | null;
   readonly finishedAt: string | null;
   readonly warnings: readonly { code: string; message: string }[];
+  readonly reason?: string | null;
   readonly resumable?: boolean;
   readonly unrestricted?: boolean;
   readonly supersededBy?: string | null;
@@ -53,7 +55,6 @@ export interface JobSummary {
 export interface JobDetail extends JobSummary {
   readonly report: string | null;
   readonly error: string | null;
-  readonly reason?: string | null;
   readonly exitCode: number | null;
   readonly unrestricted: boolean;
   readonly pipeline: string | null;
@@ -79,6 +80,12 @@ export interface JobDetail extends JobSummary {
   readonly staleReads?: readonly string[];
 }
 
+export function failedReason(d: { readonly status: string; readonly reason?: string | null; readonly error?: string | null }): string | null {
+  if (d.status !== 'failed') return null;
+  const stored = d.reason;
+  return stored ? stored : reasonFromText(d.error);
+}
+
 export function toSummary(observed: ObservedJob): JobSummary {
   const raw = observed.raw;
   const toolCalls = typeof raw['tool_calls'] === 'number' ? raw['tool_calls'] : null;
@@ -96,6 +103,11 @@ export function toSummary(observed: ObservedJob): JobSummary {
     typeof raw['chainStartedAt'] === 'string' && raw['chainStartedAt'] !== ''
       ? raw['chainStartedAt']
       : (observed.startedAt ?? undefined);
+  const reason = failedReason({
+    status: observed.status,
+    reason: typeof raw['reason'] === 'string' && raw['reason'] !== '' ? raw['reason'] : null,
+    error: typeof raw['error'] === 'string' ? raw['error'] : null,
+  });
   return {
     jobId: observed.jobId,
     name: typeof raw['name'] === 'string' && raw['name'] ? raw['name'] : observed.jobId,
@@ -119,6 +131,7 @@ export function toSummary(observed: ObservedJob): JobSummary {
     updatedAt: observed.updatedAt,
     finishedAt: observed.finishedAt,
     warnings: observed.warnings.map((w) => ({ code: w.code, message: w.message })),
+    ...(reason !== null ? { reason } : {}),
     ...(typeof raw['supersededBy'] === 'string' || raw['supersededBy'] === null
       ? { supersededBy: raw['supersededBy'] as string | null }
       : {}),

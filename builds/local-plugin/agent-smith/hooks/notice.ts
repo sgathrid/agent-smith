@@ -27,6 +27,7 @@ export interface NoticeRow {
   readonly continuationKind?: NoticeContinuationKind | null;
   readonly pendingMessages?: number | null;
   readonly warnings?: readonly { readonly code: string; readonly message?: string }[] | null;
+  readonly pipeline?: string | null;
   readonly staleReads?: readonly string[] | null;
   readonly acceptance?: { readonly pending?: boolean; readonly budgetMs?: number; readonly running?: string; readonly checks: readonly { readonly ok: boolean; readonly name?: string }[] };
   readonly liveness?: { readonly state: string; readonly silentForMs: number; readonly since: number | null; readonly tool?: string } | null;
@@ -223,7 +224,7 @@ export function parseSettledRead(
 ): { readonly kind: 'job' | 'run'; readonly id: string; readonly resolvedFrom?: string; readonly workerId?: string } | null {
   if (typeof toolName !== 'string' || !STATUS_TOOL.test(toolName)) return null;
   const payload = unwrapResponse(response);
-  if (payload === null || typeof payload['error'] === 'string') return null;
+  if (payload === null) return null;
   const bare = toolName.slice(toolName.lastIndexOf('__') + 2);
   const workerId = typeof payload['workerId'] === 'string' && payload['workerId'].length > 0 ? payload['workerId'] : undefined;
   if (bare === 'cancel') {
@@ -422,9 +423,13 @@ export function pipelineOutcome(run: RunRecord): string {
   const stages = Object.values(run.stageResults)
     .filter((s): s is NonNullable<typeof s> => s !== null && typeof s === 'object' && typeof s.stage === 'string');
   const passed = stages.filter((s) => s.status === 'passed' && s.acceptance !== 'failed').length;
-  const bad = stages.find((s) => s.status === 'failed' || s.acceptance === 'failed');
+  const failed = stages.filter((s) => s.status === 'failed' || s.acceptance === 'failed');
   const head = `${passed}/${stages.length} stages passed`;
-  if (bad) return `${head} · ${String(bad.stage)}: ${stageReason(bad)}`;
+  if (failed.length > 0) {
+    const shown = failed.slice(0, 3).map((s) => `${String(s.stage)}: ${stageReason(s)}`);
+    if (failed.length > 3) shown.push(`+${failed.length - 3} more`);
+    return `${head} · ${shown.join(', ')}`;
+  }
   return run.error && run.status !== 'passed' ? `${head} · ${reasonFromText(run.error)}` : head;
 }
 
@@ -587,6 +592,12 @@ export function due(
       keep.push(entry);
     }
   };
+  const ownedRuns = new Set(owned.filter((o) => o.kind === 'run').map((o) => o.id));
+  const ownedStageIds = new Set<string>();
+  for (const runId of ownedRuns) {
+    const run = runs.get(runId);
+    if (run) for (const sid of stageJobIds(run)) ownedStageIds.add(sid);
+  }
   const refreshed = (until: number) => Math.max(until, now + MAX_JOB_MS + 60 * 60_000);
   for (const o of owned) {
     if (o.kind === 'run') {
@@ -594,11 +605,6 @@ export function due(
       const notice = run ? noticeFromRun(run) : null;
       if (run && notice) {
         pushNotice(notice);
-        for (const sid of stageJobIds(run)) {
-          const stage = byId.get(sid);
-          const kind = stage ? kindOf(stage.status) : null;
-          if (stage && kind && kind !== 'attention') pushNotice(noticeFromRadar(stage, kind, now));
-        }
         continue;
       }
       const said = new Set(o.saidStageAttention ?? []);
@@ -613,6 +619,7 @@ export function due(
       continue;
     }
     const own = byId.get(o.id);
+    if (ownedStageIds.has(o.id) || (own?.pipeline != null && ownedRuns.has(own.pipeline))) continue;
     const workerId = o.workerId ?? own?.workerId;
     const fromTurn = o.fromTurn ?? own?.turn ?? (own ? 1 : undefined);
     let current: Owned = { ...o, ...(workerId ? { workerId } : {}), ...(fromTurn !== undefined ? { fromTurn } : {}) };

@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
@@ -688,6 +688,35 @@ test('tool failures are isError results that say what to do next', async () => {
   assert.match(text(runStatus), /"run-123" is a pipeline run, not a worker\./);
 });
 
+test('run_pipeline, pipeline_status and cancel return compact single-line JSON with structuredContent', async () => {
+  const cwd = mkdtempSync(path.join(tmpdir(), 'smith-compact-'));
+  writePipelineRecord(cwd, 'run-1', {
+    runId: 'run-1', pipeline: 'ship', status: 'passed', startedAt: 1, finishedAt: 2,
+    stageResults: { a: { stage: 'a', provider: 'codex', status: 'passed' } },
+  });
+  const service = withWorkerLookup({
+    repo: cwd,
+    cancel: (id: string) => ({ jobId: id, requested: true, signalled: true, note: 'Canceled.' }),
+    detail: async (id: string) => ({ jobId: id, workerId: 'w-1', status: 'canceled', warnings: [] }),
+  }) as never;
+  const ctx = { service, catalogs: async () => [cat('codex')], cancelSettleMs: 1_000 } as HandlerContext;
+  const ps = await callTool(ctx, 'pipeline_status', { runId: 'run-1' });
+  assert.equal(text(ps).includes('\n'), false, 'pipeline_status concise should be compact');
+  assert.ok(ps.structuredContent);
+  const psDetailed = await callTool(ctx, 'pipeline_status', { runId: 'run-1', response_format: 'detailed' });
+  assert.equal(text(psDetailed).includes('\n'), false, 'pipeline_status detailed should be compact');
+  assert.ok(psDetailed.structuredContent);
+  const cj = await callTool(ctx, 'cancel', { id: 'j1' });
+  assert.equal(text(cj).includes('\n'), false, 'cancel job should be compact');
+  assert.ok(cj.structuredContent);
+  const cp = await callTool(ctx, 'cancel', { id: 'run-1' });
+  assert.equal(text(cp).includes('\n'), false, 'cancel pipeline should be compact');
+  assert.ok(cp.structuredContent);
+  const rp = await callTool(ctx, 'run_pipeline', { spec: { name: 'ship', stages: [{ name: 'a', provider: 'codex', prompt: 'go' }] } });
+  assert.equal(text(rp).includes('\n'), false, 'run_pipeline should be compact');
+  assert.ok(rp.structuredContent);
+});
+
 test('a failed job preparation never leaves checks pending', async () => {
   const repo = mkdtempSync(path.join(tmpdir(), 'smith-prepare-fail-'));
   const service = { repo, spawnTracked: async (request: { onPrepared: (id: string) => void }) => {
@@ -770,6 +799,36 @@ test('status: a failed job carries a short reason (derived from old errors, stor
   assert.equal(ok.reason, undefined);
 });
 
+test('list_jobs and status (concise and detailed) agree on reason from persisted job.json, including cancel-vs-finish race', async () => {
+  const cwd = mkdtempSync(path.join(tmpdir(), 'smith-reason-'));
+  const writeJob = (jobId: string, manifest: Record<string, unknown>, cancel = false) => {
+    const dir = path.join(cwd, '.agent-smith', 'jobs', jobId);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, 'job.json'), JSON.stringify({
+      schema: 1, jobId, workerId: jobId, name: jobId, provider: 'codex', mode: 'implement',
+      createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:01:00.000Z',
+      startedAt: '2026-01-01T00:00:00.000Z', finishedAt: '2026-01-01T00:01:00.000Z',
+      ...manifest,
+    }));
+    if (cancel) writeFileSync(path.join(dir, 'cancel'), '2026-01-01T00:00:30.000Z\n');
+  };
+  writeJob('j-cwd', { status: 'failed', reason: 'working directory gone', error: 'working directory gone; nothing could be verified' });
+  writeJob('j-empty', { status: 'failed', reason: 'denied', error: 'no output' });
+  writeJob('j-denied', { status: 'failed', reason: 'denied RunCommand', error: 'denied RunCommand · stderr: server stopped', deniedActions: [{ action: 'command', displayName: 'RunCommand' }] });
+  writeJob('j-race', { status: 'canceled', reason: 'timed out', error: 'timed out after 2m' });
+
+  const ctx = { service: new ForgeService({ repo: cwd }), catalogs: async () => [cat('codex')] } as HandlerContext;
+  const rows = body(await callTool(ctx, 'list_jobs', {})) as Array<Record<string, unknown>>;
+  const byId = new Map(rows.map(r => [r.jobId as string, r]));
+  for (const [id, expected] of [['j-cwd', 'working directory gone'], ['j-empty', 'denied'], ['j-denied', 'denied RunCommand'], ['j-race', undefined]] as const) {
+    const concise = body(await callTool(ctx, 'status', { id }));
+    const detailed = body(await callTool(ctx, 'status', { id, response_format: 'detailed' }));
+    assert.equal(byId.get(id)?.reason, expected, `list_jobs ${id}`);
+    assert.equal(concise.reason, expected, `status concise ${id}`);
+    assert.equal(detailed.reason, expected, `status detailed ${id}`);
+  }
+});
+
 const messageAck = (extra: Record<string, unknown> = {}) => ({
   jobId: 'implement-smith-1', name: 'Ada', workerId: 'w-ada', turn: 1, action: 'queued', delivery: 'turn-end', status: 'running',
   provider: 'codex', repo: '/tmp/r', timeoutMs: 60_000, pendingMessages: 1, note: 'Queued; runs when this turn ends.', ...extra,
@@ -809,6 +868,17 @@ test('follow_up expands a model alias for the worker\'s provider before it reach
   assert.equal(res.isError, undefined, text(res));
   assert.deepEqual([seen[0]!.model, seen[0]!.effort], ['gpt-6.1-sol', 'high']);
   assert.deepEqual([body(res).action, body(res).delivery, body(res).jobId], ['started', 'now', 'implement-smith-2']);
+});
+
+test('follow_up accepts model: "default" and effort: "default" and forwards them to the service without alias errors', async () => {
+  const seen: Array<Record<string, unknown>> = [];
+  const ctx = withService({
+    followUp: async (req: Record<string, unknown>) => { seen.push(req); return messageAck({ action: 'started', delivery: 'now', jobId: 'implement-smith-2', turn: 2 }); },
+    detail: async () => detail({ name: 'Ada', provider: 'codex', model: 'gpt-6.1-sol' }),
+  });
+  const res = await callTool(ctx, 'follow_up', { worker: 'Ada', prompt: 'Reset.', model: 'default', effort: 'default' });
+  assert.equal(res.isError, undefined, text(res));
+  assert.deepEqual([seen[0]!.model, seen[0]!.effort], ['default', 'default']);
 });
 
 test('steer forwards worker, prompt, context, files and allowFresh, and passes service errors through', async () => {

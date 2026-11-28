@@ -338,12 +338,14 @@ function failureFields(verdict, result, maxError = 1_200) {
     if (verdict.status !== 'failed')
         return { error, reason: null };
     const denials = result.deniedActions ?? [];
-    const fatal = denials.length > 0 && verdict.reason !== null && DENIED_RE.test(verdict.reason);
     let reason;
-    if (fatal)
-        reason = deniedReason(denialNames(denials));
-    else if (result.status === 'timeout')
+    if (result.status === 'timeout')
         reason = REASONS.timedOut;
+    else if (result.status === 'cancelled')
+        reason = 'canceled';
+    else if (denials.length > 0 && (result.status === 'denied' || (verdict.reason !== null && DENIED_RE.test(verdict.reason)))) {
+        reason = deniedReason(denialNames(denials));
+    }
     else if (verdict.reason === REASONS.noOutput)
         reason = REASONS.noOutput;
     else if (verdict.reason === CWD_GONE_REASON && adapterError === '')
@@ -365,16 +367,19 @@ function deriveStatus(d) {
         return { status: 'running', suspicious: false, reason: null };
     }
     const denials = d.deniedActions ?? [];
-    const nonfatalOnly = denials.length > 0 && d.ok === true && !looksEmpty(d.report) && denials.every((x) => x.nonfatal === true);
+    if (d.ok === false) {
+        if (d.jobStatus === 'timeout')
+            return { status: 'failed', suspicious: false, reason: REASONS.timedOut };
+        if (d.jobStatus === 'cancelled')
+            return { status: 'failed', suspicious: false, reason: 'canceled' };
+        if (d.jobStatus === 'denied') {
+            return { status: 'failed', suspicious: true, reason: denials.length > 0 ? deniedReason(denialNames(denials)) : REASONS.workerError };
+        }
+        return { status: 'failed', suspicious: false, reason: REASONS.workerError };
+    }
+    const nonfatalOnly = denials.length > 0 && !looksEmpty(d.report) && denials.every((x) => x.nonfatal === true);
     if (denials.length > 0 && !nonfatalOnly) {
         return { status: 'failed', suspicious: true, reason: deniedReason(denialNames(denials)) };
-    }
-    if (d.ok === false) {
-        return {
-            status: 'failed',
-            suspicious: false,
-            reason: d.jobStatus === 'timeout' ? REASONS.timedOut : REASONS.workerError,
-        };
     }
     if (d.cwdMissing === true && d.writing === true) {
         return { status: 'failed', suspicious: true, reason: CWD_GONE_REASON };
@@ -2648,8 +2653,15 @@ function createAgyTranslator(maxChars) {
                 answer.work();
                 sawErrorStep = true;
                 progressedAfterError = false;
-                // agy's stream carries no error text here; the final result does.
-                out.push({ kind: 'notice', at, level: 'error', message: 'agy error', raw: su });
+                const suObj = obj(raw, 'step_update');
+                const detail = (str(suObj, 'text_delta') ??
+                    str(suObj, 'error') ??
+                    str(obj(suObj, 'error'), 'message') ??
+                    str(suObj, 'message') ??
+                    su.tool_info?.error?.message ??
+                    '').replace(/\s+/g, ' ').trim();
+                const message = detail === '' ? 'agy error' : truncate(`agy error: ${detail}`, 200).text;
+                out.push({ kind: 'notice', at, level: 'error', message, raw: su });
                 return out;
             }
             // --- system_message / checkpoint / user_input --------------------------
@@ -8264,6 +8276,7 @@ class AgentSmithReader {
             [SMITH_PAYLOAD.exitCode]: manifest?.exitCode ?? null,
             [SMITH_PAYLOAD.jobStatus]: manifest?.jobStatus ?? null,
             [SMITH_PAYLOAD.error]: orphan?.reason ?? manifest?.error ?? null,
+            reason: orphan?.reason ?? manifest?.reason ?? null,
             [SMITH_PAYLOAD.deniedActions]: normalizeDenials(manifest?.deniedActions),
             [SMITH_PAYLOAD.usage]: manifest?.usage ?? null,
             ...(Array.isArray(manifest?.changedFiles) && manifest.changedFilesTruncated !== true
@@ -8504,4 +8517,4 @@ function asUsage(v) {
 /** Normalize a raw agent-smith job snapshot. */
 function normalize(raw) {
     return smithNormalizer(raw);
-}export{markAcceptancePending as $,AgentSmithReader as A,SCHEMA_VERSION as B,validOwnerPid as C,DEFAULT_TIMEOUT_MS as D,reportFor as E,FILES as F,cwdFacts as G,normalizeDenials as H,deriveOrphan as I,deriveStatus as J,summaryHead as K,failureFields as L,MODES as M,writeAcceptance as N,createMarker as O,PROVIDERS as P,jobsDir as Q,REASONS as R,STAGE_PROMPTS as S,parseWorkerIndex as T,normalizeContinuationKind as U,fileSig as V,WORKERS_DIR as W,JobWriter as X,effectiveUnrestricted as Y,newJobId$1 as Z,newWorkerId as _,MODE_PRESETS as a,humanDuration as a0,pipeEvents as a1,checksAbortRequested as a2,verdictBlock as a3,runAcceptance as a4,senderOf as a5,taskTitle as a6,markAcceptanceSuperseded as a7,pickHead as a8,compareTurnPriority as a9,computeStaleReads as aa,SMITH_PAYLOAD as ab,isForgeStatus as ac,noticeReason as ad,readJsonSafe as ae,pipelineRecordPath as af,workerIndexPath as ag,checksReason as ah,toolLabel as ai,inheritContinuedProviders as b,readPipeline as c,jobFile as d,readAcceptance as e,isWorkerIdle as f,findProvider as g,effectiveDefaultUnrestricted as h,isTerminalStatus as i,jobDir as j,isMode as k,cancelPipeline as l,missingPipelineError as m,isTerminalForgeStatus as n,readManifest as o,providerNames as p,ownerAlive as q,reasonFromText as r,startPipeline as s,getProvider as t,errMessage as u,validateSpec as v,probeAvailability as w,writeJsonAtomic as x,normalize as y,writeAtomic as z};
+}export{markAcceptancePending as $,AgentSmithReader as A,reportFor as B,cwdFacts as C,DEFAULT_TIMEOUT_MS as D,normalizeDenials as E,FILES as F,deriveOrphan as G,deriveStatus as H,summaryHead as I,failureFields as J,writeAcceptance as K,createMarker as L,MODES as M,jobsDir as N,parseWorkerIndex as O,PROVIDERS as P,getProvider as Q,REASONS as R,STAGE_PROMPTS as S,normalizeContinuationKind as T,reasonFromText as U,fileSig as V,WORKERS_DIR as W,JobWriter as X,effectiveUnrestricted as Y,newJobId$1 as Z,newWorkerId as _,MODE_PRESETS as a,humanDuration as a0,pipeEvents as a1,checksAbortRequested as a2,verdictBlock as a3,runAcceptance as a4,senderOf as a5,taskTitle as a6,markAcceptanceSuperseded as a7,pickHead as a8,compareTurnPriority as a9,computeStaleReads as aa,SMITH_PAYLOAD as ab,isForgeStatus as ac,noticeReason as ad,readJsonSafe as ae,pipelineRecordPath as af,workerIndexPath as ag,checksReason as ah,toolLabel as ai,inheritContinuedProviders as b,jobFile as c,readAcceptance as d,cancelPipeline as e,isWorkerIdle as f,findProvider as g,effectiveDefaultUnrestricted as h,isTerminalStatus as i,jobDir as j,isMode as k,isTerminalForgeStatus as l,missingPipelineError as m,readManifest as n,ownerAlive as o,providerNames as p,normalize as q,readPipeline as r,startPipeline as s,errMessage as t,probeAvailability as u,validateSpec as v,writeJsonAtomic as w,writeAtomic as x,SCHEMA_VERSION as y,validOwnerPid as z};
