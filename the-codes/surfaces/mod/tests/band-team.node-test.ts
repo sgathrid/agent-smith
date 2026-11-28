@@ -138,15 +138,16 @@ test('settleTeam: a member is working only while the run is live and it has acte
     member('early', { lastEventAt: NOW - 10_000 }),
     member('late', { lastEventAt: NOW + 5_000 }),
     member('silent', { lastEventAt: null }),
+    member('new', { lastEventAt: null, startedAt: null }),
     member('idle', { state: 'waiting', lastEventAt: NOW - 10_000 }),
     member('gone', { state: 'killed', lastEventAt: NOW - 10_000 }),
     member('fin', { state: 'done', lastEventAt: NOW - 10_000 }),
   ]);
   const states = (x: Team) => x.members.map((m) => `${m.name}:${m.state}`);
   assert.deepEqual(states(settleTeam(t, { live: false, startedAt: NOW })),
-    ['early:stopped', 'late:stopped', 'silent:stopped', 'idle:waiting', 'gone:killed', 'fin:done'], 'a finished run has no working member');
+    ['early:stopped', 'late:stopped', 'silent:stopped', 'new:stopped', 'idle:waiting', 'gone:killed', 'fin:done'], 'a finished run has no working member');
   assert.deepEqual(states(settleTeam(t, { live: true, startedAt: NOW })),
-    ['early:stopped', 'late:working', 'silent:stopped', 'idle:waiting', 'gone:killed', 'fin:done'], 'a live run keeps only members that acted since it began');
+    ['early:stopped', 'late:working', 'silent:stopped', 'new:working', 'idle:waiting', 'gone:killed', 'fin:done'], 'a live run keeps only members that acted since it began');
   const fresh = team([member('late', { lastEventAt: NOW + 5_000 }), member('idle', { state: 'waiting' })]);
   assert.equal(settleTeam(fresh, { live: true, startedAt: NOW }), fresh, 'unchanged team is the same object');
   assert.equal(settleTeam(t, { live: true, startedAt: null }).members[0]!.state, 'working', 'no known start: nothing predates it');

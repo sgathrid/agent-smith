@@ -89,7 +89,11 @@ export function tokensCell(n: number | null | undefined): string {
 
 /** A member can be `working` only while its worker's run is live and it has acted since that run began. */
 export function settleTeam(team: Team, run: { readonly live: boolean; readonly startedAt: number | null }): Team {
-  const ended = (m: TeamMember): boolean => !run.live || (m.lastEventAt ?? 0) < (run.startedAt ?? 0);
+  const ended = (m: TeamMember): boolean => {
+    if (!run.live) return true;
+    const acted = m.lastEventAt ?? m.startedAt;
+    return acted !== null && run.startedAt !== null && acted < run.startedAt;
+  };
   if (!team.members.some((m) => m.state === 'working' && ended(m))) return team;
   return { ...team, members: team.members.map((m): TeamMember => (m.state === 'working' && ended(m) ? { ...m, state: 'stopped' } : m)) };
 }
