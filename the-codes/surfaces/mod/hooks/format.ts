@@ -3,6 +3,7 @@ import { REASONS, checksReason, reasonFromText } from './reasons.ts';
 import { ELAPSED_WIDTH, clockCell, effectiveStart, elapsed, elapsedCell } from './clock.ts';
 import { fitCell, oneLine, sanitizeText } from './text.ts';
 import { durationWords } from './notice.ts';
+import { agentsWord, hasTeam, teamCounts, teamPhrase } from './team.ts';
 
 export { ELAPSED_WIDTH, clockCell, effectiveStart, elapsed, elapsedCell, fitCell, oneLine, sanitizeText };
 
@@ -150,6 +151,8 @@ export function failedChecks(job: RadarJob): string {
   return oneLine(checksReason((job.acceptance?.checks ?? []).filter((c) => !c.ok).map((c) => oneLine(c.name))));
 }
 
+const SWARM_WAIT = /\bswarm_wait\b/i;
+
 const IN_TOOL_SHOWN_MS = 60_000;
 
 export function livenessWords(job: RadarJob): string {
@@ -179,17 +182,22 @@ export function jobDetail(job: RadarJob, options: { tools?: boolean } = {}): str
   const withTools = options.tools !== false;
   if (isTerminal(job.status)) {
     if (job.acceptance?.pending && !job.supersededBy) {
-      return job.turn > 1 ? `checking ${SEP} turn ${job.turn}` : 'checking';
+      const checking = job.turn > 1 ? `checking ${SEP} turn ${job.turn}` : 'checking';
+      return hasTeam(job.team) ? `${teamPhrase(job.team)} ${SEP} ${checking}` : checking;
     }
     return outcome(job);
   }
   const parts: string[] = [];
-  const quiet = livenessWords(job);
+  if (hasTeam(job.team)) parts.push(teamPhrase(job.team));
+  const counts = teamCounts(job.team);
+  const swarmWait = counts.working > 0 && (SWARM_WAIT.test(job.liveness?.tool ?? '') || SWARM_WAIT.test(job.activity));
+  const quiet = swarmWait && job.liveness?.state === 'in-tool' ? '' : livenessWords(job);
   if (quiet !== '') parts.push(quiet);
   const steers = pendingSteersLabel(job.pendingSteers);
   if (steers !== '') parts.push(steers);
   if (job.turn > 1) parts.push(`turn ${job.turn}`);
-  const activity = job.liveness?.state === 'in-tool' && quiet !== '' ? '' : oneLine(job.activity);
+  const activity = swarmWait ? `waiting on ${counts.working} of ${counts.total} ${agentsWord(counts.total)}`
+    : job.liveness?.state === 'in-tool' && quiet !== '' ? '' : oneLine(job.activity);
   if (activity !== '') parts.push(activity);
   if (withTools && job.toolCount !== null) parts.push(`${job.toolCount} tools`);
   return parts.join(` ${SEP} `);
