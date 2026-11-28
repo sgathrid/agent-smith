@@ -2457,18 +2457,20 @@ function oneLine(s, max = 400) {
     return clip(t, Math.max(0, max));
 }
 const SUMMARY_CHARS = 1_000;
-/** A job's short summary: its report's opening once it has a report, else the worker's last message. */
 function jobSummary(report, lastMessage) {
     return reportSummary(report ?? '') || lastMessage?.trim() || null;
 }
-/** A short summary of a worker's report or current message: its opening, without a leading
- * `Status:` line, cut at a paragraph or line boundary within `max`. */
 function reportSummary(text, max = SUMMARY_CHARS) {
-    const t = text.trim().replace(/^Status:[^\n]*(?:\n|$)/, '').trim();
-    if (t.length <= max)
-        return t;
-    const head = t.slice(0, max);
-    if (t[max] === '\n')
+    return clipAtBoundary(stripStatusLine(text), max);
+}
+function stripStatusLine(text) {
+    return text.trim().replace(/^Status:[^\n]*(?:\n|$)/, '').trim();
+}
+function clipAtBoundary(text, max) {
+    if (text.length <= max)
+        return text;
+    const head = text.slice(0, max);
+    if (text[max] === '\n')
         return head.trim();
     for (const sep of ['\n\n', '\n']) {
         const i = head.lastIndexOf(sep);
