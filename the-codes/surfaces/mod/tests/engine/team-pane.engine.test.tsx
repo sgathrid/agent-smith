@@ -63,12 +63,12 @@ const labels = async (pane: any): Promise<string[]> => (await pane.findAll({ typ
 describe('the Team section (renderWorker)', () => {
   test('collapsed: header line, first four members, a more row, m in the footer', async ($, on) => {
     const pane = await draw($, on, (W) => renderWorker(W, detail(MEMBERS), options(), actions));
-    expect(await texts(pane)).toContain('Team 6 · 2 working · 1 waiting · 1 done · 1 failed · 1 killed · board #15');
+    expect(await texts(pane)).toContain('Team 6 · 2 working · 1 reported · 1 done · 1 failed · 1 killed · board #15');
     const rows = (await labels(pane)).filter((l) => /neon-/.test(l));
     expect(rows).toHaveLength(4);
-    expect(rows[0]).toMatch(/^⏺ neon-681-core\s+Gemini 4 Neon\s+git show/);
+    expect(rows[0]).toMatch(/^⏺ neon-681-core\s+Neon\s+git show/);
     expect(rows[0]).toMatch(/14m00s · ↓ 219k$/);
-    expect(rows[3]).toMatch(/^○ neon-707\s+Gemini 4 Neon\s+posted #15\s+11m00s · ↓ 180k$/);
+    expect(rows[3]).toMatch(/^✓ neon-707\s+Neon\s+posted #15\s+11m00s · ↓ 180k$/);
     expect(await texts(pane)).toContain('  + 2 more · m: all');
     expect((await pane.find({ key: 'member-neon-681-core' }) as any).props.hotkey).toBe('1');
     expect((await pane.find({ key: 'team' }) as any).props.hotkey).toBe('m');
@@ -93,7 +93,7 @@ describe('the Team section (renderWorker)', () => {
     const small = [member('neon-681-core', { state: 'stopped', lastEventAt: NOW - 4 * 60_000 }), MEMBERS[2]!];
     const pane = await draw($, on, (W) => renderWorker(W, detail(small), options(), actions));
     expect(await pane.find({ key: 'team' })).toBeUndefined();
-    expect(await texts(pane)).toContain('Team 2 · 1 waiting · 1 stopped · board #15');
+    expect(await texts(pane)).toContain('Team 2 · 1 reported · 1 stopped · board #15');
     const rows = (await labels(pane)).filter((l) => /neon-/.test(l));
     expect(rows[0]).toMatch(/^○ neon-681-core\s.*10m00s · ↓ 219k$/);
   });
@@ -135,7 +135,7 @@ describe('the member view (renderMember)', () => {
     expect(await texts(a)).toContain('No post yet.');
     const b = await draw($, on, (W) => renderMember(W, job(MEMBERS), MEMBERS[2]!, null, options(), actions));
     const t = await texts(b);
-    expect(t[0]).toMatch(/^○ neon-707 · member of stack-swarm · agy/);
+    expect(t[0]).toMatch(/^✓ neon-707 · member of stack-swarm · agy/);
     expect(t[1]).toBe('Gemini 4 Neon (High) · worker · ↓ 180k · last post #15');
     expect(t).toContain('No detail recorded yet.');
   });
@@ -205,5 +205,49 @@ describe('the pane with a real job directory (needs the team reader)', () => {
     const pane = await open($);
     await pane.press({ key: 'member-neon-681-core' });
     expect(await pane.find({ type: 'Text', text: 'No detail recorded yet.' })).toBeDefined();
+  });
+});
+
+describe('the Result block', () => {
+  const tool = (sequence: number) => ({ sequence, kind: 'tool', at: iso(NOW), stepIndex: sequence, tool: 'Read', input: 'a.rs', output: 'x', state: 'done' });
+  const note = { sequence: 1, kind: 'message', at: iso(NOW), sender: 'steer', text: 'go on' };
+  const finished = (timeline: unknown[], report: string | null): ForgeDetail => ({
+    job: { ...job(MEMBERS), status: 'succeeded', endedAt: NOW, report }, timeline } as unknown as ForgeDetail);
+  const view = (timeline: unknown[], report: string | null): MemberView =>
+    ({ schema: 1, id: 'neon-681-core', name: 'neon-681-core', brief: 'b', report, truncated: false, timeline } as unknown as MemberView);
+  const around = async (pane: any) => {
+    const all = await texts(pane);
+    const at = all.indexOf('● Result');
+    return { at, before: all.slice(0, at), all };
+  };
+  const trailingBlanks = (before: string[]) => before.length - 1 - before.map((t) => t.trim() !== '').lastIndexOf(true);
+
+  test('worker: one blank row, then a bold marked heading, under the last timeline row', async ($, on) => {
+    const pane = await draw($, on, (W) => renderWorker(W, finished([note], 'All done'), options(), actions));
+    const { at, before } = await around(pane);
+    expect(at).toBeGreaterThan(0);
+    expect(trailingBlanks(before)).toBe(1);
+    expect(await pane.find({ type: 'Markdown', text: 'All done' })).toBeDefined();
+  });
+
+  test('worker: an expanded tool row already ends in a blank, so the gap is not doubled', async ($, on) => {
+    const pane = await draw($, on, (W) => renderWorker(W, finished([tool(0)], 'All done'), options({ tools: ['event-0'] }), actions));
+    expect(trailingBlanks((await around(pane)).before)).toBe(1);
+  });
+
+  test('worker: no report keeps its line under the same heading', async ($, on) => {
+    const pane = await draw($, on, (W) => renderWorker(W, finished([note], null), options(), actions));
+    const { at, all } = await around(pane);
+    expect(all[at + 1]).toBe('No report was written.');
+  });
+
+  test('member: the same gap and heading', async ($, on) => {
+    const a = await draw($, on, (W) => renderMember(W, job(MEMBERS), MEMBERS[0]!, view([note], 'Posted'), options(), actions));
+    expect(trailingBlanks((await around(a)).before)).toBe(1);
+    const b = await draw($, on, (W) => renderMember(W, job(MEMBERS), MEMBERS[0]!, view([tool(0)], 'Posted'), options({ tools: ['event-0'] }), actions));
+    expect(trailingBlanks((await around(b)).before)).toBe(1);
+    const c = await draw($, on, (W) => renderMember(W, job(MEMBERS), MEMBERS[3]!, view([note], null), options(), actions));
+    const { at, all } = await around(c);
+    expect(all[at + 1]).toBe('No report recorded.');
   });
 });

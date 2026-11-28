@@ -298,7 +298,7 @@ test('a running worker with a progress digest shows what it is doing and what it
   await launch($, 'job-ada');
   const band = await $.ui.mount({plugin:'agent-smith',surface:'terminal',...BAND} as never);
   const row = await band.find({key:'band-ada'}) as { props?: Record<string,unknown> } | undefined;
-  expect(String(row?.props?.label)).toMatch(/pp-engine\s+editing loader\.py · 3 files edited · last test run failed/);
+  expect(String(row?.props?.label)).toMatch(/pp-engine\s+editing loader\.py ∙ 3 files edited ∙ last test run failed/);
   await band.press({key:'band-ada'});
   const pane = await $.ui.mount(PANE_TARGET);
   expect(await pane.find({type:'Text',text:/^Editing · 21 files read · 14 searches · 2 commands · tests ran 2× · last run failed$/})).toBeDefined();
@@ -1993,8 +1993,11 @@ describe('the band team rows', () => {
     const labels = await bandTexts(band);
     expect(labels).toHaveLength(4);
     expect(labels[0]).toMatch(/swarm/);
-    expect(labels[1]).toMatch(/^\s+├ ⏺ alpha\s+reading alpha\.rs/);
-    expect(labels[2]).toMatch(/^\s+├ ⏺ bravo\s+reading bravo\.rs/);
+    expect(labels[1]).toMatch(/^\s+├ ⏺ alpha ∙ Neon\s+reading alpha\.rs/);
+    expect(labels[2]).toMatch(/^\s+├ ⏺ bravo ∙ Neon\s+reading bravo\.rs/);
+    const edge = (l: string) => l.trimEnd().length;
+    expect(edge(labels[1]!)).toBe(edge(labels[0]!));
+    expect(edge(labels[2]!)).toBe(edge(labels[0]!));
     expect(labels[3]).toMatch(/^\s+└ ○ charlie/);
   });
 

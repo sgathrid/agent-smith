@@ -1,7 +1,7 @@
-import type { RadarJob, TeamMember, TeamMemberState } from '../types/index.d.ts';
+import type { RadarJob, TeamMember } from '../types/index.d.ts';
 import { rowCap } from './band.ts';
 import { SEP, elapsedCell, fitCell, isLiveStatus, oneLine } from './format.ts';
-import { hasTeam, memberGlyph, sortMembers, tokensCell } from './team.ts';
+import { MARK_ORDER, hasTeam, markCounts, memberGlyph, memberMark, shortModel, sortMembers, tokensCell, type MemberMark } from './team.ts';
 
 export type BandEntry =
   | { readonly kind: 'job'; readonly job: RadarJob; readonly index: number }
@@ -42,16 +42,11 @@ export function planBand(shown: readonly RadarJob[], maxRows?: number): BandPlan
   return { entries, hidden: Math.max(0, shown.length - workers.length) };
 }
 
-const STATE_ORDER: readonly TeamMemberState[] = ['working', 'waiting', 'stopped', 'done', 'failed', 'killed'];
-
-function count(members: readonly TeamMember[], state: TeamMemberState): number {
-  return members.filter((m) => m.state === state).length;
-}
-
 export function foldText(hidden: readonly TeamMember[]): string {
   const parts: string[] = [];
-  const order = [...STATE_ORDER].sort((a, b) => count(hidden, b) - count(hidden, a));
-  for (const state of order) if (count(hidden, state) > 0) parts.push(`${count(hidden, state)} ${state}`);
+  const counts = markCounts(hidden);
+  const order = [...MARK_ORDER].sort((a: MemberMark, b: MemberMark) => counts[b] - counts[a]);
+  for (const mark of order) if (counts[mark] > 0) parts.push(`${counts[mark]} ${mark}`);
   let post: { name: string; seq: number } | null = null;
   for (const m of hidden) if (m.lastPost !== null && (post === null || m.lastPost.seq > post.seq)) post = { name: m.name, seq: m.lastPost.seq };
   if (post !== null) parts.push(`${oneLine(post.name)} posted #${post.seq}`);
@@ -69,15 +64,38 @@ function tokensSuffix(m: TeamMember): string {
   return t === '' ? '' : ` ${SEP} ↓ ${t}`;
 }
 
+const MIN_ACTIVITY = 10;
+
 export function tokenColumn(entries: readonly BandEntry[]): number {
   let w = 0;
   for (const e of entries) if (e.kind === 'member') w = Math.max(w, tokensSuffix(e.member).length);
   return w;
 }
 
+export const CHILD_INDENT = '   ';
+
+export function childLabel(m: TeamMember): string {
+  const model = shortModel(m);
+  return oneLine(m.name) + (model === '' ? '' : ` ${SEP} ${oneLine(model)}`);
+}
+
+export interface TreeColumns {
+  readonly worker: number;
+  readonly child: number;
+  readonly tokens: boolean;
+}
+
+export function treeColumns(columns: { readonly detail: number }, tokenWidth: number): TreeColumns {
+  const tokens = tokenWidth > 0 && columns.detail - tokenWidth >= MIN_ACTIVITY;
+  const worker = tokens ? columns.detail - tokenWidth : columns.detail;
+  return { worker, child: Math.max(0, worker - CHILD_INDENT.length), tokens };
+}
+
 export interface ChildRow {
   readonly tree: string;
   readonly glyph: string;
+  readonly name: string;
+  readonly model: string;
   readonly label: string;
   readonly detail: string;
   readonly right: string;
@@ -87,8 +105,6 @@ export interface ChildRow {
   readonly memberId: string | null;
 }
 
-const MIN_ACTIVITY = 10;
-
 export function childRow(
   entry: ChildEntry,
   now: number,
@@ -97,17 +113,20 @@ export function childRow(
 ): ChildRow {
   if (entry.kind === 'fold') {
     const text = foldText(entry.hidden);
-    return { tree: '└', glyph: '○', label: text, detail: '', right: '', plain: `└ ○ ${text}`, bold: false, dim: true, memberId: null };
+    return { tree: '└', glyph: '○', name: text, model: '', label: text, detail: '', right: '', plain: `└ ○ ${text}`, bold: false, dim: true, memberId: null };
   }
   const { member, last } = entry;
-  const withTokens = tokenWidth > 0 && columns.detail - tokenWidth >= MIN_ACTIVITY;
-  const detailWidth = withTokens ? columns.detail - tokenWidth : columns.detail;
+  const fit = treeColumns(columns, tokenWidth);
   const tree = last ? '└' : '├';
-  const glyph = memberGlyph(member.state);
-  const label = fitCell(oneLine(member.name), Math.max(0, columns.label - 2));
-  const detail = fitCell(oneLine(member.activity ?? member.task ?? ''), detailWidth);
-  const suffix = withTokens ? tokensSuffix(member).padEnd(tokenWidth) : '';
+  const mark = memberMark(member);
+  const glyph = memberGlyph(mark);
+  const name = oneLine(member.name);
+  const label = fitCell(childLabel(member), Math.max(0, columns.label - 2));
+  const nameCell = label.slice(0, name.length);
+  const modelCell = label.slice(nameCell.length);
+  const detail = fitCell(oneLine(member.activity ?? member.task ?? ''), fit.child);
+  const suffix = fit.tokens ? tokensSuffix(member).padEnd(tokenWidth) : '';
   const right = `${memberClock(member, now)}${suffix}`.trimEnd();
   const plain = `${tree} ${glyph} ${label} ${detail} ${right}`.replace(/\s+$/, '');
-  return { tree, glyph, label, detail: detail.trimEnd(), right, plain, bold: member.state === 'working', dim: member.state !== 'working', memberId: member.id };
+  return { tree, glyph, name: nameCell, model: modelCell, label, detail, right, plain, bold: member.state === 'working', dim: member.state !== 'working', memberId: member.id };
 }
