@@ -507,6 +507,7 @@ export function jobResult(args: {
   error: string | undefined;
   exit: ExitInfo;
   response: string;
+  answerKey?: string | undefined;
   startedAtMs: number;
   durationMs: number;
   stateDir: string;
@@ -525,6 +526,7 @@ export function jobResult(args: {
     finishedAt: nowIso(),
     stateDir: args.stateDir,
   };
+  if (args.answerKey !== undefined) out.answerKey = args.answerKey;
   if (error !== undefined) out.error = error;
   return out;
 }

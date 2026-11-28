@@ -440,13 +440,13 @@ export function createCodexTranslator(maxChars: number): CodexTranslator {
 
       // Assistant prose.
       if (itemType === 'agent_message') {
-        const text = str(item, 'text');
+        const text = type === 'item.completed' ? str(item, 'text') : undefined;
         if (text !== undefined) {
           if (text === '') {
             answer.emptyMessage();
           } else {
-            answer.text(text);
-            out.push({ kind: 'text', at, text, stream: 'assistant' });
+            answer.text(text, itemId);
+            out.push({ kind: 'text', at, text, stream: 'assistant', messageKey: itemId });
           }
         }
         return out;
@@ -623,7 +623,7 @@ export function buildResult(args: {
     }
   }
 
-  const out = jobResult({ provider: 'codex', jobId, status, error, exit, response, startedAtMs, durationMs, stateDir });
+  const out = jobResult({ provider: 'codex', jobId, status, error, exit, response, answerKey: tx.answer.answerKey(), startedAtMs, durationMs, stateDir });
   if (tx.usage !== undefined) out.usage = tx.usage;
   if (tx.threadId !== undefined) out.raw = { threadId: tx.threadId };
   return out;

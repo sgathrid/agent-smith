@@ -9,6 +9,8 @@ export interface Answer {
   work(): void;
   providerFinal(text: string | undefined, kind: ProviderFinalKind): void;
   value(): string;
+  /** The key of the message `value()` came from; undefined when it came from no keyed message or is empty. */
+  answerKey(): string | undefined;
 }
 
 const BOOKKEEPING_TOOLS: Readonly<Record<string, ReadonlySet<string>>> = {
@@ -89,12 +91,14 @@ export function createAnswer(provider: string): Answer {
       if (blockedByWork) return;
       if (current.trim() !== '' && kind === 'final-message') {
         current = text;
-        lastKey = undefined;
         hasMessage = true;
       }
     },
     value(): string {
       return current.trim() === '' ? '' : current;
+    },
+    answerKey(): string | undefined {
+      return current.trim() === '' ? undefined : lastKey;
     },
   };
 }

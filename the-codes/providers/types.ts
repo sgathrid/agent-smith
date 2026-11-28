@@ -40,7 +40,8 @@ export interface ActivityRef {
 
 export type ProviderEvent =
   | { kind: 'started'; at: string; conversationId?: string; model?: string; raw?: unknown }
-  | { kind: 'text'; at: string; text: string; stream: 'assistant' | 'thinking'; delta?: boolean }
+  /** `messageKey` names the provider message the text belongs to; texts of one message share it. */
+  | { kind: 'text'; at: string; text: string; stream: 'assistant' | 'thinking'; delta?: boolean; messageKey?: string }
   | { kind: 'activity-start'; at: string; activity: ActivityRef }
   | { kind: 'activity-update'; at: string; activity: ActivityRef }
   | { kind: 'activity-end'; at: string; activity: ActivityRef; status: ActivityStatus; durationSeconds?: number }
@@ -75,6 +76,8 @@ export interface JobResult {
   exitCode: number | null;
   signal: NodeJS.Signals | null;
   response: string;
+  /** The `messageKey` of the text events `response` came from; absent when it came from no keyed message. */
+  answerKey?: string;
   error?: string;
   deniedActions?: DeniedAction[];
   usage?: TokenUsage;

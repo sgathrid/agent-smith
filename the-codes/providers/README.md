@@ -179,8 +179,8 @@ after 5 s) because `codex exec` only traps `SIGINT` to send `turn/interrupt` and
 record the abort in thread history; other providers use `SIGTERM`→`SIGKILL`.
 
 Events observed live: `thread.started` (`thread_id`), `turn.started`,
-`item.completed` (`item:{id,type:'agent_message',text}`),
-`turn.completed` (`usage:{input_tokens,cached_input_tokens,cache_write_input_tokens,
+`item.completed` (`item:{id,type:'agent_message',text}`; an `agent_message`'s text is read
+from `item.completed` only, so one item is one message), `turn.completed` (`usage:{input_tokens,cached_input_tokens,cache_write_input_tokens,
 output_tokens,reasoning_output_tokens}`). `cached_input_tokens` maps to
 `cacheReadTokens` so consumers can sum across providers. No `total_tokens` — left
 undefined rather than invented.
@@ -437,3 +437,11 @@ Anthropic reports `cache_creation_input_tokens`. Inventing a total in any one
 adapter would make cross-provider totals wrong in a way that is hard to notice.
 
 `JobResult.response` is the final assistant message for every provider, not all prose from the run.
+
+An assistant `text` event carries `messageKey`, naming the provider message it belongs to: the
+agy step index, the claude and opencode message id, the codex `agent_message` item id, a
+per-message counter for kimi. All texts of one message share it. `JobResult.answerKey` is the
+key of the message `response` came from. It is absent when the response came from a provider's
+result field with no streamed text, or from text with no key. When claude's result field
+replaces the last streamed message, the key stays that message's. The forge writer uses the pair to
+keep the answer in `result.md` alone (see docs/ARCHITECTURE.md).
